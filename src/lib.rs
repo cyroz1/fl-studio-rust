@@ -1120,11 +1120,8 @@ impl FlpDocument {
                 event_index += 1;
                 continue;
             }
-            if !notes_event
-                .payload
-                .len()
-                .is_multiple_of(FLP_NOTE_RECORD_SIZE)
-            {
+            let (records, remainder) = notes_event.payload.as_chunks::<FLP_NOTE_RECORD_SIZE>();
+            if !remainder.is_empty() {
                 return Err(FlpError::InvalidEvent {
                     offset: notes_event.file_offset,
                     detail: "pattern note payload is not a whole number of 24-byte records",
@@ -1133,7 +1130,7 @@ impl FlpDocument {
 
             let mut replacement = Vec::with_capacity(notes_event.payload.len());
             let mut removed = false;
-            for record in notes_event.payload.chunks_exact(FLP_NOTE_RECORD_SIZE) {
+            for record in records {
                 let note = PatternNote::decode(record);
                 if !removed && note.channel_id == channel_id {
                     if channel_note_index == note_index {
