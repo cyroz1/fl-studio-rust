@@ -619,13 +619,24 @@ fn list_plugin_states(path: &Path) -> Result<(), String> {
     let states = document.channel_plugin_states();
     println!("channel plug-in data records: {}", states.len());
     for state in states {
+        let vst = state.vst_metadata();
         println!(
-            "channel={} plugin={} name={} data_event={} data_bytes={} wrapper_bytes={}",
+            "channel={} plugin={} channel_name={} vst_name={} vendor={} class_uid={} path={} data_event={} data_bytes={} nested_state_bytes={} wrapper_bytes={}",
             state.channel_id(),
             state.plugin_identifier().unwrap_or("unknown"),
             state.display_name().unwrap_or("(unnamed)"),
+            vst.and_then(|metadata| metadata.name())
+                .unwrap_or("unknown"),
+            vst.and_then(|metadata| metadata.vendor())
+                .unwrap_or("unknown"),
+            vst.and_then(|metadata| metadata.class_uid())
+                .unwrap_or_else(|| "unknown".to_owned()),
+            vst.and_then(|metadata| metadata.path())
+                .unwrap_or("unknown"),
             state.data_event_index(),
             state.data_payload().len(),
+            vst.and_then(|metadata| metadata.state_bytes())
+                .map_or_else(|| "unknown".to_owned(), |bytes| bytes.to_string()),
             state
                 .wrapper_payload()
                 .map_or_else(|| "none".to_owned(), |bytes| bytes.len().to_string()),
@@ -667,8 +678,11 @@ fn probe_vst3_state(bundle: &Path, project: &Path, channel_id: u16) -> Result<()
         .into_iter()
         .find(|state| state.channel_id() == channel_id)
         .ok_or_else(|| format!("channel {channel_id} has no recognized 0xD5 state event"))?;
+    let class_uid = state
+        .vst_metadata()
+        .and_then(|metadata| metadata.class_uid());
     let mut host = Vst3HostRuntime::new(44_100.0, 512)?;
-    let info = host.load(bundle, None)?;
+    let info = host.load(bundle, class_uid.as_deref())?;
     println!(
         "loaded {} by {} class={} path={}",
         info.name,
@@ -680,14 +694,22 @@ fn probe_vst3_state(bundle: &Path, project: &Path, channel_id: u16) -> Result<()
         Ok(()) => {
             let snapshot = host.save_state(info.id)?;
             println!(
-                "state restore accepted: FLP bytes={} host snapshot bytes={}",
+                "state restore accepted: FLP event bytes={} nested state bytes={} host snapshot bytes={}",
                 state.data_payload().len(),
+                state
+                    .vst_metadata()
+                    .and_then(|metadata| metadata.state_bytes())
+                    .map_or_else(|| "unknown".to_owned(), |bytes| bytes.to_string()),
                 snapshot.len()
             );
         }
         Err(error) => println!(
-            "state restore rejected: FLP bytes={} error={error}",
-            state.data_payload().len()
+            "state restore rejected: FLP event bytes={} nested state bytes={} error={error}",
+            state.data_payload().len(),
+            state
+                .vst_metadata()
+                .and_then(|metadata| metadata.state_bytes())
+                .map_or_else(|| "unknown".to_owned(), |bytes| bytes.to_string())
         ),
     }
     Ok(())

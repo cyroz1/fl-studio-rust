@@ -1,9 +1,8 @@
 //! Runtime hosting for already-installed VST3 plug-ins.
 //!
-//! FLP wrapper/state events stay in the project parser as opaque bytes until their
-//! Image-Line wrapper format is decoded. The API here accepts either state snapshots
-//! written by `vst3-host` or a raw VST3 component state supplied by a caller that has
-//! decoded the FLP wrapper.
+//! The project parser decodes VST identity metadata from recognized FLP envelopes,
+//! while preserving their complete raw bytes. This runtime does not translate
+//! Image-Line's FLP state envelope into the state stream expected by every VST3.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -85,7 +84,10 @@ impl Vst3HostRuntime {
         Ok(info)
     }
 
-    /// Load a project/session state blob after the FLP wrapper has been decoded.
+    /// Pass a state blob to the plug-in's VST3 state loader.
+    ///
+    /// The caller must provide bytes compatible with that plug-in. This method does
+    /// not convert an Image-Line FLP `0xD5` envelope into a VST3 component state.
     pub fn restore_state(&mut self, id: u64, state: &[u8]) -> Result<(), String> {
         let plugin = self.plugin(id)?;
         plugin

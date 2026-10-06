@@ -112,6 +112,23 @@ pub struct ChannelPluginState {
     wrapper_payload: Option<Vec<u8>>,
     data_payload: Vec<u8>,
     data_event_index: usize,
+    vst_metadata: Option<VstPluginStateMetadata>,
+}
+
+/// Identity fields embedded in an FLP VST plug-in state event.
+///
+/// The complete event remains available through [`ChannelPluginState::data_payload`];
+/// this structure only decodes the length-prefixed identity envelope around its state.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct VstPluginStateMetadata {
+    format_marker: u32,
+    plugin_info: Option<Vec<u8>>,
+    fourcc: Option<String>,
+    guid: Option<Vec<u8>>,
+    name: Option<String>,
+    path: Option<String>,
+    vendor: Option<String>,
+    state_bytes: Option<usize>,
 }
 
 impl ChannelPluginState {
@@ -139,6 +156,73 @@ impl ChannelPluginState {
 
     pub fn data_event_index(&self) -> usize {
         self.data_event_index
+    }
+
+    /// VST identity metadata when the `0xD5` event has a recognized VST envelope.
+    pub fn vst_metadata(&self) -> Option<&VstPluginStateMetadata> {
+        self.vst_metadata.as_ref()
+    }
+}
+
+impl VstPluginStateMetadata {
+    /// FL's VST wrapper serialization marker, observed as 8, 10, and 12.
+    pub fn format_marker(&self) -> u32 {
+        self.format_marker
+    }
+
+    /// Opaque 16-byte plug-in information field, when present.
+    pub fn plugin_info(&self) -> Option<&[u8]> {
+        self.plugin_info.as_deref()
+    }
+
+    /// VST2 four-character identifier, when present.
+    pub fn fourcc(&self) -> Option<&str> {
+        self.fourcc.as_deref()
+    }
+
+    /// Raw 16-byte GUID stored in the FLP envelope.
+    pub fn guid(&self) -> Option<&[u8]> {
+        self.guid.as_deref()
+    }
+
+    /// VST factory name stored in the FLP envelope.
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    /// Original plug-in binary path stored in the FLP envelope.
+    pub fn path(&self) -> Option<&str> {
+        self.path.as_deref()
+    }
+
+    /// Plug-in vendor stored in the FLP envelope.
+    pub fn vendor(&self) -> Option<&str> {
+        self.vendor.as_deref()
+    }
+
+    /// Size of the nested plug-in state field, without copying the state bytes.
+    pub fn state_bytes(&self) -> Option<usize> {
+        self.state_bytes
+    }
+
+    /// VST3-style 32-digit class UID converted to the format used by the host API.
+    pub fn class_uid(&self) -> Option<String> {
+        let guid: [u8; 16] = self.guid.as_deref()?.try_into().ok()?;
+        Some(format!(
+            "{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{}",
+            guid[3],
+            guid[2],
+            guid[1],
+            guid[0],
+            guid[5],
+            guid[4],
+            guid[7],
+            guid[6],
+            guid[8..]
+                .iter()
+                .map(|byte| format!("{byte:02X}"))
+                .collect::<String>()
+        ))
     }
 }
 
@@ -549,8 +633,8 @@ impl FlpDocument {
         channels
     }
 
-    /// Returns opaque per-channel plug-in wrapper and data payloads when a `0xD5` event exists.
-    /// The bytes are retained exactly as stored; this method does not decode plug-in state.
+    /// Returns per-channel plug-in wrapper and data payloads when a `0xD5` event exists.
+    /// The raw bytes are retained exactly; recognized VST envelopes also expose identity metadata.
     pub fn channel_plugin_states(&self) -> Vec<ChannelPluginState> {
         self.channels()
             .into_iter()
@@ -571,12 +655,14 @@ impl FlpDocument {
                         _ => {}
                     }
                 }
+                let data_payload = data_payload?;
                 Some(ChannelPluginState {
                     channel_id: channel.id,
                     plugin_identifier: channel.plugin_identifier,
                     display_name: channel.display_name,
                     wrapper_payload,
-                    data_payload: data_payload?,
+                    vst_metadata: parse_vst_plugin_state_metadata(&data_payload),
+                    data_payload,
                     data_event_index: data_event_index?,
                 })
             })
@@ -1618,9 +1704,55 @@ fn encode_leb128(mut value: u32) -> Vec<u8> {
     }
 }
 
+fn parse_vst_plugin_state_metadata(payload: &[u8]) -> Option<VstPluginStateMetadata> {
+    let marker = u32::from_le_bytes(payload.get(..4)?.try_into().ok()?);
+    if !matches!(marker, 8 | 10 | 12) {
+        return None;
+    }
+
+    let mut metadata = VstPluginStateMetadata {
+        format_marker: marker,
+        ..VstPluginStateMetadata::default()
+    };
+    let mut cursor = 4usize;
+    let mut field_count = 0usize;
+    while cursor < payload.len() {
+        let id_end = cursor.checked_add(4)?;
+        let length_end = cursor.checked_add(12)?;
+        let id = u32::from_le_bytes(payload.get(cursor..id_end)?.try_into().ok()?);
+        let length = u64::from_le_bytes(payload.get(id_end..length_end)?.try_into().ok()?);
+        let length = usize::try_from(length).ok()?;
+        let data_end = length_end.checked_add(length)?;
+        let data = payload.get(length_end..data_end)?;
+        field_count += 1;
+
+        match id {
+            50 if metadata.plugin_info.is_none() => metadata.plugin_info = Some(data.to_vec()),
+            51 if metadata.fourcc.is_none() => metadata.fourcc = decode_vst_text(data),
+            52 if metadata.guid.is_none() => metadata.guid = Some(data.to_vec()),
+            53 if metadata.state_bytes.is_none() => metadata.state_bytes = Some(data.len()),
+            54 if metadata.name.is_none() => metadata.name = decode_vst_text(data),
+            55 if metadata.path.is_none() => metadata.path = decode_vst_text(data),
+            56 if metadata.vendor.is_none() => metadata.vendor = decode_vst_text(data),
+            _ => {}
+        }
+        cursor = data_end;
+    }
+
+    (field_count > 0).then_some(metadata)
+}
+
+fn decode_vst_text(bytes: &[u8]) -> Option<String> {
+    let value = std::str::from_utf8(bytes)
+        .ok()?
+        .trim_end_matches('\0')
+        .to_owned();
+    (!value.is_empty()).then_some(value)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{FlpDocument, FlpError, PayloadEncoding};
+    use super::{FlpDocument, FlpError, PayloadEncoding, parse_vst_plugin_state_metadata};
 
     fn flp_fixture(event_stream: &[u8], header_extension: &[u8], trailing: &[u8]) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -1635,6 +1767,62 @@ mod tests {
         bytes.extend_from_slice(event_stream);
         bytes.extend_from_slice(trailing);
         bytes
+    }
+
+    fn append_vst_field(payload: &mut Vec<u8>, id: u32, data: &[u8]) {
+        payload.extend_from_slice(&id.to_le_bytes());
+        payload.extend_from_slice(&(data.len() as u64).to_le_bytes());
+        payload.extend_from_slice(data);
+    }
+
+    #[test]
+    fn decodes_vst_identity_fields_and_class_uid_from_d5_envelope() {
+        let mut payload = 12u32.to_le_bytes().to_vec();
+        append_vst_field(&mut payload, 50, &[0; 16]);
+        append_vst_field(
+            &mut payload,
+            52,
+            &[
+                0xDF, 0x55, 0x47, 0x32, 0xDF, 0x8F, 0x88, 0x47, 0xB4, 0xCE, 0x5B, 0x70, 0xA8, 0x03,
+                0x7E, 0xC4,
+            ],
+        );
+        append_vst_field(&mut payload, 54, b"ZENOLOGY");
+        append_vst_field(
+            &mut payload,
+            55,
+            b"/Library/Audio/Plug-Ins/VST3/Roland/ZENOLOGY.vst3",
+        );
+        append_vst_field(&mut payload, 56, b"Roland Cloud");
+        append_vst_field(&mut payload, 53, &[1, 2, 3, 4]);
+        append_vst_field(&mut payload, 999, &[5, 6]);
+
+        let metadata = parse_vst_plugin_state_metadata(&payload)
+            .expect("the VST envelope should be recognized");
+
+        assert_eq!(metadata.format_marker(), 12);
+        assert_eq!(metadata.name(), Some("ZENOLOGY"));
+        assert_eq!(metadata.vendor(), Some("Roland Cloud"));
+        assert_eq!(
+            metadata.path(),
+            Some("/Library/Audio/Plug-Ins/VST3/Roland/ZENOLOGY.vst3")
+        );
+        assert_eq!(metadata.state_bytes(), Some(4));
+        assert_eq!(
+            metadata.class_uid().as_deref(),
+            Some("324755DF8FDF4788B4CE5B70A8037EC4")
+        );
+    }
+
+    #[test]
+    fn ignores_unsupported_or_truncated_vst_envelopes() {
+        assert!(parse_vst_plugin_state_metadata(&42u32.to_le_bytes()).is_none());
+
+        let mut truncated = 12u32.to_le_bytes().to_vec();
+        truncated.extend_from_slice(&54u32.to_le_bytes());
+        truncated.extend_from_slice(&8u64.to_le_bytes());
+        truncated.push(b'X');
+        assert!(parse_vst_plugin_state_metadata(&truncated).is_none());
     }
 
     #[test]

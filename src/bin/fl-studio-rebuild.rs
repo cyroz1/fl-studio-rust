@@ -7,6 +7,7 @@ use flp_rebuild::plugins::{PluginCandidate, PluginFormat, scan_installed_plugins
 use flp_rebuild::vst3::Vst3HostRuntime;
 use flp_rebuild::{
     FlpDocument, Pattern, PatternNoteEdit, PlaylistClip, PlaylistClipEdit, PlaylistTrack,
+    VstPluginStateMetadata,
 };
 
 const PANEL: Color32 = Color32::from_rgb(31, 32, 34);
@@ -19,6 +20,36 @@ const GREEN: Color32 = Color32::from_rgb(113, 172, 77);
 const BLUE: Color32 = Color32::from_rgb(73, 128, 174);
 const PURPLE: Color32 = Color32::from_rgb(150, 93, 181);
 const ORANGE: Color32 = Color32::from_rgb(195, 129, 61);
+
+fn candidate_matches_vst_metadata(
+    candidate: &PluginCandidate,
+    metadata: &VstPluginStateMetadata,
+) -> bool {
+    if candidate.format != PluginFormat::Vst3 {
+        return false;
+    }
+
+    let candidate_name = candidate.name.to_lowercase();
+    let source_bundle = metadata.path().and_then(|path| {
+        Path::new(path)
+            .file_stem()
+            .or_else(|| Path::new(path).file_name())
+            .map(|value| value.to_string_lossy().to_lowercase())
+    });
+    source_bundle.as_deref() == Some(candidate_name.as_str())
+        || metadata
+            .name()
+            .is_some_and(|name| name.eq_ignore_ascii_case(&candidate.name))
+}
+
+fn matching_vst3_candidate<'a>(
+    candidates: &'a [PluginCandidate],
+    metadata: &VstPluginStateMetadata,
+) -> Option<&'a PluginCandidate> {
+    candidates
+        .iter()
+        .find(|candidate| candidate_matches_vst_metadata(candidate, metadata))
+}
 
 fn main() -> eframe::Result {
     let initial_project = std::env::args_os().nth(1).map(PathBuf::from);
@@ -1016,9 +1047,57 @@ impl DawUi {
                 .color(MUTED),
             );
         }
+        let selected_state = self.selected_plugin_state_channel.and_then(|channel_id| {
+            plugin_states
+                .iter()
+                .find(|state| state.channel_id() == channel_id)
+        });
+        if let Some(state) = selected_state {
+            if let Some(metadata) = state.vst_metadata() {
+                let plugin_name = metadata
+                    .name()
+                    .or(state.display_name())
+                    .unwrap_or("unknown VST");
+                ui.label(format!(
+                    "Project VST: {} · {} · class {}",
+                    plugin_name,
+                    metadata.vendor().unwrap_or("unknown vendor"),
+                    metadata.class_uid().as_deref().unwrap_or("unknown")
+                ));
+                if let Some(candidate) = matching_vst3_candidate(&self.plugin_candidates, metadata)
+                {
+                    ui.horizontal(|ui| {
+                        ui.label(format!(
+                            "Installed match: {} · {}",
+                            candidate.name,
+                            candidate.path.display()
+                        ));
+                        if ui.button("Load match + try FLP state").clicked() {
+                            restore_request = Some((
+                                candidate.path.clone(),
+                                state.channel_id(),
+                                metadata.class_uid(),
+                            ));
+                        }
+                    });
+                } else {
+                    ui.label(
+                        egui::RichText::new("No installed VST3 bundle matches this project state")
+                            .color(ORANGE),
+                    );
+                }
+            } else {
+                ui.label(
+                    egui::RichText::new(
+                        "This channel has opaque FL plug-in data without a recognized VST identity.",
+                    )
+                    .color(MUTED),
+                );
+            }
+        }
         ui.label(
             egui::RichText::new(
-                "Choose an installed VST3 to try the selected FLP channel's raw 0xD5 state.",
+                "Or choose an installed VST3 below to try the selected FLP channel's raw 0xD5 state.",
             )
             .color(MUTED),
         );
@@ -1037,6 +1116,9 @@ impl DawUi {
                 if candidate.format != PluginFormat::Vst3 {
                     continue;
                 }
+                let project_match = selected_state
+                    .and_then(|state| state.vst_metadata())
+                    .is_some_and(|metadata| candidate_matches_vst_metadata(candidate, metadata));
                 egui::Frame::new()
                     .fill(PANEL_DARK)
                     .inner_margin(6.0)
@@ -1045,6 +1127,9 @@ impl DawUi {
                             ui.vertical(|ui| {
                                 ui.strong(&candidate.name);
                                 ui.small(candidate.path.display().to_string());
+                                if project_match {
+                                    ui.small(egui::RichText::new("Project match").color(GREEN));
+                                }
                             });
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
@@ -1055,8 +1140,12 @@ impl DawUi {
                                     if let Some(channel_id) = self.selected_plugin_state_channel
                                         && ui.button("Load + try FLP state").clicked()
                                     {
+                                        let class_uid = selected_state
+                                            .filter(|_| project_match)
+                                            .and_then(|state| state.vst_metadata())
+                                            .and_then(VstPluginStateMetadata::class_uid);
                                         restore_request =
-                                            Some((candidate.path.clone(), channel_id));
+                                            Some((candidate.path.clone(), channel_id, class_uid));
                                     }
                                 },
                             );
@@ -1066,10 +1155,10 @@ impl DawUi {
             }
         });
 
-        if let Some((path, channel_id)) = restore_request {
-            self.load_installed_vst3(&path, Some(channel_id));
+        if let Some((path, channel_id, class_uid)) = restore_request {
+            self.load_installed_vst3(&path, Some(channel_id), class_uid);
         } else if let Some(path) = load_path {
-            self.load_installed_vst3(&path, None);
+            self.load_installed_vst3(&path, None, None);
         }
 
         let loaded = self
@@ -1156,7 +1245,12 @@ impl DawUi {
         }
     }
 
-    fn load_installed_vst3(&mut self, path: &Path, restore_channel_id: Option<u16>) {
+    fn load_installed_vst3(
+        &mut self,
+        path: &Path,
+        restore_channel_id: Option<u16>,
+        class_uid: Option<String>,
+    ) {
         let state_payload = restore_channel_id.and_then(|channel_id| {
             self.document
                 .as_ref()?
@@ -1184,15 +1278,17 @@ impl DawUi {
         let Some(host) = &mut self.vst3_host else {
             return;
         };
-        match host.load(path, None) {
+        match host.load(path, class_uid.as_deref()) {
             Ok(info) => {
                 let state_message = if let (Some(channel_id), Some(payload)) =
                     (restore_channel_id, state_payload.as_deref())
                 {
                     match host.restore_state(info.id, payload) {
-                        Ok(()) => format!("; restored raw FLP state from channel {channel_id}"),
+                        Ok(()) => {
+                            format!("; restored FLP VST state from channel {channel_id}")
+                        }
                         Err(error) => format!(
-                            "; could not restore raw FLP state from channel {channel_id}: {error}"
+                            "; could not restore FLP VST state from channel {channel_id}: {error}"
                         ),
                     }
                 } else {
