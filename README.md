@@ -41,6 +41,10 @@ The Standard MIDI File reader recognizes the `MThd` header and `MTrk` event stre
 
 The original application's MIDI export experiments and their measured results are recorded in [`docs/oracle-experiments.md`](docs/oracle-experiments.md). `midi-events` displays a selected MIDI track's decoded events, including tempo and marker metadata, for further format comparison.
 
+## Automated checks and installers
+
+GitHub Actions runs formatting checks, Clippy, and the Rust test suite on Ubuntu, macOS, and Windows for pushes, pull requests, and manual runs. Each platform job also builds a native desktop package with Cargo Packager and uploads it as a workflow artifact: Windows NSIS installer, macOS DMG and app bundle, and Linux Debian, AppImage, and pacman packages. The package definitions are in [`Packager.toml`](Packager.toml).
+
 ## Compatibility plan
 
 1. Project containers: broaden FLP envelope compatibility across releases, add semantic FST preset support, and handle ZIP project packages.

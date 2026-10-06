@@ -3,11 +3,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use eframe::egui::{self, Align2, Color32, FontId, Id, Sense, Stroke, Vec2};
+use flp_rebuild::plugins::{PluginCandidate, PluginFormat, scan_installed_plugins};
+use flp_rebuild::vst3::Vst3HostRuntime;
 use flp_rebuild::{
     FlpDocument, Pattern, PatternNoteEdit, PlaylistClip, PlaylistClipEdit, PlaylistTrack,
 };
-use flp_rebuild::plugins::{scan_installed_plugins, PluginCandidate, PluginFormat};
-use flp_rebuild::vst3::Vst3HostRuntime;
 
 const PANEL: Color32 = Color32::from_rgb(31, 32, 34);
 const PANEL_DARK: Color32 = Color32::from_rgb(24, 25, 27);
@@ -585,20 +585,20 @@ impl DawUi {
             let length_changed = ui
                 .add(egui::DragValue::new(&mut length).speed(1.0))
                 .changed();
-            if start_changed || length_changed {
-                if let Some(document) = &mut self.document {
-                    let edit = PlaylistClipEdit {
-                        position_ticks: start_changed.then_some(position),
-                        length_ticks: length_changed.then_some(length),
-                        ..PlaylistClipEdit::default()
-                    };
-                    if document
-                        .edit_playlist_clip(arrangement_id, index, edit)
-                        .is_ok()
-                    {
-                        self.dirty = true;
-                        self.status = "Playlist clip updated".to_owned();
-                    }
+            if (start_changed || length_changed)
+                && let Some(document) = &mut self.document
+            {
+                let edit = PlaylistClipEdit {
+                    position_ticks: start_changed.then_some(position),
+                    length_ticks: length_changed.then_some(length),
+                    ..PlaylistClipEdit::default()
+                };
+                if document
+                    .edit_playlist_clip(arrangement_id, index, edit)
+                    .is_ok()
+                {
+                    self.dirty = true;
+                    self.status = "Playlist clip updated".to_owned();
                 }
             }
             if ui.button("Deselect").clicked() {
@@ -875,14 +875,13 @@ impl DawUi {
                     velocity: velocity_changed.then_some(velocity),
                     ..PatternNoteEdit::default()
                 };
-                if let Some(document) = &mut self.document {
-                    if document
+                if let Some(document) = &mut self.document
+                    && document
                         .edit_pattern_note(pattern_id, channel_id, channel_note_index, edit)
                         .is_ok()
-                    {
-                        self.dirty = true;
-                        self.status = "Piano roll note updated".to_owned();
-                    }
+                {
+                    self.dirty = true;
+                    self.status = "Piano roll note updated".to_owned();
                 }
             }
             if ui.button("Deselect").clicked() {
@@ -930,8 +929,10 @@ impl DawUi {
             }
         });
         ui.label(
-            egui::RichText::new("Plug-ins load only when you open them. Their own editor windows are used.")
-                .color(MUTED),
+            egui::RichText::new(
+                "Plug-ins load only when you open them. Their own editor windows are used.",
+            )
+            .color(MUTED),
         );
         ui.separator();
 
@@ -1061,7 +1062,8 @@ impl DawUi {
             Ok(info) => match host.open_editor(info.id) {
                 Ok(()) => self.status = format!("Loaded {}", info.name),
                 Err(error) => {
-                    self.status = format!("Loaded {}, but its editor did not open: {error}", info.name);
+                    self.status =
+                        format!("Loaded {}, but its editor did not open: {error}", info.name);
                 }
             },
             Err(error) => self.status = format!("Could not load VST3: {error}"),

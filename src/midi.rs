@@ -614,3 +614,52 @@ fn read_u32_be(bytes: &[u8], offset: usize, context: &'static str) -> Result<u32
     };
     Ok(u32::from_be_bytes([value[0], value[1], value[2], value[3]]))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{MidiError, MidiFile};
+
+    fn midi_fixture(track: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"MThd");
+        bytes.extend_from_slice(&6u32.to_be_bytes());
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+        bytes.extend_from_slice(&1u16.to_be_bytes());
+        bytes.extend_from_slice(&480u16.to_be_bytes());
+        bytes.extend_from_slice(b"MTrk");
+        bytes.extend_from_slice(&(track.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(track);
+        bytes
+    }
+
+    #[test]
+    fn pairs_notes_across_running_status_and_preserves_original_bytes() {
+        let track = [
+            0x00, 0x90, 0x3C, 0x64, // Note on at tick 0.
+            0x81, 0x70, 0x3C, 0x00, // Running-status note off at tick 240.
+            0x00, 0xFF, 0x2F, 0x00, // End of track.
+        ];
+        let input = midi_fixture(&track);
+
+        let midi = MidiFile::parse(&input).expect("fixture should parse");
+        let notes = midi.tracks()[0].notes();
+
+        assert_eq!(midi.division(), 480);
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].key(), 60);
+        assert_eq!(notes[0].velocity(), 100);
+        assert_eq!(notes[0].start_tick(), 0);
+        assert_eq!(notes[0].end_tick(), Some(240));
+        assert_eq!(notes[0].duration_ticks(), Some(240));
+        assert_eq!(midi.encode_lossless(), input);
+    }
+
+    #[test]
+    fn rejects_overlong_delta_time_varints() {
+        let input = midi_fixture(&[0x81, 0x80, 0x80, 0x80]);
+
+        let error = MidiFile::parse(&input).expect_err("overlong delta must fail");
+
+        assert!(matches!(error, MidiError::InvalidVlq { .. }));
+    }
+}

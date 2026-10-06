@@ -114,7 +114,10 @@ impl Vst3HostRuntime {
             .find(|loaded| loaded.info.id == id)
             .ok_or_else(|| format!("no loaded VST3 instance with id {id}"))?;
         if !loaded.info.has_editor {
-            return Err(format!("{} does not provide a custom editor", loaded.info.name));
+            return Err(format!(
+                "{} does not provide a custom editor",
+                loaded.info.name
+            ));
         }
         if loaded.editor.is_none() {
             loaded.editor = Some(PluginWindow::new(loaded.plugin.clone()));

@@ -1156,12 +1156,12 @@ fn playlist_clip_record_size(
         } else {
             32
         };
-        if payload_length == 0 || payload_length % expected == 0 {
+        if payload_length == 0 || payload_length.is_multiple_of(expected) {
             return Ok(expected);
         }
         let alternatives = FLP_PLAYLIST_RECORD_SIZES
             .into_iter()
-            .filter(|size| payload_length % size == 0)
+            .filter(|size| payload_length.is_multiple_of(*size))
             .collect::<Vec<_>>();
         if alternatives.len() == 1 {
             return Ok(alternatives[0]);
@@ -1177,7 +1177,7 @@ fn playlist_clip_record_size(
     }
     let candidates = FLP_PLAYLIST_RECORD_SIZES
         .into_iter()
-        .filter(|size| payload_length % size == 0)
+        .filter(|size| payload_length.is_multiple_of(*size))
         .collect::<Vec<_>>();
     match candidates.as_slice() {
         [record_size] => Ok(*record_size),
@@ -1333,10 +1333,10 @@ fn detect_project_version(stream: &[u8]) -> Option<String> {
             if let Some(version) = ascii_version(&event.payload) {
                 return Some(version);
             }
-        } else if event.opcode == 0xC0 {
-            if let Some(version) = utf16_banner_version(&event.payload) {
-                return Some(version);
-            }
+        } else if event.opcode == 0xC0
+            && let Some(version) = utf16_banner_version(&event.payload)
+        {
+            return Some(version);
         }
         cursor = next_cursor;
         if cursor >= stream.len() {
@@ -1601,5 +1601,54 @@ fn encode_leb128(mut value: u32) -> Vec<u8> {
         if value == 0 {
             return output;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FlpDocument, FlpError, PayloadEncoding};
+
+    fn flp_fixture(event_stream: &[u8], header_extension: &[u8], trailing: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"FLhd");
+        bytes.extend_from_slice(&(6u32 + header_extension.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&96u16.to_le_bytes());
+        bytes.extend_from_slice(header_extension);
+        bytes.extend_from_slice(b"FLdt");
+        bytes.extend_from_slice(&(event_stream.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(event_stream);
+        bytes.extend_from_slice(trailing);
+        bytes
+    }
+
+    #[test]
+    fn lossless_roundtrip_preserves_unknown_event_bytes_and_container_extensions() {
+        let event_stream = [0xFF, 0x82, 0x00, 0xA1, 0xB2];
+        let header_extension = [0xC3, 0xD4];
+        let trailing = [0xE5, 0xF6];
+        let input = flp_fixture(&event_stream, &header_extension, &trailing);
+
+        let document = FlpDocument::parse(&input).expect("fixture should parse");
+
+        assert_eq!(document.header().ppq(), 96);
+        assert_eq!(document.header().extension(), &header_extension);
+        assert_eq!(document.events().len(), 1);
+        assert_eq!(document.events()[0].payload(), &[0xA1, 0xB2]);
+        assert_eq!(
+            document.events()[0].encoding(),
+            &PayloadEncoding::Data {
+                length_prefix: vec![0x82, 0x00]
+            }
+        );
+        assert_eq!(document.trailing_bytes(), &trailing);
+        assert_eq!(document.encode_lossless().unwrap(), input);
+    }
+
+    #[test]
+    fn invalid_flp_magic_is_reported() {
+        let error = FlpDocument::parse(b"not-an-flp").expect_err("bad magic must fail");
+        assert!(matches!(error, FlpError::BadMagic { .. }));
     }
 }

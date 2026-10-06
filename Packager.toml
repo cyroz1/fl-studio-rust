@@ -1,0 +1,10 @@
+name = "fl-studio-rebuild"
+product-name = "FL Studio Rebuild"
+version = "0.1.0"
+identifier = "com.cyroz.flstudiorebuild"
+description = "A clean-room Rust application for FL Studio project compatibility."
+out-dir = "dist"
+binaries-dir = "target/release"
+formats = ["default"]
+binaries = [{ path = "fl-studio-rebuild", main = true }]
+before-packaging-command = "cargo build --release --bin fl-studio-rebuild"
