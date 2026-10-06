@@ -6,8 +6,8 @@ use eframe::egui::{self, Align2, Color32, FontId, Id, Sense, Stroke, Vec2};
 use flp_rebuild::plugins::{PluginCandidate, PluginFormat, scan_installed_plugins};
 use flp_rebuild::vst3::Vst3HostRuntime;
 use flp_rebuild::{
-    FlpDocument, Pattern, PatternNoteEdit, PlaylistClip, PlaylistClipEdit, PlaylistTrack,
-    VstPluginStateMetadata,
+    FlpDocument, Pattern, PatternNote, PatternNoteEdit, PlaylistClip, PlaylistClipEdit,
+    PlaylistTrack, VstPluginStateMetadata,
 };
 
 const PANEL: Color32 = Color32::from_rgb(31, 32, 34);
@@ -106,6 +106,7 @@ struct DawUi {
     playing: bool,
     tempo_bpm: f64,
     selected_pattern: Option<u16>,
+    selected_note_channel: Option<u16>,
     selected_note: Option<(u16, u16, usize)>,
     selected_arrangement: Option<u16>,
     selected_clip: Option<usize>,
@@ -136,6 +137,7 @@ impl DawUi {
             playing: false,
             tempo_bpm: 140.0,
             selected_pattern: None,
+            selected_note_channel: None,
             selected_note: None,
             selected_arrangement: None,
             selected_clip: None,
@@ -173,6 +175,8 @@ impl DawUi {
                     .patterns()
                     .ok()
                     .and_then(|patterns| patterns.first().map(|pattern| pattern.id));
+                self.selected_note_channel =
+                    document.channels().first().map(|channel| channel.id());
                 self.selected_clip = None;
                 self.selected_note = None;
                 self.selected_plugin_state_channel = document
@@ -741,11 +745,13 @@ impl DawUi {
     }
 
     fn piano_roll(&mut self, ui: &mut egui::Ui) {
-        let Some(document) = &self.document else {
+        let Some(document) = self.document.as_ref() else {
             empty_view(ui, "Open a project to see its Piano roll");
             return;
         };
         let patterns = document.patterns().unwrap_or_default();
+        let channels = document.channels();
+        let ppq = document.header().ppq().max(1);
         if patterns.is_empty() {
             empty_view(ui, "This project has no decoded patterns");
             return;
@@ -756,6 +762,24 @@ impl DawUi {
         {
             self.selected_pattern = patterns.first().map(|pattern| pattern.id);
         }
+        if self
+            .selected_note_channel
+            .is_none_or(|id| !channels.iter().any(|channel| channel.id() == id))
+        {
+            self.selected_note_channel = channels.first().map(|channel| channel.id());
+        }
+        let selected_channel_label = self
+            .selected_note_channel
+            .and_then(|id| channels.iter().find(|channel| channel.id() == id))
+            .map(|channel| {
+                channel
+                    .display_name()
+                    .or(channel.plugin_identifier())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("Channel {}", channel.id()))
+            })
+            .unwrap_or_else(|| "No channel".to_owned());
+        let mut add_note_requested = false;
         ui.horizontal(|ui| {
             ui.strong("Piano roll");
             ui.separator();
@@ -773,18 +797,89 @@ impl DawUi {
                         );
                     }
                 });
+            egui::ComboBox::from_id_salt("piano-roll-channel-picker")
+                .selected_text(selected_channel_label)
+                .show_ui(ui, |ui| {
+                    for channel in &channels {
+                        let label = channel
+                            .display_name()
+                            .or(channel.plugin_identifier())
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| format!("Channel {}", channel.id()));
+                        ui.selectable_value(
+                            &mut self.selected_note_channel,
+                            Some(channel.id()),
+                            label,
+                        );
+                    }
+                });
             ui.label("Snap");
             ui.label("1/4 beat");
+            add_note_requested = ui
+                .add_enabled(
+                    self.selected_note_channel.is_some(),
+                    egui::Button::new("Add note"),
+                )
+                .clicked();
         });
+
+        if add_note_requested
+            && let (Some(pattern_id), Some(channel_id)) =
+                (self.selected_pattern, self.selected_note_channel)
+        {
+            let note_index = patterns
+                .iter()
+                .find(|pattern| pattern.id == pattern_id)
+                .map(|pattern| {
+                    pattern
+                        .notes
+                        .iter()
+                        .filter(|note| note.channel_id == channel_id)
+                        .count()
+                })
+                .unwrap_or(0);
+            let position = patterns
+                .iter()
+                .find(|pattern| pattern.id == pattern_id)
+                .into_iter()
+                .flat_map(|pattern| pattern.notes.iter())
+                .filter(|note| note.channel_id == channel_id)
+                .map(|note| note.position.saturating_add(note.length))
+                .max()
+                .unwrap_or(0);
+            let note = PatternNote {
+                position,
+                channel_id,
+                length: u32::from(ppq),
+                key: 60,
+                velocity: 100,
+                ..PatternNote::default()
+            };
+            if let Some(document) = &mut self.document {
+                match document.add_pattern_note(pattern_id, note) {
+                    Ok(()) => {
+                        self.selected_note = Some((pattern_id, channel_id, note_index));
+                        self.dirty = true;
+                        self.status = format!("Added note to pattern {pattern_id}");
+                    }
+                    Err(error) => self.status = error.to_string(),
+                }
+            }
+        }
         ui.separator();
-        let Some(pattern) = patterns
+        let updated_patterns = self
+            .document
+            .as_ref()
+            .and_then(|document| document.patterns().ok())
+            .unwrap_or(patterns);
+        let Some(pattern) = updated_patterns
             .iter()
             .find(|pattern| Some(pattern.id) == self.selected_pattern)
             .cloned()
         else {
             return;
         };
-        self.draw_notes(ui, &pattern, document.header().ppq().max(1));
+        self.draw_notes(ui, &pattern, ppq);
         self.selected_note_editor(ui, &pattern);
     }
 
@@ -885,6 +980,7 @@ impl DawUi {
                     );
                     if response.clicked() {
                         self.selected_note = Some((pattern.id, note.channel_id, *channel_index));
+                        self.selected_note_channel = Some(note.channel_id);
                         self.status = format!("Selected note {}", note_index + 1);
                     }
                     *channel_index += 1;
@@ -896,6 +992,10 @@ impl DawUi {
         let Some((pattern_id, channel_id, channel_note_index)) = self.selected_note else {
             return;
         };
+        if pattern_id != pattern.id {
+            self.selected_note = None;
+            return;
+        }
         let mut current_index = 0usize;
         let Some(note) = pattern.notes.iter().find(|note| {
             if note.channel_id == channel_id {
@@ -913,6 +1013,7 @@ impl DawUi {
         let mut length = note.length;
         let mut key = note.key;
         let mut velocity = note.velocity;
+        let mut delete_requested = false;
         ui.separator();
         ui.horizontal(|ui| {
             ui.label("Note");
@@ -940,7 +1041,10 @@ impl DawUi {
                         .speed(0.1),
                 )
                 .changed();
-            if position_changed || length_changed || key_changed || velocity_changed {
+            delete_requested = ui.button("Delete note").clicked();
+            if !delete_requested
+                && (position_changed || length_changed || key_changed || velocity_changed)
+            {
                 let edit = PatternNoteEdit {
                     position: position_changed.then_some(position),
                     length: length_changed.then_some(length),
@@ -961,6 +1065,16 @@ impl DawUi {
                 self.selected_note = None;
             }
         });
+        if delete_requested && let Some(document) = &mut self.document {
+            match document.delete_pattern_note(pattern_id, channel_id, channel_note_index) {
+                Ok(()) => {
+                    self.selected_note = None;
+                    self.dirty = true;
+                    self.status = format!("Deleted note from pattern {pattern_id}");
+                }
+                Err(error) => self.status = error.to_string(),
+            }
+        }
     }
 
     fn mixer(&self, ui: &mut egui::Ui) {

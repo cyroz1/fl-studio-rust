@@ -75,6 +75,39 @@ impl FlpEvent {
     pub fn file_offset(&self) -> usize {
         self.file_offset
     }
+
+    fn replace_data_payload(&mut self, payload: Vec<u8>) -> Result<(), FlpError> {
+        if !matches!(self.encoding, PayloadEncoding::Data { .. }) {
+            return Err(FlpError::InvalidEvent {
+                offset: self.file_offset,
+                detail: "event does not have a length-prefixed data payload",
+            });
+        }
+        let payload_length = u32::try_from(payload.len()).map_err(|_| FlpError::LengthOverflow)?;
+        let length_prefix = encode_leb128(payload_length);
+        let mut wire_bytes = Vec::with_capacity(1 + length_prefix.len() + payload.len());
+        wire_bytes.push(self.opcode);
+        wire_bytes.extend_from_slice(&length_prefix);
+        wire_bytes.extend_from_slice(&payload);
+        self.payload = payload;
+        self.encoding = PayloadEncoding::Data { length_prefix };
+        self.wire_bytes = wire_bytes;
+        Ok(())
+    }
+
+    fn new_data(opcode: u8, payload: Vec<u8>) -> Result<Self, FlpError> {
+        let mut event = Self {
+            opcode,
+            payload: Vec::new(),
+            encoding: PayloadEncoding::Data {
+                length_prefix: Vec::new(),
+            },
+            wire_bytes: Vec::new(),
+            file_offset: 0,
+        };
+        event.replace_data_payload(payload)?;
+        Ok(event)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -694,7 +727,11 @@ impl FlpDocument {
                     if let Some(notes_event) = self.events.get(event_index + 1)
                         && Self::is_pattern_note_event(notes_event)
                     {
-                        if notes_event.payload.len() % FLP_NOTE_RECORD_SIZE != 0 {
+                        if !notes_event
+                            .payload
+                            .len()
+                            .is_multiple_of(FLP_NOTE_RECORD_SIZE)
+                        {
                             return Err(FlpError::InvalidEvent {
                                 offset: notes_event.file_offset,
                                 detail: "pattern note payload is not a whole number of 24-byte records",
@@ -942,7 +979,11 @@ impl FlpDocument {
                 event_index += 1;
                 continue;
             }
-            if notes_event.payload.len() % FLP_NOTE_RECORD_SIZE != 0 {
+            if !notes_event
+                .payload
+                .len()
+                .is_multiple_of(FLP_NOTE_RECORD_SIZE)
+            {
                 return Err(FlpError::InvalidEvent {
                     offset: notes_event.file_offset,
                     detail: "pattern note payload is not a whole number of 24-byte records",
@@ -989,6 +1030,144 @@ impl FlpDocument {
         Err(FlpError::UnsupportedEdit(
             "the requested pattern, channel, or note index does not exist",
         ))
+    }
+
+    /// Appends a note to the selected pattern while retaining every unrelated event byte.
+    /// Empty patterns use the note-event opcode observed in the project's other patterns.
+    pub fn add_pattern_note(&mut self, pattern_id: u16, note: PatternNote) -> Result<(), FlpError> {
+        self.require_unique_channel(note.channel_id)?;
+
+        let mut target_marker = None;
+        let mut target_note_event = None;
+        let mut inferred_opcode = None;
+        let mut conflicting_opcodes = false;
+        for (event_index, event) in self.events.iter().enumerate() {
+            if event.opcode != 0x41 || event.payload.len() != 2 {
+                continue;
+            }
+            let marker_id = u16::from_le_bytes([event.payload[0], event.payload[1]]);
+            let notes_index = event_index + 1;
+            let Some(notes_event) = self.events.get(notes_index) else {
+                continue;
+            };
+            if Self::is_pattern_note_event(notes_event) {
+                match inferred_opcode {
+                    None => inferred_opcode = Some(notes_event.opcode),
+                    Some(opcode) if opcode != notes_event.opcode => conflicting_opcodes = true,
+                    _ => {}
+                }
+                if marker_id == pattern_id {
+                    target_note_event = Some(notes_index);
+                }
+            }
+            if marker_id == pattern_id {
+                target_marker = Some(event_index);
+            }
+        }
+
+        let mut record = [0u8; FLP_NOTE_RECORD_SIZE];
+        note.encode_into(&mut record);
+        if let Some(event_index) = target_note_event {
+            let mut payload = self.events[event_index].payload.clone();
+            if !payload.len().is_multiple_of(FLP_NOTE_RECORD_SIZE) {
+                return Err(FlpError::InvalidEvent {
+                    offset: self.events[event_index].file_offset,
+                    detail: "pattern note payload is not a whole number of 24-byte records",
+                });
+            }
+            payload.extend_from_slice(&record);
+            self.events[event_index].replace_data_payload(payload)?;
+        } else {
+            let marker_index = target_marker.ok_or(FlpError::UnsupportedEdit(
+                "the requested pattern does not exist",
+            ))?;
+            if conflicting_opcodes || inferred_opcode.is_none() {
+                return Err(FlpError::UnsupportedEdit(
+                    "cannot infer the note-event encoding for this empty pattern",
+                ));
+            }
+            self.events.insert(
+                marker_index + 1,
+                FlpEvent::new_data(inferred_opcode.expect("checked above"), record.to_vec())?,
+            );
+        }
+        self.refresh_event_offsets()?;
+        Ok(())
+    }
+
+    /// Removes one channel-scoped note and rewrites only its containing score event.
+    pub fn delete_pattern_note(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_index: usize,
+    ) -> Result<(), FlpError> {
+        self.require_unique_channel(channel_id)?;
+        let mut channel_note_index = 0usize;
+        let mut event_index = 0usize;
+        while event_index < self.events.len() {
+            let marker = &self.events[event_index];
+            if marker.opcode != 0x41 || marker.payload.len() != 2 {
+                event_index += 1;
+                continue;
+            }
+            let marker_id = u16::from_le_bytes([marker.payload[0], marker.payload[1]]);
+            let notes_index = event_index + 1;
+            let Some(notes_event) = self.events.get(notes_index) else {
+                break;
+            };
+            if marker_id != pattern_id || !Self::is_pattern_note_event(notes_event) {
+                event_index += 1;
+                continue;
+            }
+            if !notes_event
+                .payload
+                .len()
+                .is_multiple_of(FLP_NOTE_RECORD_SIZE)
+            {
+                return Err(FlpError::InvalidEvent {
+                    offset: notes_event.file_offset,
+                    detail: "pattern note payload is not a whole number of 24-byte records",
+                });
+            }
+
+            let mut replacement = Vec::with_capacity(notes_event.payload.len());
+            let mut removed = false;
+            for record in notes_event.payload.chunks_exact(FLP_NOTE_RECORD_SIZE) {
+                let note = PatternNote::decode(record);
+                if !removed && note.channel_id == channel_id {
+                    if channel_note_index == note_index {
+                        removed = true;
+                        continue;
+                    }
+                    channel_note_index += 1;
+                }
+                replacement.extend_from_slice(record);
+            }
+            if removed {
+                self.events[notes_index].replace_data_payload(replacement)?;
+                self.refresh_event_offsets()?;
+                return Ok(());
+            }
+            event_index += 2;
+        }
+        Err(FlpError::UnsupportedEdit(
+            "the requested pattern, channel, or note index does not exist",
+        ))
+    }
+
+    fn require_unique_channel(&self, channel_id: u16) -> Result<(), FlpError> {
+        let mut matches = self
+            .channels()
+            .into_iter()
+            .filter(|channel| channel.id() == channel_id);
+        if matches.next().is_none() {
+            return Err(FlpError::ChannelNotFound(channel_id));
+        }
+        if matches.next().is_some() {
+            return Err(FlpError::AmbiguousChannelId(channel_id));
+        }
+        Ok(())
     }
 
     pub fn project_version(&self) -> Option<&str> {
@@ -1752,7 +1931,9 @@ fn decode_vst_text(bytes: &[u8]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FlpDocument, FlpError, PayloadEncoding, parse_vst_plugin_state_metadata};
+    use super::{
+        FlpDocument, FlpError, PatternNote, PayloadEncoding, parse_vst_plugin_state_metadata,
+    };
 
     fn flp_fixture(event_stream: &[u8], header_extension: &[u8], trailing: &[u8]) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -1773,6 +1954,36 @@ mod tests {
         payload.extend_from_slice(&id.to_le_bytes());
         payload.extend_from_slice(&(data.len() as u64).to_le_bytes());
         payload.extend_from_slice(data);
+    }
+
+    fn note_record(
+        position: u32,
+        channel_id: u16,
+        length: u32,
+        key: u16,
+        velocity: u8,
+    ) -> [u8; 24] {
+        let note = PatternNote {
+            position,
+            channel_id,
+            length,
+            key,
+            velocity,
+            ..PatternNote::default()
+        };
+        let mut record = [0; 24];
+        note.encode_into(&mut record);
+        record
+    }
+
+    fn pattern_fixture(note_records: &[[u8; 24]], trailing_event: &[u8]) -> Vec<u8> {
+        let mut event_stream = vec![0x40, 0, 0, 0x41, 7, 0, 0xD0];
+        event_stream.extend_from_slice(&super::encode_leb128((note_records.len() * 24) as u32));
+        for record in note_records {
+            event_stream.extend_from_slice(record);
+        }
+        event_stream.extend_from_slice(trailing_event);
+        flp_fixture(&event_stream, &[0xA1], &[0xB2])
     }
 
     #[test]
@@ -1846,6 +2057,178 @@ mod tests {
         );
         assert_eq!(document.trailing_bytes(), &trailing);
         assert_eq!(document.encode_lossless().unwrap(), input);
+    }
+
+    #[test]
+    fn adding_notes_updates_the_length_prefix_and_preserves_other_events() {
+        let original_note = note_record(0, 0, 48, 60, 100);
+        let unknown_event = [0xFF, 0x02, 0xAA, 0xBB];
+        let input = pattern_fixture(&[original_note], &unknown_event);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+
+        document
+            .add_pattern_note(
+                7,
+                PatternNote {
+                    position: 120,
+                    channel_id: 0,
+                    length: 24,
+                    key: 64,
+                    velocity: 90,
+                    ..PatternNote::default()
+                },
+            )
+            .expect("the note should be inserted");
+
+        let patterns = document.patterns().expect("patterns should decode");
+        assert_eq!(patterns[0].notes.len(), 2);
+        assert_eq!(patterns[0].notes[1].position, 120);
+        let notes_event = document
+            .events()
+            .iter()
+            .find(|event| event.opcode() == 0xD0)
+            .expect("note event should remain");
+        assert_eq!(
+            notes_event.encoding(),
+            &PayloadEncoding::Data {
+                length_prefix: vec![0x30]
+            }
+        );
+        assert_eq!(
+            document.events().last().unwrap().wire_bytes(),
+            &unknown_event
+        );
+
+        let encoded = document.encode_lossless().unwrap();
+        let reparsed = FlpDocument::parse(&encoded).expect("edited file should parse");
+        assert_eq!(reparsed.patterns().unwrap()[0].notes.len(), 2);
+        assert_eq!(reparsed.trailing_bytes(), &[0xB2]);
+    }
+
+    #[test]
+    fn note_event_length_prefix_grows_to_two_bytes() {
+        let original_note = note_record(0, 0, 48, 60, 100);
+        let input = pattern_fixture(&[original_note], &[0xFF, 0]);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+        for index in 0..10 {
+            document
+                .add_pattern_note(
+                    7,
+                    PatternNote {
+                        position: index * 24,
+                        channel_id: 0,
+                        length: 24,
+                        key: 60,
+                        velocity: 90,
+                        ..PatternNote::default()
+                    },
+                )
+                .expect("note should be appended");
+        }
+        let notes_event = document
+            .events()
+            .iter()
+            .find(|event| event.opcode() == 0xD0)
+            .expect("note event should remain");
+        assert_eq!(
+            notes_event.encoding(),
+            &PayloadEncoding::Data {
+                length_prefix: vec![0x88, 0x02]
+            }
+        );
+        assert_eq!(document.patterns().unwrap()[0].notes.len(), 11);
+    }
+
+    #[test]
+    fn adding_to_an_empty_pattern_uses_the_projects_observed_note_encoding() {
+        let existing_note = note_record(0, 0, 48, 60, 100);
+        let mut stream = vec![0x40, 0, 0, 0x41, 7, 0, 0xD0, 0x18];
+        stream.extend_from_slice(&existing_note);
+        stream.extend_from_slice(&[0x41, 8, 0, 0xA4, 0, 0, 0, 0]);
+        let input = flp_fixture(&stream, &[], &[]);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+
+        document
+            .add_pattern_note(
+                8,
+                PatternNote {
+                    position: 24,
+                    channel_id: 0,
+                    length: 24,
+                    key: 65,
+                    velocity: 90,
+                    ..PatternNote::default()
+                },
+            )
+            .expect("the empty pattern should use the observed D0 encoding");
+
+        let patterns = document.patterns().unwrap();
+        let empty_pattern = patterns.iter().find(|pattern| pattern.id == 8).unwrap();
+        assert_eq!(empty_pattern.notes.len(), 1);
+        assert_eq!(empty_pattern.notes[0].key, 65);
+        let reparsed = FlpDocument::parse(&document.encode_lossless().unwrap()).unwrap();
+        assert_eq!(reparsed.patterns().unwrap()[1].notes.len(), 1);
+    }
+
+    #[test]
+    fn ambiguous_empty_pattern_note_encoding_is_rejected_without_mutation() {
+        let note = note_record(0, 0, 48, 60, 100);
+        let mut stream = vec![0x40, 0, 0, 0x41, 7, 0, 0xD0, 0x18];
+        stream.extend_from_slice(&note);
+        stream.extend_from_slice(&[0x41, 8, 0, 0xE0, 0x18]);
+        stream.extend_from_slice(&note);
+        stream.extend_from_slice(&[0x41, 9, 0, 0xA4, 0, 0, 0, 0]);
+        let input = flp_fixture(&stream, &[], &[]);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+
+        let error = document
+            .add_pattern_note(
+                9,
+                PatternNote {
+                    channel_id: 0,
+                    length: 24,
+                    key: 65,
+                    velocity: 90,
+                    ..PatternNote::default()
+                },
+            )
+            .expect_err("conflicting project encodings must not be guessed");
+
+        assert!(matches!(error, FlpError::UnsupportedEdit(_)));
+        assert_eq!(document.encode_lossless().unwrap(), input);
+    }
+
+    #[test]
+    fn deleting_a_note_preserves_the_remaining_records_and_can_be_reversed() {
+        let first = note_record(0, 0, 48, 60, 100);
+        let second = note_record(96, 0, 24, 64, 80);
+        let input = pattern_fixture(&[first, second], &[0xFF, 0]);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+
+        document
+            .delete_pattern_note(7, 0, 0)
+            .expect("the first note should be removed");
+        let remaining = document.patterns().unwrap();
+        assert_eq!(remaining[0].notes.len(), 1);
+        assert_eq!(remaining[0].notes[0].position, 96);
+        assert_eq!(remaining[0].notes[0].key, 64);
+
+        document
+            .add_pattern_note(
+                7,
+                PatternNote {
+                    position: 0,
+                    channel_id: 0,
+                    length: 48,
+                    key: 60,
+                    velocity: 100,
+                    ..PatternNote::default()
+                },
+            )
+            .expect("an empty note event should retain its encoding");
+        let restored = document.patterns().unwrap();
+        assert_eq!(restored[0].notes.len(), 2);
+        assert_eq!(restored[0].notes[1].position, 0);
     }
 
     #[test]

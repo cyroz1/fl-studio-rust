@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use flp_rebuild::midi::MidiFile;
 use flp_rebuild::plugins::scan_installed_plugins;
 use flp_rebuild::vst3::Vst3HostRuntime;
-use flp_rebuild::{FlpDocument, PatternNoteEdit, PlaylistClipEdit};
+use flp_rebuild::{FlpDocument, PatternNote, PatternNoteEdit, PlaylistClipEdit};
 
 fn main() -> ExitCode {
     match run(env::args().skip(1).collect()) {
@@ -127,6 +127,32 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 },
             )
         }
+        [command, input, output, pattern_id, channel_id, position, length, key, velocity]
+            if command == "add-note" =>
+        {
+            add_note(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                PatternNote {
+                    channel_id: parse_u16(channel_id, "channel id")?,
+                    position: parse_u32(position, "note position")?,
+                    length: parse_u32(length, "note length")?,
+                    key: parse_u16(key, "note key")?,
+                    velocity: parse_u8(velocity, "note velocity")?,
+                    ..PatternNote::default()
+                },
+            )
+        }
+        [command, input, output, pattern_id, channel_id, note_index] if command == "delete-note" => {
+            delete_note(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                parse_usize(note_index, "channel note index")?,
+            )
+        }
         [command, input, output, arrangement_id, clip_index, position, length]
             if command == "edit-clip" =>
         {
@@ -158,6 +184,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild set-tempo <input.flp> <output.flp> <bpm>\n",
             "  flp-rebuild rename-channel <input.flp> <output.flp> <channel-id> <name>\n",
             "  flp-rebuild edit-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index> <position> <length> <key> <velocity>\n",
+            "  flp-rebuild add-note <input.flp> <output.flp> <pattern-id> <channel-id> <position> <length> <key> <velocity>\n",
+            "  flp-rebuild delete-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index>\n",
             "  flp-rebuild edit-clip <input.flp> <output.flp> <arrangement-id> <clip-index> <position> <length>"
         )
         .to_owned()),
@@ -914,6 +942,48 @@ fn edit_note(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "edited note {note_index} in pattern {pattern_id}, channel {channel_id} to {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn add_note(input: &Path, output: &Path, pattern_id: u16, note: PatternNote) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .add_pattern_note(pattern_id, note.clone())
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "added note to pattern {pattern_id}, channel {} at {} ticks to {}",
+        note.channel_id,
+        note.position,
+        output.display()
+    );
+    Ok(())
+}
+
+fn delete_note(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    note_index: usize,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .delete_pattern_note(pattern_id, channel_id, note_index)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "deleted note {note_index} from pattern {pattern_id}, channel {channel_id} to {}",
         output.display()
     );
     Ok(())
