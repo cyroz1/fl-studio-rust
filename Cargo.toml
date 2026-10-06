@@ -1,0 +1,19 @@
+[package]
+name = "flp-rebuild"
+version = "0.1.0"
+edition = "2024"
+description = "A clean-room Rust compatibility core for FL Studio project files"
+license = "MIT"
+
+[dependencies]
+eframe = { version = "0.36.2", default-features = false, features = ["accesskit", "default_fonts", "glow", "links", "wayland", "x11"] }
+rfd = "0.17.2"
+vst3-host = { version = "0.9.0", default-features = false }
+
+[lib]
+name = "flp_rebuild"
+path = "src/lib.rs"
+
+[[bin]]
+name = "flp-rebuild"
+path = "src/main.rs"
