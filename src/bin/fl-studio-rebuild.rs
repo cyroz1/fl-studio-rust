@@ -25,7 +25,8 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_title("FL Studio Rebuild")
             .with_inner_size([1440.0, 900.0])
-            .with_min_inner_size([960.0, 640.0]),
+            .with_min_inner_size([960.0, 640.0])
+            .with_maximized(true),
         ..Default::default()
     };
     eframe::run_native(
@@ -1073,6 +1074,16 @@ impl DawUi {
 
 impl eframe::App for DawUi {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        for (key, view) in [
+            (egui::Key::F5, MainView::Playlist),
+            (egui::Key::F6, MainView::ChannelRack),
+            (egui::Key::F7, MainView::PianoRoll),
+            (egui::Key::F9, MainView::Mixer),
+        ] {
+            if ui.input(|input| input.key_pressed(key)) {
+                self.view = view;
+            }
+        }
         if let Some(host) = &mut self.vst3_host
             && let Err(error) = host.service_editors()
         {
