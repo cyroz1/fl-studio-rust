@@ -6,5 +6,6 @@ description = "A clean-room Rust application for FL Studio project compatibility
 out-dir = "dist"
 binaries-dir = "target/release"
 formats = ["default"]
+icons = ["assets/icon.png"]
 binaries = [{ path = "fl-studio-rebuild", main = true }]
 before-packaging-command = "cargo build --release --bin fl-studio-rebuild"

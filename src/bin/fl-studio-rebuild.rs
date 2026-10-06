@@ -78,6 +78,8 @@ struct DawUi {
     selected_note: Option<(u16, u16, usize)>,
     selected_arrangement: Option<u16>,
     selected_clip: Option<usize>,
+    selected_plugin_state_channel: Option<u16>,
+    last_plugin_action: Option<String>,
     timeline_zoom: f32,
     plugin_candidates: Vec<PluginCandidate>,
     vst3_host: Option<Vst3HostRuntime>,
@@ -105,6 +107,8 @@ impl DawUi {
             selected_note: None,
             selected_arrangement: None,
             selected_clip: None,
+            selected_plugin_state_channel: None,
+            last_plugin_action: None,
             timeline_zoom: 0.10,
             plugin_candidates,
             vst3_host: None,
@@ -138,6 +142,11 @@ impl DawUi {
                     .and_then(|patterns| patterns.first().map(|pattern| pattern.id));
                 self.selected_clip = None;
                 self.selected_note = None;
+                self.selected_plugin_state_channel = document
+                    .channel_plugin_states()
+                    .first()
+                    .map(|state| state.channel_id());
+                self.last_plugin_action = None;
                 self.selected_arrangement = document.arrangements().ok().and_then(|arrangements| {
                     arrangements.first().map(|arrangement| arrangement.id)
                 });
@@ -923,6 +932,7 @@ impl DawUi {
     fn plugins(&mut self, ui: &mut egui::Ui) {
         let mut refresh = false;
         let mut load_path = None;
+        let mut restore_request = None;
         let mut open_id = None;
         let mut close_id = None;
         let mut parameter_edits = Vec::new();
@@ -946,6 +956,82 @@ impl DawUi {
             self.plugin_candidates = scan_installed_plugins().candidates;
         }
 
+        let plugin_states = self
+            .document
+            .as_ref()
+            .map(FlpDocument::channel_plugin_states)
+            .unwrap_or_default();
+        if self.selected_plugin_state_channel.is_none_or(|selected| {
+            !plugin_states
+                .iter()
+                .any(|state| state.channel_id() == selected)
+        }) {
+            self.selected_plugin_state_channel =
+                plugin_states.first().map(|state| state.channel_id());
+        }
+        if !plugin_states.is_empty() {
+            let selected_label = self
+                .selected_plugin_state_channel
+                .and_then(|channel_id| {
+                    plugin_states
+                        .iter()
+                        .find(|state| state.channel_id() == channel_id)
+                })
+                .map(|state| {
+                    format!(
+                        "Channel {} · {} · {} bytes",
+                        state.channel_id(),
+                        state.display_name().unwrap_or("unnamed plug-in"),
+                        state.data_payload().len()
+                    )
+                })
+                .unwrap_or_else(|| "Select a channel state".to_owned());
+            let mut selected_channel = self.selected_plugin_state_channel;
+            ui.horizontal(|ui| {
+                ui.label("Project state channel");
+                egui::ComboBox::from_id_salt("project-plugin-state-channel")
+                    .selected_text(selected_label)
+                    .show_ui(ui, |ui| {
+                        for state in &plugin_states {
+                            let label = format!(
+                                "{} · {} · {} bytes",
+                                state.channel_id(),
+                                state.display_name().unwrap_or("unnamed plug-in"),
+                                state.data_payload().len()
+                            );
+                            ui.selectable_value(
+                                &mut selected_channel,
+                                Some(state.channel_id()),
+                                label,
+                            );
+                        }
+                    });
+            });
+            self.selected_plugin_state_channel = selected_channel;
+        } else {
+            ui.label(
+                egui::RichText::new(
+                    "Open a project with a channel plug-in state to try restoration",
+                )
+                .color(MUTED),
+            );
+        }
+        ui.label(
+            egui::RichText::new(
+                "Choose an installed VST3 to try the selected FLP channel's raw 0xD5 state.",
+            )
+            .color(MUTED),
+        );
+        if let Some(message) = &self.last_plugin_action {
+            let color = if message.to_lowercase().contains("could not") {
+                ORANGE
+            } else {
+                MUTED
+            };
+            ui.label(egui::RichText::new(message).color(color));
+        }
+        ui.separator();
+
         egui::ScrollArea::vertical().show(ui, |ui| {
             for candidate in &self.plugin_candidates {
                 if candidate.format != PluginFormat::Vst3 {
@@ -966,6 +1052,12 @@ impl DawUi {
                                     if ui.button("Load and open editor").clicked() {
                                         load_path = Some(candidate.path.clone());
                                     }
+                                    if let Some(channel_id) = self.selected_plugin_state_channel
+                                        && ui.button("Load + try FLP state").clicked()
+                                    {
+                                        restore_request =
+                                            Some((candidate.path.clone(), channel_id));
+                                    }
                                 },
                             );
                         });
@@ -974,8 +1066,10 @@ impl DawUi {
             }
         });
 
-        if let Some(path) = load_path {
-            self.load_installed_vst3(&path);
+        if let Some((path, channel_id)) = restore_request {
+            self.load_installed_vst3(&path, Some(channel_id));
+        } else if let Some(path) = load_path {
+            self.load_installed_vst3(&path, None);
         }
 
         let loaded = self
@@ -1029,16 +1123,28 @@ impl DawUi {
             && let Some(host) = &mut self.vst3_host
         {
             match host.open_editor(id) {
-                Ok(()) => self.status = "VST3 editor opened".to_owned(),
-                Err(error) => self.status = format!("Could not open VST3 editor: {error}"),
+                Ok(()) => {
+                    self.status = "VST3 editor opened".to_owned();
+                    self.last_plugin_action = Some(self.status.clone());
+                }
+                Err(error) => {
+                    self.status = format!("Could not open VST3 editor: {error}");
+                    self.last_plugin_action = Some(self.status.clone());
+                }
             }
         }
         if let Some(id) = close_id
             && let Some(host) = &mut self.vst3_host
         {
             match host.close_editor(id) {
-                Ok(()) => self.status = "VST3 editor closed".to_owned(),
-                Err(error) => self.status = format!("Could not close VST3 editor: {error}"),
+                Ok(()) => {
+                    self.status = "VST3 editor closed".to_owned();
+                    self.last_plugin_action = Some(self.status.clone());
+                }
+                Err(error) => {
+                    self.status = format!("Could not close VST3 editor: {error}");
+                    self.last_plugin_action = Some(self.status.clone());
+                }
             }
         }
         if let Some(host) = &self.vst3_host {
@@ -1050,12 +1156,26 @@ impl DawUi {
         }
     }
 
-    fn load_installed_vst3(&mut self, path: &Path) {
+    fn load_installed_vst3(&mut self, path: &Path, restore_channel_id: Option<u16>) {
+        let state_payload = restore_channel_id.and_then(|channel_id| {
+            self.document
+                .as_ref()?
+                .channel_plugin_states()
+                .into_iter()
+                .find(|state| state.channel_id() == channel_id)
+                .map(|state| state.data_payload().to_vec())
+        });
+        if restore_channel_id.is_some() && state_payload.is_none() {
+            self.status = "Selected channel has no FLP plug-in state".to_owned();
+            self.last_plugin_action = Some(self.status.clone());
+            return;
+        }
         if self.vst3_host.is_none() {
             match Vst3HostRuntime::new(44_100.0, 512) {
                 Ok(host) => self.vst3_host = Some(host),
                 Err(error) => {
                     self.status = format!("Could not initialize the VST3 host: {error}");
+                    self.last_plugin_action = Some(self.status.clone());
                     return;
                 }
             }
@@ -1065,15 +1185,32 @@ impl DawUi {
             return;
         };
         match host.load(path, None) {
-            Ok(info) => match host.open_editor(info.id) {
-                Ok(()) => self.status = format!("Loaded {}", info.name),
-                Err(error) => {
-                    self.status =
-                        format!("Loaded {}, but its editor did not open: {error}", info.name);
+            Ok(info) => {
+                let state_message = if let (Some(channel_id), Some(payload)) =
+                    (restore_channel_id, state_payload.as_deref())
+                {
+                    match host.restore_state(info.id, payload) {
+                        Ok(()) => format!("; restored raw FLP state from channel {channel_id}"),
+                        Err(error) => format!(
+                            "; could not restore raw FLP state from channel {channel_id}: {error}"
+                        ),
+                    }
+                } else {
+                    String::new()
+                };
+                match host.open_editor(info.id) {
+                    Ok(()) => self.status = format!("Loaded {}{state_message}", info.name),
+                    Err(error) => {
+                        self.status = format!(
+                            "Loaded {}{state_message}, but its editor did not open: {error}",
+                            info.name
+                        );
+                    }
                 }
-            },
+            }
             Err(error) => self.status = format!("Could not load VST3: {error}"),
         }
+        self.last_plugin_action = Some(self.status.clone());
     }
 }
 
