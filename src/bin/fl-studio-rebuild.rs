@@ -144,6 +144,18 @@ struct ActiveNoteDrag {
     kind: NoteDragKind,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PianoRollGrid {
+    rect: egui::Rect,
+    keyboard_width: f32,
+    tick_scale: f32,
+    key_height: f32,
+    key_low: u16,
+    key_high: u16,
+    snap_ticks: u32,
+    ppq: u16,
+}
+
 impl MainView {
     const ALL: [Self; 5] = [
         Self::Playlist,
@@ -965,7 +977,13 @@ impl DawUi {
         };
         let snap_ticks = self.piano_roll_snap.ticks(ppq, time_signature);
         self.draw_notes(ui, &pattern, ppq, snap_ticks);
-        self.selected_note_editor(ui, &pattern);
+        let editor_pattern = self
+            .document
+            .as_ref()
+            .and_then(|document| document.patterns().ok())
+            .and_then(|patterns| patterns.into_iter().find(|item| item.id == pattern.id))
+            .unwrap_or(pattern);
+        self.selected_note_editor(ui, &editor_pattern);
     }
 
     fn draw_notes(&mut self, ui: &mut egui::Ui, pattern: &Pattern, ppq: u16, snap_ticks: u32) {
@@ -983,11 +1001,22 @@ impl DawUi {
             .max(ppq as u32 * 16);
         let grid_width = (max_tick as f32 * tick_scale + 160.0).clamp(1400.0, 30000.0);
         let grid_height = f32::from(key_high - key_low + 1) * key_height;
+        let mut note_to_add = None;
         egui::ScrollArea::both()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let size = Vec2::new(keyboard_width + grid_width, grid_height);
-                let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+                let (rect, grid_response) = ui.allocate_exact_size(size, Sense::click());
+                let grid_geometry = PianoRollGrid {
+                    rect,
+                    keyboard_width,
+                    tick_scale,
+                    key_height,
+                    key_low,
+                    key_high,
+                    snap_ticks,
+                    ppq,
+                };
                 let painter = ui.painter_at(rect);
                 painter.rect_filled(rect, 0, PANEL_DARK);
                 let measure_ticks = ppq as u32 * 4;
@@ -1037,6 +1066,7 @@ impl DawUi {
                 }
 
                 let mut per_channel = BTreeMap::<u16, usize>::new();
+                let mut note_rects = Vec::with_capacity(pattern.notes.len());
                 for (note_index, note) in pattern.notes.iter().enumerate() {
                     let channel_index = per_channel.entry(note.channel_id).or_default();
                     let left = rect.left() + keyboard_width + note.position as f32 * tick_scale;
@@ -1047,6 +1077,7 @@ impl DawUi {
                         egui::pos2(left, y),
                         Vec2::new((note.length as f32 * tick_scale).max(4.0), key_height - 2.0),
                     );
+                    note_rects.push(note_rect);
                     let selected =
                         self.selected_note == Some((pattern.id, note.channel_id, *channel_index));
                     painter.rect_filled(
@@ -1164,9 +1195,39 @@ impl DawUi {
                     }
                     *channel_index += 1;
                 }
+                if grid_response.double_clicked()
+                    && let (Some(pointer), Some(channel_id)) = (
+                        grid_response.interact_pointer_pos(),
+                        self.selected_note_channel,
+                    )
+                    && !note_rects
+                        .iter()
+                        .any(|note_rect| note_rect.contains(pointer))
+                {
+                    note_to_add = note_from_grid_position(pointer, grid_geometry, channel_id);
+                }
             });
         if !ui.input(|input| input.pointer.primary_down()) {
             self.active_note_drag = None;
+        }
+        if let Some(note) = note_to_add {
+            let note_index = pattern
+                .notes
+                .iter()
+                .filter(|existing| existing.channel_id == note.channel_id)
+                .count();
+            let channel_id = note.channel_id;
+            if let Some(document) = &mut self.document {
+                match document.add_pattern_note(pattern.id, note) {
+                    Ok(()) => {
+                        self.selected_note = Some((pattern.id, channel_id, note_index));
+                        self.selected_note_channel = Some(channel_id);
+                        self.dirty = true;
+                        self.status = format!("Added note to pattern {}", pattern.id);
+                    }
+                    Err(error) => self.status = error.to_string(),
+                }
+            }
         }
     }
 
@@ -1750,9 +1811,54 @@ fn snap_note_tick(value: i64, quantum: u32, minimum: u32) -> u32 {
     snapped as u32
 }
 
+fn note_from_grid_position(
+    pointer: egui::Pos2,
+    grid: PianoRollGrid,
+    channel_id: u16,
+) -> Option<PatternNote> {
+    let grid_left = grid.rect.left() + grid.keyboard_width;
+    if !grid.rect.contains(pointer)
+        || pointer.x < grid_left
+        || grid.tick_scale <= 0.0
+        || grid.key_height <= 0.0
+    {
+        return None;
+    }
+    let ticks_from_start = ((pointer.x - grid_left) / grid.tick_scale).round() as i64;
+    let row = ((pointer.y - grid.rect.top()) / grid.key_height).floor() as u16;
+    let key = grid
+        .key_high
+        .saturating_sub(row)
+        .clamp(grid.key_low, grid.key_high);
+    Some(PatternNote {
+        position: snap_note_tick(ticks_from_start, grid.snap_ticks, 0),
+        channel_id,
+        length: u32::from(grid.ppq).max(1),
+        key,
+        velocity: 100,
+        ..PatternNote::default()
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{PianoRollSnap, snap_note_tick};
+    use super::{PianoRollGrid, PianoRollSnap, note_from_grid_position, snap_note_tick};
+
+    fn test_grid() -> PianoRollGrid {
+        PianoRollGrid {
+            rect: eframe::egui::Rect::from_min_size(
+                eframe::egui::pos2(100.0, 50.0),
+                eframe::egui::vec2(600.0, 624.0),
+            ),
+            keyboard_width: 68.0,
+            tick_scale: 0.1,
+            key_height: 13.0,
+            key_low: 36,
+            key_high: 83,
+            snap_ticks: 24,
+            ppq: 96,
+        }
+    }
 
     #[test]
     fn piano_roll_snap_sizes_follow_project_ppq_and_meter() {
@@ -1771,5 +1877,26 @@ mod tests {
         assert_eq!(snap_note_tick(36, 24, 0), 48);
         assert_eq!(snap_note_tick(0, 24, 1), 1);
         assert_eq!(snap_note_tick(i64::from(u32::MAX), 1, 0), u32::MAX);
+    }
+
+    #[test]
+    fn double_click_grid_mapping_applies_pitch_channel_and_snap() {
+        let note = note_from_grid_position(eframe::egui::pos2(203.0, 121.5), test_grid(), 5)
+            .expect("grid position should produce a note");
+        assert_eq!(note.position, 360);
+        assert_eq!(note.key, 78);
+        assert_eq!(note.channel_id, 5);
+        assert_eq!(note.length, 96);
+        assert_eq!(note.velocity, 100);
+    }
+
+    #[test]
+    fn piano_keyboard_and_outside_grid_do_not_create_notes() {
+        for pointer in [
+            eframe::egui::pos2(120.0, 100.0),
+            eframe::egui::pos2(701.0, 100.0),
+        ] {
+            assert!(note_from_grid_position(pointer, test_grid(), 5).is_none());
+        }
     }
 }
