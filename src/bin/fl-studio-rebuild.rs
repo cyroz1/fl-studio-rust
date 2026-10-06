@@ -114,6 +114,7 @@ struct DawUi {
     timeline_zoom: f32,
     plugin_candidates: Vec<PluginCandidate>,
     vst3_host: Option<Vst3HostRuntime>,
+    channel_vst3_instances: BTreeMap<u16, u64>,
 }
 
 impl DawUi {
@@ -143,6 +144,7 @@ impl DawUi {
             timeline_zoom: 0.10,
             plugin_candidates,
             vst3_host: None,
+            channel_vst3_instances: BTreeMap::new(),
         };
         if let Some(path) = initial_project.as_deref() {
             app.open_project(path);
@@ -178,6 +180,7 @@ impl DawUi {
                     .first()
                     .map(|state| state.channel_id());
                 self.last_plugin_action = None;
+                self.channel_vst3_instances.clear();
                 self.selected_arrangement = document.arrangements().ok().and_then(|arrangements| {
                     arrangements.first().map(|arrangement| arrangement.id)
                 });
@@ -653,12 +656,13 @@ impl DawUi {
         });
     }
 
-    fn channel_rack(&self, ui: &mut egui::Ui) {
+    fn channel_rack(&mut self, ui: &mut egui::Ui) {
         let Some(document) = &self.document else {
             empty_view(ui, "Open a project to see its Channel Rack");
             return;
         };
         let plugin_states = document.channel_plugin_states();
+        let mut open_editor = None;
         ui.horizontal(|ui| {
             ui.strong("Channel Rack");
             ui.separator();
@@ -679,6 +683,9 @@ impl DawUi {
                             } else {
                                 "●"
                             });
+                            let plugin_state = plugin_states
+                                .iter()
+                                .find(|state| state.channel_id() == channel.id());
                             ui.add_sized(
                                 [190.0, 24.0],
                                 egui::Button::new(
@@ -686,19 +693,31 @@ impl DawUi {
                                 )
                                 .fill(PANEL_LIGHT),
                             );
-                            ui.label(channel.plugin_identifier().unwrap_or("Audio"));
+                            ui.label(
+                                plugin_state
+                                    .and_then(|state| state.vst_metadata())
+                                    .and_then(VstPluginStateMetadata::name)
+                                    .or(channel.plugin_identifier())
+                                    .unwrap_or("Audio"),
+                            );
                             ui.separator();
-                            let state_bytes = plugin_states
-                                .iter()
-                                .find(|state| state.channel_id() == channel.id())
-                                .map_or(0, |state| state.data_payload().len());
+                            let state_bytes =
+                                plugin_state.map_or(0, |state| state.data_payload().len());
                             if state_bytes > 0 {
                                 ui.small(format!("state {state_bytes} B"));
                             }
+                            let loaded_instance =
+                                self.channel_vst3_instances.get(&channel.id()).copied();
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    ui.add_enabled(false, egui::Button::new("Plug-in editor"));
+                                    if let Some(instance_id) = loaded_instance {
+                                        if ui.button("Plug-in editor").clicked() {
+                                            open_editor = Some(instance_id);
+                                        }
+                                    } else {
+                                        ui.add_enabled(false, egui::Button::new("Plug-in editor"));
+                                    }
                                 },
                             );
                         });
@@ -711,6 +730,14 @@ impl DawUi {
                     .color(MUTED),
             );
         });
+        if let Some(instance_id) = open_editor
+            && let Some(host) = &mut self.vst3_host
+        {
+            match host.open_editor(instance_id) {
+                Ok(()) => self.status = "VST3 editor opened from Channel Rack".to_owned(),
+                Err(error) => self.status = format!("Could not open VST3 editor: {error}"),
+            }
+        }
     }
 
     fn piano_roll(&mut self, ui: &mut egui::Ui) {
@@ -1278,8 +1305,12 @@ impl DawUi {
         let Some(host) = &mut self.vst3_host else {
             return;
         };
+        let mut loaded_channel_instance = None;
         match host.load(path, class_uid.as_deref()) {
             Ok(info) => {
+                if let Some(channel_id) = restore_channel_id {
+                    loaded_channel_instance = Some((channel_id, info.id));
+                }
                 let state_message = if let (Some(channel_id), Some(payload)) =
                     (restore_channel_id, state_payload.as_deref())
                 {
@@ -1305,6 +1336,9 @@ impl DawUi {
                 }
             }
             Err(error) => self.status = format!("Could not load VST3: {error}"),
+        }
+        if let Some((channel_id, instance_id)) = loaded_channel_instance {
+            self.channel_vst3_instances.insert(channel_id, instance_id);
         }
         self.last_plugin_action = Some(self.status.clone());
     }

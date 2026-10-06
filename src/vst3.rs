@@ -125,9 +125,9 @@ impl Vst3HostRuntime {
             loaded.editor = Some(PluginWindow::new(loaded.plugin.clone()));
         }
         let editor = loaded.editor.as_mut().expect("editor was just created");
-        if !editor.is_open() {
-            editor.open().map_err(|error| error.to_string())?;
-        }
+        // `PluginWindow` does not expose a raise/focus operation. Reopening an existing
+        // native editor recreates its window and brings it above the main DAW window.
+        editor.open().map_err(|error| error.to_string())?;
         Ok(())
     }
 
