@@ -77,6 +77,73 @@ enum MainView {
     Plugins,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PianoRollSnap {
+    None,
+    QuarterBeat,
+    HalfBeat,
+    Beat,
+    TwoBeats,
+    Bar,
+}
+
+impl PianoRollSnap {
+    const ALL: [Self; 6] = [
+        Self::None,
+        Self::QuarterBeat,
+        Self::HalfBeat,
+        Self::Beat,
+        Self::TwoBeats,
+        Self::Bar,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::QuarterBeat => "1/4 beat",
+            Self::HalfBeat => "1/2 beat",
+            Self::Beat => "1 beat",
+            Self::TwoBeats => "2 beats",
+            Self::Bar => "1 bar",
+        }
+    }
+
+    fn ticks(self, ppq: u16, time_signature: Option<(u8, u8)>) -> u32 {
+        let ppq = u32::from(ppq).max(1);
+        match self {
+            Self::None => 1,
+            Self::QuarterBeat => (ppq / 4).max(1),
+            Self::HalfBeat => (ppq / 2).max(1),
+            Self::Beat => ppq,
+            Self::TwoBeats => ppq.saturating_mul(2),
+            Self::Bar => {
+                let (numerator, denominator) = time_signature.unwrap_or((4, 4));
+                let numerator = u32::from(numerator.max(1));
+                let denominator = u32::from(denominator.max(1));
+                ppq.saturating_mul(numerator).saturating_mul(4) / denominator
+            }
+        }
+        .max(1)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NoteDragKind {
+    Move,
+    Resize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ActiveNoteDrag {
+    pattern_id: u16,
+    channel_id: u16,
+    channel_note_index: usize,
+    start_position: u32,
+    start_length: u32,
+    start_key: u16,
+    kind: NoteDragKind,
+}
+
 impl MainView {
     const ALL: [Self; 5] = [
         Self::Playlist,
@@ -108,6 +175,8 @@ struct DawUi {
     selected_pattern: Option<u16>,
     selected_note_channel: Option<u16>,
     selected_note: Option<(u16, u16, usize)>,
+    active_note_drag: Option<ActiveNoteDrag>,
+    piano_roll_snap: PianoRollSnap,
     selected_arrangement: Option<u16>,
     selected_clip: Option<usize>,
     selected_plugin_state_channel: Option<u16>,
@@ -139,6 +208,8 @@ impl DawUi {
             selected_pattern: None,
             selected_note_channel: None,
             selected_note: None,
+            active_note_drag: None,
+            piano_roll_snap: PianoRollSnap::QuarterBeat,
             selected_arrangement: None,
             selected_clip: None,
             selected_plugin_state_channel: None,
@@ -179,6 +250,7 @@ impl DawUi {
                     document.channels().first().map(|channel| channel.id());
                 self.selected_clip = None;
                 self.selected_note = None;
+                self.active_note_drag = None;
                 self.selected_plugin_state_channel = document
                     .channel_plugin_states()
                     .first()
@@ -752,6 +824,7 @@ impl DawUi {
         let patterns = document.patterns().unwrap_or_default();
         let channels = document.channels();
         let ppq = document.header().ppq().max(1);
+        let time_signature = document.metadata().time_signature();
         if patterns.is_empty() {
             empty_view(ui, "This project has no decoded patterns");
             return;
@@ -761,6 +834,12 @@ impl DawUi {
             .is_none_or(|id| !patterns.iter().any(|pattern| pattern.id == id))
         {
             self.selected_pattern = patterns.first().map(|pattern| pattern.id);
+        }
+        if self
+            .active_note_drag
+            .is_some_and(|drag| Some(drag.pattern_id) != self.selected_pattern)
+        {
+            self.active_note_drag = None;
         }
         if self
             .selected_note_channel
@@ -813,8 +892,13 @@ impl DawUi {
                         );
                     }
                 });
-            ui.label("Snap");
-            ui.label("1/4 beat");
+            egui::ComboBox::from_id_salt("piano-roll-snap")
+                .selected_text(format!("Snap: {}", self.piano_roll_snap.label()))
+                .show_ui(ui, |ui| {
+                    for snap in PianoRollSnap::ALL {
+                        ui.selectable_value(&mut self.piano_roll_snap, snap, snap.label());
+                    }
+                });
             add_note_requested = ui
                 .add_enabled(
                     self.selected_note_channel.is_some(),
@@ -879,11 +963,12 @@ impl DawUi {
         else {
             return;
         };
-        self.draw_notes(ui, &pattern, ppq);
+        let snap_ticks = self.piano_roll_snap.ticks(ppq, time_signature);
+        self.draw_notes(ui, &pattern, ppq, snap_ticks);
         self.selected_note_editor(ui, &pattern);
     }
 
-    fn draw_notes(&mut self, ui: &mut egui::Ui, pattern: &Pattern, ppq: u16) {
+    fn draw_notes(&mut self, ui: &mut egui::Ui, pattern: &Pattern, ppq: u16, snap_ticks: u32) {
         let key_low = 36u16;
         let key_high = 83u16;
         let key_height = 13.0;
@@ -973,19 +1058,116 @@ impl DawUi {
                             GREEN
                         },
                     );
+                    let resize_handle = egui::Rect::from_min_max(
+                        egui::pos2(
+                            (note_rect.right() - 5.0).max(note_rect.left()),
+                            note_rect.top(),
+                        ),
+                        note_rect.right_bottom(),
+                    );
+                    painter.rect_filled(
+                        resize_handle,
+                        egui::CornerRadius::same(1),
+                        Color32::from_white_alpha(if selected { 100 } else { 45 }),
+                    );
                     let response = ui.interact(
                         note_rect,
                         Id::new(("piano-note", pattern.id, note.channel_id, *channel_index)),
-                        Sense::click(),
+                        Sense::click_and_drag(),
                     );
                     if response.clicked() {
                         self.selected_note = Some((pattern.id, note.channel_id, *channel_index));
                         self.selected_note_channel = Some(note.channel_id);
                         self.status = format!("Selected note {}", note_index + 1);
                     }
+                    if response.is_pointer_button_down_on() && self.active_note_drag.is_none() {
+                        let resize = response
+                            .interact_pointer_pos()
+                            .is_some_and(|pointer| pointer.x >= note_rect.right() - 6.0);
+                        self.active_note_drag = Some(ActiveNoteDrag {
+                            pattern_id: pattern.id,
+                            channel_id: note.channel_id,
+                            channel_note_index: *channel_index,
+                            start_position: note.position,
+                            start_length: note.length,
+                            start_key: note.key,
+                            kind: if resize {
+                                NoteDragKind::Resize
+                            } else {
+                                NoteDragKind::Move
+                            },
+                        });
+                        self.selected_note = Some((pattern.id, note.channel_id, *channel_index));
+                        self.selected_note_channel = Some(note.channel_id);
+                    }
+                    if response.dragged()
+                        && let Some(drag) = self.active_note_drag.filter(|drag| {
+                            drag.pattern_id == pattern.id
+                                && drag.channel_id == note.channel_id
+                                && drag.channel_note_index == *channel_index
+                        })
+                    {
+                        let delta = response.drag_delta();
+                        let tick_delta = (delta.x / tick_scale).round() as i64;
+                        let edit = match drag.kind {
+                            NoteDragKind::Move => {
+                                let position = snap_note_tick(
+                                    i64::from(drag.start_position).saturating_add(tick_delta),
+                                    snap_ticks,
+                                    0,
+                                );
+                                let semitones = (-delta.y / key_height).round() as i32;
+                                let key = i32::from(drag.start_key)
+                                    .saturating_add(semitones)
+                                    .clamp(i32::from(key_low), i32::from(key_high))
+                                    as u16;
+                                PatternNoteEdit {
+                                    position: Some(position),
+                                    key: Some(key),
+                                    ..PatternNoteEdit::default()
+                                }
+                            }
+                            NoteDragKind::Resize => PatternNoteEdit {
+                                length: Some(snap_note_tick(
+                                    i64::from(drag.start_length).saturating_add(tick_delta),
+                                    snap_ticks,
+                                    1,
+                                )),
+                                ..PatternNoteEdit::default()
+                            },
+                        };
+                        if let Some(document) = &mut self.document
+                            && document
+                                .edit_pattern_note(
+                                    drag.pattern_id,
+                                    drag.channel_id,
+                                    drag.channel_note_index,
+                                    edit,
+                                )
+                                .is_ok()
+                        {
+                            self.dirty = true;
+                            self.status = match drag.kind {
+                                NoteDragKind::Move => "Piano roll note moved".to_owned(),
+                                NoteDragKind::Resize => "Piano roll note length changed".to_owned(),
+                            };
+                        }
+                    }
+                    if response.drag_stopped()
+                        && self.active_note_drag.is_some_and(|drag| {
+                            drag.pattern_id == pattern.id
+                                && drag.channel_id == note.channel_id
+                                && drag.channel_note_index == *channel_index
+                        })
+                    {
+                        self.active_note_drag = None;
+                    }
                     *channel_index += 1;
                 }
             });
+        if !ui.input(|input| input.pointer.primary_down()) {
+            self.active_note_drag = None;
+        }
     }
 
     fn selected_note_editor(&mut self, ui: &mut egui::Ui, pattern: &Pattern) {
@@ -1554,4 +1736,40 @@ fn note_name(key: u16) -> String {
         "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
     ];
     format!("{}{}", NAMES[(key % 12) as usize], key / 12)
+}
+
+fn snap_note_tick(value: i64, quantum: u32, minimum: u32) -> u32 {
+    let quantum = u64::from(quantum.max(1));
+    let value = value.max(0) as u64;
+    let snapped = value
+        .saturating_add(quantum / 2)
+        .checked_div(quantum)
+        .unwrap_or(0)
+        .saturating_mul(quantum)
+        .clamp(u64::from(minimum), u64::from(u32::MAX));
+    snapped as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PianoRollSnap, snap_note_tick};
+
+    #[test]
+    fn piano_roll_snap_sizes_follow_project_ppq_and_meter() {
+        assert_eq!(PianoRollSnap::None.ticks(96, None), 1);
+        assert_eq!(PianoRollSnap::QuarterBeat.ticks(96, None), 24);
+        assert_eq!(PianoRollSnap::HalfBeat.ticks(96, None), 48);
+        assert_eq!(PianoRollSnap::Beat.ticks(96, None), 96);
+        assert_eq!(PianoRollSnap::TwoBeats.ticks(96, None), 192);
+        assert_eq!(PianoRollSnap::Bar.ticks(96, Some((3, 4))), 288);
+    }
+
+    #[test]
+    fn note_tick_snapping_rounds_and_respects_length_minimum() {
+        assert_eq!(snap_note_tick(-12, 24, 0), 0);
+        assert_eq!(snap_note_tick(35, 24, 0), 24);
+        assert_eq!(snap_note_tick(36, 24, 0), 48);
+        assert_eq!(snap_note_tick(0, 24, 1), 1);
+        assert_eq!(snap_note_tick(i64::from(u32::MAX), 1, 0), u32::MAX);
+    }
 }
