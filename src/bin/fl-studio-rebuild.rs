@@ -21,6 +21,7 @@ const PURPLE: Color32 = Color32::from_rgb(150, 93, 181);
 const ORANGE: Color32 = Color32::from_rgb(195, 129, 61);
 
 fn main() -> eframe::Result {
+    let initial_project = std::env::args_os().nth(1).map(PathBuf::from);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("FL Studio Rebuild")
@@ -32,7 +33,7 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "FL Studio Rebuild",
         options,
-        Box::new(|creation| Ok(Box::new(DawUi::new(creation)))),
+        Box::new(move |creation| Ok(Box::new(DawUi::new(creation, initial_project)))),
     )
 }
 
@@ -83,7 +84,7 @@ struct DawUi {
 }
 
 impl DawUi {
-    fn new(creation: &eframe::CreationContext<'_>) -> Self {
+    fn new(creation: &eframe::CreationContext<'_>, initial_project: Option<PathBuf>) -> Self {
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = PANEL;
         visuals.window_fill = PANEL;
@@ -92,7 +93,7 @@ impl DawUi {
         visuals.override_text_color = Some(TEXT);
         creation.egui_ctx.set_visuals(visuals);
         let plugin_candidates = scan_installed_plugins().candidates;
-        Self {
+        let mut app = Self {
             document: None,
             current_path: None,
             view: MainView::Playlist,
@@ -107,7 +108,11 @@ impl DawUi {
             timeline_zoom: 0.10,
             plugin_candidates,
             vst3_host: None,
+        };
+        if let Some(path) = initial_project.as_deref() {
+            app.open_project(path);
         }
+        app
     }
 
     fn open_dialog(&mut self) {
