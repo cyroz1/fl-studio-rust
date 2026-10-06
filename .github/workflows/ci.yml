@@ -28,6 +28,12 @@ jobs:
           components: clippy, rustfmt
           cache: true
 
+      - name: Install Linux native dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libxcb1-dev
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
