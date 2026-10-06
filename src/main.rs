@@ -653,7 +653,7 @@ fn preview_plugin_state(path: &Path, channel_id: u16, prefix_len: usize) -> Resu
         "channel={} wrapper_bytes={} wrapper_prefix=[{}] data_bytes={} data_prefix=[{}]",
         state.channel_id(),
         state.wrapper_payload().map_or(0, <[u8]>::len),
-        state.wrapper_payload().map_or_else(String::new, &prefix),
+        state.wrapper_payload().map_or_else(String::new, prefix),
         state.data_payload().len(),
         prefix(state.data_payload()),
     );
