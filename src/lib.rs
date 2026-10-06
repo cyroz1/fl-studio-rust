@@ -617,8 +617,10 @@ impl FlpDocument {
                         patterns[pattern_index].notes.extend(
                             notes_event
                                 .payload
-                                .chunks_exact(FLP_NOTE_RECORD_SIZE)
-                                .map(PatternNote::decode),
+                                .as_chunks::<FLP_NOTE_RECORD_SIZE>()
+                                .0
+                                .iter()
+                                .map(|record| PatternNote::decode(record)),
                         );
                         event_index += 1;
                     }
@@ -863,7 +865,9 @@ impl FlpDocument {
 
             for (record_index, record) in notes_event
                 .payload
-                .chunks_exact(FLP_NOTE_RECORD_SIZE)
+                .as_chunks::<FLP_NOTE_RECORD_SIZE>()
+                .0
+                .iter()
                 .enumerate()
             {
                 let mut note = PatternNote::decode(record);
@@ -969,7 +973,9 @@ impl FlpDocument {
 
         let old_payload = &event.payload;
         let suffix_start = old_payload
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .position(|pair| u16::from_le_bytes([pair[0], pair[1]]) == 0)
             .map_or(old_payload.len(), |unit_index| (unit_index + 1) * 2);
         let mut replacement_payload = Vec::with_capacity(name.len().saturating_mul(2) + 2);
@@ -1364,7 +1370,7 @@ fn ascii_version(payload: &[u8]) -> Option<String> {
 
 fn decode_utf16_z(payload: &[u8]) -> Option<String> {
     let mut units = Vec::with_capacity(payload.len() / 2);
-    for pair in payload.chunks_exact(2) {
+    for pair in payload.as_chunks::<2>().0 {
         let unit = u16::from_le_bytes([pair[0], pair[1]]);
         if unit == 0 {
             break;
@@ -1392,7 +1398,15 @@ fn uses_legacy_string_encoding(version: Option<&str>) -> bool {
 fn decode_project_string(payload: &[u8], version: Option<&str>) -> Option<String> {
     let encoding_is_utf16 = project_string_version(version)
         .map(|(major, minor)| major > 11 || (major == 11 && minor >= 5))
-        .unwrap_or_else(|| payload.chunks_exact(2).filter(|pair| pair[1] == 0).count() >= 2);
+        .unwrap_or_else(|| {
+            payload
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .filter(|pair| pair[1] == 0)
+                .count()
+                >= 2
+        });
 
     if encoding_is_utf16 {
         decode_utf16_z(payload)
@@ -1423,7 +1437,7 @@ fn windows_1252_char(byte: u8) -> char {
 
 fn utf16_banner_version(payload: &[u8]) -> Option<String> {
     let mut units = Vec::with_capacity(payload.len() / 2);
-    for pair in payload.chunks_exact(2) {
+    for pair in payload.as_chunks::<2>().0 {
         let unit = u16::from_le_bytes([pair[0], pair[1]]);
         if unit == 0 {
             break;
