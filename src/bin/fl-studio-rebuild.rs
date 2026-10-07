@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use eframe::egui::{self, Align2, Color32, FontId, Id, Sense, Stroke, Vec2};
 use flp_rebuild::midi::MidiFile;
 use flp_rebuild::plugins::{PluginCandidate, PluginFormat, scan_installed_plugins};
+use flp_rebuild::sample_render::{AudioClipRenderOptions, render_audio_clips_to_wav};
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions};
 use flp_rebuild::{
     FlpDocument, Pattern, PatternNote, PatternNoteEdit, PlaylistClip, PlaylistClipEdit,
@@ -357,6 +358,15 @@ impl DawUi {
             }
             if ui.small_button("Save as").clicked() {
                 self.save_as();
+            }
+            if ui
+                .add_enabled(
+                    self.document.is_some() && self.current_path.is_some(),
+                    egui::Button::new("Render audio…"),
+                )
+                .clicked()
+            {
+                self.render_audio_clips_dialog();
             }
             for item in [
                 "Edit", "Add", "Patterns", "View", "Options", "Tools", "Help",
@@ -1181,6 +1191,42 @@ impl DawUi {
                 );
             }
             Err(error) => self.status = format!("Could not render pattern channel: {error}"),
+        }
+    }
+
+    fn render_audio_clips_dialog(&mut self) {
+        let (Some(project_path), Some(document)) =
+            (self.current_path.as_deref(), self.document.as_ref())
+        else {
+            self.status = "Open a project before rendering audio clips".to_owned();
+            return;
+        };
+        let project_stem = project_path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "FL_Studio_Project".to_owned());
+        let Some(output_path) = rfd::FileDialog::new()
+            .set_title("Render Playlist audio clips")
+            .set_file_name(format!("{project_stem}_audio.wav"))
+            .add_filter("WAV audio", &["wav"])
+            .save_file()
+        else {
+            return;
+        };
+        let options = AudioClipRenderOptions {
+            arrangement_id: self.selected_arrangement.unwrap_or_default(),
+            ..AudioClipRenderOptions::default()
+        };
+        match render_audio_clips_to_wav(document, project_path, options, &output_path) {
+            Ok(summary) => {
+                self.status = format!(
+                    "Rendered {} audio clips to {} ({} skipped for non-default scale)",
+                    summary.clips_rendered,
+                    output_path.display(),
+                    summary.clips_skipped_unsupported_scale
+                );
+            }
+            Err(error) => self.status = format!("Could not render Playlist audio clips: {error}"),
         }
     }
 
