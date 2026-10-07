@@ -371,6 +371,7 @@ impl DawUi {
                 self.selected_automation_point = None;
                 self.automation_add_mode = false;
                 self.last_plugin_action = None;
+                self.vst3_host = None;
                 self.channel_vst3_instances.clear();
                 self.selected_arrangement = document.arrangements().ok().and_then(|arrangements| {
                     arrangements.first().map(|arrangement| arrangement.id)
@@ -378,9 +379,100 @@ impl DawUi {
                 self.current_path = Some(path.to_path_buf());
                 self.document = Some(document);
                 self.dirty = false;
-                self.status = format!("Opened {}", path.display());
+                let plugin_summary = self
+                    .load_project_vst3_channels()
+                    .map_or_else(String::new, |summary| format!(" · {summary}"));
+                self.status = format!("Opened {}{plugin_summary}", path.display());
             }
             Err(error) => self.status = format!("Could not open project: {error}"),
+        }
+    }
+
+    fn load_project_vst3_channels(&mut self) -> Option<String> {
+        let states = self
+            .document
+            .as_ref()
+            .map(FlpDocument::channel_plugin_states)
+            .unwrap_or_default();
+        let mut eligible_channels = 0usize;
+        let mut unresolved = Vec::new();
+        let mut plans = Vec::new();
+        for state in states {
+            let Some(metadata) = state.vst_metadata() else {
+                continue;
+            };
+            if metadata.fourcc().is_some() {
+                continue;
+            }
+            let Some(class_uid) = metadata.class_uid() else {
+                continue;
+            };
+            eligible_channels += 1;
+            if let Some(candidate) = matching_vst3_candidate(&self.plugin_candidates, metadata) {
+                plans.push((state, candidate.clone(), class_uid));
+            } else {
+                unresolved.push(format!(
+                    "channel {} has no installed match",
+                    state.channel_id()
+                ));
+            }
+        }
+        if eligible_channels == 0 {
+            return None;
+        }
+        if plans.is_empty() {
+            return Some(format!(
+                "no installed VST3 matched {} project channel(s)",
+                eligible_channels
+            ));
+        }
+
+        let mut host = match Vst3HostRuntime::new(f64::from(self.audio_settings.sample_rate), 512) {
+            Ok(host) => host,
+            Err(error) => {
+                return Some(format!("VST3 host initialization failed: {error}"));
+            }
+        };
+        let mut channel_instances = BTreeMap::new();
+        let mut restored_count = 0usize;
+        for (state, candidate, class_uid) in plans {
+            let channel_id = state.channel_id();
+            match host.load(&candidate.path, Some(&class_uid)) {
+                Ok(info) => {
+                    channel_instances.insert(channel_id, info.id);
+                    match host.restore_flp_channel_state(info.id, &state) {
+                        Ok(()) => restored_count += 1,
+                        Err(error) => unresolved.push(format!(
+                            "channel {channel_id} state could not be restored: {error}"
+                        )),
+                    }
+                }
+                Err(error) => unresolved.push(format!(
+                    "channel {channel_id} plug-in could not load: {error}"
+                )),
+            }
+        }
+        let loaded_count = channel_instances.len();
+        self.channel_vst3_instances = channel_instances;
+        if !host.loaded_plugins().is_empty() {
+            self.vst3_host = Some(host);
+        }
+
+        if unresolved.is_empty() {
+            Some(format!(
+                "auto-loaded {loaded_count} project VST3 channel(s); restored {restored_count} state(s)"
+            ))
+        } else {
+            Some(format!(
+                "auto-loaded {loaded_count}/{eligible_channels} project VST3 channel(s); restored {restored_count} state(s); {} issue(s) ({})",
+                unresolved.len(),
+                unresolved
+                    .iter()
+                    .take(2)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ))
         }
     }
 
@@ -3155,7 +3247,7 @@ impl DawUi {
         });
         ui.label(
             egui::RichText::new(
-                "Plug-ins load only when you open them. Their own editor windows are used.",
+                "Matching installed VST3 channels load with the project. Open a plug-in's native editor when you need it.",
             )
             .color(MUTED),
         );
@@ -3165,6 +3257,11 @@ impl DawUi {
             self.plugin_candidates = scan_installed_plugins().candidates;
         }
 
+        let loaded = self
+            .vst3_host
+            .as_ref()
+            .map(Vst3HostRuntime::loaded_plugins)
+            .unwrap_or_default();
         let plugin_states = self
             .document
             .as_ref()
@@ -3242,6 +3339,16 @@ impl DawUi {
                     metadata.vendor().unwrap_or("unknown vendor"),
                     metadata.class_uid().as_deref().unwrap_or("unknown")
                 ));
+                let mapped_instance = self
+                    .channel_vst3_instances
+                    .get(&state.channel_id())
+                    .copied();
+                if mapped_instance.is_some() {
+                    ui.label(
+                        egui::RichText::new("Loaded and mapped to this channel's playback")
+                            .color(GREEN),
+                    );
+                }
                 if let Some(candidate) = matching_vst3_candidate(&self.plugin_candidates, metadata)
                 {
                     ui.horizontal(|ui| {
@@ -3250,12 +3357,12 @@ impl DawUi {
                             candidate.name,
                             candidate.path.display()
                         ));
-                        if ui.button("Load match + try FLP state").clicked() {
-                            restore_request = Some((
-                                candidate.path.clone(),
-                                state.channel_id(),
-                                metadata.class_uid(),
-                            ));
+                        if let Some(instance_id) = mapped_instance
+                            && let Some(info) = loaded.iter().find(|info| info.id == instance_id)
+                            && info.has_editor
+                            && ui.button("Open editor").clicked()
+                        {
+                            open_id = Some(info.id);
                         }
                     });
                 } else {
@@ -3275,7 +3382,7 @@ impl DawUi {
         }
         ui.label(
             egui::RichText::new(
-                "Or choose an installed VST3 below to try the selected FLP channel's raw 0xD5 state.",
+                "Use the installed list below to load VST3 instances or try restoring another channel state.",
             )
             .color(MUTED),
         );
@@ -3297,6 +3404,16 @@ impl DawUi {
                 let project_match = selected_state
                     .and_then(|state| state.vst_metadata())
                     .is_some_and(|metadata| candidate_matches_vst_metadata(candidate, metadata));
+                let candidate_loaded = loaded
+                    .iter()
+                    .filter(|info| info.path == candidate.path)
+                    .collect::<Vec<_>>();
+                let mapped_instance = self
+                    .selected_plugin_state_channel
+                    .and_then(|channel_id| self.channel_vst3_instances.get(&channel_id).copied())
+                    .filter(|instance_id| {
+                        candidate_loaded.iter().any(|info| info.id == *instance_id)
+                    });
                 egui::Frame::new()
                     .fill(PANEL_DARK)
                     .inner_margin(6.0)
@@ -3312,10 +3429,24 @@ impl DawUi {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    if ui.button("Load and open editor").clicked() {
+                                    if let Some(instance_id) = mapped_instance {
+                                        if ui.button("Open mapped editor").clicked() {
+                                            open_id = Some(instance_id);
+                                        }
+                                    } else if let Some(info) = candidate_loaded.first() {
+                                        if info.has_editor {
+                                            if ui.button("Open editor").clicked() {
+                                                open_id = Some(info.id);
+                                            }
+                                        } else {
+                                            ui.small("Loaded without an editor");
+                                        }
+                                    } else if ui.button("Load and open editor").clicked() {
                                         load_path = Some(candidate.path.clone());
                                     }
                                     if let Some(channel_id) = self.selected_plugin_state_channel
+                                        && !self.channel_vst3_instances.contains_key(&channel_id)
+                                        && project_match
                                         && ui.button("Load + try FLP state").clicked()
                                     {
                                         let class_uid = selected_state
@@ -3339,11 +3470,6 @@ impl DawUi {
             self.load_installed_vst3(&path, None, None);
         }
 
-        let loaded = self
-            .vst3_host
-            .as_ref()
-            .map(Vst3HostRuntime::loaded_plugins)
-            .unwrap_or_default();
         if !loaded.is_empty() {
             ui.separator();
             ui.heading("Loaded plug-in instances");
@@ -3360,28 +3486,30 @@ impl DawUi {
                 });
                 ui.small(format!("{} · class {}", info.path.display(), info.uid));
 
-                let parameters = self
-                    .vst3_host
-                    .as_ref()
-                    .and_then(|host| host.parameter_snapshot(info.id).ok())
-                    .unwrap_or_default();
-                for parameter in parameters {
-                    let mut value = parameter.value.clamp(0.0, 1.0) as f32;
-                    let label = if parameter.unit.is_empty() {
-                        parameter.name.clone()
-                    } else {
-                        format!("{} ({})", parameter.name, parameter.unit)
-                    };
-                    if ui
-                        .add_enabled(
-                            !parameter.is_read_only,
-                            egui::Slider::new(&mut value, 0.0..=1.0).text(label),
-                        )
-                        .changed()
-                    {
-                        parameter_edits.push((info.id, parameter.id, f64::from(value)));
+                egui::CollapsingHeader::new("Parameters").show(ui, |ui| {
+                    let parameters = self
+                        .vst3_host
+                        .as_ref()
+                        .and_then(|host| host.parameter_snapshot(info.id).ok())
+                        .unwrap_or_default();
+                    for parameter in parameters {
+                        let mut value = parameter.value.clamp(0.0, 1.0) as f32;
+                        let label = if parameter.unit.is_empty() {
+                            parameter.name.clone()
+                        } else {
+                            format!("{} ({})", parameter.name, parameter.unit)
+                        };
+                        if ui
+                            .add_enabled(
+                                !parameter.is_read_only,
+                                egui::Slider::new(&mut value, 0.0..=1.0).text(label),
+                            )
+                            .changed()
+                        {
+                            parameter_edits.push((info.id, parameter.id, f64::from(value)));
+                        }
                     }
-                }
+                });
                 ui.separator();
             }
         }
@@ -3442,7 +3570,7 @@ impl DawUi {
             return;
         }
         if self.vst3_host.is_none() {
-            match Vst3HostRuntime::new(44_100.0, 512) {
+            match Vst3HostRuntime::new(f64::from(self.audio_settings.sample_rate), 512) {
                 Ok(host) => self.vst3_host = Some(host),
                 Err(error) => {
                     self.status = format!("Could not initialize the VST3 host: {error}");
