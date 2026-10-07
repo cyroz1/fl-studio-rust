@@ -1606,7 +1606,7 @@ impl FlpDocument {
                     };
                     let record_size = playlist_clip_record_size(
                         self.project_version.as_deref(),
-                        event.payload.len(),
+                        &event.payload,
                         event.file_offset,
                     )?;
                     if event.payload.len() % record_size != 0 {
@@ -3109,54 +3109,94 @@ impl std::error::Error for FlpError {}
 
 fn playlist_clip_record_size(
     project_version: Option<&str>,
-    payload_length: usize,
+    payload: &[u8],
     file_offset: usize,
 ) -> Result<usize, FlpError> {
-    if let Some(major) = project_version
+    let version_size = project_version
         .and_then(|version| version.split('.').next())
         .and_then(|major| major.parse::<u32>().ok())
-    {
-        let expected = if major >= 25 {
-            80
-        } else if major >= 21 {
-            60
-        } else {
-            32
-        };
-        if payload_length == 0 || payload_length.is_multiple_of(expected) {
-            return Ok(expected);
-        }
-        let alternatives = FLP_PLAYLIST_RECORD_SIZES
-            .into_iter()
-            .filter(|size| payload_length.is_multiple_of(*size))
-            .collect::<Vec<_>>();
-        if alternatives.len() == 1 {
-            return Ok(alternatives[0]);
-        }
-        return Err(FlpError::InvalidEvent {
-            offset: file_offset,
-            detail: "playlist clip payload size does not match the project version",
+        .map(|major| {
+            if major >= 25 {
+                80
+            } else if major >= 21 {
+                60
+            } else {
+                32
+            }
         });
-    }
 
-    if payload_length == 0 {
-        return Ok(80);
+    if payload.is_empty() {
+        return Ok(version_size.unwrap_or(80));
     }
     let candidates = FLP_PLAYLIST_RECORD_SIZES
         .into_iter()
-        .filter(|size| payload_length.is_multiple_of(*size))
+        .filter(|size| payload.len().is_multiple_of(*size))
         .collect::<Vec<_>>();
-    match candidates.as_slice() {
-        [record_size] => Ok(*record_size),
-        [] => Err(FlpError::InvalidEvent {
+    if candidates.is_empty() {
+        return Err(FlpError::InvalidEvent {
             offset: file_offset,
             detail: "playlist clip payload is not divisible by a supported record size",
-        }),
-        _ => Err(FlpError::InvalidEvent {
-            offset: file_offset,
-            detail: "playlist clip record size is ambiguous without project version metadata",
-        }),
+        });
     }
+    if let [record_size] = candidates.as_slice() {
+        return Ok(*record_size);
+    }
+
+    let mut ranked = candidates
+        .iter()
+        .map(|record_size| {
+            let score = playlist_clip_layout_score(payload, *record_size);
+            (*record_size, score)
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| right.1.0.total_cmp(&left.1.0));
+    if let Some((best, score)) = ranked.first()
+        && let Some((_, next_score)) = ranked.get(1)
+        && score.1 >= 0.5
+        && score.0 - next_score.0 >= 1.0
+    {
+        return Ok(*best);
+    }
+
+    if let Some(expected) = version_size
+        && candidates.contains(&expected)
+    {
+        return Ok(expected);
+    }
+    Err(FlpError::InvalidEvent {
+        offset: file_offset,
+        detail: "playlist clip record size is ambiguous from the payload and project version",
+    })
+}
+
+fn playlist_clip_layout_score(payload: &[u8], record_size: usize) -> (f64, f64) {
+    let records = payload.chunks_exact(record_size);
+    let record_count = records.len();
+    let mut headers = HashMap::<[u8; 4], usize>::new();
+    let mut valid_tracks = 0usize;
+    let mut nonzero_lengths = 0usize;
+    for record in records {
+        let header: [u8; 4] = record[20..24]
+            .try_into()
+            .expect("supported Playlist records include the common 32-byte prefix");
+        *headers.entry(header).or_default() += 1;
+        if u16::from_le_bytes([record[12], record[13]]) <= 499 {
+            valid_tracks += 1;
+        }
+        if record[8..12].iter().any(|byte| *byte != 0) {
+            nonzero_lengths += 1;
+        }
+    }
+    if record_count == 0 {
+        return (0.0, 0.0);
+    }
+    let header_ratio = headers.values().copied().max().unwrap_or(0) as f64 / record_count as f64;
+    let track_ratio = valid_tracks as f64 / record_count as f64;
+    let length_ratio = nonzero_lengths as f64 / record_count as f64;
+    (
+        header_ratio * 4.0 + track_ratio * 2.0 + length_ratio * 2.0,
+        header_ratio,
+    )
 }
 
 fn decode_automation_points(event: &FlpEvent) -> Result<Vec<AutomationPoint>, FlpError> {
@@ -4321,6 +4361,58 @@ mod tests {
         assert_eq!(markers[0].0, 2);
         assert_eq!(markers[0].1.position_ticks(), 480);
         assert_eq!(markers[0].1.name(), Some("Marker"));
+    }
+
+    #[test]
+    fn playlist_record_size_uses_record_structure_when_project_version_is_stale() {
+        let mut payload = Vec::new();
+        for index in 0..4u32 {
+            let mut record = [0xA0u8; 80];
+            record[0..4].copy_from_slice(&(index * 960).to_le_bytes());
+            record[4..6].copy_from_slice(&0x5000u16.to_le_bytes());
+            record[6..8].copy_from_slice(&29u16.to_le_bytes());
+            record[8..12].copy_from_slice(&960u32.to_le_bytes());
+            record[12..14].copy_from_slice(&471u16.to_le_bytes());
+            record[14..16].copy_from_slice(&0u16.to_le_bytes());
+            record[20..24].copy_from_slice(&[0x40, 0x64, 0x80, 0x80]);
+            record[24..28].copy_from_slice(&0.0f32.to_le_bytes());
+            record[28..32].copy_from_slice(&1.0f32.to_le_bytes());
+            payload.extend_from_slice(&record);
+        }
+
+        assert_eq!(
+            super::playlist_clip_record_size(Some("24.2.99.4720"), &payload, 123).unwrap(),
+            80,
+            "the record fields should override a stale version-based size"
+        );
+
+        let mut event_stream = Vec::new();
+        append_data_event(&mut event_stream, 0xC7, b"24.2.99.4720\0");
+        event_stream.extend_from_slice(&[0x63, 0, 0]);
+        append_data_event(&mut event_stream, 0xE9, &payload);
+        let document = FlpDocument::parse(&flp_fixture(&event_stream, &[], &[]))
+            .expect("the synthetic project should parse");
+        let arrangements = document
+            .arrangements()
+            .expect("structure should select the 80-byte record layout");
+        assert_eq!(arrangements[0].clips.len(), 4);
+        assert!(
+            arrangements[0]
+                .clips
+                .iter()
+                .all(|clip| clip.record_size == 80)
+        );
+    }
+
+    #[test]
+    fn playlist_record_size_keeps_version_fallback_and_rejects_weak_ambiguity() {
+        let ambiguous = [0u8; 320];
+        assert_eq!(
+            super::playlist_clip_record_size(Some("20.0.0"), &ambiguous, 0).unwrap(),
+            32
+        );
+        assert!(super::playlist_clip_record_size(Some("24.2.0"), &ambiguous, 0).is_err());
+        assert!(super::playlist_clip_record_size(None, &ambiguous, 0).is_err());
     }
 
     fn midi_fixture(track: &[u8], division: u16) -> Vec<u8> {
