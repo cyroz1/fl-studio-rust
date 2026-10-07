@@ -378,7 +378,7 @@ impl ChannelSummary {
         self.display_name.as_deref()
     }
 
-    /// Sample source path decoded from the observed audio-channel `0xC4` string event.
+    /// Sample source path decoded from a sample-bearing channel's `0xC4` string event.
     pub fn sample_path(&self) -> Option<&str> {
         self.sample_path.as_deref()
     }
@@ -1126,7 +1126,10 @@ impl FlpDocument {
                         decode_project_string(&event.payload, self.project_version.as_deref())
                             .filter(|value| !value.is_empty());
                 }
-                0xC4 if channel.kind == Some(4) && channel.sample_path.is_none() => {
+                // Sampler channels (kind 0) and sample-backed audio channels (kind 4)
+                // both use `0xC4` for the source path. Other channel kinds can contain
+                // unrelated data in their event range, so keep the scope check narrow.
+                0xC4 if matches!(channel.kind, Some(0 | 4)) && channel.sample_path.is_none() => {
                     channel.sample_path =
                         decode_project_string(&event.payload, self.project_version.as_deref())
                             .filter(|value| !value.is_empty());
@@ -3937,15 +3940,17 @@ mod tests {
     }
 
     #[test]
-    fn decodes_audio_channel_sample_path_and_preserves_original_event_bytes() {
+    fn decodes_sampler_and_audio_channel_sample_paths_losslessly() {
         let path = r"%FLStudioFactoryData%\Data\Patches\Sounds\voice.wav";
-        let input = channel_with_sample_path_fixture(4, path);
-        let document = FlpDocument::parse(&input).expect("fixture should parse");
-        let channels = document.channels();
+        for kind in [0, 4] {
+            let input = channel_with_sample_path_fixture(kind, path);
+            let document = FlpDocument::parse(&input).expect("fixture should parse");
+            let channels = document.channels();
 
-        assert_eq!(channels.len(), 1);
-        assert_eq!(channels[0].sample_path(), Some(path));
-        assert_eq!(document.encode_lossless().unwrap(), input);
+            assert_eq!(channels.len(), 1);
+            assert_eq!(channels[0].sample_path(), Some(path));
+            assert_eq!(document.encode_lossless().unwrap(), input);
+        }
     }
 
     #[test]

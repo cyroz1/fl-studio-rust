@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -13,8 +13,9 @@ use flp_rebuild::audio::{
 use flp_rebuild::midi::MidiFile;
 use flp_rebuild::plugins::{PluginCandidate, PluginFormat, scan_installed_plugins};
 use flp_rebuild::sample_render::{
-    AudioClipRenderOptions, AudioClipRenderSummary, render_audio_clips_to_wav,
-    stream_audio_clips_to_device,
+    AudioClipRenderOptions, AudioClipRenderSummary, SamplerPatternRenderOptions,
+    SamplerPatternRenderSummary, render_audio_clips_to_wav, stream_audio_clips_to_device,
+    stream_sampler_pattern_to_device,
 };
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions, Vst3PatternStreamHandle};
 use flp_rebuild::{
@@ -252,12 +253,20 @@ struct DawUi {
     audio_render_workers: Vec<PendingAudioRender>,
     pending_vst3_stream: Option<Vst3PatternStreamHandle>,
     vst3_workers: Vec<Vst3PatternStreamHandle>,
+    pending_sampler_stream: Option<PendingSamplerStream>,
+    sampler_workers: Vec<PendingSamplerStream>,
     audio_test_tone: bool,
     audio_monitor_input: bool,
 }
 
 struct PendingAudioRender {
     receiver: Receiver<Result<AudioClipRenderSummary, String>>,
+    cancelled: Arc<AtomicBool>,
+    worker: thread::JoinHandle<()>,
+}
+
+struct PendingSamplerStream {
+    receiver: Receiver<Result<SamplerPatternRenderSummary, String>>,
     cancelled: Arc<AtomicBool>,
     worker: thread::JoinHandle<()>,
 }
@@ -312,6 +321,8 @@ impl DawUi {
             audio_render_workers: Vec::new(),
             pending_vst3_stream: None,
             vst3_workers: Vec::new(),
+            pending_sampler_stream: None,
+            sampler_workers: Vec::new(),
             audio_test_tone: false,
             audio_monitor_input: false,
         };
@@ -600,6 +611,52 @@ impl DawUi {
         }
     }
 
+    fn poll_sampler_stream(&mut self) {
+        let completed = self.pending_sampler_stream.as_ref().and_then(|stream| {
+            match stream.receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Disconnected) => {
+                    Some(Err("Sampler render worker stopped unexpectedly".to_owned()))
+                }
+                Err(TryRecvError::Empty) => None,
+            }
+        });
+        if let Some(result) = completed {
+            let worker_panicked = self
+                .pending_sampler_stream
+                .take()
+                .is_some_and(|stream| stream.worker.join().is_err());
+            if worker_panicked {
+                self.stop_project_playback();
+                self.status = "Sampler pattern stream worker panicked".to_owned();
+                return;
+            }
+            match result {
+                Ok(summary) => {
+                    self.status = format!(
+                        "Sampler pattern finished: {} notes, {} voices stolen, {:.2}s at {} Hz{}",
+                        summary.notes_rendered,
+                        summary.voices_stolen,
+                        summary.frames as f64 / f64::from(summary.sample_rate),
+                        summary.sample_rate,
+                        if summary.notes_skipped_unresolved_sample == 0 {
+                            String::new()
+                        } else {
+                            format!(
+                                "; {} notes skipped because samples could not be resolved",
+                                summary.notes_skipped_unresolved_sample
+                            )
+                        }
+                    );
+                }
+                Err(error) => {
+                    self.stop_project_playback();
+                    self.status = format!("Sampler pattern stream failed: {error}");
+                }
+            }
+        }
+    }
+
     fn toggle_project_playback(&mut self) {
         if self.playing {
             if let Some(engine) = &self.audio_engine {
@@ -635,6 +692,10 @@ impl DawUi {
         if let Some(stream) = self.pending_vst3_stream.take() {
             self.vst3_workers.push(stream);
         }
+        if let Some(stream) = self.pending_sampler_stream.take() {
+            stream.cancelled.store(true, Ordering::Release);
+            self.sampler_workers.push(stream);
+        }
         if let Some(engine) = &self.audio_engine {
             engine.stop_project_playback();
         }
@@ -649,6 +710,20 @@ impl DawUi {
                 let worker = self.vst3_workers.swap_remove(index);
                 if worker.join().is_err() {
                     self.status = "A cancelled VST3 stream worker panicked".to_owned();
+                }
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    fn reap_sampler_workers(&mut self) {
+        let mut index = 0;
+        while index < self.sampler_workers.len() {
+            if self.sampler_workers[index].worker.is_finished() {
+                let stream = self.sampler_workers.swap_remove(index);
+                if stream.worker.join().is_err() {
+                    self.status = "A cancelled Sampler stream worker panicked".to_owned();
                 }
             } else {
                 index += 1;
@@ -1733,10 +1808,25 @@ impl DawUi {
                     .unwrap_or_else(|| format!("Channel {}", channel.id()))
             })
             .unwrap_or_else(|| "No channel".to_owned());
+        let sampler_channel_ids: BTreeSet<_> = channels
+            .iter()
+            .filter(|channel| channel.kind() == Some(0) && channel.enabled() != Some(false))
+            .map(|channel| channel.id())
+            .collect();
+        let has_sampler_notes = self
+            .selected_pattern
+            .and_then(|pattern_id| patterns.iter().find(|pattern| pattern.id == pattern_id))
+            .is_some_and(|pattern| {
+                pattern
+                    .notes
+                    .iter()
+                    .any(|note| sampler_channel_ids.contains(&note.channel_id))
+            });
         let mut add_note_requested = false;
         let mut open_midi_requested = false;
         let mut render_requested = false;
         let mut preview_requested = false;
+        let mut sampler_preview_requested = false;
         ui.horizontal(|ui| {
             ui.strong("Piano roll");
             ui.separator();
@@ -1798,6 +1888,9 @@ impl DawUi {
                     egui::Button::new("Preview VST3"),
                 )
                 .clicked();
+            sampler_preview_requested = ui
+                .add_enabled(has_sampler_notes, egui::Button::new("Preview Samplers"))
+                .clicked();
             open_midi_requested = ui.button("Open MIDI…").clicked();
         });
 
@@ -1806,6 +1899,9 @@ impl DawUi {
         }
         if preview_requested {
             self.play_selected_pattern_channel();
+        }
+        if sampler_preview_requested {
+            self.play_selected_sampler_pattern();
         }
 
         if open_midi_requested
@@ -2173,6 +2269,111 @@ impl DawUi {
         self.status = format!(
             "Streaming pattern {pattern_id} through {plugin_name} ({notes_to_stream} notes at {device_rate} Hz); Mixer effects are not included"
         );
+    }
+
+    fn play_selected_sampler_pattern(&mut self) {
+        let Some(pattern_id) = self.selected_pattern else {
+            self.status = "Select a pattern before previewing Sampler channels".to_owned();
+            return;
+        };
+        let Some(project_path) = self.current_path.clone() else {
+            self.status = "Save the project before previewing Sampler channels".to_owned();
+            return;
+        };
+        let Some(document) = self.document.as_ref() else {
+            self.status = "Open a project before previewing Sampler channels".to_owned();
+            return;
+        };
+        let project_bytes = match document.encode_lossless() {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.status = format!("Could not prepare Sampler preview: {error}");
+                return;
+            }
+        };
+        if self.audio_engine.is_none() {
+            match AudioEngine::start(&self.audio_settings) {
+                Ok(engine) => self.audio_engine = Some(engine),
+                Err(error) => {
+                    self.status = format!("Could not start audio output: {error}");
+                    return;
+                }
+            }
+        }
+        let Some(engine) = self.audio_engine.as_ref() else {
+            self.status = "Audio output is not available".to_owned();
+            return;
+        };
+        if !engine.output_active() {
+            self.status = "Enable an output device in Audio settings before previewing".to_owned();
+            return;
+        }
+        let device_rate = engine.sample_rate();
+
+        self.stop_project_playback();
+        if let Some(engine) = &self.audio_engine {
+            engine.set_test_tone(false);
+            if self.audio_monitor_input {
+                let _ = engine.set_input_monitor(false);
+            }
+        }
+        self.audio_test_tone = false;
+        self.audio_monitor_input = false;
+
+        let writer = match self
+            .audio_engine
+            .as_ref()
+            .ok_or_else(|| "Audio output is not available".to_owned())
+            .and_then(AudioEngine::begin_streaming_playback)
+        {
+            Ok(writer) => writer,
+            Err(error) => {
+                self.status = format!("Could not start Sampler output: {error}");
+                return;
+            }
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name("sampler-pattern-stream".to_owned())
+            .spawn(move || {
+                let result = FlpDocument::parse(&project_bytes)
+                    .map_err(|error| error.to_string())
+                    .and_then(|document| {
+                        stream_sampler_pattern_to_device(
+                            &document,
+                            &project_path,
+                            SamplerPatternRenderOptions {
+                                pattern_id,
+                                sample_rate: device_rate,
+                                ..SamplerPatternRenderOptions::default()
+                            },
+                            &writer,
+                            &worker_cancelled,
+                        )
+                    });
+                writer.finish();
+                let _ = sender.send(result);
+            });
+        match worker {
+            Ok(worker) => {
+                self.pending_sampler_stream = Some(PendingSamplerStream {
+                    receiver,
+                    cancelled,
+                    worker,
+                });
+                self.playing = true;
+                self.project_playback_loaded = true;
+                self.status = format!(
+                    "Preparing Sampler voices for pattern {pattern_id} at {device_rate} Hz…"
+                );
+            }
+            Err(error) => {
+                self.stop_project_playback();
+                self.status = format!("Could not start Sampler render worker: {error}");
+            }
+        }
     }
 
     fn render_audio_clips_dialog(&mut self) {
@@ -3269,8 +3470,10 @@ impl eframe::App for DawUi {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_project_audio_render();
         self.poll_vst3_stream();
+        self.poll_sampler_stream();
         self.reap_audio_render_workers();
         self.reap_vst3_workers();
+        self.reap_sampler_workers();
         for (key, view) in [
             (egui::Key::F5, MainView::Playlist),
             (egui::Key::F6, MainView::ChannelRack),

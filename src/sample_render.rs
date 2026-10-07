@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -14,6 +15,11 @@ use crate::{FlpDocument, PlaylistClip, PlaylistClipTarget};
 const DEFAULT_SAMPLE_RATE: u32 = 44_100;
 const MAX_MIX_BYTES: usize = 512 * 1024 * 1024;
 const MAX_SOURCE_CACHE_BYTES: usize = 512 * 1024 * 1024;
+const DEFAULT_SAMPLER_VOICE_LIMIT: usize = 64;
+const MAX_SAMPLER_VOICE_LIMIT: usize = 256;
+const SAMPLER_RELEASE_SECONDS: f64 = 0.005;
+const SAMPLER_ROOT_KEY: u16 = 60;
+const SAMPLER_BLOCK_FRAMES: usize = 1_024;
 static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -29,6 +35,35 @@ impl Default for AudioClipRenderOptions {
             sample_rate: DEFAULT_SAMPLE_RATE,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SamplerPatternRenderOptions {
+    pub pattern_id: u16,
+    pub sample_rate: u32,
+    pub voice_limit: usize,
+}
+
+impl Default for SamplerPatternRenderOptions {
+    fn default() -> Self {
+        Self {
+            pattern_id: 0,
+            sample_rate: DEFAULT_SAMPLE_RATE,
+            voice_limit: DEFAULT_SAMPLER_VOICE_LIMIT,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SamplerPatternRenderSummary {
+    pub frames: u64,
+    pub sample_rate: u32,
+    pub notes_rendered: usize,
+    pub voices_stolen: usize,
+    pub sampler_channels_rendered: usize,
+    pub source_files: usize,
+    pub notes_skipped_unresolved_sample: usize,
+    pub unresolved_sample_channels: Vec<u16>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -109,6 +144,117 @@ pub fn stream_audio_clips_to_device(
         |block| writer.write_stereo_samples(block),
     )?;
     Ok(render.summary)
+}
+
+/// Render the sample voices in one FLP pattern to a stereo 32-bit-float WAV.
+///
+/// This initial Sampler path schedules kind-0 channel notes on the project timeline, reads the
+/// channel's `0xC4` sample path, resamples by note key, applies velocity and the channel's
+/// provisional gain/pan mapping, and caps simultaneous voices. The default sample root key is
+/// assumed to be MIDI 60; sampler root-key settings, envelopes, loop modes, filters, and effects
+/// are not decoded yet.
+pub fn render_sampler_pattern_to_wav(
+    document: &FlpDocument,
+    project_path: impl AsRef<Path>,
+    options: SamplerPatternRenderOptions,
+    output_path: impl AsRef<Path>,
+) -> Result<SamplerPatternRenderSummary, String> {
+    let project_path = project_path.as_ref();
+    let output_path = output_path.as_ref();
+    validate_output_path(project_path, output_path)?;
+    let (mix, summary) = render_sampler_pattern_to_stereo_buffer(document, project_path, options)?;
+    write_float_stereo_wav(output_path, &mix, options.sample_rate, summary.frames)?;
+    Ok(summary)
+}
+
+/// Render all enabled kind-0 Sampler notes in one pattern into an interleaved stereo buffer.
+pub fn render_sampler_pattern_to_stereo_buffer(
+    document: &FlpDocument,
+    project_path: impl AsRef<Path>,
+    options: SamplerPatternRenderOptions,
+) -> Result<(Vec<f32>, SamplerPatternRenderSummary), String> {
+    let render = prepare_sampler_pattern(document, project_path.as_ref(), options, None)?;
+    let output_frames = usize::try_from(render.summary.frames)
+        .map_err(|_| "sampler render is too large for this platform".to_owned())?;
+    let output_samples = output_frames
+        .checked_mul(2)
+        .ok_or_else(|| "sampler render size overflow".to_owned())?;
+    let output_bytes = output_samples
+        .checked_mul(std::mem::size_of::<f32>())
+        .filter(|bytes| *bytes <= MAX_MIX_BYTES)
+        .ok_or_else(|| {
+            format!(
+                "sampler render exceeds the {} MiB in-memory mix limit",
+                MAX_MIX_BYTES / (1024 * 1024)
+            )
+        })?;
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(output_bytes / std::mem::size_of::<f32>())
+        .map_err(|error| format!("could not allocate sampler render buffer: {error}"))?;
+    let summary = stream_prepared_sampler_pattern(
+        &render,
+        None,
+        || false,
+        |block| {
+            output.extend_from_slice(block);
+            Ok(())
+        },
+    )?;
+    Ok((output, summary))
+}
+
+/// Render one pattern's Sampler notes on a worker and stream bounded blocks to an active device.
+pub fn stream_sampler_pattern_to_device(
+    document: &FlpDocument,
+    project_path: impl AsRef<Path>,
+    options: SamplerPatternRenderOptions,
+    writer: &StreamingAudioWriter,
+    cancelled: &AtomicBool,
+) -> Result<SamplerPatternRenderSummary, String> {
+    let render =
+        prepare_sampler_pattern(document, project_path.as_ref(), options, Some(cancelled))?;
+    stream_prepared_sampler_pattern(
+        &render,
+        Some(cancelled),
+        || writer.is_cancelled(),
+        |block| writer.write_stereo_samples(block),
+    )
+}
+
+fn stream_prepared_sampler_pattern(
+    render: &PreparedSamplerPattern,
+    cancelled: Option<&AtomicBool>,
+    mut stream_cancelled: impl FnMut() -> bool,
+    mut write_block: impl FnMut(&[f32]) -> Result<(), String>,
+) -> Result<SamplerPatternRenderSummary, String> {
+    let release_frames = (f64::from(render.summary.sample_rate) * SAMPLER_RELEASE_SECONDS)
+        .round()
+        .max(1.0) as usize;
+    let mut engine = SamplerVoiceEngine::new(
+        &render.sources_by_channel,
+        &render.notes,
+        render.voice_limit,
+        release_frames,
+        render.summary.sample_rate,
+    );
+    let mut block = vec![0.0f32; SAMPLER_BLOCK_FRAMES * 2];
+    let mut block_start = 0u64;
+    while block_start < render.summary.frames {
+        check_cancelled(cancelled)?;
+        if stream_cancelled() {
+            return Err("Sampler pattern playback was stopped".to_owned());
+        }
+        let frame_count =
+            (render.summary.frames - block_start).min(SAMPLER_BLOCK_FRAMES as u64) as usize;
+        let block_samples = &mut block[..frame_count * 2];
+        engine.render_block(block_start, frame_count, block_samples);
+        write_block(block_samples)?;
+        block_start += frame_count as u64;
+    }
+    let mut summary = render.summary.clone();
+    summary.voices_stolen = engine.voices_stolen;
+    Ok(summary)
 }
 
 fn stream_prepared_audio_clip_render(
@@ -343,6 +489,420 @@ fn prepare_audio_clip_render(
         decoded_by_path,
         clips,
     })
+}
+
+struct PreparedSamplerPattern {
+    summary: SamplerPatternRenderSummary,
+    notes: Vec<ScheduledSamplerNote>,
+    sources_by_channel: HashMap<u16, SamplerVoiceSource>,
+    voice_limit: usize,
+}
+
+#[derive(Clone)]
+struct SamplerVoiceSource {
+    audio: Arc<DecodedAudio>,
+    gain: f32,
+    pan: f32,
+}
+
+#[derive(Clone, Copy)]
+struct ScheduledSamplerNote {
+    start_frame: u64,
+    stop_frame: Option<u64>,
+    channel_id: u16,
+    key: u16,
+    velocity: u8,
+}
+
+fn prepare_sampler_pattern(
+    document: &FlpDocument,
+    project_path: &Path,
+    options: SamplerPatternRenderOptions,
+    cancelled: Option<&AtomicBool>,
+) -> Result<PreparedSamplerPattern, String> {
+    check_cancelled(cancelled)?;
+    if !(8_000..=384_000).contains(&options.sample_rate) {
+        return Err("sampler render rate must be between 8000 and 384000 Hz".to_owned());
+    }
+    if !(1..=MAX_SAMPLER_VOICE_LIMIT).contains(&options.voice_limit) {
+        return Err(format!(
+            "Sampler voice limit must be between 1 and {MAX_SAMPLER_VOICE_LIMIT}"
+        ));
+    }
+    let ppq = document.header().ppq();
+    if ppq == 0 {
+        return Err("project PPQ must be greater than zero".to_owned());
+    }
+    let tempo_bpm = document.metadata().tempo_bpm().unwrap_or(140.0);
+    if !tempo_bpm.is_finite() || tempo_bpm <= 0.0 {
+        return Err("project tempo must be finite and positive".to_owned());
+    }
+    let pattern = document
+        .patterns()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|pattern| pattern.id == options.pattern_id)
+        .ok_or_else(|| format!("pattern {} was not found", options.pattern_id))?;
+    let channels_by_id: HashMap<_, _> = document
+        .channels()
+        .into_iter()
+        .map(|channel| (channel.id(), channel))
+        .collect();
+    let sampler_note_count = pattern
+        .notes
+        .iter()
+        .filter(|note| {
+            channels_by_id.get(&note.channel_id).is_some_and(|channel| {
+                channel.kind() == Some(0) && channel.enabled() != Some(false)
+            })
+        })
+        .count();
+    if sampler_note_count == 0 {
+        return Err(format!(
+            "pattern {} contains no notes on enabled Sampler channels",
+            options.pattern_id
+        ));
+    }
+
+    let resolver = SamplePathResolver::new(project_path);
+    let mut decoded_by_path = HashMap::<PathBuf, Arc<DecodedAudio>>::new();
+    let mut sources_by_channel = HashMap::<u16, SamplerVoiceSource>::new();
+    let mut unresolved_sample_channels = std::collections::BTreeSet::new();
+    let mut notes = Vec::with_capacity(sampler_note_count);
+    let mut skipped_unresolved = 0usize;
+    let mut cached_source_bytes = 0usize;
+    let mut output_frames = 0u64;
+    let release_frames = (f64::from(options.sample_rate) * SAMPLER_RELEASE_SECONDS)
+        .round()
+        .max(1.0) as u64;
+
+    for note in &pattern.notes {
+        check_cancelled(cancelled)?;
+        let Some(channel) = channels_by_id.get(&note.channel_id) else {
+            continue;
+        };
+        if channel.kind() != Some(0) || channel.enabled() == Some(false) {
+            continue;
+        }
+        if let std::collections::hash_map::Entry::Vacant(source_entry) =
+            sources_by_channel.entry(note.channel_id)
+        {
+            let Some(sample_path) = channel.sample_path() else {
+                unresolved_sample_channels.insert(note.channel_id);
+                skipped_unresolved += 1;
+                continue;
+            };
+            let resolved_path = match resolver.resolve(sample_path) {
+                Ok(path) => path,
+                Err(_) => {
+                    unresolved_sample_channels.insert(note.channel_id);
+                    skipped_unresolved += 1;
+                    continue;
+                }
+            };
+            let audio = if let Some(audio) = decoded_by_path.get(&resolved_path) {
+                Arc::clone(audio)
+            } else {
+                let audio = decode_audio_file(&resolved_path).map_err(|error| {
+                    format!(
+                        "could not decode sample for Sampler channel {} at {}: {error}",
+                        note.channel_id,
+                        resolved_path.display()
+                    )
+                })?;
+                if !(1..=2).contains(&audio.channels.len()) {
+                    return Err(format!(
+                        "Sampler channel {} uses a {}-channel sample; only mono and stereo are supported by this renderer",
+                        note.channel_id,
+                        audio.channels.len()
+                    ));
+                }
+                let bytes = decoded_audio_bytes(&audio)?;
+                cached_source_bytes = cached_source_bytes
+                    .checked_add(bytes)
+                    .filter(|total| *total <= MAX_SOURCE_CACHE_BYTES)
+                    .ok_or_else(|| {
+                        format!(
+                            "sampler sources exceed the {} MiB render cache limit",
+                            MAX_SOURCE_CACHE_BYTES / (1024 * 1024)
+                        )
+                    })?;
+                let audio = Arc::new(audio);
+                decoded_by_path.insert(resolved_path, Arc::clone(&audio));
+                audio
+            };
+            let (gain, pan) = channel_gain_pan(channel.volume(), channel.pan());
+            source_entry.insert(SamplerVoiceSource { audio, gain, pan });
+        }
+        let Some(source) = sources_by_channel.get(&note.channel_id) else {
+            continue;
+        };
+        let start_frame = ticks_to_frames(
+            u64::from(note.position),
+            ppq,
+            tempo_bpm,
+            options.sample_rate,
+        )?;
+        // Reading the source here also validates that each prepared channel has usable frames.
+        if source.audio.frame_count() == 0 {
+            return Err(format!(
+                "Sampler channel {} references an empty sample",
+                note.channel_id
+            ));
+        }
+        let stop_frame = if note.length == 0 {
+            None
+        } else {
+            let end_tick = u64::from(note.position)
+                .checked_add(u64::from(note.length))
+                .ok_or_else(|| "Sampler note end position overflow".to_owned())?;
+            Some(
+                ticks_to_frames(end_tick, ppq, tempo_bpm, options.sample_rate)?
+                    .max(start_frame.saturating_add(1)),
+            )
+        };
+        let natural_duration = (source.audio.frame_count() as f64
+            / sampler_source_step(source.audio.sample_rate, options.sample_rate, note.key))
+        .ceil();
+        if !natural_duration.is_finite()
+            || natural_duration < 1.0
+            || natural_duration > u64::MAX as f64
+        {
+            return Err("Sampler sample duration is outside the renderable range".to_owned());
+        }
+        let voice_end_frame = match stop_frame {
+            Some(stop_frame) => stop_frame,
+            None => start_frame
+                .checked_add(natural_duration as u64)
+                .ok_or_else(|| "Sampler render timeline length overflow".to_owned())?,
+        };
+        let tail_frames = if stop_frame.is_some() {
+            release_frames
+        } else {
+            0
+        };
+        output_frames = output_frames.max(
+            voice_end_frame
+                .checked_add(tail_frames)
+                .ok_or_else(|| "Sampler render timeline length overflow".to_owned())?,
+        );
+        notes.push(ScheduledSamplerNote {
+            start_frame,
+            stop_frame,
+            channel_id: note.channel_id,
+            key: note.key,
+            velocity: note.velocity,
+        });
+    }
+
+    if notes.is_empty() {
+        let missing = unresolved_sample_channels
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "pattern {} has sampler notes, but no referenced sample could be resolved (channel IDs: {missing})",
+            options.pattern_id
+        ));
+    }
+    notes.sort_by_key(|note| (note.start_frame, note.channel_id, note.key));
+    Ok(PreparedSamplerPattern {
+        summary: SamplerPatternRenderSummary {
+            frames: output_frames,
+            sample_rate: options.sample_rate,
+            notes_rendered: notes.len(),
+            voices_stolen: 0,
+            sampler_channels_rendered: sources_by_channel.len(),
+            source_files: decoded_by_path.len(),
+            notes_skipped_unresolved_sample: skipped_unresolved,
+            unresolved_sample_channels: unresolved_sample_channels.into_iter().collect(),
+        },
+        notes,
+        sources_by_channel,
+        voice_limit: options.voice_limit,
+    })
+}
+
+struct SamplerVoiceEngine<'a> {
+    sources_by_channel: &'a HashMap<u16, SamplerVoiceSource>,
+    notes: &'a [ScheduledSamplerNote],
+    next_note: usize,
+    voices: Vec<Option<SamplerVoice>>,
+    release_frames: usize,
+    output_sample_rate: u32,
+    voices_stolen: usize,
+}
+
+struct SamplerVoice {
+    source: Arc<DecodedAudio>,
+    source_position: f64,
+    source_step: f64,
+    stop_frame: Option<u64>,
+    started_frame: u64,
+    gain: f32,
+    left_gain: f32,
+    right_gain: f32,
+    release_remaining: Option<usize>,
+}
+
+impl<'a> SamplerVoiceEngine<'a> {
+    fn new(
+        sources_by_channel: &'a HashMap<u16, SamplerVoiceSource>,
+        notes: &'a [ScheduledSamplerNote],
+        voice_limit: usize,
+        release_frames: usize,
+        output_sample_rate: u32,
+    ) -> Self {
+        Self {
+            sources_by_channel,
+            notes,
+            next_note: 0,
+            voices: std::iter::repeat_with(|| None).take(voice_limit).collect(),
+            release_frames,
+            output_sample_rate,
+            voices_stolen: 0,
+        }
+    }
+
+    fn render_block(&mut self, block_start: u64, frame_count: usize, output: &mut [f32]) {
+        output.fill(0.0);
+        for offset in 0..frame_count {
+            let frame = block_start + offset as u64;
+            while self
+                .notes
+                .get(self.next_note)
+                .is_some_and(|note| note.start_frame <= frame)
+            {
+                let note = self.notes[self.next_note];
+                self.next_note += 1;
+                self.start_voice(note);
+            }
+            let output_frame = &mut output[offset * 2..offset * 2 + 2];
+            for voice_slot in &mut self.voices {
+                let Some(voice) = voice_slot.as_mut() else {
+                    continue;
+                };
+                if voice.release_remaining.is_none()
+                    && voice
+                        .stop_frame
+                        .is_some_and(|stop_frame| frame >= stop_frame)
+                {
+                    voice.release_remaining = Some(self.release_frames);
+                }
+                let fade = match voice.release_remaining {
+                    Some(0) => {
+                        *voice_slot = None;
+                        continue;
+                    }
+                    Some(remaining) => remaining as f32 / self.release_frames as f32,
+                    None => 1.0,
+                };
+                let source_frames = voice.source.frame_count();
+                let source_index = voice.source_position.floor() as usize;
+                if source_index >= source_frames {
+                    *voice_slot = None;
+                    continue;
+                }
+                let next_index = source_index.saturating_add(1).min(source_frames - 1);
+                let fraction = (voice.source_position - source_index as f64) as f32;
+                let left = interpolate_sample_at(
+                    &voice.source.channels[0],
+                    source_index,
+                    next_index,
+                    fraction,
+                );
+                let right = if voice.source.channels.len() == 1 {
+                    left
+                } else {
+                    interpolate_sample_at(
+                        &voice.source.channels[1],
+                        source_index,
+                        next_index,
+                        fraction,
+                    )
+                };
+                let gain = voice.gain * fade;
+                output_frame[0] += left * gain * voice.left_gain;
+                output_frame[1] += right * gain * voice.right_gain;
+                voice.source_position += voice.source_step;
+                if let Some(remaining) = voice.release_remaining.as_mut() {
+                    *remaining = remaining.saturating_sub(1);
+                    if *remaining == 0 || voice.source_position >= source_frames as f64 {
+                        *voice_slot = None;
+                    }
+                } else if voice.source_position >= source_frames as f64 {
+                    *voice_slot = None;
+                }
+            }
+        }
+    }
+
+    fn start_voice(&mut self, note: ScheduledSamplerNote) {
+        let Some(source) = self.sources_by_channel.get(&note.channel_id) else {
+            return;
+        };
+        let slot_index = self
+            .voices
+            .iter()
+            .position(Option::is_none)
+            .unwrap_or_else(|| {
+                self.voices
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, voice)| {
+                        voice.as_ref().map(|voice| (index, voice.started_frame))
+                    })
+                    .min_by_key(|(_, started_frame)| *started_frame)
+                    .map(|(index, _)| index)
+                    .expect("voice pool has a positive capacity")
+            });
+        if self.voices[slot_index].is_some() {
+            self.voices_stolen += 1;
+        }
+        let source_step =
+            sampler_source_step(source.audio.sample_rate, self.output_sample_rate, note.key);
+        let (left_gain, right_gain) =
+            sampler_pan_gains(source.pan, source.audio.channels.len() == 1);
+        let velocity_gain = f32::from(note.velocity.min(127)) / 127.0;
+        self.voices[slot_index] = Some(SamplerVoice {
+            source: Arc::clone(&source.audio),
+            source_position: 0.0,
+            source_step,
+            stop_frame: note.stop_frame,
+            started_frame: note.start_frame,
+            gain: source.gain * velocity_gain,
+            left_gain,
+            right_gain,
+            release_remaining: None,
+        });
+    }
+}
+
+fn sampler_pan_gains(pan: f32, mono: bool) -> (f32, f32) {
+    let pan = pan.clamp(-1.0, 1.0);
+    if mono {
+        let angle = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
+        (angle.cos(), angle.sin())
+    } else if pan < 0.0 {
+        (1.0, 1.0 + pan)
+    } else {
+        (1.0 - pan, 1.0)
+    }
+}
+
+fn sampler_source_step(source_rate: u32, output_rate: u32, key: u16) -> f64 {
+    let semitones = (i32::from(key) - i32::from(SAMPLER_ROOT_KEY)).clamp(-48, 48);
+    f64::from(source_rate) / f64::from(output_rate.max(1))
+        * 2.0f64.powf(f64::from(semitones) / 12.0)
+}
+
+fn interpolate_sample_at(samples: &[f32], first: usize, second: usize, fraction: f32) -> f32 {
+    let first = samples[first];
+    let second = samples[second];
+    let first = if first.is_finite() { first } else { 0.0 };
+    let second = if second.is_finite() { second } else { 0.0 };
+    first + (second - first) * fraction
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -833,6 +1393,160 @@ mod tests {
         assert_eq!(channel_gain_pan(Some(5_000), Some(0)), (0.5, -1.0));
         assert_eq!(channel_gain_pan(Some(12_800), Some(12_800)), (1.28, 1.0));
         assert_eq!(channel_gain_pan(None, None), (1.0, 0.0));
+    }
+
+    #[test]
+    fn sampler_voice_starts_at_exact_frame_and_renders_identically_across_blocks() {
+        let source = Arc::new(DecodedAudio {
+            sample_rate: 4,
+            channels: vec![vec![1.0; 16]],
+        });
+        let sources = HashMap::from([(
+            7,
+            SamplerVoiceSource {
+                audio: source,
+                gain: 1.0,
+                pan: 0.0,
+            },
+        )]);
+        let notes = [ScheduledSamplerNote {
+            start_frame: 1,
+            stop_frame: Some(3),
+            channel_id: 7,
+            key: SAMPLER_ROOT_KEY,
+            velocity: 127,
+        }];
+
+        let mut whole_engine = SamplerVoiceEngine::new(&sources, &notes, 4, 4, 4);
+        let mut whole = vec![0.0; 16];
+        whole_engine.render_block(0, 8, &mut whole);
+
+        let mut split_engine = SamplerVoiceEngine::new(&sources, &notes, 4, 4, 4);
+        let mut split = vec![0.0; 16];
+        split_engine.render_block(0, 2, &mut split[..4]);
+        split_engine.render_block(2, 6, &mut split[4..]);
+
+        assert_eq!(whole, split);
+        assert_eq!(&whole[..2], &[0.0, 0.0]);
+        assert!((whole[2] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
+        assert!((whole[3] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
+        assert_eq!(&whole[14..], &[0.0, 0.0]);
+    }
+
+    #[test]
+    fn sampler_voice_resamples_at_output_rate_and_transposes_by_note_key() {
+        let source = Arc::new(DecodedAudio {
+            sample_rate: 8,
+            channels: vec![(0..16).map(|frame| frame as f32).collect()],
+        });
+        let sources = HashMap::from([(
+            2,
+            SamplerVoiceSource {
+                audio: source,
+                gain: 1.0,
+                pan: -1.0,
+            },
+        )]);
+        let notes = [ScheduledSamplerNote {
+            start_frame: 0,
+            stop_frame: Some(100),
+            channel_id: 2,
+            key: SAMPLER_ROOT_KEY + 12,
+            velocity: 127,
+        }];
+        let mut engine = SamplerVoiceEngine::new(&sources, &notes, 1, 4, 4);
+        let mut output = vec![0.0; 8];
+        engine.render_block(0, 4, &mut output);
+
+        assert_eq!(output[2], 4.0);
+        assert_eq!(output[4], 8.0);
+        assert_eq!(output[6], 12.0);
+    }
+
+    #[test]
+    fn zero_length_sampler_note_plays_the_sample_to_its_end() {
+        let source = Arc::new(DecodedAudio {
+            sample_rate: 4,
+            channels: vec![vec![0.25; 4]],
+        });
+        let sources = HashMap::from([(
+            3,
+            SamplerVoiceSource {
+                audio: source,
+                gain: 1.0,
+                pan: -1.0,
+            },
+        )]);
+        let notes = [ScheduledSamplerNote {
+            start_frame: 2,
+            stop_frame: None,
+            channel_id: 3,
+            key: SAMPLER_ROOT_KEY,
+            velocity: 127,
+        }];
+        let mut engine = SamplerVoiceEngine::new(&sources, &notes, 1, 4, 4);
+        let mut output = vec![0.0; 12];
+        engine.render_block(0, 6, &mut output);
+
+        assert_eq!(&output[..4], &[0.0; 4]);
+        assert_eq!(
+            &output[4..12],
+            &[0.25, 0.0, 0.25, 0.0, 0.25, 0.0, 0.25, 0.0]
+        );
+    }
+
+    #[test]
+    fn sampler_voice_pool_steals_the_oldest_active_voice_at_its_limit() {
+        let source_a = Arc::new(DecodedAudio {
+            sample_rate: 4,
+            channels: vec![vec![1.0; 16]],
+        });
+        let source_b = Arc::new(DecodedAudio {
+            sample_rate: 4,
+            channels: vec![vec![2.0; 16]],
+        });
+        let sources = HashMap::from([
+            (
+                1,
+                SamplerVoiceSource {
+                    audio: source_a,
+                    gain: 1.0,
+                    pan: -1.0,
+                },
+            ),
+            (
+                2,
+                SamplerVoiceSource {
+                    audio: source_b,
+                    gain: 1.0,
+                    pan: -1.0,
+                },
+            ),
+        ]);
+        let notes = [
+            ScheduledSamplerNote {
+                start_frame: 0,
+                stop_frame: Some(12),
+                channel_id: 1,
+                key: SAMPLER_ROOT_KEY,
+                velocity: 127,
+            },
+            ScheduledSamplerNote {
+                start_frame: 1,
+                stop_frame: Some(12),
+                channel_id: 2,
+                key: SAMPLER_ROOT_KEY,
+                velocity: 127,
+            },
+        ];
+        let mut engine = SamplerVoiceEngine::new(&sources, &notes, 1, 4, 4);
+        let mut output = vec![0.0; 8];
+        engine.render_block(0, 4, &mut output);
+
+        assert_eq!(engine.voices_stolen, 1);
+        assert_eq!(output[0], 1.0);
+        assert_eq!(output[2], 2.0);
+        assert_eq!(output[3], 0.0);
     }
 
     #[test]

@@ -29,7 +29,7 @@ The foundation. Everything else depends on reading projects exactly.
 | Lossless round-trip (unknown events preserved byte-exact) | `[done]` | Core project invariant: never corrupt what you don't understand |
 | FLP versions 1.x–26.x (FruityLoops era through FL Studio 26) | `[partial]` | Modern versions tested; legacy header variants and old PPQ conventions need corpus testing |
 | Header fields: PPQ, tempo, time signature, project metadata | `[partial]` | Basic fields decoded; full metadata surface unmapped |
-| Channel records: all types (sampler, generator, layer, MIDI out, automation clip) | `[partial]` | Known channel kind values 0/2/3/4/5 are named while unknown raw values are retained; Layer child IDs (`0x5E`) and raw flags (`0x90`) are decoded, and child lists can be edited in the Channel Rack through named channel choices while preserving other channel events. Legacy channel types, Layer playback, and flag editing remain incomplete. |
+| Channel records: all types (sampler, generator, layer, MIDI out, automation clip) | `[partial]` | Known channel kind values 0/2/3/4/5 are named while unknown raw values are retained; `0xC4` sample paths are decoded for kind-0 Sampler and kind-4 sample-backed channels; Layer child IDs (`0x5E`) and raw flags (`0x90`) are decoded, and child lists can be edited in the Channel Rack through named channel choices while preserving other channel events. Legacy channel types, Layer playback, and flag editing remain incomplete. |
 | Pattern/score events: note records, all encodings | `[partial]` | 24-byte records handled; empty-pattern and conflicting-encoding edge cases guarded |
 | Playlist events: clips, tracks, arrangements | `[partial]` | Clip position/length editable; all three record sizes (80/60/32) recognized |
 | Mixer state events | `[partial]` | Reads insert fields and raw `0xE1` records, recognizes candidate volume/pan/EQ parameter IDs and target bits, and can edit an existing record's value by exact record index. Insert-name editing is available. Target-to-visible-track mapping, fader UI, FX state, and routing remain incomplete. |
@@ -98,7 +98,7 @@ where real-time constraints punish sloppy code.
 - `[partial]` Lock-free audio callback: shared CPAL callbacks avoid allocation and locks; the WASAPI exclusive output event loop currently allocates a buffer for each event
 - `[todo]` Lock-free command queue (UI thread → audio thread): transport, parameter changes, note events
 - `[partial]` Lock-free metering/state queue (audio thread → UI thread): input peak is published through an atomic value; a general state queue is not implemented
-- `[todo]` Sample-accurate event scheduling within a buffer (events carry sample offsets, not just buffer indices)
+- `[partial]` Sample-accurate event scheduling within a buffer: selected-pattern Sampler and VST3 previews schedule notes at device-frame offsets; a shared transport command queue for full-song playback is not implemented
 - `[partial]` Underrun/dropout detection and reporting: shared stream errors and exclusive worker errors reach the UI; counting, history, and recovery are not implemented
 - `[todo]` Denormal protection in DSP code
 
@@ -115,8 +115,8 @@ where real-time constraints punish sloppy code.
 
 - `[partial]` Offline: WAV/OGG/FLAC/MP3/AIFF/WavPack decode by content (symphonia + wavicle)
 - `[partial]` Playlist audio clip playback: enabled audio-channel clips are mixed in bounded 1,024-frame blocks and streamed at the device rate, applying decoded channel volume/pan and source offsets. The raw level mapping is provisional and still needs comparison against native FL Studio output. Distinct sources are still decoded into a bounded in-memory cache, and non-default time stretch, automation, routing, pattern clips, and Mixer effects are unsupported.
-- `[todo]` Real-time sampler voice management: polyphony, voice stealing
-- `[todo]` Resampling (project rate vs sample rate vs device rate)
+- `[partial]` Real-time sampler voice management: selected-pattern preview uses a bounded voice pool with oldest-voice stealing, zero-length one-shot notes, and a short release ramp for keyed notes; FL envelope, loop, and polyphony settings are not decoded
+- `[partial]` Resampling (project rate vs sample rate vs device rate): linear interpolation handles input/output rate differences and note-key transposition around an assumed MIDI-60 root; pitch-root metadata and higher-quality resampling remain
 - `[todo]` FL's private RIFF-wrapped Ogg handling in realtime path
 - `[todo]` Reverse playback, ping-pong loop modes
 
@@ -329,11 +329,14 @@ Ordered by dependency and by "most compatibility per unit effort":
 1. **Format completion** — mixer state, automation events, all channel types
    (unlocks reading real-world projects fully)
 2. **Audio engine bring-up (in progress)** — shared device capture/output,
-   Windows WASAPI exclusive access, and block-streamed Playlist audio clip
-   playback with provisional channel volume/pan are implemented; next add real-time
-   sample voices and pattern scheduling, then validate stable playback on each platform
-3. **Realtime sampler + scheduler** — sample-accurate note scheduling, channel
-   gain/pan, basic mixer summing (first true playback)
+   Windows WASAPI exclusive access, block-streamed Playlist audio clip
+   playback, and selected-pattern Sampler preview with provisional channel
+   volume/pan are implemented; next connect pattern clips to transport and
+   validate stable playback on each platform
+3. **Realtime sampler + scheduler (partial)** — selected-pattern Sampler notes
+   now schedule at sample offsets with bounded polyphony, voice stealing, basic
+   sample-rate conversion, and channel gain/pan. Full-song Playlist scheduling,
+   instrument mixing, and parameter-command queues remain
 4. **VST3 realtime processing + state restore** — the compatibility crux
 5. **Full-song offline render** — instruments + samples + FX in one graph
    (validates the engine without realtime pressure)

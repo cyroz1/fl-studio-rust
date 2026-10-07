@@ -7,7 +7,10 @@ use std::process::ExitCode;
 use flp_rebuild::media::{SamplePathResolver, decode_audio_file};
 use flp_rebuild::midi::MidiFile;
 use flp_rebuild::plugins::scan_installed_plugins;
-use flp_rebuild::sample_render::{AudioClipRenderOptions, render_audio_clips_to_wav};
+use flp_rebuild::sample_render::{
+    AudioClipRenderOptions, SamplerPatternRenderOptions, render_audio_clips_to_wav,
+    render_sampler_pattern_to_wav,
+};
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions};
 use flp_rebuild::{
     AutomationPointEdit, FlpDocument, PatternNote, PatternNoteEdit, PlaylistClipEdit,
@@ -44,6 +47,41 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 AudioClipRenderOptions {
                     arrangement_id: parse_u16(arrangement_id, "arrangement id")?,
                     ..AudioClipRenderOptions::default()
+                },
+            )
+        }
+        [command, project, pattern_id, output] if command == "render-pattern-samplers" => {
+            render_pattern_samplers(
+                Path::new(project),
+                parse_u16(pattern_id, "pattern id")?,
+                Path::new(output),
+                SamplerPatternRenderOptions::default(),
+            )
+        }
+        [command, project, pattern_id, output, sample_rate]
+            if command == "render-pattern-samplers" =>
+        {
+            render_pattern_samplers(
+                Path::new(project),
+                parse_u16(pattern_id, "pattern id")?,
+                Path::new(output),
+                SamplerPatternRenderOptions {
+                    sample_rate: parse_u32(sample_rate, "sample rate")?,
+                    ..SamplerPatternRenderOptions::default()
+                },
+            )
+        }
+        [command, project, pattern_id, output, sample_rate, voice_limit]
+            if command == "render-pattern-samplers" =>
+        {
+            render_pattern_samplers(
+                Path::new(project),
+                parse_u16(pattern_id, "pattern id")?,
+                Path::new(output),
+                SamplerPatternRenderOptions {
+                    sample_rate: parse_u32(sample_rate, "sample rate")?,
+                    voice_limit: parse_usize(voice_limit, "voice limit")?,
+                    ..SamplerPatternRenderOptions::default()
                 },
             )
         }
@@ -297,6 +335,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild sample-paths <file.flp>\n",
             "  flp-rebuild audio-info <audio-file>\n",
             "  flp-rebuild render-audio-clips <project.flp> <output.wav> [arrangement-id]\n",
+            "  flp-rebuild render-pattern-samplers <project.flp> <pattern-id> <output.wav> [sample-rate] [voice-limit]\n",
             "  flp-rebuild plugin-states <file.flp>\n",
             "  flp-rebuild channel-events <file.flp> <channel-id>\n",
             "  flp-rebuild patterns <file.flp>\n",
@@ -453,6 +492,45 @@ fn render_pattern_vst3(
     );
     println!(
         "render uses the plug-in's initial state; FLP plug-in state, Playlist clips, Mixer routing, and effects are not applied"
+    );
+    Ok(())
+}
+
+fn render_pattern_samplers(
+    project_path: &Path,
+    pattern_id: u16,
+    output_path: &Path,
+    options: SamplerPatternRenderOptions,
+) -> Result<(), String> {
+    let (_, document) = load_document(project_path)?;
+    let summary = render_sampler_pattern_to_wav(
+        &document,
+        project_path,
+        SamplerPatternRenderOptions {
+            pattern_id,
+            ..options
+        },
+        output_path,
+    )?;
+    println!(
+        "rendered pattern {} Samplers to {}: {} notes, {} channels, {} source files, {:.2} seconds, {} Hz, {} voices stolen",
+        pattern_id,
+        output_path.display(),
+        summary.notes_rendered,
+        summary.sampler_channels_rendered,
+        summary.source_files,
+        summary.frames as f64 / f64::from(summary.sample_rate),
+        summary.sample_rate,
+        summary.voices_stolen,
+    );
+    if !summary.unresolved_sample_channels.is_empty() {
+        println!(
+            "skipped {} notes with unresolved samples on channels {:?}",
+            summary.notes_skipped_unresolved_sample, summary.unresolved_sample_channels,
+        );
+    }
+    println!(
+        "render uses the default C5 sample root; sampler envelopes, loop modes, Playlist arrangement, automation, Mixer routing, and effects are not applied"
     );
     Ok(())
 }
