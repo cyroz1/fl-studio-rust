@@ -9,7 +9,9 @@ use flp_rebuild::midi::MidiFile;
 use flp_rebuild::plugins::scan_installed_plugins;
 use flp_rebuild::sample_render::{AudioClipRenderOptions, render_audio_clips_to_wav};
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions};
-use flp_rebuild::{FlpDocument, PatternNote, PatternNoteEdit, PlaylistClipEdit};
+use flp_rebuild::{
+    AutomationPointEdit, FlpDocument, PatternNote, PatternNoteEdit, PlaylistClipEdit,
+};
 
 fn main() -> ExitCode {
     match run(env::args().skip(1).collect()) {
@@ -26,6 +28,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
         [command, path] if command == "info" => inspect(Path::new(path)),
         [command, path] if command == "channels" => list_channels(Path::new(path)),
         [command, path] if command == "mixer" => list_mixer(Path::new(path)),
+        [command, path] if command == "automation" => list_automation(Path::new(path)),
         [command, path] if command == "sample-paths" => list_sample_paths(Path::new(path)),
         [command, path] if command == "audio-info" => inspect_audio_file(Path::new(path)),
         [command, project, output] if command == "render-audio-clips" => render_audio_clips(
@@ -166,6 +169,19 @@ fn run(args: Vec<String>) -> Result<(), String> {
                     .map_err(|_| "channel pan must be between 0 and 12800".to_owned())?,
             )
         }
+        [command, input, output, channel_id, point_index, position, value, tension]
+            if command == "edit-automation-point" =>
+        {
+            edit_automation_point(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(channel_id, "channel id")?,
+                parse_usize(point_index, "automation point index")?,
+                parse_f64(position, "automation point position")?,
+                parse_f64(value, "automation point value")?,
+                parse_f32(tension, "automation point tension")?,
+            )
+        }
         [command, input, output, pattern_id, channel_id, note_index, position, length, key, velocity]
             if command == "edit-note" =>
         {
@@ -244,6 +260,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild render-pattern-vst3 <project.flp> <pattern-id> <channel-id> <plugin.vst3> <output.wav> [tail-seconds]\n",
             "  flp-rebuild channels <file.flp>\n",
             "  flp-rebuild mixer <file.flp>\n",
+            "  flp-rebuild automation <file.flp>\n",
             "  flp-rebuild sample-paths <file.flp>\n",
             "  flp-rebuild audio-info <audio-file>\n",
             "  flp-rebuild render-audio-clips <project.flp> <output.wav> [arrangement-id]\n",
@@ -258,6 +275,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild set-tempo <input.flp> <output.flp> <bpm>\n",
             "  flp-rebuild rename-channel <input.flp> <output.flp> <channel-id> <name>\n",
             "  flp-rebuild set-channel-levels <input.flp> <output.flp> <channel-id> <volume-0..12800> <pan-0..12800>\n",
+            "  flp-rebuild edit-automation-point <input.flp> <output.flp> <channel-id> <point-index> <position-beats> <value> <tension>\n",
             "  flp-rebuild edit-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index> <position> <length> <key> <velocity>\n",
             "  flp-rebuild add-note <input.flp> <output.flp> <pattern-id> <channel-id> <position> <length> <key> <velocity>\n",
             "  flp-rebuild delete-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index>\n",
@@ -290,6 +308,26 @@ fn parse_u32(value: &str, description: &str) -> Result<u32, String> {
     value
         .parse::<u32>()
         .map_err(|_| format!("{description} must be a non-negative 32-bit integer"))
+}
+
+fn parse_f64(value: &str, description: &str) -> Result<f64, String> {
+    let parsed = value
+        .parse::<f64>()
+        .map_err(|_| format!("{description} must be a finite number"))?;
+    if !parsed.is_finite() {
+        return Err(format!("{description} must be a finite number"));
+    }
+    Ok(parsed)
+}
+
+fn parse_f32(value: &str, description: &str) -> Result<f32, String> {
+    let parsed = value
+        .parse::<f32>()
+        .map_err(|_| format!("{description} must be a finite number"))?;
+    if !parsed.is_finite() {
+        return Err(format!("{description} must be a finite number"));
+    }
+    Ok(parsed)
 }
 
 fn parse_tempo_milli_bpm(value: &str) -> Result<u32, String> {
@@ -791,6 +829,34 @@ fn list_mixer(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn list_automation(path: &Path) -> Result<(), String> {
+    let (_, document) = load_document(path)?;
+    let channels = document
+        .automation_channels()
+        .map_err(|error| format!("could not decode automation points: {error}"))?;
+    println!("automation channels: {}", channels.len());
+    for channel in channels {
+        println!(
+            "channel={} name={} points={} event={:?}",
+            channel.channel_id(),
+            channel.display_name().unwrap_or("(unnamed)"),
+            channel.points().len(),
+            channel.data_event_index()
+        );
+        for (index, point) in channel.points().iter().enumerate() {
+            println!(
+                "  point={} position_beats={:.9} value={:.9} tension={:.7} tail={:02X?}",
+                index,
+                point.position_beats(),
+                point.value(),
+                point.tension(),
+                point.trailing_bytes()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn list_sample_paths(project_path: &Path) -> Result<(), String> {
     let (_, document) = load_document(project_path)?;
     let resolver = SamplePathResolver::new(project_path);
@@ -1189,6 +1255,39 @@ fn set_channel_levels(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "set channel {channel_id} volume to {volume} and pan to {pan} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn edit_automation_point(
+    input: &Path,
+    output: &Path,
+    channel_id: u16,
+    point_index: usize,
+    position_beats: f64,
+    value: f64,
+    tension: f32,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .edit_automation_point(
+            channel_id,
+            point_index,
+            AutomationPointEdit {
+                position_beats: Some(position_beats),
+                value: Some(value),
+                tension: Some(tension),
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "edited automation channel {channel_id} point {point_index} in {}",
         output.display()
     );
     Ok(())

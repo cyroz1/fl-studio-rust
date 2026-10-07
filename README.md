@@ -24,6 +24,7 @@ flp-rebuild channels <file.flp>
 flp-rebuild plugin-states <file.flp>
 flp-rebuild channel-events <file.flp> <channel-id>
 flp-rebuild mixer <file.flp>
+flp-rebuild automation <file.flp>
 flp-rebuild patterns <file.flp>
 flp-rebuild playlist <file.flp> [start] [count]
 flp-rebuild notes <file.flp> <pattern-id> [start] [count]
@@ -33,6 +34,7 @@ flp-rebuild roundtrip <input.flp> <output.flp>
 flp-rebuild set-tempo <input.flp> <output.flp> <bpm>
 flp-rebuild rename-channel <input.flp> <output.flp> <channel-id> <name>
 flp-rebuild set-channel-levels <input.flp> <output.flp> <channel-id> <volume-0..12800> <pan-0..12800>
+flp-rebuild edit-automation-point <input.flp> <output.flp> <channel-id> <point-index> <position-beats> <value> <tension>
 flp-rebuild edit-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index> <position> <length> <key> <velocity>
 flp-rebuild add-note <input.flp> <output.flp> <pattern-id> <channel-id> <position> <length> <key> <velocity>
 flp-rebuild delete-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index>
@@ -59,6 +61,10 @@ The original application's MIDI export experiments and their measured results ar
 ## Channel levels
 
 `channels <file.flp>` reports raw channel volume and pan values when present, along with observed sample source paths. The desktop Channel Rack exposes volume and pan sliders for channels with a valid modern `0xDB` Levels event. `set-channel-levels` edits those first two fields and preserves the remaining event payload. Older byte and word controls are decoded for inspection but remain read-only until their scaling is verified. The audio clip renderer still does not apply channel volume or pan.
+
+## Automation points
+
+`automation <file.flp>` lists point curves from type-5 automation channels. `edit-automation-point` changes an existing point's position in beats, normalized value, and tension while preserving the point's opaque bytes and the blob's header and trailer. Point insertion/removal, parameter links, event automation, and desktop curve editing are not implemented yet.
 
 ## Automated checks and installers
 
