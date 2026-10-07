@@ -3,6 +3,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use eframe::egui::{self, Align2, Color32, FontId, Id, Sense, Stroke, Vec2};
+use flp_rebuild::audio::{
+    AudioAccess, AudioDeviceCatalog, AudioEngine, AudioSettings, enumerate_devices,
+};
 use flp_rebuild::midi::MidiFile;
 use flp_rebuild::plugins::{PluginCandidate, PluginFormat, scan_installed_plugins};
 use flp_rebuild::sample_render::{AudioClipRenderOptions, render_audio_clips_to_wav};
@@ -77,6 +80,7 @@ enum MainView {
     PianoRoll,
     Mixer,
     Plugins,
+    Audio,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -165,12 +169,13 @@ struct PendingMidiImport {
 }
 
 impl MainView {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::Playlist,
         Self::ChannelRack,
         Self::PianoRoll,
         Self::Mixer,
         Self::Plugins,
+        Self::Audio,
     ];
 
     fn label(self) -> &'static str {
@@ -180,6 +185,7 @@ impl MainView {
             Self::PianoRoll => "Piano roll",
             Self::Mixer => "Mixer",
             Self::Plugins => "Plug-ins",
+            Self::Audio => "Audio",
         }
     }
 }
@@ -206,6 +212,11 @@ struct DawUi {
     plugin_candidates: Vec<PluginCandidate>,
     vst3_host: Option<Vst3HostRuntime>,
     channel_vst3_instances: BTreeMap<u16, u64>,
+    audio_catalog: AudioDeviceCatalog,
+    audio_settings: AudioSettings,
+    audio_engine: Option<AudioEngine>,
+    audio_test_tone: bool,
+    audio_monitor_input: bool,
 }
 
 impl DawUi {
@@ -218,6 +229,11 @@ impl DawUi {
         visuals.override_text_color = Some(TEXT);
         creation.egui_ctx.set_visuals(visuals);
         let plugin_candidates = scan_installed_plugins().candidates;
+        let audio_catalog = enumerate_devices();
+        let mut audio_settings = AudioSettings::default();
+        if let Some(rate) = audio_catalog.default_sample_rate {
+            audio_settings.sample_rate = rate;
+        }
         let mut app = Self {
             document: None,
             current_path: None,
@@ -240,6 +256,11 @@ impl DawUi {
             plugin_candidates,
             vst3_host: None,
             channel_vst3_instances: BTreeMap::new(),
+            audio_catalog,
+            audio_settings,
+            audio_engine: None,
+            audio_test_tone: false,
+            audio_monitor_input: false,
         };
         if let Some(path) = initial_project.as_deref() {
             app.open_project(path);
@@ -417,12 +438,13 @@ impl DawUi {
             ui.separator();
             ui.monospace("1:01:000");
             ui.separator();
-            for label in ["Playlist", "Channel Rack", "Piano roll", "Mixer"] {
+            for label in ["Playlist", "Channel Rack", "Piano roll", "Mixer", "Audio"] {
                 if ui.small_button(label).clicked() {
                     self.view = match label {
                         "Channel Rack" => MainView::ChannelRack,
                         "Piano roll" => MainView::PianoRoll,
                         "Mixer" => MainView::Mixer,
+                        "Audio" => MainView::Audio,
                         _ => MainView::Playlist,
                     };
                 }
@@ -1632,6 +1654,285 @@ impl DawUi {
         });
     }
 
+    fn audio_settings_view(&mut self, ui: &mut egui::Ui) {
+        let mut start_requested = false;
+        let mut stop_requested = false;
+
+        ui.horizontal(|ui| {
+            ui.strong("Audio settings");
+            ui.separator();
+            if ui.button("Refresh devices").clicked() {
+                self.audio_catalog = enumerate_devices();
+            }
+        });
+        ui.label(
+            egui::RichText::new(
+                "Select separate input and output devices. The input meter checks capture; monitor input to hear it through the selected output.",
+            )
+            .color(MUTED),
+        );
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.audio_settings.enable_input, "Enable input");
+            ui.checkbox(&mut self.audio_settings.enable_output, "Enable output");
+        });
+
+        let input_name = self
+            .audio_settings
+            .input_device_id
+            .as_ref()
+            .and_then(|id| {
+                self.audio_catalog
+                    .inputs
+                    .iter()
+                    .find(|device| &device.id == id)
+            })
+            .map(|device| device.name.clone())
+            .unwrap_or_else(|| {
+                self.audio_catalog
+                    .default_input_id
+                    .as_ref()
+                    .and_then(|id| {
+                        self.audio_catalog
+                            .inputs
+                            .iter()
+                            .find(|device| &device.id == id)
+                    })
+                    .map(|device| format!("System default · {}", device.name))
+                    .unwrap_or_else(|| "System default input".to_owned())
+            });
+        ui.horizontal(|ui| {
+            ui.label("Input device");
+            egui::ComboBox::from_id_salt("audio_input_device")
+                .selected_text(input_name)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.audio_settings.input_device_id,
+                        None,
+                        "System default input",
+                    );
+                    for device in &self.audio_catalog.inputs {
+                        ui.selectable_value(
+                            &mut self.audio_settings.input_device_id,
+                            Some(device.id.clone()),
+                            &device.name,
+                        );
+                    }
+                });
+        });
+
+        let output_name = self
+            .audio_settings
+            .output_device_id
+            .as_ref()
+            .and_then(|id| {
+                self.audio_catalog
+                    .outputs
+                    .iter()
+                    .find(|device| &device.id == id)
+            })
+            .map(|device| device.name.clone())
+            .unwrap_or_else(|| {
+                self.audio_catalog
+                    .default_output_id
+                    .as_ref()
+                    .and_then(|id| {
+                        self.audio_catalog
+                            .outputs
+                            .iter()
+                            .find(|device| &device.id == id)
+                    })
+                    .map(|device| format!("System default · {}", device.name))
+                    .unwrap_or_else(|| "System default output".to_owned())
+            });
+        ui.horizontal(|ui| {
+            ui.label("Output device");
+            egui::ComboBox::from_id_salt("audio_output_device")
+                .selected_text(output_name)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.audio_settings.output_device_id,
+                        None,
+                        "System default output",
+                    );
+                    for device in &self.audio_catalog.outputs {
+                        ui.selectable_value(
+                            &mut self.audio_settings.output_device_id,
+                            Some(device.id.clone()),
+                            &device.name,
+                        );
+                    }
+                });
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Windows audio API");
+            egui::ComboBox::from_id_salt("audio_access_mode")
+                .selected_text(if self.audio_settings.access == AudioAccess::Exclusive {
+                    "WASAPI · Exclusive"
+                } else if cfg!(target_os = "windows") {
+                    "WASAPI · Shared"
+                } else {
+                    "System audio · Shared"
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.audio_settings.access,
+                        AudioAccess::Shared,
+                        if cfg!(target_os = "windows") {
+                            "WASAPI · Shared"
+                        } else {
+                            "System audio · Shared"
+                        },
+                    );
+                    ui.add_enabled_ui(cfg!(target_os = "windows"), |ui| {
+                        ui.selectable_value(
+                            &mut self.audio_settings.access,
+                            AudioAccess::Exclusive,
+                            "WASAPI · Exclusive",
+                        );
+                    });
+                });
+            if !cfg!(target_os = "windows") {
+                ui.label(
+                    egui::RichText::new("Exclusive device access is Windows-only").color(MUTED),
+                );
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Sample rate");
+            egui::ComboBox::from_id_salt("audio_sample_rate")
+                .selected_text(format!("{} Hz", self.audio_settings.sample_rate))
+                .show_ui(ui, |ui| {
+                    for rate in [44_100, 48_000, 88_200, 96_000, 176_400, 192_000] {
+                        ui.selectable_value(
+                            &mut self.audio_settings.sample_rate,
+                            rate,
+                            format!("{rate} Hz"),
+                        );
+                    }
+                });
+            ui.label("Buffer");
+            egui::ComboBox::from_id_salt("audio_buffer_frames")
+                .selected_text(format!("{} frames", self.audio_settings.buffer_frames))
+                .show_ui(ui, |ui| {
+                    for frames in [64, 128, 256, 512, 1_024, 2_048] {
+                        ui.selectable_value(
+                            &mut self.audio_settings.buffer_frames,
+                            frames,
+                            format!("{frames} frames"),
+                        );
+                    }
+                });
+        });
+        ui.add_space(8.0);
+
+        if self.audio_engine.is_some() {
+            if ui.button("Stop audio engine").clicked() {
+                stop_requested = true;
+            }
+        } else if ui.button("Start audio engine").clicked() {
+            start_requested = true;
+        }
+
+        if let Some(engine) = &self.audio_engine {
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        engine.output_active(),
+                        egui::Button::new(if self.audio_test_tone {
+                            "Stop output check"
+                        } else {
+                            "Play 440 Hz output check"
+                        }),
+                    )
+                    .clicked()
+                {
+                    self.audio_test_tone = !self.audio_test_tone;
+                    if self.audio_test_tone {
+                        self.audio_monitor_input = false;
+                        let _ = engine.set_input_monitor(false);
+                    }
+                    engine.set_test_tone(self.audio_test_tone);
+                }
+                if ui
+                    .add_enabled(
+                        engine.input_active() && engine.output_active(),
+                        egui::Button::new(if self.audio_monitor_input {
+                            "Stop input monitor"
+                        } else {
+                            "Monitor input"
+                        }),
+                    )
+                    .clicked()
+                {
+                    self.audio_monitor_input = !self.audio_monitor_input;
+                    if self.audio_monitor_input {
+                        self.audio_test_tone = false;
+                        engine.set_test_tone(false);
+                    }
+                    if let Err(error) = engine.set_input_monitor(self.audio_monitor_input) {
+                        self.status = error;
+                    }
+                }
+            });
+
+            if engine.input_active() {
+                let peak = engine.input_peak();
+                ui.horizontal(|ui| {
+                    ui.label("Input level");
+                    ui.add(egui::ProgressBar::new(peak).desired_width(260.0));
+                    ui.monospace(format!("{:.1} dBFS", engine.input_level_db()));
+                });
+            } else {
+                ui.label(egui::RichText::new("No input stream is active").color(MUTED));
+            }
+            ui.small("The output check is a quiet 440 Hz tone. Stop it before leaving this page.");
+            if let Some(error) = engine.take_error() {
+                self.status = format!("Audio device error: {error}");
+            }
+        }
+
+        if let Some(error) = &self.audio_catalog.error {
+            ui.label(egui::RichText::new(format!("Device list: {error}")).color(ORANGE));
+        }
+
+        if self.audio_engine.is_some() {
+            ui.label(
+                egui::RichText::new(
+                    "Changes to device, API, rate, and buffer settings apply after restarting the audio engine.",
+                )
+                .color(MUTED),
+            );
+        }
+
+        if stop_requested {
+            self.audio_engine = None;
+            self.audio_test_tone = false;
+            self.audio_monitor_input = false;
+            self.status = "Audio engine stopped".to_owned();
+        } else if start_requested {
+            match AudioEngine::start(&self.audio_settings) {
+                Ok(engine) => {
+                    let mode = self.audio_settings.access.label();
+                    self.audio_engine = Some(engine);
+                    self.audio_test_tone = false;
+                    self.audio_monitor_input = false;
+                    self.status = if cfg!(target_os = "windows") {
+                        format!("WASAPI {mode} audio engine started")
+                    } else {
+                        format!(
+                            "Shared audio engine started at {} Hz",
+                            self.audio_settings.sample_rate
+                        )
+                    };
+                }
+                Err(error) => self.status = format!("Could not start audio engine: {error}"),
+            }
+        }
+    }
+
     fn plugins(&mut self, ui: &mut egui::Ui) {
         let mut refresh = false;
         let mut load_path = None;
@@ -2006,6 +2307,13 @@ impl eframe::App for DawUi {
         {
             self.status = format!("VST3 editor update failed: {error}");
         }
+        if let Some(error) = self.audio_engine.as_ref().and_then(AudioEngine::take_error) {
+            self.status = format!("Audio device error: {error}");
+        }
+        if self.audio_engine.is_some() {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(33));
+        }
         let width = ui.available_width();
         let full_height = ui.available_height();
         ui.vertical(|ui| {
@@ -2040,6 +2348,7 @@ impl eframe::App for DawUi {
                             MainView::PianoRoll => self.piano_roll(ui),
                             MainView::Mixer => self.mixer(ui),
                             MainView::Plugins => self.plugins(ui),
+                            MainView::Audio => self.audio_settings_view(ui),
                         }
                     },
                 );

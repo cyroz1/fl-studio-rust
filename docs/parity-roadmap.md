@@ -87,19 +87,19 @@ where real-time constraints punish sloppy code.
 
 | Item | Status | Notes |
 |---|---|---|
-| Windows: WASAPI (shared + exclusive), DirectSound, ASIO | `[todo]` | ASIO needs a Rust binding or FFI |
-| macOS: CoreAudio | `[todo]` | |
-| Linux: ALSA, PulseAudio/PipeWire, JACK | `[todo]` | |
-| Device enumeration, sample-rate / buffer-size negotiation | `[todo]` | |
-| Recommended starting point: `cpal` crate for cross-platform bring-up | `[todo]` | |
+| Windows: WASAPI (shared + exclusive), DirectSound, ASIO | `[partial]` | Shared capture/output through CPAL and direct WASAPI exclusive streams are implemented, including endpoint selection, rate/buffer settings, input metering/monitoring, and an output test tone. DirectSound and ASIO are not implemented. A shared-mode smoke run opened the current Focusrite endpoints; capture reported one startup discontinuity and then stayed active without further errors for the remainder of the 3-second check. Song playback is not routed through the engine. |
+| macOS: CoreAudio | `[partial]` | The shared CPAL path uses the platform's default audio host; hardware behavior is not verified yet. |
+| Linux: ALSA, PulseAudio/PipeWire, JACK | `[partial]` | The shared CPAL path uses the platform's default host. Cross-platform build/test CI exists; backend and hardware behavior are not verified yet. |
+| Device enumeration, sample-rate / buffer-size negotiation | `[partial]` | CPAL lists endpoints and opens selected/default devices at the requested sample rate and buffer size. Shared mode falls back to the backend's default buffer when a fixed size is rejected; complete capability negotiation is still needed. |
+| Recommended starting point: `cpal` crate for cross-platform bring-up | `[done]` | CPAL is used for shared-mode input and output on desktop platforms. |
 
 ### 3.2 Real-time thread
 
-- `[todo]` Lock-free audio callback: no allocation, no mutexes, no syscalls, no I/O on the audio thread
+- `[partial]` Lock-free audio callback: shared CPAL callbacks avoid allocation and locks; the WASAPI exclusive output event loop currently allocates a buffer for each event
 - `[todo]` Lock-free command queue (UI thread → audio thread): transport, parameter changes, note events
-- `[todo]` Lock-free metering/state queue (audio thread → UI thread)
+- `[partial]` Lock-free metering/state queue (audio thread → UI thread): input peak is published through an atomic value; a general state queue is not implemented
 - `[todo]` Sample-accurate event scheduling within a buffer (events carry sample offsets, not just buffer indices)
-- `[todo]` Underrun/dropout detection and reporting
+- `[partial]` Underrun/dropout detection and reporting: shared stream errors and exclusive worker errors reach the UI; counting, history, and recovery are not implemented
 - `[todo]` Denormal protection in DSP code
 
 ### 3.3 Mixer graph
@@ -123,7 +123,7 @@ where real-time constraints punish sloppy code.
 
 - `[todo]` Audio recording into playlist (per-track input selection)
 - `[todo]` Edison-class audio editor: record, trim, spectral view, scripting
-- `[todo]` Latency-compensated input monitoring
+- `[partial]` Latency-compensated input monitoring: shared and WASAPI-exclusive input monitoring paths exist, but they are not latency compensated.
 
 ---
 
@@ -327,8 +327,9 @@ Ordered by dependency and by "most compatibility per unit effort":
 
 1. **Format completion** — mixer state, automation events, all channel types
    (unlocks reading real-world projects fully)
-2. **Audio engine bring-up** — cpal output + lock-free ring buffer playing the
-   offline render (proves the threading model)
+2. **Audio engine bring-up (in progress)** — shared device capture/output and
+   Windows WASAPI exclusive access are implemented; next route offline sample
+   rendering through the engine and validate stable realtime playback
 3. **Realtime sampler + scheduler** — sample-accurate note scheduling, channel
    gain/pan, basic mixer summing (first true playback)
 4. **VST3 realtime processing + state restore** — the compatibility crux
