@@ -1132,7 +1132,13 @@ impl FlpDocument {
                     detail: "Mixer parameter payload is not a whole number of 12-byte records",
                 });
             }
-            for (record_index, bytes) in event.payload.chunks_exact(RECORD_SIZE).enumerate() {
+            for (record_index, bytes) in event
+                .payload
+                .as_chunks::<RECORD_SIZE>()
+                .0
+                .iter()
+                .enumerate()
+            {
                 records.push(MixerParameterRecord {
                     event_index,
                     record_index,
