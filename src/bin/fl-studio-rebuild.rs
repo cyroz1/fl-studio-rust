@@ -13,9 +13,9 @@ use flp_rebuild::audio::{
 use flp_rebuild::midi::MidiFile;
 use flp_rebuild::plugins::{PluginCandidate, PluginFormat, scan_installed_plugins};
 use flp_rebuild::sample_render::{
-    AudioClipRenderOptions, AudioClipRenderSummary, SamplerPatternRenderOptions,
-    SamplerPatternRenderSummary, render_audio_clips_to_wav, stream_audio_clips_to_device,
-    stream_sampler_pattern_to_device,
+    AudioClipRenderOptions, PlaylistRenderOptions, PlaylistRenderSummary,
+    SamplerPatternRenderOptions, SamplerPatternRenderSummary, render_audio_clips_to_wav,
+    stream_playlist_to_device, stream_sampler_pattern_to_device,
 };
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions, Vst3PatternStreamHandle};
 use flp_rebuild::{
@@ -260,7 +260,7 @@ struct DawUi {
 }
 
 struct PendingAudioRender {
-    receiver: Receiver<Result<AudioClipRenderSummary, String>>,
+    receiver: Receiver<Result<PlaylistRenderSummary, String>>,
     cancelled: Arc<AtomicBool>,
     worker: thread::JoinHandle<()>,
 }
@@ -488,9 +488,10 @@ impl DawUi {
                 return;
             }
         };
-        let options = AudioClipRenderOptions {
+        let options = PlaylistRenderOptions {
             arrangement_id: self.selected_arrangement.unwrap_or(0),
             sample_rate,
+            ..PlaylistRenderOptions::default()
         };
         let writer = match engine.begin_streaming_playback() {
             Ok(writer) => writer,
@@ -508,7 +509,7 @@ impl DawUi {
                 let result = FlpDocument::parse(&project_bytes)
                     .map_err(|error| error.to_string())
                     .and_then(|document| {
-                        stream_audio_clips_to_device(
+                        stream_playlist_to_device(
                             &document,
                             &project_path,
                             options,
@@ -528,7 +529,7 @@ impl DawUi {
                     cancelled,
                     worker,
                 });
-                self.status = "Preparing and streaming Playlist audio…".to_owned();
+                self.status = "Preparing Playlist audio and Sampler notes…".to_owned();
             }
             Err(error) => {
                 self.stop_project_playback();
@@ -560,11 +561,14 @@ impl DawUi {
             match result {
                 Ok(summary) => {
                     self.status = format!(
-                        "Streaming {} Playlist audio clips from {} source files at {} Hz ({} scaled clips skipped); patterns, instruments, and Mixer effects are not rendered",
-                        summary.clips_rendered,
+                        "Playlist finished: {} audio clips, {} Sampler pattern clips, {} Sampler notes, {} source files at {} Hz ({} scaled audio and {} scaled pattern clips skipped); plug-in instruments and Mixer effects are not rendered",
+                        summary.audio_clips_rendered,
+                        summary.sampler_pattern_clips_rendered,
+                        summary.sampler_notes_rendered,
                         summary.source_files,
                         summary.sample_rate,
-                        summary.clips_skipped_unsupported_scale
+                        summary.audio_clips_skipped_unsupported_scale,
+                        summary.pattern_clips_skipped_unsupported_scale,
                     );
                 }
                 Err(error) => {

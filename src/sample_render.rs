@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::audio::StreamingAudioWriter;
 use crate::media::{DecodedAudio, SamplePathResolver, decode_audio_file};
-use crate::{FlpDocument, PlaylistClip, PlaylistClipTarget};
+use crate::{Arrangement, FlpDocument, Pattern, PatternNote, PlaylistClip, PlaylistClipTarget};
 
 const DEFAULT_SAMPLE_RATE: u32 = 44_100;
 const MAX_MIX_BYTES: usize = 512 * 1024 * 1024;
@@ -75,6 +75,37 @@ pub struct AudioClipRenderSummary {
     pub source_files: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PlaylistRenderOptions {
+    pub arrangement_id: u16,
+    pub sample_rate: u32,
+    pub sampler_voice_limit: usize,
+}
+
+impl Default for PlaylistRenderOptions {
+    fn default() -> Self {
+        Self {
+            arrangement_id: 0,
+            sample_rate: DEFAULT_SAMPLE_RATE,
+            sampler_voice_limit: DEFAULT_SAMPLER_VOICE_LIMIT,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlaylistRenderSummary {
+    pub frames: u64,
+    pub sample_rate: u32,
+    pub audio_clips_rendered: usize,
+    pub sampler_pattern_clips_rendered: usize,
+    pub sampler_notes_rendered: usize,
+    pub voices_stolen: usize,
+    pub source_files: usize,
+    pub audio_clips_skipped_unsupported_scale: usize,
+    pub pattern_clips_skipped_unsupported_scale: usize,
+    pub notes_skipped_unresolved_sample: usize,
+}
+
 /// Render audio-channel Playlist clips into a stereo 32-bit-float WAV.
 ///
 /// This early render path uses the project's base tempo, clip positions, observed audio source
@@ -135,6 +166,7 @@ pub fn stream_audio_clips_to_device(
 ) -> Result<AudioClipRenderSummary, String> {
     let render =
         prepare_audio_clip_render(document, project_path.as_ref(), options, Some(cancelled))?;
+    require_audio_clips(&render)?;
     stream_prepared_audio_clip_render(
         &render,
         options.sample_rate,
@@ -144,6 +176,126 @@ pub fn stream_audio_clips_to_device(
         |block| writer.write_stereo_samples(block),
     )?;
     Ok(render.summary)
+}
+
+/// Stream enabled Playlist audio clips and Sampler notes placed by Pattern Clips.
+///
+/// Pattern clips are expanded on the worker thread into sample-offset note events. Audio-device
+/// callbacks continue to consume only complete stereo frames from the bounded streaming queue.
+/// Plugin instruments, automation, time stretching, and Mixer processing are not included yet.
+pub fn stream_playlist_to_device(
+    document: &FlpDocument,
+    project_path: impl AsRef<Path>,
+    options: PlaylistRenderOptions,
+    writer: &StreamingAudioWriter,
+    cancelled: &AtomicBool,
+) -> Result<PlaylistRenderSummary, String> {
+    let project_path = project_path.as_ref();
+    let audio = prepare_audio_clip_render(
+        document,
+        project_path,
+        AudioClipRenderOptions {
+            arrangement_id: options.arrangement_id,
+            sample_rate: options.sample_rate,
+        },
+        Some(cancelled),
+    )?;
+    let sampler = prepare_sampler_arrangement(document, project_path, options, Some(cancelled))?;
+    if audio.clips.is_empty() && sampler.notes.is_empty() {
+        return Err(
+            "arrangement contains no supported audio clips or Sampler notes in Pattern Clips"
+                .to_owned(),
+        );
+    }
+
+    let frames = audio.summary.frames.max(sampler.summary.frames);
+    let mut source_paths: std::collections::BTreeSet<PathBuf> =
+        audio.decoded_by_path.keys().cloned().collect();
+    source_paths.extend(sampler.source_paths.iter().cloned());
+    let mut summary = PlaylistRenderSummary {
+        frames,
+        sample_rate: options.sample_rate,
+        audio_clips_rendered: audio.summary.clips_rendered,
+        sampler_pattern_clips_rendered: sampler.pattern_clips_rendered,
+        sampler_notes_rendered: sampler.summary.notes_rendered,
+        voices_stolen: 0,
+        source_files: source_paths.len(),
+        audio_clips_skipped_unsupported_scale: audio.summary.clips_skipped_unsupported_scale,
+        pattern_clips_skipped_unsupported_scale: sampler.pattern_clips_skipped_unsupported_scale,
+        notes_skipped_unresolved_sample: sampler.summary.notes_skipped_unresolved_sample,
+    };
+
+    summary.voices_stolen = stream_prepared_playlist_render(
+        &audio,
+        &sampler,
+        options,
+        cancelled,
+        || writer.is_cancelled(),
+        |block| writer.write_stereo_samples(block),
+    )?;
+    Ok(summary)
+}
+
+fn stream_prepared_playlist_render(
+    audio: &PreparedAudioClipRender,
+    sampler: &PreparedSamplerArrangement,
+    options: PlaylistRenderOptions,
+    cancelled: &AtomicBool,
+    mut stream_cancelled: impl FnMut() -> bool,
+    mut write_block: impl FnMut(&[f32]) -> Result<(), String>,
+) -> Result<usize, String> {
+    let frames = audio.summary.frames.max(sampler.summary.frames);
+    let release_frames = (f64::from(options.sample_rate) * SAMPLER_RELEASE_SECONDS)
+        .round()
+        .max(1.0) as usize;
+    let mut sampler_engine = SamplerVoiceEngine::new(
+        &sampler.sources_by_channel,
+        &sampler.notes,
+        options.sampler_voice_limit,
+        release_frames,
+        options.sample_rate,
+    );
+    let mut output = vec![0.0f32; STREAM_BLOCK_FRAMES * 2];
+    let mut sampler_block = vec![0.0f32; STREAM_BLOCK_FRAMES * 2];
+    let mut block_start = 0u64;
+    while block_start < frames {
+        check_cancelled(Some(cancelled))?;
+        if stream_cancelled() {
+            return Err("Playlist playback was stopped".to_owned());
+        }
+        let frame_count = (frames - block_start).min(STREAM_BLOCK_FRAMES as u64) as usize;
+        let sample_count = frame_count * 2;
+        let block = &mut output[..sample_count];
+        block.fill(0.0);
+        for clip in &audio.clips {
+            let source = audio
+                .decoded_by_path
+                .get(&clip.path)
+                .expect("prepared audio clips have decoded sources");
+            mix_clip_window_into_stereo(
+                block,
+                block_start,
+                source,
+                clip,
+                options.sample_rate,
+                Some(cancelled),
+            )
+            .map_err(|error| {
+                format!(
+                    "could not mix Playlist clip {} from audio channel {}: {error}",
+                    clip.clip_index, clip.channel_id
+                )
+            })?;
+        }
+        let sampler_samples = &mut sampler_block[..sample_count];
+        sampler_engine.render_block(block_start, frame_count, sampler_samples);
+        for (mixed, sampler_sample) in block.iter_mut().zip(sampler_samples) {
+            *mixed += *sampler_sample;
+        }
+        write_block(block)?;
+        block_start += frame_count as u64;
+    }
+    Ok(sampler_engine.voices_stolen)
 }
 
 /// Render the sample voices in one FLP pattern to a stereo 32-bit-float WAV.
@@ -311,6 +463,7 @@ fn render_audio_clips_to_stereo_buffer_inner(
     cancelled: Option<&AtomicBool>,
 ) -> Result<(Vec<f32>, AudioClipRenderSummary), String> {
     let render = prepare_audio_clip_render(document, project_path, options, cancelled)?;
+    require_audio_clips(&render)?;
     let output_frames = render.summary.frames;
 
     let output_frames_usize = usize::try_from(output_frames)
@@ -409,12 +562,6 @@ fn prepare_audio_clip_render(
         let (gain, pan) = channel_gain_pan(channel.volume(), channel.pan());
         candidate_clips.push((clip_index, clip, id, resolved_path, gain, pan));
     }
-    if candidate_clips.is_empty() {
-        return Err(
-            "arrangement contains no enabled Playlist clips targeting audio channels".to_owned(),
-        );
-    }
-
     let timeline_frames = ticks_to_frames(max_tick, ppq, tempo_bpm, options.sample_rate)?;
     let mut decoded_by_path = HashMap::<PathBuf, DecodedAudio>::new();
     let mut cached_source_bytes = 0usize;
@@ -488,6 +635,348 @@ fn prepare_audio_clip_render(
         },
         decoded_by_path,
         clips,
+    })
+}
+
+fn require_audio_clips(render: &PreparedAudioClipRender) -> Result<(), String> {
+    if render.clips.is_empty() {
+        Err("arrangement contains no enabled Playlist clips targeting audio channels".to_owned())
+    } else {
+        Ok(())
+    }
+}
+
+const MAX_SCHEDULED_SAMPLER_NOTES: usize = 2_000_000;
+
+struct PlacedPatternSamplerNote<'a> {
+    note: &'a PatternNote,
+    start_tick: u64,
+    clipped_stop_tick: Option<u64>,
+    clip_index: usize,
+}
+
+struct PatternSamplerSchedule<'a> {
+    notes: Vec<PlacedPatternSamplerNote<'a>>,
+    clips_skipped_unsupported_scale: usize,
+}
+
+fn schedule_sampler_pattern_clips<'a>(
+    patterns: &'a [Pattern],
+    arrangement: &Arrangement,
+    is_enabled_sampler: impl Fn(u16) -> bool,
+) -> Result<PatternSamplerSchedule<'a>, String> {
+    let patterns_by_id: HashMap<_, _> = patterns
+        .iter()
+        .map(|pattern| (pattern.id, pattern))
+        .collect();
+    let mut schedule = PatternSamplerSchedule {
+        notes: Vec::new(),
+        clips_skipped_unsupported_scale: 0,
+    };
+
+    for (clip_index, clip) in arrangement.clips.iter().enumerate() {
+        let PlaylistClipTarget::Pattern { id } = clip.target() else {
+            continue;
+        };
+        if clip
+            .scale
+            .is_some_and(|scale| !scale.is_finite() || (scale - 1.0).abs() > 1e-9)
+        {
+            schedule.clips_skipped_unsupported_scale += 1;
+            continue;
+        }
+        let Some(pattern) = patterns_by_id.get(&id).copied() else {
+            continue;
+        };
+        let clip_length = u64::from(clip.length_ticks);
+        if clip_length == 0 {
+            continue;
+        }
+        let inferred_length = pattern
+            .notes
+            .iter()
+            .filter(|note| note.length > 0)
+            .try_fold(0u64, |end, note| {
+                let note_end = u64::from(note.position)
+                    .checked_add(u64::from(note.length))
+                    .ok_or_else(|| "pattern note end position overflow".to_owned())?;
+                Ok::<_, String>(end.max(note_end))
+            })?;
+        let loop_length = pattern
+            .length_ticks
+            .map(u64::from)
+            .filter(|length| *length > 0)
+            .unwrap_or(if inferred_length > 0 {
+                inferred_length
+            } else {
+                clip_length
+            });
+        if loop_length == 0 {
+            continue;
+        }
+        let clip_end = u64::from(clip.position_ticks)
+            .checked_add(clip_length)
+            .ok_or_else(|| "Playlist pattern clip end position overflow".to_owned())?;
+        let repetitions = clip_length.div_ceil(loop_length);
+        for repetition in 0..repetitions {
+            let repeat_start = repetition
+                .checked_mul(loop_length)
+                .ok_or_else(|| "pattern repeat position overflow".to_owned())?;
+            for note in &pattern.notes {
+                if !is_enabled_sampler(note.channel_id) {
+                    continue;
+                }
+                let relative_start = repeat_start
+                    .checked_add(u64::from(note.position))
+                    .ok_or_else(|| "repeated pattern note position overflow".to_owned())?;
+                if relative_start >= clip_length {
+                    continue;
+                }
+                if schedule.notes.len() >= MAX_SCHEDULED_SAMPLER_NOTES {
+                    return Err(format!(
+                        "Playlist expands to more than {MAX_SCHEDULED_SAMPLER_NOTES} Sampler note events"
+                    ));
+                }
+                let start_tick = u64::from(clip.position_ticks)
+                    .checked_add(relative_start)
+                    .ok_or_else(|| "Playlist pattern note position overflow".to_owned())?;
+                let clipped_stop_tick = if note.length == 0 {
+                    None
+                } else {
+                    Some(
+                        start_tick
+                            .checked_add(u64::from(note.length))
+                            .ok_or_else(|| {
+                                "Playlist pattern note end position overflow".to_owned()
+                            })?
+                            .min(clip_end),
+                    )
+                };
+                schedule.notes.push(PlacedPatternSamplerNote {
+                    note,
+                    start_tick,
+                    clipped_stop_tick,
+                    clip_index,
+                });
+            }
+        }
+    }
+    schedule
+        .notes
+        .sort_by_key(|placed| (placed.start_tick, placed.clip_index));
+    Ok(schedule)
+}
+
+struct PreparedSamplerArrangement {
+    summary: SamplerPatternRenderSummary,
+    notes: Vec<ScheduledSamplerNote>,
+    sources_by_channel: HashMap<u16, SamplerVoiceSource>,
+    pattern_clips_rendered: usize,
+    pattern_clips_skipped_unsupported_scale: usize,
+    source_paths: std::collections::BTreeSet<PathBuf>,
+}
+
+fn prepare_sampler_arrangement(
+    document: &FlpDocument,
+    project_path: &Path,
+    options: PlaylistRenderOptions,
+    cancelled: Option<&AtomicBool>,
+) -> Result<PreparedSamplerArrangement, String> {
+    check_cancelled(cancelled)?;
+    if !(8_000..=384_000).contains(&options.sample_rate) {
+        return Err("Playlist sample rate must be between 8000 and 384000 Hz".to_owned());
+    }
+    if !(1..=MAX_SAMPLER_VOICE_LIMIT).contains(&options.sampler_voice_limit) {
+        return Err(format!(
+            "Sampler voice limit must be between 1 and {MAX_SAMPLER_VOICE_LIMIT}"
+        ));
+    }
+    let ppq = document.header().ppq();
+    if ppq == 0 {
+        return Err("project PPQ must be greater than zero".to_owned());
+    }
+    let tempo_bpm = document.metadata().tempo_bpm().unwrap_or(140.0);
+    if !tempo_bpm.is_finite() || tempo_bpm <= 0.0 {
+        return Err("project tempo must be finite and positive".to_owned());
+    }
+    let arrangement = document
+        .arrangements()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|arrangement| arrangement.id == options.arrangement_id)
+        .ok_or_else(|| format!("arrangement {} was not found", options.arrangement_id))?;
+    let patterns = document.patterns().map_err(|error| error.to_string())?;
+    let channels_by_id: HashMap<_, _> = document
+        .channels()
+        .into_iter()
+        .map(|channel| (channel.id(), channel))
+        .collect();
+    let schedule = schedule_sampler_pattern_clips(&patterns, &arrangement, |channel_id| {
+        channels_by_id
+            .get(&channel_id)
+            .is_some_and(|channel| channel.kind() == Some(0) && channel.enabled() != Some(false))
+    })?;
+    let sampler_note_count = schedule.notes.len();
+    if sampler_note_count == 0 {
+        return Ok(PreparedSamplerArrangement {
+            summary: SamplerPatternRenderSummary {
+                frames: 0,
+                sample_rate: options.sample_rate,
+                notes_rendered: 0,
+                voices_stolen: 0,
+                sampler_channels_rendered: 0,
+                source_files: 0,
+                notes_skipped_unresolved_sample: 0,
+                unresolved_sample_channels: Vec::new(),
+            },
+            notes: Vec::new(),
+            sources_by_channel: HashMap::new(),
+            pattern_clips_rendered: 0,
+            pattern_clips_skipped_unsupported_scale: schedule.clips_skipped_unsupported_scale,
+            source_paths: std::collections::BTreeSet::new(),
+        });
+    }
+
+    let resolver = SamplePathResolver::new(project_path);
+    let mut decoded_by_path = HashMap::<PathBuf, Arc<DecodedAudio>>::new();
+    let mut sources_by_channel = HashMap::<u16, SamplerVoiceSource>::new();
+    let mut unresolved_sample_channels = std::collections::BTreeSet::new();
+    let mut notes = Vec::with_capacity(sampler_note_count);
+    let mut rendered_pattern_clip_indices = std::collections::BTreeSet::new();
+    let mut skipped_unresolved = 0usize;
+    let mut cached_source_bytes = 0usize;
+    let mut output_frames = 0u64;
+    let release_frames = (f64::from(options.sample_rate) * SAMPLER_RELEASE_SECONDS)
+        .round()
+        .max(1.0) as u64;
+
+    for placed in &schedule.notes {
+        check_cancelled(cancelled)?;
+        let note = placed.note;
+        let Some(channel) = channels_by_id.get(&note.channel_id) else {
+            continue;
+        };
+        if channel.kind() != Some(0) || channel.enabled() == Some(false) {
+            continue;
+        }
+        if let std::collections::hash_map::Entry::Vacant(source_entry) =
+            sources_by_channel.entry(note.channel_id)
+        {
+            let Some(sample_path) = channel.sample_path() else {
+                unresolved_sample_channels.insert(note.channel_id);
+                skipped_unresolved += 1;
+                continue;
+            };
+            let resolved_path = match resolver.resolve(sample_path) {
+                Ok(path) => path,
+                Err(_) => {
+                    unresolved_sample_channels.insert(note.channel_id);
+                    skipped_unresolved += 1;
+                    continue;
+                }
+            };
+            let audio = if let Some(audio) = decoded_by_path.get(&resolved_path) {
+                Arc::clone(audio)
+            } else {
+                let audio = decode_audio_file(&resolved_path).map_err(|error| {
+                    format!(
+                        "could not decode sample for Sampler channel {} at {}: {error}",
+                        note.channel_id,
+                        resolved_path.display()
+                    )
+                })?;
+                if !(1..=2).contains(&audio.channels.len()) {
+                    return Err(format!(
+                        "Sampler channel {} uses a {}-channel sample; only mono and stereo are supported by this renderer",
+                        note.channel_id,
+                        audio.channels.len()
+                    ));
+                }
+                let bytes = decoded_audio_bytes(&audio)?;
+                cached_source_bytes = cached_source_bytes
+                    .checked_add(bytes)
+                    .filter(|total| *total <= MAX_SOURCE_CACHE_BYTES)
+                    .ok_or_else(|| {
+                        format!(
+                            "sampler sources exceed the {} MiB render cache limit",
+                            MAX_SOURCE_CACHE_BYTES / (1024 * 1024)
+                        )
+                    })?;
+                let audio = Arc::new(audio);
+                decoded_by_path.insert(resolved_path, Arc::clone(&audio));
+                audio
+            };
+            let (gain, pan) = channel_gain_pan(channel.volume(), channel.pan());
+            source_entry.insert(SamplerVoiceSource { audio, gain, pan });
+        }
+        let Some(source) = sources_by_channel.get(&note.channel_id) else {
+            continue;
+        };
+        if source.audio.frame_count() == 0 {
+            return Err(format!(
+                "Sampler channel {} references an empty sample",
+                note.channel_id
+            ));
+        }
+        let start_frame = ticks_to_frames(placed.start_tick, ppq, tempo_bpm, options.sample_rate)?;
+        let stop_frame = placed
+            .clipped_stop_tick
+            .map(|stop_tick| {
+                ticks_to_frames(stop_tick, ppq, tempo_bpm, options.sample_rate)
+                    .map(|frame| frame.max(start_frame.saturating_add(1)))
+            })
+            .transpose()?;
+        let natural_duration = (source.audio.frame_count() as f64
+            / sampler_source_step(source.audio.sample_rate, options.sample_rate, note.key))
+        .ceil();
+        if !natural_duration.is_finite()
+            || natural_duration < 1.0
+            || natural_duration > u64::MAX as f64
+        {
+            return Err("Sampler sample duration is outside the renderable range".to_owned());
+        }
+        let voice_end_frame = match stop_frame {
+            Some(stop_frame) => stop_frame,
+            None => start_frame
+                .checked_add(natural_duration as u64)
+                .ok_or_else(|| "Sampler render timeline length overflow".to_owned())?,
+        };
+        let tail_frames = if stop_frame.is_some() {
+            release_frames
+        } else {
+            0
+        };
+        output_frames = output_frames.max(
+            voice_end_frame
+                .checked_add(tail_frames)
+                .ok_or_else(|| "Sampler render timeline length overflow".to_owned())?,
+        );
+        rendered_pattern_clip_indices.insert(placed.clip_index);
+        notes.push(ScheduledSamplerNote {
+            start_frame,
+            stop_frame,
+            channel_id: note.channel_id,
+            key: note.key,
+            velocity: note.velocity,
+        });
+    }
+    notes.sort_by_key(|note| (note.start_frame, note.channel_id, note.key));
+    Ok(PreparedSamplerArrangement {
+        summary: SamplerPatternRenderSummary {
+            frames: output_frames,
+            sample_rate: options.sample_rate,
+            notes_rendered: notes.len(),
+            voices_stolen: 0,
+            sampler_channels_rendered: sources_by_channel.len(),
+            source_files: decoded_by_path.len(),
+            notes_skipped_unresolved_sample: skipped_unresolved,
+            unresolved_sample_channels: unresolved_sample_channels.into_iter().collect(),
+        },
+        notes,
+        sources_by_channel,
+        pattern_clips_rendered: rendered_pattern_clip_indices.len(),
+        pattern_clips_skipped_unsupported_scale: schedule.clips_skipped_unsupported_scale,
+        source_paths: decoded_by_path.keys().cloned().collect(),
     })
 }
 
@@ -1270,9 +1759,186 @@ mod tests {
 
     static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(1);
 
+    fn test_pattern_clip(pattern_id: u16, position_ticks: u32, length_ticks: u32) -> PlaylistClip {
+        PlaylistClip {
+            position_ticks,
+            pattern_base: 0x5000,
+            item_index: 0x5000 + pattern_id,
+            length_ticks,
+            raw_track_index: 0,
+            track_index: Some(0),
+            group: 0,
+            unknown_word: 0,
+            item_flags: 0,
+            header_bytes: [0; 4],
+            start_offset: -1.0,
+            end_offset: -1.0,
+            clip_id: None,
+            reserved: Vec::new(),
+            scale: Some(1.0),
+            trailing_bytes: Vec::new(),
+            record_size: 80,
+            source_event_index: 0,
+            source_record_index: 0,
+        }
+    }
+
     #[test]
     fn converts_project_ticks_to_output_frames() {
         assert_eq!(ticks_to_frames(192, 96, 120.0, 48_000).unwrap(), 48_000);
+    }
+
+    #[test]
+    fn playlist_pattern_clips_place_repeat_and_clip_sampler_notes() {
+        let pattern = Pattern {
+            id: 5,
+            length_ticks: Some(192),
+            notes: vec![
+                PatternNote {
+                    position: 0,
+                    length: 96,
+                    channel_id: 2,
+                    ..PatternNote::default()
+                },
+                PatternNote {
+                    position: 144,
+                    length: 96,
+                    channel_id: 2,
+                    ..PatternNote::default()
+                },
+            ],
+            ..Pattern::default()
+        };
+        let arrangement = Arrangement {
+            id: 0,
+            clips: vec![test_pattern_clip(5, 96, 384)],
+            ..Arrangement::default()
+        };
+
+        let patterns = [pattern];
+        let schedule = schedule_sampler_pattern_clips(&patterns, &arrangement, |_| true).unwrap();
+        assert_eq!(
+            schedule
+                .notes
+                .iter()
+                .map(|placed| (placed.start_tick, placed.clipped_stop_tick))
+                .collect::<Vec<_>>(),
+            vec![
+                (96, Some(192)),
+                (240, Some(336)),
+                (288, Some(384)),
+                (432, Some(480)),
+            ]
+        );
+    }
+
+    #[test]
+    fn one_shot_only_pattern_without_explicit_length_does_not_repeat_per_tick() {
+        let pattern = Pattern {
+            id: 3,
+            notes: vec![PatternNote {
+                position: 12,
+                length: 0,
+                channel_id: 1,
+                ..PatternNote::default()
+            }],
+            ..Pattern::default()
+        };
+        let arrangement = Arrangement {
+            clips: vec![test_pattern_clip(3, 0, 768)],
+            ..Arrangement::default()
+        };
+
+        let patterns = [pattern];
+        let schedule = schedule_sampler_pattern_clips(&patterns, &arrangement, |_| true).unwrap();
+        assert_eq!(schedule.notes.len(), 1);
+        assert_eq!(schedule.notes[0].start_tick, 12);
+        assert_eq!(schedule.notes[0].clipped_stop_tick, None);
+    }
+
+    #[test]
+    fn playlist_stream_mixes_audio_clips_and_sampler_voices_in_each_block() {
+        let path = PathBuf::from("source.wav");
+        let audio = PreparedAudioClipRender {
+            summary: AudioClipRenderSummary {
+                frames: 2,
+                sample_rate: 4,
+                clips_rendered: 1,
+                clips_skipped_unsupported_scale: 0,
+                source_files: 1,
+            },
+            decoded_by_path: HashMap::from([(
+                path.clone(),
+                DecodedAudio {
+                    sample_rate: 4,
+                    channels: vec![vec![1.0, 3.0], vec![2.0, 4.0]],
+                },
+            )]),
+            clips: vec![PreparedClip {
+                clip_index: 0,
+                channel_id: 4,
+                path,
+                start_frame: 0,
+                source_bounds: SampleBounds { start: 0, end: 2 },
+                duration_frames: 2,
+                gain: 0.5,
+                pan: 0.0,
+            }],
+        };
+        let sampler = PreparedSamplerArrangement {
+            summary: SamplerPatternRenderSummary {
+                frames: 2,
+                sample_rate: 4,
+                notes_rendered: 1,
+                voices_stolen: 0,
+                sampler_channels_rendered: 1,
+                source_files: 1,
+                notes_skipped_unresolved_sample: 0,
+                unresolved_sample_channels: Vec::new(),
+            },
+            notes: vec![ScheduledSamplerNote {
+                start_frame: 0,
+                stop_frame: None,
+                channel_id: 2,
+                key: SAMPLER_ROOT_KEY,
+                velocity: 127,
+            }],
+            sources_by_channel: HashMap::from([(
+                2,
+                SamplerVoiceSource {
+                    audio: Arc::new(DecodedAudio {
+                        sample_rate: 4,
+                        channels: vec![vec![2.0; 2]],
+                    }),
+                    gain: 1.0,
+                    pan: -1.0,
+                },
+            )]),
+            pattern_clips_rendered: 1,
+            pattern_clips_skipped_unsupported_scale: 0,
+            source_paths: std::collections::BTreeSet::new(),
+        };
+        let mut rendered = Vec::new();
+
+        let voices_stolen = stream_prepared_playlist_render(
+            &audio,
+            &sampler,
+            PlaylistRenderOptions {
+                arrangement_id: 0,
+                sample_rate: 4,
+                sampler_voice_limit: 4,
+            },
+            &AtomicBool::new(false),
+            || false,
+            |block| {
+                rendered.extend_from_slice(block);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(voices_stolen, 0);
+        assert_eq!(rendered, vec![2.5, 1.0, 3.5, 2.0]);
     }
 
     #[test]

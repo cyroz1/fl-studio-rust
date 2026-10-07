@@ -87,7 +87,7 @@ where real-time constraints punish sloppy code.
 
 | Item | Status | Notes |
 |---|---|---|
-| Windows: WASAPI (shared + exclusive), DirectSound, ASIO | `[partial]` | Shared capture/output through CPAL and direct WASAPI exclusive streams are implemented, including endpoint selection, rate/buffer settings, input metering/monitoring, an output test tone, block-streamed Playlist audio clips with provisional volume/pan mapping, and block-streamed VST3 pattern output through a bounded stereo ring. A 9,600-frame excerpt rendered from `Ookay - Thief.flp` was consumed by both shared and exclusive output on the current machine. A shared-mode input smoke run opened the current Focusrite endpoints; capture reported one startup discontinuity and then stayed active without further errors for the remainder of the 3-second check. These verify current hardware paths, not all endpoints or formats. DirectSound and ASIO are not implemented. |
+| Windows: WASAPI (shared + exclusive), DirectSound, ASIO | `[partial]` | Shared capture/output through CPAL and direct WASAPI exclusive streams are implemented, including endpoint selection, rate/buffer settings, input metering/monitoring, an output test tone, and one bounded Playlist stream that mixes audio clips with Sampler notes placed by Pattern Clips using provisional volume/pan mapping. Block-streamed VST3 pattern output also uses a bounded stereo ring. A 9,600-frame excerpt rendered from `Ookay - Thief.flp` was consumed by both shared and exclusive output on the current machine. A shared-mode input smoke run opened the current Focusrite endpoints; capture reported one startup discontinuity and then stayed active without further errors for the remainder of the 3-second check. These verify current hardware paths, not all endpoints or formats. DirectSound and ASIO are not implemented. |
 | macOS: CoreAudio | `[partial]` | The shared CPAL path uses the platform's default audio host and supports block-streamed Playlist audio; hardware behavior is not verified yet. |
 | Linux: ALSA, PulseAudio/PipeWire, JACK | `[partial]` | The shared CPAL path uses the platform's default audio host and supports block-streamed Playlist audio. Cross-platform build/test CI exists; backend and hardware behavior are not verified yet. |
 | Device enumeration, sample-rate / buffer-size negotiation | `[partial]` | CPAL lists endpoints and opens selected/default devices at the requested sample rate and buffer size. Shared mode falls back to the backend's default buffer when a fixed size is rejected; complete capability negotiation is still needed. |
@@ -98,7 +98,7 @@ where real-time constraints punish sloppy code.
 - `[partial]` Lock-free audio callback: shared CPAL callbacks avoid allocation and locks; the WASAPI exclusive output event loop currently allocates a buffer for each event
 - `[todo]` Lock-free command queue (UI thread → audio thread): transport, parameter changes, note events
 - `[partial]` Lock-free metering/state queue (audio thread → UI thread): input peak is published through an atomic value; a general state queue is not implemented
-- `[partial]` Sample-accurate event scheduling within a buffer: selected-pattern Sampler and VST3 previews schedule notes at device-frame offsets; a shared transport command queue for full-song playback is not implemented
+- `[partial]` Sample-accurate event scheduling within a buffer: selected-pattern previews and Playlist Pattern Clip Sampler notes schedule at device-frame offsets; a shared transport command queue, plug-in transport, and automation scheduling are not implemented
 - `[partial]` Underrun/dropout detection and reporting: shared stream errors and exclusive worker errors reach the UI; counting, history, and recovery are not implemented
 - `[todo]` Denormal protection in DSP code
 
@@ -114,8 +114,8 @@ where real-time constraints punish sloppy code.
 ### 3.4 Sample playback
 
 - `[partial]` Offline: WAV/OGG/FLAC/MP3/AIFF/WavPack decode by content (symphonia + wavicle)
-- `[partial]` Playlist audio clip playback: enabled audio-channel clips are mixed in bounded 1,024-frame blocks and streamed at the device rate, applying decoded channel volume/pan and source offsets. The raw level mapping is provisional and still needs comparison against native FL Studio output. Distinct sources are still decoded into a bounded in-memory cache, and non-default time stretch, automation, routing, pattern clips, and Mixer effects are unsupported.
-- `[partial]` Real-time sampler voice management: selected-pattern preview uses a bounded voice pool with oldest-voice stealing, zero-length one-shot notes, and a short release ramp for keyed notes; FL envelope, loop, and polyphony settings are not decoded
+- `[partial]` Playlist playback: enabled audio-channel clips are mixed in bounded 1,024-frame blocks with decoded channel volume/pan and source offsets; enabled kind-0 Sampler notes from Pattern Clips are scheduled in the same stream. The raw level mapping and pattern repeat/edge behavior are provisional and need comparison against native FL Studio output. Distinct sources are decoded into a bounded in-memory cache; VST instruments, non-default time stretch, automation, routing, clip-state flags, and Mixer effects are unsupported.
+- `[partial]` Real-time sampler voice management: selected-pattern preview and Playlist Pattern Clips use a bounded voice pool with oldest-voice stealing, zero-length one-shot notes, and a short release ramp for keyed notes. Pattern Clips place notes at clip offsets, repeat by explicit pattern length (or a note-length inference when absent), and bound keyed notes at clip ends. FL envelope, loop, root-key, and polyphony settings are not decoded; volume/pan mapping and repeat behavior still need comparison against native output
 - `[partial]` Resampling (project rate vs sample rate vs device rate): linear interpolation handles input/output rate differences and note-key transposition around an assumed MIDI-60 root; pitch-root metadata and higher-quality resampling remain
 - `[todo]` FL's private RIFF-wrapped Ogg handling in realtime path
 - `[todo]` Reverse playback, ping-pong loop modes
@@ -164,7 +164,7 @@ decision, not a roadmap item.
 
 | Item | Status | Notes |
 |---|---|---|
-| VST3 hosting: load, process, native editor | `[partial]` | In-process load and editor open work. The selected pattern/channel can now be processed blockwise on a worker and streamed through shared or WASAPI-exclusive output; the open editor and audio worker use the same loaded instance. The device callback only drains complete stereo frames from a bounded ring. Processing can still underrun, note scheduling is limited to one pattern/channel, Playlist clip expansion and multi-instrument transport are absent, and Mixer processing/full-song playback remain unimplemented. |
+| VST3 hosting: load, process, native editor | `[partial]` | In-process load and editor open work. The selected pattern/channel can be processed blockwise on a worker and streamed through shared or WASAPI-exclusive output; the open editor and audio worker use the same loaded instance. The device callback only drains complete stereo frames from a bounded ring. Playlist Song transport still does not expand VST3 channels, restore project state into the host, schedule multiple instruments, or process the Mixer graph. |
 | VST3 state save/restore via FLP `0xD5` record | `[partial]` | Decodes identity metadata and exposes the exact nested field-53 state bytes without copying; one ZENOLOGY class probe succeeded, but an earlier nested-state probe caused an access violation, and general wrapper conversion/restoration remains unverified. |
 | VST3 parameter automation | `[todo]` | |
 | VST2 hosting | `[todo]` | Distribution of a VST2 host binary requires an applicable legacy Steinberg agreement; no such path is confirmed. Public source must not include Steinberg's VST2 SDK headers. |
@@ -218,7 +218,7 @@ roll is famously deep — the full toolset:
 - `[todo]` Audio clip waveform rendering with zoom
 - `[todo]` Audio clip fades, crossfades, gain envelopes
 - `[todo]` Stretch modes per clip (resample, stretch, e3 generic — needs time-stretch engine)
-- `[todo]` Pattern clips, automation clips on playlist tracks
+- `[partial]` Pattern clips: the selected arrangement expands Sampler notes at clip positions, repeats notes to clip length using explicit pattern lengths or an inferred note span, and clips keyed-note ends at the Playlist boundary. Plugin instruments, automation clips, clip flags, and non-default scale remain unsupported.
 - `[partial]` Time markers and meter records can be read and listed; marker editing and playback-clock behavior remain incomplete
 - `[todo]` Track grouping, mute/solo per playlist track
 - `[todo]` Slip editing, cut/copy/paste/split/merge/join
@@ -329,14 +329,14 @@ Ordered by dependency and by "most compatibility per unit effort":
 1. **Format completion** — mixer state, automation events, all channel types
    (unlocks reading real-world projects fully)
 2. **Audio engine bring-up (in progress)** — shared device capture/output,
-   Windows WASAPI exclusive access, block-streamed Playlist audio clip
-   playback, and selected-pattern Sampler preview with provisional channel
-   volume/pan are implemented; next connect pattern clips to transport and
-   validate stable playback on each platform
-3. **Realtime sampler + scheduler (partial)** — selected-pattern Sampler notes
-   now schedule at sample offsets with bounded polyphony, voice stealing, basic
-   sample-rate conversion, and channel gain/pan. Full-song Playlist scheduling,
-   instrument mixing, and parameter-command queues remain
+   Windows WASAPI exclusive access, and one bounded Playlist stream that mixes
+   audio clips with Sampler notes placed by Pattern Clips are implemented with
+   provisional channel volume/pan. Validate Playlist playback on each platform
+   and compare its timing and levels against native FL Studio output.
+3. **Realtime sampler + scheduler (partial)** — selected-pattern and Playlist
+   Sampler notes schedule at sample offsets with bounded polyphony, voice
+   stealing, basic sample-rate conversion, and channel gain/pan. Plugin
+   instrument transport, tempo automation, envelopes, and command queues remain.
 4. **VST3 realtime processing + state restore** — the compatibility crux
 5. **Full-song offline render** — instruments + samples + FX in one graph
    (validates the engine without realtime pressure)
