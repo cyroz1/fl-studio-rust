@@ -182,6 +182,29 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_f32(tension, "automation point tension")?,
             )
         }
+        [command, input, output, channel_id, point_index, position, value, tension]
+            if command == "insert-automation-point" =>
+        {
+            insert_automation_point(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(channel_id, "channel id")?,
+                parse_usize(point_index, "automation insertion slot")?,
+                parse_f64(position, "automation point position")?,
+                parse_f64(value, "automation point value")?,
+                parse_f32(tension, "automation point tension")?,
+            )
+        }
+        [command, input, output, channel_id, point_index]
+            if command == "delete-automation-point" =>
+        {
+            delete_automation_point(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(channel_id, "channel id")?,
+                parse_usize(point_index, "automation point index")?,
+            )
+        }
         [command, input, output, pattern_id, channel_id, note_index, position, length, key, velocity]
             if command == "edit-note" =>
         {
@@ -276,6 +299,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild rename-channel <input.flp> <output.flp> <channel-id> <name>\n",
             "  flp-rebuild set-channel-levels <input.flp> <output.flp> <channel-id> <volume-0..12800> <pan-0..12800>\n",
             "  flp-rebuild edit-automation-point <input.flp> <output.flp> <channel-id> <point-index> <position-beats> <value> <tension>\n",
+            "  flp-rebuild insert-automation-point <input.flp> <output.flp> <channel-id> <insertion-slot> <position-beats> <value> <tension>\n",
+            "  flp-rebuild delete-automation-point <input.flp> <output.flp> <channel-id> <point-index>\n",
             "  flp-rebuild edit-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index> <position> <length> <key> <velocity>\n",
             "  flp-rebuild add-note <input.flp> <output.flp> <pattern-id> <channel-id> <position> <length> <key> <velocity>\n",
             "  flp-rebuild delete-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index>\n",
@@ -1288,6 +1313,53 @@ fn edit_automation_point(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "edited automation channel {channel_id} point {point_index} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn insert_automation_point(
+    input: &Path,
+    output: &Path,
+    channel_id: u16,
+    point_index: usize,
+    position_beats: f64,
+    value: f64,
+    tension: f32,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .insert_automation_point(channel_id, point_index, position_beats, value, tension)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "inserted automation point at slot {point_index} in channel {channel_id} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn delete_automation_point(
+    input: &Path,
+    output: &Path,
+    channel_id: u16,
+    point_index: usize,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .delete_automation_point(channel_id, point_index)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "deleted automation point {point_index} from channel {channel_id} in {}",
         output.display()
     );
     Ok(())

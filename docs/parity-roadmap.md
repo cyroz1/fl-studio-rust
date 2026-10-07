@@ -33,7 +33,7 @@ The foundation. Everything else depends on reading projects exactly.
 | Pattern/score events: note records, all encodings | `[partial]` | 24-byte records handled; empty-pattern and conflicting-encoding edge cases guarded |
 | Playlist events: clips, tracks, arrangements | `[partial]` | Clip position/length editable; all three record sizes (80/60/32) recognized |
 | Mixer state events | `[partial]` | Reads insert names, raw input/output/color/icon fields from the observed `0x9A`/`0x93`/`0x95` sequence and preserves 12-byte records from `0xE1`; parameter meaning, FX state, and routing edits remain incomplete. |
-| Automation events (channel envelopes, event automation) | `[partial]` | Reads type-5 channel automation points from `0xEA` blobs and edits an existing point's position, normalized value, and tension while preserving the opaque header, point bytes, and era trailer. Event automation, target links, point insertion/deletion, and clip creation remain incomplete. |
+| Automation events (channel envelopes, event automation) | `[partial]` | Reads type-5 channel automation points from `0xEA` blobs and edits, inserts, or removes points while preserving unmodified point bytes and the opaque header and era trailer. Event automation, target links, automation-blob creation, and clip creation remain incomplete. |
 | Time markers, song position markers | `[todo]` | |
 | Project settings: swing, master pitch, metronome, recording settings | `[todo]` | |
 | `set-tempo`, `rename-channel`, note add/edit/delete, clip edit, channel levels | `[done]` | CLI surface; each rewrites only affected bytes |
@@ -69,7 +69,7 @@ The decoded document must model everything the format can express.
 - `[partial]` Patterns: note lists per channel
 - `[partial]` Playlist: tracks, arrangements, clips with targets
 - `[partial]` Mixer: recognized insert summaries and raw `0xE1` parameter records; full 125 inserts, master/sends, track mapping, and editable state remain incomplete
-- `[partial]` Automation: type-5 channel point curves can be read and existing points edited; parameter links, event automation, LFOs, and new clip creation remain incomplete
+- `[partial]` Automation: type-5 channel point curves can be read and points in an existing blob edited, inserted, or removed; parameter links, event automation, LFOs, and new clip creation remain incomplete
 - `[todo]` Time signatures per pattern/arrangement, tempo automation
 - `[todo]` Channel groups, colors, icons
 - `[todo]` Swing / groove settings per channel
@@ -250,7 +250,7 @@ roll is famously deep — the full toolset:
 
 ## 11. Automation system
 
-- `[partial]` Type-5 channel points: read and edit existing point position, normalized value, and tension in `0xEA` blobs while preserving opaque point/header/trailer bytes; desktop curve editing, insertion/removal, and interpolation rendering remain incomplete
+- `[partial]` Type-5 channel points: read/edit/insert/remove points in existing `0xEA` blobs while preserving unmodified point bytes and opaque header/trailer data; desktop curve editing and interpolation rendering remain incomplete
 - `[todo]` Event automation (pattern-scoped)
 - `[todo]` "Create automation clip" / "Link to controller" for any parameter
 - `[todo]` Internal controllers: LFO, envelope, formula, peak, X-Y, keyboard

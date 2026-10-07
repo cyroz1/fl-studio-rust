@@ -1754,19 +1754,11 @@ impl FlpDocument {
             ));
         };
 
-        if let Some(value) = edit.value
-            && (!value.is_finite() || !(-0.001..=1.001).contains(&value))
-        {
-            return Err(FlpError::UnsupportedEdit(
-                "automation point values must be finite and between -0.001 and 1.001",
-            ));
+        if let Some(value) = edit.value {
+            validate_automation_point_value(value)?;
         }
-        if let Some(tension) = edit.tension
-            && (!tension.is_finite() || !(-1.0..=1.0).contains(&tension))
-        {
-            return Err(FlpError::UnsupportedEdit(
-                "automation point tension must be finite and between -1 and 1",
-            ));
+        if let Some(tension) = edit.tension {
+            validate_automation_point_tension(tension)?;
         }
 
         if let Some(position) = edit.position_beats {
@@ -1824,6 +1816,208 @@ impl FlpDocument {
         if let Some(tension) = edit.tension {
             payload[point_offset + 16..point_offset + 20].copy_from_slice(&tension.to_le_bytes());
         }
+
+        self.events[event_index].replace_data_payload(payload)?;
+        self.refresh_event_offsets()?;
+        Ok(())
+    }
+
+    /// Inserts a point into an existing type-5 channel automation blob.
+    ///
+    /// `point_index` is an insertion slot and may equal the current point count.
+    /// The new point receives zeroed opaque tail bytes; existing point bytes and
+    /// any era-specific payload trailer are retained. Channels without an
+    /// existing `0xEA` blob are not created implicitly because their header
+    /// format is not established.
+    pub fn insert_automation_point(
+        &mut self,
+        channel_id: u16,
+        point_index: usize,
+        position_beats: f64,
+        value: f64,
+        tension: f32,
+    ) -> Result<(), FlpError> {
+        let channels = self.channels();
+        let mut matching = channels.iter().filter(|channel| channel.id == channel_id);
+        let Some(channel) = matching.next() else {
+            return Err(FlpError::ChannelNotFound(channel_id));
+        };
+        if matching.next().is_some() {
+            return Err(FlpError::AmbiguousChannelId(channel_id));
+        }
+        if channel.kind != Some(5) {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel is not a type-5 automation channel",
+            ));
+        }
+        let event_index = channel
+            .event_range()
+            .find(|index| self.events[*index].opcode == 0xEA)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the selected automation channel has no existing 0xEA point blob",
+            ))?;
+        let points = decode_automation_points(&self.events[event_index])?;
+        if point_index > points.len() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested automation insertion slot does not exist",
+            ));
+        }
+        validate_automation_point_value(value)?;
+        validate_automation_point_tension(tension)?;
+
+        let previous_position = if point_index == 0 {
+            0.0
+        } else {
+            points[point_index - 1].position_beats
+        };
+        let next_position = points
+            .get(point_index)
+            .map(|next_point| next_point.position_beats);
+        if !position_beats.is_finite()
+            || !previous_position.is_finite()
+            || next_position.is_some_and(|position| !position.is_finite())
+            || position_beats < previous_position
+            || next_position.is_some_and(|position| position_beats > position)
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "automation point positions must remain finite, non-negative, and ordered",
+            ));
+        }
+
+        let new_count = u32::try_from(
+            points
+                .len()
+                .checked_add(1)
+                .ok_or(FlpError::LengthOverflow)?,
+        )
+        .map_err(|_| FlpError::LengthOverflow)?;
+        let original = self.events[event_index].payload.clone();
+        let insertion_offset = FLP_AUTOMATION_POINTS_OFFSET
+            .checked_add(
+                point_index
+                    .checked_mul(FLP_AUTOMATION_POINT_SIZE)
+                    .ok_or(FlpError::LengthOverflow)?,
+            )
+            .ok_or(FlpError::LengthOverflow)?;
+        let point_bytes_length = points
+            .len()
+            .checked_mul(FLP_AUTOMATION_POINT_SIZE)
+            .ok_or(FlpError::LengthOverflow)?;
+        let old_points_end = FLP_AUTOMATION_POINTS_OFFSET
+            .checked_add(point_bytes_length)
+            .ok_or(FlpError::LengthOverflow)?;
+        let capacity = original
+            .len()
+            .checked_add(FLP_AUTOMATION_POINT_SIZE)
+            .ok_or(FlpError::LengthOverflow)?;
+        let mut payload = Vec::with_capacity(capacity);
+        payload.extend_from_slice(&original[..FLP_AUTOMATION_POINTS_OFFSET]);
+        payload[FLP_AUTOMATION_COUNT_OFFSET..FLP_AUTOMATION_POINTS_OFFSET]
+            .copy_from_slice(&new_count.to_le_bytes());
+        payload.extend_from_slice(&original[FLP_AUTOMATION_POINTS_OFFSET..insertion_offset]);
+        let inserted_point_offset = payload.len();
+        payload.extend_from_slice(&(position_beats - previous_position).to_le_bytes());
+        payload.extend_from_slice(&value.to_le_bytes());
+        payload.extend_from_slice(&tension.to_le_bytes());
+        payload.extend_from_slice(&[0; 4]);
+        payload.extend_from_slice(&original[insertion_offset..old_points_end]);
+        if let Some(next_position) = next_position {
+            let next_delta = next_position - position_beats;
+            let next_delta_offset = inserted_point_offset
+                .checked_add(FLP_AUTOMATION_POINT_SIZE)
+                .ok_or(FlpError::LengthOverflow)?;
+            let next_delta_end = next_delta_offset
+                .checked_add(8)
+                .ok_or(FlpError::LengthOverflow)?;
+            payload[next_delta_offset..next_delta_end].copy_from_slice(&next_delta.to_le_bytes());
+        }
+        payload.extend_from_slice(&original[old_points_end..]);
+
+        self.events[event_index].replace_data_payload(payload)?;
+        self.refresh_event_offsets()?;
+        Ok(())
+    }
+
+    /// Removes one point from an existing type-5 channel automation blob.
+    /// The next point's delta is adjusted to retain its absolute position, and
+    /// the original opaque header and era-specific trailer are preserved.
+    pub fn delete_automation_point(
+        &mut self,
+        channel_id: u16,
+        point_index: usize,
+    ) -> Result<(), FlpError> {
+        let channels = self.channels();
+        let mut matching = channels.iter().filter(|channel| channel.id == channel_id);
+        let Some(channel) = matching.next() else {
+            return Err(FlpError::ChannelNotFound(channel_id));
+        };
+        if matching.next().is_some() {
+            return Err(FlpError::AmbiguousChannelId(channel_id));
+        }
+        if channel.kind != Some(5) {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel is not a type-5 automation channel",
+            ));
+        }
+        let event_index = channel
+            .event_range()
+            .find(|index| self.events[*index].opcode == 0xEA)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the selected automation channel has no existing 0xEA point blob",
+            ))?;
+        let points = decode_automation_points(&self.events[event_index])?;
+        if point_index >= points.len() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested automation point does not exist",
+            ));
+        }
+
+        let new_count = u32::try_from(points.len() - 1).map_err(|_| FlpError::LengthOverflow)?;
+        let original = self.events[event_index].payload.clone();
+        let point_bytes_length = points
+            .len()
+            .checked_mul(FLP_AUTOMATION_POINT_SIZE)
+            .ok_or(FlpError::LengthOverflow)?;
+        let old_points_end = FLP_AUTOMATION_POINTS_OFFSET
+            .checked_add(point_bytes_length)
+            .ok_or(FlpError::LengthOverflow)?;
+        let removed_offset = FLP_AUTOMATION_POINTS_OFFSET
+            .checked_add(
+                point_index
+                    .checked_mul(FLP_AUTOMATION_POINT_SIZE)
+                    .ok_or(FlpError::LengthOverflow)?,
+            )
+            .ok_or(FlpError::LengthOverflow)?;
+        let removed_end = removed_offset
+            .checked_add(FLP_AUTOMATION_POINT_SIZE)
+            .ok_or(FlpError::LengthOverflow)?;
+        let capacity = original
+            .len()
+            .checked_sub(FLP_AUTOMATION_POINT_SIZE)
+            .ok_or(FlpError::LengthOverflow)?;
+        let mut payload = Vec::with_capacity(capacity);
+        payload.extend_from_slice(&original[..FLP_AUTOMATION_POINTS_OFFSET]);
+        payload[FLP_AUTOMATION_COUNT_OFFSET..FLP_AUTOMATION_POINTS_OFFSET]
+            .copy_from_slice(&new_count.to_le_bytes());
+        payload.extend_from_slice(&original[FLP_AUTOMATION_POINTS_OFFSET..removed_offset]);
+        payload.extend_from_slice(&original[removed_end..old_points_end]);
+        if let Some(next_point) = points.get(point_index + 1) {
+            let previous_position = if point_index == 0 {
+                0.0
+            } else {
+                points[point_index - 1].position_beats
+            };
+            let next_delta = next_point.position_beats - previous_position;
+            if !previous_position.is_finite() || !next_delta.is_finite() || next_delta < 0.0 {
+                return Err(FlpError::UnsupportedEdit(
+                    "automation point positions must remain finite, non-negative, and ordered",
+                ));
+            }
+            let next_delta_offset = removed_offset;
+            payload[next_delta_offset..next_delta_offset + 8]
+                .copy_from_slice(&next_delta.to_le_bytes());
+        }
+        payload.extend_from_slice(&original[old_points_end..]);
 
         self.events[event_index].replace_data_payload(payload)?;
         self.refresh_event_offsets()?;
@@ -2145,6 +2339,24 @@ fn decode_automation_points(event: &FlpEvent) -> Result<Vec<AutomationPoint>, Fl
         });
     }
     Ok(points)
+}
+
+fn validate_automation_point_value(value: f64) -> Result<(), FlpError> {
+    if !value.is_finite() || !(-0.001..=1.001).contains(&value) {
+        return Err(FlpError::UnsupportedEdit(
+            "automation point values must be finite and between -0.001 and 1.001",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_automation_point_tension(tension: f32) -> Result<(), FlpError> {
+    if !tension.is_finite() || !(-1.0..=1.0).contains(&tension) {
+        return Err(FlpError::UnsupportedEdit(
+            "automation point tension must be finite and between -1 and 1",
+        ));
+    }
+    Ok(())
 }
 
 fn decode_playlist_clip(
@@ -2713,6 +2925,25 @@ mod tests {
         flp_fixture(&event_stream, &[], &[])
     }
 
+    fn automation_channel_fixture(points: &[(f64, f64, f32, [u8; 4])], trailer: &[u8]) -> Vec<u8> {
+        let mut payload = vec![0xA7; 17];
+        payload.extend_from_slice(&(points.len() as u32).to_le_bytes());
+        let mut previous_position = 0.0;
+        for (position, value, tension, tail) in points {
+            payload.extend_from_slice(&(*position - previous_position).to_le_bytes());
+            payload.extend_from_slice(&value.to_le_bytes());
+            payload.extend_from_slice(&tension.to_le_bytes());
+            payload.extend_from_slice(tail);
+            previous_position = *position;
+        }
+        payload.extend_from_slice(trailer);
+
+        let mut event_stream = vec![0x40, 9, 0, 0x15, 5];
+        append_data_event(&mut event_stream, 0xEA, &payload);
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        flp_fixture(&event_stream, &[], &[])
+    }
+
     fn midi_fixture(track: &[u8], division: u16) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"MThd");
@@ -3208,6 +3439,92 @@ mod tests {
 
         assert!(matches!(error, FlpError::UnsupportedEdit(_)));
         assert_eq!(document.encode_lossless().unwrap(), project_bytes);
+    }
+
+    #[test]
+    fn automation_point_insert_delete_preserves_headers_trailers_and_original_bytes() {
+        let source_points = [
+            (1.0, 0.25, -0.25, [1, 2, 3, 4]),
+            (3.0, 0.75, 0.5, [5, 6, 7, 8]),
+        ];
+
+        for trailer_length in [112, 136] {
+            let trailer = (0..trailer_length)
+                .map(|index| (index * 13 % 256) as u8)
+                .collect::<Vec<_>>();
+            let original = automation_channel_fixture(&source_points, &trailer);
+            let mut document =
+                FlpDocument::parse(&original).expect("automation fixture should parse");
+            let original_payload = document
+                .events()
+                .iter()
+                .find(|event| event.opcode() == 0xEA)
+                .expect("fixture should contain an automation event")
+                .payload()
+                .to_vec();
+
+            document
+                .insert_automation_point(9, 1, 2.0, 0.5, 0.0)
+                .expect("inserting between ordered points should succeed");
+            let inserted = document.automation_channels().unwrap().remove(0);
+            assert_eq!(inserted.points().len(), 3);
+            assert_eq!(inserted.points()[0].position_beats(), 1.0);
+            assert_eq!(inserted.points()[1].position_beats(), 2.0);
+            assert_eq!(inserted.points()[2].position_beats(), 3.0);
+            assert_eq!(inserted.points()[0].trailing_bytes(), [1, 2, 3, 4]);
+            assert_eq!(inserted.points()[1].trailing_bytes(), [0; 4]);
+            assert_eq!(inserted.points()[2].trailing_bytes(), [5, 6, 7, 8]);
+
+            let inserted_payload =
+                document.events()[inserted.data_event_index().unwrap()].payload();
+            assert_eq!(&inserted_payload[..17], &original_payload[..17]);
+            assert_eq!(
+                &inserted_payload[inserted_payload.len() - trailer_length..],
+                trailer
+            );
+
+            document
+                .delete_automation_point(9, 1)
+                .expect("deleting the inserted point should succeed");
+            assert_eq!(document.encode_lossless().unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn automation_point_delete_retains_absolute_positions_at_curve_edges() {
+        let source_points = [
+            (1.0, 0.1, 0.0, [1, 1, 1, 1]),
+            (3.0, 0.5, 0.0, [2, 2, 2, 2]),
+            (4.0, 0.9, 0.0, [3, 3, 3, 3]),
+        ];
+        let trailer = vec![0xD3; 112];
+
+        for (deleted_index, expected_positions, expected_tails) in [
+            (0, [3.0, 4.0], [[2, 2, 2, 2], [3, 3, 3, 3]]),
+            (2, [1.0, 3.0], [[1, 1, 1, 1], [2, 2, 2, 2]]),
+        ] {
+            let mut document =
+                FlpDocument::parse(&automation_channel_fixture(&source_points, &trailer))
+                    .expect("automation fixture should parse");
+            document
+                .delete_automation_point(9, deleted_index)
+                .expect("deleting an edge point should succeed");
+            let channel = document.automation_channels().unwrap().remove(0);
+            assert_eq!(channel.points().len(), 2);
+            for index in 0..2 {
+                assert_eq!(
+                    channel.points()[index].position_beats(),
+                    expected_positions[index]
+                );
+                assert_eq!(
+                    channel.points()[index].trailing_bytes(),
+                    expected_tails[index]
+                );
+            }
+
+            let payload = document.events()[channel.data_event_index().unwrap()].payload();
+            assert_eq!(&payload[payload.len() - trailer.len()..], trailer);
+        }
     }
 
     #[test]
