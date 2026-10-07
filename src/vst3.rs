@@ -4,11 +4,15 @@
 //! while preserving their complete raw bytes. This runtime does not translate
 //! Image-Line's FLP state envelope into the state stream expected by every VST3.
 
+use std::collections::VecDeque;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
+use std::thread;
 
+use crate::audio::StreamingAudioWriter;
 use vst3_host::audio::AudioBuffers;
 use vst3_host::midi::{MidiChannel, MidiEvent};
 use vst3_host::{Plugin, PluginInfo, PluginWindow, Vst3Host};
@@ -41,6 +45,63 @@ struct PreparedPatternRender {
     output_channels: usize,
     block_size: usize,
     total_frames: u64,
+}
+
+/// A prepared VST3 pattern render that can stream processed blocks to a live audio device.
+pub struct Vst3PatternStream {
+    plugin: Arc<Mutex<Plugin>>,
+    render: PreparedPatternRender,
+}
+
+/// A running pattern stream with completion and worker-lifecycle handles.
+pub struct Vst3PatternStreamHandle {
+    receiver: Receiver<Result<Vst3RenderSummary, String>>,
+    worker: thread::JoinHandle<()>,
+}
+
+impl Vst3PatternStreamHandle {
+    /// Poll for the VST3 block-render worker's final result without waiting.
+    pub fn try_recv(&self) -> Result<Result<Vst3RenderSummary, String>, mpsc::TryRecvError> {
+        self.receiver.try_recv()
+    }
+
+    /// Whether the worker has exited and can be joined without waiting for plug-in processing.
+    pub fn is_finished(&self) -> bool {
+        self.worker.is_finished()
+    }
+
+    /// Join the worker after playback has been cancelled or completed.
+    pub fn join(self) -> thread::Result<()> {
+        self.worker.join()
+    }
+}
+
+impl Vst3PatternStream {
+    /// Start rendering on a worker and return a receiver for its completion result.
+    ///
+    /// The existing loaded VST3 instance is used, so its current editor state remains the
+    /// playback state. Processing locks the instance only for each block; ring-buffer backpressure
+    /// happens after releasing the plug-in lock.
+    pub fn start(
+        self,
+        writer: StreamingAudioWriter,
+        output_sample_rate: u32,
+    ) -> Result<Vst3PatternStreamHandle, String> {
+        if output_sample_rate == 0 {
+            return Err("audio output sample rate must be positive".to_owned());
+        }
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name("vst3-pattern-stream".to_owned())
+            .spawn(move || {
+                let result =
+                    stream_pattern_render(self.plugin, self.render, &writer, output_sample_rate);
+                writer.finish();
+                let _ = sender.send(result);
+            })
+            .map_err(|error| format!("could not start VST3 render worker: {error}"))?;
+        Ok(Vst3PatternStreamHandle { receiver, worker })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -315,6 +376,29 @@ impl Vst3HostRuntime {
         ))
     }
 
+    /// Prepare a single pattern channel for blockwise streaming through its loaded VST3.
+    pub fn prepare_pattern_channel_stream(
+        &self,
+        id: u64,
+        notes: &[PatternNote],
+        options: Vst3PatternRenderOptions,
+    ) -> Result<Vst3PatternStream, String> {
+        let plugin = self.plugin(id)?.clone();
+        let render = {
+            let plugin_guard = plugin
+                .lock()
+                .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
+            prepare_pattern_render(&plugin_guard, notes, options)?
+        };
+        if !(1..=2).contains(&render.output_channels) {
+            return Err(format!(
+                "VST3 streaming supports mono or stereo output buses; this instrument has {} channels",
+                render.output_channels
+            ));
+        }
+        Ok(Vst3PatternStream { plugin, render })
+    }
+
     /// Service native editor close/resize requests and the VST3 UI run loop where needed.
     pub fn service_editors(&mut self) -> Result<(), String> {
         for loaded in &mut self.loaded {
@@ -472,6 +556,217 @@ fn process_pattern_render(
     let stop_result = plugin.stop_processing().map_err(|error| error.to_string());
     render_result?;
     stop_result
+}
+
+fn stream_pattern_render(
+    plugin: Arc<Mutex<Plugin>>,
+    render: PreparedPatternRender,
+    writer: &StreamingAudioWriter,
+    output_sample_rate: u32,
+) -> Result<Vst3RenderSummary, String> {
+    let mut resampler = StereoStreamResampler::new(render.sample_rate_u32, output_sample_rate)?;
+    {
+        let mut plugin = plugin
+            .lock()
+            .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
+        plugin
+            .start_processing()
+            .map_err(|error| error.to_string())?;
+    }
+
+    let render_result = (|| {
+        let mut rendered_frames = 0_u64;
+        let mut event_index = 0;
+        while rendered_frames < render.total_frames {
+            if writer.is_cancelled() {
+                return Err("VST3 pattern stream was stopped".to_owned());
+            }
+            let frame_count =
+                (render.total_frames - rendered_frames).min(render.block_size as u64) as usize;
+            let block_end = rendered_frames + frame_count as u64;
+            let mut buffers =
+                AudioBuffers::new(0, render.output_channels, frame_count, render.sample_rate);
+            let output = {
+                let mut plugin = plugin
+                    .lock()
+                    .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
+                while let Some(event) = render.events.get(event_index)
+                    && event.frame < block_end
+                {
+                    let offset = event.frame.saturating_sub(rendered_frames) as i32;
+                    plugin
+                        .send_midi_event_at(event.event, offset)
+                        .map_err(|error| error.to_string())?;
+                    event_index += 1;
+                }
+                plugin
+                    .process_audio(&mut buffers)
+                    .map_err(|error| error.to_string())?;
+                if buffers.outputs.len() != render.output_channels
+                    || buffers
+                        .outputs
+                        .iter()
+                        .any(|channel| channel.len() < frame_count)
+                {
+                    return Err("VST3 returned audio buffers with an unexpected shape".to_owned());
+                }
+                resampler.push_outputs(&buffers.outputs, frame_count, render.output_channels)?
+            };
+            writer.write_stereo_samples(&output)?;
+            rendered_frames = block_end;
+        }
+        let output = resampler.finish()?;
+        writer.write_stereo_samples(&output)?;
+        Ok(Vst3RenderSummary {
+            frames: render.total_frames,
+            sample_rate: render.sample_rate_u32,
+            output_channels: render.output_channels,
+            notes_rendered: render.note_count,
+        })
+    })();
+    let stop_result = plugin
+        .lock()
+        .map_err(|_| "plug-in state lock was poisoned".to_owned())?
+        .stop_processing()
+        .map_err(|error| error.to_string());
+    match (render_result, stop_result) {
+        (Err(render_error), _) => Err(render_error),
+        (Ok(_), Err(stop_error)) => Err(stop_error),
+        (Ok(summary), Ok(())) => Ok(summary),
+    }
+}
+
+struct StereoStreamResampler {
+    source_rate: f64,
+    output_rate: f64,
+    source_frames: u64,
+    output_frames: u64,
+    buffer_start: u64,
+    buffer: VecDeque<[f32; 2]>,
+}
+
+impl StereoStreamResampler {
+    fn new(source_rate: u32, output_rate: u32) -> Result<Self, String> {
+        if source_rate == 0 || output_rate == 0 {
+            return Err("stream sample rates must be positive".to_owned());
+        }
+        Ok(Self {
+            source_rate: f64::from(source_rate),
+            output_rate: f64::from(output_rate),
+            source_frames: 0,
+            output_frames: 0,
+            buffer_start: 0,
+            buffer: VecDeque::new(),
+        })
+    }
+
+    fn push_outputs(
+        &mut self,
+        outputs: &[Vec<f32>],
+        frame_count: usize,
+        output_channels: usize,
+    ) -> Result<Vec<f32>, String> {
+        if !(1..=2).contains(&output_channels)
+            || outputs.len() != output_channels
+            || outputs.iter().any(|channel| channel.len() < frame_count)
+        {
+            return Err("VST3 output block is not mono or stereo".to_owned());
+        }
+        self.source_frames = self
+            .source_frames
+            .checked_add(frame_count as u64)
+            .ok_or_else(|| "VST3 stream frame count overflow".to_owned())?;
+        if output_channels == 1 {
+            for &sample in outputs[0].iter().take(frame_count) {
+                let sample = finite_sample(sample);
+                self.buffer.push_back([sample, sample]);
+            }
+        } else {
+            for (&left, &right) in outputs[0].iter().zip(&outputs[1]).take(frame_count) {
+                self.buffer
+                    .push_back([finite_sample(left), finite_sample(right)]);
+            }
+        }
+        self.emit_ready(false)
+    }
+
+    fn finish(&mut self) -> Result<Vec<f32>, String> {
+        self.emit_ready(true)
+    }
+
+    fn emit_ready(&mut self, final_block: bool) -> Result<Vec<f32>, String> {
+        if self.source_frames == 0 {
+            return Ok(Vec::new());
+        }
+        let target_frames = if final_block {
+            let count = self.source_frames as f64 * self.output_rate / self.source_rate;
+            if !count.is_finite() || count.ceil() > u64::MAX as f64 {
+                return Err("resampled VST3 stream is too long".to_owned());
+            }
+            count.ceil() as u64
+        } else {
+            u64::MAX
+        };
+        let mut output = Vec::new();
+        loop {
+            if self.output_frames >= target_frames {
+                break;
+            }
+            let source_position = self.output_frames as f64 * self.source_rate / self.output_rate;
+            if !source_position.is_finite() || source_position > u64::MAX as f64 {
+                return Err("VST3 stream resampling position overflow".to_owned());
+            }
+            let last_source_frame = self.source_frames - 1;
+            let source_position = if final_block {
+                source_position.min(last_source_frame as f64)
+            } else {
+                source_position
+            };
+            let first_frame = source_position.floor() as u64;
+            let second_frame = first_frame.saturating_add(1);
+            if !final_block && second_frame >= self.source_frames {
+                break;
+            }
+            let second_frame = second_frame.min(last_source_frame);
+            let first = self.sample_at(first_frame)?;
+            let second = self.sample_at(second_frame)?;
+            let fraction = (source_position - first_frame as f64) as f32;
+            output.push(first[0] + (second[0] - first[0]) * fraction);
+            output.push(first[1] + (second[1] - first[1]) * fraction);
+            self.output_frames = self
+                .output_frames
+                .checked_add(1)
+                .ok_or_else(|| "VST3 stream output frame count overflow".to_owned())?;
+
+            let next_source_position =
+                self.output_frames as f64 * self.source_rate / self.output_rate;
+            if !next_source_position.is_finite() || next_source_position > u64::MAX as f64 {
+                return Err("VST3 stream resampling position overflow".to_owned());
+            }
+            let discard_before =
+                (next_source_position.floor() as u64).min(self.source_frames.saturating_sub(1));
+            while self.buffer_start < discard_before {
+                self.buffer.pop_front();
+                self.buffer_start += 1;
+            }
+        }
+        Ok(output)
+    }
+
+    fn sample_at(&self, source_frame: u64) -> Result<[f32; 2], String> {
+        let buffer_index = source_frame
+            .checked_sub(self.buffer_start)
+            .and_then(|index| usize::try_from(index).ok())
+            .ok_or_else(|| "VST3 resampler lost a required source frame".to_owned())?;
+        self.buffer
+            .get(buffer_index)
+            .copied()
+            .ok_or_else(|| "VST3 resampler source frame is not buffered".to_owned())
+    }
+}
+
+fn finite_sample(sample: f32) -> f32 {
+    if sample.is_finite() { sample } else { 0.0 }
 }
 
 fn append_vst_output_block_to_stereo(
@@ -767,6 +1062,51 @@ mod tests {
         assert!(append_vst_output_block_to_stereo(&mut stereo, &[0.0], 2).is_err());
         assert!(append_vst_output_block_to_stereo(&mut stereo, &[0.0; 6], 3).is_err());
         assert!(stereo.is_empty());
+    }
+
+    #[test]
+    fn streaming_resampler_preserves_stereo_across_block_boundaries() {
+        let mut resampler = StereoStreamResampler::new(2, 2).unwrap();
+        assert_eq!(
+            resampler
+                .push_outputs(&[vec![0.0, 0.5], vec![1.0, 1.5]], 2, 2)
+                .unwrap(),
+            [0.0, 1.0]
+        );
+        assert_eq!(
+            resampler
+                .push_outputs(&[vec![1.0], vec![2.0]], 1, 2)
+                .unwrap(),
+            [0.5, 1.5]
+        );
+        assert_eq!(resampler.finish().unwrap(), [1.0, 2.0]);
+    }
+
+    #[test]
+    fn streaming_resampler_changes_rate_and_duplicates_mono() {
+        let mut upsample = StereoStreamResampler::new(2, 4).unwrap();
+        assert_eq!(
+            upsample.push_outputs(&[vec![0.0, 1.0, 2.0]], 3, 1).unwrap(),
+            [0.0, 0.0, 0.5, 0.5, 1.0, 1.0, 1.5, 1.5]
+        );
+        assert_eq!(upsample.finish().unwrap(), [2.0, 2.0, 2.0, 2.0]);
+
+        let mut downsample = StereoStreamResampler::new(48_000, 1).unwrap();
+        assert_eq!(
+            downsample
+                .push_outputs(&[vec![0.25, 0.5], vec![-0.25, -0.5]], 2, 2)
+                .unwrap(),
+            [0.25, -0.25]
+        );
+        assert!(downsample.finish().unwrap().is_empty());
+    }
+
+    #[test]
+    fn streaming_resampler_rejects_invalid_rates_and_output_shapes() {
+        assert!(StereoStreamResampler::new(0, 48_000).is_err());
+        let mut resampler = StereoStreamResampler::new(44_100, 48_000).unwrap();
+        assert!(resampler.push_outputs(&[], 4, 2).is_err());
+        assert!(resampler.push_outputs(&[vec![0.0; 4]], 4, 2).is_err());
     }
 
     #[test]

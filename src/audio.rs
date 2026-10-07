@@ -16,7 +16,9 @@ const AUDIO_SOURCE_SILENT: u8 = 0;
 const AUDIO_SOURCE_TEST_TONE: u8 = 1;
 const AUDIO_SOURCE_INPUT_MONITOR: u8 = 2;
 const AUDIO_SOURCE_PROJECT: u8 = 3;
+const AUDIO_SOURCE_STREAM: u8 = 4;
 const AUDIO_RING_CAPACITY: usize = 65_536;
+const STREAM_PREFILL_FRAMES: usize = 512;
 const TEST_TONE_HZ: f32 = 440.0;
 const TEST_TONE_LEVEL: f32 = 0.12;
 
@@ -79,30 +81,116 @@ impl Default for AudioSettings {
 
 struct PlaybackState {
     samples: ArcSwapOption<Vec<f32>>,
+    streaming: ArcSwapOption<StreamingPlayback>,
     cursor_frames: AtomicU64,
     active: AtomicBool,
+}
+
+struct StreamingPlayback {
+    ring: AudioRingBuffer,
+    active: AtomicBool,
+    paused: AtomicBool,
+    finished: AtomicBool,
+    cancelled: AtomicBool,
+    underrun_frames: AtomicU64,
+}
+
+/// The producer side of audio streamed into an active device callback.
+///
+/// Writes may wait for the callback to consume ring-buffer space. This handle is intended for
+/// worker threads; the device callback never waits for the producer.
+pub struct StreamingAudioWriter {
+    playback: Arc<StreamingPlayback>,
+}
+
+impl StreamingAudioWriter {
+    /// Write interleaved stereo samples, waiting outside the audio callback when the ring fills.
+    pub fn write_stereo_samples(&self, samples: &[f32]) -> Result<(), String> {
+        if !samples.len().is_multiple_of(2) {
+            return Err("streamed audio must contain stereo sample frames".to_owned());
+        }
+        for frame in samples.chunks_exact(2) {
+            while !self.playback.ring.push_stereo_frame(frame[0], frame[1]) {
+                if self.playback.cancelled.load(Ordering::Acquire) {
+                    return Err("streamed audio playback was stopped".to_owned());
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            if self.playback.cancelled.load(Ordering::Acquire) {
+                return Err("streamed audio playback was stopped".to_owned());
+            }
+        }
+        Ok(())
+    }
+
+    /// Mark the stream complete. Buffered frames continue playing before the device goes idle.
+    pub fn finish(&self) {
+        self.playback.finished.store(true, Ordering::Release);
+    }
+
+    /// Whether Stop or a replacement playback source cancelled this stream.
+    pub fn is_cancelled(&self) -> bool {
+        self.playback.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Number of stereo frames the device requested after the stream began but before data was
+    /// available. This is useful for diagnosing producer underruns.
+    pub fn underrun_frames(&self) -> u64 {
+        self.playback.underrun_frames.load(Ordering::Acquire)
+    }
 }
 
 impl PlaybackState {
     fn new() -> Self {
         Self {
             samples: ArcSwapOption::empty(),
+            streaming: ArcSwapOption::empty(),
             cursor_frames: AtomicU64::new(0),
             active: AtomicBool::new(false),
         }
     }
 
     fn start(&self, samples: Vec<f32>) {
+        self.cancel_stream();
         self.samples.store(Some(Arc::new(samples)));
         self.cursor_frames.store(0, Ordering::Release);
         self.active.store(true, Ordering::Release);
     }
 
+    fn start_streaming(&self) -> StreamingAudioWriter {
+        self.stop();
+        let playback = Arc::new(StreamingPlayback {
+            ring: AudioRingBuffer::new(AUDIO_RING_CAPACITY),
+            active: AtomicBool::new(false),
+            paused: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
+            underrun_frames: AtomicU64::new(0),
+        });
+        self.streaming.store(Some(Arc::clone(&playback)));
+        StreamingAudioWriter { playback }
+    }
+
     fn pause(&self) {
         self.active.store(false, Ordering::Release);
+        if let Some(streaming) = self.streaming.load().as_deref() {
+            streaming.active.store(false, Ordering::Release);
+            streaming.paused.store(true, Ordering::Release);
+        }
     }
 
     fn resume(&self) -> Result<(), String> {
+        if let Some(streaming) = self.streaming.load().as_deref() {
+            if streaming.cancelled.load(Ordering::Acquire)
+                || (streaming.finished.load(Ordering::Acquire)
+                    && streaming.ring.available_stereo_frames() == 0)
+            {
+                return Err("No streamed project audio remains to resume".to_owned());
+            }
+            streaming.paused.store(false, Ordering::Release);
+            streaming.active.store(true, Ordering::Release);
+            return Ok(());
+        }
         let frame_count = self
             .samples
             .load()
@@ -123,6 +211,31 @@ impl PlaybackState {
         self.active.store(false, Ordering::Release);
         self.cursor_frames.store(0, Ordering::Release);
         self.samples.store(None);
+        self.cancel_stream();
+    }
+
+    fn cancel_stream(&self) {
+        if let Some(streaming) = self.streaming.swap(None) {
+            streaming.cancelled.store(true, Ordering::Release);
+            streaming.active.store(false, Ordering::Release);
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        if self.active.load(Ordering::Acquire) {
+            return true;
+        }
+        self.streaming.load().as_deref().is_some_and(|streaming| {
+            !streaming.cancelled.load(Ordering::Acquire)
+                && !streaming.paused.load(Ordering::Acquire)
+                && (streaming.active.load(Ordering::Acquire)
+                    || !streaming.finished.load(Ordering::Acquire)
+                    || streaming.ring.available_stereo_frames() > 0)
+        })
+    }
+
+    fn is_streaming(&self) -> bool {
+        self.streaming.load().is_some()
     }
 }
 
@@ -257,14 +370,22 @@ impl AudioEngine {
         Ok(())
     }
 
+    /// Begin consuming interleaved stereo samples from a bounded producer ring.
+    ///
+    /// VST3 and other block processors can render on a worker thread while the shared or
+    /// WASAPI-exclusive device callback pulls frames without allocating or locking.
+    pub fn begin_streaming_playback(&self) -> Result<StreamingAudioWriter, String> {
+        if !self.output_active {
+            return Err("Start an output device before streaming audio".into());
+        }
+        let writer = self.playback.start_streaming();
+        self.source.store(AUDIO_SOURCE_STREAM, Ordering::Release);
+        Ok(writer)
+    }
+
     pub fn pause_project_playback(&self) {
         self.playback.pause();
-        let _ = self.source.compare_exchange(
-            AUDIO_SOURCE_PROJECT,
-            AUDIO_SOURCE_SILENT,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        self.stop_playback_source();
     }
 
     pub fn resume_project_playback(&self) -> Result<(), String> {
@@ -272,22 +393,34 @@ impl AudioEngine {
             return Err("Start an output device before resuming project playback".into());
         }
         self.playback.resume()?;
-        self.source.store(AUDIO_SOURCE_PROJECT, Ordering::Release);
+        self.source.store(
+            if self.playback.is_streaming() {
+                AUDIO_SOURCE_STREAM
+            } else {
+                AUDIO_SOURCE_PROJECT
+            },
+            Ordering::Release,
+        );
         Ok(())
     }
 
     pub fn stop_project_playback(&self) {
         self.playback.stop();
-        let _ = self.source.compare_exchange(
-            AUDIO_SOURCE_PROJECT,
-            AUDIO_SOURCE_SILENT,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        self.stop_playback_source();
     }
 
     pub fn project_playback_active(&self) -> bool {
-        self.playback.active.load(Ordering::Acquire)
+        self.playback.is_active()
+    }
+
+    /// Number of device frames that arrived before streamed audio was ready.
+    pub fn streaming_underrun_frames(&self) -> u64 {
+        self.playback
+            .streaming
+            .load()
+            .as_deref()
+            .map(|streaming| streaming.underrun_frames.load(Ordering::Acquire))
+            .unwrap_or(0)
     }
 
     pub fn input_peak(&self) -> f32 {
@@ -316,6 +449,17 @@ impl AudioEngine {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
+    }
+
+    fn stop_playback_source(&self) {
+        for playback_source in [AUDIO_SOURCE_PROJECT, AUDIO_SOURCE_STREAM] {
+            let _ = self.source.compare_exchange(
+                playback_source,
+                AUDIO_SOURCE_SILENT,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
     }
 
     fn start_shared(settings: &AudioSettings) -> Result<Self, String> {
@@ -543,6 +687,7 @@ impl AudioEngine {
 
 impl Drop for AudioEngine {
     fn drop(&mut self) {
+        self.playback.stop();
         #[cfg(windows)]
         if let Some(stop) = &self.exclusive_stop {
             stop.store(true, Ordering::Release);
@@ -722,11 +867,13 @@ where
             config,
             move |output, _| {
                 let playback_samples = playback_for_callback.samples.load();
+                let streaming = playback_for_callback.streaming.load();
                 for frame in output.chunks_mut(channels) {
                     let [left, right] = next_output_frame(
                         &source,
                         &ring,
                         playback_samples.as_deref().map(Vec::as_slice),
+                        streaming.as_deref(),
                         &playback_for_callback,
                         sample_rate,
                         &mut phase,
@@ -858,6 +1005,7 @@ fn next_output_frame(
     source: &AtomicU8,
     ring: &AudioRingBuffer,
     project_samples: Option<&[f32]>,
+    streaming: Option<&StreamingPlayback>,
     playback: &PlaybackState,
     sample_rate: f32,
     phase: &mut f32,
@@ -891,6 +1039,34 @@ fn next_output_frame(
                 return [0.0, 0.0];
             };
             [samples[0], samples[1]]
+        }
+        AUDIO_SOURCE_STREAM => {
+            let Some(streaming) = streaming else {
+                return [0.0, 0.0];
+            };
+            if streaming.cancelled.load(Ordering::Acquire)
+                || streaming.paused.load(Ordering::Acquire)
+            {
+                return [0.0, 0.0];
+            }
+            if !streaming.active.load(Ordering::Acquire) {
+                let available = streaming.ring.available_stereo_frames();
+                if available < STREAM_PREFILL_FRAMES
+                    && !(streaming.finished.load(Ordering::Acquire) && available > 0)
+                {
+                    return [0.0, 0.0];
+                }
+                streaming.active.store(true, Ordering::Release);
+            }
+            if let Some(frame) = streaming.ring.pop_stereo_frame() {
+                frame
+            } else if streaming.finished.load(Ordering::Acquire) {
+                streaming.active.store(false, Ordering::Release);
+                [0.0, 0.0]
+            } else {
+                streaming.underrun_frames.fetch_add(1, Ordering::Relaxed);
+                [0.0, 0.0]
+            }
         }
         _ => [0.0, 0.0],
     }
@@ -939,6 +1115,42 @@ impl AudioRingBuffer {
         self.write_index
             .store(write.wrapping_add(1), Ordering::Release);
         true
+    }
+
+    fn push_stereo_frame(&self, left: f32, right: f32) -> bool {
+        let write = self.write_index.load(Ordering::Relaxed);
+        let read = self.read_index.load(Ordering::Acquire);
+        if write.wrapping_sub(read).saturating_add(2) > self.samples.len() as u64 {
+            return false;
+        }
+        let capacity = self.samples.len();
+        self.samples[write as usize % capacity].store(left.to_bits(), Ordering::Relaxed);
+        self.samples[(write as usize + 1) % capacity].store(right.to_bits(), Ordering::Relaxed);
+        self.write_index
+            .store(write.wrapping_add(2), Ordering::Release);
+        true
+    }
+
+    fn pop_stereo_frame(&self) -> Option<[f32; 2]> {
+        let read = self.read_index.load(Ordering::Relaxed);
+        let write = self.write_index.load(Ordering::Acquire);
+        if write.wrapping_sub(read) < 2 {
+            return None;
+        }
+        let capacity = self.samples.len();
+        let frame = [
+            f32::from_bits(self.samples[read as usize % capacity].load(Ordering::Relaxed)),
+            f32::from_bits(self.samples[(read as usize + 1) % capacity].load(Ordering::Relaxed)),
+        ];
+        self.read_index
+            .store(read.wrapping_add(2), Ordering::Release);
+        Some(frame)
+    }
+
+    fn available_stereo_frames(&self) -> usize {
+        let write = self.write_index.load(Ordering::Acquire);
+        let read = self.read_index.load(Ordering::Acquire);
+        (write.wrapping_sub(read) / 2).min(usize::MAX as u64) as usize
     }
 
     fn pop(&self) -> Option<f32> {
@@ -1371,11 +1583,13 @@ fn render_wasapi_buffer(
     let mut output = vec![0_u8; frames.saturating_mul(format.frame_bytes)];
     let sample_rate = format.get_sample_rate();
     let playback_samples = playback.samples.load();
+    let streaming = playback.streaming.load();
     for frame in output.chunks_exact_mut(format.frame_bytes) {
         let stereo = next_output_frame(
             source,
             ring,
             playback_samples.as_deref().map(Vec::as_slice),
+            streaming.as_deref(),
             playback,
             sample_rate,
             phase,
@@ -1404,8 +1618,8 @@ mod tests {
     use std::sync::atomic::{AtomicU8, Ordering};
 
     use super::{
-        AUDIO_SOURCE_PROJECT, AudioAccess, AudioRingBuffer, AudioSettings, PlaybackState,
-        next_output_frame, tone_sample, validate_settings,
+        AUDIO_SOURCE_PROJECT, AUDIO_SOURCE_STREAM, AudioAccess, AudioRingBuffer, AudioSettings,
+        PlaybackState, next_output_frame, tone_sample, validate_settings,
     };
 
     #[test]
@@ -1465,6 +1679,7 @@ mod tests {
                 &source,
                 &ring,
                 samples.as_deref().map(Vec::as_slice),
+                None,
                 &playback,
                 48_000.0,
                 &mut phase,
@@ -1476,6 +1691,7 @@ mod tests {
                 &source,
                 &ring,
                 samples.as_deref().map(Vec::as_slice),
+                None,
                 &playback,
                 48_000.0,
                 &mut phase,
@@ -1487,6 +1703,7 @@ mod tests {
                 &source,
                 &ring,
                 samples.as_deref().map(Vec::as_slice),
+                None,
                 &playback,
                 48_000.0,
                 &mut phase,
@@ -1500,6 +1717,7 @@ mod tests {
                 &source,
                 &ring,
                 samples.as_deref().map(Vec::as_slice),
+                None,
                 &playback,
                 48_000.0,
                 &mut phase,
@@ -1508,5 +1726,123 @@ mod tests {
         );
         playback.stop();
         assert!(playback.resume().is_err());
+    }
+
+    #[test]
+    fn stereo_ring_keeps_frames_atomic_and_in_order() {
+        let ring = AudioRingBuffer::new(4);
+        assert!(ring.push_stereo_frame(0.25, -0.5));
+        assert!(ring.push_stereo_frame(0.75, -1.0));
+        assert!(!ring.push_stereo_frame(0.0, 0.0));
+        assert_eq!(ring.pop_stereo_frame(), Some([0.25, -0.5]));
+        assert_eq!(ring.pop_stereo_frame(), Some([0.75, -1.0]));
+        assert_eq!(ring.pop_stereo_frame(), None);
+    }
+
+    #[test]
+    fn streamed_output_waits_for_prefill_and_drains_before_stopping() {
+        let playback = PlaybackState::new();
+        let writer = playback.start_streaming();
+        let source = AtomicU8::new(AUDIO_SOURCE_STREAM);
+        let ring = AudioRingBuffer::new(2);
+        let mut phase = 0.0;
+        let stream = playback.streaming.load();
+
+        assert_eq!(
+            next_output_frame(
+                &source,
+                &ring,
+                None,
+                stream.as_deref(),
+                &playback,
+                48_000.0,
+                &mut phase,
+            ),
+            [0.0, 0.0]
+        );
+        assert_eq!(writer.underrun_frames(), 0);
+        writer
+            .write_stereo_samples(&[0.25, -0.5, 0.75, -1.0])
+            .unwrap();
+        writer.finish();
+
+        assert_eq!(
+            next_output_frame(
+                &source,
+                &ring,
+                None,
+                stream.as_deref(),
+                &playback,
+                48_000.0,
+                &mut phase,
+            ),
+            [0.25, -0.5]
+        );
+        assert_eq!(
+            next_output_frame(
+                &source,
+                &ring,
+                None,
+                stream.as_deref(),
+                &playback,
+                48_000.0,
+                &mut phase,
+            ),
+            [0.75, -1.0]
+        );
+        assert_eq!(
+            next_output_frame(
+                &source,
+                &ring,
+                None,
+                stream.as_deref(),
+                &playback,
+                48_000.0,
+                &mut phase,
+            ),
+            [0.0, 0.0]
+        );
+        assert!(!playback.is_active());
+    }
+
+    #[test]
+    fn streamed_output_pause_preserves_queued_frames_for_resume() {
+        let playback = PlaybackState::new();
+        let writer = playback.start_streaming();
+        writer.write_stereo_samples(&[0.25, -0.5]).unwrap();
+        writer.finish();
+        let stream = playback.streaming.load();
+        let source = AtomicU8::new(AUDIO_SOURCE_STREAM);
+        let ring = AudioRingBuffer::new(2);
+        let mut phase = 0.0;
+
+        playback.pause();
+        assert_eq!(
+            next_output_frame(
+                &source,
+                &ring,
+                None,
+                stream.as_deref(),
+                &playback,
+                48_000.0,
+                &mut phase,
+            ),
+            [0.0, 0.0]
+        );
+        assert_eq!(stream.as_deref().unwrap().ring.available_stereo_frames(), 1);
+
+        playback.resume().unwrap();
+        assert_eq!(
+            next_output_frame(
+                &source,
+                &ring,
+                None,
+                stream.as_deref(),
+                &playback,
+                48_000.0,
+                &mut phase,
+            ),
+            [0.25, -0.5]
+        );
     }
 }

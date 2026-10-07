@@ -16,7 +16,7 @@ use flp_rebuild::sample_render::{
     AudioClipRenderOptions, AudioClipRenderSummary,
     render_audio_clips_to_stereo_buffer_cancellable, render_audio_clips_to_wav,
 };
-use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions};
+use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions, Vst3PatternStreamHandle};
 use flp_rebuild::{
     AutomationChannel, AutomationPoint, AutomationPointEdit, FlpDocument, Pattern, PatternNote,
     PatternNoteEdit, PlaylistClip, PlaylistClipEdit, PlaylistTrack, VstPluginStateMetadata,
@@ -248,6 +248,8 @@ struct DawUi {
     audio_settings: AudioSettings,
     audio_engine: Option<AudioEngine>,
     pending_audio_render: Option<PendingAudioRender>,
+    pending_vst3_stream: Option<Vst3PatternStreamHandle>,
+    vst3_workers: Vec<Vst3PatternStreamHandle>,
     audio_test_tone: bool,
     audio_monitor_input: bool,
 }
@@ -304,6 +306,8 @@ impl DawUi {
             audio_settings,
             audio_engine: None,
             pending_audio_render: None,
+            pending_vst3_stream: None,
+            vst3_workers: Vec::new(),
             audio_test_tone: false,
             audio_monitor_input: false,
         };
@@ -528,6 +532,42 @@ impl DawUi {
         }
     }
 
+    fn poll_vst3_stream(&mut self) {
+        let completed =
+            self.pending_vst3_stream
+                .as_ref()
+                .and_then(|stream| match stream.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(TryRecvError::Disconnected) => {
+                        Some(Err("VST3 render worker stopped unexpectedly".to_owned()))
+                    }
+                    Err(TryRecvError::Empty) => None,
+                });
+        if let Some(result) = completed {
+            let worker_panicked = self
+                .pending_vst3_stream
+                .take()
+                .is_some_and(|stream| stream.join().is_err());
+            if worker_panicked {
+                self.stop_project_playback();
+                self.status = "VST3 pattern stream worker panicked".to_owned();
+                return;
+            }
+            match result {
+                Ok(summary) => {
+                    self.status = format!(
+                        "VST3 pattern stream rendered {} frames at {} Hz",
+                        summary.frames, summary.sample_rate
+                    );
+                }
+                Err(error) => {
+                    self.stop_project_playback();
+                    self.status = format!("VST3 pattern stream failed: {error}");
+                }
+            }
+        }
+    }
+
     fn start_rendered_project_playback(
         &mut self,
         samples: Vec<f32>,
@@ -587,11 +627,28 @@ impl DawUi {
         if let Some(pending) = self.pending_audio_render.take() {
             pending.cancelled.store(true, Ordering::Release);
         }
+        if let Some(stream) = self.pending_vst3_stream.take() {
+            self.vst3_workers.push(stream);
+        }
         if let Some(engine) = &self.audio_engine {
             engine.stop_project_playback();
         }
         self.playing = false;
         self.project_playback_loaded = false;
+    }
+
+    fn reap_vst3_workers(&mut self) {
+        let mut index = 0;
+        while index < self.vst3_workers.len() {
+            if self.vst3_workers[index].is_finished() {
+                let worker = self.vst3_workers.swap_remove(index);
+                if worker.join().is_err() {
+                    self.status = "A cancelled VST3 stream worker panicked".to_owned();
+                }
+            } else {
+                index += 1;
+            }
+        }
     }
 
     fn top_menu(&mut self, ui: &mut egui::Ui) {
@@ -1949,12 +2006,12 @@ impl DawUi {
         self.audio_test_tone = false;
         self.audio_monitor_input = false;
 
-        let result = self
+        let prepared = self
             .vst3_host
             .as_ref()
             .ok_or_else(|| "VST3 host is not initialized".to_owned())
             .and_then(|host| {
-                host.render_pattern_channel_to_stereo_buffer(
+                host.prepare_pattern_channel_stream(
                     instance_id,
                     &notes,
                     Vst3PatternRenderOptions {
@@ -1965,47 +2022,53 @@ impl DawUi {
                     },
                 )
             });
-        let (plugin_samples, summary) = match result {
-            Ok(rendered) => rendered,
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
             Err(error) => {
-                self.status = format!("Could not preview pattern channel: {error}");
+                self.status = format!("Could not prepare pattern playback: {error}");
                 return;
             }
         };
-        let samples =
-            match resample_stereo_interleaved(&plugin_samples, summary.sample_rate, device_rate) {
-                Ok(samples) => samples,
-                Err(error) => {
-                    self.status = format!("Could not prepare VST3 preview: {error}");
-                    return;
-                }
-            };
-        let result = self
+        let writer = self
             .audio_engine
             .as_ref()
             .ok_or_else(|| "Audio output is not available".to_owned())
-            .and_then(|engine| engine.set_project_playback(samples));
-        match result {
-            Ok(()) => {
-                let plugin_name = self
-                    .vst3_host
-                    .as_ref()
-                    .and_then(|host| {
-                        host.loaded_plugins()
-                            .into_iter()
-                            .find(|plugin| plugin.id == instance_id)
-                    })
-                    .map(|plugin| plugin.name)
-                    .unwrap_or_else(|| "VST3 instrument".to_owned());
-                self.playing = true;
-                self.project_playback_loaded = true;
-                self.status = format!(
-                    "Previewing pattern {pattern_id} through {plugin_name} ({} notes at {device_rate} Hz); Mixer effects are not included",
-                    summary.notes_rendered
-                );
+            .and_then(AudioEngine::begin_streaming_playback);
+        let writer = match writer {
+            Ok(writer) => writer,
+            Err(error) => {
+                self.status = format!("Could not start VST3 output: {error}");
+                return;
             }
-            Err(error) => self.status = format!("Could not start VST3 preview: {error}"),
-        }
+        };
+        let stream = match prepared.start(writer, device_rate) {
+            Ok(stream) => stream,
+            Err(error) => {
+                self.stop_project_playback();
+                self.status = format!("Could not start VST3 render worker: {error}");
+                return;
+            }
+        };
+        let plugin_name = self
+            .vst3_host
+            .as_ref()
+            .and_then(|host| {
+                host.loaded_plugins()
+                    .into_iter()
+                    .find(|plugin| plugin.id == instance_id)
+            })
+            .map(|plugin| plugin.name)
+            .unwrap_or_else(|| "VST3 instrument".to_owned());
+        let notes_to_stream = notes
+            .iter()
+            .filter(|note| note.channel_id == channel_id)
+            .count();
+        self.pending_vst3_stream = Some(stream);
+        self.playing = true;
+        self.project_playback_loaded = true;
+        self.status = format!(
+            "Streaming pattern {pattern_id} through {plugin_name} ({notes_to_stream} notes at {device_rate} Hz); Mixer effects are not included"
+        );
     }
 
     fn render_audio_clips_dialog(&mut self) {
@@ -3078,6 +3141,8 @@ impl DawUi {
 impl eframe::App for DawUi {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_project_audio_render();
+        self.poll_vst3_stream();
+        self.reap_vst3_workers();
         for (key, view) in [
             (egui::Key::F5, MainView::Playlist),
             (egui::Key::F6, MainView::ChannelRack),
@@ -3103,6 +3168,7 @@ impl eframe::App for DawUi {
                 .is_some_and(|engine| !engine.project_playback_active())
         {
             self.playing = false;
+            self.project_playback_loaded = false;
             self.status = "Project playback reached the end".to_owned();
         }
         if self.audio_engine.is_some() {
@@ -3170,6 +3236,12 @@ impl eframe::App for DawUi {
 impl Drop for DawUi {
     fn drop(&mut self) {
         self.stop_project_playback();
+        if let Some(stream) = self.pending_vst3_stream.take() {
+            self.vst3_workers.push(stream);
+        }
+        for worker in self.vst3_workers.drain(..) {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -3177,48 +3249,6 @@ fn empty_view(ui: &mut egui::Ui, message: &str) {
     ui.centered_and_justified(|ui| {
         ui.label(egui::RichText::new(message).color(MUTED));
     });
-}
-
-fn resample_stereo_interleaved(
-    samples: &[f32],
-    source_rate: u32,
-    output_rate: u32,
-) -> Result<Vec<f32>, String> {
-    if samples.is_empty() || !samples.len().is_multiple_of(2) {
-        return Err("VST3 preview is not a non-empty stereo buffer".to_owned());
-    }
-    if source_rate == 0 || output_rate == 0 {
-        return Err("VST3 preview sample rates must be positive".to_owned());
-    }
-    if source_rate == output_rate {
-        return Ok(samples.to_vec());
-    }
-
-    let source_frames = samples.len() / 2;
-    let output_frames_f64 = source_frames as f64 * f64::from(output_rate) / f64::from(source_rate);
-    if !output_frames_f64.is_finite() || output_frames_f64 <= 0.0 {
-        return Err("VST3 preview duration is outside the resampling range".to_owned());
-    }
-    let output_frames = output_frames_f64.ceil();
-    if output_frames > (512 * 1024 * 1024 / std::mem::size_of::<f32>() / 2) as f64 {
-        return Err("resampled VST3 preview exceeds the 512 MiB buffer limit".to_owned());
-    }
-    let output_frames = output_frames as usize;
-    let mut output = Vec::with_capacity(output_frames * 2);
-    let source_frames_per_output = f64::from(source_rate) / f64::from(output_rate);
-    for output_frame in 0..output_frames {
-        let source_position =
-            (output_frame as f64 * source_frames_per_output).min((source_frames - 1) as f64);
-        let first_frame = source_position.floor() as usize;
-        let second_frame = (first_frame + 1).min(source_frames - 1);
-        let fraction = (source_position - first_frame as f64) as f32;
-        for channel in 0..2 {
-            let first = samples[first_frame * 2 + channel];
-            let second = samples[second_frame * 2 + channel];
-            output.push(first + (second - first) * fraction);
-        }
-    }
-    Ok(output)
 }
 
 fn automation_point_screen_position(
@@ -3304,10 +3334,7 @@ fn note_from_grid_position(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        PianoRollGrid, PianoRollSnap, note_from_grid_position, resample_stereo_interleaved,
-        snap_note_tick,
-    };
+    use super::{PianoRollGrid, PianoRollSnap, note_from_grid_position, snap_note_tick};
 
     fn test_grid() -> PianoRollGrid {
         PianoRollGrid {
@@ -3363,31 +3390,5 @@ mod tests {
         ] {
             assert!(note_from_grid_position(pointer, test_grid(), 5).is_none());
         }
-    }
-
-    #[test]
-    fn preview_resampling_preserves_stereo_order_and_duration() {
-        let source = [0.0, 1.0, 0.5, 1.5];
-        let output = resample_stereo_interleaved(&source, 2, 4).unwrap();
-        assert_eq!(output, [0.0, 1.0, 0.25, 1.25, 0.5, 1.5, 0.5, 1.5]);
-        assert_eq!(
-            resample_stereo_interleaved(&source, 4, 2).unwrap(),
-            [0.0, 1.0]
-        );
-    }
-
-    #[test]
-    fn preview_resampling_keeps_a_single_frame_when_downsampling() {
-        assert_eq!(
-            resample_stereo_interleaved(&[0.25, -0.25], 48_000, 1).unwrap(),
-            [0.25, -0.25]
-        );
-    }
-
-    #[test]
-    fn preview_resampling_rejects_invalid_audio_and_rates() {
-        assert!(resample_stereo_interleaved(&[], 44_100, 48_000).is_err());
-        assert!(resample_stereo_interleaved(&[0.0], 44_100, 48_000).is_err());
-        assert!(resample_stereo_interleaved(&[0.0, 1.0], 0, 48_000).is_err());
     }
 }
