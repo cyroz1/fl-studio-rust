@@ -3429,15 +3429,14 @@ impl DawUi {
         restore_channel_id: Option<u16>,
         class_uid: Option<String>,
     ) {
-        let state_payload = restore_channel_id.and_then(|channel_id| {
+        let project_plugin_state = restore_channel_id.and_then(|channel_id| {
             self.document
                 .as_ref()?
                 .channel_plugin_states()
                 .into_iter()
                 .find(|state| state.channel_id() == channel_id)
-                .map(|state| state.data_payload().to_vec())
         });
-        if restore_channel_id.is_some() && state_payload.is_none() {
+        if restore_channel_id.is_some() && project_plugin_state.is_none() {
             self.status = "Selected channel has no FLP plug-in state".to_owned();
             self.last_plugin_action = Some(self.status.clone());
             return;
@@ -3462,10 +3461,10 @@ impl DawUi {
                 if let Some(channel_id) = restore_channel_id {
                     loaded_channel_instance = Some((channel_id, info.id));
                 }
-                let state_message = if let (Some(channel_id), Some(payload)) =
-                    (restore_channel_id, state_payload.as_deref())
+                let state_message = if let (Some(channel_id), Some(project_state)) =
+                    (restore_channel_id, project_plugin_state.as_ref())
                 {
-                    match host.restore_state(info.id, payload) {
+                    match host.restore_flp_channel_state(info.id, project_state) {
                         Ok(()) => {
                             format!("; restored FLP VST state from channel {channel_id}")
                         }

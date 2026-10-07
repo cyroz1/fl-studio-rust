@@ -1176,11 +1176,11 @@ fn probe_vst3_state(bundle: &Path, project: &Path, channel_id: u16) -> Result<()
         info.uid,
         info.path.display()
     );
-    match host.restore_state(info.id, state.data_payload()) {
+    match host.restore_flp_channel_state(info.id, &state) {
         Ok(()) => {
             let snapshot = host.save_state(info.id)?;
             println!(
-                "state restore accepted: FLP event bytes={} nested state bytes={} host snapshot bytes={}",
+                "FLP VST3 component/controller state restored: FLP event bytes={} nested state bytes={} host snapshot bytes={}",
                 state.data_payload().len(),
                 state
                     .vst_metadata()
@@ -1190,7 +1190,7 @@ fn probe_vst3_state(bundle: &Path, project: &Path, channel_id: u16) -> Result<()
             );
         }
         Err(error) => println!(
-            "state restore rejected: FLP event bytes={} nested state bytes={} error={error}",
+            "FLP VST3 state restore failed: FLP event bytes={} nested state bytes={} error={error}",
             state.data_payload().len(),
             state
                 .vst_metadata()

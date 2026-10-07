@@ -98,7 +98,7 @@ where real-time constraints punish sloppy code.
 - `[partial]` Lock-free audio callback: shared CPAL callbacks avoid allocation and locks; the WASAPI exclusive output event loop currently allocates a buffer for each event
 - `[todo]` Lock-free command queue (UI thread → audio thread): transport, parameter changes, note events
 - `[partial]` Lock-free metering/state queue (audio thread → UI thread): input peak is published through an atomic value; a general state queue is not implemented
-- `[partial]` Sample-accurate event scheduling within a buffer: selected-pattern previews and Playlist Pattern Clip Sampler notes schedule at device-frame offsets, while VST3 notes are timestamped in plug-in sample frames before resampling to the device rate; VST3 project-state restore, a shared transport command queue, and automation scheduling are not implemented
+- `[partial]` Sample-accurate event scheduling within a buffer: selected-pattern previews and Playlist Pattern Clip Sampler notes schedule at device-frame offsets, while VST3 notes are timestamped in plug-in sample frames before resampling to the device rate; marker-12 FLP VST3 component/controller state restore is implemented for nested field-53 records, while project-wide plug-in autoload, a shared transport command queue, and automation scheduling are not implemented
 - `[partial]` Underrun/dropout detection and reporting: shared stream errors and exclusive worker errors reach the UI; counting, history, and recovery are not implemented
 - `[todo]` Denormal protection in DSP code
 
@@ -114,7 +114,7 @@ where real-time constraints punish sloppy code.
 ### 3.4 Sample playback
 
 - `[partial]` Offline: WAV/OGG/FLAC/MP3/AIFF/WavPack decode by content (symphonia + wavicle)
-- `[partial]` Playlist playback: enabled audio-channel clips, enabled kind-0 Sampler notes, and notes for manually loaded VST3 instrument channels are mixed in bounded worker blocks at the device rate. Pattern Clips schedule plugin MIDI at absolute arrangement ticks; mono/stereo plugin output is resampled and mixed with audio and Sampler sources. The raw level mapping and pattern repeat/edge behavior are provisional and need comparison against native FL Studio output. Project plugin-state restore/autoload, non-default time stretch, automation, routing, clip-state flags, Mixer effects, and plugin delay compensation are unsupported.
+- `[partial]` Playlist playback: enabled audio-channel clips, enabled kind-0 Sampler notes, and notes for manually loaded VST3 instrument channels are mixed in bounded worker blocks at the device rate. Pattern Clips schedule plugin MIDI at absolute arrangement ticks; mono/stereo plugin output is resampled and mixed with audio and Sampler sources. The raw level mapping and pattern repeat/edge behavior are provisional and need comparison against native FL Studio output. Project-wide plug-in autoload, non-default time stretch, automation, routing, clip-state flags, Mixer effects, and plugin delay compensation are unsupported.
 - `[partial]` Real-time sampler voice management: selected-pattern preview and Playlist Pattern Clips use a bounded voice pool with oldest-voice stealing, zero-length one-shot notes, and a short release ramp for keyed notes. Pattern Clips place notes at clip offsets, repeat by explicit pattern length (or a note-length inference when absent), and bound keyed notes at clip ends. FL envelope, loop, root-key, and polyphony settings are not decoded; volume/pan mapping and repeat behavior still need comparison against native output
 - `[partial]` Resampling (project rate vs sample rate vs device rate): linear interpolation handles input/output rate differences and note-key transposition around an assumed MIDI-60 root; pitch-root metadata and higher-quality resampling remain
 - `[todo]` FL's private RIFF-wrapped Ogg handling in realtime path
@@ -164,8 +164,8 @@ decision, not a roadmap item.
 
 | Item | Status | Notes |
 |---|---|---|
-| VST3 hosting: load, process, native editor | `[partial]` | In-process load and editor open work. Selected-pattern preview and Playlist Song transport process loaded instruments blockwise on a worker and stream through shared or WASAPI-exclusive output; the open editor and audio worker use the same loaded instance. Playlist Pattern Clips expand notes for mapped VST3 channels, and multiple instruments are mixed with audio clips and Samplers through the bounded stream. Missing/unloaded instruments are counted and surfaced. General project-state conversion/autoload, Mixer graph processing, automation, PDC, multibus output, crash isolation, and native comparison remain incomplete. |
-| VST3 state save/restore via FLP `0xD5` record | `[partial]` | Decodes identity metadata and exposes the exact nested field-53 state bytes without copying; one ZENOLOGY class probe succeeded, but an earlier nested-state probe caused an access violation, and general wrapper conversion/restoration remains unverified. |
+| VST3 hosting: load, process, native editor | `[partial]` | In-process load and editor open work. Marker-12 FLP state restoration maps nested field-53 records 3 and 4 to VST3 component and controller streams for a manually loaded matching channel. Selected-pattern preview and Playlist Song transport process loaded instruments blockwise on a worker and stream through shared or WASAPI-exclusive output; the open editor and audio worker use the same loaded instance. Playlist Pattern Clips expand notes for mapped VST3 channels, and multiple instruments are mixed with audio clips and Samplers through the bounded stream. Project-wide autoload, Mixer graph processing, automation, PDC, multibus output, crash isolation, and native audio comparison remain incomplete. |
+| VST3 state save/restore via FLP `0xD5` record | `[partial]` | Marker-12 records with nested field-53 version 1 are converted to the host's component/controller snapshot. A local ZENOLOGY experiment verified that the restored component stream matches FLP record 3 byte-for-byte. Other wrapper markers, nested state layouts, state write-back, automatic project loading, and plugin-level/audio comparison remain unverified. |
 | VST3 parameter automation | `[todo]` | |
 | VST2 hosting | `[todo]` | Distribution of a VST2 host binary requires an applicable legacy Steinberg agreement; no such path is confirmed. Public source must not include Steinberg's VST2 SDK headers. |
 | CLAP hosting | `[todo]` | FL Studio supports CLAP as of recent versions |
@@ -218,7 +218,7 @@ roll is famously deep — the full toolset:
 - `[todo]` Audio clip waveform rendering with zoom
 - `[todo]` Audio clip fades, crossfades, gain envelopes
 - `[todo]` Stretch modes per clip (resample, stretch, e3 generic — needs time-stretch engine)
-- `[partial]` Pattern clips: the selected arrangement expands Sampler and mapped VST3 instrument notes at clip positions, repeats notes to clip length using explicit pattern lengths or an inferred note span, and clips keyed-note ends at the Playlist boundary. VST3 transport requires a manually loaded instance for each channel; project state restore/autoload, automation clips, clip flags, and non-default scale remain unsupported.
+- `[partial]` Pattern clips: the selected arrangement expands Sampler and mapped VST3 instrument notes at clip positions, repeats notes to clip length using explicit pattern lengths or an inferred note span, and clips keyed-note ends at the Playlist boundary. VST3 transport requires a manually loaded instance for each channel; project-wide plug-in autoload, automation clips, clip flags, and non-default scale remain unsupported.
 - `[partial]` Time markers and meter records can be read and listed; marker editing and playback-clock behavior remain incomplete
 - `[todo]` Track grouping, mute/solo per playlist track
 - `[todo]` Slip editing, cut/copy/paste/split/merge/join
@@ -339,9 +339,9 @@ Ordered by dependency and by "most compatibility per unit effort":
    stealing, basic sample-rate conversion, and channel gain/pan. VST3 Pattern
    Clip transport now runs for manually loaded instances. Tempo automation,
    envelopes, and command queues remain.
-4. **VST3 project-state restore + full plugin routing** — restore/autoload from
-   FLP state blobs, then add automation, multibus routing, Mixer integration,
-   and PDC; these remain the compatibility crux.
+4. **VST3 project-wide autoload + full plugin routing** — load each matching
+   installed VST3 from its FLP channel state, add state write-back, then add
+   automation, multibus routing, Mixer integration, and PDC.
 5. **Full-song offline render** — instruments + samples + FX in one graph
    (validates the engine without realtime pressure)
 6. **PDC + sends/sidechain** — mixer correctness
