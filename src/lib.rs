@@ -3902,7 +3902,8 @@ fn decode_vst_text(bytes: &[u8]) -> Option<String> {
 mod tests {
     use super::{
         FlpDocument, FlpError, MixerParameterKind, PatternNote, PayloadEncoding, ProjectInfoEdit,
-        ProjectSettingsEdit, midi::MidiFile, parse_vst_plugin_state_metadata,
+        ProjectSettingsEdit, midi::MidiChannelMapping, midi::MidiFile,
+        parse_vst_plugin_state_metadata,
     };
 
     fn flp_fixture(event_stream: &[u8], header_extension: &[u8], trailing: &[u8]) -> Vec<u8> {
@@ -5157,6 +5158,78 @@ mod tests {
 
         let reparsed = FlpDocument::parse(&document.encode_lossless().unwrap()).unwrap();
         assert_eq!(reparsed.patterns().unwrap()[0].notes.len(), 3);
+    }
+
+    #[test]
+    fn exports_pattern_notes_with_project_ppq_and_stored_midi_channels() {
+        let mut note = note_record(96, 3, 48, 60, 96);
+        note[19] = 9;
+        let document = FlpDocument::parse(&pattern_fixture(&[note], &[]))
+            .expect("project fixture should parse");
+        let source_tempo = document.metadata().tempo_bpm().unwrap_or(140.0);
+
+        let bytes = MidiFile::encode_project_pattern(
+            &document,
+            7,
+            MidiChannelMapping::PreserveNoteChannels,
+        )
+        .expect("pattern should export");
+        let midi = MidiFile::parse(&bytes).expect("exported file should parse");
+        let track = midi
+            .tracks()
+            .iter()
+            .find(|track| !track.notes().is_empty())
+            .expect("export should contain the pattern note track");
+        let exported_note = track.notes().remove(0);
+
+        assert_eq!(midi.division(), 96);
+        assert!(
+            (midi.tracks()[0]
+                .tempo_bpm()
+                .expect("tempo event should export")
+                - source_tempo)
+                .abs()
+                < 0.001
+        );
+        assert_eq!(exported_note.channel(), 9);
+        assert_eq!(exported_note.key(), 60);
+        assert_eq!(exported_note.velocity(), 96);
+        assert_eq!(exported_note.start_tick(), 96);
+        assert_eq!(exported_note.end_tick(), Some(144));
+    }
+
+    #[test]
+    fn exports_song_pattern_clips_with_repeats_and_clip_boundary_truncation() {
+        let note = note_record(0, 3, 48, 60, 100);
+        let mut event_stream = vec![0x40, 0, 0, 0x41, 7, 0, 0xD0, 24];
+        event_stream.extend_from_slice(&note);
+        event_stream.extend_from_slice(&[0x63, 0, 0]);
+        let mut clip = [0u8; 80];
+        clip[..4].copy_from_slice(&100u32.to_le_bytes());
+        clip[6..8].copy_from_slice(&7u16.to_le_bytes());
+        clip[8..12].copy_from_slice(&100u32.to_le_bytes());
+        clip[64..72].copy_from_slice(&1.0f64.to_le_bytes());
+        append_data_event(&mut event_stream, 0xE9, &clip);
+        let document = FlpDocument::parse(&flp_fixture(&event_stream, &[], &[]))
+            .expect("arrangement fixture should parse");
+
+        let bytes =
+            MidiFile::encode_project_song(&document, 0, MidiChannelMapping::PreserveNoteChannels)
+                .expect("arrangement should export");
+        let midi = MidiFile::parse(&bytes).expect("exported file should parse");
+        let notes = midi
+            .tracks()
+            .iter()
+            .flat_map(|track| track.notes())
+            .collect::<Vec<_>>();
+
+        assert_eq!(notes.len(), 3);
+        assert_eq!(notes[0].start_tick(), 100);
+        assert_eq!(notes[0].end_tick(), Some(148));
+        assert_eq!(notes[1].start_tick(), 148);
+        assert_eq!(notes[1].end_tick(), Some(196));
+        assert_eq!(notes[2].start_tick(), 196);
+        assert_eq!(notes[2].end_tick(), Some(200));
     }
 
     #[test]

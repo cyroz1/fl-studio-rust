@@ -10,7 +10,7 @@ use eframe::egui::{self, Align2, Color32, FontId, Id, Sense, Stroke, Vec2};
 use flp_rebuild::audio::{
     AudioAccess, AudioDeviceCatalog, AudioEngine, AudioSettings, enumerate_devices,
 };
-use flp_rebuild::midi::MidiFile;
+use flp_rebuild::midi::{MidiChannelMapping, MidiFile};
 use flp_rebuild::plugins::{PluginCandidate, PluginFormat, scan_installed_plugins};
 use flp_rebuild::sample_render::{
     AudioClipRenderOptions, PlaylistRenderOptions, PlaylistRenderSummary,
@@ -293,6 +293,7 @@ struct DawUi {
     active_note_drag: Option<ActiveNoteDrag>,
     piano_roll_snap: PianoRollSnap,
     pending_midi_import: Option<PendingMidiImport>,
+    midi_channel_mapping: MidiChannelMapping,
     selected_arrangement: Option<u16>,
     selected_clip: Option<usize>,
     selected_plugin_state_channel: Option<u16>,
@@ -370,6 +371,7 @@ impl DawUi {
             active_note_drag: None,
             piano_roll_snap: PianoRollSnap::QuarterBeat,
             pending_midi_import: None,
+            midi_channel_mapping: MidiChannelMapping::PreserveNoteChannels,
             selected_arrangement: None,
             selected_clip: None,
             selected_plugin_state_channel: None,
@@ -1196,6 +1198,15 @@ impl DawUi {
                 .clicked()
             {
                 self.render_audio_clips_dialog();
+            }
+            if ui
+                .add_enabled(
+                    self.document.is_some(),
+                    egui::Button::new("Export song MIDI…"),
+                )
+                .clicked()
+            {
+                self.export_song_midi_dialog();
             }
             for item in [
                 "Edit", "Add", "Patterns", "View", "Options", "Tools", "Help",
@@ -2250,6 +2261,7 @@ impl DawUi {
             });
         let mut add_note_requested = false;
         let mut open_midi_requested = false;
+        let mut export_midi_requested = false;
         let mut render_requested = false;
         let mut preview_requested = false;
         let mut sampler_preview_requested = false;
@@ -2293,6 +2305,29 @@ impl DawUi {
                         ui.selectable_value(&mut self.piano_roll_snap, snap, snap.label());
                     }
                 });
+            egui::ComboBox::from_id_salt("midi-channel-mapping")
+                .selected_text(match self.midi_channel_mapping {
+                    MidiChannelMapping::PreserveNoteChannels => "MIDI channels: Stored",
+                    MidiChannelMapping::AssignProjectChannels => "MIDI channels: Per channel",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.midi_channel_mapping,
+                        MidiChannelMapping::PreserveNoteChannels,
+                        "Stored note channels",
+                    );
+                    ui.selectable_value(
+                        &mut self.midi_channel_mapping,
+                        MidiChannelMapping::AssignProjectChannels,
+                        "One per FL channel",
+                    );
+                });
+            export_midi_requested = ui
+                .add_enabled(
+                    self.selected_pattern.is_some(),
+                    egui::Button::new("Export pattern MIDI…"),
+                )
+                .clicked();
             add_note_requested = ui
                 .add_enabled(
                     self.selected_note_channel.is_some(),
@@ -2328,6 +2363,9 @@ impl DawUi {
         }
         if sampler_preview_requested {
             self.play_selected_sampler_pattern();
+        }
+        if export_midi_requested {
+            self.export_selected_pattern_midi_dialog();
         }
 
         if open_midi_requested
@@ -2835,6 +2873,106 @@ impl DawUi {
                 );
             }
             Err(error) => self.status = format!("Could not render Playlist audio clips: {error}"),
+        }
+    }
+
+    fn export_selected_pattern_midi_dialog(&mut self) {
+        let Some(pattern_id) = self.selected_pattern else {
+            self.status = "Select a pattern before exporting MIDI".to_owned();
+            return;
+        };
+        let Some(document) = self.document.as_ref() else {
+            self.status = "Open a project before exporting MIDI".to_owned();
+            return;
+        };
+        let bytes =
+            match MidiFile::encode_project_pattern(document, pattern_id, self.midi_channel_mapping)
+            {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    self.status = format!("Could not export pattern MIDI: {error}");
+                    return;
+                }
+            };
+        let project_stem = self
+            .current_path
+            .as_deref()
+            .and_then(Path::file_stem)
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "FL_Studio_Project".to_owned());
+        let Some(output_path) = rfd::FileDialog::new()
+            .set_title("Export pattern as MIDI")
+            .set_file_name(format!("{project_stem}_pattern_{pattern_id}.mid"))
+            .add_filter("MIDI files", &["mid", "midi"])
+            .save_file()
+        else {
+            return;
+        };
+        match fs::write(&output_path, bytes) {
+            Ok(()) => {
+                self.status = format!("Exported pattern {pattern_id} to {}", output_path.display())
+            }
+            Err(error) => {
+                self.status = format!("Could not write {}: {error}", output_path.display())
+            }
+        }
+    }
+
+    fn export_song_midi_dialog(&mut self) {
+        let Some(document) = self.document.as_ref() else {
+            self.status = "Open a project before exporting MIDI".to_owned();
+            return;
+        };
+        let arrangements = match document.arrangements() {
+            Ok(arrangements) => arrangements,
+            Err(error) => {
+                self.status = format!("Could not read Playlist arrangements: {error}");
+                return;
+            }
+        };
+        let arrangement_id = self
+            .selected_arrangement
+            .filter(|id| arrangements.iter().any(|arrangement| arrangement.id == *id))
+            .or_else(|| arrangements.first().map(|arrangement| arrangement.id));
+        let Some(arrangement_id) = arrangement_id else {
+            self.status = "This project has no Playlist arrangement to export".to_owned();
+            return;
+        };
+        let bytes = match MidiFile::encode_project_song(
+            document,
+            arrangement_id,
+            self.midi_channel_mapping,
+        ) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.status = format!("Could not export song MIDI: {error}");
+                return;
+            }
+        };
+        let project_stem = self
+            .current_path
+            .as_deref()
+            .and_then(Path::file_stem)
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "FL_Studio_Project".to_owned());
+        let Some(output_path) = rfd::FileDialog::new()
+            .set_title("Export Playlist arrangement as MIDI")
+            .set_file_name(format!("{project_stem}.mid"))
+            .add_filter("MIDI files", &["mid", "midi"])
+            .save_file()
+        else {
+            return;
+        };
+        match fs::write(&output_path, bytes) {
+            Ok(()) => {
+                self.status = format!(
+                    "Exported arrangement {arrangement_id} to {}",
+                    output_path.display()
+                )
+            }
+            Err(error) => {
+                self.status = format!("Could not write {}: {error}", output_path.display())
+            }
         }
     }
 

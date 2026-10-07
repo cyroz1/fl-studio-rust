@@ -57,8 +57,8 @@ The foundation. Everything else depends on reading projects exactly.
 | MIDI import into pattern/channel with PPQ conversion | `[done]` | |
 | SMPTE-timed MIDI | `[todo]` | |
 | Tempo-map conversion on import | `[todo]` | Currently preserves FLP tempo |
-| MIDI export (File > Export > MIDI) | `[todo]` | |
-| MIDI export options: pattern vs song, channel mapping | `[todo]` | |
+| MIDI export (File > Export > MIDI) | `[partial]` | Exports pattern notes and arrangement Pattern Clips as SMF format 1 with project PPQ, base tempo, time signature, named channel tracks, pattern repeats, and clip-edge note truncation. Native MIDI export comparison, tempo automation, scaled clips, note properties beyond key/velocity/channel, markers, and unsupported Playlist layouts remain. |
+| MIDI export options: pattern vs song, channel mapping | `[partial]` | The CLI and desktop expose pattern or arrangement export; channel mapping can preserve each note's stored low four channel bits or assign one MIDI channel per FL channel. Full native export modes and channel mapping behavior remain to be compared against FL Studio. |
 
 ---
 
@@ -353,7 +353,7 @@ Ordered by dependency and by "most compatibility per unit effort":
 7. **Piano roll tools** — the editing depth users expect
 8. **Playlist audio** — waveforms, fades, stretch
 9. **Recording + Edison-class editor**
-10. **MIDI hardware + export**
+10. **MIDI hardware + export (partial)** — pattern and arrangement MIDI export now works for decoded layouts; native parity, tempo automation, scaled clips, full note properties, and hardware support remain.
 11. **Polish**: undo everywhere, themes, shortcuts, autosave
 
 (Stock plugin DSP is intentionally absent from this list — see §4.)

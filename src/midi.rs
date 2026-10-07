@@ -1,8 +1,12 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 
+use crate::{FlpDocument, PatternNote, PlaylistClipTarget};
+
 const MTHD: &[u8; 4] = b"MThd";
 const MTRK: &[u8; 4] = b"MTrk";
+const MAX_VLQ: u64 = 0x0FFF_FFFF;
+const MAX_EXPORTED_NOTES: usize = 1_000_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MidiFile {
@@ -40,6 +44,52 @@ pub struct MidiNote {
 pub struct MidiTempoEvent {
     tick: u64,
     microseconds_per_quarter: u32,
+}
+
+/// Selects how FL Studio channels are assigned to MIDI channels during export.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MidiChannelMapping {
+    /// Preserve the low four bits of each note's stored MIDI channel.
+    #[default]
+    PreserveNoteChannels,
+    /// Assign each distinct FL Studio channel its own MIDI channel, wrapping after 16.
+    AssignProjectChannels,
+}
+
+/// A note to serialize into a Standard MIDI File.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MidiExportNote {
+    pub channel: u8,
+    pub key: u8,
+    pub velocity: u8,
+    pub start_tick: u64,
+    pub end_tick: u64,
+}
+
+/// A named MIDI track representing one FL Studio channel.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MidiExportTrack {
+    pub name: String,
+    pub project_channel_id: Option<u16>,
+    pub end_tick: u64,
+    pub notes: Vec<MidiExportNote>,
+}
+
+struct TimedMidiBytes {
+    tick: u64,
+    order: u8,
+    bytes: Vec<u8>,
+}
+
+impl MidiExportTrack {
+    pub fn new(name: impl Into<String>, project_channel_id: Option<u16>) -> Self {
+        Self {
+            name: name.into(),
+            project_channel_id,
+            end_tick: 0,
+            notes: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -139,6 +189,324 @@ impl MidiFile {
     /// Returns the untouched Standard MIDI File bytes.
     pub fn encode_lossless(&self) -> Vec<u8> {
         self.original.clone()
+    }
+
+    /// Exports one FL Studio pattern to a format-1 MIDI file.
+    pub fn encode_project_pattern(
+        document: &FlpDocument,
+        pattern_id: u16,
+        channel_mapping: MidiChannelMapping,
+    ) -> Result<Vec<u8>, MidiError> {
+        let patterns = document
+            .patterns()
+            .map_err(|error| MidiError::Project(error.to_string()))?;
+        let pattern = patterns
+            .iter()
+            .find(|pattern| pattern.id == pattern_id)
+            .ok_or(MidiError::InvalidExport(
+                "the requested pattern does not exist",
+            ))?;
+        let mut tracks = tracks_for_notes(document, &pattern.notes)?;
+        if tracks.is_empty() {
+            tracks.push(MidiExportTrack::new(
+                pattern
+                    .name
+                    .as_deref()
+                    .filter(|name| !name.is_empty())
+                    .map_or_else(|| format!("Pattern {pattern_id}"), str::to_owned),
+                None,
+            ));
+        }
+        Self::encode_project_export_tracks(document, &tracks, channel_mapping)
+    }
+
+    /// Exports pattern clips in one FL Studio arrangement to a format-1 MIDI file.
+    /// Audio clips and non-pattern clip targets are omitted.
+    pub fn encode_project_song(
+        document: &FlpDocument,
+        arrangement_id: u16,
+        channel_mapping: MidiChannelMapping,
+    ) -> Result<Vec<u8>, MidiError> {
+        let arrangements = document
+            .arrangements()
+            .map_err(|error| MidiError::Project(error.to_string()))?;
+        let arrangement = arrangements
+            .iter()
+            .find(|arrangement| arrangement.id == arrangement_id)
+            .ok_or(MidiError::InvalidExport(
+                "the requested Playlist arrangement does not exist",
+            ))?;
+        let patterns = document
+            .patterns()
+            .map_err(|error| MidiError::Project(error.to_string()))?;
+        let patterns_by_id: BTreeMap<_, _> = patterns
+            .iter()
+            .map(|pattern| (pattern.id, pattern))
+            .collect();
+        let mut notes_by_channel = BTreeMap::<u16, Vec<MidiExportNote>>::new();
+        let mut song_end_tick = 0u64;
+        let mut exported_note_count = 0usize;
+
+        for clip in &arrangement.clips {
+            if clip.track_index.is_none() || clip.length_ticks == 0 {
+                continue;
+            }
+            let PlaylistClipTarget::Pattern { id } = clip.target() else {
+                continue;
+            };
+            let Some(pattern) = patterns_by_id.get(&id).copied() else {
+                continue;
+            };
+            let clip_end = u64::from(clip.position_ticks)
+                .checked_add(u64::from(clip.length_ticks))
+                .ok_or(MidiError::LengthOverflow)?;
+            song_end_tick = song_end_tick.max(clip_end);
+            if clip
+                .scale
+                .is_some_and(|scale| !scale.is_finite() || (scale - 1.0).abs() > 1e-9)
+            {
+                return Err(MidiError::InvalidExport(
+                    "scaled Playlist Pattern Clips cannot be exported yet",
+                ));
+            }
+            let clip_length = u64::from(clip.length_ticks);
+            if clip_length == 0 {
+                continue;
+            }
+            let inferred_length = pattern
+                .notes
+                .iter()
+                .filter(|note| note.length > 0)
+                .map(|note| u64::from(note.position) + u64::from(note.length))
+                .max()
+                .unwrap_or(0);
+            let loop_length = pattern
+                .length_ticks
+                .map(u64::from)
+                .filter(|length| *length > 0)
+                .unwrap_or(if inferred_length > 0 {
+                    inferred_length
+                } else {
+                    clip_length
+                });
+            if loop_length == 0 {
+                continue;
+            }
+            let clip_start = u64::from(clip.position_ticks);
+            let repetitions = clip_length.div_ceil(loop_length);
+            for repetition in 0..repetitions {
+                let repeat_start = repetition
+                    .checked_mul(loop_length)
+                    .ok_or(MidiError::LengthOverflow)?;
+                for note in &pattern.notes {
+                    let relative_start = repeat_start
+                        .checked_add(u64::from(note.position))
+                        .ok_or(MidiError::LengthOverflow)?;
+                    if relative_start >= clip_length {
+                        continue;
+                    }
+                    exported_note_count = exported_note_count.saturating_add(1);
+                    if exported_note_count > MAX_EXPORTED_NOTES {
+                        return Err(MidiError::InvalidExport(
+                            "the arrangement expands to more than one million MIDI notes",
+                        ));
+                    }
+                    let start_tick = clip_start
+                        .checked_add(relative_start)
+                        .ok_or(MidiError::LengthOverflow)?;
+                    let stop_tick = start_tick
+                        .checked_add(u64::from(note.length))
+                        .ok_or(MidiError::LengthOverflow)?
+                        .min(clip_end);
+                    notes_by_channel
+                        .entry(note.channel_id)
+                        .or_default()
+                        .push(export_note(note, start_tick, stop_tick));
+                }
+            }
+        }
+
+        let mut tracks = tracks_for_grouped_notes(document, notes_by_channel)?;
+        if tracks.is_empty() {
+            tracks.push(MidiExportTrack::new("Song", None));
+        }
+        for track in &mut tracks {
+            track.end_tick = song_end_tick;
+        }
+        Self::encode_project_export_tracks(document, &tracks, channel_mapping)
+    }
+
+    /// Serializes named channel tracks and a conductor track to Standard MIDI File format 1.
+    pub fn encode_export_tracks(
+        tracks: &[MidiExportTrack],
+        ppq: u16,
+        tempo_bpm: f64,
+        time_signature: Option<(u8, u8)>,
+        channel_mapping: MidiChannelMapping,
+    ) -> Result<Vec<u8>, MidiError> {
+        Self::encode_export_tracks_with_channel_order(
+            tracks,
+            ppq,
+            tempo_bpm,
+            time_signature,
+            channel_mapping,
+            &[],
+        )
+    }
+
+    fn encode_project_export_tracks(
+        document: &FlpDocument,
+        tracks: &[MidiExportTrack],
+        channel_mapping: MidiChannelMapping,
+    ) -> Result<Vec<u8>, MidiError> {
+        let channel_order = document
+            .channels()
+            .into_iter()
+            .map(|channel| channel.id())
+            .collect::<Vec<_>>();
+        Self::encode_export_tracks_with_channel_order(
+            tracks,
+            document.header().ppq(),
+            document.metadata().tempo_bpm().unwrap_or(140.0),
+            document.metadata().time_signature(),
+            channel_mapping,
+            &channel_order,
+        )
+    }
+
+    fn encode_export_tracks_with_channel_order(
+        tracks: &[MidiExportTrack],
+        ppq: u16,
+        tempo_bpm: f64,
+        time_signature: Option<(u8, u8)>,
+        channel_mapping: MidiChannelMapping,
+        project_channel_order: &[u16],
+    ) -> Result<Vec<u8>, MidiError> {
+        if ppq == 0 || ppq & 0x8000 != 0 {
+            return Err(MidiError::InvalidExport(
+                "project PPQ must be in the range 1..=32767",
+            ));
+        }
+        if !tempo_bpm.is_finite() || tempo_bpm <= 0.0 {
+            return Err(MidiError::InvalidExport(
+                "tempo must be positive and finite",
+            ));
+        }
+        let micros_per_quarter = (60_000_000.0 / tempo_bpm).round();
+        if !(1.0..=16_777_215.0).contains(&micros_per_quarter) {
+            return Err(MidiError::InvalidExport(
+                "tempo is outside the range representable by Standard MIDI Files",
+            ));
+        }
+        if let Some((numerator, denominator)) = time_signature
+            && (numerator == 0 || denominator == 0 || !denominator.is_power_of_two())
+        {
+            return Err(MidiError::InvalidExport(
+                "time signature must have a positive numerator and power-of-two denominator",
+            ));
+        }
+
+        let fallback_track;
+        let tracks = if tracks.is_empty() {
+            fallback_track = [MidiExportTrack::new("MIDI", None)];
+            &fallback_track[..]
+        } else {
+            tracks
+        };
+        let track_count = tracks
+            .len()
+            .checked_add(1)
+            .ok_or(MidiError::LengthOverflow)?;
+        let track_count = u16::try_from(track_count).map_err(|_| MidiError::LengthOverflow)?;
+        let mut ordered_channel_ids = Vec::new();
+        let mut seen_channels = std::collections::BTreeSet::new();
+        for channel_id in project_channel_order.iter().copied().chain(
+            tracks
+                .iter()
+                .filter_map(|track| track.project_channel_id)
+                .collect::<std::collections::BTreeSet<_>>(),
+        ) {
+            if seen_channels.insert(channel_id) {
+                ordered_channel_ids.push(channel_id);
+            }
+        }
+        let channel_indices: BTreeMap<_, _> = ordered_channel_ids
+            .into_iter()
+            .enumerate()
+            .map(|(index, channel_id)| (channel_id, (index % 16) as u8))
+            .collect();
+
+        let mut output = Vec::new();
+        output.extend_from_slice(MTHD);
+        output.extend_from_slice(&6u32.to_be_bytes());
+        output.extend_from_slice(&1u16.to_be_bytes());
+        output.extend_from_slice(&track_count.to_be_bytes());
+        output.extend_from_slice(&ppq.to_be_bytes());
+
+        let mut conductor = Vec::new();
+        push_meta_event(&mut conductor, 0, 0x03, b"Tempo and meter")?;
+        let tempo_bytes = (micros_per_quarter as u32).to_be_bytes();
+        push_meta_event(&mut conductor, 0, 0x51, &tempo_bytes[1..])?;
+        if let Some((numerator, denominator)) = time_signature {
+            let exponent = denominator.trailing_zeros() as u8;
+            push_meta_event(&mut conductor, 0, 0x58, &[numerator, exponent, 24, 8])?;
+        }
+        write_end_of_track(&mut conductor, 0)?;
+        append_track_chunk(&mut output, conductor)?;
+
+        for track in tracks {
+            let mut events = Vec::<TimedMidiBytes>::new();
+            events.push(TimedMidiBytes {
+                tick: 0,
+                order: 0,
+                bytes: meta_event_bytes(0x03, track.name.as_bytes())?,
+            });
+            let assigned_channel = track
+                .project_channel_id
+                .and_then(|id| channel_indices.get(&id).copied())
+                .unwrap_or(0);
+            for note in &track.notes {
+                if note.key > 127 {
+                    return Err(MidiError::InvalidExport(
+                        "a note key exceeds the MIDI range 0..=127",
+                    ));
+                }
+                let channel = match channel_mapping {
+                    MidiChannelMapping::PreserveNoteChannels => note.channel & 0x0F,
+                    MidiChannelMapping::AssignProjectChannels => assigned_channel,
+                };
+                let start_tick = note.start_tick;
+                let end_tick = note.end_tick.max(start_tick.saturating_add(1));
+                let velocity = note.velocity.min(127);
+                events.push(TimedMidiBytes {
+                    tick: start_tick,
+                    order: 2,
+                    bytes: vec![0x90 | channel, note.key, velocity],
+                });
+                events.push(TimedMidiBytes {
+                    tick: end_tick,
+                    order: 1,
+                    bytes: vec![0x80 | channel, note.key, 0],
+                });
+            }
+            events.sort_by_key(|event| (event.tick, event.order));
+            let mut track_bytes = Vec::new();
+            let mut previous_tick = 0u64;
+            for event in events {
+                write_delta(&mut track_bytes, event.tick.saturating_sub(previous_tick))?;
+                track_bytes.extend_from_slice(&event.bytes);
+                previous_tick = event.tick;
+            }
+            write_end_of_track(
+                &mut track_bytes,
+                track
+                    .end_tick
+                    .max(previous_tick)
+                    .saturating_sub(previous_tick),
+            )?;
+            append_track_chunk(&mut output, track_bytes)?;
+        }
+        Ok(output)
     }
 }
 
@@ -342,6 +710,8 @@ pub enum MidiError {
         offset: usize,
         detail: &'static str,
     },
+    Project(String),
+    InvalidExport(&'static str),
     LengthOverflow,
 }
 
@@ -375,12 +745,137 @@ impl fmt::Display for MidiError {
             Self::InvalidEvent { offset, detail } => {
                 write!(formatter, "invalid MIDI event at byte {offset}: {detail}")
             }
+            Self::Project(error) => {
+                write!(formatter, "could not read FL Studio project data: {error}")
+            }
+            Self::InvalidExport(detail) => write!(formatter, "could not export MIDI: {detail}"),
             Self::LengthOverflow => write!(formatter, "MIDI length exceeds supported size"),
         }
     }
 }
 
 impl std::error::Error for MidiError {}
+
+fn tracks_for_notes(
+    document: &FlpDocument,
+    notes: &[PatternNote],
+) -> Result<Vec<MidiExportTrack>, MidiError> {
+    if notes.len() > MAX_EXPORTED_NOTES {
+        return Err(MidiError::InvalidExport(
+            "the pattern contains more than one million MIDI notes",
+        ));
+    }
+    let mut grouped = BTreeMap::<u16, Vec<MidiExportNote>>::new();
+    for note in notes {
+        let track_notes = grouped.entry(note.channel_id).or_default();
+        if track_notes.len() >= MAX_EXPORTED_NOTES {
+            return Err(MidiError::InvalidExport(
+                "the pattern expands to more than one million MIDI notes",
+            ));
+        }
+        let end_tick = u64::from(note.position) + u64::from(note.length);
+        track_notes.push(export_note(note, u64::from(note.position), end_tick));
+    }
+    tracks_for_grouped_notes(document, grouped)
+}
+
+fn tracks_for_grouped_notes(
+    document: &FlpDocument,
+    grouped: BTreeMap<u16, Vec<MidiExportNote>>,
+) -> Result<Vec<MidiExportTrack>, MidiError> {
+    let channels: BTreeMap<_, _> = document
+        .channels()
+        .into_iter()
+        .map(|channel| (channel.id(), channel.display_name().map(str::to_owned)))
+        .collect();
+    Ok(grouped
+        .into_iter()
+        .map(|(channel_id, notes)| {
+            let name = channels
+                .get(&channel_id)
+                .and_then(Option::as_deref)
+                .filter(|name| !name.is_empty())
+                .map_or_else(|| format!("Channel {channel_id}"), str::to_owned);
+            let mut track = MidiExportTrack::new(name, Some(channel_id));
+            track.end_tick = notes.iter().map(|note| note.end_tick).max().unwrap_or(0);
+            track.notes = notes;
+            track
+        })
+        .collect())
+}
+
+fn export_note(note: &PatternNote, start_tick: u64, end_tick: u64) -> MidiExportNote {
+    MidiExportNote {
+        channel: note.midi_channel,
+        key: u8::try_from(note.key).unwrap_or(u8::MAX),
+        velocity: note.velocity,
+        start_tick,
+        end_tick,
+    }
+}
+
+fn push_meta_event(
+    output: &mut Vec<u8>,
+    delta_ticks: u64,
+    meta_type: u8,
+    data: &[u8],
+) -> Result<(), MidiError> {
+    write_delta(output, delta_ticks)?;
+    output.extend_from_slice(&meta_event_bytes(meta_type, data)?);
+    Ok(())
+}
+
+fn meta_event_bytes(meta_type: u8, data: &[u8]) -> Result<Vec<u8>, MidiError> {
+    let length = u32::try_from(data.len()).map_err(|_| MidiError::LengthOverflow)?;
+    if u64::from(length) > MAX_VLQ {
+        return Err(MidiError::LengthOverflow);
+    }
+    let mut bytes = Vec::with_capacity(data.len().saturating_add(6));
+    bytes.push(0xFF);
+    bytes.push(meta_type);
+    write_vlq(&mut bytes, length);
+    bytes.extend_from_slice(data);
+    Ok(bytes)
+}
+
+fn write_end_of_track(output: &mut Vec<u8>, delta_ticks: u64) -> Result<(), MidiError> {
+    write_delta(output, delta_ticks)?;
+    output.extend_from_slice(&[0xFF, 0x2F, 0x00]);
+    Ok(())
+}
+
+fn write_delta(output: &mut Vec<u8>, mut delta_ticks: u64) -> Result<(), MidiError> {
+    while delta_ticks > MAX_VLQ {
+        write_vlq(output, MAX_VLQ as u32);
+        // A sequencer-specific empty meta event advances the track when a delta exceeds
+        // the four-byte VLQ limit. It carries no musical event or project data.
+        output.extend_from_slice(&[0xFF, 0x7F, 0x00]);
+        delta_ticks -= MAX_VLQ;
+    }
+    write_vlq(output, delta_ticks as u32);
+    Ok(())
+}
+
+fn write_vlq(output: &mut Vec<u8>, value: u32) {
+    let mut buffer = [0u8; 4];
+    let mut cursor = buffer.len() - 1;
+    buffer[cursor] = (value & 0x7F) as u8;
+    let mut value = value >> 7;
+    while value > 0 {
+        cursor -= 1;
+        buffer[cursor] = ((value & 0x7F) as u8) | 0x80;
+        value >>= 7;
+    }
+    output.extend_from_slice(&buffer[cursor..]);
+}
+
+fn append_track_chunk(output: &mut Vec<u8>, track_data: Vec<u8>) -> Result<(), MidiError> {
+    let length = u32::try_from(track_data.len()).map_err(|_| MidiError::LengthOverflow)?;
+    output.extend_from_slice(MTRK);
+    output.extend_from_slice(&length.to_be_bytes());
+    output.extend_from_slice(&track_data);
+    Ok(())
+}
 
 fn parse_track(bytes: &[u8], absolute_start: usize) -> Result<MidiTrack, MidiError> {
     let mut cursor = 0usize;
@@ -617,7 +1112,7 @@ fn read_u32_be(bytes: &[u8], offset: usize, context: &'static str) -> Result<u32
 
 #[cfg(test)]
 mod tests {
-    use super::{MidiError, MidiFile};
+    use super::{MidiChannelMapping, MidiError, MidiExportNote, MidiExportTrack, MidiFile};
 
     fn midi_fixture(track: &[u8]) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -661,5 +1156,160 @@ mod tests {
         let error = MidiFile::parse(&input).expect_err("overlong delta must fail");
 
         assert!(matches!(error, MidiError::InvalidVlq { .. }));
+    }
+
+    #[test]
+    fn exports_format_one_tracks_with_tempo_meter_and_channel_mapping() {
+        let mut piano = MidiExportTrack::new("Piano", Some(14));
+        piano.end_tick = 480;
+        piano.notes.push(MidiExportNote {
+            channel: 7,
+            key: 60,
+            velocity: 96,
+            start_tick: 0,
+            end_tick: 240,
+        });
+        let mut bass = MidiExportTrack::new("Bass", Some(27));
+        bass.end_tick = 480;
+        bass.notes.push(MidiExportNote {
+            channel: 7,
+            key: 36,
+            velocity: 128,
+            start_tick: 120,
+            end_tick: 480,
+        });
+
+        let bytes = MidiFile::encode_export_tracks(
+            &[piano, bass],
+            480,
+            120.0,
+            Some((3, 4)),
+            MidiChannelMapping::AssignProjectChannels,
+        )
+        .expect("valid export data should serialize");
+        let midi = MidiFile::parse(&bytes).expect("encoded MIDI should parse");
+
+        assert_eq!(midi.format(), 1);
+        assert_eq!(midi.division(), 480);
+        assert_eq!(midi.tracks().len(), 3);
+        assert_eq!(midi.tracks()[0].tempo_bpm(), Some(120.0));
+        assert_eq!(midi.tracks()[1].name().as_deref(), Some("Piano"));
+        assert_eq!(midi.tracks()[2].name().as_deref(), Some("Bass"));
+        let piano_note = midi.tracks()[1].notes().remove(0);
+        let bass_note = midi.tracks()[2].notes().remove(0);
+        assert_eq!(piano_note.channel(), 0);
+        assert_eq!(piano_note.key(), 60);
+        assert_eq!(piano_note.velocity(), 96);
+        assert_eq!(piano_note.end_tick(), Some(240));
+        assert_eq!(bass_note.channel(), 1);
+        assert_eq!(bass_note.velocity(), 127);
+        assert_eq!(bass_note.end_tick(), Some(480));
+        assert!(midi.tracks()[0].events().iter().any(|event| {
+            matches!(event.kind(), super::MidiEventKind::Meta { meta_type: 0x58, data } if data == &[3, 2, 24, 8])
+        }));
+    }
+
+    #[test]
+    fn exports_large_note_positions_using_vlq_safe_meta_events() {
+        let mut track = MidiExportTrack::new("Long timeline", Some(0));
+        track.notes.push(MidiExportNote {
+            channel: 0,
+            key: 64,
+            velocity: 100,
+            start_tick: u64::from(super::MAX_VLQ as u32) + 17,
+            end_tick: u64::from(super::MAX_VLQ as u32) + 200,
+        });
+        let bytes = MidiFile::encode_export_tracks(
+            &[track],
+            960,
+            90.0,
+            None,
+            MidiChannelMapping::PreserveNoteChannels,
+        )
+        .expect("large timeline should serialize");
+        let midi = MidiFile::parse(&bytes).expect("encoded MIDI should parse");
+        let note = midi.tracks()[1].notes().remove(0);
+        assert_eq!(note.start_tick(), u64::from(super::MAX_VLQ as u32) + 17);
+        assert_eq!(
+            note.end_tick(),
+            Some(u64::from(super::MAX_VLQ as u32) + 200)
+        );
+    }
+
+    #[test]
+    fn stored_channel_export_uses_only_the_midi_channel_nibble() {
+        let mut track = MidiExportTrack::new("Legacy channel", Some(0));
+        track.notes.push(MidiExportNote {
+            channel: 32,
+            key: 60,
+            velocity: 100,
+            start_tick: 0,
+            end_tick: 24,
+        });
+        let bytes = MidiFile::encode_export_tracks(
+            &[track],
+            96,
+            140.0,
+            None,
+            MidiChannelMapping::PreserveNoteChannels,
+        )
+        .expect("the stored channel should be normalized to a MIDI status nibble");
+        let midi = MidiFile::parse(&bytes).expect("encoded MIDI should parse");
+
+        assert_eq!(midi.tracks()[1].notes()[0].channel(), 0);
+    }
+
+    #[test]
+    fn channel_mapping_respects_empty_project_channels() {
+        let mut piano = MidiExportTrack::new("Piano", Some(14));
+        piano.notes.push(MidiExportNote {
+            channel: 0,
+            key: 60,
+            velocity: 100,
+            start_tick: 0,
+            end_tick: 24,
+        });
+        let mut bass = MidiExportTrack::new("Bass", Some(27));
+        bass.notes.push(MidiExportNote {
+            channel: 0,
+            key: 36,
+            velocity: 100,
+            start_tick: 0,
+            end_tick: 24,
+        });
+        let bytes = MidiFile::encode_export_tracks_with_channel_order(
+            &[piano, bass],
+            96,
+            140.0,
+            None,
+            MidiChannelMapping::AssignProjectChannels,
+            &[7, 14, 27],
+        )
+        .expect("project channel order should serialize");
+        let midi = MidiFile::parse(&bytes).expect("encoded MIDI should parse");
+
+        assert_eq!(midi.tracks()[1].notes()[0].channel(), 1);
+        assert_eq!(midi.tracks()[2].notes()[0].channel(), 2);
+    }
+
+    #[test]
+    fn rejects_unrepresentable_midi_export_values() {
+        let mut track = MidiExportTrack::new("Invalid", Some(0));
+        track.notes.push(MidiExportNote {
+            channel: 16,
+            key: 128,
+            velocity: 100,
+            start_tick: 0,
+            end_tick: 1,
+        });
+        let error = MidiFile::encode_export_tracks(
+            &[track],
+            480,
+            120.0,
+            None,
+            MidiChannelMapping::PreserveNoteChannels,
+        )
+        .expect_err("out-of-range key must be rejected");
+        assert!(matches!(error, MidiError::InvalidExport(_)));
     }
 }
