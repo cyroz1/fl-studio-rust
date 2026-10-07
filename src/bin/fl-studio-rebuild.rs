@@ -771,6 +771,7 @@ impl DawUi {
         };
         let plugin_states = document.channel_plugin_states();
         let mut open_editor = None;
+        let mut level_edits = Vec::new();
         ui.horizontal(|ui| {
             ui.strong("Channel Rack");
             ui.separator();
@@ -781,6 +782,11 @@ impl DawUi {
         ui.separator();
         egui::ScrollArea::vertical().show(ui, |ui| {
             for channel in document.channels() {
+                let mut volume = channel.volume().unwrap_or(10_000);
+                let mut pan = channel.pan().unwrap_or(6_400);
+                let levels_editable = channel.levels_editable();
+                let mut volume_changed = false;
+                let mut pan_changed = false;
                 egui::Frame::new()
                     .fill(PANEL_DARK)
                     .inner_margin(4.0)
@@ -808,6 +814,28 @@ impl DawUi {
                                     .or(channel.plugin_identifier())
                                     .unwrap_or("Audio"),
                             );
+                            ui.add_space(8.0);
+                            volume_changed = ui
+                                .add_enabled_ui(levels_editable, |ui| {
+                                    ui.add_sized(
+                                        [96.0, 22.0],
+                                        egui::Slider::new(&mut volume, 0..=12_800)
+                                            .show_value(false),
+                                    )
+                                })
+                                .inner
+                                .changed();
+                            ui.label(format!("VOL {volume}"));
+                            pan_changed = ui
+                                .add_enabled_ui(levels_editable, |ui| {
+                                    ui.add_sized(
+                                        [96.0, 22.0],
+                                        egui::Slider::new(&mut pan, 0..=12_800).show_value(false),
+                                    )
+                                })
+                                .inner
+                                .changed();
+                            ui.label(format!("PAN {pan}"));
                             ui.separator();
                             let state_bytes =
                                 plugin_state.map_or(0, |state| state.data_payload().len());
@@ -830,6 +858,9 @@ impl DawUi {
                             );
                         });
                     });
+                if volume_changed || pan_changed {
+                    level_edits.push((channel.id(), volume, pan));
+                }
                 ui.add_space(2.0);
             }
             ui.separator();
@@ -838,6 +869,19 @@ impl DawUi {
                     .color(MUTED),
             );
         });
+        if !level_edits.is_empty()
+            && let Some(document) = self.document.as_mut()
+        {
+            for (channel_id, volume, pan) in level_edits {
+                match document.set_channel_levels(channel_id, volume, pan) {
+                    Ok(()) => {
+                        self.dirty = true;
+                        self.status = format!("Channel {channel_id} volume and pan updated");
+                    }
+                    Err(error) => self.status = format!("Could not update channel levels: {error}"),
+                }
+            }
+        }
         if let Some(instance_id) = open_editor
             && let Some(host) = &mut self.vst3_host
         {

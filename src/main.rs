@@ -155,6 +155,16 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 .map_err(|_| "channel id must be an integer from 0 through 65535".to_owned())?;
             rename_channel(Path::new(input), Path::new(output), channel_id, name)
         }
+        [command, input, output, channel_id, volume, pan] if command == "set-channel-levels" => {
+            set_channel_levels(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(channel_id, "channel id")?,
+                parse_u32(volume, "channel volume")?,
+                i32::try_from(parse_u32(pan, "channel pan")?)
+                    .map_err(|_| "channel pan must be between 0 and 12800".to_owned())?,
+            )
+        }
         [command, input, output, pattern_id, channel_id, note_index, position, length, key, velocity]
             if command == "edit-note" =>
         {
@@ -245,6 +255,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild roundtrip <input.flp> <output.flp>\n",
             "  flp-rebuild set-tempo <input.flp> <output.flp> <bpm>\n",
             "  flp-rebuild rename-channel <input.flp> <output.flp> <channel-id> <name>\n",
+            "  flp-rebuild set-channel-levels <input.flp> <output.flp> <channel-id> <volume-0..12800> <pan-0..12800>\n",
             "  flp-rebuild edit-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index> <position> <length> <key> <velocity>\n",
             "  flp-rebuild add-note <input.flp> <output.flp> <pattern-id> <channel-id> <position> <length> <key> <velocity>\n",
             "  flp-rebuild delete-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index>\n",
@@ -736,7 +747,7 @@ fn list_channels(path: &Path) -> Result<(), String> {
     println!("channels: {}", channels.len());
     for channel in channels {
         println!(
-            "id={} kind={} enabled={} plugin={} name={} sample_path={:?} events={:?}",
+            "id={} kind={} enabled={} volume={:?} pan={:?} plugin={} name={} sample_path={:?} events={:?}",
             channel.id(),
             channel
                 .kind()
@@ -744,6 +755,8 @@ fn list_channels(path: &Path) -> Result<(), String> {
             channel
                 .enabled()
                 .map_or_else(|| "unknown".to_owned(), |enabled| enabled.to_string()),
+            channel.volume(),
+            channel.pan(),
             channel.plugin_identifier().unwrap_or("unknown"),
             channel.display_name().unwrap_or("(unnamed)"),
             channel.sample_path(),
@@ -1128,6 +1141,29 @@ fn rename_channel(input: &Path, output: &Path, channel_id: u16, name: &str) -> R
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "renamed channel {channel_id} to {name:?} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn set_channel_levels(
+    input: &Path,
+    output: &Path,
+    channel_id: u16,
+    volume: u32,
+    pan: i32,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .set_channel_levels(channel_id, volume, pan)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "set channel {channel_id} volume to {volume} and pan to {pan} in {}",
         output.display()
     );
     Ok(())

@@ -31,6 +31,7 @@ flp-rebuild extract-event <file.flp> <index> <output.bin>
 flp-rebuild roundtrip <input.flp> <output.flp>
 flp-rebuild set-tempo <input.flp> <output.flp> <bpm>
 flp-rebuild rename-channel <input.flp> <output.flp> <channel-id> <name>
+flp-rebuild set-channel-levels <input.flp> <output.flp> <channel-id> <volume-0..12800> <pan-0..12800>
 flp-rebuild edit-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index> <position> <length> <key> <velocity>
 flp-rebuild add-note <input.flp> <output.flp> <pattern-id> <channel-id> <position> <length> <key> <velocity>
 flp-rebuild delete-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index>
@@ -53,6 +54,10 @@ The Standard MIDI File reader recognizes the `MThd` header and `MTrk` event stre
 `scan <directory>` inventories `.flp` and `.fst` files recursively, grouping successfully parsed files by project version, header format, and PPQ while reporting any unparsed files. `plugin-scan` lists VST3 bundles and VST2 DLL candidates in the conventional Windows plug-in folders without loading their code. `plugin-state-preview` reports a channel's opaque wrapper and plug-in payload sizes and leading bytes. `vst3-state-probe` transiently loads a VST3 and offers the selected FLP channel's plug-in state to it through the host state interface; this is an experiment, not yet project-wide compatibility. In the current ZENOLOGY probe, the VST3 accepted a 164,850-byte FLP payload and produced a 163,256-byte host snapshot. These commands map installed compatibility inputs before deeper project and plug-in support is added.
 
 The original application's MIDI export experiments and their measured results are recorded in [`docs/oracle-experiments.md`](docs/oracle-experiments.md). `midi-events` displays a selected MIDI track's decoded events, including tempo and marker metadata, for further format comparison.
+
+## Channel levels
+
+`channels <file.flp>` reports raw channel volume and pan values when present, along with observed sample source paths. The desktop Channel Rack exposes volume and pan sliders for channels with a valid modern `0xDB` Levels event. `set-channel-levels` edits those first two fields and preserves the remaining event payload. Older byte and word controls are decoded for inspection but remain read-only until their scaling is verified. The audio clip renderer still does not apply channel volume or pan.
 
 ## Automated checks and installers
 

@@ -133,6 +133,11 @@ pub struct ChannelSummary {
     id: u16,
     kind: Option<u8>,
     enabled: Option<bool>,
+    volume: Option<u32>,
+    pan: Option<i32>,
+    levels_editable: bool,
+    volume_priority: u8,
+    pan_priority: u8,
     plugin_identifier: Option<String>,
     display_name: Option<String>,
     sample_path: Option<String>,
@@ -273,6 +278,21 @@ impl ChannelSummary {
 
     pub fn enabled(&self) -> Option<bool> {
         self.enabled
+    }
+
+    /// Raw FL channel volume value, in the project's 0..=12800 control range.
+    pub fn volume(&self) -> Option<u32> {
+        self.volume
+    }
+
+    /// Raw FL channel pan value, in the project's 0..=12800 control range.
+    pub fn pan(&self) -> Option<i32> {
+        self.pan
+    }
+
+    /// Whether this channel has a recognized modern levels event that can be edited losslessly.
+    pub fn levels_editable(&self) -> bool {
+        self.levels_editable
     }
 
     pub fn plugin_identifier(&self) -> Option<&str> {
@@ -646,6 +666,49 @@ impl FlpDocument {
                     channel.enabled = Some(event.payload[0] != 0);
                 }
                 0x15 if event.payload.len() == 1 => channel.kind = Some(event.payload[0]),
+                // FL 25+ stores channel pan and volume at the start of the 0xDB
+                // Levels data event. Keep legacy byte/word values as fallbacks.
+                0xDB if event.payload.len() >= 8 => {
+                    channel.levels_editable = true;
+                    if channel.pan_priority < 3 {
+                        channel.pan = Some(i32::from_le_bytes(
+                            event.payload[0..4]
+                                .try_into()
+                                .expect("the 0xDB pan field has four bytes"),
+                        ));
+                        channel.pan_priority = 3;
+                    }
+                    if channel.volume_priority < 3 {
+                        channel.volume = Some(u32::from_le_bytes(
+                            event.payload[4..8]
+                                .try_into()
+                                .expect("the 0xDB volume field has four bytes"),
+                        ));
+                        channel.volume_priority = 3;
+                    }
+                }
+                0x48 if event.payload.len() == 2 && channel.volume_priority < 2 => {
+                    channel.volume = Some(u32::from(u16::from_le_bytes([
+                        event.payload[0],
+                        event.payload[1],
+                    ])));
+                    channel.volume_priority = 2;
+                }
+                0x49 if event.payload.len() == 2 && channel.pan_priority < 2 => {
+                    channel.pan = Some(i32::from(u16::from_le_bytes([
+                        event.payload[0],
+                        event.payload[1],
+                    ])));
+                    channel.pan_priority = 2;
+                }
+                0x02 if event.payload.len() == 1 && channel.volume_priority < 1 => {
+                    channel.volume = Some(u32::from(event.payload[0]));
+                    channel.volume_priority = 1;
+                }
+                0x03 if event.payload.len() == 1 && channel.pan_priority < 1 => {
+                    channel.pan = Some(i32::from(event.payload[0]));
+                    channel.pan_priority = 1;
+                }
                 0xC9 if channel.plugin_identifier.is_none() => {
                     channel.plugin_identifier =
                         decode_project_string(&event.payload, self.project_version.as_deref())
@@ -1308,6 +1371,51 @@ impl FlpDocument {
         wire_payload.copy_from_slice(&encoded_value);
         event.payload.copy_from_slice(&encoded_value);
         self.metadata = read_project_metadata(&self.events);
+        Ok(())
+    }
+
+    /// Updates a channel's modern `0xDB` Levels event while preserving its other fields.
+    ///
+    /// Legacy projects that store these controls as byte or word events remain readable, but
+    /// cannot be edited through this API because their control ranges are not equivalent.
+    pub fn set_channel_levels(
+        &mut self,
+        channel_id: u16,
+        volume: u32,
+        pan: i32,
+    ) -> Result<(), FlpError> {
+        if volume > 12_800 || !(0..=12_800).contains(&pan) {
+            return Err(FlpError::UnsupportedEdit(
+                "channel volume and pan must be in the 0..=12800 range",
+            ));
+        }
+
+        let channels = self.channels();
+        let mut matching = channels.iter().filter(|channel| channel.id == channel_id);
+        let Some(channel) = matching.next() else {
+            return Err(FlpError::ChannelNotFound(channel_id));
+        };
+        if matching.next().is_some() {
+            return Err(FlpError::AmbiguousChannelId(channel_id));
+        }
+
+        let event_index = channel
+            .event_range()
+            .find(|index| self.events[*index].opcode == 0xDB)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the selected channel has no editable 0xDB Levels event",
+            ))?;
+        let event = &mut self.events[event_index];
+        if !matches!(event.encoding, PayloadEncoding::Data { .. }) || event.payload.len() < 8 {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel's 0xDB Levels event is truncated or not length-prefixed",
+            ));
+        }
+        let mut payload = event.payload.clone();
+        payload[..4].copy_from_slice(&pan.to_le_bytes());
+        payload[4..8].copy_from_slice(&volume.to_le_bytes());
+        event.replace_data_payload(payload)?;
+        self.refresh_event_offsets()?;
         Ok(())
     }
 
@@ -2116,6 +2224,19 @@ mod tests {
         flp_fixture(&event_stream, &[], &[])
     }
 
+    fn channel_with_levels_fixture(id: u16, pan: i32, volume: u32, tail: &[u8]) -> Vec<u8> {
+        let mut event_stream = vec![0x40];
+        event_stream.extend_from_slice(&id.to_le_bytes());
+        event_stream.extend_from_slice(&[0x15, 4, 0xDB]);
+        let mut payload = Vec::from(pan.to_le_bytes());
+        payload.extend_from_slice(&volume.to_le_bytes());
+        payload.extend_from_slice(tail);
+        event_stream.extend_from_slice(&super::encode_leb128(payload.len() as u32));
+        event_stream.extend_from_slice(&payload);
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        flp_fixture(&event_stream, &[], &[])
+    }
+
     fn midi_fixture(track: &[u8], division: u16) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"MThd");
@@ -2189,6 +2310,69 @@ mod tests {
         assert_eq!(channels.len(), 1);
         assert_eq!(channels[0].sample_path(), Some(path));
         assert_eq!(document.encode_lossless().unwrap(), input);
+    }
+
+    #[test]
+    fn decodes_and_edits_channel_levels_without_touching_other_level_fields() {
+        let tail = [0xA5; 16];
+        let input = channel_with_levels_fixture(9, 3_200, 8_750, &tail);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+        let channel = &document.channels()[0];
+
+        assert_eq!(channel.volume(), Some(8_750));
+        assert_eq!(channel.pan(), Some(3_200));
+        assert_eq!(document.encode_lossless().unwrap(), input);
+
+        document
+            .set_channel_levels(9, 12_000, 9_600)
+            .expect("the modern levels event should be editable");
+
+        let channel = &document.channels()[0];
+        assert_eq!(channel.volume(), Some(12_000));
+        assert_eq!(channel.pan(), Some(9_600));
+        let levels = document
+            .events()
+            .iter()
+            .find(|event| event.opcode() == 0xDB)
+            .expect("levels event should remain");
+        assert_eq!(&levels.payload()[..4], &9_600i32.to_le_bytes());
+        assert_eq!(&levels.payload()[4..8], &12_000u32.to_le_bytes());
+        assert_eq!(&levels.payload()[8..], &tail);
+        let encoded = document.encode_lossless().unwrap();
+        let reparsed = FlpDocument::parse(&encoded).expect("edited file should parse");
+        assert_eq!(reparsed.channels()[0].volume(), Some(12_000));
+        assert_eq!(reparsed.channels()[0].pan(), Some(9_600));
+    }
+
+    #[test]
+    fn prefers_modern_channel_levels_over_legacy_channel_controls() {
+        let mut event_stream = vec![0x40, 3, 0, 0x02, 99, 0x48, 0x20, 0x03, 17, 0x49, 0x30, 0];
+        event_stream.extend_from_slice(&[0x15, 4, 0xDB]);
+        let mut payload = 6_400i32.to_le_bytes().to_vec();
+        payload.extend_from_slice(&10_000u32.to_le_bytes());
+        payload.extend_from_slice(&[0; 16]);
+        event_stream.extend_from_slice(&super::encode_leb128(payload.len() as u32));
+        event_stream.extend_from_slice(&payload);
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        let document = FlpDocument::parse(&flp_fixture(&event_stream, &[], &[]))
+            .expect("fixture should parse");
+
+        assert_eq!(document.channels()[0].volume(), Some(10_000));
+        assert_eq!(document.channels()[0].pan(), Some(6_400));
+    }
+
+    #[test]
+    fn channel_level_edit_rejects_out_of_range_values_and_legacy_only_channels() {
+        let input = channel_with_levels_fixture(4, 6_400, 10_000, &[0; 16]);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+        assert!(document.set_channel_levels(4, 12_801, 6_400).is_err());
+        assert!(document.set_channel_levels(4, 10_000, -1).is_err());
+
+        let legacy = flp_fixture(&[0x40, 4, 0, 0x02, 100, 0x03, 64, 0x62, 0, 0], &[], &[]);
+        let mut legacy = FlpDocument::parse(&legacy).expect("legacy fixture should parse");
+        assert_eq!(legacy.channels()[0].volume(), Some(100));
+        assert_eq!(legacy.channels()[0].pan(), Some(64));
+        assert!(legacy.set_channel_levels(4, 10_000, 6_400).is_err());
     }
 
     #[test]
