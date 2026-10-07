@@ -192,9 +192,7 @@ impl Vst3PlaylistStreamProcessor {
                 .lock()
                 .map_err(|_| "plug-in state lock was poisoned".to_owned())
                 .and_then(|mut plugin| {
-                    plugin
-                        .start_processing()
-                        .map_err(|error| error.to_string())
+                    plugin.start_processing().map_err(|error| error.to_string())
                 });
             if let Err(error) = result {
                 let _ = self.stop_processing();
