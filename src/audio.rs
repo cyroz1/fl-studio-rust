@@ -4,16 +4,18 @@
 //! streams are opened directly with WASAPI so the requested endpoint format and
 //! exclusive-access errors are visible to the application.
 
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use arc_swap::ArcSwapOption;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat, Stream, StreamConfig, SupportedStreamConfig};
 
 const AUDIO_SOURCE_SILENT: u8 = 0;
 const AUDIO_SOURCE_TEST_TONE: u8 = 1;
 const AUDIO_SOURCE_INPUT_MONITOR: u8 = 2;
+const AUDIO_SOURCE_PROJECT: u8 = 3;
 const AUDIO_RING_CAPACITY: usize = 65_536;
 const TEST_TONE_HZ: f32 = 440.0;
 const TEST_TONE_LEVEL: f32 = 0.12;
@@ -75,6 +77,55 @@ impl Default for AudioSettings {
     }
 }
 
+struct PlaybackState {
+    samples: ArcSwapOption<Vec<f32>>,
+    cursor_frames: AtomicU64,
+    active: AtomicBool,
+}
+
+impl PlaybackState {
+    fn new() -> Self {
+        Self {
+            samples: ArcSwapOption::empty(),
+            cursor_frames: AtomicU64::new(0),
+            active: AtomicBool::new(false),
+        }
+    }
+
+    fn start(&self, samples: Vec<f32>) {
+        self.samples.store(Some(Arc::new(samples)));
+        self.cursor_frames.store(0, Ordering::Release);
+        self.active.store(true, Ordering::Release);
+    }
+
+    fn pause(&self) {
+        self.active.store(false, Ordering::Release);
+    }
+
+    fn resume(&self) -> Result<(), String> {
+        let frame_count = self
+            .samples
+            .load()
+            .as_deref()
+            .map(|samples| samples.len() / 2)
+            .unwrap_or(0);
+        if frame_count == 0 {
+            return Err("No rendered project audio is loaded".into());
+        }
+        if self.cursor_frames.load(Ordering::Acquire) >= frame_count as u64 {
+            self.cursor_frames.store(0, Ordering::Release);
+        }
+        self.active.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    fn stop(&self) {
+        self.active.store(false, Ordering::Release);
+        self.cursor_frames.store(0, Ordering::Release);
+        self.samples.store(None);
+    }
+}
+
 /// Enumerate the default system host's active input and output endpoints.
 pub fn enumerate_devices() -> AudioDeviceCatalog {
     let host = cpal::default_host();
@@ -132,10 +183,12 @@ pub fn enumerate_devices() -> AudioDeviceCatalog {
 }
 
 /// An active pair of device streams. Input is captured into a lock-free mono
-/// ring buffer and exposed as a peak meter; output can play a test tone or
-/// monitor that input.
+/// ring buffer and exposed as a peak meter; output can play project audio, a
+/// test tone, or monitor that input.
 pub struct AudioEngine {
     source: Arc<AtomicU8>,
+    playback: Arc<PlaybackState>,
+    sample_rate: u32,
     input_peak: Arc<AtomicU32>,
     error: Arc<Mutex<Option<String>>>,
     input_stream: Option<Stream>,
@@ -158,6 +211,9 @@ impl AudioEngine {
     }
 
     pub fn set_test_tone(&self, enabled: bool) {
+        if enabled {
+            self.playback.pause();
+        }
         self.source.store(
             if enabled {
                 AUDIO_SOURCE_TEST_TONE
@@ -174,6 +230,9 @@ impl AudioEngine {
                 "Select and start both an input and an output device to monitor input".into(),
             );
         }
+        if enabled {
+            self.playback.pause();
+        }
         self.source.store(
             if enabled {
                 AUDIO_SOURCE_INPUT_MONITOR
@@ -183,6 +242,52 @@ impl AudioEngine {
             Ordering::Release,
         );
         Ok(())
+    }
+
+    /// Start outputting interleaved stereo project audio at the device sample rate.
+    pub fn set_project_playback(&self, samples: Vec<f32>) -> Result<(), String> {
+        if !self.output_active {
+            return Err("Start an output device before playing the project".into());
+        }
+        if samples.is_empty() || !samples.len().is_multiple_of(2) {
+            return Err("Rendered project audio must contain stereo sample frames".into());
+        }
+        self.playback.start(samples);
+        self.source.store(AUDIO_SOURCE_PROJECT, Ordering::Release);
+        Ok(())
+    }
+
+    pub fn pause_project_playback(&self) {
+        self.playback.pause();
+        let _ = self.source.compare_exchange(
+            AUDIO_SOURCE_PROJECT,
+            AUDIO_SOURCE_SILENT,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    pub fn resume_project_playback(&self) -> Result<(), String> {
+        if !self.output_active {
+            return Err("Start an output device before resuming project playback".into());
+        }
+        self.playback.resume()?;
+        self.source.store(AUDIO_SOURCE_PROJECT, Ordering::Release);
+        Ok(())
+    }
+
+    pub fn stop_project_playback(&self) {
+        self.playback.stop();
+        let _ = self.source.compare_exchange(
+            AUDIO_SOURCE_PROJECT,
+            AUDIO_SOURCE_SILENT,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    pub fn project_playback_active(&self) -> bool {
+        self.playback.active.load(Ordering::Acquire)
     }
 
     pub fn input_peak(&self) -> f32 {
@@ -202,6 +307,10 @@ impl AudioEngine {
         self.output_active
     }
 
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
     pub fn take_error(&self) -> Option<String> {
         self.error
             .lock()
@@ -213,6 +322,7 @@ impl AudioEngine {
         let host = cpal::default_host();
         let ring = Arc::new(AudioRingBuffer::new(AUDIO_RING_CAPACITY));
         let source = Arc::new(AtomicU8::new(AUDIO_SOURCE_SILENT));
+        let playback = Arc::new(PlaybackState::new());
         let input_peak = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
         let error = Arc::new(Mutex::new(None));
 
@@ -234,6 +344,7 @@ impl AudioEngine {
                 &device,
                 settings,
                 Arc::clone(&source),
+                Arc::clone(&playback),
                 Arc::clone(&ring),
                 Arc::clone(&error),
             )?;
@@ -264,6 +375,8 @@ impl AudioEngine {
 
         Ok(Self {
             source,
+            playback,
+            sample_rate: settings.sample_rate,
             input_peak,
             error,
             input_active: input_stream.is_some(),
@@ -279,12 +392,12 @@ impl AudioEngine {
 
     #[cfg(windows)]
     fn start_exclusive(settings: &AudioSettings) -> Result<Self, String> {
-        use std::sync::atomic::AtomicBool;
         use std::sync::mpsc;
         use std::thread;
 
         let ring = Arc::new(AudioRingBuffer::new(AUDIO_RING_CAPACITY));
         let source = Arc::new(AtomicU8::new(AUDIO_SOURCE_SILENT));
+        let playback = Arc::new(PlaybackState::new());
         let input_peak = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
         let error = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
@@ -298,6 +411,7 @@ impl AudioEngine {
             let (ready_tx, ready_rx) = mpsc::sync_channel(1);
             let worker_settings = settings.clone();
             let worker_source = Arc::clone(&source);
+            let worker_playback = Arc::clone(&playback);
             let worker_ring = Arc::clone(&ring);
             let worker_peak = Arc::clone(&input_peak);
             let worker_error = Arc::clone(&error);
@@ -310,6 +424,7 @@ impl AudioEngine {
                         &worker_settings,
                         WasapiWorkerState {
                             source: worker_source,
+                            playback: worker_playback,
                             ring: worker_ring,
                             input_peak: worker_peak,
                             error: worker_error,
@@ -340,6 +455,7 @@ impl AudioEngine {
             let worker_ring = Arc::clone(&ring);
             let worker_peak = Arc::clone(&input_peak);
             let worker_source = Arc::clone(&source);
+            let worker_playback = Arc::clone(&playback);
             let worker_error = Arc::clone(&error);
             let worker_stop = Arc::clone(&stop);
             let input_thread = thread::Builder::new()
@@ -350,6 +466,7 @@ impl AudioEngine {
                         &worker_settings,
                         WasapiWorkerState {
                             source: worker_source,
+                            playback: worker_playback,
                             ring: worker_ring,
                             input_peak: worker_peak,
                             error: worker_error,
@@ -405,6 +522,8 @@ impl AudioEngine {
                 || cpal::default_host().default_input_device().is_some());
         Ok(Self {
             source,
+            playback,
+            sample_rate: settings.sample_rate,
             input_peak,
             error,
             input_active,
@@ -515,6 +634,7 @@ fn build_output_stream(
     device: &cpal::Device,
     settings: &AudioSettings,
     source: Arc<AtomicU8>,
+    playback: Arc<PlaybackState>,
     ring: Arc<AudioRingBuffer>,
     error: Arc<Mutex<Option<String>>>,
 ) -> Result<Stream, String> {
@@ -527,6 +647,7 @@ fn build_output_stream(
         config,
         format,
         Arc::clone(&source),
+        Arc::clone(&playback),
         Arc::clone(&ring),
         Arc::clone(&error),
     ) {
@@ -534,9 +655,16 @@ fn build_output_stream(
         Err(first_error) => {
             let mut default_config = supported.config();
             default_config.buffer_size = cpal::BufferSize::Default;
-            build_typed_output(device, default_config, format, source, ring, error).map_err(
-                |error| format!("{error} (requested buffer was also rejected: {first_error})"),
+            build_typed_output(
+                device,
+                default_config,
+                format,
+                source,
+                playback,
+                ring,
+                error,
             )
+            .map_err(|error| format!("{error} (requested buffer was also rejected: {first_error})"))
         }
     }
 }
@@ -546,12 +674,13 @@ fn build_typed_output(
     config: StreamConfig,
     format: SampleFormat,
     source: Arc<AtomicU8>,
+    playback: Arc<PlaybackState>,
     ring: Arc<AudioRingBuffer>,
     error: Arc<Mutex<Option<String>>>,
 ) -> Result<Stream, String> {
     macro_rules! build {
         ($sample:ty) => {
-            build_tone_stream::<$sample>(device, config, source, ring, error)
+            build_tone_stream::<$sample>(device, config, source, playback, ring, error)
         };
     }
     match format {
@@ -577,6 +706,7 @@ fn build_tone_stream<T>(
     device: &cpal::Device,
     config: StreamConfig,
     source: Arc<AtomicU8>,
+    playback: Arc<PlaybackState>,
     ring: Arc<AudioRingBuffer>,
     error: Arc<Mutex<Option<String>>>,
 ) -> Result<Stream, String>
@@ -586,14 +716,29 @@ where
     let sample_rate = config.sample_rate as f32;
     let channels = usize::from(config.channels).max(1);
     let mut phase = 0.0_f32;
+    let playback_for_callback = Arc::clone(&playback);
     let stream = device
         .build_output_stream::<T, _, _>(
             config,
             move |output, _| {
+                let playback_samples = playback_for_callback.samples.load();
                 for frame in output.chunks_mut(channels) {
-                    let sample = next_output_sample(&source, &ring, sample_rate, &mut phase);
-                    let converted = T::from_sample(sample);
-                    frame.fill(converted);
+                    let [left, right] = next_output_frame(
+                        &source,
+                        &ring,
+                        playback_samples.as_deref().map(Vec::as_slice),
+                        &playback_for_callback,
+                        sample_rate,
+                        &mut phase,
+                    );
+                    for (channel, destination) in frame.iter_mut().enumerate() {
+                        let sample = match channel {
+                            0 => left,
+                            1 => right,
+                            _ => 0.0,
+                        };
+                        *destination = T::from_sample(sample.clamp(-1.0, 1.0));
+                    }
                 }
             },
             move |stream_error| set_error(&error, stream_error.to_string()),
@@ -709,20 +854,45 @@ where
     Ok(stream)
 }
 
-fn next_output_sample(
+fn next_output_frame(
     source: &AtomicU8,
     ring: &AudioRingBuffer,
+    project_samples: Option<&[f32]>,
+    playback: &PlaybackState,
     sample_rate: f32,
     phase: &mut f32,
-) -> f32 {
+) -> [f32; 2] {
     match source.load(Ordering::Acquire) {
         AUDIO_SOURCE_TEST_TONE => {
             let (value, next_phase) = tone_sample(*phase, sample_rate);
             *phase = next_phase;
-            value
+            [value, value]
         }
-        AUDIO_SOURCE_INPUT_MONITOR => ring.pop().unwrap_or(0.0),
-        _ => 0.0,
+        AUDIO_SOURCE_INPUT_MONITOR => {
+            let value = ring.pop().unwrap_or(0.0);
+            [value, value]
+        }
+        AUDIO_SOURCE_PROJECT => {
+            if !playback.active.load(Ordering::Acquire) {
+                return [0.0, 0.0];
+            }
+            let frame = playback.cursor_frames.fetch_add(1, Ordering::Relaxed);
+            let Some(offset) = usize::try_from(frame)
+                .ok()
+                .and_then(|frame| frame.checked_mul(2))
+            else {
+                playback.active.store(false, Ordering::Release);
+                return [0.0, 0.0];
+            };
+            let Some(samples) =
+                project_samples.and_then(|samples| samples.get(offset..offset.saturating_add(2)))
+            else {
+                playback.active.store(false, Ordering::Release);
+                return [0.0, 0.0];
+            };
+            [samples[0], samples[1]]
+        }
+        _ => [0.0, 0.0],
     }
 }
 
@@ -801,6 +971,7 @@ fn set_wasapi_error(error: &Mutex<Option<String>>, message: String) {
 #[cfg(windows)]
 struct WasapiWorkerState {
     source: Arc<AtomicU8>,
+    playback: Arc<PlaybackState>,
     ring: Arc<AudioRingBuffer>,
     input_peak: Arc<AtomicU32>,
     error: Arc<Mutex<Option<String>>>,
@@ -816,6 +987,7 @@ fn wasapi_exclusive_output_worker(
 ) {
     let WasapiWorkerState {
         source,
+        playback,
         ring,
         error,
         stop,
@@ -860,8 +1032,14 @@ fn wasapi_exclusive_output_worker(
         let initial_frames = client
             .get_available_space_in_frames()
             .map_err(|error| error.to_string())? as usize;
-        let initial =
-            render_wasapi_buffer(initial_frames, &format_spec, &source, &ring, &mut phase)?;
+        let initial = render_wasapi_buffer(
+            initial_frames,
+            &format_spec,
+            &source,
+            &playback,
+            &ring,
+            &mut phase,
+        )?;
         render
             .write_to_device(initial_frames, &initial, None)
             .map_err(|error| error.to_string())?;
@@ -878,8 +1056,14 @@ fn wasapi_exclusive_output_worker(
                         .get_available_space_in_frames()
                         .map_err(|error| error.to_string())?
                         as usize;
-                    let bytes =
-                        render_wasapi_buffer(frames, &format_spec, &source, &ring, &mut phase)?;
+                    let bytes = render_wasapi_buffer(
+                        frames,
+                        &format_spec,
+                        &source,
+                        &playback,
+                        &ring,
+                        &mut phase,
+                    )?;
                     render
                         .write_to_device(frames, &bytes, None)
                         .map_err(|error| error.to_string())?;
@@ -915,6 +1099,7 @@ fn wasapi_exclusive_input_worker(
         source,
         error,
         stop,
+        ..
     } = state;
     let mut started = false;
     let result = (|| -> Result<(), String> {
@@ -1179,22 +1364,28 @@ fn render_wasapi_buffer(
     frames: usize,
     format: &WasapiSampleSpec,
     source: &AtomicU8,
+    playback: &PlaybackState,
     ring: &AudioRingBuffer,
     phase: &mut f32,
 ) -> Result<Vec<u8>, String> {
     let mut output = vec![0_u8; frames.saturating_mul(format.frame_bytes)];
     let sample_rate = format.get_sample_rate();
+    let playback_samples = playback.samples.load();
     for frame in output.chunks_exact_mut(format.frame_bytes) {
-        let sample = match source.load(Ordering::Acquire) {
-            AUDIO_SOURCE_TEST_TONE => {
-                let (value, next_phase) = tone_sample(*phase, sample_rate);
-                *phase = next_phase;
-                value
-            }
-            AUDIO_SOURCE_INPUT_MONITOR => ring.pop().unwrap_or(0.0),
-            _ => 0.0,
-        };
-        for channel in frame.chunks_exact_mut(format.sample_bytes) {
+        let stereo = next_output_frame(
+            source,
+            ring,
+            playback_samples.as_deref().map(Vec::as_slice),
+            playback,
+            sample_rate,
+            phase,
+        );
+        for (channel_index, channel) in frame.chunks_exact_mut(format.sample_bytes).enumerate() {
+            let sample = match channel_index {
+                0 => stereo[0],
+                1 => stereo[1],
+                _ => 0.0,
+            };
             format.encode(sample, channel)?;
         }
     }
@@ -1210,7 +1401,12 @@ impl WasapiSampleSpec {
 
 #[cfg(test)]
 mod tests {
-    use super::{AudioAccess, AudioRingBuffer, AudioSettings, tone_sample, validate_settings};
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    use super::{
+        AUDIO_SOURCE_PROJECT, AudioAccess, AudioRingBuffer, AudioSettings, PlaybackState,
+        next_output_frame, tone_sample, validate_settings,
+    };
 
     #[test]
     fn shared_is_the_default_access_mode_and_device_settings_are_sane() {
@@ -1253,5 +1449,64 @@ mod tests {
         assert!(second > 0.0);
         assert!(next_phase > phase);
         assert!(second <= 0.12);
+    }
+
+    #[test]
+    fn project_output_preserves_stereo_order_and_stops_at_the_end() {
+        let playback = PlaybackState::new();
+        playback.start(vec![0.25_f32, -0.5, 0.75, -1.0]);
+        let source = AtomicU8::new(AUDIO_SOURCE_PROJECT);
+        let ring = AudioRingBuffer::new(2);
+        let mut phase = 0.0;
+        let samples = playback.samples.load();
+
+        assert_eq!(
+            next_output_frame(
+                &source,
+                &ring,
+                samples.as_deref().map(Vec::as_slice),
+                &playback,
+                48_000.0,
+                &mut phase,
+            ),
+            [0.25, -0.5]
+        );
+        assert_eq!(
+            next_output_frame(
+                &source,
+                &ring,
+                samples.as_deref().map(Vec::as_slice),
+                &playback,
+                48_000.0,
+                &mut phase,
+            ),
+            [0.75, -1.0]
+        );
+        assert_eq!(
+            next_output_frame(
+                &source,
+                &ring,
+                samples.as_deref().map(Vec::as_slice),
+                &playback,
+                48_000.0,
+                &mut phase,
+            ),
+            [0.0, 0.0]
+        );
+        assert!(!playback.active.load(Ordering::Acquire));
+        playback.resume().expect("loaded playback should resume");
+        assert_eq!(
+            next_output_frame(
+                &source,
+                &ring,
+                samples.as_deref().map(Vec::as_slice),
+                &playback,
+                48_000.0,
+                &mut phase,
+            ),
+            [0.25, -0.5]
+        );
+        playback.stop();
+        assert!(playback.resume().is_err());
     }
 }

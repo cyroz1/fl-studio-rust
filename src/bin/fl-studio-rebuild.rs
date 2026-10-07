@@ -1,6 +1,10 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
 
 use eframe::egui::{self, Align2, Color32, FontId, Id, Sense, Stroke, Vec2};
 use flp_rebuild::audio::{
@@ -8,7 +12,10 @@ use flp_rebuild::audio::{
 };
 use flp_rebuild::midi::MidiFile;
 use flp_rebuild::plugins::{PluginCandidate, PluginFormat, scan_installed_plugins};
-use flp_rebuild::sample_render::{AudioClipRenderOptions, render_audio_clips_to_wav};
+use flp_rebuild::sample_render::{
+    AudioClipRenderOptions, AudioClipRenderSummary,
+    render_audio_clips_to_stereo_buffer_cancellable, render_audio_clips_to_wav,
+};
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions};
 use flp_rebuild::{
     FlpDocument, Pattern, PatternNote, PatternNoteEdit, PlaylistClip, PlaylistClipEdit,
@@ -197,6 +204,7 @@ struct DawUi {
     status: String,
     dirty: bool,
     playing: bool,
+    project_playback_loaded: bool,
     tempo_bpm: f64,
     selected_pattern: Option<u16>,
     selected_note_channel: Option<u16>,
@@ -215,8 +223,14 @@ struct DawUi {
     audio_catalog: AudioDeviceCatalog,
     audio_settings: AudioSettings,
     audio_engine: Option<AudioEngine>,
+    pending_audio_render: Option<PendingAudioRender>,
     audio_test_tone: bool,
     audio_monitor_input: bool,
+}
+
+struct PendingAudioRender {
+    receiver: Receiver<Result<(Vec<f32>, AudioClipRenderSummary), String>>,
+    cancelled: Arc<AtomicBool>,
 }
 
 impl DawUi {
@@ -241,6 +255,7 @@ impl DawUi {
             status: "Open an FL Studio project to begin".to_owned(),
             dirty: false,
             playing: false,
+            project_playback_loaded: false,
             tempo_bpm: 140.0,
             selected_pattern: None,
             selected_note_channel: None,
@@ -259,6 +274,7 @@ impl DawUi {
             audio_catalog,
             audio_settings,
             audio_engine: None,
+            pending_audio_render: None,
             audio_test_tone: false,
             audio_monitor_input: false,
         };
@@ -284,6 +300,7 @@ impl DawUi {
             .and_then(|bytes| FlpDocument::parse(&bytes).map_err(|error| error.to_string()))
         {
             Ok(document) => {
+                self.stop_project_playback();
                 self.tempo_bpm = document.metadata().tempo_bpm().unwrap_or(140.0);
                 self.selected_pattern = document
                     .patterns()
@@ -354,13 +371,192 @@ impl DawUi {
         if !bpm.is_finite() || bpm <= 0.0 {
             return;
         }
-        if let Some(document) = &mut self.document {
-            let milli_bpm = (bpm * 1000.0).round().clamp(1.0, f64::from(u32::MAX)) as u32;
-            if document.set_tempo_milli_bpm(milli_bpm).is_ok() {
-                self.dirty = true;
-                self.status = format!("Tempo set to {:.3} BPM", f64::from(milli_bpm) / 1000.0);
+        let milli_bpm = (bpm * 1000.0).round().clamp(1.0, f64::from(u32::MAX)) as u32;
+        let changed = self
+            .document
+            .as_mut()
+            .is_some_and(|document| document.set_tempo_milli_bpm(milli_bpm).is_ok());
+        if changed {
+            self.stop_project_playback();
+            self.dirty = true;
+            self.status = format!("Tempo set to {:.3} BPM", f64::from(milli_bpm) / 1000.0);
+        }
+    }
+
+    fn start_project_playback(&mut self) {
+        if self.pending_audio_render.is_some() {
+            self.status = "Project audio is already being prepared".to_owned();
+            return;
+        }
+        if self.document.is_none() {
+            self.status = "Open an FL Studio project before playing".to_owned();
+            return;
+        }
+        let Some(project_path) = self.current_path.clone() else {
+            self.status = "Save the project to a file before playing its audio clips".to_owned();
+            return;
+        };
+        if self.audio_engine.is_none() {
+            match AudioEngine::start(&self.audio_settings) {
+                Ok(engine) => self.audio_engine = Some(engine),
+                Err(error) => {
+                    self.status = format!("Could not start audio output: {error}");
+                    return;
+                }
             }
         }
+        let Some(engine) = self.audio_engine.as_ref() else {
+            self.status = "Audio output is not available".to_owned();
+            return;
+        };
+        if !engine.output_active() {
+            self.status = "Enable an output device in Audio settings before playing".to_owned();
+            return;
+        }
+        if self.audio_test_tone {
+            engine.set_test_tone(false);
+            self.audio_test_tone = false;
+        }
+        if self.audio_monitor_input {
+            let _ = engine.set_input_monitor(false);
+            self.audio_monitor_input = false;
+        }
+        let sample_rate = engine.sample_rate();
+        let project_bytes = match self
+            .document
+            .as_ref()
+            .expect("the project was checked above")
+            .encode_lossless()
+        {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.status = format!("Could not prepare project audio: {error}");
+                return;
+            }
+        };
+        let options = AudioClipRenderOptions {
+            arrangement_id: self.selected_arrangement.unwrap_or(0),
+            sample_rate,
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name("project-audio-render".to_owned())
+            .spawn(move || {
+                let result = FlpDocument::parse(&project_bytes)
+                    .map_err(|error| error.to_string())
+                    .and_then(|document| {
+                        render_audio_clips_to_stereo_buffer_cancellable(
+                            &document,
+                            &project_path,
+                            options,
+                            &worker_cancelled,
+                        )
+                    });
+                let _ = sender.send(result);
+            });
+        match worker {
+            Ok(_) => {
+                self.playing = false;
+                self.project_playback_loaded = false;
+                self.pending_audio_render = Some(PendingAudioRender {
+                    receiver,
+                    cancelled,
+                });
+                self.status = "Preparing Playlist audio for playback…".to_owned();
+            }
+            Err(error) => self.status = format!("Could not start audio preparation: {error}"),
+        }
+    }
+
+    fn poll_project_audio_render(&mut self) {
+        let completed = self.pending_audio_render.as_ref().and_then(|pending| {
+            match pending.receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Disconnected) => {
+                    Some(Err("audio render worker stopped unexpectedly".to_owned()))
+                }
+                Err(TryRecvError::Empty) => None,
+            }
+        });
+        if let Some(result) = completed {
+            self.pending_audio_render = None;
+            match result {
+                Ok((samples, summary)) => self.start_rendered_project_playback(samples, summary),
+                Err(error) => {
+                    self.playing = false;
+                    self.project_playback_loaded = false;
+                    self.status = format!("Could not render project audio for playback: {error}");
+                }
+            }
+        }
+    }
+
+    fn start_rendered_project_playback(
+        &mut self,
+        samples: Vec<f32>,
+        summary: AudioClipRenderSummary,
+    ) {
+        let result = self
+            .audio_engine
+            .as_ref()
+            .ok_or_else(|| "Audio output is not available".to_owned())
+            .and_then(|engine| engine.set_project_playback(samples));
+        match result {
+            Ok(()) => {
+                self.playing = true;
+                self.project_playback_loaded = true;
+                self.audio_test_tone = false;
+                self.audio_monitor_input = false;
+                self.status = format!(
+                    "Playing {} audio clips from {} source files at {} Hz ({} scaled clips skipped); instruments and Mixer effects are not rendered",
+                    summary.clips_rendered,
+                    summary.source_files,
+                    summary.sample_rate,
+                    summary.clips_skipped_unsupported_scale
+                );
+            }
+            Err(error) => self.status = format!("Could not start project playback: {error}"),
+        }
+    }
+
+    fn toggle_project_playback(&mut self) {
+        if self.pending_audio_render.is_some() {
+            self.status = "Preparing Playlist audio for playback…".to_owned();
+        } else if self.playing {
+            if let Some(engine) = &self.audio_engine {
+                engine.pause_project_playback();
+            }
+            self.playing = false;
+            self.status = "Project playback paused".to_owned();
+        } else if self.project_playback_loaded {
+            let result = self
+                .audio_engine
+                .as_ref()
+                .ok_or_else(|| "Audio output is not available".to_owned())
+                .and_then(AudioEngine::resume_project_playback);
+            match result {
+                Ok(()) => {
+                    self.playing = true;
+                    self.status = "Project playback resumed".to_owned();
+                }
+                Err(error) => self.status = format!("Could not resume project playback: {error}"),
+            }
+        } else {
+            self.start_project_playback();
+        }
+    }
+
+    fn stop_project_playback(&mut self) {
+        if let Some(pending) = self.pending_audio_render.take() {
+            pending.cancelled.store(true, Ordering::Release);
+        }
+        if let Some(engine) = &self.audio_engine {
+            engine.stop_project_playback();
+        }
+        self.playing = false;
+        self.project_playback_loaded = false;
     }
 
     fn top_menu(&mut self, ui: &mut egui::Ui) {
@@ -413,14 +609,30 @@ impl DawUi {
                 self.status = "Recording is not implemented yet".to_owned();
             }
             if ui.button("■").on_hover_text("Stop").clicked() {
-                self.playing = false;
+                let was_preparing = self.pending_audio_render.is_some();
+                self.stop_project_playback();
+                self.status = if was_preparing {
+                    "Audio preparation cancelled".to_owned()
+                } else {
+                    "Project playback stopped".to_owned()
+                };
             }
-            let play_label = if self.playing { "❚❚" } else { "▶" };
-            if ui.button(play_label).on_hover_text("Play").clicked() {
-                self.playing = !self.playing;
-                if self.playing {
-                    self.status = "Audio playback is not implemented yet".to_owned();
-                }
+            let play_label = if self.pending_audio_render.is_some() {
+                "…"
+            } else if self.playing {
+                "❚❚"
+            } else {
+                "▶"
+            };
+            let play_hint = if self.pending_audio_render.is_some() {
+                "Preparing audio"
+            } else if self.playing {
+                "Pause"
+            } else {
+                "Play"
+            };
+            if ui.button(play_label).on_hover_text(play_hint).clicked() {
+                self.toggle_project_playback();
             }
             ui.separator();
             ui.label("PAT");
@@ -764,18 +976,19 @@ impl DawUi {
             let length_changed = ui
                 .add(egui::DragValue::new(&mut length).speed(1.0))
                 .changed();
-            if (start_changed || length_changed)
-                && let Some(document) = &mut self.document
-            {
+            if start_changed || length_changed {
                 let edit = PlaylistClipEdit {
                     position_ticks: start_changed.then_some(position),
                     length_ticks: length_changed.then_some(length),
                     ..PlaylistClipEdit::default()
                 };
-                if document
-                    .edit_playlist_clip(arrangement_id, index, edit)
-                    .is_ok()
-                {
+                let updated = self.document.as_mut().is_some_and(|document| {
+                    document
+                        .edit_playlist_clip(arrangement_id, index, edit)
+                        .is_ok()
+                });
+                if updated {
+                    self.stop_project_playback();
                     self.dirty = true;
                     self.status = "Playlist clip updated".to_owned();
                 }
@@ -1885,6 +2098,7 @@ impl DawUi {
                 {
                     self.audio_test_tone = !self.audio_test_tone;
                     if self.audio_test_tone {
+                        self.playing = false;
                         self.audio_monitor_input = false;
                         let _ = engine.set_input_monitor(false);
                     }
@@ -1903,6 +2117,7 @@ impl DawUi {
                 {
                     self.audio_monitor_input = !self.audio_monitor_input;
                     if self.audio_monitor_input {
+                        self.playing = false;
                         self.audio_test_tone = false;
                         engine.set_test_tone(false);
                     }
@@ -1942,6 +2157,7 @@ impl DawUi {
         }
 
         if stop_requested {
+            self.stop_project_playback();
             self.audio_engine = None;
             self.audio_test_tone = false;
             self.audio_monitor_input = false;
@@ -2326,6 +2542,7 @@ impl DawUi {
 
 impl eframe::App for DawUi {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.poll_project_audio_render();
         for (key, view) in [
             (egui::Key::F5, MainView::Playlist),
             (egui::Key::F6, MainView::ChannelRack),
@@ -2343,6 +2560,15 @@ impl eframe::App for DawUi {
         }
         if let Some(error) = self.audio_engine.as_ref().and_then(AudioEngine::take_error) {
             self.status = format!("Audio device error: {error}");
+        }
+        if self.playing
+            && self
+                .audio_engine
+                .as_ref()
+                .is_some_and(|engine| !engine.project_playback_active())
+        {
+            self.playing = false;
+            self.status = "Project playback reached the end".to_owned();
         }
         if self.audio_engine.is_some() {
             ui.ctx()
@@ -2402,6 +2628,12 @@ impl eframe::App for DawUi {
                 },
             );
         });
+    }
+}
+
+impl Drop for DawUi {
+    fn drop(&mut self) {
+        self.stop_project_playback();
     }
 }
 

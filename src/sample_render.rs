@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::media::{DecodedAudio, SamplePathResolver, decode_audio_file};
@@ -52,6 +53,44 @@ pub fn render_audio_clips_to_wav(
     let project_path = project_path.as_ref();
     let output_path = output_path.as_ref();
     validate_output_path(project_path, output_path)?;
+    let (mix, summary) = render_audio_clips_to_stereo_buffer(document, project_path, options)?;
+    write_float_stereo_wav(output_path, &mix, options.sample_rate, summary.frames)?;
+    Ok(summary)
+}
+
+/// Render enabled Playlist clips that reference audio channels into an interleaved stereo buffer.
+/// The frame rate is `options.sample_rate`, so the result can be sent directly to a matching
+/// output device without resampling in the real-time callback.
+pub fn render_audio_clips_to_stereo_buffer(
+    document: &FlpDocument,
+    project_path: impl AsRef<Path>,
+    options: AudioClipRenderOptions,
+) -> Result<(Vec<f32>, AudioClipRenderSummary), String> {
+    render_audio_clips_to_stereo_buffer_inner(document, project_path.as_ref(), options, None)
+}
+
+/// Cancellable variant for preparing audio on a background worker.
+pub fn render_audio_clips_to_stereo_buffer_cancellable(
+    document: &FlpDocument,
+    project_path: impl AsRef<Path>,
+    options: AudioClipRenderOptions,
+    cancelled: &AtomicBool,
+) -> Result<(Vec<f32>, AudioClipRenderSummary), String> {
+    render_audio_clips_to_stereo_buffer_inner(
+        document,
+        project_path.as_ref(),
+        options,
+        Some(cancelled),
+    )
+}
+
+fn render_audio_clips_to_stereo_buffer_inner(
+    document: &FlpDocument,
+    project_path: &Path,
+    options: AudioClipRenderOptions,
+    cancelled: Option<&AtomicBool>,
+) -> Result<(Vec<f32>, AudioClipRenderSummary), String> {
+    check_cancelled(cancelled)?;
     if !(8_000..=384_000).contains(&options.sample_rate) {
         return Err("render sample rate must be between 8000 and 384000 Hz".to_owned());
     }
@@ -76,6 +115,7 @@ pub fn render_audio_clips_to_wav(
     let mut clips_skipped_unsupported_scale = 0usize;
     let mut candidate_clips = Vec::<(usize, &PlaylistClip, u16, PathBuf)>::new();
     for (clip_index, clip) in arrangement.clips.iter().enumerate() {
+        check_cancelled(cancelled)?;
         max_tick = max_tick.max(u64::from(clip.position_ticks) + u64::from(clip.length_ticks));
         let PlaylistClipTarget::Channel { id } = clip.target() else {
             continue;
@@ -111,6 +151,7 @@ pub fn render_audio_clips_to_wav(
     let mut decoded_by_path = HashMap::<PathBuf, DecodedAudio>::new();
     let mut cached_source_bytes = 0usize;
     for (_, _, _, path) in &candidate_clips {
+        check_cancelled(cancelled)?;
         if decoded_by_path.contains_key(path) {
             continue;
         }
@@ -131,6 +172,7 @@ pub fn render_audio_clips_to_wav(
     let mut prepared = Vec::with_capacity(candidate_clips.len());
     let mut output_frames = timeline_frames;
     for (clip_index, clip, channel_id, path) in &candidate_clips {
+        check_cancelled(cancelled)?;
         let audio = decoded_by_path
             .get(path)
             .expect("all candidate source files were decoded");
@@ -186,6 +228,7 @@ pub fn render_audio_clips_to_wav(
     mix.resize(mix_samples, 0.0);
 
     for clip in &prepared {
+        check_cancelled(cancelled)?;
         let audio = decoded_by_path
             .get(&clip.path)
             .expect("prepared clips have decoded sources");
@@ -196,6 +239,7 @@ pub fn render_audio_clips_to_wav(
             clip.start_frame,
             clip.duration_frames,
             options.sample_rate,
+            cancelled,
         )
         .map_err(|error| {
             format!(
@@ -205,14 +249,16 @@ pub fn render_audio_clips_to_wav(
         })?;
     }
 
-    write_float_stereo_wav(output_path, &mix, options.sample_rate, output_frames)?;
-    Ok(AudioClipRenderSummary {
-        frames: output_frames,
-        sample_rate: options.sample_rate,
-        clips_rendered: prepared.len(),
-        clips_skipped_unsupported_scale,
-        source_files: decoded_by_path.len(),
-    })
+    Ok((
+        mix,
+        AudioClipRenderSummary {
+            frames: output_frames,
+            sample_rate: options.sample_rate,
+            clips_rendered: prepared.len(),
+            clips_skipped_unsupported_scale,
+            source_files: decoded_by_path.len(),
+        },
+    ))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -299,6 +345,14 @@ fn source_duration_to_frames(
     Ok(duration.ceil() as u64)
 }
 
+fn check_cancelled(cancelled: Option<&AtomicBool>) -> Result<(), String> {
+    if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        Err("audio render cancelled".to_owned())
+    } else {
+        Ok(())
+    }
+}
+
 fn mix_clip_into_stereo(
     mix: &mut [f32],
     source: &DecodedAudio,
@@ -306,6 +360,7 @@ fn mix_clip_into_stereo(
     start_frame: u64,
     output_frames: u64,
     output_rate: u32,
+    cancelled: Option<&AtomicBool>,
 ) -> Result<(), String> {
     if source.channels.is_empty() || source.channels.len() > 2 {
         return Err("source must have one or two channels".to_owned());
@@ -329,6 +384,9 @@ fn mix_clip_into_stereo(
     }
     let source_frames_per_output = f64::from(source.sample_rate) / f64::from(output_rate);
     for output_offset in 0..output_frames {
+        if output_offset.is_multiple_of(16_384) {
+            check_cancelled(cancelled)?;
+        }
         let position = (bounds.start as f64 + output_offset as f64 * source_frames_per_output)
             .min((bounds.end - 1) as f64);
         let left = interpolate_sample(&source.channels[0], position);
@@ -518,13 +576,46 @@ impl Drop for TemporaryWav {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
 
     static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(1);
 
     #[test]
     fn converts_project_ticks_to_output_frames() {
         assert_eq!(ticks_to_frames(192, 96, 120.0, 48_000).unwrap(), 48_000);
+    }
+
+    #[test]
+    fn cancellation_is_observed_before_render_work() {
+        let cancelled = AtomicBool::new(true);
+        assert_eq!(
+            check_cancelled(Some(&cancelled)),
+            Err("audio render cancelled".to_owned())
+        );
+    }
+
+    #[test]
+    fn cancellable_buffer_render_exits_before_project_work() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"FLhd");
+        bytes.extend_from_slice(&6_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&96_u16.to_le_bytes());
+        bytes.extend_from_slice(b"FLdt");
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        let document = FlpDocument::parse(&bytes).expect("the empty fixture should parse");
+        let cancelled = AtomicBool::new(true);
+        assert_eq!(
+            render_audio_clips_to_stereo_buffer_cancellable(
+                &document,
+                ".",
+                AudioClipRenderOptions::default(),
+                &cancelled,
+            )
+            .unwrap_err(),
+            "audio render cancelled"
+        );
     }
 
     #[test]
@@ -541,6 +632,7 @@ mod tests {
             0,
             4,
             4,
+            None,
         )
         .unwrap();
         assert_eq!(mix, vec![0.0, 0.0, 0.5, 0.5, 1.0, 1.0, 1.0, 1.0]);

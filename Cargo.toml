@@ -6,6 +6,7 @@ description = "A clean-room Rust compatibility core for FL Studio project files"
 license = "MIT"
 
 [dependencies]
+arc-swap = "1.7.1"
 cpal = "0.18.2"
 eframe = { version = "0.36.2", default-features = false, features = ["accesskit", "default_fonts", "glow", "links", "wayland", "x11"] }
 rfd = "0.17.2"
