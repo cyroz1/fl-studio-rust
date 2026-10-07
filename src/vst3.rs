@@ -16,6 +16,7 @@ use vst3_host::{Plugin, PluginInfo, PluginWindow, Vst3Host};
 use crate::PatternNote;
 
 static NEXT_RENDER_FILE_ID: AtomicU64 = AtomicU64::new(1);
+const MAX_STEREO_BUFFER_BYTES: usize = 512 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ScheduledMidiEvent {
@@ -30,6 +31,16 @@ pub struct Vst3RenderSummary {
     pub sample_rate: u32,
     pub output_channels: usize,
     pub notes_rendered: usize,
+}
+
+struct PreparedPatternRender {
+    events: Vec<ScheduledMidiEvent>,
+    note_count: usize,
+    sample_rate: f64,
+    sample_rate_u32: u32,
+    output_channels: usize,
+    block_size: usize,
+    total_frames: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -208,62 +219,14 @@ impl Vst3HostRuntime {
         options: Vst3PatternRenderOptions,
         path: impl AsRef<Path>,
     ) -> Result<Vst3RenderSummary, String> {
-        let Vst3PatternRenderOptions {
-            channel_id,
-            ppq,
-            tempo_bpm,
-            tail_seconds,
-        } = options;
-        if ppq == 0 {
-            return Err("project PPQ must be greater than zero".to_owned());
-        }
-        if !tempo_bpm.is_finite() || tempo_bpm <= 0.0 {
-            return Err("project tempo must be finite and positive".to_owned());
-        }
-        if !tail_seconds.is_finite() || !(0.0..=60.0).contains(&tail_seconds) {
-            return Err("render tail must be between 0 and 60 seconds".to_owned());
-        }
-
         let plugin = self.plugin(id)?;
         let mut plugin = plugin
             .lock()
             .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
-        let sample_rate = plugin.sample_rate();
-        let sample_rate_u32 = sample_rate.round() as u32;
-        if !sample_rate.is_finite() || !(8_000.0..=384_000.0).contains(&sample_rate) {
-            return Err("VST3 host sample rate is invalid".to_owned());
-        }
-        let block_size = plugin.block_size();
-        if block_size == 0 || block_size > 65_536 {
-            return Err("VST3 host block size is not renderable".to_owned());
-        }
-        let output_channels = plugin.output_channel_count();
-        if output_channels == 0 || output_channels > 64 {
-            return Err("VST3 instrument has no supported audio output buses".to_owned());
-        }
-
-        let (events, note_count) =
-            scheduled_pattern_events(notes, channel_id, ppq, tempo_bpm, sample_rate)?;
-        if note_count == 0 {
-            return Err(format!(
-                "pattern channel {channel_id} has no notes to render"
-            ));
-        }
-        let final_note_frame = events
-            .iter()
-            .map(|event| event.frame)
-            .max()
-            .ok_or_else(|| "pattern channel has no renderable notes".to_owned())?;
-        // The maximum scheduled event is a note-off; add the requested release tail.
-        let tail_frames = (tail_seconds * sample_rate).round();
-        if !tail_frames.is_finite() || tail_frames < 0.0 || tail_frames > u64::MAX as f64 {
-            return Err("render tail is too long".to_owned());
-        }
-        let total_frames = final_note_frame
-            .checked_add((tail_frames as u64).max(1))
-            .ok_or_else(|| "render length overflow".to_owned())?;
-        let data_bytes = total_frames
-            .checked_mul(output_channels as u64)
+        let render = prepare_pattern_render(&plugin, notes, options)?;
+        let data_bytes = render
+            .total_frames
+            .checked_mul(render.output_channels as u64)
             .and_then(|frames| frames.checked_mul(4))
             .ok_or_else(|| "rendered WAV size overflow".to_owned())?;
         if data_bytes > u64::from(u32::MAX - 36) {
@@ -274,75 +237,82 @@ impl Vst3HostRuntime {
         let mut temporary = TemporaryWaveFile::create(output_path)?;
         write_float_wave_header(
             temporary.file.as_mut().expect("temporary WAV is open"),
-            total_frames as u32,
-            sample_rate_u32,
-            output_channels as u16,
+            render.total_frames as u32,
+            render.sample_rate_u32,
+            render.output_channels as u16,
         )?;
 
-        plugin
-            .start_processing()
-            .map_err(|error| error.to_string())?;
-        let render_result = (|| {
-            let mut rendered_frames = 0u64;
-            let mut event_index = 0usize;
-            let block_bytes = block_size
-                .checked_mul(output_channels)
-                .and_then(|samples| samples.checked_mul(4))
-                .ok_or_else(|| "VST3 block buffer size overflow".to_owned())?;
-            let mut interleaved = Vec::<u8>::with_capacity(block_bytes);
-            while rendered_frames < total_frames {
-                let frame_count = (total_frames - rendered_frames).min(block_size as u64) as usize;
-                let block_end = rendered_frames + frame_count as u64;
-                while let Some(event) = events.get(event_index)
-                    && event.frame < block_end
-                {
-                    let offset = event.frame.saturating_sub(rendered_frames) as i32;
-                    plugin
-                        .send_midi_event_at(event.event, offset)
-                        .map_err(|error| error.to_string())?;
-                    event_index += 1;
-                }
-
-                let mut buffers = AudioBuffers::new(0, output_channels, frame_count, sample_rate);
-                plugin
-                    .process_audio(&mut buffers)
-                    .map_err(|error| error.to_string())?;
-                if buffers.outputs.len() != output_channels
-                    || buffers
-                        .outputs
-                        .iter()
-                        .any(|channel| channel.len() < frame_count)
-                {
-                    return Err("VST3 returned audio buffers with an unexpected shape".to_owned());
-                }
-
-                interleaved.clear();
-                for frame in 0..frame_count {
-                    for channel in &buffers.outputs {
-                        interleaved.extend_from_slice(&channel[frame].to_le_bytes());
-                    }
-                }
-                temporary
-                    .file
-                    .as_mut()
-                    .expect("temporary WAV is open")
-                    .write_all(&interleaved)
-                    .map_err(|error| format!("could not write WAV audio data: {error}"))?;
-                rendered_frames = block_end;
+        let mut interleaved_bytes =
+            Vec::with_capacity(render.block_size * render.output_channels * 4);
+        process_pattern_render(&mut plugin, &render, |interleaved| {
+            interleaved_bytes.clear();
+            for sample in interleaved {
+                interleaved_bytes.extend_from_slice(&sample.to_le_bytes());
             }
-            Ok(())
-        })();
-        let stop_result = plugin.stop_processing().map_err(|error| error.to_string());
-        render_result?;
-        stop_result?;
+            temporary
+                .file
+                .as_mut()
+                .expect("temporary WAV is open")
+                .write_all(&interleaved_bytes)
+                .map_err(|error| format!("could not write WAV audio data: {error}"))
+        })?;
 
         temporary.commit(output_path)?;
         Ok(Vst3RenderSummary {
-            frames: total_frames,
-            sample_rate: sample_rate_u32,
-            output_channels,
-            notes_rendered: note_count,
+            frames: render.total_frames,
+            sample_rate: render.sample_rate_u32,
+            output_channels: render.output_channels,
+            notes_rendered: render.note_count,
         })
+    }
+
+    /// Render one pattern channel through an installed VST3 into interleaved stereo samples.
+    /// The result is suitable for device playback after resampling to the device rate.
+    /// This is an offline render; it does not expand Playlist clips or apply Mixer processing.
+    pub fn render_pattern_channel_to_stereo_buffer(
+        &self,
+        id: u64,
+        notes: &[PatternNote],
+        options: Vst3PatternRenderOptions,
+    ) -> Result<(Vec<f32>, Vst3RenderSummary), String> {
+        let plugin = self.plugin(id)?;
+        let mut plugin = plugin
+            .lock()
+            .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
+        let render = prepare_pattern_render(&plugin, notes, options)?;
+        if !(1..=2).contains(&render.output_channels) {
+            return Err(format!(
+                "VST3 preview supports mono or stereo output buses; this instrument has {} channels",
+                render.output_channels
+            ));
+        }
+        let sample_count = usize::try_from(render.total_frames)
+            .ok()
+            .and_then(|frames| frames.checked_mul(2))
+            .ok_or_else(|| "preview buffer size overflow".to_owned())?;
+        let buffer_bytes = sample_count
+            .checked_mul(std::mem::size_of::<f32>())
+            .filter(|bytes| *bytes <= MAX_STEREO_BUFFER_BYTES)
+            .ok_or_else(|| {
+                format!(
+                    "preview exceeds the {} MiB in-memory render limit",
+                    MAX_STEREO_BUFFER_BYTES / (1024 * 1024)
+                )
+            })?;
+        let mut stereo = Vec::with_capacity(buffer_bytes / std::mem::size_of::<f32>());
+        process_pattern_render(&mut plugin, &render, |interleaved| {
+            append_vst_output_block_to_stereo(&mut stereo, interleaved, render.output_channels)
+        })?;
+
+        Ok((
+            stereo,
+            Vst3RenderSummary {
+                frames: render.total_frames,
+                sample_rate: render.sample_rate_u32,
+                output_channels: render.output_channels,
+                notes_rendered: render.note_count,
+            },
+        ))
     }
 
     /// Service native editor close/resize requests and the VST3 UI run loop where needed.
@@ -376,6 +346,155 @@ impl Vst3HostRuntime {
             .map(|loaded| &loaded.plugin)
             .ok_or_else(|| format!("no loaded VST3 instance with id {id}"))
     }
+}
+
+fn prepare_pattern_render(
+    plugin: &Plugin,
+    notes: &[PatternNote],
+    options: Vst3PatternRenderOptions,
+) -> Result<PreparedPatternRender, String> {
+    let Vst3PatternRenderOptions {
+        channel_id,
+        ppq,
+        tempo_bpm,
+        tail_seconds,
+    } = options;
+    if ppq == 0 {
+        return Err("project PPQ must be greater than zero".to_owned());
+    }
+    if !tempo_bpm.is_finite() || tempo_bpm <= 0.0 {
+        return Err("project tempo must be finite and positive".to_owned());
+    }
+    if !tail_seconds.is_finite() || !(0.0..=60.0).contains(&tail_seconds) {
+        return Err("render tail must be between 0 and 60 seconds".to_owned());
+    }
+
+    let sample_rate = plugin.sample_rate();
+    if !sample_rate.is_finite() || !(8_000.0..=384_000.0).contains(&sample_rate) {
+        return Err("VST3 host sample rate is invalid".to_owned());
+    }
+    let sample_rate_u32 = sample_rate.round() as u32;
+    let block_size = plugin.block_size();
+    if block_size == 0 || block_size > 65_536 {
+        return Err("VST3 host block size is not renderable".to_owned());
+    }
+    let output_channels = plugin.output_channel_count();
+    if output_channels == 0 || output_channels > 64 {
+        return Err("VST3 instrument has no supported audio output buses".to_owned());
+    }
+
+    let (events, note_count) =
+        scheduled_pattern_events(notes, channel_id, ppq, tempo_bpm, sample_rate)?;
+    if note_count == 0 {
+        return Err(format!(
+            "pattern channel {channel_id} has no notes to render"
+        ));
+    }
+    let final_note_frame = events
+        .iter()
+        .map(|event| event.frame)
+        .max()
+        .ok_or_else(|| "pattern channel has no renderable notes".to_owned())?;
+    let tail_frames = (tail_seconds * sample_rate).round();
+    if !tail_frames.is_finite() || tail_frames < 0.0 || tail_frames > u64::MAX as f64 {
+        return Err("render tail is too long".to_owned());
+    }
+    let total_frames = final_note_frame
+        .checked_add((tail_frames as u64).max(1))
+        .ok_or_else(|| "render length overflow".to_owned())?;
+
+    Ok(PreparedPatternRender {
+        events,
+        note_count,
+        sample_rate,
+        sample_rate_u32,
+        output_channels,
+        block_size,
+        total_frames,
+    })
+}
+
+fn process_pattern_render(
+    plugin: &mut Plugin,
+    render: &PreparedPatternRender,
+    mut consume: impl FnMut(&[f32]) -> Result<(), String>,
+) -> Result<(), String> {
+    plugin
+        .start_processing()
+        .map_err(|error| error.to_string())?;
+    let render_result = (|| {
+        let mut rendered_frames = 0u64;
+        let mut event_index = 0usize;
+        let buffer_samples = render
+            .block_size
+            .checked_mul(render.output_channels)
+            .ok_or_else(|| "VST3 block buffer size overflow".to_owned())?;
+        let mut interleaved = Vec::<f32>::with_capacity(buffer_samples);
+        while rendered_frames < render.total_frames {
+            let frame_count =
+                (render.total_frames - rendered_frames).min(render.block_size as u64) as usize;
+            let block_end = rendered_frames + frame_count as u64;
+            while let Some(event) = render.events.get(event_index)
+                && event.frame < block_end
+            {
+                let offset = event.frame.saturating_sub(rendered_frames) as i32;
+                plugin
+                    .send_midi_event_at(event.event, offset)
+                    .map_err(|error| error.to_string())?;
+                event_index += 1;
+            }
+
+            let mut buffers =
+                AudioBuffers::new(0, render.output_channels, frame_count, render.sample_rate);
+            plugin
+                .process_audio(&mut buffers)
+                .map_err(|error| error.to_string())?;
+            if buffers.outputs.len() != render.output_channels
+                || buffers
+                    .outputs
+                    .iter()
+                    .any(|channel| channel.len() < frame_count)
+            {
+                return Err("VST3 returned audio buffers with an unexpected shape".to_owned());
+            }
+
+            interleaved.clear();
+            for frame in 0..frame_count {
+                for channel in &buffers.outputs {
+                    interleaved.push(channel[frame]);
+                }
+            }
+            consume(&interleaved)?;
+            rendered_frames = block_end;
+        }
+        Ok(())
+    })();
+    let stop_result = plugin.stop_processing().map_err(|error| error.to_string());
+    render_result?;
+    stop_result
+}
+
+fn append_vst_output_block_to_stereo(
+    stereo: &mut Vec<f32>,
+    interleaved: &[f32],
+    output_channels: usize,
+) -> Result<(), String> {
+    if !(1..=2).contains(&output_channels) {
+        return Err(format!(
+            "VST3 preview supports mono or stereo output buses; this instrument has {output_channels} channels"
+        ));
+    }
+    if !interleaved.len().is_multiple_of(output_channels) {
+        return Err("VST3 output block is not a whole number of frames".to_owned());
+    }
+    if output_channels == 1 {
+        for sample in interleaved {
+            stereo.extend_from_slice(&[*sample, *sample]);
+        }
+    } else {
+        stereo.extend_from_slice(interleaved);
+    }
+    Ok(())
 }
 
 fn scheduled_pattern_events(
@@ -631,6 +750,23 @@ mod tests {
         assert_eq!(events[1].frame, events[2].frame);
         assert!(matches!(events[1].event, MidiEvent::NoteOff { .. }));
         assert!(matches!(events[2].event, MidiEvent::NoteOn { .. }));
+    }
+
+    #[test]
+    fn preview_blocks_duplicate_mono_and_preserve_stereo_channel_order() {
+        let mut stereo = Vec::new();
+        append_vst_output_block_to_stereo(&mut stereo, &[0.25, -0.5], 1).unwrap();
+        append_vst_output_block_to_stereo(&mut stereo, &[0.75, -1.0], 2).unwrap();
+        assert_eq!(stereo, [0.25, 0.25, -0.5, -0.5, 0.75, -1.0]);
+    }
+
+    #[test]
+    fn preview_blocks_reject_unsupported_channel_shapes() {
+        let mut stereo = Vec::new();
+        assert!(append_vst_output_block_to_stereo(&mut stereo, &[0.0], 0).is_err());
+        assert!(append_vst_output_block_to_stereo(&mut stereo, &[0.0], 2).is_err());
+        assert!(append_vst_output_block_to_stereo(&mut stereo, &[0.0; 6], 3).is_err());
+        assert!(stereo.is_empty());
     }
 
     #[test]

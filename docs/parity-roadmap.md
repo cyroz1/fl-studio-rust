@@ -87,7 +87,7 @@ where real-time constraints punish sloppy code.
 
 | Item | Status | Notes |
 |---|---|---|
-| Windows: WASAPI (shared + exclusive), DirectSound, ASIO | `[partial]` | Shared capture/output through CPAL and direct WASAPI exclusive streams are implemented, including endpoint selection, rate/buffer settings, input metering/monitoring, an output test tone, and transport playback of a pre-rendered Playlist audio-clip mix. A 9,600-frame excerpt rendered from `Ookay - Thief.flp` was consumed by both shared and exclusive output on the current machine. A shared-mode input smoke run opened the current Focusrite endpoints; capture reported one startup discontinuity and then stayed active without further errors for the remainder of the 3-second check. This verifies the current hardware path, not all endpoints or formats. DirectSound and ASIO are not implemented. |
+| Windows: WASAPI (shared + exclusive), DirectSound, ASIO | `[partial]` | Shared capture/output through CPAL and direct WASAPI exclusive streams are implemented, including endpoint selection, rate/buffer settings, input metering/monitoring, an output test tone, and transport playback of pre-rendered Playlist audio or selected-pattern VST3 preview buffers. A 9,600-frame excerpt rendered from `Ookay - Thief.flp` was consumed by both shared and exclusive output on the current machine. A shared-mode input smoke run opened the current Focusrite endpoints; capture reported one startup discontinuity and then stayed active without further errors for the remainder of the 3-second check. This verifies the current hardware path, not all endpoints or formats. DirectSound and ASIO are not implemented. |
 | macOS: CoreAudio | `[partial]` | The shared CPAL path uses the platform's default audio host and supports rendered Playlist audio buffers; hardware behavior is not verified yet. |
 | Linux: ALSA, PulseAudio/PipeWire, JACK | `[partial]` | The shared CPAL path uses the platform's default host and supports rendered Playlist audio buffers. Cross-platform build/test CI exists; backend and hardware behavior are not verified yet. |
 | Device enumeration, sample-rate / buffer-size negotiation | `[partial]` | CPAL lists endpoints and opens selected/default devices at the requested sample rate and buffer size. Shared mode falls back to the backend's default buffer when a fixed size is rejected; complete capability negotiation is still needed. |
@@ -164,7 +164,7 @@ decision, not a roadmap item.
 
 | Item | Status | Notes |
 |---|---|---|
-| VST3 hosting: load, process, native editor | `[partial]` | In-process load + editor open works; realtime processing unproven |
+| VST3 hosting: load, process, native editor | `[partial]` | In-process load + editor open works; offline single-pattern/channel render can be played through the selected device as a preview. Realtime processing, Playlist clip expansion, and full-song processing remain unimplemented. |
 | VST3 state save/restore via FLP `0xD5` record | `[partial]` | Single ZENOLOGY probe succeeded; not general |
 | VST3 parameter automation | `[todo]` | |
 | VST2 hosting | `[todo]` | Needs a VST2 SDK implementation (Steinberg discontinued the SDK; use vestige headers) |

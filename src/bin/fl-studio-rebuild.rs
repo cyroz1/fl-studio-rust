@@ -1575,6 +1575,7 @@ impl DawUi {
         let mut add_note_requested = false;
         let mut open_midi_requested = false;
         let mut render_requested = false;
+        let mut preview_requested = false;
         ui.horizontal(|ui| {
             ui.strong("Piano roll");
             ui.separator();
@@ -1630,11 +1631,20 @@ impl DawUi {
                     egui::Button::new("Render WAV…"),
                 )
                 .clicked();
+            preview_requested = ui
+                .add_enabled(
+                    has_loaded_instrument && self.selected_pattern.is_some(),
+                    egui::Button::new("Preview VST3"),
+                )
+                .clicked();
             open_midi_requested = ui.button("Open MIDI…").clicked();
         });
 
         if render_requested {
             self.render_selected_pattern_channel();
+        }
+        if preview_requested {
+            self.play_selected_pattern_channel();
         }
 
         if open_midi_requested
@@ -1873,6 +1883,128 @@ impl DawUi {
                 );
             }
             Err(error) => self.status = format!("Could not render pattern channel: {error}"),
+        }
+    }
+
+    fn play_selected_pattern_channel(&mut self) {
+        let (Some(pattern_id), Some(channel_id)) =
+            (self.selected_pattern, self.selected_note_channel)
+        else {
+            self.status = "Select a pattern and channel before previewing".to_owned();
+            return;
+        };
+        let Some(instance_id) = self.channel_vst3_instances.get(&channel_id).copied() else {
+            self.status = "Load a VST3 instrument for this channel before previewing".to_owned();
+            return;
+        };
+        let Some(document) = self.document.as_ref() else {
+            self.status = "Open a project before previewing a pattern".to_owned();
+            return;
+        };
+        let notes = match document.patterns() {
+            Ok(patterns) => match patterns
+                .into_iter()
+                .find(|pattern| pattern.id == pattern_id)
+            {
+                Some(pattern) => pattern.notes,
+                None => {
+                    self.status = format!("Pattern {pattern_id} was not found");
+                    return;
+                }
+            },
+            Err(error) => {
+                self.status = format!("Could not decode pattern: {error}");
+                return;
+            }
+        };
+        let ppq = document.header().ppq();
+        let tempo_bpm = document.metadata().tempo_bpm().unwrap_or(self.tempo_bpm);
+
+        if self.audio_engine.is_none() {
+            match AudioEngine::start(&self.audio_settings) {
+                Ok(engine) => self.audio_engine = Some(engine),
+                Err(error) => {
+                    self.status = format!("Could not start audio output: {error}");
+                    return;
+                }
+            }
+        }
+        let Some(engine) = self.audio_engine.as_ref() else {
+            self.status = "Audio output is not available".to_owned();
+            return;
+        };
+        if !engine.output_active() {
+            self.status = "Enable an output device in Audio settings before previewing".to_owned();
+            return;
+        }
+        let device_rate = engine.sample_rate();
+
+        self.stop_project_playback();
+        if let Some(engine) = &self.audio_engine {
+            engine.set_test_tone(false);
+            if self.audio_monitor_input {
+                let _ = engine.set_input_monitor(false);
+            }
+        }
+        self.audio_test_tone = false;
+        self.audio_monitor_input = false;
+
+        let result = self
+            .vst3_host
+            .as_ref()
+            .ok_or_else(|| "VST3 host is not initialized".to_owned())
+            .and_then(|host| {
+                host.render_pattern_channel_to_stereo_buffer(
+                    instance_id,
+                    &notes,
+                    Vst3PatternRenderOptions {
+                        channel_id,
+                        ppq,
+                        tempo_bpm,
+                        tail_seconds: 2.0,
+                    },
+                )
+            });
+        let (plugin_samples, summary) = match result {
+            Ok(rendered) => rendered,
+            Err(error) => {
+                self.status = format!("Could not preview pattern channel: {error}");
+                return;
+            }
+        };
+        let samples =
+            match resample_stereo_interleaved(&plugin_samples, summary.sample_rate, device_rate) {
+                Ok(samples) => samples,
+                Err(error) => {
+                    self.status = format!("Could not prepare VST3 preview: {error}");
+                    return;
+                }
+            };
+        let result = self
+            .audio_engine
+            .as_ref()
+            .ok_or_else(|| "Audio output is not available".to_owned())
+            .and_then(|engine| engine.set_project_playback(samples));
+        match result {
+            Ok(()) => {
+                let plugin_name = self
+                    .vst3_host
+                    .as_ref()
+                    .and_then(|host| {
+                        host.loaded_plugins()
+                            .into_iter()
+                            .find(|plugin| plugin.id == instance_id)
+                    })
+                    .map(|plugin| plugin.name)
+                    .unwrap_or_else(|| "VST3 instrument".to_owned());
+                self.playing = true;
+                self.project_playback_loaded = true;
+                self.status = format!(
+                    "Previewing pattern {pattern_id} through {plugin_name} ({} notes at {device_rate} Hz); Mixer effects are not included",
+                    summary.notes_rendered
+                );
+            }
+            Err(error) => self.status = format!("Could not start VST3 preview: {error}"),
         }
     }
 
@@ -3047,6 +3179,48 @@ fn empty_view(ui: &mut egui::Ui, message: &str) {
     });
 }
 
+fn resample_stereo_interleaved(
+    samples: &[f32],
+    source_rate: u32,
+    output_rate: u32,
+) -> Result<Vec<f32>, String> {
+    if samples.is_empty() || !samples.len().is_multiple_of(2) {
+        return Err("VST3 preview is not a non-empty stereo buffer".to_owned());
+    }
+    if source_rate == 0 || output_rate == 0 {
+        return Err("VST3 preview sample rates must be positive".to_owned());
+    }
+    if source_rate == output_rate {
+        return Ok(samples.to_vec());
+    }
+
+    let source_frames = samples.len() / 2;
+    let output_frames_f64 = source_frames as f64 * f64::from(output_rate) / f64::from(source_rate);
+    if !output_frames_f64.is_finite() || output_frames_f64 <= 0.0 {
+        return Err("VST3 preview duration is outside the resampling range".to_owned());
+    }
+    let output_frames = output_frames_f64.ceil();
+    if output_frames > (512 * 1024 * 1024 / std::mem::size_of::<f32>() / 2) as f64 {
+        return Err("resampled VST3 preview exceeds the 512 MiB buffer limit".to_owned());
+    }
+    let output_frames = output_frames as usize;
+    let mut output = Vec::with_capacity(output_frames * 2);
+    let source_frames_per_output = f64::from(source_rate) / f64::from(output_rate);
+    for output_frame in 0..output_frames {
+        let source_position =
+            (output_frame as f64 * source_frames_per_output).min((source_frames - 1) as f64);
+        let first_frame = source_position.floor() as usize;
+        let second_frame = (first_frame + 1).min(source_frames - 1);
+        let fraction = (source_position - first_frame as f64) as f32;
+        for channel in 0..2 {
+            let first = samples[first_frame * 2 + channel];
+            let second = samples[second_frame * 2 + channel];
+            output.push(first + (second - first) * fraction);
+        }
+    }
+    Ok(output)
+}
+
 fn automation_point_screen_position(
     point: &AutomationPoint,
     plot_rect: egui::Rect,
@@ -3130,7 +3304,10 @@ fn note_from_grid_position(
 
 #[cfg(test)]
 mod tests {
-    use super::{PianoRollGrid, PianoRollSnap, note_from_grid_position, snap_note_tick};
+    use super::{
+        PianoRollGrid, PianoRollSnap, note_from_grid_position, resample_stereo_interleaved,
+        snap_note_tick,
+    };
 
     fn test_grid() -> PianoRollGrid {
         PianoRollGrid {
@@ -3186,5 +3363,31 @@ mod tests {
         ] {
             assert!(note_from_grid_position(pointer, test_grid(), 5).is_none());
         }
+    }
+
+    #[test]
+    fn preview_resampling_preserves_stereo_order_and_duration() {
+        let source = [0.0, 1.0, 0.5, 1.5];
+        let output = resample_stereo_interleaved(&source, 2, 4).unwrap();
+        assert_eq!(output, [0.0, 1.0, 0.25, 1.25, 0.5, 1.5, 0.5, 1.5]);
+        assert_eq!(
+            resample_stereo_interleaved(&source, 4, 2).unwrap(),
+            [0.0, 1.0]
+        );
+    }
+
+    #[test]
+    fn preview_resampling_keeps_a_single_frame_when_downsampling() {
+        assert_eq!(
+            resample_stereo_interleaved(&[0.25, -0.25], 48_000, 1).unwrap(),
+            [0.25, -0.25]
+        );
+    }
+
+    #[test]
+    fn preview_resampling_rejects_invalid_audio_and_rates() {
+        assert!(resample_stereo_interleaved(&[], 44_100, 48_000).is_err());
+        assert!(resample_stereo_interleaved(&[0.0], 44_100, 48_000).is_err());
+        assert!(resample_stereo_interleaved(&[0.0, 1.0], 0, 48_000).is_err());
     }
 }
