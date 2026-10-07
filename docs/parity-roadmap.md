@@ -165,9 +165,9 @@ decision, not a roadmap item.
 | Item | Status | Notes |
 |---|---|---|
 | VST3 hosting: load, process, native editor | `[partial]` | In-process load and editor open work. The selected pattern/channel can now be processed blockwise on a worker and streamed through shared or WASAPI-exclusive output; the open editor and audio worker use the same loaded instance. The device callback only drains complete stereo frames from a bounded ring. Processing can still underrun, note scheduling is limited to one pattern/channel, Playlist clip expansion and multi-instrument transport are absent, and Mixer processing/full-song playback remain unimplemented. |
-| VST3 state save/restore via FLP `0xD5` record | `[partial]` | Single ZENOLOGY probe succeeded; not general |
+| VST3 state save/restore via FLP `0xD5` record | `[partial]` | Decodes identity metadata and exposes the exact nested field-53 state bytes without copying; one ZENOLOGY class probe succeeded, but an earlier nested-state probe caused an access violation, and general wrapper conversion/restoration remains unverified. |
 | VST3 parameter automation | `[todo]` | |
-| VST2 hosting | `[todo]` | Needs a VST2 SDK implementation (Steinberg discontinued the SDK; use vestige headers) |
+| VST2 hosting | `[todo]` | Distribution of a VST2 host binary requires an applicable legacy Steinberg agreement; no such path is confirmed. Public source must not include Steinberg's VST2 SDK headers. |
 | CLAP hosting | `[todo]` | FL Studio supports CLAP as of recent versions |
 | AU hosting (macOS) | `[todo]` | |
 | 32-bit plugin bridging on 64-bit host | `[todo]` | Out-of-process sandbox + IPC |

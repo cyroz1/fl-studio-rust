@@ -221,7 +221,7 @@ pub struct ChannelPluginState {
 /// Identity fields embedded in an FLP VST plug-in state event.
 ///
 /// The complete event remains available through [`ChannelPluginState::data_payload`];
-/// this structure only decodes the length-prefixed identity envelope around its state.
+/// this structure decodes the length-prefixed identity fields and state-field byte range.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct VstPluginStateMetadata {
     format_marker: u32,
@@ -231,7 +231,7 @@ pub struct VstPluginStateMetadata {
     name: Option<String>,
     path: Option<String>,
     vendor: Option<String>,
-    state_bytes: Option<usize>,
+    state_data_range: Option<std::ops::Range<usize>>,
 }
 
 impl ChannelPluginState {
@@ -255,6 +255,13 @@ impl ChannelPluginState {
     /// Opaque `0xD5` per-instance plug-in data.
     pub fn data_payload(&self) -> &[u8] {
         &self.data_payload
+    }
+
+    /// Nested state bytes from the recognized VST field 53, when present.
+    /// The returned slice points into the original `0xD5` data payload.
+    pub fn vst_state_bytes(&self) -> Option<&[u8]> {
+        let range = self.vst_metadata.as_ref()?.state_data_range.as_ref()?;
+        self.data_payload.get(range.clone())
     }
 
     pub fn data_event_index(&self) -> usize {
@@ -305,7 +312,9 @@ impl VstPluginStateMetadata {
 
     /// Size of the nested plug-in state field, without copying the state bytes.
     pub fn state_bytes(&self) -> Option<usize> {
-        self.state_bytes
+        self.state_data_range
+            .as_ref()
+            .map(|range| range.end - range.start)
     }
 
     /// VST3-style 32-digit class UID converted to the format used by the host API.
@@ -3358,7 +3367,9 @@ fn parse_vst_plugin_state_metadata(payload: &[u8]) -> Option<VstPluginStateMetad
             50 if metadata.plugin_info.is_none() => metadata.plugin_info = Some(data.to_vec()),
             51 if metadata.fourcc.is_none() => metadata.fourcc = decode_vst_text(data),
             52 if metadata.guid.is_none() => metadata.guid = Some(data.to_vec()),
-            53 if metadata.state_bytes.is_none() => metadata.state_bytes = Some(data.len()),
+            53 if metadata.state_data_range.is_none() => {
+                metadata.state_data_range = Some(length_end..data_end)
+            }
             54 if metadata.name.is_none() => metadata.name = decode_vst_text(data),
             55 if metadata.path.is_none() => metadata.path = decode_vst_text(data),
             56 if metadata.vendor.is_none() => metadata.vendor = decode_vst_text(data),
@@ -3902,6 +3913,16 @@ mod tests {
             metadata.class_uid().as_deref(),
             Some("324755DF8FDF4788B4CE5B70A8037EC4")
         );
+        let state = super::ChannelPluginState {
+            channel_id: 0,
+            plugin_identifier: None,
+            display_name: None,
+            wrapper_payload: None,
+            data_payload: payload.clone(),
+            data_event_index: 0,
+            vst_metadata: Some(metadata),
+        };
+        assert_eq!(state.vst_state_bytes(), Some(&[1, 2, 3, 4][..]));
     }
 
     #[test]
