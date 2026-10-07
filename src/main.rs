@@ -4,6 +4,7 @@ use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
 
+use flp_rebuild::media::SamplePathResolver;
 use flp_rebuild::midi::MidiFile;
 use flp_rebuild::plugins::scan_installed_plugins;
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions};
@@ -23,6 +24,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
     match args.as_slice() {
         [command, path] if command == "info" => inspect(Path::new(path)),
         [command, path] if command == "channels" => list_channels(Path::new(path)),
+        [command, path] if command == "sample-paths" => list_sample_paths(Path::new(path)),
         [command, path] if command == "plugin-states" => list_plugin_states(Path::new(path)),
         [command, path, channel_id] if command == "plugin-state-preview" => {
             preview_plugin_state(Path::new(path), parse_u16(channel_id, "channel id")?, 64)
@@ -213,6 +215,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild plugin-scan\n",
             "  flp-rebuild render-pattern-vst3 <project.flp> <pattern-id> <channel-id> <plugin.vst3> <output.wav> [tail-seconds]\n",
             "  flp-rebuild channels <file.flp>\n",
+            "  flp-rebuild sample-paths <file.flp>\n",
             "  flp-rebuild plugin-states <file.flp>\n",
             "  flp-rebuild channel-events <file.flp> <channel-id>\n",
             "  flp-rebuild patterns <file.flp>\n",
@@ -728,6 +731,35 @@ fn list_channels(path: &Path) -> Result<(), String> {
             channel.event_range()
         );
     }
+    Ok(())
+}
+
+fn list_sample_paths(project_path: &Path) -> Result<(), String> {
+    let (_, document) = load_document(project_path)?;
+    let resolver = SamplePathResolver::new(project_path);
+    let mut sample_count = 0usize;
+    for channel in document.channels() {
+        let Some(sample_path) = channel.sample_path() else {
+            continue;
+        };
+        sample_count += 1;
+        match resolver.resolve(sample_path) {
+            Ok(resolved) => println!(
+                "channel={} name={} source={:?} resolved={}",
+                channel.id(),
+                channel.display_name().unwrap_or("(unnamed)"),
+                sample_path,
+                resolved.display()
+            ),
+            Err(error) => println!(
+                "channel={} name={} source={:?} unresolved={error}",
+                channel.id(),
+                channel.display_name().unwrap_or("(unnamed)"),
+                sample_path
+            ),
+        }
+    }
+    println!("sample references: {sample_count}");
     Ok(())
 }
 

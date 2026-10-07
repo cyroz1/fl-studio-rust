@@ -14,6 +14,7 @@ flp-rebuild midi-info <file.mid>
 flp-rebuild midi-events <file.mid> <track> [start] [count]
 flp-rebuild scan <directory>
 flp-rebuild plugin-scan
+flp-rebuild sample-paths <file.flp>
 flp-rebuild render-pattern-vst3 <project.flp> <pattern-id> <channel-id> <plugin.vst3> <output.wav> [tail-seconds]
 flp-rebuild plugin-state-preview <file.flp> <channel-id>
 flp-rebuild vst3-state-probe <plugin.vst3> <file.flp> <channel-id>
@@ -39,7 +40,7 @@ Launch the native desktop shell with `cargo run --release --bin fl-studio-rebuil
 
 The desktop executable also accepts an `.flp` path as its first argument to open that project at startup.
 
-`channels <file.flp>` reports the observed sample source path on audio-channel records, including `%FLStudioFactoryData%` references. The project model keeps the original event bytes unchanged; expanding that macro to an installed sample file and playing the media are still future work.
+`channels <file.flp>` reports the observed sample source path on audio-channel records, including `%FLStudioFactoryData%` references. `sample-paths <file.flp>` tries to resolve each reference using the project folder, configured factory roots, and common FL Studio install locations; it reports paths it cannot find. Set `FL_STUDIO_ROOT` or `FL_STUDIO_FACTORY_DATA` to select a custom installation. The project model keeps the original event bytes unchanged. Audio decoding, clip playback, and sample mixing are still future work.
 
 In the desktop Piano roll, **Open MIDI…** loads a MIDI file, lets you choose a track, and imports its notes into the selected pattern and channel. The selected track's note timing is converted from MIDI PPQ to project PPQ. **Render WAV…** is enabled when the selected channel has a loaded VST3 instrument; it exports that pattern/channel using the currently loaded plug-in instance. The CLI offers MIDI import and pattern rendering for batch use.
 

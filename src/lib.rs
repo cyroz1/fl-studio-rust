@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
+pub mod media;
 pub mod midi;
 pub mod plugins;
 pub mod vst3;
