@@ -18,8 +18,8 @@ use flp_rebuild::sample_render::{
 };
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions};
 use flp_rebuild::{
-    FlpDocument, Pattern, PatternNote, PatternNoteEdit, PlaylistClip, PlaylistClipEdit,
-    PlaylistTrack, VstPluginStateMetadata,
+    AutomationChannel, AutomationPoint, AutomationPointEdit, FlpDocument, Pattern, PatternNote,
+    PatternNoteEdit, PlaylistClip, PlaylistClipEdit, PlaylistTrack, VstPluginStateMetadata,
 };
 
 const PANEL: Color32 = Color32::from_rgb(31, 32, 34);
@@ -88,6 +88,7 @@ enum MainView {
     Mixer,
     Plugins,
     Audio,
+    Automation,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -157,6 +158,22 @@ struct ActiveNoteDrag {
     kind: NoteDragKind,
 }
 
+enum AutomationEditAction {
+    Insert {
+        slot: usize,
+        position_beats: f64,
+        value: f64,
+        tension: f32,
+    },
+    Edit {
+        point_index: usize,
+        edit: AutomationPointEdit,
+    },
+    Delete {
+        point_index: usize,
+    },
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct PianoRollGrid {
     rect: egui::Rect,
@@ -176,13 +193,14 @@ struct PendingMidiImport {
 }
 
 impl MainView {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::Playlist,
         Self::ChannelRack,
         Self::PianoRoll,
         Self::Mixer,
         Self::Plugins,
         Self::Audio,
+        Self::Automation,
     ];
 
     fn label(self) -> &'static str {
@@ -193,6 +211,7 @@ impl MainView {
             Self::Mixer => "Mixer",
             Self::Plugins => "Plug-ins",
             Self::Audio => "Audio",
+            Self::Automation => "Automation",
         }
     }
 }
@@ -215,6 +234,11 @@ struct DawUi {
     selected_arrangement: Option<u16>,
     selected_clip: Option<usize>,
     selected_plugin_state_channel: Option<u16>,
+    selected_automation_channel: Option<u16>,
+    selected_automation_point: Option<usize>,
+    automation_add_mode: bool,
+    automation_snap: bool,
+    automation_visible_beats: f64,
     last_plugin_action: Option<String>,
     timeline_zoom: f32,
     plugin_candidates: Vec<PluginCandidate>,
@@ -266,6 +290,11 @@ impl DawUi {
             selected_arrangement: None,
             selected_clip: None,
             selected_plugin_state_channel: None,
+            selected_automation_channel: None,
+            selected_automation_point: None,
+            automation_add_mode: false,
+            automation_snap: true,
+            automation_visible_beats: 16.0,
             last_plugin_action: None,
             timeline_zoom: 0.10,
             plugin_candidates,
@@ -316,6 +345,12 @@ impl DawUi {
                     .channel_plugin_states()
                     .first()
                     .map(|state| state.channel_id());
+                self.selected_automation_channel = document
+                    .automation_channels()
+                    .ok()
+                    .and_then(|channels| channels.first().map(AutomationChannel::channel_id));
+                self.selected_automation_point = None;
+                self.automation_add_mode = false;
                 self.last_plugin_action = None;
                 self.channel_vst3_instances.clear();
                 self.selected_arrangement = document.arrangements().ok().and_then(|arrangements| {
@@ -650,13 +685,21 @@ impl DawUi {
             ui.separator();
             ui.monospace("1:01:000");
             ui.separator();
-            for label in ["Playlist", "Channel Rack", "Piano roll", "Mixer", "Audio"] {
+            for label in [
+                "Playlist",
+                "Channel Rack",
+                "Piano roll",
+                "Mixer",
+                "Audio",
+                "Automation",
+            ] {
                 if ui.small_button(label).clicked() {
                     self.view = match label {
                         "Channel Rack" => MainView::ChannelRack,
                         "Piano roll" => MainView::PianoRoll,
                         "Mixer" => MainView::Mixer,
                         "Audio" => MainView::Audio,
+                        "Automation" => MainView::Automation,
                         _ => MainView::Playlist,
                     };
                 }
@@ -1123,6 +1166,366 @@ impl DawUi {
             match host.open_editor(instance_id) {
                 Ok(()) => self.status = "VST3 editor opened from Channel Rack".to_owned(),
                 Err(error) => self.status = format!("Could not open VST3 editor: {error}"),
+            }
+        }
+    }
+
+    fn automation_editor(&mut self, ui: &mut egui::Ui) {
+        let Some(document) = self.document.as_ref() else {
+            empty_view(ui, "Open an FL Studio project to edit automation curves");
+            return;
+        };
+        let automation_channels = match document.automation_channels() {
+            Ok(channels) if !channels.is_empty() => channels,
+            Ok(_) => {
+                empty_view(ui, "This project has no decoded automation channels");
+                return;
+            }
+            Err(error) => {
+                ui.colored_label(ORANGE, format!("Could not decode automation: {error}"));
+                return;
+            }
+        };
+
+        let first_channel_id = automation_channels[0].channel_id();
+        let mut channel_id = self
+            .selected_automation_channel
+            .filter(|id| {
+                automation_channels
+                    .iter()
+                    .any(|channel| channel.channel_id() == *id)
+            })
+            .unwrap_or(first_channel_id);
+        let old_channel_id = self.selected_automation_channel;
+        let mut action = None;
+        ui.horizontal(|ui| {
+            ui.strong("Automation");
+            ui.separator();
+            egui::ComboBox::from_id_salt("automation-channel-select")
+                .selected_text(
+                    automation_channels
+                        .iter()
+                        .find(|channel| channel.channel_id() == channel_id)
+                        .and_then(AutomationChannel::display_name)
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("Channel {channel_id}")),
+                )
+                .show_ui(ui, |ui| {
+                    for channel in &automation_channels {
+                        let label = channel
+                            .display_name()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| format!("Channel {}", channel.channel_id()));
+                        ui.selectable_value(&mut channel_id, channel.channel_id(), label);
+                    }
+                });
+
+            let has_blob = automation_channels
+                .iter()
+                .find(|channel| channel.channel_id() == channel_id)
+                .is_some_and(|channel| channel.data_event_index().is_some());
+            let add = ui.add_enabled_ui(has_blob, |ui| {
+                ui.selectable_label(self.automation_add_mode, "Add point")
+            });
+            if add.inner.clicked() {
+                self.automation_add_mode = !self.automation_add_mode;
+                self.selected_automation_point = None;
+            }
+            let can_delete = self.selected_automation_point.is_some();
+            if ui
+                .add_enabled(can_delete, egui::Button::new("Delete point"))
+                .clicked()
+                && let Some(point_index) = self.selected_automation_point
+            {
+                action = Some(AutomationEditAction::Delete { point_index });
+            }
+            ui.checkbox(&mut self.automation_snap, "Snap 1/4 beat");
+            ui.add(egui::Slider::new(&mut self.automation_visible_beats, 4.0..=64.0).text("Span"));
+        });
+        if old_channel_id != Some(channel_id) {
+            self.selected_automation_point = None;
+            self.automation_add_mode = false;
+            action = None;
+        }
+        self.selected_automation_channel = Some(channel_id);
+
+        let Some(channel) = automation_channels
+            .iter()
+            .find(|channel| channel.channel_id() == channel_id)
+        else {
+            empty_view(ui, "Select an automation channel");
+            return;
+        };
+        let points = channel.points();
+        let points_are_editable = channel.data_event_index().is_some()
+            && points.iter().all(|point| {
+                point.position_beats().is_finite()
+                    && point.position_beats() >= 0.0
+                    && point.value().is_finite()
+                    && point.tension().is_finite()
+            })
+            && points
+                .windows(2)
+                .all(|pair| pair[0].position_beats() <= pair[1].position_beats());
+        let selected_index = self
+            .selected_automation_point
+            .filter(|index| *index < points.len());
+        self.selected_automation_point = selected_index;
+        ui.horizontal(|ui| {
+            ui.label(format!("{} points", points.len()));
+            if channel.data_event_index().is_none() {
+                ui.colored_label(
+                    MUTED,
+                    "This channel has no existing 0xEA curve blob to edit",
+                );
+            } else if !points_are_editable {
+                ui.colored_label(
+                    ORANGE,
+                    "Curve has invalid or unordered values; editing is disabled",
+                );
+            }
+            if self.automation_add_mode {
+                ui.colored_label(ORANGE, "Click inside the graph to insert a point");
+            } else {
+                ui.colored_label(MUTED, "Drag a point to edit its position and value");
+            }
+            ui.colored_label(MUTED, "Straight-line preview; tension is not rendered yet");
+        });
+
+        if points_are_editable && let Some(point_index) = selected_index {
+            let point = &points[point_index];
+            let mut position = point.position_beats();
+            let mut value = point.value();
+            let mut tension = point.tension();
+            let position_changed = ui
+                .add(
+                    egui::DragValue::new(&mut position)
+                        .speed(0.01)
+                        .prefix("Position ")
+                        .suffix(" beats"),
+                )
+                .changed();
+            let value_changed = ui
+                .add(egui::Slider::new(&mut value, 0.0..=1.0).text("Value"))
+                .changed();
+            let tension_changed = ui
+                .add(egui::Slider::new(&mut tension, -1.0..=1.0).text("Tension"))
+                .changed();
+            if position_changed || value_changed || tension_changed {
+                action = Some(AutomationEditAction::Edit {
+                    point_index,
+                    edit: AutomationPointEdit {
+                        position_beats: position_changed.then_some(position),
+                        value: value_changed.then_some(value),
+                        tension: tension_changed.then_some(tension),
+                    },
+                });
+            }
+        }
+
+        let chart_height = ui.available_height().clamp(230.0, 430.0);
+        let (canvas_response, painter) = ui.allocate_painter(
+            Vec2::new(ui.available_width().max(1.0), chart_height),
+            Sense::click(),
+        );
+        let canvas_rect = canvas_response.rect;
+        painter.rect_filled(canvas_rect, egui::CornerRadius::same(2), PANEL_DARK);
+        painter.rect_stroke(
+            canvas_rect,
+            egui::CornerRadius::same(2),
+            Stroke::new(1.0, GRID),
+            egui::StrokeKind::Inside,
+        );
+        let plot_rect = egui::Rect::from_min_max(
+            egui::pos2(canvas_rect.left() + 48.0, canvas_rect.top() + 12.0),
+            egui::pos2(canvas_rect.right() - 12.0, canvas_rect.bottom() - 25.0),
+        );
+        let visible_beats = self.automation_visible_beats.max(4.0);
+        for division in 0..=4 {
+            let value = division as f32 / 4.0;
+            let y = egui::lerp(plot_rect.bottom()..=plot_rect.top(), value);
+            painter.line_segment(
+                [
+                    egui::pos2(plot_rect.left(), y),
+                    egui::pos2(plot_rect.right(), y),
+                ],
+                Stroke::new(1.0, GRID),
+            );
+            painter.text(
+                egui::pos2(canvas_rect.left() + 5.0, y),
+                Align2::LEFT_CENTER,
+                format!("{value:.2}"),
+                FontId::proportional(10.0),
+                MUTED,
+            );
+        }
+        let beat_step = if visible_beats <= 32.0 { 1.0 } else { 4.0 };
+        let beat_divisions = (visible_beats / beat_step).ceil() as usize;
+        for division in 0..=beat_divisions {
+            let beat = division as f64 * beat_step;
+            let x = egui::lerp(
+                plot_rect.left()..=plot_rect.right(),
+                (beat / visible_beats) as f32,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(x, plot_rect.top()),
+                    egui::pos2(x, plot_rect.bottom()),
+                ],
+                Stroke::new(1.0, GRID),
+            );
+            painter.text(
+                egui::pos2(x + 3.0, canvas_rect.bottom() - 13.0),
+                Align2::LEFT_CENTER,
+                format!("{beat:.0}"),
+                FontId::proportional(10.0),
+                MUTED,
+            );
+        }
+        let point_position = |point: &AutomationPoint| {
+            automation_point_screen_position(point, plot_rect, visible_beats)
+        };
+        for pair in points.windows(2) {
+            painter.line_segment(
+                [point_position(&pair[0]), point_position(&pair[1])],
+                Stroke::new(1.5, ORANGE),
+            );
+        }
+        let mut interacted_with_point = false;
+        for (point_index, point) in points.iter().enumerate() {
+            let center = point_position(point);
+            let hit_rect = egui::Rect::from_center_size(center, Vec2::splat(14.0));
+            let response = ui.interact(
+                hit_rect,
+                Id::new(("automation-point", channel_id, point_index)),
+                if points_are_editable {
+                    Sense::click_and_drag()
+                } else {
+                    Sense::hover()
+                },
+            );
+            let selected = selected_index == Some(point_index);
+            painter.circle_filled(
+                center,
+                if selected { 5.5 } else { 4.5 },
+                if selected { Color32::WHITE } else { PURPLE },
+            );
+            painter.circle_stroke(
+                center,
+                if selected { 6.0 } else { 5.0 },
+                Stroke::new(1.0, if selected { ORANGE } else { TEXT }),
+            );
+            if response.clicked() {
+                interacted_with_point = true;
+                self.selected_automation_point = Some(point_index);
+            }
+            if response.dragged()
+                && let Some(pointer) = response.interact_pointer_pos()
+            {
+                interacted_with_point = true;
+                self.selected_automation_point = Some(point_index);
+                let mut position =
+                    f64::from(((pointer.x - plot_rect.left()) / plot_rect.width()).clamp(0.0, 1.0))
+                        * visible_beats;
+                if self.automation_snap {
+                    position = (position * 4.0).round() / 4.0;
+                }
+                let previous_position = if point_index == 0 {
+                    0.0
+                } else {
+                    points[point_index - 1].position_beats()
+                };
+                let next_position = points
+                    .get(point_index + 1)
+                    .map(AutomationPoint::position_beats)
+                    .unwrap_or_else(|| visible_beats.max(point.position_beats()));
+                let value = f64::from(
+                    ((plot_rect.bottom() - pointer.y) / plot_rect.height()).clamp(0.0, 1.0),
+                );
+                if previous_position.is_finite()
+                    && next_position.is_finite()
+                    && previous_position <= next_position
+                {
+                    position = position.clamp(previous_position, next_position);
+                }
+                if previous_position.is_finite()
+                    && next_position.is_finite()
+                    && previous_position <= next_position
+                    && (position != point.position_beats() || value != point.value())
+                {
+                    action = Some(AutomationEditAction::Edit {
+                        point_index,
+                        edit: AutomationPointEdit {
+                            position_beats: Some(position),
+                            value: Some(value),
+                            ..AutomationPointEdit::default()
+                        },
+                    });
+                }
+            }
+        }
+        if canvas_response.clicked() && !interacted_with_point {
+            if self.automation_add_mode
+                && points_are_editable
+                && let Some(pointer) = canvas_response.interact_pointer_pos()
+                && plot_rect.contains(pointer)
+            {
+                let mut position =
+                    f64::from(((pointer.x - plot_rect.left()) / plot_rect.width()).clamp(0.0, 1.0))
+                        * visible_beats;
+                if self.automation_snap {
+                    position = (position * 4.0).round() / 4.0;
+                }
+                let value = f64::from(
+                    ((plot_rect.bottom() - pointer.y) / plot_rect.height()).clamp(0.0, 1.0),
+                );
+                let slot = points.partition_point(|point| point.position_beats() <= position);
+                action = Some(AutomationEditAction::Insert {
+                    slot,
+                    position_beats: position,
+                    value,
+                    tension: 0.0,
+                });
+            } else {
+                self.selected_automation_point = None;
+            }
+        }
+
+        if let Some(action) = action
+            && let Some(document) = self.document.as_mut()
+        {
+            let result = match action {
+                AutomationEditAction::Insert {
+                    slot,
+                    position_beats,
+                    value,
+                    tension,
+                } => {
+                    self.selected_automation_point = Some(slot);
+                    document.insert_automation_point(
+                        channel_id,
+                        slot,
+                        position_beats,
+                        value,
+                        tension,
+                    )
+                }
+                AutomationEditAction::Edit { point_index, edit } => {
+                    self.selected_automation_point = Some(point_index);
+                    document.edit_automation_point(channel_id, point_index, edit)
+                }
+                AutomationEditAction::Delete { point_index } => {
+                    self.selected_automation_point = None;
+                    self.automation_add_mode = false;
+                    document.delete_automation_point(channel_id, point_index)
+                }
+            };
+            match result {
+                Ok(()) => {
+                    self.dirty = true;
+                    self.status = "Automation curve updated".to_owned();
+                }
+                Err(error) => self.status = format!("Could not edit automation: {error}"),
             }
         }
     }
@@ -2609,6 +3012,7 @@ impl eframe::App for DawUi {
                             MainView::Mixer => self.mixer(ui),
                             MainView::Plugins => self.plugins(ui),
                             MainView::Audio => self.audio_settings_view(ui),
+                            MainView::Automation => self.automation_editor(ui),
                         }
                     },
                 );
@@ -2641,6 +3045,27 @@ fn empty_view(ui: &mut egui::Ui, message: &str) {
     ui.centered_and_justified(|ui| {
         ui.label(egui::RichText::new(message).color(MUTED));
     });
+}
+
+fn automation_point_screen_position(
+    point: &AutomationPoint,
+    plot_rect: egui::Rect,
+    visible_beats: f64,
+) -> egui::Pos2 {
+    let beat_fraction = if point.position_beats().is_finite() {
+        (point.position_beats() / visible_beats).clamp(0.0, 1.0) as f32
+    } else {
+        0.0
+    };
+    let value_fraction = if point.value().is_finite() {
+        point.value().clamp(0.0, 1.0) as f32
+    } else {
+        0.5
+    };
+    egui::pos2(
+        egui::lerp(plot_rect.left()..=plot_rect.right(), beat_fraction),
+        egui::lerp(plot_rect.bottom()..=plot_rect.top(), value_fraction),
+    )
 }
 
 fn clip_name(clip: &PlaylistClip, tracks: &[PlaylistTrack]) -> String {

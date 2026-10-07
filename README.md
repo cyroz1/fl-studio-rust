@@ -64,7 +64,7 @@ The original application's MIDI export experiments and their measured results ar
 
 ## Automation points
 
-`automation <file.flp>` lists point curves from type-5 automation channels. `edit-automation-point` changes an existing point's position in beats, normalized value, and tension. `insert-automation-point` inserts at a zero-based slot (including the slot after the last point), and `delete-automation-point` removes a point by zero-based index. These operations preserve existing point tails and the blob's header and era trailer; new points use a zeroed opaque tail. They require a channel with an existing `0xEA` point blob. Parameter links, event automation, and desktop curve editing are not implemented yet.
+`automation <file.flp>` lists point curves from type-5 automation channels. `edit-automation-point` changes an existing point's position in beats, normalized value, and tension. `insert-automation-point` inserts at a zero-based slot (including the slot after the last point), and `delete-automation-point` removes a point by zero-based index. These operations preserve existing point tails and the blob's header and era trailer; new points use a zeroed opaque tail. They require a channel with an existing `0xEA` point blob. The desktop Automation view draws a type-5 curve and supports point selection, drag and numeric editing, insertion, and deletion. Its current preview uses straight segments and does not render tension/interpolation modes. Parameter links, event automation, automation-clip creation, and FL Studio's window-level curve workflow remain incomplete.
 
 ## Automated checks and installers
 
