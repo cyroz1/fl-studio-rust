@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::audio::StreamingAudioWriter;
 use crate::media::{DecodedAudio, SamplePathResolver, decode_audio_file};
+use crate::vst3::Vst3PlaylistStreamProcessor;
 use crate::{Arrangement, FlpDocument, Pattern, PatternNote, PlaylistClip, PlaylistClipTarget};
 
 const DEFAULT_SAMPLE_RATE: u32 = 44_100;
@@ -104,6 +105,9 @@ pub struct PlaylistRenderSummary {
     pub audio_clips_skipped_unsupported_scale: usize,
     pub pattern_clips_skipped_unsupported_scale: usize,
     pub notes_skipped_unresolved_sample: usize,
+    pub vst3_plugin_channels_rendered: usize,
+    pub vst3_notes_rendered: usize,
+    pub vst3_plugin_channels_unloaded: usize,
 }
 
 /// Render audio-channel Playlist clips into a stereo 32-bit-float WAV.
@@ -190,6 +194,18 @@ pub fn stream_playlist_to_device(
     writer: &StreamingAudioWriter,
     cancelled: &AtomicBool,
 ) -> Result<PlaylistRenderSummary, String> {
+    stream_playlist_with_vst3_to_device(document, project_path, options, writer, cancelled, None)
+}
+
+/// Stream Playlist audio, Sampler Pattern Clips, and prepared VST3 instruments into one mix.
+pub fn stream_playlist_with_vst3_to_device(
+    document: &FlpDocument,
+    project_path: impl AsRef<Path>,
+    options: PlaylistRenderOptions,
+    writer: &StreamingAudioWriter,
+    cancelled: &AtomicBool,
+    mut vst3_processor: Option<Vst3PlaylistStreamProcessor>,
+) -> Result<PlaylistRenderSummary, String> {
     let project_path = project_path.as_ref();
     let audio = prepare_audio_clip_render(
         document,
@@ -201,17 +217,40 @@ pub fn stream_playlist_to_device(
         Some(cancelled),
     )?;
     let sampler = prepare_sampler_arrangement(document, project_path, options, Some(cancelled))?;
-    if audio.clips.is_empty() && sampler.notes.is_empty() {
+    if audio.clips.is_empty()
+        && sampler.notes.is_empty()
+        && vst3_processor
+            .as_ref()
+            .is_none_or(|processor| processor.summary().plugin_channels_rendered == 0)
+    {
+        if let Some(processor) = vst3_processor.as_ref() {
+            let unloaded_channels = processor.summary().unloaded_plugin_channels;
+            if !unloaded_channels.is_empty() {
+                let channel_ids = unloaded_channels
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(format!(
+                    "arrangement has VST3 notes on channel(s) {channel_ids}, but no matching plug-in instance is loaded"
+                ));
+            }
+        }
         return Err(
-            "arrangement contains no supported audio clips or Sampler notes in Pattern Clips"
+            "arrangement contains no supported audio clips, Sampler notes, or loaded VST3 notes in Pattern Clips"
                 .to_owned(),
         );
     }
 
-    let frames = audio.summary.frames.max(sampler.summary.frames);
+    let mut frames = audio.summary.frames.max(sampler.summary.frames);
+    if let Some(processor) = vst3_processor.as_mut() {
+        frames = frames.max(processor.summary().frames);
+        processor.extend_to_output_frames(frames)?;
+    }
     let mut source_paths: std::collections::BTreeSet<PathBuf> =
         audio.decoded_by_path.keys().cloned().collect();
     source_paths.extend(sampler.source_paths.iter().cloned());
+    let vst3_summary = vst3_processor.as_ref().map(|processor| processor.summary());
     let mut summary = PlaylistRenderSummary {
         frames,
         sample_rate: options.sample_rate,
@@ -223,12 +262,25 @@ pub fn stream_playlist_to_device(
         audio_clips_skipped_unsupported_scale: audio.summary.clips_skipped_unsupported_scale,
         pattern_clips_skipped_unsupported_scale: sampler.pattern_clips_skipped_unsupported_scale,
         notes_skipped_unresolved_sample: sampler.summary.notes_skipped_unresolved_sample,
+        vst3_plugin_channels_rendered: vst3_summary
+            .as_ref()
+            .map_or(0, |summary| summary.plugin_channels_rendered),
+        vst3_notes_rendered: vst3_summary
+            .as_ref()
+            .map_or(0, |summary| summary.notes_scheduled),
+        vst3_plugin_channels_unloaded: vst3_summary
+            .as_ref()
+            .map_or(0, |summary| summary.unloaded_plugin_channels.len()),
     };
 
     summary.voices_stolen = stream_prepared_playlist_render(
-        &audio,
-        &sampler,
-        options,
+        PreparedPlaylistBlockMix {
+            audio: &audio,
+            sampler: &sampler,
+            options,
+            frames,
+            vst3_processor: vst3_processor.as_mut(),
+        },
         cancelled,
         || writer.is_cancelled(),
         |block| writer.write_stereo_samples(block),
@@ -236,64 +288,91 @@ pub fn stream_playlist_to_device(
     Ok(summary)
 }
 
-fn stream_prepared_playlist_render(
-    audio: &PreparedAudioClipRender,
-    sampler: &PreparedSamplerArrangement,
+struct PreparedPlaylistBlockMix<'a> {
+    audio: &'a PreparedAudioClipRender,
+    sampler: &'a PreparedSamplerArrangement,
     options: PlaylistRenderOptions,
+    frames: u64,
+    vst3_processor: Option<&'a mut Vst3PlaylistStreamProcessor>,
+}
+
+fn stream_prepared_playlist_render(
+    mut render: PreparedPlaylistBlockMix<'_>,
     cancelled: &AtomicBool,
     mut stream_cancelled: impl FnMut() -> bool,
     mut write_block: impl FnMut(&[f32]) -> Result<(), String>,
 ) -> Result<usize, String> {
-    let frames = audio.summary.frames.max(sampler.summary.frames);
+    let frames = render.frames;
+    let options = render.options;
     let release_frames = (f64::from(options.sample_rate) * SAMPLER_RELEASE_SECONDS)
         .round()
         .max(1.0) as usize;
     let mut sampler_engine = SamplerVoiceEngine::new(
-        &sampler.sources_by_channel,
-        &sampler.notes,
+        &render.sampler.sources_by_channel,
+        &render.sampler.notes,
         options.sampler_voice_limit,
         release_frames,
         options.sample_rate,
     );
+    if let Some(processor) = render.vst3_processor.as_deref_mut() {
+        processor.start_processing()?;
+    }
     let mut output = vec![0.0f32; STREAM_BLOCK_FRAMES * 2];
     let mut sampler_block = vec![0.0f32; STREAM_BLOCK_FRAMES * 2];
-    let mut block_start = 0u64;
-    while block_start < frames {
-        check_cancelled(Some(cancelled))?;
-        if stream_cancelled() {
-            return Err("Playlist playback was stopped".to_owned());
-        }
-        let frame_count = (frames - block_start).min(STREAM_BLOCK_FRAMES as u64) as usize;
-        let sample_count = frame_count * 2;
-        let block = &mut output[..sample_count];
-        block.fill(0.0);
-        for clip in &audio.clips {
-            let source = audio
-                .decoded_by_path
-                .get(&clip.path)
-                .expect("prepared audio clips have decoded sources");
-            mix_clip_window_into_stereo(
-                block,
-                block_start,
-                source,
-                clip,
-                options.sample_rate,
-                Some(cancelled),
-            )
-            .map_err(|error| {
-                format!(
-                    "could not mix Playlist clip {} from audio channel {}: {error}",
-                    clip.clip_index, clip.channel_id
+    let mix_result = (|| {
+        let mut block_start = 0u64;
+        while block_start < frames {
+            check_cancelled(Some(cancelled))?;
+            if stream_cancelled() {
+                return Err("Playlist playback was stopped".to_owned());
+            }
+            let frame_count = (frames - block_start).min(STREAM_BLOCK_FRAMES as u64) as usize;
+            let sample_count = frame_count * 2;
+            let block = &mut output[..sample_count];
+            block.fill(0.0);
+            for clip in &render.audio.clips {
+                let source = render
+                    .audio
+                    .decoded_by_path
+                    .get(&clip.path)
+                    .expect("prepared audio clips have decoded sources");
+                mix_clip_window_into_stereo(
+                    block,
+                    block_start,
+                    source,
+                    clip,
+                    options.sample_rate,
+                    Some(cancelled),
                 )
-            })?;
+                .map_err(|error| {
+                    format!(
+                        "could not mix Playlist clip {} from audio channel {}: {error}",
+                        clip.clip_index, clip.channel_id
+                    )
+                })?;
+            }
+            let sampler_samples = &mut sampler_block[..sample_count];
+            sampler_engine.render_block(block_start, frame_count, sampler_samples);
+            for (mixed, sampler_sample) in block.iter_mut().zip(sampler_samples) {
+                *mixed += *sampler_sample;
+            }
+            if let Some(processor) = render.vst3_processor.as_deref_mut() {
+                processor.mix_next_block(block)?;
+            }
+            write_block(block)?;
+            block_start += frame_count as u64;
         }
-        let sampler_samples = &mut sampler_block[..sample_count];
-        sampler_engine.render_block(block_start, frame_count, sampler_samples);
-        for (mixed, sampler_sample) in block.iter_mut().zip(sampler_samples) {
-            *mixed += *sampler_sample;
-        }
-        write_block(block)?;
-        block_start += frame_count as u64;
+        Ok::<_, String>(())
+    })();
+    let stop_result = if let Some(processor) = render.vst3_processor.as_deref_mut() {
+        processor.stop_processing()
+    } else {
+        Ok(())
+    };
+    match (mix_result, stop_result) {
+        (Err(error), _) => return Err(error),
+        (Ok(()), Err(error)) => return Err(error),
+        (Ok(()), Ok(())) => {}
     }
     Ok(sampler_engine.voices_stolen)
 }
@@ -646,30 +725,30 @@ fn require_audio_clips(render: &PreparedAudioClipRender) -> Result<(), String> {
     }
 }
 
-const MAX_SCHEDULED_SAMPLER_NOTES: usize = 2_000_000;
+const MAX_SCHEDULED_PLAYLIST_NOTES: usize = 2_000_000;
 
-struct PlacedPatternSamplerNote<'a> {
-    note: &'a PatternNote,
-    start_tick: u64,
-    clipped_stop_tick: Option<u64>,
-    clip_index: usize,
+pub(crate) struct PlaylistPatternNote<'a> {
+    pub(crate) note: &'a PatternNote,
+    pub(crate) start_tick: u64,
+    pub(crate) clipped_stop_tick: Option<u64>,
+    pub(crate) clip_index: usize,
 }
 
-struct PatternSamplerSchedule<'a> {
-    notes: Vec<PlacedPatternSamplerNote<'a>>,
-    clips_skipped_unsupported_scale: usize,
+pub(crate) struct PlaylistPatternSchedule<'a> {
+    pub(crate) notes: Vec<PlaylistPatternNote<'a>>,
+    pub(crate) clips_skipped_unsupported_scale: usize,
 }
 
-fn schedule_sampler_pattern_clips<'a>(
+pub(crate) fn schedule_playlist_pattern_notes<'a>(
     patterns: &'a [Pattern],
     arrangement: &Arrangement,
     is_enabled_sampler: impl Fn(u16) -> bool,
-) -> Result<PatternSamplerSchedule<'a>, String> {
+) -> Result<PlaylistPatternSchedule<'a>, String> {
     let patterns_by_id: HashMap<_, _> = patterns
         .iter()
         .map(|pattern| (pattern.id, pattern))
         .collect();
-    let mut schedule = PatternSamplerSchedule {
+    let mut schedule = PlaylistPatternSchedule {
         notes: Vec::new(),
         clips_skipped_unsupported_scale: 0,
     };
@@ -732,9 +811,9 @@ fn schedule_sampler_pattern_clips<'a>(
                 if relative_start >= clip_length {
                     continue;
                 }
-                if schedule.notes.len() >= MAX_SCHEDULED_SAMPLER_NOTES {
+                if schedule.notes.len() >= MAX_SCHEDULED_PLAYLIST_NOTES {
                     return Err(format!(
-                        "Playlist expands to more than {MAX_SCHEDULED_SAMPLER_NOTES} Sampler note events"
+                        "Playlist expands to more than {MAX_SCHEDULED_PLAYLIST_NOTES} pattern note events"
                     ));
                 }
                 let start_tick = u64::from(clip.position_ticks)
@@ -752,7 +831,7 @@ fn schedule_sampler_pattern_clips<'a>(
                             .min(clip_end),
                     )
                 };
-                schedule.notes.push(PlacedPatternSamplerNote {
+                schedule.notes.push(PlaylistPatternNote {
                     note,
                     start_tick,
                     clipped_stop_tick,
@@ -811,7 +890,7 @@ fn prepare_sampler_arrangement(
         .into_iter()
         .map(|channel| (channel.id(), channel))
         .collect();
-    let schedule = schedule_sampler_pattern_clips(&patterns, &arrangement, |channel_id| {
+    let schedule = schedule_playlist_pattern_notes(&patterns, &arrangement, |channel_id| {
         channels_by_id
             .get(&channel_id)
             .is_some_and(|channel| channel.kind() == Some(0) && channel.enabled() != Some(false))
@@ -1488,7 +1567,7 @@ fn source_duration_to_frames(
     Ok(duration.ceil() as u64)
 }
 
-fn channel_gain_pan(volume: Option<u32>, pan: Option<i32>) -> (f32, f32) {
+pub(crate) fn channel_gain_pan(volume: Option<u32>, pan: Option<i32>) -> (f32, f32) {
     let gain = volume.unwrap_or(10_000).min(12_800) as f32 / 10_000.0;
     let pan = pan
         .map(|raw| (raw.clamp(0, 12_800) as f32 / 6_400.0) - 1.0)
@@ -1816,7 +1895,7 @@ mod tests {
         };
 
         let patterns = [pattern];
-        let schedule = schedule_sampler_pattern_clips(&patterns, &arrangement, |_| true).unwrap();
+        let schedule = schedule_playlist_pattern_notes(&patterns, &arrangement, |_| true).unwrap();
         assert_eq!(
             schedule
                 .notes
@@ -1850,7 +1929,7 @@ mod tests {
         };
 
         let patterns = [pattern];
-        let schedule = schedule_sampler_pattern_clips(&patterns, &arrangement, |_| true).unwrap();
+        let schedule = schedule_playlist_pattern_notes(&patterns, &arrangement, |_| true).unwrap();
         assert_eq!(schedule.notes.len(), 1);
         assert_eq!(schedule.notes[0].start_tick, 12);
         assert_eq!(schedule.notes[0].clipped_stop_tick, None);
@@ -1921,12 +2000,16 @@ mod tests {
         let mut rendered = Vec::new();
 
         let voices_stolen = stream_prepared_playlist_render(
-            &audio,
-            &sampler,
-            PlaylistRenderOptions {
-                arrangement_id: 0,
-                sample_rate: 4,
-                sampler_voice_limit: 4,
+            PreparedPlaylistBlockMix {
+                audio: &audio,
+                sampler: &sampler,
+                options: PlaylistRenderOptions {
+                    arrangement_id: 0,
+                    sample_rate: 4,
+                    sampler_voice_limit: 4,
+                },
+                frames: 2,
+                vst3_processor: None,
             },
             &AtomicBool::new(false),
             || false,

@@ -4,7 +4,7 @@
 //! while preserving their complete raw bytes. This runtime does not translate
 //! Image-Line's FLP state envelope into the state stream expected by every VST3.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -12,7 +12,9 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use crate::FlpDocument;
 use crate::audio::StreamingAudioWriter;
+use crate::sample_render::{channel_gain_pan, schedule_playlist_pattern_notes};
 use vst3_host::audio::AudioBuffers;
 use vst3_host::midi::{MidiChannel, MidiEvent};
 use vst3_host::{Plugin, PluginInfo, PluginWindow, Vst3Host};
@@ -110,6 +112,230 @@ pub struct Vst3PatternRenderOptions {
     pub ppq: u16,
     pub tempo_bpm: f64,
     pub tail_seconds: f64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Vst3PlaylistRenderSummary {
+    pub plugin_channels_rendered: usize,
+    pub notes_scheduled: usize,
+    pub unloaded_plugin_channels: Vec<u16>,
+    pub frames: u64,
+    pub sample_rate: u32,
+}
+
+#[derive(Clone, Copy)]
+struct PlaylistMidiNote {
+    start_tick: u64,
+    stop_tick: u64,
+    key: u16,
+    velocity: u8,
+    midi_channel: u8,
+}
+
+struct PlaylistPluginStream {
+    channel_id: u16,
+    plugin: Arc<Mutex<Plugin>>,
+    render: PreparedPatternRender,
+    resampler: StereoStreamResampler,
+    pending_output: VecDeque<[f32; 2]>,
+    source_frame: u64,
+    next_event: usize,
+    resampler_finished: bool,
+    gain: f32,
+    left_pan_gain: f32,
+    right_pan_gain: f32,
+}
+
+/// Prepared VST3 instrument channels for blockwise Playlist Song transport.
+/// The instances are the same objects used by the open editors.
+pub struct Vst3PlaylistStreamProcessor {
+    streams: Vec<PlaylistPluginStream>,
+    output_sample_rate: u32,
+    output_frames: u64,
+    notes_scheduled: usize,
+    unloaded_plugin_channels: Vec<u16>,
+    started_count: usize,
+}
+
+impl Vst3PlaylistStreamProcessor {
+    pub fn summary(&self) -> Vst3PlaylistRenderSummary {
+        Vst3PlaylistRenderSummary {
+            plugin_channels_rendered: self.streams.len(),
+            notes_scheduled: self.notes_scheduled,
+            unloaded_plugin_channels: self.unloaded_plugin_channels.clone(),
+            frames: self.output_frames,
+            sample_rate: self.output_sample_rate,
+        }
+    }
+
+    pub fn extend_to_output_frames(&mut self, frames: u64) -> Result<(), String> {
+        self.output_frames = self.output_frames.max(frames);
+        for stream in &mut self.streams {
+            let source_frames = (self.output_frames as f64 * stream.render.sample_rate
+                / f64::from(self.output_sample_rate))
+            .ceil();
+            if !source_frames.is_finite() || source_frames > u64::MAX as f64 {
+                return Err(
+                    "VST3 Playlist stream length is outside the renderable range".to_owned(),
+                );
+            }
+            stream.render.total_frames = source_frames as u64;
+        }
+        Ok(())
+    }
+
+    pub fn start_processing(&mut self) -> Result<(), String> {
+        for index in 0..self.streams.len() {
+            let channel_id = self.streams[index].channel_id;
+            let result = self.streams[index]
+                .plugin
+                .lock()
+                .map_err(|_| "plug-in state lock was poisoned".to_owned())
+                .and_then(|mut plugin| {
+                    plugin
+                        .start_processing()
+                        .map_err(|error| error.to_string())
+                });
+            if let Err(error) = result {
+                let _ = self.stop_processing();
+                return Err(format!(
+                    "could not start VST3 channel {} processing: {error}",
+                    channel_id
+                ));
+            }
+            self.started_count += 1;
+        }
+        Ok(())
+    }
+
+    pub fn mix_next_block(&mut self, output: &mut [f32]) -> Result<(), String> {
+        if !output.len().is_multiple_of(2) {
+            return Err("VST3 Playlist mix buffer must contain stereo frames".to_owned());
+        }
+        let frame_count = output.len() / 2;
+        for stream in &mut self.streams {
+            let mut plugin_output = Vec::new();
+            plugin_output
+                .try_reserve_exact(output.len())
+                .map_err(|error| format!("could not allocate VST3 Playlist block: {error}"))?;
+            stream.render_output_frames(frame_count, &mut plugin_output)?;
+            for (frame_index, frame) in plugin_output.chunks_exact(2).enumerate() {
+                let left = frame[0] * stream.gain;
+                let right = frame[1] * stream.gain;
+                output[frame_index * 2] += left * stream.left_pan_gain;
+                output[frame_index * 2 + 1] += right * stream.right_pan_gain;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn stop_processing(&mut self) -> Result<(), String> {
+        let mut first_error = None;
+        while self.started_count > 0 {
+            self.started_count -= 1;
+            let stream = &self.streams[self.started_count];
+            let result = stream
+                .plugin
+                .lock()
+                .map_err(|_| "plug-in state lock was poisoned".to_owned())
+                .and_then(|mut plugin| plugin.stop_processing().map_err(|error| error.to_string()));
+            if let Err(error) = result
+                && first_error.is_none()
+            {
+                first_error = Some(format!(
+                    "could not stop VST3 channel {} processing: {error}",
+                    stream.channel_id
+                ));
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+}
+
+impl PlaylistPluginStream {
+    fn render_output_frames(
+        &mut self,
+        frame_count: usize,
+        output: &mut Vec<f32>,
+    ) -> Result<(), String> {
+        output.clear();
+        let output_samples = frame_count
+            .checked_mul(2)
+            .ok_or_else(|| "VST3 Playlist output block size overflow".to_owned())?;
+        output
+            .try_reserve(output_samples)
+            .map_err(|error| format!("could not allocate VST3 Playlist output: {error}"))?;
+        while self.pending_output.len() < frame_count && !self.resampler_finished {
+            if self.source_frame < self.render.total_frames {
+                let source_count = (self.render.total_frames - self.source_frame)
+                    .min(self.render.block_size as u64) as usize;
+                let block_end = self.source_frame + source_count as u64;
+                let mut buffers = AudioBuffers::new(
+                    0,
+                    self.render.output_channels,
+                    source_count,
+                    self.render.sample_rate,
+                );
+                let output_block = {
+                    let mut plugin = self
+                        .plugin
+                        .lock()
+                        .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
+                    while let Some(event) = self.render.events.get(self.next_event)
+                        && event.frame < block_end
+                    {
+                        let offset = event.frame.saturating_sub(self.source_frame) as i32;
+                        plugin
+                            .send_midi_event_at(event.event, offset)
+                            .map_err(|error| error.to_string())?;
+                        self.next_event += 1;
+                    }
+                    plugin
+                        .process_audio(&mut buffers)
+                        .map_err(|error| error.to_string())?;
+                    if buffers.outputs.len() != self.render.output_channels
+                        || buffers
+                            .outputs
+                            .iter()
+                            .any(|channel| channel.len() < source_count)
+                    {
+                        return Err(format!(
+                            "VST3 channel {} returned audio buffers with an unexpected shape",
+                            self.channel_id
+                        ));
+                    }
+                    self.resampler.push_outputs(
+                        &buffers.outputs,
+                        source_count,
+                        self.render.output_channels,
+                    )?
+                };
+                self.push_interleaved(&output_block)?;
+                self.source_frame = block_end;
+            } else {
+                let output_block = self.resampler.finish()?;
+                self.push_interleaved(&output_block)?;
+                self.resampler_finished = true;
+            }
+        }
+        for _ in 0..frame_count {
+            let frame = self.pending_output.pop_front().unwrap_or([0.0, 0.0]);
+            output.extend_from_slice(&frame);
+        }
+        Ok(())
+    }
+
+    fn push_interleaved(&mut self, samples: &[f32]) -> Result<(), String> {
+        if !samples.len().is_multiple_of(2) {
+            return Err("VST3 Playlist resampler returned a partial stereo frame".to_owned());
+        }
+        self.pending_output.extend(
+            samples
+                .chunks_exact(2)
+                .map(|frame| [finite_sample(frame[0]), finite_sample(frame[1])]),
+        );
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -399,6 +625,172 @@ impl Vst3HostRuntime {
         Ok(Vst3PatternStream { plugin, render })
     }
 
+    /// Prepare all loaded VST3 instrument channels used by the selected Playlist arrangement.
+    ///
+    /// Pattern Clips are expanded into absolute project ticks, then each mapped channel is
+    /// processed independently on the playback worker and resampled into the shared song mix.
+    /// Unloaded instrument channels are reported so the caller can surface missing plug-ins.
+    pub fn prepare_playlist_stream(
+        &self,
+        document: &FlpDocument,
+        arrangement_id: u16,
+        channel_instances: &BTreeMap<u16, u64>,
+        output_sample_rate: u32,
+        tail_seconds: f64,
+    ) -> Result<Vst3PlaylistStreamProcessor, String> {
+        if !(8_000..=384_000).contains(&output_sample_rate) {
+            return Err("Playlist audio rate must be between 8000 and 384000 Hz".to_owned());
+        }
+        if !tail_seconds.is_finite() || !(0.0..=60.0).contains(&tail_seconds) {
+            return Err("VST3 Playlist tail must be between 0 and 60 seconds".to_owned());
+        }
+        let ppq = document.header().ppq();
+        if ppq == 0 {
+            return Err("project PPQ must be greater than zero".to_owned());
+        }
+        let tempo_bpm = document.metadata().tempo_bpm().unwrap_or(140.0);
+        if !tempo_bpm.is_finite() || tempo_bpm <= 0.0 {
+            return Err("project tempo must be finite and positive".to_owned());
+        }
+        let arrangement = document
+            .arrangements()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|arrangement| arrangement.id == arrangement_id)
+            .ok_or_else(|| format!("arrangement {arrangement_id} was not found"))?;
+        let patterns = document.patterns().map_err(|error| error.to_string())?;
+        let channels = document.channels();
+        let channels_by_id: BTreeMap<_, _> = channels
+            .iter()
+            .map(|channel| (channel.id(), channel))
+            .collect();
+        let mut plugin_channels: BTreeSet<_> = document
+            .channel_plugin_states()
+            .into_iter()
+            .map(|state| state.channel_id())
+            .collect();
+        plugin_channels.extend(
+            channels
+                .iter()
+                .filter(|channel| {
+                    channel.plugin_identifier().is_some() && channel.enabled() != Some(false)
+                })
+                .map(|channel| channel.id()),
+        );
+        let schedule = schedule_playlist_pattern_notes(&patterns, &arrangement, |channel_id| {
+            plugin_channels.contains(&channel_id)
+                && channels_by_id
+                    .get(&channel_id)
+                    .is_none_or(|channel| channel.enabled() != Some(false))
+        })?;
+
+        let mut notes_by_channel = BTreeMap::<u16, Vec<PlaylistMidiNote>>::new();
+        for placed in &schedule.notes {
+            let note = placed.note;
+            let stop_tick = match placed.clipped_stop_tick {
+                Some(stop_tick) => stop_tick,
+                None => placed
+                    .start_tick
+                    .checked_add(1)
+                    .ok_or_else(|| "zero-length VST3 note end overflow".to_owned())?,
+            };
+            notes_by_channel
+                .entry(note.channel_id)
+                .or_default()
+                .push(PlaylistMidiNote {
+                    start_tick: placed.start_tick,
+                    stop_tick,
+                    key: note.key,
+                    velocity: note.velocity,
+                    midi_channel: note.midi_channel,
+                });
+        }
+
+        let ppq = u64::from(ppq);
+        let max_tick = arrangement.clips.iter().fold(0u64, |end, clip| {
+            end.max(u64::from(clip.position_ticks) + u64::from(clip.length_ticks))
+        });
+        let duration_seconds = max_tick as f64 * 60.0 / (ppq as f64 * tempo_bpm);
+        let base_output_frames = duration_seconds * f64::from(output_sample_rate);
+        let tail_output_frames = tail_seconds * f64::from(output_sample_rate);
+        let total_output_frames = base_output_frames + tail_output_frames;
+        if !total_output_frames.is_finite() || total_output_frames > u64::MAX as f64 {
+            return Err("VST3 Playlist length is outside the renderable range".to_owned());
+        }
+        let mut output_frames = if notes_by_channel.is_empty() {
+            0
+        } else {
+            (total_output_frames.ceil() as u64).max(1)
+        };
+
+        let mut streams = Vec::new();
+        let mut unloaded_plugin_channels = BTreeSet::new();
+        let mut notes_scheduled = 0usize;
+        for (channel_id, notes) in notes_by_channel {
+            let Some(instance_id) = channel_instances.get(&channel_id).copied() else {
+                unloaded_plugin_channels.insert(channel_id);
+                continue;
+            };
+            let Ok(plugin) = self.plugin(instance_id).cloned() else {
+                unloaded_plugin_channels.insert(channel_id);
+                continue;
+            };
+            let channel = channels_by_id.get(&channel_id);
+            let (gain, pan) = channel_gain_pan(
+                channel.and_then(|channel| channel.volume()),
+                channel.and_then(|channel| channel.pan()),
+            );
+            let render = {
+                let plugin_guard = plugin
+                    .lock()
+                    .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
+                let source_frames = (output_frames as f64 * plugin_guard.sample_rate()
+                    / f64::from(output_sample_rate))
+                .ceil();
+                if !source_frames.is_finite() || source_frames > u64::MAX as f64 {
+                    return Err(format!(
+                        "VST3 channel {channel_id} Playlist length is outside the renderable range"
+                    ));
+                }
+                prepare_playlist_pattern_render(
+                    &plugin_guard,
+                    &notes,
+                    u16::try_from(ppq).map_err(|_| "project PPQ is out of range".to_owned())?,
+                    tempo_bpm,
+                    source_frames as u64,
+                )?
+            };
+            let (left_pan_gain, right_pan_gain) =
+                playlist_plugin_pan_gains(pan, render.output_channels == 1);
+            let resampler = StereoStreamResampler::new(render.sample_rate_u32, output_sample_rate)?;
+            notes_scheduled += render.note_count;
+            streams.push(PlaylistPluginStream {
+                channel_id,
+                plugin,
+                render,
+                resampler,
+                pending_output: VecDeque::new(),
+                source_frame: 0,
+                next_event: 0,
+                resampler_finished: false,
+                gain,
+                left_pan_gain,
+                right_pan_gain,
+            });
+        }
+        if streams.is_empty() {
+            output_frames = 0;
+        }
+        Ok(Vst3PlaylistStreamProcessor {
+            streams,
+            output_sample_rate,
+            output_frames,
+            notes_scheduled,
+            unloaded_plugin_channels: unloaded_plugin_channels.into_iter().collect(),
+            started_count: 0,
+        })
+    }
+
     /// Service native editor close/resize requests and the VST3 UI run loop where needed.
     pub fn service_editors(&mut self) -> Result<(), String> {
         for loaded in &mut self.loaded {
@@ -429,6 +821,143 @@ impl Vst3HostRuntime {
             .find(|loaded| loaded.info.id == id)
             .map(|loaded| &loaded.plugin)
             .ok_or_else(|| format!("no loaded VST3 instance with id {id}"))
+    }
+}
+
+fn prepare_playlist_pattern_render(
+    plugin: &Plugin,
+    notes: &[PlaylistMidiNote],
+    ppq: u16,
+    tempo_bpm: f64,
+    total_frames: u64,
+) -> Result<PreparedPatternRender, String> {
+    if ppq == 0 {
+        return Err("project PPQ must be greater than zero".to_owned());
+    }
+    if !tempo_bpm.is_finite() || tempo_bpm <= 0.0 {
+        return Err("project tempo must be finite and positive".to_owned());
+    }
+    if notes.is_empty() {
+        return Err("VST3 Playlist channel has no notes to render".to_owned());
+    }
+    let sample_rate = plugin.sample_rate();
+    if !sample_rate.is_finite() || !(8_000.0..=384_000.0).contains(&sample_rate) {
+        return Err("VST3 host sample rate is invalid".to_owned());
+    }
+    let sample_rate_u32 = sample_rate.round() as u32;
+    let block_size = plugin.block_size();
+    if block_size == 0 || block_size > 65_536 {
+        return Err("VST3 host block size is not renderable".to_owned());
+    }
+    let output_channels = plugin.output_channel_count();
+    if !(1..=2).contains(&output_channels) {
+        return Err(format!(
+            "VST3 Playlist supports mono or stereo output buses; the instrument has {output_channels} channels"
+        ));
+    }
+    let (events, note_count) = scheduled_playlist_midi_events(notes, ppq, tempo_bpm, sample_rate)?;
+    let last_event_frame = events
+        .iter()
+        .map(|event| event.frame)
+        .max()
+        .ok_or_else(|| "VST3 Playlist channel has no renderable notes".to_owned())?;
+    Ok(PreparedPatternRender {
+        events,
+        note_count,
+        sample_rate,
+        sample_rate_u32,
+        output_channels,
+        block_size,
+        total_frames: total_frames.max(last_event_frame.saturating_add(1)),
+    })
+}
+
+fn scheduled_playlist_midi_events(
+    notes: &[PlaylistMidiNote],
+    ppq: u16,
+    tempo_bpm: f64,
+    sample_rate: f64,
+) -> Result<(Vec<ScheduledMidiEvent>, usize), String> {
+    if ppq == 0 {
+        return Err("project PPQ must be greater than zero".to_owned());
+    }
+    if !tempo_bpm.is_finite() || tempo_bpm <= 0.0 {
+        return Err("project tempo must be finite and positive".to_owned());
+    }
+    if !sample_rate.is_finite() || sample_rate <= 0.0 {
+        return Err("VST3 host sample rate must be finite and positive".to_owned());
+    }
+    if notes.len() > 2_000_000 {
+        return Err("VST3 Playlist expands to more than 2000000 note events".to_owned());
+    }
+    let mut events = Vec::with_capacity(notes.len().saturating_mul(2));
+    let mut note_count = 0usize;
+    for note in notes {
+        if note.key > 127 {
+            return Err(format!(
+                "Playlist pattern contains key {} outside the MIDI note range",
+                note.key
+            ));
+        }
+        if note.velocity > 127 {
+            return Err(format!(
+                "Playlist pattern contains velocity {} outside the MIDI range",
+                note.velocity
+            ));
+        }
+        let channel = MidiChannel::from_index(note.midi_channel).ok_or_else(|| {
+            format!(
+                "Playlist pattern contains MIDI channel {} outside 0..15",
+                note.midi_channel
+            )
+        })?;
+        let frame_for_tick =
+            |tick: u64| ((tick as f64 / f64::from(ppq)) * (60.0 / tempo_bpm) * sample_rate).round();
+        let start_frame = frame_for_tick(note.start_tick);
+        let end_frame = frame_for_tick(note.stop_tick.max(note.start_tick.saturating_add(1)));
+        if !start_frame.is_finite()
+            || !end_frame.is_finite()
+            || start_frame < 0.0
+            || end_frame < start_frame
+            || end_frame > u64::MAX as f64
+        {
+            return Err("Playlist note timing is outside the renderable range".to_owned());
+        }
+        let start_frame = start_frame as u64;
+        let end_frame = (end_frame as u64).max(start_frame.saturating_add(1));
+        events.push(ScheduledMidiEvent {
+            frame: start_frame,
+            priority: 1,
+            event: MidiEvent::NoteOn {
+                channel,
+                note: note.key as u8,
+                velocity: note.velocity,
+            },
+        });
+        events.push(ScheduledMidiEvent {
+            frame: end_frame,
+            priority: 0,
+            event: MidiEvent::NoteOff {
+                channel,
+                note: note.key as u8,
+                velocity: 0,
+            },
+        });
+        note_count += 1;
+    }
+    events.sort_by_key(|event| (event.frame, event.priority));
+    Ok((events, note_count))
+}
+
+fn playlist_plugin_pan_gains(pan: f32, mono: bool) -> (f32, f32) {
+    let pan = pan.clamp(-1.0, 1.0);
+    if mono {
+        let angle = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
+        (angle.cos(), angle.sin())
+    } else if pan < 0.0 {
+        (1.0, 1.0 + pan)
+    } else {
+        (1.0 - pan, 1.0)
     }
 }
 
@@ -1045,6 +1574,78 @@ mod tests {
         assert_eq!(events[1].frame, events[2].frame);
         assert!(matches!(events[1].event, MidiEvent::NoteOff { .. }));
         assert!(matches!(events[2].event, MidiEvent::NoteOn { .. }));
+    }
+
+    #[test]
+    fn playlist_notes_keep_absolute_arrangement_ticks_and_order_tied_note_offs_first() {
+        let notes = [
+            PlaylistMidiNote {
+                start_tick: 480,
+                stop_tick: 720,
+                key: 64,
+                velocity: 96,
+                midi_channel: 0,
+            },
+            PlaylistMidiNote {
+                start_tick: 720,
+                stop_tick: 960,
+                key: 64,
+                velocity: 80,
+                midi_channel: 0,
+            },
+        ];
+
+        let (events, note_count) =
+            scheduled_playlist_midi_events(&notes, 480, 120.0, 48_000.0).unwrap();
+
+        assert_eq!(note_count, 2);
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0].frame, 24_000);
+        assert!(matches!(
+            events[0].event,
+            MidiEvent::NoteOn { note: 64, .. }
+        ));
+        assert_eq!(events[1].frame, 36_000);
+        assert!(matches!(
+            events[1].event,
+            MidiEvent::NoteOff { note: 64, .. }
+        ));
+        assert_eq!(events[2].frame, 36_000);
+        assert!(matches!(
+            events[2].event,
+            MidiEvent::NoteOn { note: 64, .. }
+        ));
+        assert_eq!(events[3].frame, 48_000);
+        assert!(matches!(
+            events[3].event,
+            MidiEvent::NoteOff { note: 64, .. }
+        ));
+    }
+
+    #[test]
+    fn playlist_midi_scheduler_rejects_invalid_channel_and_timing() {
+        let note = PlaylistMidiNote {
+            start_tick: 0,
+            stop_tick: 1,
+            key: 60,
+            velocity: 100,
+            midi_channel: 16,
+        };
+        assert!(
+            scheduled_playlist_midi_events(&[note], 480, 120.0, 48_000.0)
+                .unwrap_err()
+                .contains("outside 0..15")
+        );
+
+        let note = PlaylistMidiNote {
+            midi_channel: 0,
+            ..note
+        };
+        assert!(
+            scheduled_playlist_midi_events(&[note], 0, 120.0, 48_000.0)
+                .unwrap_err()
+                .contains("PPQ")
+        );
     }
 
     #[test]

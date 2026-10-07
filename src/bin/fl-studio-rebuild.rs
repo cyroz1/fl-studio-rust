@@ -15,7 +15,7 @@ use flp_rebuild::plugins::{PluginCandidate, PluginFormat, scan_installed_plugins
 use flp_rebuild::sample_render::{
     AudioClipRenderOptions, PlaylistRenderOptions, PlaylistRenderSummary,
     SamplerPatternRenderOptions, SamplerPatternRenderSummary, render_audio_clips_to_wav,
-    stream_playlist_to_device, stream_sampler_pattern_to_device,
+    stream_playlist_with_vst3_to_device, stream_sampler_pattern_to_device,
 };
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions, Vst3PatternStreamHandle};
 use flp_rebuild::{
@@ -493,6 +493,26 @@ impl DawUi {
             sample_rate,
             ..PlaylistRenderOptions::default()
         };
+        let vst3_processor = self
+            .vst3_host
+            .as_ref()
+            .map(|host| {
+                host.prepare_playlist_stream(
+                    self.document.as_ref().expect("project was checked above"),
+                    options.arrangement_id,
+                    &self.channel_vst3_instances,
+                    sample_rate,
+                    2.0,
+                )
+            })
+            .transpose();
+        let vst3_processor = match vst3_processor {
+            Ok(processor) => processor,
+            Err(error) => {
+                self.status = format!("Could not prepare Playlist VST3 instruments: {error}");
+                return;
+            }
+        };
         let writer = match engine.begin_streaming_playback() {
             Ok(writer) => writer,
             Err(error) => {
@@ -509,12 +529,13 @@ impl DawUi {
                 let result = FlpDocument::parse(&project_bytes)
                     .map_err(|error| error.to_string())
                     .and_then(|document| {
-                        stream_playlist_to_device(
+                        stream_playlist_with_vst3_to_device(
                             &document,
                             &project_path,
                             options,
                             &writer,
                             &worker_cancelled,
+                            vst3_processor,
                         )
                     });
                 writer.finish();
@@ -529,7 +550,8 @@ impl DawUi {
                     cancelled,
                     worker,
                 });
-                self.status = "Preparing Playlist audio and Sampler notes…".to_owned();
+                self.status =
+                    "Preparing Playlist audio, Samplers, and VST3 instruments…".to_owned();
             }
             Err(error) => {
                 self.stop_project_playback();
@@ -561,12 +583,15 @@ impl DawUi {
             match result {
                 Ok(summary) => {
                     self.status = format!(
-                        "Playlist finished: {} audio clips, {} Sampler pattern clips, {} Sampler notes, {} source files at {} Hz ({} scaled audio and {} scaled pattern clips skipped); plug-in instruments and Mixer effects are not rendered",
+                        "Playlist finished: {} audio clips, {} Sampler pattern clips, {} Sampler notes, {} VST3 channels, {} VST3 notes, {} source files at {} Hz ({} VST3 channels unloaded, {} scaled audio and {} scaled pattern clips skipped); automation and Mixer effects are not rendered",
                         summary.audio_clips_rendered,
                         summary.sampler_pattern_clips_rendered,
                         summary.sampler_notes_rendered,
+                        summary.vst3_plugin_channels_rendered,
+                        summary.vst3_notes_rendered,
                         summary.source_files,
                         summary.sample_rate,
+                        summary.vst3_plugin_channels_unloaded,
                         summary.audio_clips_skipped_unsupported_scale,
                         summary.pattern_clips_skipped_unsupported_scale,
                     );
