@@ -217,7 +217,7 @@ impl Vst3PlaylistStreamProcessor {
                 .try_reserve_exact(output.len())
                 .map_err(|error| format!("could not allocate VST3 Playlist block: {error}"))?;
             stream.render_output_frames(frame_count, &mut plugin_output)?;
-            for (frame_index, frame) in plugin_output.chunks_exact(2).enumerate() {
+            for (frame_index, frame) in plugin_output.as_chunks::<2>().0.iter().enumerate() {
                 let left = frame[0] * stream.gain;
                 let right = frame[1] * stream.gain;
                 output[frame_index * 2] += left * stream.left_pan_gain;
@@ -329,7 +329,9 @@ impl PlaylistPluginStream {
         }
         self.pending_output.extend(
             samples
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|frame| [finite_sample(frame[0]), finite_sample(frame[1])]),
         );
         Ok(())
