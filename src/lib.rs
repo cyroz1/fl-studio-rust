@@ -133,6 +133,7 @@ pub struct ChannelSummary {
     enabled: Option<bool>,
     plugin_identifier: Option<String>,
     display_name: Option<String>,
+    sample_path: Option<String>,
     first_event_index: usize,
     end_event_index: usize,
 }
@@ -278,6 +279,11 @@ impl ChannelSummary {
 
     pub fn display_name(&self) -> Option<&str> {
         self.display_name.as_deref()
+    }
+
+    /// Sample source path decoded from the observed audio-channel `0xC4` string event.
+    pub fn sample_path(&self) -> Option<&str> {
+        self.sample_path.as_deref()
     }
 
     pub fn event_range(&self) -> std::ops::Range<usize> {
@@ -652,6 +658,11 @@ impl FlpDocument {
                     && uses_legacy_string_encoding(self.project_version.as_deref()) =>
                 {
                     channel.display_name =
+                        decode_project_string(&event.payload, self.project_version.as_deref())
+                            .filter(|value| !value.is_empty());
+                }
+                0xC4 if channel.kind == Some(4) && channel.sample_path.is_none() => {
+                    channel.sample_path =
                         decode_project_string(&event.payload, self.project_version.as_deref())
                             .filter(|value| !value.is_empty());
                 }
@@ -2091,6 +2102,18 @@ mod tests {
         flp_fixture(&event_stream, &[0xA1], &[0xB2])
     }
 
+    fn channel_with_sample_path_fixture(kind: u8, sample_path: &str) -> Vec<u8> {
+        let mut event_stream = vec![0x40, 7, 0, 0x15, kind, 0xC4];
+        let payload = sample_path
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        event_stream.extend_from_slice(&super::encode_leb128(payload.len() as u32));
+        event_stream.extend_from_slice(&payload);
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        flp_fixture(&event_stream, &[], &[])
+    }
+
     fn midi_fixture(track: &[u8], division: u16) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"MThd");
@@ -2152,6 +2175,27 @@ mod tests {
         truncated.extend_from_slice(&8u64.to_le_bytes());
         truncated.push(b'X');
         assert!(parse_vst_plugin_state_metadata(&truncated).is_none());
+    }
+
+    #[test]
+    fn decodes_audio_channel_sample_path_and_preserves_original_event_bytes() {
+        let path = r"%FLStudioFactoryData%\Data\Patches\Sounds\voice.wav";
+        let input = channel_with_sample_path_fixture(4, path);
+        let document = FlpDocument::parse(&input).expect("fixture should parse");
+        let channels = document.channels();
+
+        assert_eq!(channels.len(), 1);
+        assert_eq!(channels[0].sample_path(), Some(path));
+        assert_eq!(document.encode_lossless().unwrap(), input);
+    }
+
+    #[test]
+    fn does_not_treat_plugin_channel_factory_data_as_a_sample_path() {
+        let input = channel_with_sample_path_fixture(2, r"%FLStudioFactoryData%\Data\sounds.wav");
+        let document = FlpDocument::parse(&input).expect("fixture should parse");
+        let channels = document.channels();
+
+        assert_eq!(channels[0].sample_path(), None);
     }
 
     #[test]

@@ -714,7 +714,7 @@ fn list_channels(path: &Path) -> Result<(), String> {
     println!("channels: {}", channels.len());
     for channel in channels {
         println!(
-            "id={} kind={} enabled={} plugin={} name={} events={:?}",
+            "id={} kind={} enabled={} plugin={} name={} sample_path={:?} events={:?}",
             channel.id(),
             channel
                 .kind()
@@ -724,6 +724,7 @@ fn list_channels(path: &Path) -> Result<(), String> {
                 .map_or_else(|| "unknown".to_owned(), |enabled| enabled.to_string()),
             channel.plugin_identifier().unwrap_or("unknown"),
             channel.display_name().unwrap_or("(unnamed)"),
+            channel.sample_path(),
             channel.event_range()
         );
     }
