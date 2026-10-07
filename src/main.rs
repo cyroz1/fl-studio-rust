@@ -812,16 +812,19 @@ fn list_channels(path: &Path) -> Result<(), String> {
     println!("channels: {}", channels.len());
     for channel in channels {
         println!(
-            "id={} kind={} enabled={} volume={:?} pan={:?} plugin={} name={} sample_path={:?} events={:?}",
+            "id={} kind={} type={:?} enabled={} volume={:?} pan={:?} layer_children={:?} layer_flags={:?} plugin={} name={} sample_path={:?} events={:?}",
             channel.id(),
             channel
                 .kind()
                 .map_or_else(|| "unknown".to_owned(), |kind| kind.to_string()),
+            channel.channel_type(),
             channel
                 .enabled()
                 .map_or_else(|| "unknown".to_owned(), |enabled| enabled.to_string()),
             channel.volume(),
             channel.pan(),
+            channel.layer_child_ids(),
+            channel.layer_flags(),
             channel.plugin_identifier().unwrap_or("unknown"),
             channel.display_name().unwrap_or("(unnamed)"),
             channel.sample_path(),

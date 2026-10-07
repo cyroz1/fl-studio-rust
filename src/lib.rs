@@ -132,6 +132,41 @@ pub struct ProjectMetadata {
     build_number: Option<u32>,
 }
 
+/// A known FL channel kind, while retaining unrecognized raw values.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChannelType {
+    Sampler,
+    Native,
+    Layer,
+    Instrument,
+    Automation,
+    Unknown(u8),
+}
+
+impl ChannelType {
+    pub fn from_raw(value: u8) -> Self {
+        match value {
+            0 => Self::Sampler,
+            2 => Self::Native,
+            3 => Self::Layer,
+            4 => Self::Instrument,
+            5 => Self::Automation,
+            other => Self::Unknown(other),
+        }
+    }
+
+    pub fn raw(self) -> u8 {
+        match self {
+            Self::Sampler => 0,
+            Self::Native => 2,
+            Self::Layer => 3,
+            Self::Instrument => 4,
+            Self::Automation => 5,
+            Self::Unknown(value) => value,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ChannelSummary {
     id: u16,
@@ -145,6 +180,8 @@ pub struct ChannelSummary {
     plugin_identifier: Option<String>,
     display_name: Option<String>,
     sample_path: Option<String>,
+    layer_children: Vec<u16>,
+    layer_flags: Option<u32>,
     first_event_index: usize,
     end_event_index: usize,
 }
@@ -280,6 +317,10 @@ impl ChannelSummary {
         self.kind
     }
 
+    pub fn channel_type(&self) -> Option<ChannelType> {
+        self.kind.map(ChannelType::from_raw)
+    }
+
     pub fn enabled(&self) -> Option<bool> {
         self.enabled
     }
@@ -310,6 +351,28 @@ impl ChannelSummary {
     /// Sample source path decoded from the observed audio-channel `0xC4` string event.
     pub fn sample_path(&self) -> Option<&str> {
         self.sample_path.as_deref()
+    }
+
+    /// Channel IDs referenced by a Layer channel's repeated `0x5E` events.
+    pub fn layer_child_ids(&self) -> Option<&[u16]> {
+        (self.channel_type() == Some(ChannelType::Layer)).then_some(&self.layer_children)
+    }
+
+    /// Raw Layer flags from the `0x90` dword event.
+    pub fn layer_flags(&self) -> Option<u32> {
+        (self.channel_type() == Some(ChannelType::Layer))
+            .then_some(self.layer_flags)
+            .flatten()
+    }
+
+    /// Observed Layer flag bit 0, named `Random` by independent format research.
+    pub fn layer_random_enabled(&self) -> Option<bool> {
+        self.layer_flags().map(|flags| flags & 1 != 0)
+    }
+
+    /// Observed Layer flag bit 1, named `Crossfade` by independent format research.
+    pub fn layer_crossfade_enabled(&self) -> Option<bool> {
+        self.layer_flags().map(|flags| flags & 2 != 0)
     }
 
     pub fn event_range(&self) -> std::ops::Range<usize> {
@@ -834,6 +897,18 @@ impl FlpDocument {
                     channel.enabled = Some(event.payload[0] != 0);
                 }
                 0x15 if event.payload.len() == 1 => channel.kind = Some(event.payload[0]),
+                0x5E if event.payload.len() == 2 => {
+                    channel
+                        .layer_children
+                        .push(u16::from_le_bytes([event.payload[0], event.payload[1]]));
+                }
+                0x90 if event.payload.len() == 4 => {
+                    channel.layer_flags = Some(u32::from_le_bytes(
+                        event.payload[..4]
+                            .try_into()
+                            .expect("a dword event has four payload bytes"),
+                    ));
+                }
                 // FL 25+ stores channel pan and volume at the start of the 0xDB
                 // Levels data event. Keep legacy byte/word values as fallbacks.
                 0xDB if event.payload.len() >= 8 => {
@@ -2944,6 +3019,18 @@ mod tests {
         flp_fixture(&event_stream, &[], &[])
     }
 
+    fn layer_channel_fixture(flags: u32, children: &[u16]) -> Vec<u8> {
+        let mut event_stream = vec![0x40, 0, 0, 0x15, 3, 0x90];
+        event_stream.extend_from_slice(&flags.to_le_bytes());
+        for child in children {
+            event_stream.push(0x5E);
+            event_stream.extend_from_slice(&child.to_le_bytes());
+        }
+        event_stream.extend_from_slice(&[0x40, 1, 0, 0x15, 2]);
+        event_stream.extend_from_slice(&[0x40, 2, 0, 0x15, 4, 0x62, 0, 0]);
+        flp_fixture(&event_stream, &[], &[])
+    }
+
     fn midi_fixture(track: &[u8], division: u16) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"MThd");
@@ -3525,6 +3612,33 @@ mod tests {
             let payload = document.events()[channel.data_event_index().unwrap()].payload();
             assert_eq!(&payload[payload.len() - trailer.len()..], trailer);
         }
+    }
+
+    #[test]
+    fn decodes_layer_child_channel_ids_and_flags_losslessly() {
+        let original = layer_channel_fixture(3, &[1, 2]);
+        let document = FlpDocument::parse(&original).expect("layer fixture should parse");
+        let channels = document.channels();
+        assert_eq!(channels.len(), 3);
+        assert_eq!(channels[0].kind(), Some(3));
+        assert_eq!(channels[0].channel_type(), Some(super::ChannelType::Layer));
+        assert_eq!(channels[0].layer_child_ids(), Some([1, 2].as_slice()));
+        assert_eq!(channels[0].layer_flags(), Some(3));
+        assert_eq!(channels[0].layer_random_enabled(), Some(true));
+        assert_eq!(channels[0].layer_crossfade_enabled(), Some(true));
+        assert_eq!(channels[1].channel_type(), Some(super::ChannelType::Native));
+        assert_eq!(
+            channels[2].channel_type(),
+            Some(super::ChannelType::Instrument)
+        );
+        assert_eq!(document.encode_lossless().unwrap(), original);
+    }
+
+    #[test]
+    fn unknown_channel_type_round_trips_its_raw_value() {
+        let channel_type = super::ChannelType::from_raw(1);
+        assert_eq!(channel_type, super::ChannelType::Unknown(1));
+        assert_eq!(channel_type.raw(), 1);
     }
 
     #[test]
