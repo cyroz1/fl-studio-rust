@@ -21,7 +21,7 @@ use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions, Vst3PatternSt
 use flp_rebuild::{
     AutomationChannel, AutomationPoint, AutomationPointEdit, ChannelSummary, FlpDocument, Pattern,
     PatternNote, PatternNoteEdit, PlaylistClip, PlaylistClipEdit, PlaylistTrack, ProjectInfoEdit,
-    VstPluginStateMetadata,
+    ProjectSettingsEdit, VstPluginStateMetadata,
 };
 
 const PANEL: Color32 = Color32::from_rgb(31, 32, 34);
@@ -323,6 +323,9 @@ struct DawUi {
     project_info_comments: String,
     project_info_genre: String,
     project_info_web_link: String,
+    project_settings_open: bool,
+    project_settings_play_truncated: bool,
+    project_settings_fast_declick: bool,
 }
 
 struct PendingAudioRender {
@@ -397,6 +400,9 @@ impl DawUi {
             project_info_comments: String::new(),
             project_info_genre: String::new(),
             project_info_web_link: String::new(),
+            project_settings_open: false,
+            project_settings_play_truncated: false,
+            project_settings_fast_declick: false,
         };
         if let Some(path) = initial_project.as_deref() {
             app.open_project(path);
@@ -438,6 +444,13 @@ impl DawUi {
                     .web_link()
                     .unwrap_or_default()
                     .to_owned();
+                if let Some(settings) = document.project_settings() {
+                    self.project_settings_play_truncated = settings.play_truncated_notes_in_clips;
+                    self.project_settings_fast_declick = settings.fast_declick_for_cut_groups;
+                } else {
+                    self.project_settings_play_truncated = false;
+                    self.project_settings_fast_declick = false;
+                }
                 self.selected_pattern = document
                     .patterns()
                     .ok()
@@ -679,6 +692,74 @@ impl DawUi {
         self.project_info_open = open && !cancel;
         if apply {
             self.apply_project_info();
+        }
+    }
+
+    fn open_project_settings(&mut self) {
+        let settings = self
+            .document
+            .as_ref()
+            .and_then(FlpDocument::project_settings);
+        if let Some(settings) = settings {
+            self.project_settings_play_truncated = settings.play_truncated_notes_in_clips;
+            self.project_settings_fast_declick = settings.fast_declick_for_cut_groups;
+            self.project_settings_open = true;
+        } else {
+            self.status = "This project's settings block is not recognized yet".to_owned();
+        }
+    }
+
+    fn apply_project_settings(&mut self) {
+        let Some(document) = self.document.as_mut() else {
+            self.status = "Open a project before editing Project settings".to_owned();
+            return;
+        };
+        match document.set_project_settings(ProjectSettingsEdit {
+            play_truncated_notes_in_clips: Some(self.project_settings_play_truncated),
+            fast_declick_for_cut_groups: Some(self.project_settings_fast_declick),
+        }) {
+            Ok(()) => {
+                self.dirty = true;
+                self.project_settings_open = false;
+                self.status = "Project settings updated".to_owned();
+            }
+            Err(error) => self.status = format!("Could not update Project settings: {error}"),
+        }
+    }
+
+    fn project_settings_dialog(&mut self, context: &egui::Context) {
+        if !self.project_settings_open {
+            return;
+        }
+        let mut apply = false;
+        let mut cancel = false;
+        let mut open = self.project_settings_open;
+        egui::Window::new("Project settings")
+            .id(Id::new("project-settings-dialog"))
+            .open(&mut open)
+            .resizable(false)
+            .default_width(360.0)
+            .show(context, |ui| {
+                ui.checkbox(
+                    &mut self.project_settings_play_truncated,
+                    "Play truncated notes in clips",
+                );
+                ui.checkbox(
+                    &mut self.project_settings_fast_declick,
+                    "Fast declick for cut groups",
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("Apply").clicked() {
+                        apply = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        self.project_settings_open = open && !cancel;
+        if apply {
+            self.apply_project_settings();
         }
     }
 
@@ -1076,6 +1157,15 @@ impl DawUi {
                 .clicked()
             {
                 self.open_project_info();
+            }
+            if ui
+                .add_enabled(
+                    self.document.is_some(),
+                    egui::Button::new("Project settings…"),
+                )
+                .clicked()
+            {
+                self.open_project_settings();
             }
             if ui
                 .add_enabled(
@@ -3912,6 +4002,7 @@ impl eframe::App for DawUi {
             );
         });
         self.project_info_dialog(ui.ctx());
+        self.project_settings_dialog(ui.ctx());
     }
 }
 

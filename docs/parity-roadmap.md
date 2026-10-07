@@ -36,7 +36,7 @@ The foundation. Everything else depends on reading projects exactly.
 | Mixer state events | `[partial]` | Reads insert fields and raw `0xE1` records, recognizes candidate volume/pan/EQ parameter IDs and target bits, and can edit an existing record's value by exact record index. Insert-name editing is available. Target-to-visible-track mapping, fader UI, FX state, and routing remain incomplete. |
 | Automation events (channel envelopes, event automation) | `[partial]` | Reads type-5 channel automation points from `0xEA` blobs and edits, inserts, or removes points while preserving unmodified point bytes and the opaque header and era trailer. The desktop Automation view edits those curves with a straight-line preview; interpolation, event automation, target links, automation-blob creation, and clip creation remain incomplete. |
 | Time markers, song position markers | `[partial]` | Reads arrangement-scoped marker positions, names, and time signatures. The documented signature bit is exposed separately; other position bits remain intact. Marker editing, song-position playback, and broader version verification remain incomplete. |
-| Project settings: swing, master pitch, metronome, recording settings | `[todo]` | |
+| Project settings: swing, master pitch, metronome, recording settings | `[partial]` | The Project model, CLI, and desktop dialog read and edit the FL Studio 26 Advanced options `Play truncated notes in clips` and `Fast declick for cut groups`. Swing, master pitch, metronome, recording settings, panning law, and other controls remain unmapped. |
 | `set-tempo`, `rename-channel`, note add/edit/delete, clip edit, channel levels | `[done]` | CLI surface; each rewrites only affected bytes |
 | Create missing objects (patterns, channels, clips) | `[todo]` | CLI only edits existing objects today |
 
@@ -74,6 +74,7 @@ The decoded document must model everything the format can express.
 - `[todo]` Time signatures per pattern/arrangement, tempo automation
 - `[todo]` Channel groups, colors, icons
 - `[todo]` Swing / groove settings per channel
+- `[partial]` Project settings: the two verified FL Studio 26 Advanced options `Play truncated notes in clips` and `Fast declick for cut groups` can be read and edited; other project-wide settings remain unmapped
 - `[todo]` Layer channels (keyboard splits, crossfades)
 - `[done]` Project info: title, author, comments, genre, and web link; the Project Info dialog and CLI can edit these fields.
 

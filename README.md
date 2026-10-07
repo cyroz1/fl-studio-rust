@@ -11,6 +11,7 @@ The first milestone is deliberately a compatibility foundation: inspect FL Studi
 ```text
 flp-rebuild info <file.flp>
 flp-rebuild project-info <file.flp>
+flp-rebuild project-settings <file.flp>
 flp-rebuild midi-info <file.mid>
 flp-rebuild midi-events <file.mid> <track> [start] [count]
 flp-rebuild scan <directory>
@@ -35,6 +36,7 @@ flp-rebuild extract-event <file.flp> <index> <output.bin>
 flp-rebuild roundtrip <input.flp> <output.flp>
 flp-rebuild set-tempo <input.flp> <output.flp> <bpm>
 flp-rebuild set-project-info <input.flp> <output.flp> <title|-> <author|-> <genre|-> <comments|-> <web-link|->
+flp-rebuild set-project-settings <input.flp> <output.flp> <play-truncated:0|1|-> <fast-declick:0|1|->
 flp-rebuild rename-channel <input.flp> <output.flp> <channel-id> <name>
 flp-rebuild set-channel-levels <input.flp> <output.flp> <channel-id> <volume-0..12800> <pan-0..12800>
 flp-rebuild set-layer-children <input.flp> <output.flp> <layer-channel-id> <child-ids-comma-separated|->
@@ -51,6 +53,8 @@ Launch the native desktop shell with `cargo run --release --bin fl-studio-rebuil
 The desktop executable also accepts an `.flp` path as its first argument to open that project at startup.
 
 The **Project Info…** control edits the project's title, author, genre, comments, and web link. `project-info` prints those fields; `set-project-info` accepts `-` for fields to leave unchanged and an empty quoted string to clear a field. Missing fields are inserted before the first channel marker, and all other event bytes remain unchanged.
+
+The **Project settings…** control edits the currently mapped Advanced options: “Play truncated notes in clips” and “Fast declick for cut groups.” `project-settings` prints those values; `set-project-settings` accepts `0`, `1`, or `-` for each field. These settings are mapped from controlled FL Studio 26 saves; swing, master pitch, metronome, recording settings, panning law, and the remaining project controls are not yet decoded.
 
 `channels <file.flp>` reports each channel's raw kind, known type label, observed Layer child IDs/flags, sample source path, volume, and pan. Sample paths are decoded from `0xC4` for kind-0 Sampler channels and kind-4 sample-backed channels; plugin channel payloads remain excluded. Known type labels cover Sampler, Native, Layer, Instrument, and Automation; unrecognized raw values remain available. `mixer <file.flp>` reports recognized Mixer insert names and raw fields from the observed `0x9A`/`0x93`/`0x95` sequence, plus the count of fixed-size `0xE1` parameter records. It does not yet map those parameter records to faders, effect slots, or routing controls. `sample-paths <file.flp>` tries to resolve each reference using the project folder, configured factory roots, and common FL Studio install locations; it reports paths it cannot find. Set `FL_STUDIO_ROOT` or `FL_STUDIO_FACTORY_DATA` to select a custom installation. `audio-info <audio-file>` decodes WAV, OGG/Vorbis, FLAC, MP3, AIFF, and lossless mono/stereo WavPack media by content, including FL Studio's private RIFF wrapper around Ogg data. `render-audio-clips <project.flp> <output.wav>` makes an experimental stereo float render of enabled Playlist clips that target audio channels, using the base project tempo and observed source offsets. Clips with non-default scale are skipped and counted. The Playlist transport mixes audio clips, supported Sampler notes, and mapped VST3 instruments placed by Pattern Clips in bounded worker blocks at the device rate. Opening a project auto-loads recognized VST3 channels when an installed bundle matches; unsupported or missing plug-ins are reported. VST3 output is resampled and mixed from the same instances used by open editors. It applies provisional channel volume/pan mapping and inferred pattern repeat behavior, which still need comparison against native FL Studio output. Automation, routing, tempo changes, and Mixer effects are not yet part of Song transport.
 

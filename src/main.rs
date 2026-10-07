@@ -14,7 +14,7 @@ use flp_rebuild::sample_render::{
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions};
 use flp_rebuild::{
     AutomationPointEdit, FlpDocument, PatternNote, PatternNoteEdit, PlaylistClipEdit,
-    ProjectInfoEdit,
+    ProjectInfoEdit, ProjectSettingsEdit,
 };
 
 fn main() -> ExitCode {
@@ -31,6 +31,9 @@ fn run(args: Vec<String>) -> Result<(), String> {
     match args.as_slice() {
         [command, path] if command == "info" => inspect(Path::new(path)),
         [command, path] if command == "project-info" => show_project_info(Path::new(path)),
+        [command, path] if command == "project-settings" => {
+            show_project_settings(Path::new(path))
+        }
         [command, path] if command == "channels" => list_channels(Path::new(path)),
         [command, path] if command == "mixer" => list_mixer(Path::new(path)),
         [command, path] if command == "automation" => list_automation(Path::new(path)),
@@ -209,6 +212,24 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 },
             )
         }
+        [command, input, output, play_truncated, fast_declick]
+            if command == "set-project-settings" =>
+        {
+            write_project_settings(
+                Path::new(input),
+                Path::new(output),
+                ProjectSettingsEdit {
+                    play_truncated_notes_in_clips: parse_optional_bool(
+                        play_truncated,
+                        "Play truncated notes setting",
+                    )?,
+                    fast_declick_for_cut_groups: parse_optional_bool(
+                        fast_declick,
+                        "Fast declick setting",
+                    )?,
+                },
+            )
+        }
         [command, input, output, channel_id, name] if command == "rename-channel" => {
             let channel_id = channel_id
                 .parse::<u16>()
@@ -341,6 +362,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "usage:\n",
             "  flp-rebuild info <file.flp>\n",
             "  flp-rebuild project-info <file.flp>\n",
+            "  flp-rebuild project-settings <file.flp>\n",
             "  flp-rebuild midi-info <file.mid>\n",
             "  flp-rebuild midi-events <file.mid> <track> [start] [count]\n",
             "  flp-rebuild scan <directory>\n",
@@ -364,6 +386,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild roundtrip <input.flp> <output.flp>\n",
             "  flp-rebuild set-tempo <input.flp> <output.flp> <bpm>\n",
             "  flp-rebuild set-project-info <input.flp> <output.flp> <title|-> <author|-> <genre|-> <comments|-> <web-link|->\n",
+            "  flp-rebuild set-project-settings <input.flp> <output.flp> <play-truncated:0|1|-> <fast-declick:0|1|->\n",
             "  flp-rebuild rename-channel <input.flp> <output.flp> <channel-id> <name>\n",
             "  flp-rebuild set-channel-levels <input.flp> <output.flp> <channel-id> <volume-0..12800> <pan-0..12800>\n",
             "  flp-rebuild set-layer-children <input.flp> <output.flp> <layer-channel-id> <child-ids-comma-separated|->\n",
@@ -415,6 +438,15 @@ fn parse_channel_id_list(value: &str) -> Result<Vec<u16>, String> {
 
 fn project_info_argument(value: &str) -> Option<String> {
     (value != "-").then(|| value.to_owned())
+}
+
+fn parse_optional_bool(value: &str, description: &str) -> Result<Option<bool>, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "-" => Ok(None),
+        "0" | "false" => Ok(Some(false)),
+        "1" | "true" => Ok(Some(true)),
+        _ => Err(format!("{description} must be 0, 1, true, false, or -")),
+    }
 }
 
 fn parse_u32(value: &str, description: &str) -> Result<u32, String> {
@@ -641,6 +673,25 @@ fn show_project_info(path: &Path) -> Result<(), String> {
     println!("genre: {:?}", metadata.genre());
     println!("comments: {:?}", metadata.comments());
     println!("web link: {:?}", metadata.web_link());
+    Ok(())
+}
+
+fn show_project_settings(path: &Path) -> Result<(), String> {
+    let (_, document) = load_document(path)?;
+    let settings = document.project_settings().ok_or_else(|| {
+        format!(
+            "could not identify the supported Project settings block in {}",
+            path.display()
+        )
+    })?;
+    println!(
+        "play truncated notes in clips: {}",
+        settings.play_truncated_notes_in_clips
+    );
+    println!(
+        "fast declick for cut groups: {}",
+        settings.fast_declick_for_cut_groups
+    );
     Ok(())
 }
 
@@ -1437,6 +1488,24 @@ fn write_project_info(input: &Path, output: &Path, edit: ProjectInfoEdit) -> Res
     fs::write(output, bytes)
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!("wrote updated Project Info to {}", output.display());
+    Ok(())
+}
+
+fn write_project_settings(
+    input: &Path,
+    output: &Path,
+    edit: ProjectSettingsEdit,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .set_project_settings(edit)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!("wrote updated Project settings to {}", output.display());
     Ok(())
 }
 

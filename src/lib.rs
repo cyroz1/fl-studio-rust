@@ -136,6 +136,24 @@ impl FlpEvent {
             file_offset: 0,
         }
     }
+
+    fn replace_byte_payload(&mut self, value: u8) -> Result<(), FlpError> {
+        if self.encoding != PayloadEncoding::Byte || self.payload.len() != 1 {
+            return Err(FlpError::InvalidEvent {
+                offset: self.file_offset,
+                detail: "event does not have a one-byte payload",
+            });
+        }
+        let Some(wire_payload) = self.wire_bytes.get_mut(1) else {
+            return Err(FlpError::InvalidEvent {
+                offset: self.file_offset,
+                detail: "byte event does not contain its payload",
+            });
+        };
+        *wire_payload = value;
+        self.payload[0] = value;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -169,6 +187,22 @@ pub struct ProjectInfoEdit {
     pub comments: Option<String>,
     pub genre: Option<String>,
     pub web_link: Option<String>,
+}
+
+/// Project settings verified against FL Studio 26.1.6 saves.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ProjectSettings {
+    pub play_truncated_notes_in_clips: bool,
+    pub fast_declick_for_cut_groups: bool,
+}
+
+/// Fields that can be changed in the supported Project settings subset.
+///
+/// A `None` field is left unchanged.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ProjectSettingsEdit {
+    pub play_truncated_notes_in_clips: Option<bool>,
+    pub fast_declick_for_cut_groups: Option<bool>,
 }
 
 /// A known FL channel kind, while retaining unrecognized raw values.
@@ -2175,6 +2209,80 @@ impl FlpDocument {
         &self.metadata
     }
 
+    /// Returns the project settings block when its event sequence is recognized.
+    pub fn project_settings(&self) -> Option<ProjectSettings> {
+        let anchor = find_project_settings_anchor(&self.events)?;
+        let play_truncated_notes_in_clips = match anchor.checked_sub(1).and_then(|index| {
+            self.events
+                .get(index)
+                .filter(|event| event.opcode == 0x64)
+                .map(|event| (index, event))
+        }) {
+            Some((_, event)) if event.encoding == PayloadEncoding::Word => {
+                if event.payload != [0, 0] {
+                    return None;
+                }
+                false
+            }
+            Some(_) => return None,
+            None => true,
+        };
+        let fast_declick = self.events.get(anchor + 2)?;
+        if fast_declick.payload.len() != 1 || fast_declick.payload[0] > 1 {
+            return None;
+        }
+        Some(ProjectSettings {
+            play_truncated_notes_in_clips,
+            fast_declick_for_cut_groups: fast_declick.payload[0] != 0,
+        })
+    }
+
+    /// Updates the supported Project settings while preserving unrelated FLP events.
+    pub fn set_project_settings(&mut self, edit: ProjectSettingsEdit) -> Result<(), FlpError> {
+        if edit.play_truncated_notes_in_clips.is_none()
+            && edit.fast_declick_for_cut_groups.is_none()
+        {
+            return Ok(());
+        }
+        let mut candidate = self.clone();
+        let anchor =
+            find_project_settings_anchor(&candidate.events).ok_or(FlpError::UnsupportedEdit(
+                "the supported Project settings event block could not be identified",
+            ))?;
+
+        if let Some(enabled) = edit.fast_declick_for_cut_groups {
+            candidate.events[anchor + 2].replace_byte_payload(u8::from(enabled))?;
+        }
+
+        if let Some(enabled) = edit.play_truncated_notes_in_clips {
+            let existing_event = anchor.checked_sub(1).and_then(|index| {
+                candidate
+                    .events
+                    .get(index)
+                    .filter(|event| event.opcode == 0x64)
+                    .map(|_| index)
+            });
+            if let Some(index) = existing_event {
+                let event = &candidate.events[index];
+                if event.encoding != PayloadEncoding::Word || event.payload != [0, 0] {
+                    return Err(FlpError::UnsupportedEdit(
+                        "the Play truncated notes event has an unrecognized payload",
+                    ));
+                }
+            }
+            match (enabled, existing_event) {
+                (true, Some(index)) => {
+                    candidate.events.remove(index);
+                }
+                (false, None) => candidate.events.insert(anchor, FlpEvent::new_word(0x64, 0)),
+                _ => {}
+            }
+        }
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
     /// Updates selected FL Studio Project Info fields while retaining each field's
     /// project-version string encoding, terminator convention, and trailing payload bytes.
     pub fn set_project_info(&mut self, edit: ProjectInfoEdit) -> Result<(), FlpError> {
@@ -3258,6 +3366,39 @@ fn project_info_event_rank(opcode: u8) -> Option<usize> {
         .position(|candidate| *candidate == opcode)
 }
 
+fn find_project_settings_anchor(events: &[FlpEvent]) -> Option<usize> {
+    let mut matched = None;
+    for index in 0..events.len().saturating_sub(5) {
+        let block = &events[index..index + 6];
+        let matches = block[0].opcode == 0x1D
+            && block[0].encoding == PayloadEncoding::Byte
+            && block[0].payload == [1]
+            && block[1].opcode == 0x27
+            && block[1].encoding == PayloadEncoding::Byte
+            && block[1].payload == [1]
+            && block[2].opcode == 0x28
+            && block[2].encoding == PayloadEncoding::Byte
+            && block[2].payload.len() == 1
+            && block[2].payload[0] <= 1
+            && block[3].opcode == 0x1F
+            && block[3].encoding == PayloadEncoding::Byte
+            && block[3].payload == [0]
+            && block[4].opcode == 0x26
+            && block[4].encoding == PayloadEncoding::Byte
+            && block[4].payload == [1]
+            && block[5].opcode == 0x67
+            && block[5].encoding == PayloadEncoding::Word
+            && block[5].payload == [0x12, 0];
+        if matches {
+            if matched.is_some() {
+                return None;
+            }
+            matched = Some(index);
+        }
+    }
+    matched
+}
+
 fn encode_project_string(value: &str, utf16: bool) -> Result<Vec<u8>, FlpError> {
     let mut payload = Vec::new();
     if utf16 {
@@ -3626,7 +3767,7 @@ fn decode_vst_text(bytes: &[u8]) -> Option<String> {
 mod tests {
     use super::{
         FlpDocument, FlpError, MixerParameterKind, PatternNote, PayloadEncoding, ProjectInfoEdit,
-        midi::MidiFile, parse_vst_plugin_state_metadata,
+        ProjectSettingsEdit, midi::MidiFile, parse_vst_plugin_state_metadata,
     };
 
     fn flp_fixture(event_stream: &[u8], header_extension: &[u8], trailing: &[u8]) -> Vec<u8> {
@@ -3660,6 +3801,31 @@ mod tests {
 
     fn append_project_info_string(event_stream: &mut Vec<u8>, opcode: u8, value: &str) {
         append_data_event(event_stream, opcode, &utf16_project_string(value));
+    }
+
+    fn append_project_settings_block(
+        event_stream: &mut Vec<u8>,
+        play_truncated: bool,
+        fast_declick: bool,
+    ) {
+        if !play_truncated {
+            event_stream.extend_from_slice(&[0x64, 0, 0]);
+        }
+        event_stream.extend_from_slice(&[
+            0x1D,
+            1,
+            0x27,
+            1,
+            0x28,
+            u8::from(fast_declick),
+            0x1F,
+            0,
+            0x26,
+            1,
+            0x67,
+            0x12,
+            0,
+        ]);
     }
 
     fn append_time_marker(
@@ -3783,6 +3949,86 @@ mod tests {
             Some("https://new.example/project")
         );
         assert_eq!(reparsed.trailing_bytes(), &[0xD1, 0xD2]);
+    }
+
+    #[test]
+    fn project_settings_decode_edit_and_roundtrip_losslessly() {
+        let mut event_stream = vec![0xF2, 28];
+        event_stream.extend_from_slice(&[0; 28]);
+        append_project_settings_block(&mut event_stream, true, true);
+        event_stream.extend_from_slice(&[0x62, 0, 0, 0x33, 1]);
+        let original = flp_fixture(&event_stream, &[0xA1], &[0xD1, 0xD2]);
+        let mut document = FlpDocument::parse(&original).expect("fixture should parse");
+        assert_eq!(
+            document.project_settings(),
+            Some(super::ProjectSettings {
+                play_truncated_notes_in_clips: true,
+                fast_declick_for_cut_groups: true,
+            })
+        );
+
+        let unrelated_events: Vec<_> = document
+            .events()
+            .iter()
+            .filter(|event| !matches!(event.opcode(), 0x64 | 0x28))
+            .map(|event| event.wire_bytes().to_vec())
+            .collect();
+        document
+            .set_project_settings(ProjectSettingsEdit {
+                play_truncated_notes_in_clips: Some(false),
+                fast_declick_for_cut_groups: Some(false),
+            })
+            .expect("supported Project settings should be editable");
+        assert_eq!(
+            document.project_settings(),
+            Some(super::ProjectSettings {
+                play_truncated_notes_in_clips: false,
+                fast_declick_for_cut_groups: false,
+            })
+        );
+        assert_eq!(
+            document
+                .events()
+                .iter()
+                .filter(|event| !matches!(event.opcode(), 0x64 | 0x28))
+                .map(|event| event.wire_bytes().to_vec())
+                .collect::<Vec<_>>(),
+            unrelated_events
+        );
+        assert!(document.events().iter().any(|event| event.opcode() == 0x64));
+
+        document
+            .set_project_settings(ProjectSettingsEdit {
+                play_truncated_notes_in_clips: Some(true),
+                fast_declick_for_cut_groups: Some(true),
+            })
+            .expect("settings should be re-enabled");
+        let encoded = document.encode_lossless().expect("document should encode");
+        let reparsed = FlpDocument::parse(&encoded).expect("edited project should reparse");
+        assert_eq!(
+            reparsed.project_settings(),
+            Some(super::ProjectSettings {
+                play_truncated_notes_in_clips: true,
+                fast_declick_for_cut_groups: true,
+            })
+        );
+        assert_eq!(reparsed.trailing_bytes(), &[0xD1, 0xD2]);
+    }
+
+    #[test]
+    fn project_settings_refuse_an_unrecognized_event_layout_without_mutation() {
+        let original = flp_fixture(&[0x64, 0, 0, 0x40, 0, 0], &[], &[]);
+        let mut document = FlpDocument::parse(&original).expect("fixture should parse");
+        assert_eq!(document.project_settings(), None);
+        assert!(
+            document
+                .set_project_settings(ProjectSettingsEdit {
+                    fast_declick_for_cut_groups: Some(true),
+                    ..ProjectSettingsEdit::default()
+                })
+                .is_err()
+        );
+        assert_eq!(document.encode_lossless().unwrap(), original);
     }
 
     #[test]

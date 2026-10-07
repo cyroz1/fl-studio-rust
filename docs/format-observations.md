@@ -40,6 +40,12 @@ In a disposable copy of the installed `Data/Templates/Empty/Empty.flp`, the orig
 
 The Rust model reads all five strings, retains empty values as empty strings, and edits only the selected field events while preserving their terminator convention, bytes after the terminator, and every unrelated event. For absent fields it inserts a new length-prefixed event before the first channel marker. Legacy projects use the repository's existing version-based Windows-1252 string rule. A controlled FL Studio reopen of the Rust-written disposable project displayed the edited title, author, genre, comments, and web link. Legacy encoding behavior is covered by synthetic fixtures rather than an installed old-version FL Studio oracle.
 
+## Project settings observations
+
+Controlled toggles in FL Studio 26.1.6 Project settings > Project > Advanced mapped two options. `Fast declick for cut groups` is a one-byte `0x28` event in the recognized settings sequence; payload `01` means enabled and `00` means disabled. `Play truncated notes in clips` defaults to enabled when the zero-valued word event `0x64 00 00` is absent; adding that event immediately before the sequence disables the option. The surrounding sequence begins with `0x1D 01`, `0x27 01`, then `0x28`, followed by `0x1F 00`, `0x26 01`, and `0x67 12 00`.
+
+The Rust model, CLI, and desktop dialog only edit this recognized event block, preserve unrelated events, and reject files where the block is missing or ambiguous. These mappings were verified against one FL Studio 26.1.6 project; other project settings, older-version layouts, and behavior across a broader project corpus remain to be mapped.
+
 ## Channel grouping observations
 
 The stream contains 45 `0x40` markers, matching the header's channel count. At the first marker, the following fields occur before the next channel marker: a one-byte `0x15` value of `2`, a UTF-16LE `0xC9` string `Harmless`, and a UTF-16LE `0xCB` string `Synth Bass`. A later one-byte `0x00` event carries `1`. Across all 45 groups, the `0xCB` text produces plausible channel labels such as `Grv Kick 27`, `Piano Dark`, and `TEMPO`; `0xC9` produces plugin labels such as `3x Osc` and `FLEX` where present.
