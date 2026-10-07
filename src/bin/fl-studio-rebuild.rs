@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use eframe::egui::{self, Align2, Color32, FontId, Id, Sense, Stroke, Vec2};
 use flp_rebuild::midi::MidiFile;
 use flp_rebuild::plugins::{PluginCandidate, PluginFormat, scan_installed_plugins};
-use flp_rebuild::vst3::Vst3HostRuntime;
+use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions};
 use flp_rebuild::{
     FlpDocument, Pattern, PatternNote, PatternNoteEdit, PlaylistClip, PlaylistClipEdit,
     PlaylistTrack, VstPluginStateMetadata,
@@ -882,6 +882,7 @@ impl DawUi {
             .unwrap_or_else(|| "No channel".to_owned());
         let mut add_note_requested = false;
         let mut open_midi_requested = false;
+        let mut render_requested = false;
         ui.horizontal(|ui| {
             ui.strong("Piano roll");
             ui.separator();
@@ -928,8 +929,21 @@ impl DawUi {
                     egui::Button::new("Add note"),
                 )
                 .clicked();
+            let has_loaded_instrument = self
+                .selected_note_channel
+                .is_some_and(|channel_id| self.channel_vst3_instances.contains_key(&channel_id));
+            render_requested = ui
+                .add_enabled(
+                    has_loaded_instrument && self.selected_pattern.is_some(),
+                    egui::Button::new("Render WAV…"),
+                )
+                .clicked();
             open_midi_requested = ui.button("Open MIDI…").clicked();
         });
+
+        if render_requested {
+            self.render_selected_pattern_channel();
+        }
 
         if open_midi_requested
             && let Some(path) = rfd::FileDialog::new()
@@ -1098,6 +1112,76 @@ impl DawUi {
             .and_then(|patterns| patterns.into_iter().find(|item| item.id == pattern.id))
             .unwrap_or(pattern);
         self.selected_note_editor(ui, &editor_pattern);
+    }
+
+    fn render_selected_pattern_channel(&mut self) {
+        let (Some(pattern_id), Some(channel_id)) =
+            (self.selected_pattern, self.selected_note_channel)
+        else {
+            return;
+        };
+        let Some(instance_id) = self.channel_vst3_instances.get(&channel_id).copied() else {
+            self.status = "Load a VST3 instrument for this channel before rendering".to_owned();
+            return;
+        };
+        let Some(document) = self.document.as_ref() else {
+            self.status = "Open a project before rendering".to_owned();
+            return;
+        };
+        let notes = match document.patterns() {
+            Ok(patterns) => match patterns
+                .into_iter()
+                .find(|pattern| pattern.id == pattern_id)
+            {
+                Some(pattern) => pattern.notes,
+                None => {
+                    self.status = format!("Pattern {pattern_id} was not found");
+                    return;
+                }
+            },
+            Err(error) => {
+                self.status = format!("Could not decode pattern: {error}");
+                return;
+            }
+        };
+        let ppq = document.header().ppq();
+        let tempo_bpm = document.metadata().tempo_bpm().unwrap_or(self.tempo_bpm);
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Render selected pattern channel")
+            .set_file_name(format!("Pattern_{pattern_id}_Channel_{channel_id}.wav"))
+            .add_filter("WAV audio", &["wav"])
+            .save_file()
+        else {
+            return;
+        };
+
+        let result = self
+            .vst3_host
+            .as_ref()
+            .ok_or_else(|| "VST3 host is not initialized".to_owned())
+            .and_then(|host| {
+                host.render_pattern_channel_to_wav(
+                    instance_id,
+                    &notes,
+                    Vst3PatternRenderOptions {
+                        channel_id,
+                        ppq,
+                        tempo_bpm,
+                        tail_seconds: 2.0,
+                    },
+                    &path,
+                )
+            });
+        match result {
+            Ok(summary) => {
+                self.status = format!(
+                    "Rendered pattern {pattern_id}, channel {channel_id} to {} ({:.2}s)",
+                    path.display(),
+                    summary.frames as f64 / f64::from(summary.sample_rate),
+                );
+            }
+            Err(error) => self.status = format!("Could not render pattern channel: {error}"),
+        }
     }
 
     fn draw_notes(&mut self, ui: &mut egui::Ui, pattern: &Pattern, ppq: u16, snap_ticks: u32) {

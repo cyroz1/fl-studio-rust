@@ -4,10 +4,41 @@
 //! while preserving their complete raw bytes. This runtime does not translate
 //! Image-Line's FLP state envelope into the state stream expected by every VST3.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use vst3_host::audio::AudioBuffers;
+use vst3_host::midi::{MidiChannel, MidiEvent};
 use vst3_host::{Plugin, PluginInfo, PluginWindow, Vst3Host};
+
+use crate::PatternNote;
+
+static NEXT_RENDER_FILE_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ScheduledMidiEvent {
+    frame: u64,
+    priority: u8,
+    event: MidiEvent,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Vst3RenderSummary {
+    pub frames: u64,
+    pub sample_rate: u32,
+    pub output_channels: usize,
+    pub notes_rendered: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Vst3PatternRenderOptions {
+    pub channel_id: u16,
+    pub ppq: u16,
+    pub tempo_bpm: f64,
+    pub tail_seconds: f64,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HostedPluginInfo {
@@ -165,6 +196,155 @@ impl Vst3HostRuntime {
             .map_err(|error| error.to_string())
     }
 
+    /// Render notes from one FLP pattern channel through a loaded instrument to a float WAV.
+    ///
+    /// This schedules the decoded score notes with the project's PPQ and tempo. It does not
+    /// restore the FLP plug-in wrapper state, apply Mixer routing/effects, or expand Playlist
+    /// clips. `tail_seconds` is appended after the final note to capture instrument release.
+    pub fn render_pattern_channel_to_wav(
+        &self,
+        id: u64,
+        notes: &[PatternNote],
+        options: Vst3PatternRenderOptions,
+        path: impl AsRef<Path>,
+    ) -> Result<Vst3RenderSummary, String> {
+        let Vst3PatternRenderOptions {
+            channel_id,
+            ppq,
+            tempo_bpm,
+            tail_seconds,
+        } = options;
+        if ppq == 0 {
+            return Err("project PPQ must be greater than zero".to_owned());
+        }
+        if !tempo_bpm.is_finite() || tempo_bpm <= 0.0 {
+            return Err("project tempo must be finite and positive".to_owned());
+        }
+        if !tail_seconds.is_finite() || !(0.0..=60.0).contains(&tail_seconds) {
+            return Err("render tail must be between 0 and 60 seconds".to_owned());
+        }
+
+        let plugin = self.plugin(id)?;
+        let mut plugin = plugin
+            .lock()
+            .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
+        let sample_rate = plugin.sample_rate();
+        let sample_rate_u32 = sample_rate.round() as u32;
+        if !sample_rate.is_finite() || !(8_000.0..=384_000.0).contains(&sample_rate) {
+            return Err("VST3 host sample rate is invalid".to_owned());
+        }
+        let block_size = plugin.block_size();
+        if block_size == 0 || block_size > 65_536 {
+            return Err("VST3 host block size is not renderable".to_owned());
+        }
+        let output_channels = plugin.output_channel_count();
+        if output_channels == 0 || output_channels > 64 {
+            return Err("VST3 instrument has no supported audio output buses".to_owned());
+        }
+
+        let (events, note_count) =
+            scheduled_pattern_events(notes, channel_id, ppq, tempo_bpm, sample_rate)?;
+        if note_count == 0 {
+            return Err(format!(
+                "pattern channel {channel_id} has no notes to render"
+            ));
+        }
+        let final_note_frame = events
+            .iter()
+            .map(|event| event.frame)
+            .max()
+            .ok_or_else(|| "pattern channel has no renderable notes".to_owned())?;
+        // The maximum scheduled event is a note-off; add the requested release tail.
+        let tail_frames = (tail_seconds * sample_rate).round();
+        if !tail_frames.is_finite() || tail_frames < 0.0 || tail_frames > u64::MAX as f64 {
+            return Err("render tail is too long".to_owned());
+        }
+        let total_frames = final_note_frame
+            .checked_add((tail_frames as u64).max(1))
+            .ok_or_else(|| "render length overflow".to_owned())?;
+        let data_bytes = total_frames
+            .checked_mul(output_channels as u64)
+            .and_then(|frames| frames.checked_mul(4))
+            .ok_or_else(|| "rendered WAV size overflow".to_owned())?;
+        if data_bytes > u64::from(u32::MAX - 36) {
+            return Err("render is too long for a standard RIFF/WAVE file".to_owned());
+        }
+
+        let output_path = path.as_ref();
+        let mut temporary = TemporaryWaveFile::create(output_path)?;
+        write_float_wave_header(
+            temporary.file.as_mut().expect("temporary WAV is open"),
+            total_frames as u32,
+            sample_rate_u32,
+            output_channels as u16,
+        )?;
+
+        plugin
+            .start_processing()
+            .map_err(|error| error.to_string())?;
+        let render_result = (|| {
+            let mut rendered_frames = 0u64;
+            let mut event_index = 0usize;
+            let block_bytes = block_size
+                .checked_mul(output_channels)
+                .and_then(|samples| samples.checked_mul(4))
+                .ok_or_else(|| "VST3 block buffer size overflow".to_owned())?;
+            let mut interleaved = Vec::<u8>::with_capacity(block_bytes);
+            while rendered_frames < total_frames {
+                let frame_count = (total_frames - rendered_frames).min(block_size as u64) as usize;
+                let block_end = rendered_frames + frame_count as u64;
+                while let Some(event) = events.get(event_index)
+                    && event.frame < block_end
+                {
+                    let offset = event.frame.saturating_sub(rendered_frames) as i32;
+                    plugin
+                        .send_midi_event_at(event.event, offset)
+                        .map_err(|error| error.to_string())?;
+                    event_index += 1;
+                }
+
+                let mut buffers = AudioBuffers::new(0, output_channels, frame_count, sample_rate);
+                plugin
+                    .process_audio(&mut buffers)
+                    .map_err(|error| error.to_string())?;
+                if buffers.outputs.len() != output_channels
+                    || buffers
+                        .outputs
+                        .iter()
+                        .any(|channel| channel.len() < frame_count)
+                {
+                    return Err("VST3 returned audio buffers with an unexpected shape".to_owned());
+                }
+
+                interleaved.clear();
+                for frame in 0..frame_count {
+                    for channel in &buffers.outputs {
+                        interleaved.extend_from_slice(&channel[frame].to_le_bytes());
+                    }
+                }
+                temporary
+                    .file
+                    .as_mut()
+                    .expect("temporary WAV is open")
+                    .write_all(&interleaved)
+                    .map_err(|error| format!("could not write WAV audio data: {error}"))?;
+                rendered_frames = block_end;
+            }
+            Ok(())
+        })();
+        let stop_result = plugin.stop_processing().map_err(|error| error.to_string());
+        render_result?;
+        stop_result?;
+
+        temporary.commit(output_path)?;
+        Ok(Vst3RenderSummary {
+            frames: total_frames,
+            sample_rate: sample_rate_u32,
+            output_channels,
+            notes_rendered: note_count,
+        })
+    }
+
     /// Service native editor close/resize requests and the VST3 UI run loop where needed.
     pub fn service_editors(&mut self) -> Result<(), String> {
         for loaded in &mut self.loaded {
@@ -198,6 +378,182 @@ impl Vst3HostRuntime {
     }
 }
 
+fn scheduled_pattern_events(
+    notes: &[PatternNote],
+    channel_id: u16,
+    ppq: u16,
+    tempo_bpm: f64,
+    sample_rate: f64,
+) -> Result<(Vec<ScheduledMidiEvent>, usize), String> {
+    if !sample_rate.is_finite() || sample_rate <= 0.0 {
+        return Err("VST3 host sample rate must be finite and positive".to_owned());
+    }
+    let mut events = Vec::new();
+    let mut note_count = 0usize;
+    for note in notes.iter().filter(|note| note.channel_id == channel_id) {
+        if note.key > 127 {
+            return Err(format!(
+                "pattern channel {channel_id} contains key {} outside the MIDI note range",
+                note.key
+            ));
+        }
+        if note.length == 0 {
+            return Err(format!(
+                "pattern channel {channel_id} contains a zero-length note"
+            ));
+        }
+        if note.velocity > 127 {
+            return Err(format!(
+                "pattern channel {channel_id} contains velocity {} outside the MIDI range",
+                note.velocity
+            ));
+        }
+        let channel = MidiChannel::from_index(note.midi_channel).ok_or_else(|| {
+            format!(
+                "pattern channel {channel_id} contains MIDI channel {} outside 0..15",
+                note.midi_channel
+            )
+        })?;
+        let start_tick = u64::from(note.position);
+        let end_tick = start_tick
+            .checked_add(u64::from(note.length))
+            .ok_or_else(|| "note end position overflow".to_owned())?;
+        let frame_for_tick =
+            |tick: u64| ((tick as f64 / f64::from(ppq)) * (60.0 / tempo_bpm) * sample_rate).round();
+        let start_frame = frame_for_tick(start_tick);
+        let end_frame = frame_for_tick(end_tick);
+        if !start_frame.is_finite()
+            || !end_frame.is_finite()
+            || start_frame < 0.0
+            || end_frame < start_frame
+            || end_frame > u64::MAX as f64
+        {
+            return Err("note timing is outside the renderable range".to_owned());
+        }
+        events.push(ScheduledMidiEvent {
+            frame: start_frame as u64,
+            priority: 1,
+            event: MidiEvent::NoteOn {
+                channel,
+                note: note.key as u8,
+                velocity: note.velocity,
+            },
+        });
+        events.push(ScheduledMidiEvent {
+            frame: end_frame as u64,
+            priority: 0,
+            event: MidiEvent::NoteOff {
+                channel,
+                note: note.key as u8,
+                velocity: 0,
+            },
+        });
+        note_count += 1;
+    }
+    events.sort_by_key(|event| (event.frame, event.priority));
+    Ok((events, note_count))
+}
+
+fn write_float_wave_header(
+    file: &mut std::fs::File,
+    frames: u32,
+    sample_rate: u32,
+    channels: u16,
+) -> Result<(), String> {
+    use std::io::Write;
+
+    let data_bytes = frames
+        .checked_mul(u32::from(channels))
+        .and_then(|samples| samples.checked_mul(4))
+        .ok_or_else(|| "rendered WAV size overflow".to_owned())?;
+    let block_align = channels
+        .checked_mul(4)
+        .ok_or_else(|| "rendered WAV channel count overflow".to_owned())?;
+    let byte_rate = sample_rate
+        .checked_mul(u32::from(block_align))
+        .ok_or_else(|| "rendered WAV byte rate overflow".to_owned())?;
+    file.write_all(b"RIFF")
+        .and_then(|()| file.write_all(&(36u32 + data_bytes).to_le_bytes()))
+        .and_then(|()| file.write_all(b"WAVEfmt "))
+        .and_then(|()| file.write_all(&16u32.to_le_bytes()))
+        .and_then(|()| file.write_all(&3u16.to_le_bytes()))
+        .and_then(|()| file.write_all(&channels.to_le_bytes()))
+        .and_then(|()| file.write_all(&sample_rate.to_le_bytes()))
+        .and_then(|()| file.write_all(&byte_rate.to_le_bytes()))
+        .and_then(|()| file.write_all(&block_align.to_le_bytes()))
+        .and_then(|()| file.write_all(&32u16.to_le_bytes()))
+        .and_then(|()| file.write_all(b"data"))
+        .and_then(|()| file.write_all(&data_bytes.to_le_bytes()))
+        .map_err(|error| format!("could not write WAV header: {error}"))
+}
+
+struct TemporaryWaveFile {
+    path: PathBuf,
+    file: Option<std::fs::File>,
+    committed: bool,
+}
+
+impl TemporaryWaveFile {
+    fn create(output_path: &Path) -> Result<Self, String> {
+        use std::fs::OpenOptions;
+
+        let parent = output_path.parent().unwrap_or_else(|| Path::new("."));
+        let file_name = output_path
+            .file_name()
+            .ok_or_else(|| "output WAV path must include a file name".to_owned())?;
+        for _ in 0..100 {
+            let id = NEXT_RENDER_FILE_ID.fetch_add(1, Ordering::Relaxed);
+            let mut temporary_name = file_name.to_os_string();
+            temporary_name.push(format!(".{}.{}.tmp", std::process::id(), id));
+            let path = parent.join(temporary_name);
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => {
+                    return Ok(Self {
+                        path,
+                        file: Some(file),
+                        committed: false,
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "could not create temporary WAV beside {}: {error}",
+                        output_path.display()
+                    ));
+                }
+            }
+        }
+        Err("could not allocate a unique temporary WAV file".to_owned())
+    }
+
+    fn commit(mut self, output_path: &Path) -> Result<(), String> {
+        use std::io::Write;
+
+        let mut file = self.file.take().expect("temporary WAV is open");
+        file.flush()
+            .map_err(|error| format!("could not flush rendered WAV: {error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("could not sync rendered WAV: {error}"))?;
+        drop(file);
+        if output_path.exists() {
+            std::fs::remove_file(output_path)
+                .map_err(|error| format!("could not replace {}: {error}", output_path.display()))?;
+        }
+        std::fs::rename(&self.path, output_path)
+            .map_err(|error| format!("could not finalize {}: {error}", output_path.display()))?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for TemporaryWaveFile {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
 fn hosted_info(id: u64, info: &PluginInfo, has_editor: bool) -> HostedPluginInfo {
     HostedPluginInfo {
         id,
@@ -208,5 +564,118 @@ fn hosted_info(id: u64, info: &PluginInfo, has_editor: bool) -> HostedPluginInfo
         uid: info.uid.clone(),
         path: info.path.clone(),
         has_editor,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn schedules_pattern_note_on_project_timeline() {
+        let note = PatternNote {
+            position: 480,
+            length: 240,
+            channel_id: 7,
+            key: 60,
+            midi_channel: 1,
+            velocity: 99,
+            ..PatternNote::default()
+        };
+        let (events, note_count) =
+            scheduled_pattern_events(&[note], 7, 480, 120.0, 48_000.0).unwrap();
+        assert_eq!(note_count, 1);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].frame, 24_000);
+        assert_eq!(events[1].frame, 36_000);
+        assert!(matches!(
+            events[0].event,
+            MidiEvent::NoteOn {
+                channel: MidiChannel::Ch2,
+                note: 60,
+                velocity: 99
+            }
+        ));
+        assert!(matches!(
+            events[1].event,
+            MidiEvent::NoteOff {
+                channel: MidiChannel::Ch2,
+                note: 60,
+                velocity: 0
+            }
+        ));
+    }
+
+    #[test]
+    fn note_off_precedes_note_on_at_a_shared_frame() {
+        let notes = [
+            PatternNote {
+                position: 0,
+                length: 120,
+                channel_id: 3,
+                key: 60,
+                velocity: 100,
+                ..PatternNote::default()
+            },
+            PatternNote {
+                position: 120,
+                length: 120,
+                channel_id: 3,
+                key: 60,
+                velocity: 100,
+                ..PatternNote::default()
+            },
+        ];
+        let (events, _) = scheduled_pattern_events(&notes, 3, 480, 120.0, 48_000.0).unwrap();
+        assert_eq!(events[1].frame, events[2].frame);
+        assert!(matches!(events[1].event, MidiEvent::NoteOff { .. }));
+        assert!(matches!(events[2].event, MidiEvent::NoteOn { .. }));
+    }
+
+    #[test]
+    fn rejects_notes_that_cannot_be_represented_as_midi() {
+        let note = PatternNote {
+            channel_id: 2,
+            key: 128,
+            length: 60,
+            velocity: 100,
+            ..PatternNote::default()
+        };
+        let error = scheduled_pattern_events(&[note], 2, 480, 120.0, 48_000.0).unwrap_err();
+        assert!(error.contains("outside the MIDI note range"));
+    }
+
+    #[test]
+    fn writes_and_commits_float_wav_header_and_audio_data() {
+        let output_path = std::env::temp_dir().join(format!(
+            "flp-rebuild-render-test-{}-{}.wav",
+            std::process::id(),
+            NEXT_RENDER_FILE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&output_path, b"previous output").unwrap();
+        let mut temporary = TemporaryWaveFile::create(&output_path).unwrap();
+        write_float_wave_header(temporary.file.as_mut().unwrap(), 2, 48_000, 2).unwrap();
+        temporary
+            .file
+            .as_mut()
+            .unwrap()
+            .write_all(&[0u8; 16])
+            .unwrap();
+        temporary.commit(&output_path).unwrap();
+
+        let bytes = std::fs::read(&output_path).unwrap();
+        assert_eq!(bytes.len(), 60);
+        assert_eq!(&bytes[..4], b"RIFF");
+        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 52);
+        assert_eq!(&bytes[8..16], b"WAVEfmt ");
+        assert_eq!(u16::from_le_bytes(bytes[20..22].try_into().unwrap()), 3);
+        assert_eq!(u16::from_le_bytes(bytes[22..24].try_into().unwrap()), 2);
+        assert_eq!(
+            u32::from_le_bytes(bytes[24..28].try_into().unwrap()),
+            48_000
+        );
+        assert_eq!(u32::from_le_bytes(bytes[40..44].try_into().unwrap()), 16);
+        std::fs::remove_file(output_path).unwrap();
     }
 }

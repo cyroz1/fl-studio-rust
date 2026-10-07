@@ -6,7 +6,7 @@ use std::process::ExitCode;
 
 use flp_rebuild::midi::MidiFile;
 use flp_rebuild::plugins::scan_installed_plugins;
-use flp_rebuild::vst3::Vst3HostRuntime;
+use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions};
 use flp_rebuild::{FlpDocument, PatternNote, PatternNoteEdit, PlaylistClipEdit};
 
 fn main() -> ExitCode {
@@ -32,6 +32,33 @@ fn run(args: Vec<String>) -> Result<(), String> {
             Path::new(path),
             parse_u16(channel_id, "channel id")?,
         ),
+        [command, project, pattern_id, channel_id, bundle, output]
+            if command == "render-pattern-vst3" =>
+        {
+            render_pattern_vst3(
+                Path::new(project),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Path::new(bundle),
+                Path::new(output),
+                2.0,
+            )
+        }
+        [command, project, pattern_id, channel_id, bundle, output, tail]
+            if command == "render-pattern-vst3" =>
+        {
+            let tail_seconds = tail
+                .parse::<f64>()
+                .map_err(|_| "render tail must be a number of seconds".to_owned())?;
+            render_pattern_vst3(
+                Path::new(project),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Path::new(bundle),
+                Path::new(output),
+                tail_seconds,
+            )
+        }
         [command, path, channel_id] if command == "channel-events" => list_channel_events(
             Path::new(path),
             parse_u16(channel_id, "channel id")?,
@@ -184,6 +211,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild midi-events <file.mid> <track> [start] [count]\n",
             "  flp-rebuild scan <directory>\n",
             "  flp-rebuild plugin-scan\n",
+            "  flp-rebuild render-pattern-vst3 <project.flp> <pattern-id> <channel-id> <plugin.vst3> <output.wav> [tail-seconds]\n",
             "  flp-rebuild channels <file.flp>\n",
             "  flp-rebuild plugin-states <file.flp>\n",
             "  flp-rebuild channel-events <file.flp> <channel-id>\n",
@@ -249,6 +277,93 @@ fn load_document(path: &Path) -> Result<(Vec<u8>, FlpDocument), String> {
     let document = FlpDocument::parse(&bytes)
         .map_err(|error| format!("could not parse {}: {error}", path.display()))?;
     Ok((bytes, document))
+}
+
+fn render_pattern_vst3(
+    project_path: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    bundle_path: &Path,
+    output_path: &Path,
+    tail_seconds: f64,
+) -> Result<(), String> {
+    let (_, document) = load_document(project_path)?;
+    let pattern = document
+        .patterns()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|pattern| pattern.id == pattern_id)
+        .ok_or_else(|| format!("pattern id {pattern_id} was not found"))?;
+    if !document
+        .channels()
+        .iter()
+        .any(|channel| channel.id() == channel_id)
+    {
+        return Err(format!("channel id {channel_id} was not found"));
+    }
+
+    let class_uid = matching_project_class_uid(&document, channel_id, bundle_path);
+    let mut host = Vst3HostRuntime::new(48_000.0, 512)?;
+    let plugin = host.load(bundle_path, class_uid.as_deref())?;
+    let summary = host.render_pattern_channel_to_wav(
+        plugin.id,
+        &pattern.notes,
+        Vst3PatternRenderOptions {
+            channel_id,
+            ppq: document.header().ppq(),
+            tempo_bpm: document.metadata().tempo_bpm().unwrap_or(120.0),
+            tail_seconds,
+        },
+        output_path,
+    )?;
+    println!(
+        "rendered pattern {} channel {} through {} to {}: {} notes, {:.2} seconds, {} Hz, {} channels",
+        pattern_id,
+        channel_id,
+        plugin.name,
+        output_path.display(),
+        summary.notes_rendered,
+        summary.frames as f64 / f64::from(summary.sample_rate),
+        summary.sample_rate,
+        summary.output_channels,
+    );
+    println!(
+        "render uses the plug-in's initial state; FLP plug-in state, Playlist clips, Mixer routing, and effects are not applied"
+    );
+    Ok(())
+}
+
+fn matching_project_class_uid(
+    document: &FlpDocument,
+    channel_id: u16,
+    bundle_path: &Path,
+) -> Option<String> {
+    let selected_bundle_name = bundle_path
+        .file_stem()
+        .or_else(|| bundle_path.file_name())?
+        .to_string_lossy();
+    document
+        .channel_plugin_states()
+        .into_iter()
+        .find(|state| state.channel_id() == channel_id)
+        .and_then(|state| {
+            let metadata = state.vst_metadata()?;
+            let path_matches = metadata.path().is_some_and(|path| {
+                Path::new(path)
+                    .file_stem()
+                    .or_else(|| Path::new(path).file_name())
+                    .is_some_and(|name| {
+                        name.to_string_lossy()
+                            .eq_ignore_ascii_case(&selected_bundle_name)
+                    })
+            });
+            let name_matches = metadata
+                .name()
+                .is_some_and(|name| name.eq_ignore_ascii_case(&selected_bundle_name));
+            (path_matches || name_matches)
+                .then(|| metadata.class_uid())
+                .flatten()
+        })
 }
 
 fn inspect(path: &Path) -> Result<(), String> {
