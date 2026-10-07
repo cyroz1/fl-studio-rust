@@ -2545,7 +2545,7 @@ impl DawUi {
         }
     }
 
-    fn mixer(&self, ui: &mut egui::Ui) {
+    fn mixer(&mut self, ui: &mut egui::Ui) {
         let Some(document) = self.document.as_ref() else {
             empty_view(ui, "Open a project to see the Mixer");
             return;
@@ -2578,9 +2578,10 @@ impl DawUi {
             return;
         }
 
+        let mut rename_edits = Vec::new();
         ui.label(
             egui::RichText::new(
-                "Insert names and raw route fields are available. Faders, effect slots, and routing edits still need format mapping.",
+                "Rename inserts here. Faders, effect slots, and routing edits still need format mapping.",
             )
             .color(MUTED),
         );
@@ -2590,9 +2591,15 @@ impl DawUi {
                 ui.horizontal(|ui| {
                     for insert in &inserts {
                         ui.group(|ui| {
-                            ui.set_min_width(132.0);
+                            ui.set_min_width(168.0);
                             ui.vertical(|ui| {
-                                ui.strong(insert.name().unwrap_or("(unnamed)"));
+                                let mut name = insert.name().unwrap_or_default().to_owned();
+                                let response = ui.add(
+                                    egui::TextEdit::singleline(&mut name).hint_text("Insert name"),
+                                );
+                                if response.changed() {
+                                    rename_edits.push((insert.ordinal(), name));
+                                }
                                 ui.small(format!("Input {}", insert.input_raw()));
                                 ui.small(format!("Output {}", insert.output_raw()));
                                 ui.small(format!("Color 0x{:08X}", insert.color_raw()));
@@ -2601,6 +2608,22 @@ impl DawUi {
                     }
                 });
             });
+
+        if !rename_edits.is_empty()
+            && let Some(document) = self.document.as_mut()
+        {
+            for (insert_ordinal, name) in rename_edits {
+                match document.set_mixer_insert_name(insert_ordinal, &name) {
+                    Ok(()) => {
+                        self.dirty = true;
+                        self.status = format!("Renamed Mixer insert {}", insert_ordinal + 1);
+                    }
+                    Err(error) => {
+                        self.status = format!("Could not rename Mixer insert: {error}");
+                    }
+                }
+            }
+        }
     }
 
     fn audio_settings_view(&mut self, ui: &mut egui::Ui) {

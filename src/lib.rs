@@ -1494,6 +1494,86 @@ impl FlpDocument {
             .collect()
     }
 
+    /// Renames a recognized Mixer insert through its existing `0xCC` name event.
+    /// The event's string encoding, terminator convention, and bytes after the
+    /// terminator are retained; every other event remains untouched.
+    pub fn set_mixer_insert_name(
+        &mut self,
+        insert_ordinal: usize,
+        name: &str,
+    ) -> Result<(), FlpError> {
+        if name.contains('\0') {
+            return Err(FlpError::UnsupportedEdit(
+                "Mixer insert names cannot contain an embedded NUL character",
+            ));
+        }
+
+        let insert = self
+            .mixer_inserts()
+            .into_iter()
+            .find(|insert| insert.ordinal() == insert_ordinal)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested Mixer insert does not exist",
+            ))?;
+        let event_index = insert
+            .event_range()
+            .find(|index| self.events[*index].opcode == 0xCC)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the selected Mixer insert has no recognized 0xCC name event",
+            ))?;
+        let event = &self.events[event_index];
+        if !matches!(event.encoding, PayloadEncoding::Data { .. }) {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected Mixer insert's 0xCC event is not a length-prefixed data event",
+            ));
+        }
+
+        let old_payload = &event.payload;
+        let utf16 = project_string_is_utf16(old_payload, self.project_version.as_deref());
+        let (suffix_start, had_terminator) = if utf16 {
+            old_payload
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .position(|pair| u16::from_le_bytes(*pair) == 0)
+                .map_or((old_payload.len(), false), |unit_index| {
+                    ((unit_index + 1) * 2, true)
+                })
+        } else {
+            old_payload
+                .iter()
+                .position(|byte| *byte == 0)
+                .map_or((old_payload.len(), false), |byte_index| {
+                    (byte_index + 1, true)
+                })
+        };
+
+        let mut replacement_payload = Vec::new();
+        if utf16 {
+            for unit in name.encode_utf16() {
+                replacement_payload.extend_from_slice(&unit.to_le_bytes());
+            }
+            if had_terminator {
+                replacement_payload.extend_from_slice(&[0, 0]);
+            }
+        } else {
+            for character in name.chars() {
+                let byte = windows_1252_byte(character).ok_or(FlpError::UnsupportedEdit(
+                    "the name contains a character unavailable in the project's legacy encoding",
+                ))?;
+                replacement_payload.push(byte);
+            }
+            if had_terminator {
+                replacement_payload.push(0);
+            }
+        }
+        replacement_payload.extend_from_slice(&old_payload[suffix_start..]);
+
+        self.events[event_index].replace_data_payload(replacement_payload)?;
+        self.refresh_event_offsets()?;
+        Ok(())
+    }
+
     /// Decodes only the fixed 12-byte framing observed in Mixer `0xE1` parameter records.
     /// Unknown fields remain raw, and a different record size is reported instead of guessed.
     pub fn mixer_parameter_records(&self) -> Result<Vec<MixerParameterRecord>, FlpError> {
@@ -2904,7 +2984,15 @@ fn uses_legacy_string_encoding(version: Option<&str>) -> bool {
 }
 
 fn decode_project_string(payload: &[u8], version: Option<&str>) -> Option<String> {
-    let encoding_is_utf16 = project_string_version(version)
+    if project_string_is_utf16(payload, version) {
+        decode_utf16_z(payload)
+    } else {
+        decode_windows_1252_z(payload)
+    }
+}
+
+fn project_string_is_utf16(payload: &[u8], version: Option<&str>) -> bool {
+    project_string_version(version)
         .map(|(major, minor)| major > 11 || (major == 11 && minor >= 5))
         .unwrap_or_else(|| {
             payload
@@ -2914,13 +3002,7 @@ fn decode_project_string(payload: &[u8], version: Option<&str>) -> Option<String
                 .filter(|pair| pair[1] == 0)
                 .count()
                 >= 2
-        });
-
-    if encoding_is_utf16 {
-        decode_utf16_z(payload)
-    } else {
-        decode_windows_1252_z(payload)
-    }
+        })
 }
 
 fn decode_windows_1252_z(payload: &[u8]) -> Option<String> {
@@ -2941,6 +3023,14 @@ fn windows_1252_char(byte: u8) -> char {
     } else {
         char::from(byte)
     }
+}
+
+fn windows_1252_byte(character: char) -> Option<u8> {
+    let scalar = u32::from(character);
+    if scalar <= 0x7F || (0xA0..=0xFF).contains(&scalar) {
+        return u8::try_from(scalar).ok();
+    }
+    (0x80..=0x9F).find(|byte| windows_1252_char(*byte) == character)
 }
 
 fn utf16_banner_version(payload: &[u8]) -> Option<String> {
@@ -3442,6 +3532,103 @@ mod tests {
                 .encode_lossless()
                 .expect("lossless encoding should succeed"),
             original
+        );
+    }
+
+    #[test]
+    fn mixer_insert_rename_preserves_utf16_terminator_suffix_and_other_events() {
+        let mut event_stream = vec![0x9A];
+        event_stream.extend_from_slice(&(-1_i32).to_le_bytes());
+        event_stream.push(0x93);
+        event_stream.extend_from_slice(&0_i32.to_le_bytes());
+        event_stream.push(0x95);
+        event_stream.extend_from_slice(&0x001C_1F8Cu32.to_le_bytes());
+        event_stream.push(0x5F);
+        event_stream.extend_from_slice(&75_i16.to_le_bytes());
+        let mut name_payload = "KICK"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        name_payload.extend_from_slice(&[0, 0, 0xAA, 0xBB]);
+        append_data_event(&mut event_stream, 0xCC, &name_payload);
+        append_data_event(&mut event_stream, 0xE8, &[0x55]);
+
+        let original = flp_fixture(&event_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&original).expect("the fixture should parse");
+        let original_events = document
+            .events()
+            .iter()
+            .map(|event| event.wire_bytes().to_vec())
+            .collect::<Vec<_>>();
+        document
+            .set_mixer_insert_name(0, "KICK 💥")
+            .expect("UTF-16 names should support Unicode");
+
+        let insert = &document.mixer_inserts()[0];
+        assert_eq!(insert.name(), Some("KICK 💥"));
+        let name_event_index = insert
+            .event_range()
+            .find(|index| document.events()[*index].opcode() == 0xCC)
+            .expect("the insert should retain its name event");
+        let mut expected_payload = "KICK 💥"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        expected_payload.extend_from_slice(&[0, 0, 0xAA, 0xBB]);
+        assert_eq!(
+            document.events()[name_event_index].payload(),
+            expected_payload
+        );
+        for (index, event) in document.events().iter().enumerate() {
+            if index != name_event_index {
+                assert_eq!(event.wire_bytes(), original_events[index]);
+            }
+        }
+        let encoded = document
+            .encode_lossless()
+            .expect("the renamed project should encode");
+        assert_eq!(
+            FlpDocument::parse(&encoded)
+                .expect("the renamed project should parse")
+                .mixer_inserts()[0]
+                .name(),
+            Some("KICK 💥")
+        );
+    }
+
+    #[test]
+    fn mixer_insert_rename_uses_legacy_encoding_and_rejects_unrepresentable_text() {
+        let mut event_stream = vec![0x9A];
+        event_stream.extend_from_slice(&(-1_i32).to_le_bytes());
+        event_stream.push(0x93);
+        event_stream.extend_from_slice(&0_i32.to_le_bytes());
+        event_stream.push(0x95);
+        event_stream.extend_from_slice(&0x001C_1F8Cu32.to_le_bytes());
+        append_data_event(&mut event_stream, 0xCC, b"KICK\0");
+
+        let mut document = FlpDocument::parse(&flp_fixture(&event_stream, &[], &[]))
+            .expect("the fixture should parse");
+        document.project_version = Some("10.0".to_owned());
+        document
+            .set_mixer_insert_name(0, "Café")
+            .expect("representable legacy text should encode");
+        assert_eq!(document.mixer_inserts()[0].name(), Some("Café"));
+        let name_event = document
+            .events()
+            .iter()
+            .find(|event| event.opcode() == 0xCC)
+            .expect("the name event should remain");
+        assert_eq!(name_event.payload(), b"Caf\xE9\0");
+
+        let before = document.encode_lossless().expect("document should encode");
+        assert!(matches!(
+            document.set_mixer_insert_name(0, "Café 🥁"),
+            Err(FlpError::UnsupportedEdit(_))
+        ));
+        assert_eq!(
+            document.encode_lossless().expect("document should encode"),
+            before,
+            "failed renames should not partially mutate the name event"
         );
     }
 

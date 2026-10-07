@@ -70,6 +70,10 @@ The original application's MIDI export experiments and their measured results ar
 
 Layer child relationships and raw flags are available in the project model. The desktop Channel Rack exposes a child selector with channel names and IDs; `set-layer-children` replaces a Layer channel's repeated `0x5E` references while retaining other channel events. Pass comma-separated child IDs or `-` to clear the list. Layer playback and flag editing remain incomplete.
 
+## Mixer
+
+The desktop Mixer view lists recognized inserts and raw route fields. Existing insert names can be edited through their recognized `0xCC` events while retaining the project's string encoding and unrelated bytes. Faders, effect slots, and routing remain unmapped.
+
 ## Automation points
 
 `automation <file.flp>` lists point curves from type-5 automation channels. `edit-automation-point` changes an existing point's position in beats, normalized value, and tension. `insert-automation-point` inserts at a zero-based slot (including the slot after the last point), and `delete-automation-point` removes a point by zero-based index. These operations preserve existing point tails and the blob's header and era trailer; new points use a zeroed opaque tail. They require a channel with an existing `0xEA` point blob. The desktop Automation view draws a type-5 curve and supports point selection, drag and numeric editing, insertion, and deletion. Its current preview uses straight segments and does not render tension/interpolation modes. Parameter links, event automation, automation-clip creation, and FL Studio's window-level curve workflow remain incomplete.

@@ -32,7 +32,7 @@ The foundation. Everything else depends on reading projects exactly.
 | Channel records: all types (sampler, generator, layer, MIDI out, automation clip) | `[partial]` | Known channel kind values 0/2/3/4/5 are named while unknown raw values are retained; Layer child IDs (`0x5E`) and raw flags (`0x90`) are decoded, and child lists can be edited in the Channel Rack through named channel choices while preserving other channel events. Legacy channel types, Layer playback, and flag editing remain incomplete. |
 | Pattern/score events: note records, all encodings | `[partial]` | 24-byte records handled; empty-pattern and conflicting-encoding edge cases guarded |
 | Playlist events: clips, tracks, arrangements | `[partial]` | Clip position/length editable; all three record sizes (80/60/32) recognized |
-| Mixer state events | `[partial]` | Reads insert names, raw input/output/color/icon fields from the observed `0x9A`/`0x93`/`0x95` sequence and preserves 12-byte records from `0xE1`; parameter meaning, FX state, and routing edits remain incomplete. |
+| Mixer state events | `[partial]` | Reads insert names, raw input/output/color/icon fields from the observed `0x9A`/`0x93`/`0x95` sequence and preserves 12-byte records from `0xE1`; existing insert names can be edited while retaining string encoding and unrelated events. Parameter meaning, FX state, and routing edits remain incomplete. |
 | Automation events (channel envelopes, event automation) | `[partial]` | Reads type-5 channel automation points from `0xEA` blobs and edits, inserts, or removes points while preserving unmodified point bytes and the opaque header and era trailer. The desktop Automation view edits those curves with a straight-line preview; interpolation, event automation, target links, automation-blob creation, and clip creation remain incomplete. |
 | Time markers, song position markers | `[partial]` | Reads arrangement-scoped marker positions, names, and time signatures. The documented signature bit is exposed separately; other position bits remain intact. Marker editing, song-position playback, and broader version verification remain incomplete. |
 | Project settings: swing, master pitch, metronome, recording settings | `[todo]` | |
@@ -68,7 +68,7 @@ The decoded document must model everything the format can express.
 - `[partial]` Channels: summaries, sample paths, plugin state blobs, levels, known kind mapping, and Layer child relationships/raw flags
 - `[partial]` Patterns: note lists per channel
 - `[partial]` Playlist: tracks, arrangements, clips with targets
-- `[partial]` Mixer: recognized insert summaries and raw `0xE1` parameter records; full 125 inserts, master/sends, track mapping, and editable state remain incomplete
+- `[partial]` Mixer: recognized insert summaries and raw `0xE1` parameter records, with existing insert names editable; full 125 inserts, master/sends, track mapping, and fader/effect/routing state remain incomplete
 - `[partial]` Automation: type-5 channel point curves can be read and points in an existing blob edited, inserted, or removed from the desktop view; interpolation, parameter links, event automation, LFOs, and new clip creation remain incomplete
 - `[todo]` Time signatures per pattern/arrangement, tempo automation
 - `[todo]` Channel groups, colors, icons
