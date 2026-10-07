@@ -7,6 +7,7 @@ use std::process::ExitCode;
 use flp_rebuild::media::{SamplePathResolver, decode_audio_file};
 use flp_rebuild::midi::MidiFile;
 use flp_rebuild::plugins::scan_installed_plugins;
+use flp_rebuild::sample_render::{AudioClipRenderOptions, render_audio_clips_to_wav};
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions};
 use flp_rebuild::{FlpDocument, PatternNote, PatternNoteEdit, PlaylistClipEdit};
 
@@ -26,6 +27,21 @@ fn run(args: Vec<String>) -> Result<(), String> {
         [command, path] if command == "channels" => list_channels(Path::new(path)),
         [command, path] if command == "sample-paths" => list_sample_paths(Path::new(path)),
         [command, path] if command == "audio-info" => inspect_audio_file(Path::new(path)),
+        [command, project, output] if command == "render-audio-clips" => render_audio_clips(
+            Path::new(project),
+            Path::new(output),
+            AudioClipRenderOptions::default(),
+        ),
+        [command, project, output, arrangement_id] if command == "render-audio-clips" => {
+            render_audio_clips(
+                Path::new(project),
+                Path::new(output),
+                AudioClipRenderOptions {
+                    arrangement_id: parse_u16(arrangement_id, "arrangement id")?,
+                    ..AudioClipRenderOptions::default()
+                },
+            )
+        }
         [command, path] if command == "plugin-states" => list_plugin_states(Path::new(path)),
         [command, path, channel_id] if command == "plugin-state-preview" => {
             preview_plugin_state(Path::new(path), parse_u16(channel_id, "channel id")?, 64)
@@ -218,6 +234,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild channels <file.flp>\n",
             "  flp-rebuild sample-paths <file.flp>\n",
             "  flp-rebuild audio-info <audio-file>\n",
+            "  flp-rebuild render-audio-clips <project.flp> <output.wav> [arrangement-id]\n",
             "  flp-rebuild plugin-states <file.flp>\n",
             "  flp-rebuild channel-events <file.flp> <channel-id>\n",
             "  flp-rebuild patterns <file.flp>\n",
@@ -775,6 +792,25 @@ fn inspect_audio_file(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn render_audio_clips(
+    project_path: &Path,
+    output_path: &Path,
+    options: AudioClipRenderOptions,
+) -> Result<(), String> {
+    let (_, document) = load_document(project_path)?;
+    let summary = render_audio_clips_to_wav(&document, project_path, options, output_path)?;
+    println!(
+        "rendered {} Playlist audio clips from {} source files to {} ({} Hz stereo, {} frames; skipped {} scaled clips)",
+        summary.clips_rendered,
+        summary.source_files,
+        output_path.display(),
+        summary.sample_rate,
+        summary.frames,
+        summary.clips_skipped_unsupported_scale,
+    );
+    Ok(())
+}
+
 fn list_channel_events(path: &Path, channel_id: u16) -> Result<(), String> {
     let (_, document) = load_document(path)?;
     let channel = document
@@ -977,7 +1013,7 @@ fn list_playlist(path: &Path, start: usize, count: usize) -> Result<(), String> 
                 flp_rebuild::PlaylistClipTarget::Pattern { .. } => "(pattern)",
             };
             println!(
-                "  clip={} position={} length={} track={} track_name={:?} raw_track={} target={:?} target_name={:?} group={} flags=0x{:04X} offsets={:.6}..{:.6} clip_id={} record_size={}",
+                "  clip={} position={} length={} track={} track_name={:?} raw_track={} target={:?} target_name={:?} group={} flags=0x{:04X} offsets={:.6}..{:.6} scale={:?} clip_id={} record_size={}",
                 index,
                 clip.position_ticks,
                 clip.length_ticks,
@@ -994,6 +1030,7 @@ fn list_playlist(path: &Path, start: usize, count: usize) -> Result<(), String> 
                 clip.item_flags,
                 clip.start_offset,
                 clip.end_offset,
+                clip.scale,
                 clip.clip_id
                     .map_or_else(|| "none".to_owned(), |id| id.to_string()),
                 clip.record_size,

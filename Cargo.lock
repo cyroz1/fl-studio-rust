@@ -1049,6 +1049,7 @@ dependencies = [
  "rfd",
  "symphonia",
  "vst3-host",
+ "wavicle",
 ]
 
 [[package]]
@@ -3414,6 +3415,12 @@ checksum = "23f0c9c52aa7cd7d77769a4cfe2a9adb1b331f489a41d912ce14513d5ab995c6"
 dependencies = [
  "unicode-ident",
 ]
+
+[[package]]
+name = "wavicle"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e312eaf22b4a7e5b7bf038edb3a7e4703c7b86dfabaea49d17af85e55eb76ab"
 
 [[package]]
 name = "wayland-backend"

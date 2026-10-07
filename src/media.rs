@@ -1,5 +1,7 @@
 //! Project media path resolution.
 
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use symphonia::core::audio::sample::Sample;
@@ -7,7 +9,7 @@ use symphonia::core::codecs::audio::AudioDecoderOptions;
 use symphonia::core::errors::Error as DecodeError;
 use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, TrackType};
-use symphonia::core::io::MediaSourceStream;
+use symphonia::core::io::{MediaSource, MediaSourceStream};
 use symphonia::core::meta::MetadataOptions;
 
 const FACTORY_DATA_MACRO: &str = "%FLStudioFactoryData%";
@@ -19,6 +21,72 @@ pub struct DecodedAudio {
     pub sample_rate: u32,
     /// Samples indexed `[channel][frame]` and converted to `f32` in approximately -1.0..1.0.
     pub channels: Vec<Vec<f32>>,
+}
+
+/// FL Studio factory samples can wrap an Ogg stream in a RIFF/WAVE header with a private codec
+/// tag. Present the embedded stream at offset zero so Symphonia can probe it by its Ogg signature.
+struct OffsetMediaSource {
+    file: File,
+    offset: u64,
+    length: u64,
+}
+
+impl OffsetMediaSource {
+    fn new(mut file: File, offset: u64) -> io::Result<Self> {
+        let file_length = file.metadata()?.len();
+        let length = file_length.checked_sub(offset).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "media offset exceeds file length",
+            )
+        })?;
+        file.seek(SeekFrom::Start(offset))?;
+        Ok(Self {
+            file,
+            offset,
+            length,
+        })
+    }
+}
+
+impl Read for OffsetMediaSource {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.file.read(buffer)
+    }
+}
+
+impl Seek for OffsetMediaSource {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        let current = self
+            .file
+            .stream_position()?
+            .checked_sub(self.offset)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid media position"))?;
+        let target = match position {
+            SeekFrom::Start(position) => i128::from(position),
+            SeekFrom::Current(delta) => i128::from(current) + i128::from(delta),
+            SeekFrom::End(delta) => i128::from(self.length) + i128::from(delta),
+        };
+        if !(0..=i128::from(self.length)).contains(&target) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "media seek is outside the embedded stream",
+            ));
+        }
+        let target = target as u64;
+        self.file.seek(SeekFrom::Start(self.offset + target))?;
+        Ok(target)
+    }
+}
+
+impl MediaSource for OffsetMediaSource {
+    fn is_seekable(&self) -> bool {
+        true
+    }
+
+    fn byte_len(&self) -> Option<u64> {
+        Some(self.length)
+    }
 }
 
 impl DecodedAudio {
@@ -38,9 +106,23 @@ impl DecodedAudio {
 /// streaming playback instead of this in-memory helper.
 pub fn decode_audio_file(path: impl AsRef<Path>) -> Result<DecodedAudio, String> {
     let path = path.as_ref();
-    let file = std::fs::File::open(path)
+    let mut file = File::open(path)
         .map_err(|error| format!("could not open sample {}: {error}", path.display()))?;
-    let source = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut signature = [0; 4];
+    if file.read_exact(&mut signature).is_ok() && &signature == b"wvpk" {
+        return decode_wavpack_file(file, path);
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| format!("could not seek sample {}: {error}", path.display()))?;
+    let embedded_ogg_offset = find_embedded_ogg_offset(&mut file)
+        .map_err(|error| format!("could not inspect sample {}: {error}", path.display()))?;
+    let source: Box<dyn MediaSource> = match embedded_ogg_offset {
+        Some(offset) => Box::new(OffsetMediaSource::new(file, offset).map_err(|error| {
+            format!("could not read embedded sample {}: {error}", path.display())
+        })?),
+        None => Box::new(file),
+    };
+    let source = MediaSourceStream::new(source, Default::default());
     let mut hint = Hint::new();
     if let Some(extension) = path.extension().and_then(|extension| extension.to_str()) {
         hint.with_extension(extension);
@@ -150,6 +232,162 @@ pub fn decode_audio_file(path: impl AsRef<Path>) -> Result<DecodedAudio, String>
         sample_rate,
         channels: output_channels,
     })
+}
+
+fn decode_wavpack_file(mut file: File, path: &Path) -> Result<DecodedAudio, String> {
+    let file_length = file
+        .metadata()
+        .map_err(|error| {
+            format!(
+                "could not inspect WavPack sample {}: {error}",
+                path.display()
+            )
+        })?
+        .len();
+    let file_length = usize::try_from(file_length)
+        .map_err(|_| format!("WavPack sample {} is too large", path.display()))?;
+    if file_length > MAX_DECODED_SAMPLE_BYTES {
+        return Err(format!(
+            "WavPack sample {} exceeds the {} MiB compressed input limit",
+            path.display(),
+            MAX_DECODED_SAMPLE_BYTES / (1024 * 1024)
+        ));
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| format!("could not seek WavPack sample {}: {error}", path.display()))?;
+    let mut encoded = Vec::new();
+    encoded
+        .try_reserve_exact(file_length)
+        .map_err(|error| format!("could not allocate WavPack input buffer: {error}"))?;
+    file.read_to_end(&mut encoded)
+        .map_err(|error| format!("could not read WavPack sample {}: {error}", path.display()))?;
+
+    let stream_info = wavicle::StreamInfo::scan(&encoded).map_err(|error| {
+        format!(
+            "could not inspect WavPack sample {}: {error}",
+            path.display()
+        )
+    })?;
+    if !(1..=2).contains(&stream_info.channels) || stream_info.sample_rate == 0 {
+        return Err(format!(
+            "WavPack sample {} has an unsupported channel count or sample rate",
+            path.display()
+        ));
+    }
+    let output_sample_count = wavicle::Blocks::new(&encoded).try_fold(0u64, |total, block| {
+        let block = block.map_err(|error| error.to_string())?;
+        let count = u64::from(block.header.block_samples)
+            .checked_mul(u64::from(block.header.flags.output_channels()))
+            .and_then(|count| total.checked_add(count))
+            .ok_or_else(|| "WavPack decoded sample count overflow".to_owned())?;
+        Ok::<u64, String>(count)
+    })?;
+    let _decoded_bytes = output_sample_count
+        .checked_mul(std::mem::size_of::<f32>() as u64)
+        .filter(|bytes| *bytes <= MAX_DECODED_SAMPLE_BYTES as u64)
+        .ok_or_else(|| {
+            format!(
+                "WavPack sample {} exceeds the {} MiB decoded sample limit",
+                path.display(),
+                MAX_DECODED_SAMPLE_BYTES / (1024 * 1024)
+            )
+        })?;
+    let decoded = wavicle::decode_stream(&encoded).map_err(|error| {
+        format!(
+            "could not decode WavPack sample {}: {error}",
+            path.display()
+        )
+    })?;
+    if decoded.channels != stream_info.channels || decoded.sample_rate != stream_info.sample_rate {
+        return Err(format!(
+            "WavPack sample {} changed format while decoding",
+            path.display()
+        ));
+    }
+    let channel_count = usize::try_from(decoded.channels)
+        .map_err(|_| "WavPack channel count does not fit this platform".to_owned())?;
+    if !decoded.samples.len().is_multiple_of(channel_count) {
+        return Err(format!(
+            "WavPack sample {} returned an incomplete frame",
+            path.display()
+        ));
+    }
+    let frame_count = decoded.samples.len() / channel_count;
+    let mut channels = vec![Vec::<f32>::new(); channel_count];
+    for channel in &mut channels {
+        channel
+            .try_reserve_exact(frame_count)
+            .map_err(|error| format!("could not allocate decoded WavPack channels: {error}"))?;
+    }
+    let scale = 2f32.powi((decoded.bits_per_sample.saturating_sub(1)) as i32);
+    for frame in decoded.samples.chunks_exact(channel_count) {
+        for (channel, sample) in channels.iter_mut().zip(frame) {
+            let value = if decoded.is_float {
+                f32::from_bits(*sample as u32)
+            } else {
+                *sample as f32 / scale
+            };
+            channel.push(value);
+        }
+    }
+    Ok(DecodedAudio {
+        sample_rate: decoded.sample_rate,
+        channels,
+    })
+}
+
+fn find_embedded_ogg_offset(file: &mut File) -> io::Result<Option<u64>> {
+    let file_length = file.metadata()?.len();
+    if file_length < 12 {
+        return Ok(None);
+    }
+
+    file.seek(SeekFrom::Start(0))?;
+    let mut header = [0; 12];
+    file.read_exact(&mut header)?;
+    if &header[..4] != b"RIFF" || &header[8..12] != b"WAVE" {
+        return Ok(None);
+    }
+
+    let mut chunk_offset = 12u64;
+    while chunk_offset
+        .checked_add(8)
+        .is_some_and(|end| end <= file_length)
+    {
+        file.seek(SeekFrom::Start(chunk_offset))?;
+        let mut chunk_header = [0; 8];
+        file.read_exact(&mut chunk_header)?;
+        let chunk_length = u64::from(u32::from_le_bytes([
+            chunk_header[4],
+            chunk_header[5],
+            chunk_header[6],
+            chunk_header[7],
+        ]));
+        let data_offset = chunk_offset + 8;
+        let Some(chunk_end) = data_offset.checked_add(chunk_length) else {
+            return Ok(None);
+        };
+        if chunk_end > file_length {
+            return Ok(None);
+        }
+        if &chunk_header[..4] == b"data" && chunk_length >= 4 {
+            file.seek(SeekFrom::Start(data_offset))?;
+            let mut signature = [0; 4];
+            file.read_exact(&mut signature)?;
+            if &signature == b"OggS" {
+                return Ok(Some(data_offset));
+            }
+        }
+        let padded_length = chunk_length + (chunk_length & 1);
+        let Some(next_offset) = data_offset.checked_add(padded_length) else {
+            return Ok(None);
+        };
+        if next_offset <= chunk_offset {
+            return Ok(None);
+        }
+        chunk_offset = next_offset;
+    }
+    Ok(None)
 }
 
 /// Resolves sample references against a project folder and FL Studio installation roots.
@@ -385,6 +623,27 @@ mod tests {
         bytes
     }
 
+    fn private_ogg_wave_fixture() -> Vec<u8> {
+        let ogg = b"OggS-test";
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(46u32 + ogg.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&26u32.to_le_bytes());
+        bytes.extend_from_slice(&0x674Fu16.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&44_100u32.to_le_bytes());
+        bytes.extend_from_slice(&14_000u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&16u16.to_le_bytes());
+        bytes.extend_from_slice(&8u16.to_le_bytes());
+        bytes.extend_from_slice(&[0; 8]);
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&(ogg.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(ogg);
+        bytes
+    }
+
     #[test]
     fn resolves_factory_macro_from_an_explicit_installation_root() {
         let root = fixture_root();
@@ -431,6 +690,26 @@ mod tests {
         assert_eq!(decoded.frame_count(), 2);
         assert_eq!(decoded.channels[0][0], -1.0);
         assert!((decoded.channels[0][1] - 0.999_969_5).abs() < 1e-6);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn finds_ogg_stream_embedded_in_fl_studio_wave_wrapper() {
+        let root = fixture_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("wrapped.wav");
+        std::fs::write(&path, private_ogg_wave_fixture()).unwrap();
+
+        let mut file = File::open(&path).unwrap();
+        let offset = find_embedded_ogg_offset(&mut file).unwrap().unwrap();
+        assert_eq!(offset, 54);
+        let mut source = OffsetMediaSource::new(file, offset).unwrap();
+        assert_eq!(source.byte_len(), Some(9));
+        assert_eq!(source.seek(SeekFrom::End(-9)).unwrap(), 0);
+        let mut signature = [0; 4];
+        source.read_exact(&mut signature).unwrap();
+        assert_eq!(&signature, b"OggS");
 
         std::fs::remove_dir_all(root).unwrap();
     }

@@ -4,6 +4,7 @@ use std::fmt;
 pub mod media;
 pub mod midi;
 pub mod plugins;
+pub mod sample_render;
 pub mod vst3;
 
 const FLHD: &[u8; 4] = b"FLhd";
