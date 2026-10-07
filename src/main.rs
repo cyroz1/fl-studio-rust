@@ -879,7 +879,20 @@ fn list_mixer(path: &Path) -> Result<(), String> {
             insert.event_range()
         );
     }
-    println!("opaque 0xE1 parameter records: {}", parameters.len());
+    let count_kind = |kind| {
+        parameters
+            .iter()
+            .filter(|record| record.kind() == kind)
+            .count()
+    };
+    println!(
+        "0xE1 records: {} (volume={}, pan={}, stereo_separation={}, route_volume={})",
+        parameters.len(),
+        count_kind(flp_rebuild::MixerParameterKind::Volume),
+        count_kind(flp_rebuild::MixerParameterKind::Pan),
+        count_kind(flp_rebuild::MixerParameterKind::StereoSeparation),
+        count_kind(flp_rebuild::MixerParameterKind::RouteVolume),
+    );
     Ok(())
 }
 

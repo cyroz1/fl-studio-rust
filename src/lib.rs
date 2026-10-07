@@ -90,7 +90,14 @@ impl FlpEvent {
             });
         }
         let payload_length = u32::try_from(payload.len()).map_err(|_| FlpError::LengthOverflow)?;
-        let length_prefix = encode_leb128(payload_length);
+        let original_payload_length = self.payload.len();
+        let length_prefix = match &self.encoding {
+            PayloadEncoding::Data { length_prefix } if payload.len() == original_payload_length => {
+                length_prefix.clone()
+            }
+            PayloadEncoding::Data { .. } => encode_leb128(payload_length),
+            _ => unreachable!("data encoding was checked above"),
+        };
         let mut wire_bytes = Vec::with_capacity(1 + length_prefix.len() + payload.len());
         wire_bytes.push(self.opcode);
         wire_bytes.extend_from_slice(&length_prefix);
@@ -641,7 +648,28 @@ impl MixerInsertSummary {
     }
 }
 
-/// One opaque 12-byte Mixer parameter record from a `0xE1` event.
+/// Recognized parameter-ID interpretations for Mixer `0xE1` records.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MixerParameterKind {
+    SlotEnabled,
+    SlotMix,
+    RouteVolume,
+    Volume,
+    Pan,
+    StereoSeparation,
+    LowEqGain,
+    MidEqGain,
+    HighEqGain,
+    LowEqFrequency,
+    MidEqFrequency,
+    HighEqFrequency,
+    LowEqQ,
+    MidEqQ,
+    HighEqQ,
+    Unknown(u8),
+}
+
+/// One 12-byte Mixer parameter record from a `0xE1` event.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MixerParameterRecord {
     event_index: usize,
@@ -669,6 +697,44 @@ impl MixerParameterRecord {
 
     pub fn parameter_id(&self) -> u8 {
         self.parameter_id
+    }
+
+    /// Interprets parameter IDs recognized by an independent FLP parser.
+    pub fn kind(&self) -> MixerParameterKind {
+        match self.parameter_id {
+            0 => MixerParameterKind::SlotEnabled,
+            1 => MixerParameterKind::SlotMix,
+            64..=191 => MixerParameterKind::RouteVolume,
+            192 => MixerParameterKind::Volume,
+            193 => MixerParameterKind::Pan,
+            194 => MixerParameterKind::StereoSeparation,
+            208 => MixerParameterKind::LowEqGain,
+            209 => MixerParameterKind::MidEqGain,
+            210 => MixerParameterKind::HighEqGain,
+            216 => MixerParameterKind::LowEqFrequency,
+            217 => MixerParameterKind::MidEqFrequency,
+            218 => MixerParameterKind::HighEqFrequency,
+            224 => MixerParameterKind::LowEqQ,
+            225 => MixerParameterKind::MidEqQ,
+            226 => MixerParameterKind::HighEqQ,
+            value => MixerParameterKind::Unknown(value),
+        }
+    }
+
+    /// Candidate target index extracted from bits 6–12 of `channel_data`.
+    /// Its relationship to visible Mixer insert numbering still needs broader validation.
+    pub fn target_index(&self) -> u8 {
+        ((self.channel_data >> 6) & 0x7F) as u8
+    }
+
+    /// Candidate slot index extracted from bits 0–5 of `channel_data`.
+    pub fn slot_index(&self) -> u8 {
+        (self.channel_data & 0x3F) as u8
+    }
+
+    /// Uninterpreted top three bits of `channel_data`.
+    pub fn target_scope_raw(&self) -> u8 {
+        (self.channel_data >> 13) as u8
     }
 
     pub fn reserved(&self) -> u8 {
@@ -1616,6 +1682,57 @@ impl FlpDocument {
         Ok(records)
     }
 
+    /// Changes the signed value in one existing 12-byte Mixer parameter record.
+    /// The record prefix, ID, reserved byte, target word, and all other records remain intact.
+    pub fn set_mixer_parameter_record_value(
+        &mut self,
+        event_index: usize,
+        record_index: usize,
+        value: i32,
+    ) -> Result<(), FlpError> {
+        const RECORD_SIZE: usize = 12;
+        let event = self
+            .events
+            .get(event_index)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested Mixer parameter event does not exist",
+            ))?;
+        if event.opcode != 0xE1 {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested event is not a Mixer parameter event",
+            ));
+        }
+        if !matches!(event.encoding, PayloadEncoding::Data { .. }) {
+            return Err(FlpError::UnsupportedEdit(
+                "the Mixer parameter event is not a length-prefixed data event",
+            ));
+        }
+        if !event.payload.len().is_multiple_of(RECORD_SIZE) {
+            return Err(FlpError::InvalidEvent {
+                offset: event.file_offset,
+                detail: "Mixer parameter payload is not a whole number of 12-byte records",
+            });
+        }
+        let record_start = record_index
+            .checked_mul(RECORD_SIZE)
+            .ok_or(FlpError::LengthOverflow)?;
+        let value_start = record_start
+            .checked_add(8)
+            .ok_or(FlpError::LengthOverflow)?;
+        let value_end = value_start.checked_add(4).ok_or(FlpError::LengthOverflow)?;
+        if value_end > event.payload.len() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested Mixer parameter record does not exist",
+            ));
+        }
+
+        let mut payload = event.payload.clone();
+        payload[value_start..value_end].copy_from_slice(&value.to_le_bytes());
+        self.events[event_index].replace_data_payload(payload)?;
+        self.refresh_event_offsets()?;
+        Ok(())
+    }
+
     /// Edits fields with established playlist record offsets while preserving every other byte.
     /// `clip_index` is zero-based in the selected arrangement's stored clip order.
     pub fn edit_playlist_clip(
@@ -2496,19 +2613,7 @@ impl FlpDocument {
         replacement_payload.extend_from_slice(&[0, 0]);
         replacement_payload.extend_from_slice(&old_payload[suffix_start..]);
 
-        let payload_length =
-            u32::try_from(replacement_payload.len()).map_err(|_| FlpError::LengthOverflow)?;
-        let length_prefix = encode_leb128(payload_length);
-        let mut wire_bytes =
-            Vec::with_capacity(1 + length_prefix.len() + replacement_payload.len());
-        wire_bytes.push(0xCB);
-        wire_bytes.extend_from_slice(&length_prefix);
-        wire_bytes.extend_from_slice(&replacement_payload);
-
-        let event = &mut self.events[event_index];
-        event.payload = replacement_payload;
-        event.encoding = PayloadEncoding::Data { length_prefix };
-        event.wire_bytes = wire_bytes;
+        self.events[event_index].replace_data_payload(replacement_payload)?;
         self.refresh_event_offsets()?;
         Ok(())
     }
@@ -3276,7 +3381,7 @@ fn decode_vst_text(bytes: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        FlpDocument, FlpError, PatternNote, PayloadEncoding, midi::MidiFile,
+        FlpDocument, FlpError, MixerParameterKind, PatternNote, PayloadEncoding, midi::MidiFile,
         parse_vst_plugin_state_metadata,
     };
 
@@ -3651,12 +3756,20 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].prefix(), [0xAA, 0xBB, 0xCC, 0xDD]);
         assert_eq!(records[0].parameter_id(), 192);
+        assert_eq!(records[0].kind(), MixerParameterKind::Volume);
         assert_eq!(records[0].reserved(), 0);
         assert_eq!(records[0].channel_data(), 0x0123);
+        assert_eq!(records[0].target_index(), 4);
+        assert_eq!(records[0].slot_index(), 0x23);
+        assert_eq!(records[0].target_scope_raw(), 0);
         assert_eq!(records[0].value(), 12_800);
         assert_eq!(records[1].parameter_id(), 193);
+        assert_eq!(records[1].kind(), MixerParameterKind::Pan);
         assert_eq!(records[1].reserved(), 7);
         assert_eq!(records[1].channel_data(), 0x4567);
+        assert_eq!(records[1].target_index(), 21);
+        assert_eq!(records[1].slot_index(), 0x27);
+        assert_eq!(records[1].target_scope_raw(), 2);
         assert_eq!(records[1].value(), -6400);
 
         let mut malformed_stream = Vec::new();
@@ -3667,6 +3780,89 @@ mod tests {
             malformed.mixer_parameter_records(),
             Err(FlpError::InvalidEvent { .. })
         ));
+    }
+
+    #[test]
+    fn editing_mixer_parameter_value_preserves_record_and_event_bytes() {
+        let mut payload = vec![0xAA, 0xBB, 0xCC, 0xDD, 192, 0];
+        payload.extend_from_slice(&0x1040_u16.to_le_bytes());
+        payload.extend_from_slice(&12_800_i32.to_le_bytes());
+        payload.extend_from_slice(&[0x11, 0x22, 0x33, 0x44, 193, 7]);
+        payload.extend_from_slice(&0x1080_u16.to_le_bytes());
+        payload.extend_from_slice(&(-6400_i32).to_le_bytes());
+        let mut event_stream = Vec::new();
+        event_stream.extend_from_slice(&[0xE1, 0x98, 0x00]);
+        event_stream.extend_from_slice(&payload);
+        append_data_event(&mut event_stream, 0xE8, &[0xA5, 0x5A]);
+
+        let original = flp_fixture(&event_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&original).expect("the fixture should parse");
+        let event_index = document
+            .events()
+            .iter()
+            .position(|event| event.opcode() == 0xE1)
+            .expect("the fixture should contain Mixer parameters");
+        let other_event_index = event_index + 1;
+        let other_event = document.events()[other_event_index].wire_bytes().to_vec();
+        let mut expected_mixer_event = document.events()[event_index].wire_bytes().to_vec();
+        expected_mixer_event[11..15].copy_from_slice(&10_000_i32.to_le_bytes());
+        document
+            .set_mixer_parameter_record_value(event_index, 0, 10_000)
+            .expect("an existing parameter value should be editable");
+
+        let records = document
+            .mixer_parameter_records()
+            .expect("the parameter records should remain valid");
+        assert_eq!(records[0].value(), 10_000);
+        assert_eq!(records[1].value(), -6_400);
+        assert_eq!(records[0].prefix(), [0xAA, 0xBB, 0xCC, 0xDD]);
+        assert_eq!(records[0].channel_data(), 0x1040);
+        assert_eq!(records[1].prefix(), [0x11, 0x22, 0x33, 0x44]);
+        assert_eq!(records[1].channel_data(), 0x1080);
+        assert_eq!(
+            document.events()[event_index].wire_bytes(),
+            expected_mixer_event
+        );
+        assert_eq!(
+            document.events()[event_index].encoding(),
+            &PayloadEncoding::Data {
+                length_prefix: vec![0x98, 0x00]
+            }
+        );
+        assert_eq!(
+            document.events()[other_event_index].wire_bytes(),
+            other_event
+        );
+        let encoded = document
+            .encode_lossless()
+            .expect("the edited project should encode");
+        let round_trip = FlpDocument::parse(&encoded).expect("the edited project should parse");
+        assert_eq!(
+            round_trip.mixer_parameter_records().unwrap()[0].value(),
+            10_000
+        );
+    }
+
+    #[test]
+    fn mixer_parameter_value_edit_rejects_invalid_targets_without_mutation() {
+        let mut event_stream = vec![0x01, 0x00];
+        append_data_event(&mut event_stream, 0xE1, &[0; 12]);
+        let original = flp_fixture(&event_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&original).expect("the fixture should parse");
+        let before = document.encode_lossless().expect("document should encode");
+
+        assert!(matches!(
+            document.set_mixer_parameter_record_value(0, 0, 123),
+            Err(FlpError::UnsupportedEdit(_))
+        ));
+        assert!(matches!(
+            document.set_mixer_parameter_record_value(1, 1, 123),
+            Err(FlpError::UnsupportedEdit(_))
+        ));
+        assert_eq!(
+            document.encode_lossless().expect("document should encode"),
+            before
+        );
     }
 
     #[test]
