@@ -1,7 +1,5 @@
 # Rust DAW compatibility rebuild
 
-This is a clean-room Rust project started from the FL Studio 26.1.6.5639 installation supplied with the workspace. It is an independent rebuild; it does not load, patch, or link against the installed FL Studio executable or engine. The end goal is to open and modify any FL Studio project with backwards compatibility, matching controls, windows, and editing behavior, installed plug-in hosting, playback, and rendering. The current code contains the lossless file-format core and the first desktop editing shell; it is still far from full parity.
-
 ## Parity progress — 2026-10-07
 
 **Early prototype; not yet suitable as a full FL Studio replacement.** The [parity roadmap](docs/parity-roadmap.md) currently marks **11 items done, 47 partial, and 90 todo** (148 checklist entries total). This is an unweighted checklist count: partial items cover only stated subsets, and a completed small item does not count as the same amount of work as a complete subsystem.
@@ -11,6 +9,8 @@ This is a clean-room Rust project started from the FL Studio 26.1.6.5639 install
 - **Major parity gaps:** complete song rendering through automation, Mixer routing/effects, and PDC; automation playback; broad VST compatibility and state write-back; full FL Studio window/control behavior; and verified compatibility across FL Studio versions.
 
 See the roadmap for subsystem-level status and evidence. The counts above are refreshed manually when the roadmap changes.
+
+This is a clean-room Rust project started from the FL Studio 26.1.6.5639 installation supplied with the workspace. It is an independent rebuild; it does not load, patch, or link against the installed FL Studio executable or engine. The end goal is to open and modify any FL Studio project with backwards compatibility, matching controls, windows, and editing behavior, installed plug-in hosting, playback, and rendering. The current code contains the lossless file-format core and the first desktop editing shell; it is still far from full parity.
 
 The first milestone is deliberately a compatibility foundation: inspect FL Studio project (`.flp`) files and preserve every event, including data the reader does not understand. The same chunk reader also accepts a bundled `.fst` state preset, though it does not yet interpret most preset state. FL Studio's own documentation describes `.flp` as its native project format, `.fst` as a state/preset format, and ZIP project packages as projects bundled with referenced sample files. The installed projects and presets provide a local compatibility corpus.
 
