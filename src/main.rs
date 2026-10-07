@@ -14,7 +14,7 @@ use flp_rebuild::sample_render::{
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions};
 use flp_rebuild::{
     AutomationPointEdit, FlpDocument, PatternNote, PatternNoteEdit, PlaylistClipEdit,
-    ProjectInfoEdit, ProjectSettingsEdit,
+    ProjectInfoEdit, ProjectSettingsEdit, TimeMarkerEdit,
 };
 
 fn main() -> ExitCode {
@@ -381,6 +381,23 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u32(length, "clip length")?,
             )
         }
+        [command, input, output, arrangement_id, marker_index, position, is_signature, numerator, denominator, name]
+            if command == "edit-time-marker" =>
+        {
+            edit_time_marker(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(arrangement_id, "arrangement id")?,
+                parse_usize(marker_index, "time marker index")?,
+                TimeMarkerEdit {
+                    position_ticks: parse_optional_u32(position, "time marker position")?,
+                    is_signature: parse_optional_bool(is_signature, "time signature marker flag")?,
+                    numerator: parse_optional_u8(numerator, "time signature numerator")?,
+                    denominator: parse_optional_u8(denominator, "time signature denominator")?,
+                    name: project_info_argument(name),
+                },
+            )
+        }
         [command, input, midi_path, output, track, pattern_id, channel_id]
             if command == "import-midi" =>
         {
@@ -435,7 +452,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild add-note <input.flp> <output.flp> <pattern-id> <channel-id> <position> <length> <key> <velocity>\n",
             "  flp-rebuild delete-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index>\n",
             "  flp-rebuild import-midi <input.flp> <input.mid> <output.flp> <track> <pattern-id> <channel-id>\n",
-            "  flp-rebuild edit-clip <input.flp> <output.flp> <arrangement-id> <clip-index> <position> <length>"
+            "  flp-rebuild edit-clip <input.flp> <output.flp> <arrangement-id> <clip-index> <position> <length>\n",
+            "  flp-rebuild edit-time-marker <input.flp> <output.flp> <arrangement-id> <marker-index> <position-ticks|-> <signature:0|1|-> <numerator|-> <denominator|-> <name|->"
         )
         .to_owned()),
     }
@@ -492,6 +510,22 @@ fn parse_optional_bool(value: &str, description: &str) -> Result<Option<bool>, S
         "0" | "false" => Ok(Some(false)),
         "1" | "true" => Ok(Some(true)),
         _ => Err(format!("{description} must be 0, 1, true, false, or -")),
+    }
+}
+
+fn parse_optional_u8(value: &str, description: &str) -> Result<Option<u8>, String> {
+    if value == "-" {
+        Ok(None)
+    } else {
+        parse_u8(value, description).map(Some)
+    }
+}
+
+fn parse_optional_u32(value: &str, description: &str) -> Result<Option<u32>, String> {
+    if value == "-" {
+        Ok(None)
+    } else {
+        parse_u32(value, description).map(Some)
     }
 }
 
@@ -1870,6 +1904,29 @@ fn edit_clip(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "wrote arrangement {arrangement_id} clip {clip_index} with position {position} and length {length} to {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn edit_time_marker(
+    input: &Path,
+    output: &Path,
+    arrangement_id: u16,
+    marker_index: usize,
+    edit: TimeMarkerEdit,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .edit_time_marker(arrangement_id, marker_index, edit)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "edited time marker {marker_index} in arrangement {arrangement_id} to {}",
         output.display()
     );
     Ok(())

@@ -16,6 +16,8 @@ const FLP_PLAYLIST_RECORD_SIZES: [usize; 3] = [80, 60, 32];
 const FLP_AUTOMATION_COUNT_OFFSET: usize = 17;
 const FLP_AUTOMATION_POINTS_OFFSET: usize = 21;
 const FLP_AUTOMATION_POINT_SIZE: usize = 24;
+const TIME_MARKER_SIGNATURE_BIT: u32 = 0x0800_0000;
+const TIME_MARKER_TICK_MASK: u32 = 0x07FF_FFFF;
 const PROJECT_INFO_STRING_EVENTS: [u8; 5] = [0xC2, 0xCE, 0xCF, 0xC3, 0xC5];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -137,6 +139,16 @@ impl FlpEvent {
         }
     }
 
+    fn new_byte(opcode: u8, value: u8) -> Self {
+        Self {
+            opcode,
+            payload: vec![value],
+            encoding: PayloadEncoding::Byte,
+            wire_bytes: vec![opcode, value],
+            file_offset: 0,
+        }
+    }
+
     fn replace_byte_payload(&mut self, value: u8) -> Result<(), FlpError> {
         if self.encoding != PayloadEncoding::Byte || self.payload.len() != 1 {
             return Err(FlpError::InvalidEvent {
@@ -152,6 +164,25 @@ impl FlpEvent {
         };
         *wire_payload = value;
         self.payload[0] = value;
+        Ok(())
+    }
+
+    fn replace_dword_payload(&mut self, value: u32) -> Result<(), FlpError> {
+        if self.encoding != PayloadEncoding::Dword || self.payload.len() != 4 {
+            return Err(FlpError::InvalidEvent {
+                offset: self.file_offset,
+                detail: "event does not have a four-byte payload",
+            });
+        }
+        let encoded = value.to_le_bytes();
+        let Some(wire_payload) = self.wire_bytes.get_mut(1..5) else {
+            return Err(FlpError::InvalidEvent {
+                offset: self.file_offset,
+                detail: "dword event does not contain its payload",
+            });
+        };
+        wire_payload.copy_from_slice(&encoded);
+        self.payload.copy_from_slice(&encoded);
         Ok(())
     }
 }
@@ -588,6 +619,24 @@ pub struct TimeMarker {
     numerator: Option<u8>,
     denominator: Option<u8>,
     name: Option<String>,
+    source_events: TimeMarkerSourceEvents,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct TimeMarkerSourceEvents {
+    position: Option<usize>,
+    numerator: Option<usize>,
+    denominator: Option<usize>,
+    name: Option<usize>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TimeMarkerEdit {
+    pub position_ticks: Option<u32>,
+    pub is_signature: Option<bool>,
+    pub numerator: Option<u8>,
+    pub denominator: Option<u8>,
+    pub name: Option<String>,
 }
 
 impl TimeMarker {
@@ -597,14 +646,14 @@ impl TimeMarker {
     }
 
     /// Tick position with the documented signature-kind bit removed.
-    /// Other high bits are retained because their meaning is not established.
+    /// The raw dword remains available through `raw_position()` for unknown high bits.
     pub fn position_ticks(&self) -> u32 {
-        self.raw_position & !0x0800_0000
+        self.raw_position & TIME_MARKER_TICK_MASK
     }
 
     /// True when bit 27 marks this record as a time-signature marker.
     pub fn is_signature(&self) -> bool {
-        self.raw_position & 0x0800_0000 != 0
+        self.raw_position & TIME_MARKER_SIGNATURE_BIT != 0
     }
 
     pub fn numerator(&self) -> Option<u8> {
@@ -1470,6 +1519,151 @@ impl FlpDocument {
         Ok(markers)
     }
 
+    /// Edits the stored fields of one Playlist time marker while retaining its raw flags
+    /// and all unrelated events. Marker indexes are zero-based within the arrangement.
+    pub fn edit_time_marker(
+        &mut self,
+        arrangement_id: u16,
+        marker_index: usize,
+        edit: TimeMarkerEdit,
+    ) -> Result<(), FlpError> {
+        if edit.name.as_deref().is_some_and(|name| name.contains('\0')) {
+            return Err(FlpError::UnsupportedEdit(
+                "time marker names cannot contain an embedded NUL character",
+            ));
+        }
+        if edit.numerator == Some(0) || edit.denominator == Some(0) {
+            return Err(FlpError::UnsupportedEdit(
+                "time signature numerator and denominator must be positive",
+            ));
+        }
+        if edit
+            .position_ticks
+            .is_some_and(|position| position > TIME_MARKER_TICK_MASK)
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "time marker positions must fit in the low 27 position bits",
+            ));
+        }
+
+        let arrangements = self.arrangements_impl(false)?;
+        let mut matching_arrangements = arrangements
+            .iter()
+            .filter(|arrangement| arrangement.id == arrangement_id);
+        let Some(arrangement) = matching_arrangements.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested Playlist arrangement does not exist",
+            ));
+        };
+        if matching_arrangements.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested Playlist arrangement id is ambiguous",
+            ));
+        }
+        let marker =
+            arrangement
+                .time_markers
+                .get(marker_index)
+                .ok_or(FlpError::UnsupportedEdit(
+                    "the requested time marker does not exist",
+                ))?;
+        let source_events = marker.source_events.clone();
+        let position_event_index = source_events.position.ok_or(FlpError::UnsupportedEdit(
+            "the selected time marker has no source position event",
+        ))?;
+
+        let mut raw_position = marker.raw_position;
+        if let Some(position_ticks) = edit.position_ticks {
+            raw_position = (raw_position & !TIME_MARKER_TICK_MASK) | position_ticks;
+        }
+        if let Some(is_signature) = edit.is_signature {
+            if is_signature {
+                raw_position |= TIME_MARKER_SIGNATURE_BIT;
+            } else {
+                raw_position &= !TIME_MARKER_SIGNATURE_BIT;
+            }
+        }
+
+        let is_signature = raw_position & TIME_MARKER_SIGNATURE_BIT != 0;
+        let numerator = edit.numerator.or(marker.numerator);
+        let denominator = edit.denominator.or(marker.denominator);
+        if (edit.numerator.is_some() || edit.denominator.is_some()) && !is_signature {
+            return Err(FlpError::UnsupportedEdit(
+                "numerator and denominator can only be edited on a time-signature marker",
+            ));
+        }
+        if (edit.numerator.is_some() || edit.denominator.is_some())
+            && (numerator.is_none() || denominator.is_none())
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "editing a time signature requires both numerator and denominator values",
+            ));
+        }
+        if edit.is_signature == Some(true)
+            && !marker.is_signature()
+            && (numerator.is_none() || denominator.is_none())
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "converting a marker to a time signature requires numerator and denominator values",
+            ));
+        }
+
+        let mut candidate = self.clone();
+        candidate.events[position_event_index].replace_dword_payload(raw_position)?;
+
+        let mut insertion_index = position_event_index + 1;
+        for event_index in [source_events.numerator, source_events.denominator]
+            .into_iter()
+            .flatten()
+        {
+            insertion_index = insertion_index.max(event_index + 1);
+        }
+        if let Some(name_event_index) = source_events.name {
+            insertion_index = insertion_index.min(name_event_index);
+        }
+
+        let mut insertions = Vec::<(usize, u8, FlpEvent)>::new();
+        for (value, event_index, opcode, rank) in [
+            (edit.numerator, source_events.numerator, 0x21, 0),
+            (edit.denominator, source_events.denominator, 0x22, 1),
+        ] {
+            let Some(value) = value else {
+                continue;
+            };
+            if let Some(event_index) = event_index {
+                candidate.events[event_index].replace_byte_payload(value)?;
+            } else {
+                insertions.push((insertion_index, rank, FlpEvent::new_byte(opcode, value)));
+            }
+        }
+
+        if let Some(name) = edit.name {
+            if let Some(name_event_index) = source_events.name {
+                let event = &candidate.events[name_event_index];
+                if !matches!(event.encoding, PayloadEncoding::Data { .. }) {
+                    return Err(FlpError::UnsupportedEdit(
+                        "the selected time marker name is not a length-prefixed data event",
+                    ));
+                }
+                let utf16 =
+                    project_string_is_utf16(&event.payload, candidate.project_version.as_deref());
+                let payload = replace_project_string_payload(&event.payload, &name, utf16)?;
+                candidate.events[name_event_index].replace_data_payload(payload)?;
+            } else {
+                let payload = encode_project_string(&name, candidate.project_strings_use_utf16())?;
+                insertions.push((insertion_index, 2, FlpEvent::new_data(0xCD, payload)?));
+            }
+        }
+
+        insertions.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
+        for (event_index, _, event) in insertions {
+            candidate.events.insert(event_index, event);
+        }
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
     fn arrangements_impl(&self, include_clips: bool) -> Result<Vec<Arrangement>, FlpError> {
         let mut arrangements = Vec::<Arrangement>::new();
         let mut current_arrangement = None;
@@ -1538,6 +1732,10 @@ impl FlpDocument {
                             .time_markers
                             .push(TimeMarker {
                                 raw_position,
+                                source_events: TimeMarkerSourceEvents {
+                                    position: Some(event_index),
+                                    ..TimeMarkerSourceEvents::default()
+                                },
                                 ..TimeMarker::default()
                             });
                         current_time_marker = Some(TimeMarkerTarget::Arrangement {
@@ -1548,6 +1746,10 @@ impl FlpDocument {
                         let marker_index = pending_time_markers.len();
                         pending_time_markers.push(TimeMarker {
                             raw_position,
+                            source_events: TimeMarkerSourceEvents {
+                                position: Some(event_index),
+                                ..TimeMarkerSourceEvents::default()
+                            },
                             ..TimeMarker::default()
                         });
                         current_time_marker = Some(TimeMarkerTarget::Pending { marker_index });
@@ -1559,6 +1761,10 @@ impl FlpDocument {
                         let marker_index = arrangements[0].time_markers.len();
                         arrangements[0].time_markers.push(TimeMarker {
                             raw_position,
+                            source_events: TimeMarkerSourceEvents {
+                                position: Some(event_index),
+                                ..TimeMarkerSourceEvents::default()
+                            },
                             ..TimeMarker::default()
                         });
                         current_time_marker = Some(TimeMarkerTarget::Arrangement {
@@ -1572,6 +1778,7 @@ impl FlpDocument {
                         time_marker_at_mut(target, &mut arrangements, &mut pending_time_markers)
                     }) {
                         marker.numerator = Some(event.payload[0]);
+                        marker.source_events.numerator = Some(event_index);
                     }
                 }
                 0x22 if event.payload.len() == 1 => {
@@ -1579,6 +1786,7 @@ impl FlpDocument {
                         time_marker_at_mut(target, &mut arrangements, &mut pending_time_markers)
                     }) {
                         marker.denominator = Some(event.payload[0]);
+                        marker.source_events.denominator = Some(event_index);
                     }
                 }
                 0xCD => {
@@ -1588,6 +1796,7 @@ impl FlpDocument {
                         marker.name =
                             decode_project_string(&event.payload, self.project_version.as_deref())
                                 .filter(|name| !name.is_empty());
+                        marker.source_events.name = Some(event_index);
                     }
                     current_time_marker = None;
                 }
@@ -2467,6 +2676,19 @@ impl FlpDocument {
         self.events[..channel_start]
             .iter()
             .find(|event| PROJECT_INFO_STRING_EVENTS.contains(&event.opcode))
+            .is_some_and(|event| project_string_is_utf16(&event.payload, None))
+    }
+
+    fn project_strings_use_utf16(&self) -> bool {
+        if self.project_version.is_some() {
+            return !uses_legacy_string_encoding(self.project_version.as_deref());
+        }
+        self.events
+            .iter()
+            .find(|event| {
+                PROJECT_INFO_STRING_EVENTS.contains(&event.opcode)
+                    || matches!(event.opcode, 0xC1 | 0xCB | 0xCD | 0xF1)
+            })
             .is_some_and(|event| project_string_is_utf16(&event.payload, None))
     }
 
@@ -3902,7 +4124,7 @@ fn decode_vst_text(bytes: &[u8]) -> Option<String> {
 mod tests {
     use super::{
         FlpDocument, FlpError, MixerParameterKind, PatternNote, PayloadEncoding, ProjectInfoEdit,
-        ProjectSettingsEdit, midi::MidiChannelMapping, midi::MidiFile,
+        ProjectSettingsEdit, TimeMarkerEdit, midi::MidiChannelMapping, midi::MidiFile,
         parse_vst_plugin_state_metadata,
     };
 
@@ -4328,6 +4550,110 @@ mod tests {
         assert_eq!(named_marker.denominator(), Some(4));
         assert_eq!(named_marker.name(), Some("Verse"));
         assert_eq!(document.encode_lossless().unwrap(), input);
+    }
+
+    #[test]
+    fn edits_time_marker_position_and_name_while_preserving_raw_flags() {
+        let mut event_stream = vec![0x63, 7, 0];
+        append_time_marker(&mut event_stream, 0x0800_0000 | 1_536, 7, 8, "Signature");
+        append_time_marker(&mut event_stream, 0x8000_0900, 4, 4, "Verse");
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        let input = flp_fixture(&event_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+        let original_events = document
+            .events()
+            .iter()
+            .map(|event| event.wire_bytes().to_vec())
+            .collect::<Vec<_>>();
+        let position_event = document
+            .events()
+            .iter()
+            .rposition(|event| event.opcode() == 0x94)
+            .expect("second position event should exist");
+        let name_event = document
+            .events()
+            .iter()
+            .rposition(|event| event.opcode() == 0xCD)
+            .expect("second name event should exist");
+
+        document
+            .edit_time_marker(
+                7,
+                1,
+                TimeMarkerEdit {
+                    position_ticks: Some(2_048),
+                    name: Some("Chorus".to_owned()),
+                    ..TimeMarkerEdit::default()
+                },
+            )
+            .expect("marker should be editable");
+
+        let markers = document.time_markers().expect("markers should decode");
+        assert_eq!(markers[1].1.raw_position(), 0x8000_0800);
+        assert_eq!(markers[1].1.position_ticks(), 2_048);
+        assert!(!markers[1].1.is_signature());
+        assert_eq!(markers[1].1.numerator(), Some(4));
+        assert_eq!(markers[1].1.denominator(), Some(4));
+        assert_eq!(markers[1].1.name(), Some("Chorus"));
+        assert_eq!(document.events().len(), original_events.len());
+        for (index, (before, after)) in original_events.iter().zip(document.events()).enumerate() {
+            if index == position_event || index == name_event {
+                continue;
+            }
+            assert_eq!(
+                before,
+                after.wire_bytes(),
+                "event {index} should be unchanged"
+            );
+        }
+        let encoded = document
+            .encode_lossless()
+            .expect("edited project should encode");
+        FlpDocument::parse(&encoded).expect("edited project should parse again");
+    }
+
+    #[test]
+    fn marker_edit_can_add_signature_fields_and_rejects_invalid_updates_atomically() {
+        let mut event_stream = vec![0x63, 7, 0, 0x94];
+        event_stream.extend_from_slice(&960u32.to_le_bytes());
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        let input = flp_fixture(&event_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+
+        document
+            .edit_time_marker(
+                7,
+                0,
+                TimeMarkerEdit {
+                    is_signature: Some(true),
+                    numerator: Some(3),
+                    denominator: Some(8),
+                    name: Some("Pickup".to_owned()),
+                    ..TimeMarkerEdit::default()
+                },
+            )
+            .expect("signature marker fields should be insertable");
+        let marker = &document.time_markers().expect("marker should decode")[0].1;
+        assert_eq!(marker.position_ticks(), 960);
+        assert!(marker.is_signature());
+        assert_eq!(marker.numerator(), Some(3));
+        assert_eq!(marker.denominator(), Some(8));
+        assert_eq!(marker.name(), Some("Pickup"));
+
+        let before = document.encode_lossless().expect("project should encode");
+        assert!(
+            document
+                .edit_time_marker(
+                    7,
+                    0,
+                    TimeMarkerEdit {
+                        position_ticks: Some(0x0800_0000),
+                        ..TimeMarkerEdit::default()
+                    },
+                )
+                .is_err()
+        );
+        assert_eq!(document.encode_lossless().unwrap(), before);
     }
 
     #[test]
