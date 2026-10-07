@@ -1631,27 +1631,61 @@ impl DawUi {
     }
 
     fn mixer(&self, ui: &mut egui::Ui) {
-        if self.document.is_none() {
+        let Some(document) = self.document.as_ref() else {
             empty_view(ui, "Open a project to see the Mixer");
             return;
-        }
+        };
+        let inserts = document.mixer_inserts();
+        let parameter_count = document
+            .mixer_parameter_records()
+            .map(|records| records.len())
+            .unwrap_or(0);
         ui.horizontal(|ui| {
             ui.strong("Mixer");
             ui.separator();
-            ui.label("Master");
+            ui.label(format!("{} insert records", inserts.len()));
+            ui.separator();
+            ui.label(format!("{parameter_count} parameter records"));
         });
         ui.separator();
-        ui.centered_and_justified(|ui| {
-            ui.vertical_centered(|ui| {
-                ui.heading("Mixer data is not decoded yet");
-                ui.label(
-                    egui::RichText::new(
-                        "Insert tracks, routing, effect slots, and meters will appear here",
-                    )
-                    .color(MUTED),
-                );
+        if inserts.is_empty() {
+            ui.centered_and_justified(|ui| {
+                ui.vertical_centered(|ui| {
+                    ui.heading("No recognized Mixer insert records");
+                    ui.label(
+                        egui::RichText::new(
+                            "This project may use an older or not yet decoded Mixer layout",
+                        )
+                        .color(MUTED),
+                    );
+                });
             });
-        });
+            return;
+        }
+
+        ui.label(
+            egui::RichText::new(
+                "Insert names and raw route fields are available. Faders, effect slots, and routing edits still need format mapping.",
+            )
+            .color(MUTED),
+        );
+        egui::ScrollArea::horizontal()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for insert in &inserts {
+                        ui.group(|ui| {
+                            ui.set_min_width(132.0);
+                            ui.vertical(|ui| {
+                                ui.strong(insert.name().unwrap_or("(unnamed)"));
+                                ui.small(format!("Input {}", insert.input_raw()));
+                                ui.small(format!("Output {}", insert.output_raw()));
+                                ui.small(format!("Color 0x{:08X}", insert.color_raw()));
+                            });
+                        });
+                    }
+                });
+            });
     }
 
     fn audio_settings_view(&mut self, ui: &mut egui::Ui) {

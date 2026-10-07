@@ -32,7 +32,7 @@ The foundation. Everything else depends on reading projects exactly.
 | Channel records: all types (sampler, generator, layer, MIDI out, automation clip) | `[partial]` | Audio channels + VST identity decoded; legacy channel types unmapped |
 | Pattern/score events: note records, all encodings | `[partial]` | 24-byte records handled; empty-pattern and conflicting-encoding edge cases guarded |
 | Playlist events: clips, tracks, arrangements | `[partial]` | Clip position/length editable; all three record sizes (80/60/32) recognized |
-| Mixer state events | `[todo]` | Track names, routing, FX slot assignments, levels — opaque today |
+| Mixer state events | `[partial]` | Reads insert names, raw input/output/color/icon fields from the observed `0x9A`/`0x93`/`0x95` sequence and preserves 12-byte records from `0xE1`; parameter meaning, FX state, and routing edits remain incomplete. |
 | Automation events (channel envelopes, event automation) | `[todo]` | |
 | Time markers, song position markers | `[todo]` | |
 | Project settings: swing, master pitch, metronome, recording settings | `[todo]` | |
@@ -68,7 +68,7 @@ The decoded document must model everything the format can express.
 - `[partial]` Channels: summaries, sample paths, plugin state blobs, levels
 - `[partial]` Patterns: note lists per channel
 - `[partial]` Playlist: tracks, arrangements, clips with targets
-- `[todo]` Mixer: 125 insert tracks + master + sends, per-track state
+- `[partial]` Mixer: recognized insert summaries and raw `0xE1` parameter records; full 125 inserts, master/sends, track mapping, and editable state remain incomplete
 - `[todo]` Automation: clips, LFOs, envelopes bound to parameters
 - `[todo]` Time signatures per pattern/arrangement, tempo automation
 - `[todo]` Channel groups, colors, icons
@@ -228,7 +228,7 @@ roll is famously deep — the full toolset:
 
 ## 9. Mixer
 
-- `[todo]` Full 125-track UI with routing visualization
+- `[partial]` Full 125-track UI with routing visualization: current view lists recognized insert names and raw route fields, without controls or routing visualization
 - `[todo]` Per-track EQ, stereo separation, phase invert
 - `[todo]` FX slot management (10 slots/track), drag-reorder, save/load chains
 - `[todo]` Send knobs, sidechain inputs

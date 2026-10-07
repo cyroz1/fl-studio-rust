@@ -374,6 +374,101 @@ pub struct PlaylistTrack {
     pub state_bytes: Vec<u8>,
 }
 
+/// Read-only Mixer insert fields recognized from the observed `0x9A`, `0x93`,
+/// `0x95` sequence. The source events remain byte-exact in [`FlpDocument::events`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MixerInsertSummary {
+    ordinal: usize,
+    input_raw: i32,
+    output_raw: i32,
+    color_raw: u32,
+    icon_raw: Option<i16>,
+    name: Option<String>,
+    first_event_index: usize,
+    end_event_index: usize,
+}
+
+impl MixerInsertSummary {
+    /// Zero-based order among Mixer insert records recognized in the event stream.
+    pub fn ordinal(&self) -> usize {
+        self.ordinal
+    }
+
+    /// Raw signed value carried by the insert's `0x9A` event.
+    pub fn input_raw(&self) -> i32 {
+        self.input_raw
+    }
+
+    /// Raw signed value carried by the insert's `0x93` event.
+    pub fn output_raw(&self) -> i32 {
+        self.output_raw
+    }
+
+    /// Raw four-byte value carried by the insert's `0x95` event.
+    pub fn color_raw(&self) -> u32 {
+        self.color_raw
+    }
+
+    /// Raw signed icon value carried by the insert's `0x5F` event, when present.
+    pub fn icon_raw(&self) -> Option<i16> {
+        self.icon_raw
+    }
+
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    /// Event range associated with this insert record, ending before the next recognized record.
+    pub fn event_range(&self) -> std::ops::Range<usize> {
+        self.first_event_index..self.end_event_index
+    }
+}
+
+/// One opaque 12-byte Mixer parameter record from a `0xE1` event.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MixerParameterRecord {
+    event_index: usize,
+    record_index: usize,
+    prefix: [u8; 4],
+    parameter_id: u8,
+    reserved: u8,
+    channel_data: u16,
+    value: i32,
+}
+
+impl MixerParameterRecord {
+    pub fn event_index(&self) -> usize {
+        self.event_index
+    }
+
+    pub fn record_index(&self) -> usize {
+        self.record_index
+    }
+
+    /// Four leading bytes retained without assigning them a meaning.
+    pub fn prefix(&self) -> [u8; 4] {
+        self.prefix
+    }
+
+    pub fn parameter_id(&self) -> u8 {
+        self.parameter_id
+    }
+
+    pub fn reserved(&self) -> u8 {
+        self.reserved
+    }
+
+    /// Raw little-endian word retained without assigning its bit fields a meaning.
+    pub fn channel_data(&self) -> u16 {
+        self.channel_data
+    }
+
+    /// Raw signed parameter value.
+    pub fn value(&self) -> i32 {
+        self.value
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlaylistClip {
     pub position_ticks: u32,
@@ -954,6 +1049,108 @@ impl FlpDocument {
             });
         }
         tracks
+    }
+
+    /// Returns Mixer insert summaries for the observed adjacent `0x9A`, `0x93`, `0x95`
+    /// record signature. This is intentionally read-only; the unparsed insert and effect data
+    /// remains available byte-for-byte through `events()`.
+    pub fn mixer_inserts(&self) -> Vec<MixerInsertSummary> {
+        let starts = self
+            .events
+            .windows(3)
+            .enumerate()
+            .filter_map(|(index, window)| {
+                (window[0].opcode == 0x9A
+                    && window[0].payload.len() == 4
+                    && window[1].opcode == 0x93
+                    && window[1].payload.len() == 4
+                    && window[2].opcode == 0x95
+                    && window[2].payload.len() == 4)
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+
+        starts
+            .iter()
+            .enumerate()
+            .map(|(ordinal, &start)| {
+                let end = starts
+                    .get(ordinal + 1)
+                    .copied()
+                    .unwrap_or(self.events.len());
+                let insert_events = &self.events[start..end];
+                let read_i32 = |offset: usize| {
+                    i32::from_le_bytes(
+                        self.events[start + offset].payload[..4]
+                            .try_into()
+                            .expect("the Mixer record signature checked four-byte fields"),
+                    )
+                };
+                let color_raw = u32::from_le_bytes(
+                    self.events[start + 2].payload[..4]
+                        .try_into()
+                        .expect("the Mixer record signature checked four-byte fields"),
+                );
+                let icon_raw = insert_events
+                    .iter()
+                    .find(|event| event.opcode == 0x5F && event.payload.len() == 2)
+                    .map(|event| i16::from_le_bytes([event.payload[0], event.payload[1]]));
+                let name = insert_events
+                    .iter()
+                    .find(|event| event.opcode == 0xCC)
+                    .and_then(|event| {
+                        decode_project_string(&event.payload, self.project_version.as_deref())
+                    })
+                    .filter(|value| !value.is_empty());
+
+                MixerInsertSummary {
+                    ordinal,
+                    input_raw: read_i32(0),
+                    output_raw: read_i32(1),
+                    color_raw,
+                    icon_raw,
+                    name,
+                    first_event_index: start,
+                    end_event_index: end,
+                }
+            })
+            .collect()
+    }
+
+    /// Decodes only the fixed 12-byte framing observed in Mixer `0xE1` parameter records.
+    /// Unknown fields remain raw, and a different record size is reported instead of guessed.
+    pub fn mixer_parameter_records(&self) -> Result<Vec<MixerParameterRecord>, FlpError> {
+        const RECORD_SIZE: usize = 12;
+        let mut records = Vec::new();
+        for (event_index, event) in self.events.iter().enumerate() {
+            if event.opcode != 0xE1 {
+                continue;
+            }
+            if !event.payload.len().is_multiple_of(RECORD_SIZE) {
+                return Err(FlpError::InvalidEvent {
+                    offset: event.file_offset,
+                    detail: "Mixer parameter payload is not a whole number of 12-byte records",
+                });
+            }
+            for (record_index, bytes) in event.payload.chunks_exact(RECORD_SIZE).enumerate() {
+                records.push(MixerParameterRecord {
+                    event_index,
+                    record_index,
+                    prefix: bytes[..4]
+                        .try_into()
+                        .expect("the Mixer parameter record has four prefix bytes"),
+                    parameter_id: bytes[4],
+                    reserved: bytes[5],
+                    channel_data: u16::from_le_bytes([bytes[6], bytes[7]]),
+                    value: i32::from_le_bytes(
+                        bytes[8..12]
+                            .try_into()
+                            .expect("the Mixer parameter record has a four-byte value"),
+                    ),
+                });
+            }
+        }
+        Ok(records)
     }
 
     /// Edits fields with established playlist record offsets while preserving every other byte.
@@ -2177,6 +2374,12 @@ mod tests {
         bytes
     }
 
+    fn append_data_event(event_stream: &mut Vec<u8>, opcode: u8, payload: &[u8]) {
+        event_stream.push(opcode);
+        event_stream.extend_from_slice(&super::encode_leb128(payload.len() as u32));
+        event_stream.extend_from_slice(payload);
+    }
+
     fn append_vst_field(payload: &mut Vec<u8>, id: u32, data: &[u8]) {
         payload.extend_from_slice(&id.to_le_bytes());
         payload.extend_from_slice(&(data.len() as u64).to_le_bytes());
@@ -2249,6 +2452,87 @@ mod tests {
         bytes.extend_from_slice(&(track.len() as u32).to_be_bytes());
         bytes.extend_from_slice(track);
         bytes
+    }
+
+    #[test]
+    fn decodes_observed_mixer_insert_fields_without_rewriting_source_events() {
+        let mut event_stream = Vec::new();
+        for (input, output, color, icon, name) in [
+            (-1_i32, 0_i32, 0x001C_1F8Cu32, 75_i16, "KICK"),
+            (-1_i32, -1_i32, 0x001D_2792u32, 76_i16, "TOMS"),
+        ] {
+            event_stream.push(0x9A);
+            event_stream.extend_from_slice(&input.to_le_bytes());
+            event_stream.push(0x93);
+            event_stream.extend_from_slice(&output.to_le_bytes());
+            event_stream.push(0x95);
+            event_stream.extend_from_slice(&color.to_le_bytes());
+            event_stream.push(0x5F);
+            event_stream.extend_from_slice(&icon.to_le_bytes());
+            let name = name
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>();
+            append_data_event(&mut event_stream, 0xCC, &name);
+        }
+
+        let original = flp_fixture(&event_stream, &[], &[]);
+        let document = FlpDocument::parse(&original).expect("the fixture should parse");
+        let inserts = document.mixer_inserts();
+
+        assert_eq!(inserts.len(), 2);
+        assert_eq!(inserts[0].ordinal(), 0);
+        assert_eq!(inserts[0].name(), Some("KICK"));
+        assert_eq!(inserts[0].input_raw(), -1);
+        assert_eq!(inserts[0].output_raw(), 0);
+        assert_eq!(inserts[0].color_raw(), 0x001C_1F8C);
+        assert_eq!(inserts[0].icon_raw(), Some(75));
+        assert_eq!(inserts[0].event_range(), 0..5);
+        assert_eq!(inserts[1].name(), Some("TOMS"));
+        assert_eq!(inserts[1].output_raw(), -1);
+        assert_eq!(
+            document
+                .encode_lossless()
+                .expect("lossless encoding should succeed"),
+            original
+        );
+    }
+
+    #[test]
+    fn decodes_fixed_mixer_parameter_records_and_rejects_unmapped_record_sizes() {
+        let mut payload = vec![0xAA, 0xBB, 0xCC, 0xDD, 192, 0];
+        payload.extend_from_slice(&0x0123_u16.to_le_bytes());
+        payload.extend_from_slice(&12_800_i32.to_le_bytes());
+        payload.extend_from_slice(&[0x11, 0x22, 0x33, 0x44, 193, 7]);
+        payload.extend_from_slice(&0x4567_u16.to_le_bytes());
+        payload.extend_from_slice(&(-6400_i32).to_le_bytes());
+        let mut event_stream = Vec::new();
+        append_data_event(&mut event_stream, 0xE1, &payload);
+        let document = FlpDocument::parse(&flp_fixture(&event_stream, &[], &[]))
+            .expect("the fixed-size Mixer parameter event should parse");
+
+        let records = document
+            .mixer_parameter_records()
+            .expect("12-byte records should decode");
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].prefix(), [0xAA, 0xBB, 0xCC, 0xDD]);
+        assert_eq!(records[0].parameter_id(), 192);
+        assert_eq!(records[0].reserved(), 0);
+        assert_eq!(records[0].channel_data(), 0x0123);
+        assert_eq!(records[0].value(), 12_800);
+        assert_eq!(records[1].parameter_id(), 193);
+        assert_eq!(records[1].reserved(), 7);
+        assert_eq!(records[1].channel_data(), 0x4567);
+        assert_eq!(records[1].value(), -6400);
+
+        let mut malformed_stream = Vec::new();
+        append_data_event(&mut malformed_stream, 0xE1, &[0xAA]);
+        let malformed = FlpDocument::parse(&flp_fixture(&malformed_stream, &[], &[]))
+            .expect("unknown parameter payloads remain parseable");
+        assert!(matches!(
+            malformed.mixer_parameter_records(),
+            Err(FlpError::InvalidEvent { .. })
+        ));
     }
 
     #[test]

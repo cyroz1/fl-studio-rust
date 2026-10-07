@@ -25,6 +25,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
     match args.as_slice() {
         [command, path] if command == "info" => inspect(Path::new(path)),
         [command, path] if command == "channels" => list_channels(Path::new(path)),
+        [command, path] if command == "mixer" => list_mixer(Path::new(path)),
         [command, path] if command == "sample-paths" => list_sample_paths(Path::new(path)),
         [command, path] if command == "audio-info" => inspect_audio_file(Path::new(path)),
         [command, project, output] if command == "render-audio-clips" => render_audio_clips(
@@ -242,6 +243,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild plugin-scan\n",
             "  flp-rebuild render-pattern-vst3 <project.flp> <pattern-id> <channel-id> <plugin.vst3> <output.wav> [tail-seconds]\n",
             "  flp-rebuild channels <file.flp>\n",
+            "  flp-rebuild mixer <file.flp>\n",
             "  flp-rebuild sample-paths <file.flp>\n",
             "  flp-rebuild audio-info <audio-file>\n",
             "  flp-rebuild render-audio-clips <project.flp> <output.wav> [arrangement-id]\n",
@@ -763,6 +765,29 @@ fn list_channels(path: &Path) -> Result<(), String> {
             channel.event_range()
         );
     }
+    Ok(())
+}
+
+fn list_mixer(path: &Path) -> Result<(), String> {
+    let (_, document) = load_document(path)?;
+    let inserts = document.mixer_inserts();
+    let parameters = document
+        .mixer_parameter_records()
+        .map_err(|error| format!("could not decode Mixer parameter records: {error}"))?;
+    println!("recognized insert records: {}", inserts.len());
+    for insert in inserts {
+        println!(
+            "ordinal={} name={} input_raw={} output_raw={} color_raw=0x{:08X} icon_raw={:?} events={:?}",
+            insert.ordinal(),
+            insert.name().unwrap_or("(unnamed)"),
+            insert.input_raw(),
+            insert.output_raw(),
+            insert.color_raw(),
+            insert.icon_raw(),
+            insert.event_range()
+        );
+    }
+    println!("opaque 0xE1 parameter records: {}", parameters.len());
     Ok(())
 }
 
