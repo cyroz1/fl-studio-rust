@@ -276,11 +276,17 @@ implementation).
 
 ## 13. Render / export
 
-Current: experimental offline renders (audio clips → WAV, pattern via VST3 →
-WAV). Full export surface:
+Current: experimental offline renders include audio clips, Sampler Pattern
+Clips, and mapped VST3 instruments in one bounded Playlist mix → stereo float
+WAV. This first combined renderer uses base tempo and provisional channel
+volume/pan; it does not apply automation, Mixer routing/effects, or PDC. Full
+export surface:
 
-- `[todo]` Full-song render through the complete mixer graph (instruments +
-  samples + automation + FX + PDC) — the definition of "it plays back right"
+- `[partial]` Full-song render through the complete mixer graph (instruments +
+  samples + automation + FX + PDC): the desktop can render enabled Playlist
+  audio clips, Sampler Pattern Clips, and mapped installed VST3 instruments in
+  bounded blocks to a 32-bit float WAV. Automation, Mixer routing/effects, PDC,
+  native level comparison, and export options remain incomplete.
 - `[todo]` Formats: WAV (16/24/32-bit), MP3, OGG, FLAC
 - `[todo]` Render options: quality (resampling), dithering, normalize, tail length
 - `[todo]` Stem export: split mixer tracks, "split channel tracks"
@@ -348,8 +354,9 @@ Ordered by dependency and by "most compatibility per unit effort":
    found and attempts supported marker-12 state restore. Broaden identity and
    state-layout support, add state write-back, then add automation, multibus
    routing, Mixer integration, process isolation, and PDC.
-5. **Full-song offline render** — instruments + samples + FX in one graph
-   (validates the engine without realtime pressure)
+5. **Full-song offline render (partial)** — Playlist audio, Samplers, and mapped
+   VST3 instruments render together; add automation, Mixer routing/effects,
+   PDC, native comparison, and export options to complete the graph
 6. **PDC + sends/sidechain** — mixer correctness
 7. **Piano roll tools** — the editing depth users expect
 8. **Playlist audio** — waveforms, fades, stretch

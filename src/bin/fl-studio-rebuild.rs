@@ -15,7 +15,8 @@ use flp_rebuild::plugins::{PluginCandidate, PluginFormat, scan_installed_plugins
 use flp_rebuild::sample_render::{
     AudioClipRenderOptions, PlaylistRenderOptions, PlaylistRenderSummary,
     SamplerPatternRenderOptions, SamplerPatternRenderSummary, render_audio_clips_to_wav,
-    stream_playlist_with_vst3_to_device, stream_sampler_pattern_to_device,
+    render_playlist_with_vst3_to_wav_cancellable, stream_playlist_with_vst3_to_device,
+    stream_sampler_pattern_to_device,
 };
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions, Vst3PatternStreamHandle};
 use flp_rebuild::{
@@ -312,6 +313,8 @@ struct DawUi {
     audio_engine: Option<AudioEngine>,
     pending_audio_render: Option<PendingAudioRender>,
     audio_render_workers: Vec<PendingAudioRender>,
+    pending_song_render: Option<PendingSongRender>,
+    song_render_workers: Vec<PendingSongRender>,
     pending_vst3_stream: Option<Vst3PatternStreamHandle>,
     vst3_workers: Vec<Vst3PatternStreamHandle>,
     pending_sampler_stream: Option<PendingSamplerStream>,
@@ -333,6 +336,13 @@ struct PendingAudioRender {
     receiver: Receiver<Result<PlaylistRenderSummary, String>>,
     cancelled: Arc<AtomicBool>,
     worker: thread::JoinHandle<()>,
+}
+
+struct PendingSongRender {
+    receiver: Receiver<Result<PlaylistRenderSummary, String>>,
+    cancelled: Arc<AtomicBool>,
+    worker: thread::JoinHandle<()>,
+    output_path: PathBuf,
 }
 
 struct PendingSamplerStream {
@@ -390,6 +400,8 @@ impl DawUi {
             audio_engine: None,
             pending_audio_render: None,
             audio_render_workers: Vec::new(),
+            pending_song_render: None,
+            song_render_workers: Vec::new(),
             pending_vst3_stream: None,
             vst3_workers: Vec::new(),
             pending_sampler_stream: None,
@@ -816,6 +828,10 @@ impl DawUi {
     }
 
     fn start_project_playback(&mut self) {
+        if self.pending_song_render.is_some() {
+            self.status = "Stop the Playlist render before starting playback".to_owned();
+            return;
+        }
         if self.pending_audio_render.is_some() {
             self.status = "Project audio is already being prepared".to_owned();
             return;
@@ -1065,6 +1081,10 @@ impl DawUi {
     }
 
     fn toggle_project_playback(&mut self) {
+        if self.pending_song_render.is_some() {
+            self.status = "Stop the Playlist render before starting playback".to_owned();
+            return;
+        }
         if self.playing {
             if let Some(engine) = &self.audio_engine {
                 engine.pause_project_playback();
@@ -1095,6 +1115,10 @@ impl DawUi {
         if let Some(pending) = self.pending_audio_render.take() {
             pending.cancelled.store(true, Ordering::Release);
             self.audio_render_workers.push(pending);
+        }
+        if let Some(render) = self.pending_song_render.take() {
+            render.cancelled.store(true, Ordering::Release);
+            self.song_render_workers.push(render);
         }
         if let Some(stream) = self.pending_vst3_stream.take() {
             self.vst3_workers.push(stream);
@@ -1152,6 +1176,20 @@ impl DawUi {
         }
     }
 
+    fn reap_song_render_workers(&mut self) {
+        let mut index = 0;
+        while index < self.song_render_workers.len() {
+            if self.song_render_workers[index].worker.is_finished() {
+                let render = self.song_render_workers.swap_remove(index);
+                if render.worker.join().is_err() {
+                    self.status = "A cancelled Playlist render worker panicked".to_owned();
+                }
+            } else {
+                index += 1;
+            }
+        }
+    }
+
     fn top_menu(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_centered(|ui| {
             ui.strong("FL")
@@ -1192,8 +1230,19 @@ impl DawUi {
             }
             if ui
                 .add_enabled(
+                    self.document.is_some()
+                        && self.current_path.is_some()
+                        && self.pending_song_render.is_none(),
+                    egui::Button::new("Render Playlist mix…"),
+                )
+                .clicked()
+            {
+                self.render_playlist_dialog();
+            }
+            if ui
+                .add_enabled(
                     self.document.is_some() && self.current_path.is_some(),
-                    egui::Button::new("Render audio…"),
+                    egui::Button::new("Render audio clips…"),
                 )
                 .clicked()
             {
@@ -1232,10 +1281,11 @@ impl DawUi {
                 self.status = "Recording is not implemented yet".to_owned();
             }
             if ui.button("■").on_hover_text("Stop").clicked() {
-                let was_preparing = self.pending_audio_render.is_some();
+                let was_preparing =
+                    self.pending_audio_render.is_some() || self.pending_song_render.is_some();
                 self.stop_project_playback();
                 self.status = if was_preparing {
-                    "Audio preparation cancelled".to_owned()
+                    "Audio preparation or render cancelled".to_owned()
                 } else {
                     "Project playback stopped".to_owned()
                 };
@@ -2876,6 +2926,141 @@ impl DawUi {
         }
     }
 
+    fn render_playlist_dialog(&mut self) {
+        let (Some(project_path), Some(document)) =
+            (self.current_path.as_deref(), self.document.as_ref())
+        else {
+            self.status = "Open a project before rendering the Playlist".to_owned();
+            return;
+        };
+        if self.pending_song_render.is_some() {
+            self.status = "A Playlist render is already running".to_owned();
+            return;
+        }
+        if self.playing
+            || self.project_playback_loaded
+            || self.pending_audio_render.is_some()
+            || self.pending_vst3_stream.is_some()
+            || self.pending_sampler_stream.is_some()
+        {
+            self.status =
+                "Stop Song playback or pattern preview before rendering the Playlist".to_owned();
+            return;
+        }
+        let project_stem = project_path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "FL_Studio_Project".to_owned());
+        let Some(output_path) = rfd::FileDialog::new()
+            .set_title("Render Playlist mix")
+            .set_file_name(format!("{project_stem}.wav"))
+            .add_filter("32-bit float WAV audio", &["wav"])
+            .save_file()
+        else {
+            return;
+        };
+
+        let options = PlaylistRenderOptions {
+            arrangement_id: self.selected_arrangement.unwrap_or_default(),
+            sample_rate: self.audio_settings.sample_rate,
+            ..PlaylistRenderOptions::default()
+        };
+        let vst3_processor = self
+            .vst3_host
+            .as_ref()
+            .map(|host| {
+                host.prepare_playlist_stream(
+                    document,
+                    options.arrangement_id,
+                    &self.channel_vst3_instances,
+                    options.sample_rate,
+                    2.0,
+                )
+            })
+            .transpose();
+        let vst3_processor = match vst3_processor {
+            Ok(processor) => processor,
+            Err(error) => {
+                self.status = format!("Could not prepare Playlist VST3 instruments: {error}");
+                return;
+            }
+        };
+
+        let project_path = project_path.to_path_buf();
+        let document = document.clone();
+        let output_path_for_worker = output_path.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name("playlist-wav-render".to_owned())
+            .spawn(move || {
+                let result = render_playlist_with_vst3_to_wav_cancellable(
+                    &document,
+                    &project_path,
+                    options,
+                    &output_path_for_worker,
+                    vst3_processor,
+                    &worker_cancelled,
+                );
+                let _ = sender.send(result);
+            });
+        match worker {
+            Ok(worker) => {
+                self.pending_song_render = Some(PendingSongRender {
+                    receiver,
+                    cancelled,
+                    worker,
+                    output_path: output_path.clone(),
+                });
+                self.status = format!("Rendering Playlist mix to {}…", output_path.display());
+            }
+            Err(error) => {
+                self.status = format!("Could not start Playlist render worker: {error}");
+            }
+        }
+    }
+
+    fn poll_song_render(&mut self) {
+        let completed = self.pending_song_render.as_ref().and_then(|pending| {
+            match pending.receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Disconnected) => {
+                    Some(Err("Playlist render worker stopped unexpectedly".to_owned()))
+                }
+                Err(TryRecvError::Empty) => None,
+            }
+        });
+        let Some(result) = completed else {
+            return;
+        };
+        let Some(pending) = self.pending_song_render.take() else {
+            return;
+        };
+        if pending.worker.join().is_err() {
+            self.status = "Playlist render worker panicked".to_owned();
+            return;
+        }
+        match result {
+            Ok(summary) => {
+                self.status = format!(
+                    "Rendered {} audio clips, {} Sampler clips ({} notes), and {} VST3 channels ({} notes) to {} at {} Hz; {} plug-in channels unloaded, {} scaled audio and {} scaled pattern clips skipped. Mixer effects and automation were not rendered",
+                    summary.audio_clips_rendered,
+                    summary.sampler_pattern_clips_rendered,
+                    summary.sampler_notes_rendered,
+                    summary.vst3_plugin_channels_rendered,
+                    summary.vst3_notes_rendered,
+                    pending.output_path.display(),
+                    summary.sample_rate,
+                    summary.vst3_plugin_channels_unloaded,
+                    summary.audio_clips_skipped_unsupported_scale,
+                    summary.pattern_clips_skipped_unsupported_scale,
+                );
+            }
+            Err(error) => self.status = format!("Could not render Playlist mix: {error}"),
+        }
+    }
+
     fn export_selected_pattern_midi_dialog(&mut self) {
         let Some(pattern_id) = self.selected_pattern else {
             self.status = "Select a pattern before exporting MIDI".to_owned();
@@ -4068,9 +4253,11 @@ impl DawUi {
 impl eframe::App for DawUi {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_project_audio_render();
+        self.poll_song_render();
         self.poll_vst3_stream();
         self.poll_sampler_stream();
         self.reap_audio_render_workers();
+        self.reap_song_render_workers();
         self.reap_vst3_workers();
         self.reap_sampler_workers();
         for (key, view) in [
@@ -4170,6 +4357,9 @@ impl Drop for DawUi {
         self.stop_project_playback();
         for worker in self.audio_render_workers.drain(..) {
             let _ = worker.worker.join();
+        }
+        for render in self.song_render_workers.drain(..) {
+            let _ = render.worker.join();
         }
         if let Some(stream) = self.pending_vst3_stream.take() {
             self.vst3_workers.push(stream);

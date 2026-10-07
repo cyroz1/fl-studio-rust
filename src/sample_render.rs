@@ -288,6 +288,150 @@ pub fn stream_playlist_with_vst3_to_device(
     Ok(summary)
 }
 
+/// Render enabled Playlist audio clips, Sampler Pattern Clips, and mapped VST3 instruments to a
+/// stereo 32-bit-float WAV. Audio is mixed in bounded blocks and written to a temporary file, so
+/// song length does not determine the in-memory mix size. Mixer effects, routing, tempo
+/// automation, and plugin delay compensation are not applied.
+pub fn render_playlist_with_vst3_to_wav_cancellable(
+    document: &FlpDocument,
+    project_path: impl AsRef<Path>,
+    options: PlaylistRenderOptions,
+    output_path: impl AsRef<Path>,
+    mut vst3_processor: Option<Vst3PlaylistStreamProcessor>,
+    cancelled: &AtomicBool,
+) -> Result<PlaylistRenderSummary, String> {
+    let project_path = project_path.as_ref();
+    let output_path = output_path.as_ref();
+    validate_output_path(project_path, output_path)?;
+    let audio = prepare_audio_clip_render(
+        document,
+        project_path,
+        AudioClipRenderOptions {
+            arrangement_id: options.arrangement_id,
+            sample_rate: options.sample_rate,
+        },
+        Some(cancelled),
+    )?;
+    let sampler = prepare_sampler_arrangement(document, project_path, options, Some(cancelled))?;
+    if audio.clips.is_empty()
+        && sampler.notes.is_empty()
+        && vst3_processor
+            .as_ref()
+            .is_none_or(|processor| processor.summary().plugin_channels_rendered == 0)
+    {
+        if let Some(processor) = vst3_processor.as_ref() {
+            let unloaded_channels = processor.summary().unloaded_plugin_channels;
+            if !unloaded_channels.is_empty() {
+                let channel_ids = unloaded_channels
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(format!(
+                    "arrangement has VST3 notes on channel(s) {channel_ids}, but no matching plug-in instance is loaded"
+                ));
+            }
+        }
+        return Err(
+            "arrangement contains no supported audio clips, Sampler notes, or loaded VST3 notes in Pattern Clips"
+                .to_owned(),
+        );
+    }
+
+    let mut frames = audio.summary.frames.max(sampler.summary.frames);
+    if let Some(processor) = vst3_processor.as_mut() {
+        frames = frames.max(processor.summary().frames);
+        processor.extend_to_output_frames(frames)?;
+    }
+    let frames_u32 =
+        u32::try_from(frames).map_err(|_| "render is too long for a RIFF/WAVE file".to_owned())?;
+    let data_bytes = frames_u32
+        .checked_mul(8)
+        .filter(|bytes| *bytes <= u32::MAX - 36)
+        .ok_or_else(|| "rendered WAV size exceeds the RIFF/WAVE limit".to_owned())?;
+    let mut source_paths: std::collections::BTreeSet<PathBuf> =
+        audio.decoded_by_path.keys().cloned().collect();
+    source_paths.extend(sampler.source_paths.iter().cloned());
+    let vst3_summary = vst3_processor.as_ref().map(|processor| processor.summary());
+    let mut summary = PlaylistRenderSummary {
+        frames,
+        sample_rate: options.sample_rate,
+        audio_clips_rendered: audio.summary.clips_rendered,
+        sampler_pattern_clips_rendered: sampler.pattern_clips_rendered,
+        sampler_notes_rendered: sampler.summary.notes_rendered,
+        voices_stolen: 0,
+        source_files: source_paths.len(),
+        audio_clips_skipped_unsupported_scale: audio.summary.clips_skipped_unsupported_scale,
+        pattern_clips_skipped_unsupported_scale: sampler.pattern_clips_skipped_unsupported_scale,
+        notes_skipped_unresolved_sample: sampler.summary.notes_skipped_unresolved_sample,
+        vst3_plugin_channels_rendered: vst3_summary
+            .as_ref()
+            .map_or(0, |summary| summary.plugin_channels_rendered),
+        vst3_notes_rendered: vst3_summary
+            .as_ref()
+            .map_or(0, |summary| summary.notes_scheduled),
+        vst3_plugin_channels_unloaded: vst3_summary
+            .as_ref()
+            .map_or(0, |summary| summary.unloaded_plugin_channels.len()),
+    };
+
+    let mut temporary = TemporaryWav::create(output_path)?;
+    {
+        let file = temporary.file.as_mut().expect("temporary WAV is open");
+        write_float_stereo_wav_header(file, options.sample_rate, frames_u32, data_bytes)?;
+        let mut bytes = Vec::with_capacity(STREAM_BLOCK_FRAMES * 2 * 4);
+        summary.voices_stolen = stream_prepared_playlist_render(
+            PreparedPlaylistBlockMix {
+                audio: &audio,
+                sampler: &sampler,
+                options,
+                frames,
+                vst3_processor: vst3_processor.as_mut(),
+            },
+            cancelled,
+            || false,
+            |block| {
+                bytes.clear();
+                for sample in block {
+                    bytes.extend_from_slice(&sample.to_le_bytes());
+                }
+                file.write_all(&bytes)
+                    .map_err(|error| format!("could not write rendered WAV data: {error}"))
+            },
+        )?;
+    }
+    temporary.commit(output_path)?;
+    Ok(summary)
+}
+
+fn write_float_stereo_wav_header(
+    file: &mut File,
+    sample_rate: u32,
+    frames: u32,
+    data_bytes: u32,
+) -> Result<(), String> {
+    let byte_rate = sample_rate
+        .checked_mul(8)
+        .ok_or_else(|| "rendered WAV byte rate overflow".to_owned())?;
+    file.write_all(b"RIFF")
+        .and_then(|()| file.write_all(&(36 + data_bytes).to_le_bytes()))
+        .and_then(|()| file.write_all(b"WAVEfmt "))
+        .and_then(|()| file.write_all(&16u32.to_le_bytes()))
+        .and_then(|()| file.write_all(&3u16.to_le_bytes()))
+        .and_then(|()| file.write_all(&2u16.to_le_bytes()))
+        .and_then(|()| file.write_all(&sample_rate.to_le_bytes()))
+        .and_then(|()| file.write_all(&byte_rate.to_le_bytes()))
+        .and_then(|()| file.write_all(&8u16.to_le_bytes()))
+        .and_then(|()| file.write_all(&32u16.to_le_bytes()))
+        .and_then(|()| file.write_all(b"data"))
+        .and_then(|()| file.write_all(&data_bytes.to_le_bytes()))
+        .map_err(|error| format!("could not write rendered WAV header: {error}"))?;
+    if frames == 0 {
+        return Err("rendered WAV contains no frames".to_owned());
+    }
+    Ok(())
+}
+
 struct PreparedPlaylistBlockMix<'a> {
     audio: &'a PreparedAudioClipRender,
     sampler: &'a PreparedSamplerArrangement,
