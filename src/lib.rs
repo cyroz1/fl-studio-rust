@@ -5233,6 +5233,37 @@ mod tests {
     }
 
     #[test]
+    fn inferred_pattern_repeat_length_rounds_up_to_the_project_measure() {
+        let note = note_record(0, 3, 1_501, 60, 100);
+        let mut event_stream = vec![0x40, 0, 0, 0x41, 7, 0, 0xD0, 24];
+        event_stream.extend_from_slice(&note);
+        event_stream.extend_from_slice(&[0x63, 0, 0]);
+        let mut clip = [0u8; 80];
+        clip[4..6].copy_from_slice(&0u16.to_le_bytes());
+        clip[6..8].copy_from_slice(&7u16.to_le_bytes());
+        clip[8..12].copy_from_slice(&1_536u32.to_le_bytes());
+        clip[12..14].copy_from_slice(&499u16.to_le_bytes());
+        clip[64..72].copy_from_slice(&1.0f64.to_le_bytes());
+        append_data_event(&mut event_stream, 0xE9, &clip);
+        let document = FlpDocument::parse(&flp_fixture(&event_stream, &[], &[]))
+            .expect("arrangement fixture should parse");
+
+        let bytes =
+            MidiFile::encode_project_song(&document, 0, MidiChannelMapping::PreserveNoteChannels)
+                .expect("arrangement should export");
+        let midi = MidiFile::parse(&bytes).expect("exported file should parse");
+        let notes = midi
+            .tracks()
+            .iter()
+            .flat_map(|track| track.notes())
+            .collect::<Vec<_>>();
+
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].start_tick(), 0);
+        assert_eq!(notes[0].end_tick(), Some(1_501));
+    }
+
+    #[test]
     fn exports_tempo_automation_per_tick_and_restores_the_project_tempo() {
         let mut event_stream = vec![0x40, 40, 0, 0x15, 5];
         append_project_info_string(&mut event_stream, 0xCB, "TEMPO");

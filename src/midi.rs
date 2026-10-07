@@ -285,10 +285,13 @@ impl MidiFile {
                 .length_ticks
                 .map(u64::from)
                 .filter(|length| *length > 0)
-                .unwrap_or(if inferred_length > 0 {
-                    inferred_length
-                } else {
-                    clip_length
+                .unwrap_or_else(|| {
+                    inferred_pattern_loop_length(
+                        inferred_length,
+                        clip_length,
+                        document.header().ppq(),
+                        document.metadata().time_signature(),
+                    )
                 });
             if loop_length == 0 {
                 continue;
@@ -736,6 +739,34 @@ fn midi_tempo_microseconds_per_quarter(bpm: f64) -> Result<u32, MidiError> {
         ));
     }
     Ok(micros_per_quarter as u32)
+}
+
+fn inferred_pattern_loop_length(
+    inferred_length: u64,
+    clip_length: u64,
+    ppq: u16,
+    time_signature: Option<(u8, u8)>,
+) -> u64 {
+    if inferred_length == 0 {
+        return clip_length;
+    }
+
+    // The last note-off only bounds an automatic pattern's length; observed FL clips
+    // repeat on the project measure grid instead of at that exact tick.
+    let (numerator, denominator) = time_signature.unwrap_or((4, 4));
+    if denominator == 0 {
+        return inferred_length;
+    }
+    let measure_numerator = u64::from(ppq) * 4 * u64::from(numerator);
+    let measure_ticks = measure_numerator.div_ceil(u64::from(denominator));
+    if measure_ticks == 0 || clip_length < measure_ticks {
+        return inferred_length;
+    }
+
+    inferred_length
+        .div_ceil(measure_ticks)
+        .checked_mul(measure_ticks)
+        .unwrap_or(inferred_length)
 }
 
 fn song_tempo_events(

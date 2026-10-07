@@ -30,7 +30,7 @@ The Rust song export has the same tempo event ticks but 3,076 tempo events: it o
 
 ## Rust exporter comparison
 
-The new `export-midi-song` path was run against the prepared `NewStuff.flp` export. Its format-1 output has the same PPQ (96), base tempo (150 BPM), channel names, and note counts for Synth Bass (85), Piano Dark (196), and Tinke Bell (1,920). It exports 104 Saw Bass notes instead of the prepared native export's 94, and 224 White Noise notes instead of 210. Playlist repeat/export rules still need to be matched. Tempo-map sampling is now implemented and is compared separately against the direct UI capture above.
+The new `export-midi-song` path was run against the prepared `NewStuff.flp` export. Its 42,052-byte, six-track format-1 output has the same PPQ (96), base tempo (150 BPM), channel names, and all five instrument note counts as the prepared native export: Synth Bass (85), Saw Bass (94), White Noise (210), Piano Dark (196), and Tinke Bell (1,920). The native file has seven tracks, so track layout and metadata still differ. Matching the missing automatic pattern lengths to the project measure grid removed the previous Saw Bass and White Noise overcounts. Tempo-map sampling is compared separately against the direct UI capture above.
 
 ## Arrangement payload boundaries
 
