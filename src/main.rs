@@ -197,6 +197,9 @@ fn run(args: Vec<String>) -> Result<(), String> {
             let milli_bpm = parse_tempo_milli_bpm(bpm)?;
             set_tempo(Path::new(input), Path::new(output), milli_bpm)
         }
+        [command, input, output] if command == "create-pattern" => {
+            create_pattern(Path::new(input), Path::new(output))
+        }
         [command, input, output, title, author, genre, comments, web_link]
             if command == "set-project-info" =>
         {
@@ -385,6 +388,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild extract-event <file.flp> <index> <output.bin>\n",
             "  flp-rebuild roundtrip <input.flp> <output.flp>\n",
             "  flp-rebuild set-tempo <input.flp> <output.flp> <bpm>\n",
+            "  flp-rebuild create-pattern <input.flp> <output.flp>\n",
             "  flp-rebuild set-project-info <input.flp> <output.flp> <title|-> <author|-> <genre|-> <comments|-> <web-link|->\n",
             "  flp-rebuild set-project-settings <input.flp> <output.flp> <play-truncated:0|1|-> <fast-declick:0|1|->\n",
             "  flp-rebuild rename-channel <input.flp> <output.flp> <channel-id> <name>\n",
@@ -1691,6 +1695,20 @@ fn add_note(input: &Path, output: &Path, pattern_id: u16, note: PatternNote) -> 
         note.position,
         output.display()
     );
+    Ok(())
+}
+
+fn create_pattern(input: &Path, output: &Path) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let pattern_id = document
+        .create_pattern()
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!("created empty pattern {pattern_id} in {}", output.display());
     Ok(())
 }
 

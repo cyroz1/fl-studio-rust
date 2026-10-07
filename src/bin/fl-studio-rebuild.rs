@@ -727,6 +727,21 @@ impl DawUi {
         }
     }
 
+    fn create_pattern(&mut self) {
+        let Some(document) = self.document.as_mut() else {
+            self.status = "Open a project before creating a pattern".to_owned();
+            return;
+        };
+        match document.create_pattern() {
+            Ok(pattern_id) => {
+                self.selected_pattern = Some(pattern_id);
+                self.dirty = true;
+                self.status = format!("Created empty pattern {pattern_id}");
+            }
+            Err(error) => self.status = format!("Could not create a pattern: {error}"),
+        }
+    }
+
     fn project_settings_dialog(&mut self, context: &egui::Context) {
         if !self.project_settings_open {
             return;
@@ -1157,6 +1172,12 @@ impl DawUi {
                 .clicked()
             {
                 self.open_project_info();
+            }
+            if ui
+                .add_enabled(self.document.is_some(), egui::Button::new("New pattern"))
+                .clicked()
+            {
+                self.create_pattern();
             }
             if ui
                 .add_enabled(

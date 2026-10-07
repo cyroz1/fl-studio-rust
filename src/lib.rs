@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 pub mod audio;
@@ -114,7 +114,7 @@ impl FlpEvent {
             opcode,
             payload: Vec::new(),
             encoding: PayloadEncoding::Data {
-                length_prefix: Vec::new(),
+                length_prefix: encode_leb128(0),
             },
             wire_bytes: Vec::new(),
             file_offset: 0,
@@ -1350,6 +1350,101 @@ impl FlpDocument {
         }
         patterns.sort_by_key(|pattern| pattern.id);
         Ok(patterns)
+    }
+
+    /// Creates an empty pattern using the note-event encoding already present in the project.
+    ///
+    /// Projects without a uniquely recognized pattern-note encoding are rejected rather than
+    /// guessing between version-specific score event layouts.
+    pub fn create_pattern(&mut self) -> Result<u16, FlpError> {
+        let mut score_regions = Vec::new();
+        let mut note_opcode = None;
+        let mut conflicting_opcodes = false;
+
+        for (event_index, event) in self.events.iter().enumerate() {
+            if event.opcode != 0x41 || event.payload.len() != 2 {
+                continue;
+            }
+            if let Some(notes_event) = self.events.get(event_index + 1)
+                && Self::is_pattern_note_event(notes_event)
+            {
+                if event.encoding != PayloadEncoding::Word
+                    || !matches!(notes_event.encoding, PayloadEncoding::Data { .. })
+                    || !notes_event
+                        .payload
+                        .len()
+                        .is_multiple_of(FLP_NOTE_RECORD_SIZE)
+                {
+                    return Err(FlpError::UnsupportedEdit(
+                        "the project's pattern note event layout is not recognized",
+                    ));
+                }
+                let section_start = self.events[..event_index]
+                    .iter()
+                    .rposition(|candidate| matches!(candidate.opcode, 0x40 | 0x62 | 0x63))
+                    .map_or(0, |boundary| boundary + 1);
+                let section_end = self.events[event_index + 1..]
+                    .iter()
+                    .position(|candidate| matches!(candidate.opcode, 0x40 | 0x62 | 0x63))
+                    .map_or(self.events.len(), |offset| event_index + 1 + offset);
+                score_regions.push((section_start, section_end));
+
+                match note_opcode {
+                    None => note_opcode = Some(notes_event.opcode),
+                    Some(opcode) if opcode != notes_event.opcode => {
+                        conflicting_opcodes = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if conflicting_opcodes || note_opcode.is_none() {
+            return Err(FlpError::UnsupportedEdit(
+                "cannot infer a unique pattern note-event encoding for this project",
+            ));
+        }
+        let Some((_, insert_index)) = score_regions.iter().copied().max_by_key(|range| range.0)
+        else {
+            return Err(FlpError::UnsupportedEdit(
+                "the project has no recognized pattern marker to extend",
+            ));
+        };
+        let mut pattern_ids = HashSet::new();
+        for (region_start, region_end) in score_regions {
+            for event in &self.events[region_start..region_end] {
+                if event.opcode == 0x41
+                    && event.encoding == PayloadEncoding::Word
+                    && event.payload.len() == 2
+                {
+                    pattern_ids.insert(u16::from_le_bytes([event.payload[0], event.payload[1]]));
+                }
+            }
+        }
+        let Some(highest_pattern_id) = pattern_ids.iter().max().copied() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the recognized score section contains no pattern IDs",
+            ));
+        };
+
+        let new_id = highest_pattern_id
+            .checked_add(1)
+            .ok_or(FlpError::LengthOverflow)?;
+
+        let mut candidate = self.clone();
+        candidate
+            .events
+            .insert(insert_index, FlpEvent::new_word(0x41, new_id));
+        candidate.events.insert(
+            insert_index + 1,
+            FlpEvent::new_data(
+                note_opcode.expect("unique opcode checked above"),
+                Vec::new(),
+            )?,
+        );
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(new_id)
     }
 
     /// Returns playlist arrangements and their stored clip records.
@@ -4788,6 +4883,79 @@ mod tests {
         assert_eq!(empty_pattern.notes[0].key, 65);
         let reparsed = FlpDocument::parse(&document.encode_lossless().unwrap()).unwrap();
         assert_eq!(reparsed.patterns().unwrap()[1].notes.len(), 1);
+    }
+
+    #[test]
+    fn creating_an_empty_pattern_uses_the_observed_encoding_and_preserves_other_events() {
+        let existing_note = note_record(0, 0, 48, 60, 100);
+        let mut stream = vec![0x40, 0, 0, 0x41, 7, 0, 0xD0, 0x18];
+        stream.extend_from_slice(&existing_note);
+        stream.extend_from_slice(&[0xA4, 0x80, 0x01, 0, 0]);
+        stream.extend_from_slice(&[0x40, 1, 0, 0x15, 2]);
+        stream.extend_from_slice(&[0x41, 7, 0, 0x96, 0, 0, 0, 0]);
+        let input = flp_fixture(&stream, &[0xA1], &[0xB2]);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+        let original_events: Vec<_> = document
+            .events()
+            .iter()
+            .map(|event| event.wire_bytes().to_vec())
+            .collect();
+
+        let new_id = document
+            .create_pattern()
+            .expect("the existing pattern encoding should be reusable");
+
+        assert_eq!(new_id, 8);
+        let patterns = document.patterns().expect("patterns should decode");
+        let created = patterns
+            .iter()
+            .find(|pattern| pattern.id == new_id)
+            .expect("new pattern should be present");
+        assert!(created.notes.is_empty());
+        assert!(created.name.is_none());
+        let new_marker = document
+            .events()
+            .iter()
+            .position(|event| event.opcode() == 0x41 && event.payload() == new_id.to_le_bytes())
+            .expect("new pattern marker should be present");
+        assert_eq!(document.events()[new_marker + 1].opcode(), 0xD0);
+        assert!(document.events()[new_marker + 1].payload().is_empty());
+
+        let current_events: Vec<_> = document
+            .events()
+            .iter()
+            .filter(|event| {
+                !(event.opcode() == 0x41 && event.payload() == new_id.to_le_bytes())
+                    && !(event.opcode() == 0xD0 && event.payload().is_empty())
+            })
+            .map(|event| event.wire_bytes().to_vec())
+            .collect();
+        assert_eq!(current_events, original_events);
+
+        let encoded = document.encode_lossless().expect("project should encode");
+        let reparsed = FlpDocument::parse(&encoded).expect("created project should reparse");
+        assert!(
+            reparsed
+                .patterns()
+                .unwrap()
+                .iter()
+                .any(|pattern| pattern.id == new_id)
+        );
+        assert_eq!(reparsed.trailing_bytes(), &[0xB2]);
+    }
+
+    #[test]
+    fn creating_a_pattern_refuses_ambiguous_note_event_encodings_without_mutation() {
+        let note = note_record(0, 0, 48, 60, 100);
+        let mut stream = vec![0x40, 0, 0, 0x41, 7, 0, 0xD0, 0x18];
+        stream.extend_from_slice(&note);
+        stream.extend_from_slice(&[0x41, 8, 0, 0xE0, 0x18]);
+        stream.extend_from_slice(&note);
+        let input = flp_fixture(&stream, &[], &[]);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+
+        assert!(document.create_pattern().is_err());
+        assert_eq!(document.encode_lossless().unwrap(), input);
     }
 
     #[test]

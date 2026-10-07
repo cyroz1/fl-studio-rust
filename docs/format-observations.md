@@ -46,6 +46,10 @@ Controlled toggles in FL Studio 26.1.6 Project settings > Project > Advanced map
 
 The Rust model, CLI, and desktop dialog only edit this recognized event block, preserve unrelated events, and reject files where the block is missing or ambiguous. These mappings were verified against one FL Studio 26.1.6 project; other project settings, older-version layouts, and behavior across a broader project corpus remain to be mapped.
 
+## Pattern creation observations
+
+The pattern model recognizes word-sized `0x41` pattern IDs and treats an immediately following `0xD0` or `0xE0` data event as that pattern's 24-byte note records. Empty-pattern creation locates score sections by those adjacent marker/note-event pairs, reuses their unique note-event opcode, and chooses the next ID after the highest marker in those sections. This avoids confusing repeated `0x41` markers in later Playlist track records with score patterns. The new marker and zero-length note event are inserted at the end of the last recognized score section. A Rust-created pattern 15 in the installed `Electric Loop - The Ogun Dream.flp` demo project re-parsed as an empty pattern, and synthetic round-trip fixtures preserve unrelated events. The modified project has not yet been opened in FL Studio, so the insertion strategy still needs native validation.
+
 ## Channel grouping observations
 
 The stream contains 45 `0x40` markers, matching the header's channel count. At the first marker, the following fields occur before the next channel marker: a one-byte `0x15` value of `2`, a UTF-16LE `0xC9` string `Harmless`, and a UTF-16LE `0xCB` string `Synth Bass`. A later one-byte `0x00` event carries `1`. Across all 45 groups, the `0xCB` text produces plausible channel labels such as `Grv Kick 27`, `Piano Dark`, and `TEMPO`; `0xC9` produces plugin labels such as `3x Osc` and `FLEX` where present.

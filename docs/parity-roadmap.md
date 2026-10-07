@@ -38,7 +38,7 @@ The foundation. Everything else depends on reading projects exactly.
 | Time markers, song position markers | `[partial]` | Reads arrangement-scoped marker positions, names, and time signatures. The documented signature bit is exposed separately; other position bits remain intact. Marker editing, song-position playback, and broader version verification remain incomplete. |
 | Project settings: swing, master pitch, metronome, recording settings | `[partial]` | The Project model, CLI, and desktop dialog read and edit the FL Studio 26 Advanced options `Play truncated notes in clips` and `Fast declick for cut groups`. Swing, master pitch, metronome, recording settings, panning law, and other controls remain unmapped. |
 | `set-tempo`, `rename-channel`, note add/edit/delete, clip edit, channel levels | `[done]` | CLI surface; each rewrites only affected bytes |
-| Create missing objects (patterns, channels, clips) | `[todo]` | CLI only edits existing objects today |
+| Create missing objects (patterns, channels, clips) | `[partial]` | Creates an empty pattern through the desktop control or CLI when a unique existing `0xD0`/`0xE0` note-event encoding is available. New channels, clips, unsupported/ambiguous layouts, and native FL Studio validation remain outstanding. |
 
 ### 1.2 Presets and packages
 
@@ -67,7 +67,7 @@ The foundation. Everything else depends on reading projects exactly.
 The decoded document must model everything the format can express.
 
 - `[partial]` Channels: summaries, sample paths, plugin state blobs, levels, known kind mapping, and Layer child relationships/raw flags
-- `[partial]` Patterns: note lists per channel
+- `[partial]` Patterns: note lists per channel; empty patterns can be created when the project supplies an unambiguous note-event encoding
 - `[partial]` Playlist: tracks, arrangements, clips with targets
 - `[partial]` Mixer: recognized insert summaries and parameter kinds, with exact-record value editing and insert-name editing; full 125 inserts, master/sends, target mapping, fader UI, effects, and routing remain incomplete
 - `[partial]` Automation: type-5 channel point curves can be read and points in an existing blob edited, inserted, or removed from the desktop view; interpolation, parameter links, event automation, LFOs, and new clip creation remain incomplete
