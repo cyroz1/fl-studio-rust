@@ -4,7 +4,7 @@ use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
 
-use flp_rebuild::media::SamplePathResolver;
+use flp_rebuild::media::{SamplePathResolver, decode_audio_file};
 use flp_rebuild::midi::MidiFile;
 use flp_rebuild::plugins::scan_installed_plugins;
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions};
@@ -25,6 +25,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
         [command, path] if command == "info" => inspect(Path::new(path)),
         [command, path] if command == "channels" => list_channels(Path::new(path)),
         [command, path] if command == "sample-paths" => list_sample_paths(Path::new(path)),
+        [command, path] if command == "audio-info" => inspect_audio_file(Path::new(path)),
         [command, path] if command == "plugin-states" => list_plugin_states(Path::new(path)),
         [command, path, channel_id] if command == "plugin-state-preview" => {
             preview_plugin_state(Path::new(path), parse_u16(channel_id, "channel id")?, 64)
@@ -216,6 +217,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild render-pattern-vst3 <project.flp> <pattern-id> <channel-id> <plugin.vst3> <output.wav> [tail-seconds]\n",
             "  flp-rebuild channels <file.flp>\n",
             "  flp-rebuild sample-paths <file.flp>\n",
+            "  flp-rebuild audio-info <audio-file>\n",
             "  flp-rebuild plugin-states <file.flp>\n",
             "  flp-rebuild channel-events <file.flp> <channel-id>\n",
             "  flp-rebuild patterns <file.flp>\n",
@@ -760,6 +762,16 @@ fn list_sample_paths(project_path: &Path) -> Result<(), String> {
         }
     }
     println!("sample references: {sample_count}");
+    Ok(())
+}
+
+fn inspect_audio_file(path: &Path) -> Result<(), String> {
+    let audio = decode_audio_file(path)?;
+    println!("file: {}", path.display());
+    println!("sample rate: {} Hz", audio.sample_rate);
+    println!("channels: {}", audio.channels.len());
+    println!("frames: {}", audio.frame_count());
+    println!("duration: {:.3} seconds", audio.duration_seconds());
     Ok(())
 }
 

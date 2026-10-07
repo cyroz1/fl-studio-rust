@@ -15,6 +15,7 @@ flp-rebuild midi-events <file.mid> <track> [start] [count]
 flp-rebuild scan <directory>
 flp-rebuild plugin-scan
 flp-rebuild sample-paths <file.flp>
+flp-rebuild audio-info <audio-file>
 flp-rebuild render-pattern-vst3 <project.flp> <pattern-id> <channel-id> <plugin.vst3> <output.wav> [tail-seconds]
 flp-rebuild plugin-state-preview <file.flp> <channel-id>
 flp-rebuild vst3-state-probe <plugin.vst3> <file.flp> <channel-id>
@@ -40,7 +41,7 @@ Launch the native desktop shell with `cargo run --release --bin fl-studio-rebuil
 
 The desktop executable also accepts an `.flp` path as its first argument to open that project at startup.
 
-`channels <file.flp>` reports the observed sample source path on audio-channel records, including `%FLStudioFactoryData%` references. `sample-paths <file.flp>` tries to resolve each reference using the project folder, configured factory roots, and common FL Studio install locations; it reports paths it cannot find. Set `FL_STUDIO_ROOT` or `FL_STUDIO_FACTORY_DATA` to select a custom installation. The project model keeps the original event bytes unchanged. Audio decoding, clip playback, and sample mixing are still future work.
+`channels <file.flp>` reports the observed sample source path on audio-channel records, including `%FLStudioFactoryData%` references. `sample-paths <file.flp>` tries to resolve each reference using the project folder, configured factory roots, and common FL Studio install locations; it reports paths it cannot find. Set `FL_STUDIO_ROOT` or `FL_STUDIO_FACTORY_DATA` to select a custom installation. `audio-info <audio-file>` decodes supported WAV, OGG/Vorbis, FLAC, MP3, and AIFF media by content, so it handles Ogg data stored under a `.wav` filename. Full streaming playback, clip timing, and sample mixing are still future work.
 
 In the desktop Piano roll, **Open MIDI…** loads a MIDI file, lets you choose a track, and imports its notes into the selected pattern and channel. The selected track's note timing is converted from MIDI PPQ to project PPQ. **Render WAV…** is enabled when the selected channel has a loaded VST3 instrument; it exports that pattern/channel using the currently loaded plug-in instance. The CLI offers MIDI import and pattern rendering for batch use.
 
@@ -59,7 +60,7 @@ GitHub Actions runs formatting checks, Clippy, and the Rust test suite on Ubuntu
 ## Compatibility plan
 
 1. Project containers: broaden FLP envelope compatibility across releases, add semantic FST preset support, and handle ZIP project packages.
-2. Musical model: broaden pattern and note editing, then decode channel and plugin state, Playlist clip variants, automation, mixer routing, and referenced media, while retaining unsupported fields.
+2. Musical model: broaden pattern and note editing, then decode channel and plugin state, Playlist clip variants, automation, mixer routing, and sample scheduling, while retaining unsupported fields.
 3. Interchange: MIDI import/export and audio export with stable timing and channel mapping.
 4. Playback: transport, tempo clock, sample scheduling, mixing, automation, and a low-latency audio backend.
 5. Instruments and effects: continue VST3 hosting from the current discovery, native editor window, parameter-list prototype, and single-pattern offline render into project-state restore, automation, MIDI/audio routing, Mixer processing, and whole-project rendering. Add VST2 hosting if an applicable legacy licensing path is available. Preserve plug-in identity and opaque state when a plug-in is unavailable. Rebuilding FL's bundled plug-in DSP is out of scope.

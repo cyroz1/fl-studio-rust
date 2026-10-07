@@ -2,7 +2,155 @@
 
 use std::path::{Path, PathBuf};
 
+use symphonia::core::audio::sample::Sample;
+use symphonia::core::codecs::audio::AudioDecoderOptions;
+use symphonia::core::errors::Error as DecodeError;
+use symphonia::core::formats::probe::Hint;
+use symphonia::core::formats::{FormatOptions, TrackType};
+use symphonia::core::io::MediaSourceStream;
+use symphonia::core::meta::MetadataOptions;
+
 const FACTORY_DATA_MACRO: &str = "%FLStudioFactoryData%";
+const MAX_DECODED_SAMPLE_BYTES: usize = 512 * 1024 * 1024;
+
+/// Fully decoded, deinterleaved audio for sample preview and offline processing.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DecodedAudio {
+    pub sample_rate: u32,
+    /// Samples indexed `[channel][frame]` and converted to `f32` in approximately -1.0..1.0.
+    pub channels: Vec<Vec<f32>>,
+}
+
+impl DecodedAudio {
+    pub fn frame_count(&self) -> usize {
+        self.channels.first().map_or(0, Vec::len)
+    }
+
+    pub fn duration_seconds(&self) -> f64 {
+        self.frame_count() as f64 / f64::from(self.sample_rate)
+    }
+}
+
+/// Decode common FL Studio sample formats by inspecting file content rather than its extension.
+///
+/// FLP projects can contain compressed audio whose filename extension does not match its
+/// container. The decoded audio is bounded to 512 MiB of `f32` sample data; longer media needs
+/// streaming playback instead of this in-memory helper.
+pub fn decode_audio_file(path: impl AsRef<Path>) -> Result<DecodedAudio, String> {
+    let path = path.as_ref();
+    let file = std::fs::File::open(path)
+        .map_err(|error| format!("could not open sample {}: {error}", path.display()))?;
+    let source = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    if let Some(extension) = path.extension().and_then(|extension| extension.to_str()) {
+        hint.with_extension(extension);
+    }
+    let mut format = symphonia::default::get_probe()
+        .probe(
+            &hint,
+            source,
+            FormatOptions::default(),
+            MetadataOptions::default(),
+        )
+        .map_err(|error| format!("could not identify sample {}: {error}", path.display()))?;
+    let track = format
+        .default_track(TrackType::Audio)
+        .ok_or_else(|| format!("sample {} has no audio track", path.display()))?;
+    let track_id = track.id;
+    let codec_params = track
+        .codec_params
+        .as_ref()
+        .and_then(|params| params.audio())
+        .cloned()
+        .ok_or_else(|| format!("sample {} has no audio codec parameters", path.display()))?;
+    let mut decoder = symphonia::default::get_codecs()
+        .make_audio_decoder(&codec_params, &AudioDecoderOptions::default())
+        .map_err(|error| format!("could not initialize sample decoder: {error}"))?;
+
+    let mut output_channels = Vec::<Vec<f32>>::new();
+    let mut output_sample_rate = None;
+    let mut total_samples = 0usize;
+    loop {
+        let packet = match format.next_packet() {
+            Ok(Some(packet)) => packet,
+            Ok(None) => break,
+            Err(DecodeError::ResetRequired) => {
+                return Err(format!(
+                    "sample {} contains chained audio streams that need a refreshed track selection",
+                    path.display()
+                ));
+            }
+            Err(error) => {
+                return Err(format!("could not read sample {}: {error}", path.display()));
+            }
+        };
+        if packet.track_id != track_id {
+            continue;
+        }
+        let decoded = decoder
+            .decode(&packet)
+            .map_err(|error| format!("could not decode sample {}: {error}", path.display()))?;
+        let channel_count = decoded.spec().channels().count();
+        let sample_rate = decoded.spec().rate();
+        if channel_count == 0 || sample_rate == 0 {
+            return Err(format!(
+                "sample {} has an invalid channel count or sample rate",
+                path.display()
+            ));
+        }
+        if let Some(output_rate) = output_sample_rate {
+            if output_rate != sample_rate || output_channels.len() != channel_count {
+                return Err(format!(
+                    "sample {} changes sample rate or channel layout while decoding",
+                    path.display()
+                ));
+            }
+        } else {
+            output_sample_rate = Some(sample_rate);
+            output_channels.resize_with(channel_count, Vec::new);
+        }
+
+        let frame_count = decoded.frames();
+        let sample_count = frame_count
+            .checked_mul(channel_count)
+            .ok_or_else(|| "decoded sample size overflow".to_owned())?;
+        total_samples = total_samples
+            .checked_add(sample_count)
+            .filter(|count| {
+                count
+                    .checked_mul(std::mem::size_of::<f32>())
+                    .is_some_and(|bytes| bytes <= MAX_DECODED_SAMPLE_BYTES)
+            })
+            .ok_or_else(|| {
+                format!(
+                    "sample {} exceeds the {} MiB in-memory decode limit",
+                    path.display(),
+                    MAX_DECODED_SAMPLE_BYTES / (1024 * 1024)
+                )
+            })?;
+        for channel in &mut output_channels {
+            channel
+                .try_reserve(frame_count)
+                .map_err(|error| format!("could not allocate sample buffers: {error}"))?;
+        }
+
+        let mut interleaved = vec![f32::MID; decoded.samples_interleaved()];
+        decoded.copy_to_slice_interleaved(&mut interleaved);
+        for frame in interleaved[..sample_count].chunks_exact(channel_count) {
+            for (channel, sample) in output_channels.iter_mut().zip(frame) {
+                channel.push(*sample);
+            }
+        }
+    }
+
+    let sample_rate = output_sample_rate
+        .filter(|_| total_samples > 0)
+        .ok_or_else(|| format!("sample {} contains no decodable audio", path.display()))?;
+    Ok(DecodedAudio {
+        sample_rate,
+        channels: output_channels,
+    })
+}
 
 /// Resolves sample references against a project folder and FL Studio installation roots.
 ///
@@ -218,6 +366,25 @@ mod tests {
         ))
     }
 
+    fn pcm16_wav_fixture() -> Vec<u8> {
+        let samples = [0x00, 0x80, 0xFF, 0x7F];
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&40u32.to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&44_100u32.to_le_bytes());
+        bytes.extend_from_slice(&88_200u32.to_le_bytes());
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&16u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&(samples.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&samples);
+        bytes
+    }
+
     #[test]
     fn resolves_factory_macro_from_an_explicit_installation_root() {
         let root = fixture_root();
@@ -247,6 +414,23 @@ mod tests {
 
         let resolved = resolver.resolve(r"audio\voice.wav").unwrap();
         assert_eq!(resolved, asset);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn decodes_pcm_wav_to_deinterleaved_float_samples() {
+        let root = fixture_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("voice.wav");
+        std::fs::write(&path, pcm16_wav_fixture()).unwrap();
+
+        let decoded = decode_audio_file(&path).unwrap();
+        assert_eq!(decoded.sample_rate, 44_100);
+        assert_eq!(decoded.channels.len(), 1);
+        assert_eq!(decoded.frame_count(), 2);
+        assert_eq!(decoded.channels[0][0], -1.0);
+        assert!((decoded.channels[0][1] - 0.999_969_5).abs() < 1e-6);
 
         std::fs::remove_dir_all(root).unwrap();
     }
