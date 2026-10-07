@@ -16,6 +16,7 @@ const FLP_PLAYLIST_RECORD_SIZES: [usize; 3] = [80, 60, 32];
 const FLP_AUTOMATION_COUNT_OFFSET: usize = 17;
 const FLP_AUTOMATION_POINTS_OFFSET: usize = 21;
 const FLP_AUTOMATION_POINT_SIZE: usize = 24;
+const PROJECT_INFO_STRING_EVENTS: [u8; 5] = [0xC2, 0xCE, 0xCF, 0xC3, 0xC5];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FlpHeader {
@@ -151,6 +152,23 @@ pub struct ProjectMetadata {
     tempo_milli_bpm: Option<u32>,
     time_signature: Option<(u8, u8)>,
     build_number: Option<u32>,
+    title: Option<String>,
+    author: Option<String>,
+    comments: Option<String>,
+    genre: Option<String>,
+    web_link: Option<String>,
+}
+
+/// Fields that can be changed in FL Studio's Project Info dialog.
+///
+/// A `None` field is left unchanged. `Some("")` clears that field.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ProjectInfoEdit {
+    pub title: Option<String>,
+    pub author: Option<String>,
+    pub comments: Option<String>,
+    pub genre: Option<String>,
+    pub web_link: Option<String>,
 }
 
 /// A known FL channel kind, while retaining unrecognized raw values.
@@ -919,6 +937,26 @@ impl ProjectMetadata {
     pub fn build_number(&self) -> Option<u32> {
         self.build_number
     }
+
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+
+    pub fn author(&self) -> Option<&str> {
+        self.author.as_deref()
+    }
+
+    pub fn comments(&self) -> Option<&str> {
+        self.comments.as_deref()
+    }
+
+    pub fn genre(&self) -> Option<&str> {
+        self.genre.as_deref()
+    }
+
+    pub fn web_link(&self) -> Option<&str> {
+        self.web_link.as_deref()
+    }
 }
 
 impl FlpDocument {
@@ -998,7 +1036,7 @@ impl FlpDocument {
             cursor = next_cursor;
         }
 
-        let metadata = read_project_metadata(&events);
+        let metadata = read_project_metadata(&events, project_version.as_deref());
 
         Ok(Self {
             header,
@@ -2137,6 +2175,98 @@ impl FlpDocument {
         &self.metadata
     }
 
+    /// Updates selected FL Studio Project Info fields while retaining each field's
+    /// project-version string encoding, terminator convention, and trailing payload bytes.
+    pub fn set_project_info(&mut self, edit: ProjectInfoEdit) -> Result<(), FlpError> {
+        let mut candidate = self.clone();
+        for (opcode, value) in [
+            (0xC2, edit.title),
+            (0xCF, edit.author),
+            (0xC3, edit.comments),
+            (0xCE, edit.genre),
+            (0xC5, edit.web_link),
+        ] {
+            if let Some(value) = value {
+                candidate.set_project_info_string(opcode, &value)?;
+            }
+        }
+        candidate.metadata =
+            read_project_metadata(&candidate.events, candidate.project_version.as_deref());
+        *self = candidate;
+        Ok(())
+    }
+
+    fn set_project_info_string(&mut self, opcode: u8, value: &str) -> Result<(), FlpError> {
+        if !PROJECT_INFO_STRING_EVENTS.contains(&opcode) {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested event is not a supported Project Info string",
+            ));
+        }
+        if value.contains('\0') {
+            return Err(FlpError::UnsupportedEdit(
+                "Project Info strings cannot contain a NUL character",
+            ));
+        }
+
+        let channel_start = self
+            .events
+            .iter()
+            .position(|event| event.opcode == 0x40)
+            .unwrap_or(self.events.len());
+        if let Some(event_index) = self.events[..channel_start]
+            .iter()
+            .rposition(|event| event.opcode == opcode)
+        {
+            let event = &self.events[event_index];
+            if !matches!(event.encoding, PayloadEncoding::Data { .. }) {
+                return Err(FlpError::UnsupportedEdit(
+                    "the selected Project Info event is not a length-prefixed string",
+                ));
+            }
+            let replacement = replace_project_string_payload(
+                &event.payload,
+                value,
+                self.project_info_strings_use_utf16(),
+            )?;
+            self.events[event_index].replace_data_payload(replacement)?;
+        } else {
+            let rank = project_info_event_rank(opcode).expect("supported field has a rank");
+            let insertion_index = self.events[..channel_start]
+                .iter()
+                .position(|event| {
+                    project_info_event_rank(event.opcode)
+                        .is_some_and(|other_rank| other_rank > rank)
+                })
+                .or_else(|| {
+                    self.events[..channel_start]
+                        .iter()
+                        .rposition(|event| project_info_event_rank(event.opcode).is_some())
+                        .map(|index| index + 1)
+                })
+                .unwrap_or(channel_start);
+            let payload = encode_project_string(value, self.project_info_strings_use_utf16())?;
+            self.events
+                .insert(insertion_index, FlpEvent::new_data(opcode, payload)?);
+        }
+        self.refresh_event_offsets()?;
+        Ok(())
+    }
+
+    fn project_info_strings_use_utf16(&self) -> bool {
+        if self.project_version.is_some() {
+            return !uses_legacy_string_encoding(self.project_version.as_deref());
+        }
+        let channel_start = self
+            .events
+            .iter()
+            .position(|event| event.opcode == 0x40)
+            .unwrap_or(self.events.len());
+        self.events[..channel_start]
+            .iter()
+            .find(|event| PROJECT_INFO_STRING_EVENTS.contains(&event.opcode))
+            .is_some_and(|event| project_string_is_utf16(&event.payload, None))
+    }
+
     /// Changes an existing four-byte `0x9C` tempo event without reserializing other events.
     pub fn set_tempo_milli_bpm(&mut self, milli_bpm: u32) -> Result<(), FlpError> {
         let event_index = self.events.iter().position(|event| {
@@ -2160,7 +2290,7 @@ impl FlpDocument {
         };
         wire_payload.copy_from_slice(&encoded_value);
         event.payload.copy_from_slice(&encoded_value);
-        self.metadata = read_project_metadata(&self.events);
+        self.metadata = read_project_metadata(&self.events, self.project_version.as_deref());
         Ok(())
     }
 
@@ -3122,6 +3252,77 @@ fn project_string_is_utf16(payload: &[u8], version: Option<&str>) -> bool {
         })
 }
 
+fn project_info_event_rank(opcode: u8) -> Option<usize> {
+    PROJECT_INFO_STRING_EVENTS
+        .iter()
+        .position(|candidate| *candidate == opcode)
+}
+
+fn encode_project_string(value: &str, utf16: bool) -> Result<Vec<u8>, FlpError> {
+    let mut payload = Vec::new();
+    if utf16 {
+        for unit in value.encode_utf16() {
+            payload.extend_from_slice(&unit.to_le_bytes());
+        }
+        payload.extend_from_slice(&[0, 0]);
+    } else {
+        for character in value.chars() {
+            let byte = windows_1252_byte(character).ok_or(FlpError::UnsupportedEdit(
+                "the Project Info text contains a character unavailable in the project's legacy encoding",
+            ))?;
+            payload.push(byte);
+        }
+        payload.push(0);
+    }
+    Ok(payload)
+}
+
+fn replace_project_string_payload(
+    old_payload: &[u8],
+    value: &str,
+    utf16: bool,
+) -> Result<Vec<u8>, FlpError> {
+    let (suffix_start, had_terminator) = if utf16 {
+        old_payload
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .position(|pair| u16::from_le_bytes(*pair) == 0)
+            .map_or((old_payload.len(), false), |unit_index| {
+                ((unit_index + 1) * 2, true)
+            })
+    } else {
+        old_payload
+            .iter()
+            .position(|byte| *byte == 0)
+            .map_or((old_payload.len(), false), |byte_index| {
+                (byte_index + 1, true)
+            })
+    };
+
+    let mut payload = Vec::new();
+    if utf16 {
+        for unit in value.encode_utf16() {
+            payload.extend_from_slice(&unit.to_le_bytes());
+        }
+        if had_terminator {
+            payload.extend_from_slice(&[0, 0]);
+        }
+    } else {
+        for character in value.chars() {
+            let byte = windows_1252_byte(character).ok_or(FlpError::UnsupportedEdit(
+                "the Project Info text contains a character unavailable in the project's legacy encoding",
+            ))?;
+            payload.push(byte);
+        }
+        if had_terminator {
+            payload.push(0);
+        }
+    }
+    payload.extend_from_slice(&old_payload[suffix_start..]);
+    Ok(payload)
+}
+
 fn decode_windows_1252_z(payload: &[u8]) -> Option<String> {
     let text = payload.split(|byte| *byte == 0).next()?;
     Some(text.iter().copied().map(windows_1252_char).collect())
@@ -3175,15 +3376,24 @@ fn utf16_banner_version(payload: &[u8]) -> Option<String> {
         .then_some(version)
 }
 
-fn read_project_metadata(events: &[FlpEvent]) -> ProjectMetadata {
+fn read_project_metadata(events: &[FlpEvent], project_version: Option<&str>) -> ProjectMetadata {
     let mut modern_tempo = None;
     let mut legacy_coarse_tempo = None;
     let mut legacy_fine_tempo = 0u32;
     let mut numerator = None;
     let mut denominator = None;
     let mut build_number = None;
+    let mut title = None;
+    let mut author = None;
+    let mut comments = None;
+    let mut genre = None;
+    let mut web_link = None;
+    let channel_start = events
+        .iter()
+        .position(|event| event.opcode == 0x40)
+        .unwrap_or(events.len());
 
-    for event in events {
+    for (event_index, event) in events.iter().enumerate() {
         match event.opcode {
             0x11 if event.payload.len() == 1 => numerator = Some(event.payload[0]),
             0x12 if event.payload.len() == 1 => denominator = Some(event.payload[0]),
@@ -3213,6 +3423,21 @@ fn read_project_metadata(events: &[FlpEvent]) -> ProjectMetadata {
                     event.payload[3],
                 ]));
             }
+            0xC2 if event_index < channel_start => {
+                title = decode_project_string(&event.payload, project_version);
+            }
+            0xCF if event_index < channel_start => {
+                author = decode_project_string(&event.payload, project_version);
+            }
+            0xC3 if event_index < channel_start => {
+                comments = decode_project_string(&event.payload, project_version);
+            }
+            0xCE if event_index < channel_start => {
+                genre = decode_project_string(&event.payload, project_version);
+            }
+            0xC5 if event_index < channel_start => {
+                web_link = decode_project_string(&event.payload, project_version);
+            }
             _ => {}
         }
     }
@@ -3230,6 +3455,11 @@ fn read_project_metadata(events: &[FlpEvent]) -> ProjectMetadata {
         tempo_milli_bpm,
         time_signature,
         build_number,
+        title,
+        author,
+        comments,
+        genre,
+        web_link,
     }
 }
 
@@ -3395,8 +3625,8 @@ fn decode_vst_text(bytes: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        FlpDocument, FlpError, MixerParameterKind, PatternNote, PayloadEncoding, midi::MidiFile,
-        parse_vst_plugin_state_metadata,
+        FlpDocument, FlpError, MixerParameterKind, PatternNote, PayloadEncoding, ProjectInfoEdit,
+        midi::MidiFile, parse_vst_plugin_state_metadata,
     };
 
     fn flp_fixture(event_stream: &[u8], header_extension: &[u8], trailing: &[u8]) -> Vec<u8> {
@@ -3418,6 +3648,18 @@ mod tests {
         event_stream.push(opcode);
         event_stream.extend_from_slice(&super::encode_leb128(payload.len() as u32));
         event_stream.extend_from_slice(payload);
+    }
+
+    fn utf16_project_string(value: &str) -> Vec<u8> {
+        value
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    }
+
+    fn append_project_info_string(event_stream: &mut Vec<u8>, opcode: u8, value: &str) {
+        append_data_event(event_stream, opcode, &utf16_project_string(value));
     }
 
     fn append_time_marker(
@@ -3472,6 +3714,149 @@ mod tests {
         }
         event_stream.extend_from_slice(trailing_event);
         flp_fixture(&event_stream, &[0xA1], &[0xB2])
+    }
+
+    #[test]
+    fn project_info_strings_decode_edit_and_roundtrip_losslessly() {
+        let mut event_stream = Vec::new();
+        append_data_event(&mut event_stream, 0xC7, b"26.0.0\0");
+        append_project_info_string(&mut event_stream, 0xC2, "Old title");
+        append_project_info_string(&mut event_stream, 0xCE, "Ambient");
+        append_project_info_string(&mut event_stream, 0xCF, "Original author");
+        event_stream.extend_from_slice(&[0xA7, 1, 2, 3, 4]);
+        append_project_info_string(&mut event_stream, 0xC3, "Old comments");
+        append_project_info_string(&mut event_stream, 0xC5, "https://old.example");
+        event_stream.extend_from_slice(&[0x40, 7, 0, 0x15, 0, 0x62, 0, 0]);
+        let input = flp_fixture(&event_stream, &[0xB1, 0xB2], &[0xD1, 0xD2]);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+
+        assert_eq!(document.metadata().title(), Some("Old title"));
+        assert_eq!(document.metadata().author(), Some("Original author"));
+        assert_eq!(document.metadata().comments(), Some("Old comments"));
+        assert_eq!(document.metadata().genre(), Some("Ambient"));
+        assert_eq!(document.metadata().web_link(), Some("https://old.example"));
+
+        let unchanged_wire_events: Vec<_> = document
+            .events()
+            .iter()
+            .filter(|event| !super::PROJECT_INFO_STRING_EVENTS.contains(&event.opcode()))
+            .map(|event| event.wire_bytes().to_vec())
+            .collect();
+        document
+            .set_project_info(ProjectInfoEdit {
+                title: Some("New title".to_owned()),
+                author: Some("Zoë".to_owned()),
+                comments: Some("Line one\nLine two".to_owned()),
+                genre: Some("Jazz".to_owned()),
+                web_link: Some("https://new.example/project".to_owned()),
+            })
+            .expect("Project Info fields should be editable");
+
+        assert_eq!(document.metadata().title(), Some("New title"));
+        assert_eq!(document.metadata().author(), Some("Zoë"));
+        assert_eq!(document.metadata().comments(), Some("Line one\nLine two"));
+        assert_eq!(document.metadata().genre(), Some("Jazz"));
+        assert_eq!(
+            document.metadata().web_link(),
+            Some("https://new.example/project")
+        );
+        assert_eq!(
+            document
+                .events()
+                .iter()
+                .filter(|event| !super::PROJECT_INFO_STRING_EVENTS.contains(&event.opcode()))
+                .map(|event| event.wire_bytes().to_vec())
+                .collect::<Vec<_>>(),
+            unchanged_wire_events
+        );
+
+        let encoded = document
+            .encode_lossless()
+            .expect("edited project should encode");
+        let reparsed = FlpDocument::parse(&encoded).expect("edited project should reparse");
+        assert_eq!(reparsed.metadata().title(), Some("New title"));
+        assert_eq!(reparsed.metadata().author(), Some("Zoë"));
+        assert_eq!(reparsed.metadata().comments(), Some("Line one\nLine two"));
+        assert_eq!(reparsed.metadata().genre(), Some("Jazz"));
+        assert_eq!(
+            reparsed.metadata().web_link(),
+            Some("https://new.example/project")
+        );
+        assert_eq!(reparsed.trailing_bytes(), &[0xD1, 0xD2]);
+    }
+
+    #[test]
+    fn project_info_edits_insert_missing_events_and_keep_legacy_encoding() {
+        let mut event_stream = Vec::new();
+        append_data_event(&mut event_stream, 0xC7, b"10.9.0\0");
+        append_data_event(&mut event_stream, 0xC2, b"old\0tail");
+        event_stream.extend_from_slice(&[0x40, 3, 0, 0x15, 0, 0x62, 0, 0]);
+        let input = flp_fixture(&event_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&input).expect("legacy fixture should parse");
+        document
+            .set_project_info(ProjectInfoEdit {
+                title: Some("Café".to_owned()),
+                author: Some("Zoë".to_owned()),
+                comments: Some("First\nSecond".to_owned()),
+                genre: Some("Jazz".to_owned()),
+                web_link: Some("https://legacy.example".to_owned()),
+            })
+            .expect("legacy strings should use Windows-1252");
+
+        assert_eq!(document.metadata().title(), Some("Café"));
+        assert_eq!(document.metadata().author(), Some("Zoë"));
+        assert_eq!(document.metadata().genre(), Some("Jazz"));
+        assert_eq!(document.metadata().comments(), Some("First\nSecond"));
+        assert_eq!(
+            document.metadata().web_link(),
+            Some("https://legacy.example")
+        );
+        assert_eq!(
+            document
+                .events()
+                .iter()
+                .find(|event| event.opcode() == 0xC2)
+                .expect("title event should remain")
+                .payload(),
+            b"Caf\xE9\0tail"
+        );
+        let first_channel = document
+            .events()
+            .iter()
+            .position(|event| event.opcode() == 0x40)
+            .expect("channel marker should remain");
+        assert!(
+            document.events()[..first_channel]
+                .iter()
+                .any(|event| { event.opcode() == 0xCF && event.payload() == b"Zo\xEB\0" })
+        );
+        assert!(
+            document.events()[..first_channel]
+                .iter()
+                .any(|event| event.opcode() == 0xCE)
+        );
+        assert!(
+            document.events()[..first_channel]
+                .iter()
+                .any(|event| event.opcode() == 0xC3)
+        );
+        assert!(
+            document.events()[..first_channel]
+                .iter()
+                .any(|event| event.opcode() == 0xC5)
+        );
+
+        let mut rejected = FlpDocument::parse(&input).expect("legacy fixture should parse");
+        let original = rejected.clone();
+        assert!(
+            rejected
+                .set_project_info(ProjectInfoEdit {
+                    title: Some("🎹".to_owned()),
+                    ..ProjectInfoEdit::default()
+                })
+                .is_err()
+        );
+        assert_eq!(rejected, original, "failed edits must be transactional");
     }
 
     fn channel_with_sample_path_fixture(kind: u8, sample_path: &str) -> Vec<u8> {

@@ -28,7 +28,8 @@ The foundation. Everything else depends on reading projects exactly.
 | Event stream decoding (byte/word/dword/data encodings) | `[done]` | |
 | Lossless round-trip (unknown events preserved byte-exact) | `[done]` | Core project invariant: never corrupt what you don't understand |
 | FLP versions 1.x–26.x (FruityLoops era through FL Studio 26) | `[partial]` | Modern versions tested; legacy header variants and old PPQ conventions need corpus testing |
-| Header fields: PPQ, tempo, time signature, project metadata | `[partial]` | Basic fields decoded; full metadata surface unmapped |
+| Header fields: PPQ, tempo, time signature, project metadata | `[partial]` | Tempo, meter, build number, and Project Info strings are decoded; swing, master pitch, recording options, and broader version validation remain unmapped. |
+| Project Info: title, author, comments, genre, web link | `[done]` | Read/write through the desktop Project Info dialog and CLI. Metadata events are edited without rewriting unrelated event bytes. |
 | Channel records: all types (sampler, generator, layer, MIDI out, automation clip) | `[partial]` | Known channel kind values 0/2/3/4/5 are named while unknown raw values are retained; `0xC4` sample paths are decoded for kind-0 Sampler and kind-4 sample-backed channels; Layer child IDs (`0x5E`) and raw flags (`0x90`) are decoded, and child lists can be edited in the Channel Rack through named channel choices while preserving other channel events. Legacy channel types, Layer playback, and flag editing remain incomplete. |
 | Pattern/score events: note records, all encodings | `[partial]` | 24-byte records handled; empty-pattern and conflicting-encoding edge cases guarded |
 | Playlist events: clips, tracks, arrangements | `[partial]` | Clip position/length editable; all three record sizes (80/60/32) recognized |
@@ -74,7 +75,7 @@ The decoded document must model everything the format can express.
 - `[todo]` Channel groups, colors, icons
 - `[todo]` Swing / groove settings per channel
 - `[todo]` Layer channels (keyboard splits, crossfades)
-- `[todo]` Project info: title, author, comments, genre
+- `[done]` Project info: title, author, comments, genre, and web link; the Project Info dialog and CLI can edit these fields.
 
 ---
 

@@ -14,6 +14,7 @@ use flp_rebuild::sample_render::{
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions};
 use flp_rebuild::{
     AutomationPointEdit, FlpDocument, PatternNote, PatternNoteEdit, PlaylistClipEdit,
+    ProjectInfoEdit,
 };
 
 fn main() -> ExitCode {
@@ -29,6 +30,7 @@ fn main() -> ExitCode {
 fn run(args: Vec<String>) -> Result<(), String> {
     match args.as_slice() {
         [command, path] if command == "info" => inspect(Path::new(path)),
+        [command, path] if command == "project-info" => show_project_info(Path::new(path)),
         [command, path] if command == "channels" => list_channels(Path::new(path)),
         [command, path] if command == "mixer" => list_mixer(Path::new(path)),
         [command, path] if command == "automation" => list_automation(Path::new(path)),
@@ -192,6 +194,21 @@ fn run(args: Vec<String>) -> Result<(), String> {
             let milli_bpm = parse_tempo_milli_bpm(bpm)?;
             set_tempo(Path::new(input), Path::new(output), milli_bpm)
         }
+        [command, input, output, title, author, genre, comments, web_link]
+            if command == "set-project-info" =>
+        {
+            write_project_info(
+                Path::new(input),
+                Path::new(output),
+                ProjectInfoEdit {
+                    title: project_info_argument(title),
+                    author: project_info_argument(author),
+                    genre: project_info_argument(genre),
+                    comments: project_info_argument(comments),
+                    web_link: project_info_argument(web_link),
+                },
+            )
+        }
         [command, input, output, channel_id, name] if command == "rename-channel" => {
             let channel_id = channel_id
                 .parse::<u16>()
@@ -323,6 +340,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
         _ => Err(concat!(
             "usage:\n",
             "  flp-rebuild info <file.flp>\n",
+            "  flp-rebuild project-info <file.flp>\n",
             "  flp-rebuild midi-info <file.mid>\n",
             "  flp-rebuild midi-events <file.mid> <track> [start] [count]\n",
             "  flp-rebuild scan <directory>\n",
@@ -345,6 +363,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild extract-event <file.flp> <index> <output.bin>\n",
             "  flp-rebuild roundtrip <input.flp> <output.flp>\n",
             "  flp-rebuild set-tempo <input.flp> <output.flp> <bpm>\n",
+            "  flp-rebuild set-project-info <input.flp> <output.flp> <title|-> <author|-> <genre|-> <comments|-> <web-link|->\n",
             "  flp-rebuild rename-channel <input.flp> <output.flp> <channel-id> <name>\n",
             "  flp-rebuild set-channel-levels <input.flp> <output.flp> <channel-id> <volume-0..12800> <pan-0..12800>\n",
             "  flp-rebuild set-layer-children <input.flp> <output.flp> <layer-channel-id> <child-ids-comma-separated|->\n",
@@ -392,6 +411,10 @@ fn parse_channel_id_list(value: &str) -> Result<Vec<u16>, String> {
             parse_u16(child_id, "child channel id")
         })
         .collect()
+}
+
+fn project_info_argument(value: &str) -> Option<String> {
+    (value != "-").then(|| value.to_owned())
 }
 
 fn parse_u32(value: &str, description: &str) -> Result<u32, String> {
@@ -589,6 +612,9 @@ fn inspect(path: &Path) -> Result<(), String> {
     if let Some(build) = document.metadata().build_number() {
         println!("writer build: {build}");
     }
+    if let Some(title) = document.metadata().title() {
+        println!("title: {title:?}");
+    }
     println!("events: {}", document.events().len());
     println!("channel summaries: {}", document.channels().len());
     println!("trailing bytes: {}", document.trailing_bytes().len());
@@ -604,6 +630,17 @@ fn inspect(path: &Path) -> Result<(), String> {
     for (opcode, count) in present.into_iter().take(24) {
         println!("  0x{opcode:02X}: {count}");
     }
+    Ok(())
+}
+
+fn show_project_info(path: &Path) -> Result<(), String> {
+    let (_, document) = load_document(path)?;
+    let metadata = document.metadata();
+    println!("title: {:?}", metadata.title());
+    println!("author: {:?}", metadata.author());
+    println!("genre: {:?}", metadata.genre());
+    println!("comments: {:?}", metadata.comments());
+    println!("web link: {:?}", metadata.web_link());
     Ok(())
 }
 
@@ -1386,6 +1423,20 @@ fn set_tempo(input: &Path, output: &Path, milli_bpm: u32) -> Result<(), String> 
         f64::from(milli_bpm) / 1000.0,
         output.display()
     );
+    Ok(())
+}
+
+fn write_project_info(input: &Path, output: &Path, edit: ProjectInfoEdit) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .set_project_info(edit)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!("wrote updated Project Info to {}", output.display());
     Ok(())
 }
 

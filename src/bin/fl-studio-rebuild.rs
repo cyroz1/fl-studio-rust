@@ -20,7 +20,7 @@ use flp_rebuild::sample_render::{
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions, Vst3PatternStreamHandle};
 use flp_rebuild::{
     AutomationChannel, AutomationPoint, AutomationPointEdit, ChannelSummary, FlpDocument, Pattern,
-    PatternNote, PatternNoteEdit, PlaylistClip, PlaylistClipEdit, PlaylistTrack,
+    PatternNote, PatternNoteEdit, PlaylistClip, PlaylistClipEdit, PlaylistTrack, ProjectInfoEdit,
     VstPluginStateMetadata,
 };
 
@@ -34,6 +34,65 @@ const GREEN: Color32 = Color32::from_rgb(113, 172, 77);
 const BLUE: Color32 = Color32::from_rgb(73, 128, 174);
 const PURPLE: Color32 = Color32::from_rgb(150, 93, 181);
 const ORANGE: Color32 = Color32::from_rgb(195, 129, 61);
+const FL_GENRES: &[&str] = &[
+    "(none)",
+    "Acid House",
+    "Afro House",
+    "Afrobeats",
+    "Amapiano",
+    "Ambient",
+    "Bass House",
+    "Boom Bap",
+    "Breakbeat",
+    "Cinematic",
+    "Classic House",
+    "Classical",
+    "Country",
+    "D&B",
+    "Dancehall",
+    "Deep House",
+    "Disco",
+    "Downtempo",
+    "Drill",
+    "Dubstep",
+    "EDM",
+    "Electro",
+    "Electronica",
+    "Film Score",
+    "Funk",
+    "Future Bass",
+    "Future Rave",
+    "Hardstyle",
+    "Hip hop",
+    "House",
+    "Hybrid Trap",
+    "Hyperpop",
+    "Hypertrance",
+    "Indie",
+    "Jazz",
+    "Jersey Club",
+    "Latin",
+    "Latin House",
+    "Lo-Fi",
+    "Lounge",
+    "Melodic Techno",
+    "Phonk",
+    "Pop",
+    "Progressive House",
+    "Psytrance",
+    "R&B",
+    "Rage Trap",
+    "Reggaeton",
+    "Rock",
+    "Slap House",
+    "Soul",
+    "Synthwave",
+    "Tech House",
+    "Techno",
+    "Trance",
+    "Trap",
+    "Tropical House",
+];
 
 fn candidate_matches_vst_metadata(
     candidate: &PluginCandidate,
@@ -258,6 +317,12 @@ struct DawUi {
     sampler_workers: Vec<PendingSamplerStream>,
     audio_test_tone: bool,
     audio_monitor_input: bool,
+    project_info_open: bool,
+    project_info_title: String,
+    project_info_author: String,
+    project_info_comments: String,
+    project_info_genre: String,
+    project_info_web_link: String,
 }
 
 struct PendingAudioRender {
@@ -326,6 +391,12 @@ impl DawUi {
             sampler_workers: Vec::new(),
             audio_test_tone: false,
             audio_monitor_input: false,
+            project_info_open: false,
+            project_info_title: String::new(),
+            project_info_author: String::new(),
+            project_info_comments: String::new(),
+            project_info_genre: String::new(),
+            project_info_web_link: String::new(),
         };
         if let Some(path) = initial_project.as_deref() {
             app.open_project(path);
@@ -351,6 +422,22 @@ impl DawUi {
             Ok(document) => {
                 self.stop_project_playback();
                 self.tempo_bpm = document.metadata().tempo_bpm().unwrap_or(140.0);
+                self.project_info_title =
+                    document.metadata().title().unwrap_or_default().to_owned();
+                self.project_info_author =
+                    document.metadata().author().unwrap_or_default().to_owned();
+                self.project_info_comments = document
+                    .metadata()
+                    .comments()
+                    .unwrap_or_default()
+                    .to_owned();
+                self.project_info_genre =
+                    document.metadata().genre().unwrap_or_default().to_owned();
+                self.project_info_web_link = document
+                    .metadata()
+                    .web_link()
+                    .unwrap_or_default()
+                    .to_owned();
                 self.selected_pattern = document
                     .patterns()
                     .ok()
@@ -492,6 +579,106 @@ impl DawUi {
             .save_file()
         {
             self.write_project(&path);
+        }
+    }
+
+    fn open_project_info(&mut self) {
+        if let Some(metadata) = self.document.as_ref().map(FlpDocument::metadata) {
+            self.project_info_title = metadata.title().unwrap_or_default().to_owned();
+            self.project_info_author = metadata.author().unwrap_or_default().to_owned();
+            self.project_info_comments = metadata.comments().unwrap_or_default().to_owned();
+            self.project_info_genre = metadata.genre().unwrap_or_default().to_owned();
+            self.project_info_web_link = metadata.web_link().unwrap_or_default().to_owned();
+            self.project_info_open = true;
+        }
+    }
+
+    fn apply_project_info(&mut self) {
+        let edit = ProjectInfoEdit {
+            title: Some(self.project_info_title.clone()),
+            author: Some(self.project_info_author.clone()),
+            comments: Some(self.project_info_comments.clone()),
+            genre: Some(self.project_info_genre.clone()),
+            web_link: Some(self.project_info_web_link.clone()),
+        };
+        let Some(document) = self.document.as_mut() else {
+            self.status = "Open a project before editing Project Info".to_owned();
+            return;
+        };
+        match document.set_project_info(edit) {
+            Ok(()) => {
+                self.dirty = true;
+                self.project_info_open = false;
+                self.status = "Project Info updated".to_owned();
+            }
+            Err(error) => self.status = format!("Could not update Project Info: {error}"),
+        }
+    }
+
+    fn project_info_dialog(&mut self, context: &egui::Context) {
+        if !self.project_info_open {
+            return;
+        }
+        let mut apply = false;
+        let mut cancel = false;
+        let mut open = self.project_info_open;
+        egui::Window::new("Project Info")
+            .id(Id::new("project-info-dialog"))
+            .open(&mut open)
+            .resizable(true)
+            .default_width(500.0)
+            .show(context, |ui| {
+                ui.label("Title");
+                ui.text_edit_singleline(&mut self.project_info_title);
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label("Author");
+                        ui.text_edit_singleline(&mut self.project_info_author);
+                    });
+                    ui.vertical(|ui| {
+                        ui.label("Genre");
+                        egui::ComboBox::from_id_salt("project-info-genre")
+                            .selected_text(if self.project_info_genre.is_empty() {
+                                "(none)"
+                            } else {
+                                &self.project_info_genre
+                            })
+                            .show_ui(ui, |ui| {
+                                for genre in FL_GENRES {
+                                    let value = if *genre == "(none)" {
+                                        String::new()
+                                    } else {
+                                        (*genre).to_owned()
+                                    };
+                                    ui.selectable_value(
+                                        &mut self.project_info_genre,
+                                        value,
+                                        *genre,
+                                    );
+                                }
+                            });
+                    });
+                });
+                ui.label("Comments");
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.project_info_comments)
+                        .desired_rows(8)
+                        .desired_width(f32::INFINITY),
+                );
+                ui.label("Web link");
+                ui.text_edit_singleline(&mut self.project_info_web_link);
+                ui.horizontal(|ui| {
+                    if ui.button("Apply").clicked() {
+                        apply = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        self.project_info_open = open && !cancel;
+        if apply {
+            self.apply_project_info();
         }
     }
 
@@ -883,6 +1070,12 @@ impl DawUi {
             }
             if ui.small_button("Save as").clicked() {
                 self.save_as();
+            }
+            if ui
+                .add_enabled(self.document.is_some(), egui::Button::new("Project Info…"))
+                .clicked()
+            {
+                self.open_project_info();
             }
             if ui
                 .add_enabled(
@@ -3718,6 +3911,7 @@ impl eframe::App for DawUi {
                 },
             );
         });
+        self.project_info_dialog(ui.ctx());
     }
 }
 

@@ -34,6 +34,12 @@ The Rust reader found 4,404 event boundaries in this fixture. The first events i
 
 The opcode-size rules used by the reader are the conventional four groups visible in the event stream: byte payloads for `00`–`3F`, two-byte payloads for `40`–`7F`, four-byte payloads for `80`–`BF`, and length-prefixed data for `C0`–`FF`. In this fixture, `AC` is a version-specific exception with three payload bytes. Corpus scanning confirms these framing rules across the installed FLP/FST files.
 
+## Project Info observations
+
+In a disposable copy of the installed `Data/Templates/Empty/Empty.flp`, the original FL Studio Project Info dialog exposes Title, Author, Genre, Comments, and Web link. Saving controlled values changed the top-level `0xC2` (title), `0xCF` (author), `0xCE` (genre), `0xC3` (comments), and `0xC5` (web link) data events. The observed modern payloads use UTF-16LE with a two-byte NUL terminator; the empty template stores empty title, genre, author, and comments as `00 00`, and the web-link event is omitted until a value is entered. The event stream places these fields before the first `0x40` channel marker.
+
+The Rust model reads all five strings, retains empty values as empty strings, and edits only the selected field events while preserving their terminator convention, bytes after the terminator, and every unrelated event. For absent fields it inserts a new length-prefixed event before the first channel marker. Legacy projects use the repository's existing version-based Windows-1252 string rule. A controlled FL Studio reopen of the Rust-written disposable project displayed the edited title, author, genre, comments, and web link. Legacy encoding behavior is covered by synthetic fixtures rather than an installed old-version FL Studio oracle.
+
 ## Channel grouping observations
 
 The stream contains 45 `0x40` markers, matching the header's channel count. At the first marker, the following fields occur before the next channel marker: a one-byte `0x15` value of `2`, a UTF-16LE `0xC9` string `Harmless`, and a UTF-16LE `0xCB` string `Synth Bass`. A later one-byte `0x00` event carries `1`. Across all 45 groups, the `0xCB` text produces plausible channel labels such as `Grv Kick 27`, `Piano Dark`, and `TEMPO`; `0xC9` produces plugin labels such as `3x Osc` and `FLEX` where present.
