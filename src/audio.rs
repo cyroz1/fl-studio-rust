@@ -109,8 +109,9 @@ impl StreamingAudioWriter {
         if !samples.len().is_multiple_of(2) {
             return Err("streamed audio must contain stereo sample frames".to_owned());
         }
-        for frame in samples.chunks_exact(2) {
-            while !self.playback.ring.push_stereo_frame(frame[0], frame[1]) {
+        let (frames, _) = samples.as_chunks::<2>();
+        for &[left, right] in frames {
+            while !self.playback.ring.push_stereo_frame(left, right) {
                 if self.playback.cancelled.load(Ordering::Acquire) {
                     return Err("streamed audio playback was stopped".to_owned());
                 }
