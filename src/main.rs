@@ -29,6 +29,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
         [command, path] if command == "channels" => list_channels(Path::new(path)),
         [command, path] if command == "mixer" => list_mixer(Path::new(path)),
         [command, path] if command == "automation" => list_automation(Path::new(path)),
+        [command, path] if command == "time-markers" => list_time_markers(Path::new(path)),
         [command, path] if command == "sample-paths" => list_sample_paths(Path::new(path)),
         [command, path] if command == "audio-info" => inspect_audio_file(Path::new(path)),
         [command, project, output] if command == "render-audio-clips" => render_audio_clips(
@@ -284,6 +285,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild channels <file.flp>\n",
             "  flp-rebuild mixer <file.flp>\n",
             "  flp-rebuild automation <file.flp>\n",
+            "  flp-rebuild time-markers <file.flp>\n",
             "  flp-rebuild sample-paths <file.flp>\n",
             "  flp-rebuild audio-info <audio-file>\n",
             "  flp-rebuild render-audio-clips <project.flp> <output.wav> [arrangement-id]\n",
@@ -1168,6 +1170,30 @@ fn list_playlist(path: &Path, start: usize, count: usize) -> Result<(), String> 
                 clip.record_size,
             );
         }
+    }
+    Ok(())
+}
+
+fn list_time_markers(path: &Path) -> Result<(), String> {
+    let (_, document) = load_document(path)?;
+    let markers = document.time_markers().map_err(|error| error.to_string())?;
+    println!("time markers: {}", markers.len());
+    for (index, (arrangement_id, marker)) in markers.iter().enumerate() {
+        println!(
+            "arrangement={} marker={} ticks={} raw=0x{:08X} signature={} meter={}/{} name={:?}",
+            arrangement_id,
+            index,
+            marker.position_ticks(),
+            marker.raw_position(),
+            marker.is_signature(),
+            marker
+                .numerator()
+                .map_or_else(|| "?".to_owned(), |value| value.to_string()),
+            marker
+                .denominator()
+                .map_or_else(|| "?".to_owned(), |value| value.to_string()),
+            marker.name().unwrap_or(""),
+        );
     }
     Ok(())
 }

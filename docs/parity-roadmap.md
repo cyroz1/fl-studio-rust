@@ -34,7 +34,7 @@ The foundation. Everything else depends on reading projects exactly.
 | Playlist events: clips, tracks, arrangements | `[partial]` | Clip position/length editable; all three record sizes (80/60/32) recognized |
 | Mixer state events | `[partial]` | Reads insert names, raw input/output/color/icon fields from the observed `0x9A`/`0x93`/`0x95` sequence and preserves 12-byte records from `0xE1`; parameter meaning, FX state, and routing edits remain incomplete. |
 | Automation events (channel envelopes, event automation) | `[partial]` | Reads type-5 channel automation points from `0xEA` blobs and edits, inserts, or removes points while preserving unmodified point bytes and the opaque header and era trailer. The desktop Automation view edits those curves with a straight-line preview; interpolation, event automation, target links, automation-blob creation, and clip creation remain incomplete. |
-| Time markers, song position markers | `[todo]` | |
+| Time markers, song position markers | `[partial]` | Reads arrangement-scoped marker positions, names, and time signatures. The documented signature bit is exposed separately; other position bits remain intact. Marker editing, song-position playback, and broader version verification remain incomplete. |
 | Project settings: swing, master pitch, metronome, recording settings | `[todo]` | |
 | `set-tempo`, `rename-channel`, note add/edit/delete, clip edit, channel levels | `[done]` | CLI surface; each rewrites only affected bytes |
 | Create missing objects (patterns, channels, clips) | `[todo]` | CLI only edits existing objects today |
@@ -219,7 +219,7 @@ roll is famously deep — the full toolset:
 - `[todo]` Audio clip fades, crossfades, gain envelopes
 - `[todo]` Stretch modes per clip (resample, stretch, e3 generic — needs time-stretch engine)
 - `[todo]` Pattern clips, automation clips on playlist tracks
-- `[todo]` Time markers, time signature changes
+- `[partial]` Time markers and meter records can be read and listed; marker editing and playback-clock behavior remain incomplete
 - `[todo]` Track grouping, mute/solo per playlist track
 - `[todo]` Slip editing, cut/copy/paste/split/merge/join
 - `[todo]` Performance mode (clip launching)

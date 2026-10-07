@@ -25,6 +25,7 @@ flp-rebuild plugin-states <file.flp>
 flp-rebuild channel-events <file.flp> <channel-id>
 flp-rebuild mixer <file.flp>
 flp-rebuild automation <file.flp>
+flp-rebuild time-markers <file.flp>
 flp-rebuild patterns <file.flp>
 flp-rebuild playlist <file.flp> [start] [count]
 flp-rebuild notes <file.flp> <pattern-id> [start] [count]
@@ -47,6 +48,8 @@ Launch the native desktop shell with `cargo run --release --bin fl-studio-rebuil
 The desktop executable also accepts an `.flp` path as its first argument to open that project at startup.
 
 `channels <file.flp>` reports each channel's raw kind, known type label, observed Layer child IDs/flags, sample source path, volume, and pan. Known type labels cover Sampler, Native, Layer, Instrument, and Automation; unrecognized raw values remain available. `mixer <file.flp>` reports recognized Mixer insert names and raw fields from the observed `0x9A`/`0x93`/`0x95` sequence, plus the count of fixed-size `0xE1` parameter records. It does not yet map those parameter records to faders, effect slots, or routing controls. `sample-paths <file.flp>` tries to resolve each reference using the project folder, configured factory roots, and common FL Studio install locations; it reports paths it cannot find. Set `FL_STUDIO_ROOT` or `FL_STUDIO_FACTORY_DATA` to select a custom installation. `audio-info <audio-file>` decodes WAV, OGG/Vorbis, FLAC, MP3, AIFF, and lossless mono/stereo WavPack media by content, including FL Studio's private RIFF wrapper around Ogg data. `render-audio-clips <project.flp> <output.wav>` makes an experimental stereo float render of enabled Playlist clips that target audio channels, using the base project tempo and observed source offsets. Clips with non-default scale are skipped and counted. The transport prepares that audio-clip mix in the background and plays it through the selected output at its configured sample rate; Stop cancels preparation. Pattern instruments, tempo automation, channel gain/pan, plug-ins, and Mixer effects are not part of this playback path yet.
+
+`time-markers <file.flp>` lists arrangement time markers with positions, names, signature status, and meter values. It removes only the documented time-signature flag from the displayed position and prints the original raw dword so unknown bits remain visible. It reads marker events independently of clip decoding, so it can inspect projects whose Playlist clip layout is not yet understood. The decoder is read-only; marker editing and playback-clock behavior are not implemented yet.
 
 In the desktop Piano roll, **Open MIDI…** loads a MIDI file, lets you choose a track, and imports its notes into the selected pattern and channel. The selected track's note timing is converted from MIDI PPQ to project PPQ. **Render WAV…** is enabled when the selected channel has a loaded VST3 instrument; it exports that pattern/channel using the currently loaded plug-in instance. The top menu's **Render audio…** exports the selected arrangement's enabled audio-channel clips. Both are early render paths with the limits described below.
 

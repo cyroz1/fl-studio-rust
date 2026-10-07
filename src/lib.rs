@@ -496,6 +496,74 @@ pub struct Arrangement {
     pub id: u16,
     pub name: Option<String>,
     pub clips: Vec<PlaylistClip>,
+    pub time_markers: Vec<TimeMarker>,
+}
+
+/// A Playlist marker or time-signature marker stored in an arrangement.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TimeMarker {
+    raw_position: u32,
+    numerator: Option<u8>,
+    denominator: Option<u8>,
+    name: Option<String>,
+}
+
+impl TimeMarker {
+    /// Original little-endian `0x94` value, including all type/flag bits.
+    pub fn raw_position(&self) -> u32 {
+        self.raw_position
+    }
+
+    /// Tick position with the documented signature-kind bit removed.
+    /// Other high bits are retained because their meaning is not established.
+    pub fn position_ticks(&self) -> u32 {
+        self.raw_position & !0x0800_0000
+    }
+
+    /// True when bit 27 marks this record as a time-signature marker.
+    pub fn is_signature(&self) -> bool {
+        self.raw_position & 0x0800_0000 != 0
+    }
+
+    pub fn numerator(&self) -> Option<u8> {
+        self.numerator
+    }
+
+    pub fn denominator(&self) -> Option<u8> {
+        self.denominator
+    }
+
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TimeMarkerTarget {
+    Arrangement {
+        arrangement_index: usize,
+        marker_index: usize,
+    },
+    Pending {
+        marker_index: usize,
+    },
+}
+
+fn time_marker_at_mut<'a>(
+    target: TimeMarkerTarget,
+    arrangements: &'a mut [Arrangement],
+    pending: &'a mut [TimeMarker],
+) -> Option<&'a mut TimeMarker> {
+    match target {
+        TimeMarkerTarget::Arrangement {
+            arrangement_index,
+            marker_index,
+        } => arrangements
+            .get_mut(arrangement_index)?
+            .time_markers
+            .get_mut(marker_index),
+        TimeMarkerTarget::Pending { marker_index } => pending.get_mut(marker_index),
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1123,8 +1191,31 @@ impl FlpDocument {
     /// Returns playlist arrangements and their stored clip records.
     /// The source events remain available unchanged through `events()`.
     pub fn arrangements(&self) -> Result<Vec<Arrangement>, FlpError> {
+        self.arrangements_impl(true)
+    }
+
+    /// Returns flattened time markers without decoding Playlist clip records.
+    /// This lets callers inspect marker data even when a project's clip layout
+    /// is not yet supported by `arrangements()`.
+    pub fn time_markers(&self) -> Result<Vec<(u16, TimeMarker)>, FlpError> {
+        let arrangements = self.arrangements_impl(false)?;
+        let mut markers = Vec::new();
+        for arrangement in arrangements {
+            markers.extend(
+                arrangement
+                    .time_markers
+                    .into_iter()
+                    .map(|marker| (arrangement.id, marker)),
+            );
+        }
+        Ok(markers)
+    }
+
+    fn arrangements_impl(&self, include_clips: bool) -> Result<Vec<Arrangement>, FlpError> {
         let mut arrangements = Vec::<Arrangement>::new();
         let mut current_arrangement = None;
+        let mut current_time_marker = None;
+        let mut pending_time_markers = Vec::new();
         let has_arrangement_markers = self
             .events
             .iter()
@@ -1139,8 +1230,34 @@ impl FlpDocument {
                         ..Arrangement::default()
                     });
                     current_arrangement = Some(arrangements.len() - 1);
+                    if !pending_time_markers.is_empty() {
+                        let arrangement_index = arrangements.len() - 1;
+                        let marker_start = arrangements[arrangement_index].time_markers.len();
+                        let pending_count = pending_time_markers.len();
+                        arrangements[arrangement_index]
+                            .time_markers
+                            .append(&mut pending_time_markers);
+                        current_time_marker = match current_time_marker {
+                            Some(TimeMarkerTarget::Pending { marker_index })
+                                if marker_index < pending_count =>
+                            {
+                                Some(TimeMarkerTarget::Arrangement {
+                                    arrangement_index,
+                                    marker_index: marker_start + marker_index,
+                                })
+                            }
+                            _ => None,
+                        };
+                    } else {
+                        current_time_marker = None;
+                    }
                 }
-                0x62 if has_arrangement_markers => current_arrangement = None,
+                0x62 => {
+                    if has_arrangement_markers {
+                        current_arrangement = None;
+                    }
+                    current_time_marker = None;
+                }
                 0xF1 => {
                     if let Some(arrangement_index) = current_arrangement
                         && arrangements[arrangement_index].name.is_none()
@@ -1150,6 +1267,72 @@ impl FlpDocument {
                                 .filter(|name| !name.is_empty());
                     }
                 }
+                0x94 if event.payload.len() == 4 => {
+                    let raw_position = u32::from_le_bytes(
+                        event.payload[..4]
+                            .try_into()
+                            .expect("a dword time-marker event has four bytes"),
+                    );
+                    if let Some(arrangement_index) = current_arrangement {
+                        let marker_index = arrangements[arrangement_index].time_markers.len();
+                        arrangements[arrangement_index]
+                            .time_markers
+                            .push(TimeMarker {
+                                raw_position,
+                                ..TimeMarker::default()
+                            });
+                        current_time_marker = Some(TimeMarkerTarget::Arrangement {
+                            arrangement_index,
+                            marker_index,
+                        });
+                    } else if has_arrangement_markers {
+                        let marker_index = pending_time_markers.len();
+                        pending_time_markers.push(TimeMarker {
+                            raw_position,
+                            ..TimeMarker::default()
+                        });
+                        current_time_marker = Some(TimeMarkerTarget::Pending { marker_index });
+                    } else {
+                        if arrangements.is_empty() {
+                            arrangements.push(Arrangement::default());
+                        }
+                        current_arrangement = Some(0);
+                        let marker_index = arrangements[0].time_markers.len();
+                        arrangements[0].time_markers.push(TimeMarker {
+                            raw_position,
+                            ..TimeMarker::default()
+                        });
+                        current_time_marker = Some(TimeMarkerTarget::Arrangement {
+                            arrangement_index: 0,
+                            marker_index,
+                        });
+                    }
+                }
+                0x21 if event.payload.len() == 1 => {
+                    if let Some(marker) = current_time_marker.and_then(|target| {
+                        time_marker_at_mut(target, &mut arrangements, &mut pending_time_markers)
+                    }) {
+                        marker.numerator = Some(event.payload[0]);
+                    }
+                }
+                0x22 if event.payload.len() == 1 => {
+                    if let Some(marker) = current_time_marker.and_then(|target| {
+                        time_marker_at_mut(target, &mut arrangements, &mut pending_time_markers)
+                    }) {
+                        marker.denominator = Some(event.payload[0]);
+                    }
+                }
+                0xCD => {
+                    if let Some(marker) = current_time_marker.and_then(|target| {
+                        time_marker_at_mut(target, &mut arrangements, &mut pending_time_markers)
+                    }) {
+                        marker.name =
+                            decode_project_string(&event.payload, self.project_version.as_deref())
+                                .filter(|name| !name.is_empty());
+                    }
+                    current_time_marker = None;
+                }
+                0xE9 if !include_clips => {}
                 0xE9 => {
                     let arrangement_index = if has_arrangement_markers {
                         let Some(arrangement_index) = current_arrangement else {
@@ -1183,6 +1366,14 @@ impl FlpDocument {
                 }
                 _ => {}
             }
+        }
+        if !pending_time_markers.is_empty() && !has_arrangement_markers {
+            if arrangements.is_empty() {
+                arrangements.push(Arrangement::default());
+            }
+            arrangements[0]
+                .time_markers
+                .append(&mut pending_time_markers);
         }
         Ok(arrangements)
     }
@@ -2939,6 +3130,24 @@ mod tests {
         event_stream.extend_from_slice(payload);
     }
 
+    fn append_time_marker(
+        event_stream: &mut Vec<u8>,
+        raw_position: u32,
+        numerator: u8,
+        denominator: u8,
+        name: &str,
+    ) {
+        event_stream.push(0x94);
+        event_stream.extend_from_slice(&raw_position.to_le_bytes());
+        event_stream.extend_from_slice(&[0x21, numerator, 0x22, denominator]);
+        let mut name_payload = name
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        name_payload.extend_from_slice(&[0, 0]);
+        append_data_event(event_stream, 0xCD, &name_payload);
+    }
+
     fn append_vst_field(payload: &mut Vec<u8>, id: u32, data: &[u8]) {
         payload.extend_from_slice(&id.to_le_bytes());
         payload.extend_from_slice(&(data.len() as u64).to_le_bytes());
@@ -3029,6 +3238,73 @@ mod tests {
         event_stream.extend_from_slice(&[0x40, 1, 0, 0x15, 2]);
         event_stream.extend_from_slice(&[0x40, 2, 0, 0x15, 4, 0x62, 0, 0]);
         flp_fixture(&event_stream, &[], &[])
+    }
+
+    #[test]
+    fn decodes_time_markers_and_preserves_unknown_position_bits() {
+        let mut event_stream = vec![0x63, 7, 0];
+        append_time_marker(&mut event_stream, 0x0800_0000 | 1_536, 7, 8, "Signature");
+        event_stream.extend_from_slice(&[0x21, 9, 0x22, 16]);
+        append_time_marker(&mut event_stream, 0x0400_0900, 4, 4, "Verse");
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        let input = flp_fixture(&event_stream, &[], &[]);
+        let document = FlpDocument::parse(&input).expect("fixture should parse");
+
+        let arrangements = document.arrangements().expect("arrangements should decode");
+        assert_eq!(arrangements.len(), 1);
+        assert_eq!(arrangements[0].id, 7);
+        assert_eq!(arrangements[0].time_markers.len(), 2);
+
+        let signature = &arrangements[0].time_markers[0];
+        assert_eq!(signature.raw_position(), 0x0800_0000 | 1_536);
+        assert_eq!(signature.position_ticks(), 1_536);
+        assert!(signature.is_signature());
+        assert_eq!(signature.numerator(), Some(7));
+        assert_eq!(signature.denominator(), Some(8));
+        assert_eq!(signature.name(), Some("Signature"));
+
+        let named_marker = &arrangements[0].time_markers[1];
+        assert_eq!(named_marker.raw_position(), 0x0400_0900);
+        assert_eq!(named_marker.position_ticks(), 0x0400_0900);
+        assert!(!named_marker.is_signature());
+        assert_eq!(named_marker.numerator(), Some(4));
+        assert_eq!(named_marker.denominator(), Some(4));
+        assert_eq!(named_marker.name(), Some("Verse"));
+        assert_eq!(document.encode_lossless().unwrap(), input);
+    }
+
+    #[test]
+    fn attaches_leading_time_markers_to_the_first_arrangement() {
+        let mut event_stream = Vec::new();
+        append_time_marker(&mut event_stream, 960, 3, 4, "Pickup");
+        event_stream.extend_from_slice(&[0x63, 11, 0, 0x62, 0, 0]);
+        let document = FlpDocument::parse(&flp_fixture(&event_stream, &[], &[]))
+            .expect("fixture should parse");
+
+        let arrangements = document.arrangements().expect("arrangements should decode");
+        assert_eq!(arrangements.len(), 1);
+        assert_eq!(arrangements[0].id, 11);
+        assert_eq!(arrangements[0].time_markers.len(), 1);
+        assert_eq!(arrangements[0].time_markers[0].position_ticks(), 960);
+        assert_eq!(arrangements[0].time_markers[0].name(), Some("Pickup"));
+    }
+
+    #[test]
+    fn time_marker_inspection_does_not_depend_on_playlist_clip_layout() {
+        let mut event_stream = vec![0x63, 2, 0];
+        append_time_marker(&mut event_stream, 480, 4, 4, "Marker");
+        append_data_event(&mut event_stream, 0xE9, &[0xAA]);
+        let document = FlpDocument::parse(&flp_fixture(&event_stream, &[], &[]))
+            .expect("fixture should parse");
+
+        assert!(document.arrangements().is_err());
+        let markers = document
+            .time_markers()
+            .expect("marker inspection should skip unsupported clip records");
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].0, 2);
+        assert_eq!(markers[0].1.position_ticks(), 480);
+        assert_eq!(markers[0].1.name(), Some("Marker"));
     }
 
     fn midi_fixture(track: &[u8], division: u16) -> Vec<u8> {
