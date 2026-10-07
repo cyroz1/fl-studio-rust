@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::audio::StreamingAudioWriter;
 use crate::media::{DecodedAudio, SamplePathResolver, decode_audio_file};
 use crate::{FlpDocument, PlaylistClip, PlaylistClipTarget};
 
@@ -41,9 +42,11 @@ pub struct AudioClipRenderSummary {
 
 /// Render audio-channel Playlist clips into a stereo 32-bit-float WAV.
 ///
-/// This early render path uses the project's base tempo, clip positions, and observed audio
-/// source offsets. Clips with default `-1` offsets use the full source file. It does not render
-/// pattern instruments, tempo automation, channel gain/pan, plug-ins, or Mixer effects.
+/// This early render path uses the project's base tempo, clip positions, observed audio source
+/// offsets, and decoded audio-channel volume/pan. Clips with default `-1` offsets use the full
+/// source file. The raw volume/pan mapping is provisional and has not been compared against
+/// native FL Studio output. Pattern instruments, tempo automation, plug-ins, and Mixer effects
+/// are not rendered.
 pub fn render_audio_clips_to_wav(
     document: &FlpDocument,
     project_path: impl AsRef<Path>,
@@ -84,12 +87,130 @@ pub fn render_audio_clips_to_stereo_buffer_cancellable(
     )
 }
 
+/// Decode and mix enabled Playlist audio clips in bounded blocks for live device playback.
+///
+/// Source files are decoded once, while the song-length mix is never held in memory. The writer
+/// applies backpressure outside the device callback and returns promptly after playback stops.
+pub fn stream_audio_clips_to_device(
+    document: &FlpDocument,
+    project_path: impl AsRef<Path>,
+    options: AudioClipRenderOptions,
+    writer: &StreamingAudioWriter,
+    cancelled: &AtomicBool,
+) -> Result<AudioClipRenderSummary, String> {
+    let render =
+        prepare_audio_clip_render(document, project_path.as_ref(), options, Some(cancelled))?;
+    stream_prepared_audio_clip_render(
+        &render,
+        options.sample_rate,
+        STREAM_BLOCK_FRAMES,
+        cancelled,
+        || writer.is_cancelled(),
+        |block| writer.write_stereo_samples(block),
+    )?;
+    Ok(render.summary)
+}
+
+fn stream_prepared_audio_clip_render(
+    render: &PreparedAudioClipRender,
+    output_rate: u32,
+    block_frames: usize,
+    cancelled: &AtomicBool,
+    mut stream_cancelled: impl FnMut() -> bool,
+    mut write_block: impl FnMut(&[f32]) -> Result<(), String>,
+) -> Result<(), String> {
+    if block_frames == 0 {
+        return Err("audio stream block size must be greater than zero".to_owned());
+    }
+    let mut block = Vec::<f32>::with_capacity(block_frames * 2);
+    let mut block_start = 0u64;
+    while block_start < render.summary.frames {
+        check_cancelled(Some(cancelled))?;
+        if stream_cancelled() {
+            return Err("audio clip playback was stopped".to_owned());
+        }
+        let frame_count = (render.summary.frames - block_start).min(block_frames as u64) as usize;
+        block.resize(frame_count * 2, 0.0);
+        block.fill(0.0);
+        for clip in &render.clips {
+            let audio = render
+                .decoded_by_path
+                .get(&clip.path)
+                .expect("prepared clips have decoded sources");
+            mix_clip_window_into_stereo(
+                &mut block,
+                block_start,
+                audio,
+                clip,
+                output_rate,
+                Some(cancelled),
+            )
+            .map_err(|error| {
+                format!(
+                    "could not mix Playlist clip {} from audio channel {}: {error}",
+                    clip.clip_index, clip.channel_id
+                )
+            })?;
+        }
+        write_block(&block)?;
+        block_start += frame_count as u64;
+    }
+    Ok(())
+}
+
 fn render_audio_clips_to_stereo_buffer_inner(
     document: &FlpDocument,
     project_path: &Path,
     options: AudioClipRenderOptions,
     cancelled: Option<&AtomicBool>,
 ) -> Result<(Vec<f32>, AudioClipRenderSummary), String> {
+    let render = prepare_audio_clip_render(document, project_path, options, cancelled)?;
+    let output_frames = render.summary.frames;
+
+    let output_frames_usize = usize::try_from(output_frames)
+        .map_err(|_| "render mix buffer is too large for this platform".to_owned())?;
+    let mix_samples = output_frames_usize
+        .checked_mul(2)
+        .ok_or_else(|| "rendered audio size overflow".to_owned())?;
+    let _mix_bytes = mix_samples
+        .checked_mul(std::mem::size_of::<f32>())
+        .filter(|bytes| *bytes <= MAX_MIX_BYTES)
+        .ok_or_else(|| {
+            format!(
+                "render exceeds the {} MiB in-memory mix limit",
+                MAX_MIX_BYTES / (1024 * 1024)
+            )
+        })?;
+    let mut mix = Vec::<f32>::new();
+    mix.try_reserve_exact(mix_samples)
+        .map_err(|error| format!("could not allocate render mix buffer: {error}"))?;
+    mix.resize(mix_samples, 0.0);
+
+    for clip in &render.clips {
+        check_cancelled(cancelled)?;
+        let audio = render
+            .decoded_by_path
+            .get(&clip.path)
+            .expect("prepared clips have decoded sources");
+        mix_clip_into_stereo(&mut mix, audio, clip, options.sample_rate, cancelled).map_err(
+            |error| {
+                format!(
+                    "could not mix Playlist clip {} from audio channel {}: {error}",
+                    clip.clip_index, clip.channel_id
+                )
+            },
+        )?;
+    }
+
+    Ok((mix, render.summary))
+}
+
+fn prepare_audio_clip_render(
+    document: &FlpDocument,
+    project_path: &Path,
+    options: AudioClipRenderOptions,
+    cancelled: Option<&AtomicBool>,
+) -> Result<PreparedAudioClipRender, String> {
     check_cancelled(cancelled)?;
     if !(8_000..=384_000).contains(&options.sample_rate) {
         return Err("render sample rate must be between 8000 and 384000 Hz".to_owned());
@@ -113,17 +234,17 @@ fn render_audio_clips_to_stereo_buffer_inner(
 
     let mut max_tick = 0u64;
     let mut clips_skipped_unsupported_scale = 0usize;
-    let mut candidate_clips = Vec::<(usize, &PlaylistClip, u16, PathBuf)>::new();
+    let mut candidate_clips = Vec::<(usize, &PlaylistClip, u16, PathBuf, f32, f32)>::new();
     for (clip_index, clip) in arrangement.clips.iter().enumerate() {
         check_cancelled(cancelled)?;
         max_tick = max_tick.max(u64::from(clip.position_ticks) + u64::from(clip.length_ticks));
         let PlaylistClipTarget::Channel { id } = clip.target() else {
             continue;
         };
-        let Some(matching_channels) = channels.iter().find(|channel| channel.id() == id) else {
+        let Some(channel) = channels.iter().find(|channel| channel.id() == id) else {
             continue;
         };
-        if matching_channels.kind() != Some(4) || matching_channels.enabled() == Some(false) {
+        if channel.kind() != Some(4) || channel.enabled() == Some(false) {
             continue;
         }
         if clip
@@ -133,13 +254,14 @@ fn render_audio_clips_to_stereo_buffer_inner(
             clips_skipped_unsupported_scale += 1;
             continue;
         }
-        let sample_path = matching_channels.sample_path().ok_or_else(|| {
+        let sample_path = channel.sample_path().ok_or_else(|| {
             format!("audio channel {id} has no decoded sample path (Playlist clip {clip_index})")
         })?;
         let resolved_path = resolver.resolve(sample_path).map_err(|error| {
             format!("could not resolve audio channel {id} for Playlist clip {clip_index}: {error}")
         })?;
-        candidate_clips.push((clip_index, clip, id, resolved_path));
+        let (gain, pan) = channel_gain_pan(channel.volume(), channel.pan());
+        candidate_clips.push((clip_index, clip, id, resolved_path, gain, pan));
     }
     if candidate_clips.is_empty() {
         return Err(
@@ -150,7 +272,7 @@ fn render_audio_clips_to_stereo_buffer_inner(
     let timeline_frames = ticks_to_frames(max_tick, ppq, tempo_bpm, options.sample_rate)?;
     let mut decoded_by_path = HashMap::<PathBuf, DecodedAudio>::new();
     let mut cached_source_bytes = 0usize;
-    for (_, _, _, path) in &candidate_clips {
+    for (_, _, _, path, _, _) in &candidate_clips {
         check_cancelled(cancelled)?;
         if decoded_by_path.contains_key(path) {
             continue;
@@ -169,9 +291,9 @@ fn render_audio_clips_to_stereo_buffer_inner(
         decoded_by_path.insert(path.clone(), audio);
     }
 
-    let mut prepared = Vec::with_capacity(candidate_clips.len());
+    let mut clips = Vec::with_capacity(candidate_clips.len());
     let mut output_frames = timeline_frames;
-    for (clip_index, clip, channel_id, path) in &candidate_clips {
+    for (clip_index, clip, channel_id, path, gain, pan) in &candidate_clips {
         check_cancelled(cancelled)?;
         let audio = decoded_by_path
             .get(path)
@@ -198,67 +320,29 @@ fn render_audio_clips_to_stereo_buffer_inner(
             .checked_add(duration_frames)
             .ok_or_else(|| "render timeline length overflow".to_owned())?;
         output_frames = output_frames.max(end_frame);
-        prepared.push(PreparedClip {
+        clips.push(PreparedClip {
             clip_index: *clip_index,
             channel_id: *channel_id,
             path: path.clone(),
             start_frame,
             source_bounds,
             duration_frames,
+            gain: *gain,
+            pan: *pan,
         });
     }
 
-    let output_frames_usize = usize::try_from(output_frames)
-        .map_err(|_| "render mix buffer is too large for this platform".to_owned())?;
-    let mix_samples = output_frames_usize
-        .checked_mul(2)
-        .ok_or_else(|| "rendered audio size overflow".to_owned())?;
-    let _mix_bytes = mix_samples
-        .checked_mul(std::mem::size_of::<f32>())
-        .filter(|bytes| *bytes <= MAX_MIX_BYTES)
-        .ok_or_else(|| {
-            format!(
-                "render exceeds the {} MiB in-memory mix limit",
-                MAX_MIX_BYTES / (1024 * 1024)
-            )
-        })?;
-    let mut mix = Vec::<f32>::new();
-    mix.try_reserve_exact(mix_samples)
-        .map_err(|error| format!("could not allocate render mix buffer: {error}"))?;
-    mix.resize(mix_samples, 0.0);
-
-    for clip in &prepared {
-        check_cancelled(cancelled)?;
-        let audio = decoded_by_path
-            .get(&clip.path)
-            .expect("prepared clips have decoded sources");
-        mix_clip_into_stereo(
-            &mut mix,
-            audio,
-            clip.source_bounds,
-            clip.start_frame,
-            clip.duration_frames,
-            options.sample_rate,
-            cancelled,
-        )
-        .map_err(|error| {
-            format!(
-                "could not mix Playlist clip {} from audio channel {}: {error}",
-                clip.clip_index, clip.channel_id
-            )
-        })?;
-    }
-
-    Ok((
-        mix,
-        AudioClipRenderSummary {
+    Ok(PreparedAudioClipRender {
+        summary: AudioClipRenderSummary {
             frames: output_frames,
             sample_rate: options.sample_rate,
-            clips_rendered: prepared.len(),
+            clips_rendered: clips.len(),
             clips_skipped_unsupported_scale,
             source_files: decoded_by_path.len(),
         },
-    ))
+        decoded_by_path,
+        clips,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -275,7 +359,17 @@ struct PreparedClip {
     start_frame: u64,
     source_bounds: SampleBounds,
     duration_frames: u64,
+    gain: f32,
+    pan: f32,
 }
+
+struct PreparedAudioClipRender {
+    summary: AudioClipRenderSummary,
+    decoded_by_path: HashMap<PathBuf, DecodedAudio>,
+    clips: Vec<PreparedClip>,
+}
+
+const STREAM_BLOCK_FRAMES: usize = 1024;
 
 fn sample_source_bounds(
     clip: &PlaylistClip,
@@ -345,6 +439,14 @@ fn source_duration_to_frames(
     Ok(duration.ceil() as u64)
 }
 
+fn channel_gain_pan(volume: Option<u32>, pan: Option<i32>) -> (f32, f32) {
+    let gain = volume.unwrap_or(10_000).min(12_800) as f32 / 10_000.0;
+    let pan = pan
+        .map(|raw| (raw.clamp(0, 12_800) as f32 / 6_400.0) - 1.0)
+        .unwrap_or(0.0);
+    (gain, pan)
+}
+
 fn check_cancelled(cancelled: Option<&AtomicBool>) -> Result<(), String> {
     if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
         Err("audio render cancelled".to_owned())
@@ -356,48 +458,76 @@ fn check_cancelled(cancelled: Option<&AtomicBool>) -> Result<(), String> {
 fn mix_clip_into_stereo(
     mix: &mut [f32],
     source: &DecodedAudio,
-    bounds: SampleBounds,
-    start_frame: u64,
-    output_frames: u64,
+    clip: &PreparedClip,
+    output_rate: u32,
+    cancelled: Option<&AtomicBool>,
+) -> Result<(), String> {
+    mix_clip_window_into_stereo(mix, 0, source, clip, output_rate, cancelled)
+}
+
+fn mix_clip_window_into_stereo(
+    mix: &mut [f32],
+    mix_start_frame: u64,
+    source: &DecodedAudio,
+    clip: &PreparedClip,
     output_rate: u32,
     cancelled: Option<&AtomicBool>,
 ) -> Result<(), String> {
     if source.channels.is_empty() || source.channels.len() > 2 {
         return Err("source must have one or two channels".to_owned());
     }
-    if source.sample_rate == 0 || output_rate == 0 || bounds.start >= bounds.end {
+    if source.sample_rate == 0
+        || output_rate == 0
+        || clip.source_bounds.start >= clip.source_bounds.end
+    {
         return Err("source audio range or sample rate is invalid".to_owned());
     }
     if source
         .channels
         .iter()
-        .any(|channel| bounds.end > channel.len())
+        .any(|channel| clip.source_bounds.end > channel.len())
     {
         return Err("source audio range exceeds a channel buffer".to_owned());
     }
-    let end_frame = start_frame
-        .checked_add(output_frames)
+    let end_frame = clip
+        .start_frame
+        .checked_add(clip.duration_frames)
         .ok_or_else(|| "audio clip end position overflow".to_owned())?;
     let mix_frames = mix.len() / 2;
-    if !mix.len().is_multiple_of(2) || end_frame > mix_frames as u64 {
-        return Err("audio clip exceeds the render mix buffer".to_owned());
+    let mix_end_frame = mix_start_frame
+        .checked_add(mix_frames as u64)
+        .ok_or_else(|| "audio mix window end position overflow".to_owned())?;
+    if !mix.len().is_multiple_of(2) {
+        return Err("audio mix window must contain stereo frames".to_owned());
     }
+    let overlap_start = clip.start_frame.max(mix_start_frame);
+    let overlap_end = end_frame.min(mix_end_frame);
+    if overlap_start >= overlap_end {
+        return Ok(());
+    }
+    let pan = clip.pan.clamp(-1.0, 1.0);
+    let left_gain = (1.0 - pan.max(0.0)) * clip.gain;
+    let right_gain = (1.0 + pan.min(0.0)) * clip.gain;
     let source_frames_per_output = f64::from(source.sample_rate) / f64::from(output_rate);
-    for output_offset in 0..output_frames {
+    for output_frame in overlap_start..overlap_end {
+        let output_offset = output_frame - clip.start_frame;
         if output_offset.is_multiple_of(16_384) {
             check_cancelled(cancelled)?;
         }
-        let position = (bounds.start as f64 + output_offset as f64 * source_frames_per_output)
-            .min((bounds.end - 1) as f64);
+        let position = (clip.source_bounds.start as f64
+            + output_offset as f64 * source_frames_per_output)
+            .min((clip.source_bounds.end - 1) as f64);
         let left = interpolate_sample(&source.channels[0], position);
         let right = if source.channels.len() == 1 {
             left
         } else {
             interpolate_sample(&source.channels[1], position)
         };
-        let output_index = (start_frame + output_offset) as usize * 2;
-        mix[output_index] += left;
-        mix[output_index + 1] += right;
+        let output_index = usize::try_from(output_frame - mix_start_frame)
+            .map_err(|_| "audio output frame index exceeds this platform".to_owned())?
+            * 2;
+        mix[output_index] += left * left_gain;
+        mix[output_index + 1] += right * right_gain;
     }
     Ok(())
 }
@@ -624,18 +754,85 @@ mod tests {
             sample_rate: 2,
             channels: vec![vec![0.0, 1.0]],
         };
+        let clip = PreparedClip {
+            clip_index: 0,
+            channel_id: 0,
+            path: PathBuf::new(),
+            start_frame: 0,
+            source_bounds: SampleBounds { start: 0, end: 2 },
+            duration_frames: 4,
+            gain: 1.0,
+            pan: 0.0,
+        };
         let mut mix = vec![0.0; 8];
-        mix_clip_into_stereo(
-            &mut mix,
-            &source,
-            SampleBounds { start: 0, end: 2 },
-            0,
+        mix_clip_into_stereo(&mut mix, &source, &clip, 4, None).unwrap();
+        assert_eq!(mix, vec![0.0, 0.0, 0.5, 0.5, 1.0, 1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn block_stream_mix_matches_offline_mix_with_channel_levels() {
+        let path = PathBuf::from("source.wav");
+        let source = DecodedAudio {
+            sample_rate: 4,
+            channels: vec![
+                vec![1.0, 3.0, 5.0, 7.0, 9.0],
+                vec![2.0, 4.0, 6.0, 8.0, 10.0],
+            ],
+        };
+        let clip = PreparedClip {
+            clip_index: 0,
+            channel_id: 3,
+            path: path.clone(),
+            start_frame: 2,
+            source_bounds: SampleBounds { start: 0, end: 5 },
+            duration_frames: 5,
+            gain: 0.5,
+            pan: 0.5,
+        };
+        let render = PreparedAudioClipRender {
+            summary: AudioClipRenderSummary {
+                frames: 9,
+                sample_rate: 4,
+                clips_rendered: 1,
+                clips_skipped_unsupported_scale: 0,
+                source_files: 1,
+            },
+            decoded_by_path: HashMap::from([(path, source.clone())]),
+            clips: vec![clip.clone()],
+        };
+        let mut offline = vec![0.0; render.summary.frames as usize * 2];
+        mix_clip_into_stereo(&mut offline, &source, &clip, 4, None).unwrap();
+
+        let mut streamed = Vec::new();
+        stream_prepared_audio_clip_render(
+            &render,
             4,
-            4,
-            None,
+            2,
+            &AtomicBool::new(false),
+            || false,
+            |block| {
+                streamed.extend_from_slice(block);
+                Ok(())
+            },
         )
         .unwrap();
-        assert_eq!(mix, vec![0.0, 0.0, 0.5, 0.5, 1.0, 1.0, 1.0, 1.0]);
+
+        assert_eq!(streamed, offline);
+        assert_eq!(
+            streamed,
+            vec![
+                0.0, 0.0, 0.0, 0.0, 0.25, 1.0, 0.75, 2.0, 1.25, 3.0, 1.75, 4.0, 2.25, 5.0, 0.0,
+                0.0, 0.0, 0.0
+            ]
+        );
+    }
+
+    #[test]
+    fn channel_volume_and_pan_use_fl_default_values_as_unity_and_center() {
+        assert_eq!(channel_gain_pan(Some(10_000), Some(6_400)), (1.0, 0.0));
+        assert_eq!(channel_gain_pan(Some(5_000), Some(0)), (0.5, -1.0));
+        assert_eq!(channel_gain_pan(Some(12_800), Some(12_800)), (1.28, 1.0));
+        assert_eq!(channel_gain_pan(None, None), (1.0, 0.0));
     }
 
     #[test]

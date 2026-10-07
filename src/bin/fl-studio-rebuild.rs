@@ -13,8 +13,8 @@ use flp_rebuild::audio::{
 use flp_rebuild::midi::MidiFile;
 use flp_rebuild::plugins::{PluginCandidate, PluginFormat, scan_installed_plugins};
 use flp_rebuild::sample_render::{
-    AudioClipRenderOptions, AudioClipRenderSummary,
-    render_audio_clips_to_stereo_buffer_cancellable, render_audio_clips_to_wav,
+    AudioClipRenderOptions, AudioClipRenderSummary, render_audio_clips_to_wav,
+    stream_audio_clips_to_device,
 };
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions, Vst3PatternStreamHandle};
 use flp_rebuild::{
@@ -248,6 +248,7 @@ struct DawUi {
     audio_settings: AudioSettings,
     audio_engine: Option<AudioEngine>,
     pending_audio_render: Option<PendingAudioRender>,
+    audio_render_workers: Vec<PendingAudioRender>,
     pending_vst3_stream: Option<Vst3PatternStreamHandle>,
     vst3_workers: Vec<Vst3PatternStreamHandle>,
     audio_test_tone: bool,
@@ -255,8 +256,9 @@ struct DawUi {
 }
 
 struct PendingAudioRender {
-    receiver: Receiver<Result<(Vec<f32>, AudioClipRenderSummary), String>>,
+    receiver: Receiver<Result<AudioClipRenderSummary, String>>,
     cancelled: Arc<AtomicBool>,
+    worker: thread::JoinHandle<()>,
 }
 
 impl DawUi {
@@ -306,6 +308,7 @@ impl DawUi {
             audio_settings,
             audio_engine: None,
             pending_audio_render: None,
+            audio_render_workers: Vec::new(),
             pending_vst3_stream: None,
             vst3_workers: Vec::new(),
             audio_test_tone: false,
@@ -464,7 +467,7 @@ impl DawUi {
         let project_bytes = match self
             .document
             .as_ref()
-            .expect("the project was checked above")
+            .expect("project was checked above")
             .encode_lossless()
         {
             Ok(bytes) => bytes,
@@ -477,6 +480,13 @@ impl DawUi {
             arrangement_id: self.selected_arrangement.unwrap_or(0),
             sample_rate,
         };
+        let writer = match engine.begin_streaming_playback() {
+            Ok(writer) => writer,
+            Err(error) => {
+                self.status = format!("Could not start Playlist audio output: {error}");
+                return;
+            }
+        };
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
         let (sender, receiver) = mpsc::sync_channel(1);
@@ -486,26 +496,32 @@ impl DawUi {
                 let result = FlpDocument::parse(&project_bytes)
                     .map_err(|error| error.to_string())
                     .and_then(|document| {
-                        render_audio_clips_to_stereo_buffer_cancellable(
+                        stream_audio_clips_to_device(
                             &document,
                             &project_path,
                             options,
+                            &writer,
                             &worker_cancelled,
                         )
                     });
+                writer.finish();
                 let _ = sender.send(result);
             });
         match worker {
-            Ok(_) => {
-                self.playing = false;
-                self.project_playback_loaded = false;
+            Ok(worker) => {
+                self.playing = true;
+                self.project_playback_loaded = true;
                 self.pending_audio_render = Some(PendingAudioRender {
                     receiver,
                     cancelled,
+                    worker,
                 });
-                self.status = "Preparing Playlist audio for playback…".to_owned();
+                self.status = "Preparing and streaming Playlist audio…".to_owned();
             }
-            Err(error) => self.status = format!("Could not start audio preparation: {error}"),
+            Err(error) => {
+                self.stop_project_playback();
+                self.status = format!("Could not start audio streaming: {error}");
+            }
         }
     }
 
@@ -520,12 +536,27 @@ impl DawUi {
             }
         });
         if let Some(result) = completed {
-            self.pending_audio_render = None;
+            let worker_panicked = self
+                .pending_audio_render
+                .take()
+                .is_some_and(|pending| pending.worker.join().is_err());
+            if worker_panicked {
+                self.stop_project_playback();
+                self.status = "Playlist audio worker panicked".to_owned();
+                return;
+            }
             match result {
-                Ok((samples, summary)) => self.start_rendered_project_playback(samples, summary),
+                Ok(summary) => {
+                    self.status = format!(
+                        "Streaming {} Playlist audio clips from {} source files at {} Hz ({} scaled clips skipped); patterns, instruments, and Mixer effects are not rendered",
+                        summary.clips_rendered,
+                        summary.source_files,
+                        summary.sample_rate,
+                        summary.clips_skipped_unsupported_scale
+                    );
+                }
                 Err(error) => {
-                    self.playing = false;
-                    self.project_playback_loaded = false;
+                    self.stop_project_playback();
                     self.status = format!("Could not render project audio for playback: {error}");
                 }
             }
@@ -568,38 +599,8 @@ impl DawUi {
         }
     }
 
-    fn start_rendered_project_playback(
-        &mut self,
-        samples: Vec<f32>,
-        summary: AudioClipRenderSummary,
-    ) {
-        let result = self
-            .audio_engine
-            .as_ref()
-            .ok_or_else(|| "Audio output is not available".to_owned())
-            .and_then(|engine| engine.set_project_playback(samples));
-        match result {
-            Ok(()) => {
-                self.playing = true;
-                self.project_playback_loaded = true;
-                self.audio_test_tone = false;
-                self.audio_monitor_input = false;
-                self.status = format!(
-                    "Playing {} audio clips from {} source files at {} Hz ({} scaled clips skipped); instruments and Mixer effects are not rendered",
-                    summary.clips_rendered,
-                    summary.source_files,
-                    summary.sample_rate,
-                    summary.clips_skipped_unsupported_scale
-                );
-            }
-            Err(error) => self.status = format!("Could not start project playback: {error}"),
-        }
-    }
-
     fn toggle_project_playback(&mut self) {
-        if self.pending_audio_render.is_some() {
-            self.status = "Preparing Playlist audio for playback…".to_owned();
-        } else if self.playing {
+        if self.playing {
             if let Some(engine) = &self.audio_engine {
                 engine.pause_project_playback();
             }
@@ -618,6 +619,8 @@ impl DawUi {
                 }
                 Err(error) => self.status = format!("Could not resume project playback: {error}"),
             }
+        } else if self.pending_audio_render.is_some() {
+            self.status = "Preparing Playlist audio…".to_owned();
         } else {
             self.start_project_playback();
         }
@@ -626,6 +629,7 @@ impl DawUi {
     fn stop_project_playback(&mut self) {
         if let Some(pending) = self.pending_audio_render.take() {
             pending.cancelled.store(true, Ordering::Release);
+            self.audio_render_workers.push(pending);
         }
         if let Some(stream) = self.pending_vst3_stream.take() {
             self.vst3_workers.push(stream);
@@ -644,6 +648,20 @@ impl DawUi {
                 let worker = self.vst3_workers.swap_remove(index);
                 if worker.join().is_err() {
                     self.status = "A cancelled VST3 stream worker panicked".to_owned();
+                }
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    fn reap_audio_render_workers(&mut self) {
+        let mut index = 0;
+        while index < self.audio_render_workers.len() {
+            if self.audio_render_workers[index].worker.is_finished() {
+                let worker = self.audio_render_workers.swap_remove(index);
+                if worker.worker.join().is_err() {
+                    self.status = "A cancelled Playlist audio worker panicked".to_owned();
                 }
             } else {
                 index += 1;
@@ -3142,6 +3160,7 @@ impl eframe::App for DawUi {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_project_audio_render();
         self.poll_vst3_stream();
+        self.reap_audio_render_workers();
         self.reap_vst3_workers();
         for (key, view) in [
             (egui::Key::F5, MainView::Playlist),
@@ -3236,6 +3255,9 @@ impl eframe::App for DawUi {
 impl Drop for DawUi {
     fn drop(&mut self) {
         self.stop_project_playback();
+        for worker in self.audio_render_workers.drain(..) {
+            let _ = worker.worker.join();
+        }
         if let Some(stream) = self.pending_vst3_stream.take() {
             self.vst3_workers.push(stream);
         }

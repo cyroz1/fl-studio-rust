@@ -87,9 +87,9 @@ where real-time constraints punish sloppy code.
 
 | Item | Status | Notes |
 |---|---|---|
-| Windows: WASAPI (shared + exclusive), DirectSound, ASIO | `[partial]` | Shared capture/output through CPAL and direct WASAPI exclusive streams are implemented, including endpoint selection, rate/buffer settings, input metering/monitoring, an output test tone, pre-rendered Playlist audio, and block-streamed VST3 pattern output through a bounded stereo ring. A 9,600-frame excerpt rendered from `Ookay - Thief.flp` was consumed by both shared and exclusive output on the current machine. A shared-mode input smoke run opened the current Focusrite endpoints; capture reported one startup discontinuity and then stayed active without further errors for the remainder of the 3-second check. These verify current hardware paths, not all endpoints or formats. DirectSound and ASIO are not implemented. |
-| macOS: CoreAudio | `[partial]` | The shared CPAL path uses the platform's default audio host and supports rendered Playlist audio buffers; hardware behavior is not verified yet. |
-| Linux: ALSA, PulseAudio/PipeWire, JACK | `[partial]` | The shared CPAL path uses the platform's default host and supports rendered Playlist audio buffers. Cross-platform build/test CI exists; backend and hardware behavior are not verified yet. |
+| Windows: WASAPI (shared + exclusive), DirectSound, ASIO | `[partial]` | Shared capture/output through CPAL and direct WASAPI exclusive streams are implemented, including endpoint selection, rate/buffer settings, input metering/monitoring, an output test tone, block-streamed Playlist audio clips with provisional volume/pan mapping, and block-streamed VST3 pattern output through a bounded stereo ring. A 9,600-frame excerpt rendered from `Ookay - Thief.flp` was consumed by both shared and exclusive output on the current machine. A shared-mode input smoke run opened the current Focusrite endpoints; capture reported one startup discontinuity and then stayed active without further errors for the remainder of the 3-second check. These verify current hardware paths, not all endpoints or formats. DirectSound and ASIO are not implemented. |
+| macOS: CoreAudio | `[partial]` | The shared CPAL path uses the platform's default audio host and supports block-streamed Playlist audio; hardware behavior is not verified yet. |
+| Linux: ALSA, PulseAudio/PipeWire, JACK | `[partial]` | The shared CPAL path uses the platform's default audio host and supports block-streamed Playlist audio. Cross-platform build/test CI exists; backend and hardware behavior are not verified yet. |
 | Device enumeration, sample-rate / buffer-size negotiation | `[partial]` | CPAL lists endpoints and opens selected/default devices at the requested sample rate and buffer size. Shared mode falls back to the backend's default buffer when a fixed size is rejected; complete capability negotiation is still needed. |
 | Recommended starting point: `cpal` crate for cross-platform bring-up | `[done]` | CPAL is used for shared-mode input and output on desktop platforms. |
 
@@ -114,7 +114,7 @@ where real-time constraints punish sloppy code.
 ### 3.4 Sample playback
 
 - `[partial]` Offline: WAV/OGG/FLAC/MP3/AIFF/WavPack decode by content (symphonia + wavicle)
-- `[partial]` Playlist audio clip playback: audio-only clip mixes are rendered at the device rate and streamed to the selected output; pattern sampler voices and real-time polyphony are not implemented
+- `[partial]` Playlist audio clip playback: enabled audio-channel clips are mixed in bounded 1,024-frame blocks and streamed at the device rate, applying decoded channel volume/pan and source offsets. The raw level mapping is provisional and still needs comparison against native FL Studio output. Distinct sources are still decoded into a bounded in-memory cache, and non-default time stretch, automation, routing, pattern clips, and Mixer effects are unsupported.
 - `[todo]` Real-time sampler voice management: polyphony, voice stealing
 - `[todo]` Resampling (project rate vs sample rate vs device rate)
 - `[todo]` FL's private RIFF-wrapped Ogg handling in realtime path
@@ -329,9 +329,9 @@ Ordered by dependency and by "most compatibility per unit effort":
 1. **Format completion** — mixer state, automation events, all channel types
    (unlocks reading real-world projects fully)
 2. **Audio engine bring-up (in progress)** — shared device capture/output,
-   Windows WASAPI exclusive access, and transport playback for pre-rendered
-   Playlist audio clips are implemented; next add real-time sample scheduling
-   and validate stable playback on each platform
+   Windows WASAPI exclusive access, and block-streamed Playlist audio clip
+   playback with provisional channel volume/pan are implemented; next add real-time
+   sample voices and pattern scheduling, then validate stable playback on each platform
 3. **Realtime sampler + scheduler** — sample-accurate note scheduling, channel
    gain/pan, basic mixer summing (first true playback)
 4. **VST3 realtime processing + state restore** — the compatibility crux
