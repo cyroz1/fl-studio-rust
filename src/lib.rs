@@ -5233,6 +5233,74 @@ mod tests {
     }
 
     #[test]
+    fn exports_tempo_automation_per_tick_and_restores_the_project_tempo() {
+        let mut event_stream = vec![0x40, 40, 0, 0x15, 5];
+        append_project_info_string(&mut event_stream, 0xCB, "TEMPO");
+
+        let points: [(f64, f64, f32, [u8; 4]); 3] = [
+            (0.0, 0.75, 0.0f32, [0, 0, 0, 0]),
+            (4.0, 0.75, -0.1142857f32, [0, 0, 0, 0xFF]),
+            (8.0, 0.0, 0.0f32, [0, 0, 0, 2]),
+        ];
+        let mut automation = vec![0xA7; 17];
+        automation.extend_from_slice(&(points.len() as u32).to_le_bytes());
+        let mut previous_position = 0.0;
+        for (position, value, tension, tail) in points {
+            automation.extend_from_slice(&(position - previous_position).to_le_bytes());
+            automation.extend_from_slice(&value.to_le_bytes());
+            automation.extend_from_slice(&tension.to_le_bytes());
+            automation.extend_from_slice(&tail);
+            previous_position = position;
+        }
+        append_data_event(&mut event_stream, 0xEA, &automation);
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+
+        let mut clip = [0u8; 80];
+        clip[4..6].copy_from_slice(&1_000u16.to_le_bytes());
+        clip[6..8].copy_from_slice(&40u16.to_le_bytes());
+        clip[8..12].copy_from_slice(&768u32.to_le_bytes());
+        clip[12..14].copy_from_slice(&499u16.to_le_bytes());
+        clip[64..72].copy_from_slice(&1.0f64.to_le_bytes());
+        append_data_event(&mut event_stream, 0xE9, &clip);
+
+        let document = FlpDocument::parse(&flp_fixture(&event_stream, &[], &[]))
+            .expect("tempo automation project fixture should parse");
+        let bytes =
+            MidiFile::encode_project_song(&document, 0, MidiChannelMapping::PreserveNoteChannels)
+                .expect("song tempo automation should export");
+        let midi = MidiFile::parse(&bytes).expect("exported MIDI should parse");
+        let conductor = &midi.tracks()[0];
+        let tempos = conductor.tempo_events();
+
+        assert!(
+            tempos
+                .iter()
+                .any(|tempo| tempo.tick() == 0 && (tempo.bpm() - 150.0).abs() < 0.001)
+        );
+        assert!(
+            tempos
+                .iter()
+                .any(|tempo| tempo.tick() == 383 && (tempo.bpm() - 150.0).abs() < 0.001)
+        );
+        assert!(
+            tempos
+                .iter()
+                .any(|tempo| tempo.tick() == 384 && (tempo.bpm() - 149.766).abs() < 0.01)
+        );
+        assert!(
+            tempos
+                .iter()
+                .any(|tempo| tempo.tick() == 767 && (tempo.bpm() - 60.0).abs() < 0.001)
+        );
+        assert!(
+            tempos
+                .iter()
+                .any(|tempo| tempo.tick() == 769 && (tempo.bpm() - 140.0).abs() < 0.001)
+        );
+        assert_eq!(conductor.end_tick(), 769);
+    }
+
+    #[test]
     fn midi_import_rejects_ambiguous_empty_pattern_encoding_without_mutation() {
         let note = note_record(0, 0, 48, 60, 100);
         let mut stream = vec![0x40, 0, 0, 0x41, 7, 0, 0xD0, 0x18];

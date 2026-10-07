@@ -34,7 +34,7 @@ The foundation. Everything else depends on reading projects exactly.
 | Pattern/score events: note records, all encodings | `[partial]` | 24-byte records handled; empty-pattern and conflicting-encoding edge cases guarded |
 | Playlist events: clips, tracks, arrangements | `[partial]` | Clip position/length editable; all three record sizes (80/60/32) recognized, with structural inference when the stored version tag disagrees with the record width |
 | Mixer state events | `[partial]` | Reads insert fields and raw `0xE1` records, recognizes candidate volume/pan/EQ parameter IDs and target bits, and can edit an existing record's value by exact record index. Insert-name editing is available. Target-to-visible-track mapping, fader UI, FX state, and routing remain incomplete. |
-| Automation events (channel envelopes, event automation) | `[partial]` | Reads type-5 channel automation points from `0xEA` blobs and edits, inserts, or removes points while preserving unmodified point bytes and the opaque header and era trailer. The desktop Automation view edits those curves with a straight-line preview; interpolation, event automation, target links, automation-blob creation, and clip creation remain incomplete. |
+| Automation events (channel envelopes, event automation) | `[partial]` | Reads type-5 channel automation points from `0xEA` blobs and edits, inserts, or removes points while preserving unmodified point bytes and the opaque header and era trailer. Song MIDI export samples linear type-5 automation on a Playlist clip targeting a channel named `TEMPO` once per tick and restores the project tempo after the clip. The desktop Automation view uses a straight-line preview; native curve tension, realtime tempo playback, event automation, target links, automation-blob creation, and clip creation remain incomplete. |
 | Time markers, song position markers | `[partial]` | Reads arrangement-scoped marker positions, names, and time signatures. The documented signature bit is exposed separately; other position bits remain intact. Marker editing, song-position playback, and broader version verification remain incomplete. |
 | Project settings: swing, master pitch, metronome, recording settings | `[partial]` | The Project model, CLI, and desktop dialog read and edit the FL Studio 26 Advanced options `Play truncated notes in clips` and `Fast declick for cut groups`. Swing, master pitch, metronome, recording settings, panning law, and other controls remain unmapped. |
 | `set-tempo`, `rename-channel`, note add/edit/delete, clip edit, channel levels | `[done]` | CLI surface; each rewrites only affected bytes |
@@ -57,7 +57,7 @@ The foundation. Everything else depends on reading projects exactly.
 | MIDI import into pattern/channel with PPQ conversion | `[done]` | |
 | SMPTE-timed MIDI | `[todo]` | |
 | Tempo-map conversion on import | `[todo]` | Currently preserves FLP tempo |
-| MIDI export (File > Export > MIDI) | `[partial]` | Exports pattern notes and arrangement Pattern Clips as SMF format 1 with project PPQ, base tempo, time signature, named channel tracks, pattern repeats, and clip-edge note truncation. Native MIDI export comparison, tempo automation, scaled clips, note properties beyond key/velocity/channel, markers, and unsupported Playlist layouts remain. |
+| MIDI export (File > Export > MIDI) | `[partial]` | Exports pattern notes and arrangement Pattern Clips as SMF format 1 with project PPQ, base tempo, time signature, named channel tracks, pattern repeats, and clip-edge note truncation. Song export samples linear `TEMPO` automation once per tick and restores the project tempo after its clip; a direct FL Studio export matched the tempo event ticks, with up to 9 microseconds-per-quarter differences and three fewer redundant tempo events. Other native export modes, scaled clips, note properties beyond key/velocity/channel, markers, and unsupported Playlist layouts remain. |
 | MIDI export options: pattern vs song, channel mapping | `[partial]` | The CLI and desktop expose pattern or arrangement export; channel mapping can preserve each note's stored low four channel bits or assign one MIDI channel per FL channel. Full native export modes and channel mapping behavior remain to be compared against FL Studio. |
 
 ---
@@ -70,8 +70,8 @@ The decoded document must model everything the format can express.
 - `[partial]` Patterns: note lists per channel; empty patterns can be created when the project supplies an unambiguous note-event encoding
 - `[partial]` Playlist: tracks, arrangements, clips with targets
 - `[partial]` Mixer: recognized insert summaries and parameter kinds, with exact-record value editing and insert-name editing; full 125 inserts, master/sends, target mapping, fader UI, effects, and routing remain incomplete
-- `[partial]` Automation: type-5 channel point curves can be read and points in an existing blob edited, inserted, or removed from the desktop view; interpolation, parameter links, event automation, LFOs, and new clip creation remain incomplete
-- `[todo]` Time signatures per pattern/arrangement, tempo automation
+- `[partial]` Automation: type-5 channel point curves can be read and points in an existing blob edited, inserted, or removed from the desktop view; linear tempo-map conversion is implemented for song MIDI export, while native curve interpolation, realtime tempo playback, parameter links, event automation, LFOs, and new clip creation remain incomplete
+- `[partial]` Tempo automation: linear channel curves named `TEMPO` are sampled for MIDI song export; realtime playback and native tension/easing semantics remain
 - `[todo]` Channel groups, colors, icons
 - `[todo]` Swing / groove settings per channel
 - `[partial]` Project settings: the two verified FL Studio 26 Advanced options `Play truncated notes in clips` and `Fast declick for cut groups` can be read and edited; other project-wide settings remain unmapped
@@ -340,8 +340,9 @@ Ordered by dependency and by "most compatibility per unit effort":
 3. **Realtime sampler + scheduler (partial)** — selected-pattern and Playlist
    Sampler notes schedule at sample offsets with bounded polyphony, voice
    stealing, basic sample-rate conversion, and channel gain/pan. VST3 Pattern
-   Clip transport now runs for mapped VST3 instances. Tempo automation,
-   envelopes, and command queues remain.
+   Clip transport now runs for mapped VST3 instances. Realtime tempo automation,
+   envelopes, and command queues remain; linear `TEMPO` automation currently
+   applies to MIDI song export only.
 4. **VST3 project-wide autoload + full plugin routing (partial)** — project
    opening now loads recognized channels when a matching installed VST3 is
    found and attempts supported marker-12 state restore. Broaden identity and
@@ -353,7 +354,7 @@ Ordered by dependency and by "most compatibility per unit effort":
 7. **Piano roll tools** — the editing depth users expect
 8. **Playlist audio** — waveforms, fades, stretch
 9. **Recording + Edison-class editor**
-10. **MIDI hardware + export (partial)** — pattern and arrangement MIDI export now works for decoded layouts; native parity, tempo automation, scaled clips, full note properties, and hardware support remain.
+10. **MIDI hardware + export (partial)** — pattern and arrangement MIDI export now works for decoded layouts, including per-tick linear `TEMPO` automation on song export; native event values/duplicates, scaled clips, full note properties, and hardware support remain.
 11. **Polish**: undo everywhere, themes, shortcuts, autosave
 
 (Stock plugin DSP is intentionally absent from this list — see §4.)

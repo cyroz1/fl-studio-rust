@@ -1,6 +1,6 @@
 # Original FL Studio oracle experiments
 
-These experiments use the installed FL Studio command-line MIDI export on copies of bundled projects. The source projects under `Data` are left unchanged. The manual describes `/M` as the batch MIDI render option: [Exporting Audio & MIDI](https://www.image-line.com/fl-studio-learning/fl-studio-beta-online-manual/html/fformats_save_export.htm).
+These experiments use copies of bundled projects; the source projects under `Data` are left unchanged. The 42,801-byte prepared export below and the 21,653-byte direct UI export are separate captures: preparing the project for MIDI export changes which score tracks are written. The manual describes `/M` as the batch MIDI render option: [Exporting Audio & MIDI](https://www.image-line.com/fl-studio-learning/fl-studio-beta-online-manual/html/fformats_save_export.htm).
 
 ## Project name and channel score export
 
@@ -20,11 +20,17 @@ Changing the equal-length UTF-16LE channel label `Synth Bass` to `Synth Test` in
 
 The empty template at 140 BPM exported MIDI with a 140 BPM tempo event. Editing its `0x9C` field from 140,000 to 100,000 using `set-tempo` produced an export at 100 BPM. This confirms that the project-level `0x9C` value uses thousandths of a BPM.
 
-Changing NewStuff's `0x9C` value from 150,000 to 100,000 left its exported MIDI at 150 BPM. NewStuff has an enabled channel with id 40 and display name `TEMPO`; the channel contains an `0xEA` data event of 205 bytes. The exported MIDI tempo track has 3,079 tempo events from tick 0 through tick 55,297. Its tempo varies from 150 BPM down to 60 BPM near tick 55,295 and returns to 150 BPM at tick 55,297. This strongly indicates that the `TEMPO` channel automation overrides the project base tempo during export. The 205-byte automation payload layout remains undecoded, so the curve has only been observed through the original exporter, not reconstructed from the FLP bytes.
+Changing NewStuff's `0x9C` value from 150,000 to 100,000 left its prepared export at 150 BPM. NewStuff has an enabled channel with id 40 and display name `TEMPO`; the channel contains an `0xEA` data event of 205 bytes. Its exported MIDI tempo track has 3,079 tempo events from tick 0 through tick 55,297. The tempo varies from 150 BPM down to 60 BPM near tick 55,295 and returns to 150 BPM at tick 55,297. This strongly indicates that the `TEMPO` channel automation overrides the project base tempo during export. The 205-byte automation payload layout remains undecoded, so the curve has only been observed through the original exporter, not reconstructed from the FLP bytes.
+
+### Direct UI export capture (2026-10-07)
+
+Using File > Export > MIDI on a temporary copy of `NewStuff.flp`, without preparing the project, produced a 21,653-byte format-1 MIDI file at 96 PPQ with four tracks. It contains no note events. The conductor data has 3,079 tempo events: four redundant 150 BPM events at tick 0, 150 BPM at tick 52,223, one event per tick from 52,224 through 55,295, then two redundant 150 BPM events at tick 55,297. This capture is kept separate from the prepared export above because their score-track contents differ.
+
+The Rust song export has the same tempo event ticks but 3,076 tempo events: it omits two redundant tick-0 events and one redundant reset event. On shared ticks, tempo values differ by at most 9 microseconds per quarter note in this capture. The linear 60–180 BPM mapping and per-tick sampling reproduce the broad ramp; FL Studio's curve tension or numeric conversion still needs to be identified for exact values.
 
 ## Rust exporter comparison
 
-The new `export-midi-song` path was run against the same `NewStuff.flp`. Its format-1 output has the same PPQ (96), base tempo (150 BPM), channel names, and note counts for Synth Bass (85), Piano Dark (196), and Tinke Bell (1,920). It currently exports 104 Saw Bass notes instead of the original export's 94, and 224 White Noise notes instead of 210. Its conductor track contains only the base tempo, so it also omits NewStuff's 3,079-event tempo automation map. These differences show that Playlist repeat/export rules and automation-to-tempo conversion still need to be matched against FL Studio.
+The new `export-midi-song` path was run against the prepared `NewStuff.flp` export. Its format-1 output has the same PPQ (96), base tempo (150 BPM), channel names, and note counts for Synth Bass (85), Piano Dark (196), and Tinke Bell (1,920). It exports 104 Saw Bass notes instead of the prepared native export's 94, and 224 White Noise notes instead of 210. Playlist repeat/export rules still need to be matched. Tempo-map sampling is now implemented and is compared separately against the direct UI capture above.
 
 ## Arrangement payload boundaries
 

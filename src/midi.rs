@@ -1,12 +1,13 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 
-use crate::{FlpDocument, PatternNote, PlaylistClipTarget};
+use crate::{FlpDocument, PatternNote, PlaylistClip, PlaylistClipTarget};
 
 const MTHD: &[u8; 4] = b"MThd";
 const MTRK: &[u8; 4] = b"MTrk";
 const MAX_VLQ: u64 = 0x0FFF_FFFF;
 const MAX_EXPORTED_NOTES: usize = 1_000_000;
+const MAX_EXPORTED_TEMPO_EVENTS: usize = 1_000_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MidiFile {
@@ -251,16 +252,16 @@ impl MidiFile {
             if clip.track_index.is_none() || clip.length_ticks == 0 {
                 continue;
             }
+            let clip_end = u64::from(clip.position_ticks)
+                .checked_add(u64::from(clip.length_ticks))
+                .ok_or(MidiError::LengthOverflow)?;
+            song_end_tick = song_end_tick.max(clip_end);
             let PlaylistClipTarget::Pattern { id } = clip.target() else {
                 continue;
             };
             let Some(pattern) = patterns_by_id.get(&id).copied() else {
                 continue;
             };
-            let clip_end = u64::from(clip.position_ticks)
-                .checked_add(u64::from(clip.length_ticks))
-                .ok_or(MidiError::LengthOverflow)?;
-            song_end_tick = song_end_tick.max(clip_end);
             if clip
                 .scale
                 .is_some_and(|scale| !scale.is_finite() || (scale - 1.0).abs() > 1e-9)
@@ -333,7 +334,13 @@ impl MidiFile {
         for track in &mut tracks {
             track.end_tick = song_end_tick;
         }
-        Self::encode_project_export_tracks(document, &tracks, channel_mapping)
+        let tempo_events = song_tempo_events(document, &arrangement.clips)?;
+        Self::encode_project_export_tracks_with_tempo_events(
+            document,
+            &tracks,
+            channel_mapping,
+            &tempo_events,
+        )
     }
 
     /// Serializes named channel tracks and a conductor track to Standard MIDI File format 1.
@@ -359,18 +366,28 @@ impl MidiFile {
         tracks: &[MidiExportTrack],
         channel_mapping: MidiChannelMapping,
     ) -> Result<Vec<u8>, MidiError> {
+        Self::encode_project_export_tracks_with_tempo_events(document, tracks, channel_mapping, &[])
+    }
+
+    fn encode_project_export_tracks_with_tempo_events(
+        document: &FlpDocument,
+        tracks: &[MidiExportTrack],
+        channel_mapping: MidiChannelMapping,
+        tempo_events: &[(u64, f64)],
+    ) -> Result<Vec<u8>, MidiError> {
         let channel_order = document
             .channels()
             .into_iter()
             .map(|channel| channel.id())
             .collect::<Vec<_>>();
-        Self::encode_export_tracks_with_channel_order(
+        Self::encode_export_tracks_with_channel_order_and_tempo_events(
             tracks,
             document.header().ppq(),
             document.metadata().tempo_bpm().unwrap_or(140.0),
             document.metadata().time_signature(),
             channel_mapping,
             &channel_order,
+            tempo_events,
         )
     }
 
@@ -382,22 +399,32 @@ impl MidiFile {
         channel_mapping: MidiChannelMapping,
         project_channel_order: &[u16],
     ) -> Result<Vec<u8>, MidiError> {
+        Self::encode_export_tracks_with_channel_order_and_tempo_events(
+            tracks,
+            ppq,
+            tempo_bpm,
+            time_signature,
+            channel_mapping,
+            project_channel_order,
+            &[],
+        )
+    }
+
+    fn encode_export_tracks_with_channel_order_and_tempo_events(
+        tracks: &[MidiExportTrack],
+        ppq: u16,
+        tempo_bpm: f64,
+        time_signature: Option<(u8, u8)>,
+        channel_mapping: MidiChannelMapping,
+        project_channel_order: &[u16],
+        tempo_events: &[(u64, f64)],
+    ) -> Result<Vec<u8>, MidiError> {
         if ppq == 0 || ppq & 0x8000 != 0 {
             return Err(MidiError::InvalidExport(
                 "project PPQ must be in the range 1..=32767",
             ));
         }
-        if !tempo_bpm.is_finite() || tempo_bpm <= 0.0 {
-            return Err(MidiError::InvalidExport(
-                "tempo must be positive and finite",
-            ));
-        }
-        let micros_per_quarter = (60_000_000.0 / tempo_bpm).round();
-        if !(1.0..=16_777_215.0).contains(&micros_per_quarter) {
-            return Err(MidiError::InvalidExport(
-                "tempo is outside the range representable by Standard MIDI Files",
-            ));
-        }
+        midi_tempo_microseconds_per_quarter(tempo_bpm)?;
         if let Some((numerator, denominator)) = time_signature
             && (numerator == 0 || denominator == 0 || !denominator.is_power_of_two())
         {
@@ -445,11 +472,24 @@ impl MidiFile {
 
         let mut conductor = Vec::new();
         push_meta_event(&mut conductor, 0, 0x03, b"Tempo and meter")?;
-        let tempo_bytes = (micros_per_quarter as u32).to_be_bytes();
-        push_meta_event(&mut conductor, 0, 0x51, &tempo_bytes[1..])?;
         if let Some((numerator, denominator)) = time_signature {
             let exponent = denominator.trailing_zeros() as u8;
             push_meta_event(&mut conductor, 0, 0x58, &[numerator, exponent, 24, 8])?;
+        }
+        let mut ordered_tempo_events = Vec::with_capacity(tempo_events.len().saturating_add(1));
+        ordered_tempo_events.push((0, tempo_bpm));
+        ordered_tempo_events.extend_from_slice(tempo_events);
+        ordered_tempo_events.sort_by_key(|(tick, _)| *tick);
+        let mut previous_tempo_tick = 0u64;
+        for (tick, bpm) in ordered_tempo_events {
+            let tempo_bytes = midi_tempo_microseconds_per_quarter(bpm)?.to_be_bytes();
+            push_meta_event(
+                &mut conductor,
+                tick.saturating_sub(previous_tempo_tick),
+                0x51,
+                &tempo_bytes[1..],
+            )?;
+            previous_tempo_tick = tick;
         }
         write_end_of_track(&mut conductor, 0)?;
         append_track_chunk(&mut output, conductor)?;
@@ -672,6 +712,140 @@ impl MidiTempoEvent {
             60_000_000.0 / f64::from(self.microseconds_per_quarter)
         }
     }
+}
+
+/// The native exporter emits tempo-control curves over FL's observed 60–180 BPM range.
+/// This mapping is inferred from the installed FL Studio reference project and needs
+/// more oracle coverage for other control ranges and non-linear point shapes.
+fn tempo_automation_bpm(value: f64) -> Result<f64, MidiError> {
+    let bpm = 60.0 + value * 120.0;
+    midi_tempo_microseconds_per_quarter(bpm)?;
+    Ok(bpm)
+}
+
+fn midi_tempo_microseconds_per_quarter(bpm: f64) -> Result<u32, MidiError> {
+    if !bpm.is_finite() || bpm <= 0.0 {
+        return Err(MidiError::InvalidExport(
+            "tempo must be positive and finite",
+        ));
+    }
+    let micros_per_quarter = (60_000_000.0 / bpm).round();
+    if !(1.0..=16_777_215.0).contains(&micros_per_quarter) {
+        return Err(MidiError::InvalidExport(
+            "tempo is outside the range representable by Standard MIDI Files",
+        ));
+    }
+    Ok(micros_per_quarter as u32)
+}
+
+fn song_tempo_events(
+    document: &FlpDocument,
+    clips: &[PlaylistClip],
+) -> Result<Vec<(u64, f64)>, MidiError> {
+    let automation_channels = document
+        .automation_channels()
+        .map_err(|error| MidiError::Project(error.to_string()))?;
+    let ppq = document.header().ppq();
+    let base_tempo = document.metadata().tempo_bpm().unwrap_or(140.0);
+    let mut events = Vec::new();
+
+    for clip in clips {
+        if clip.track_index.is_none() || clip.length_ticks == 0 {
+            continue;
+        }
+        let PlaylistClipTarget::Channel { id } = clip.target() else {
+            continue;
+        };
+        let Some(channel) = automation_channels.iter().find(|channel| {
+            channel.channel_id() == id
+                && channel
+                    .display_name()
+                    .is_some_and(|name| name.trim().eq_ignore_ascii_case("tempo"))
+        }) else {
+            continue;
+        };
+        if clip
+            .scale
+            .is_some_and(|scale| !scale.is_finite() || (scale - 1.0).abs() > 1e-9)
+        {
+            return Err(MidiError::InvalidExport(
+                "scaled Playlist tempo automation Clips cannot be exported yet",
+            ));
+        }
+        if channel.points().is_empty() {
+            continue;
+        }
+
+        let clip_start = u64::from(clip.position_ticks);
+        let clip_end = clip_start
+            .checked_add(u64::from(clip.length_ticks))
+            .ok_or(MidiError::LengthOverflow)?;
+        let points = channel.points();
+        let first_point_tick = clip_start
+            .checked_add(automation_point_tick(points[0].position_beats(), ppq)?)
+            .ok_or(MidiError::LengthOverflow)?;
+        if first_point_tick < clip_end {
+            events.push((first_point_tick, tempo_automation_bpm(points[0].value())?));
+        }
+
+        let mut clip_event_count = 0usize;
+        for pair in points.windows(2) {
+            let from = &pair[0];
+            let to = &pair[1];
+            if from.value() == to.value() {
+                continue;
+            }
+
+            let segment_start = clip_start
+                .checked_add(automation_point_tick(from.position_beats(), ppq)?)
+                .ok_or(MidiError::LengthOverflow)?;
+            let segment_end = clip_start
+                .checked_add(automation_point_tick(to.position_beats(), ppq)?)
+                .ok_or(MidiError::LengthOverflow)?;
+            if segment_start >= clip_end || segment_end <= segment_start {
+                continue;
+            }
+            let sample_end = segment_end.min(clip_end);
+            let span = (segment_end - segment_start) as f64;
+            let first_sample_tick = segment_start.saturating_sub(1);
+            for tick in first_sample_tick..sample_end {
+                let elapsed = tick.saturating_add(1).saturating_sub(segment_start) as f64;
+                let fraction = (elapsed / span).clamp(0.0, 1.0);
+                let value = from.value() + (to.value() - from.value()) * fraction;
+                events.push((tick, tempo_automation_bpm(value)?));
+                clip_event_count = clip_event_count.saturating_add(1);
+                if clip_event_count > MAX_EXPORTED_TEMPO_EVENTS {
+                    return Err(MidiError::InvalidExport(
+                        "tempo automation expands to more than one million MIDI events",
+                    ));
+                }
+            }
+        }
+
+        let reset_tick = clip_end.checked_add(1).ok_or(MidiError::LengthOverflow)?;
+        events.push((reset_tick, base_tempo));
+    }
+
+    events.sort_by_key(|(tick, _)| *tick);
+    events.dedup_by(|current, previous| {
+        current.0 == previous.0 && (current.1 - previous.1).abs() <= 1e-9
+    });
+    if events.len() > MAX_EXPORTED_TEMPO_EVENTS {
+        return Err(MidiError::InvalidExport(
+            "tempo automation expands to more than one million MIDI events",
+        ));
+    }
+    Ok(events)
+}
+
+fn automation_point_tick(position_beats: f64, ppq: u16) -> Result<u64, MidiError> {
+    let ticks = position_beats * f64::from(ppq);
+    if !ticks.is_finite() || ticks < 0.0 || ticks >= u64::MAX as f64 {
+        return Err(MidiError::InvalidExport(
+            "tempo automation positions must be finite, non-negative, and representable",
+        ));
+    }
+    Ok(ticks.round() as u64)
 }
 
 impl MidiEvent {
