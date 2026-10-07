@@ -165,6 +165,18 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u32(length, "clip length")?,
             )
         }
+        [command, input, midi_path, output, track, pattern_id, channel_id]
+            if command == "import-midi" =>
+        {
+            import_midi_track(
+                Path::new(input),
+                Path::new(midi_path),
+                Path::new(output),
+                parse_usize(track, "MIDI track number")?,
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+            )
+        }
         _ => Err(concat!(
             "usage:\n",
             "  flp-rebuild info <file.flp>\n",
@@ -186,6 +198,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild edit-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index> <position> <length> <key> <velocity>\n",
             "  flp-rebuild add-note <input.flp> <output.flp> <pattern-id> <channel-id> <position> <length> <key> <velocity>\n",
             "  flp-rebuild delete-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index>\n",
+            "  flp-rebuild import-midi <input.flp> <input.mid> <output.flp> <track> <pattern-id> <channel-id>\n",
             "  flp-rebuild edit-clip <input.flp> <output.flp> <arrangement-id> <clip-index> <position> <length>"
         )
         .to_owned()),
@@ -984,6 +997,34 @@ fn delete_note(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "deleted note {note_index} from pattern {pattern_id}, channel {channel_id} to {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn import_midi_track(
+    input: &Path,
+    midi_path: &Path,
+    output: &Path,
+    track_index: usize,
+    pattern_id: u16,
+    channel_id: u16,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let midi_bytes = fs::read(midi_path)
+        .map_err(|error| format!("could not read {}: {error}", midi_path.display()))?;
+    let midi = MidiFile::parse(&midi_bytes)
+        .map_err(|error| format!("could not parse {}: {error}", midi_path.display()))?;
+    let imported = document
+        .import_midi_track(&midi, track_index, pattern_id, channel_id)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "imported {imported} MIDI notes from track {track_index} into pattern {pattern_id}, channel {channel_id} in {}",
         output.display()
     );
     Ok(())

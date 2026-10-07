@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use eframe::egui::{self, Align2, Color32, FontId, Id, Sense, Stroke, Vec2};
+use flp_rebuild::midi::MidiFile;
 use flp_rebuild::plugins::{PluginCandidate, PluginFormat, scan_installed_plugins};
 use flp_rebuild::vst3::Vst3HostRuntime;
 use flp_rebuild::{
@@ -156,6 +157,12 @@ struct PianoRollGrid {
     ppq: u16,
 }
 
+struct PendingMidiImport {
+    path: PathBuf,
+    midi: MidiFile,
+    selected_track: usize,
+}
+
 impl MainView {
     const ALL: [Self; 5] = [
         Self::Playlist,
@@ -189,6 +196,7 @@ struct DawUi {
     selected_note: Option<(u16, u16, usize)>,
     active_note_drag: Option<ActiveNoteDrag>,
     piano_roll_snap: PianoRollSnap,
+    pending_midi_import: Option<PendingMidiImport>,
     selected_arrangement: Option<u16>,
     selected_clip: Option<usize>,
     selected_plugin_state_channel: Option<u16>,
@@ -222,6 +230,7 @@ impl DawUi {
             selected_note: None,
             active_note_drag: None,
             piano_roll_snap: PianoRollSnap::QuarterBeat,
+            pending_midi_import: None,
             selected_arrangement: None,
             selected_clip: None,
             selected_plugin_state_channel: None,
@@ -263,6 +272,7 @@ impl DawUi {
                 self.selected_clip = None;
                 self.selected_note = None;
                 self.active_note_drag = None;
+                self.pending_midi_import = None;
                 self.selected_plugin_state_channel = document
                     .channel_plugin_states()
                     .first()
@@ -871,6 +881,7 @@ impl DawUi {
             })
             .unwrap_or_else(|| "No channel".to_owned());
         let mut add_note_requested = false;
+        let mut open_midi_requested = false;
         ui.horizontal(|ui| {
             ui.strong("Piano roll");
             ui.separator();
@@ -917,7 +928,110 @@ impl DawUi {
                     egui::Button::new("Add note"),
                 )
                 .clicked();
+            open_midi_requested = ui.button("Open MIDI…").clicked();
         });
+
+        if open_midi_requested
+            && let Some(path) = rfd::FileDialog::new()
+                .set_title("Open MIDI file")
+                .add_filter("MIDI files", &["mid", "midi"])
+                .pick_file()
+        {
+            match fs::read(&path) {
+                Ok(bytes) => match MidiFile::parse(&bytes) {
+                    Ok(midi) if !midi.tracks().is_empty() => {
+                        self.pending_midi_import = Some(PendingMidiImport {
+                            path: path.clone(),
+                            midi,
+                            selected_track: 0,
+                        });
+                        self.status = format!("Loaded MIDI file {}", path.display());
+                    }
+                    Ok(_) => self.status = "The MIDI file contains no tracks".to_owned(),
+                    Err(error) => self.status = format!("Could not parse MIDI file: {error}"),
+                },
+                Err(error) => self.status = format!("Could not read {}: {error}", path.display()),
+            }
+        }
+
+        let mut import_midi_request = None;
+        let mut clear_midi_import = false;
+        if let Some(pending) = &mut self.pending_midi_import {
+            ui.horizontal(|ui| {
+                ui.small(pending.path.file_name().map_or_else(
+                    || "MIDI".to_owned(),
+                    |name| name.to_string_lossy().into_owned(),
+                ));
+                let selected_track_label = pending
+                    .midi
+                    .tracks()
+                    .get(pending.selected_track)
+                    .map(|track| {
+                        track
+                            .name()
+                            .filter(|name| !name.is_empty())
+                            .unwrap_or_else(|| format!("Track {}", pending.selected_track + 1))
+                    })
+                    .unwrap_or_else(|| "No track".to_owned());
+                egui::ComboBox::from_id_salt("midi-import-track-picker")
+                    .selected_text(selected_track_label)
+                    .show_ui(ui, |ui| {
+                        for (index, track) in pending.midi.tracks().iter().enumerate() {
+                            let label = track
+                                .name()
+                                .filter(|name| !name.is_empty())
+                                .unwrap_or_else(|| format!("Track {}", index + 1));
+                            ui.selectable_value(&mut pending.selected_track, index, label);
+                        }
+                    });
+                if ui
+                    .add_enabled(
+                        self.selected_pattern.is_some() && self.selected_note_channel.is_some(),
+                        egui::Button::new("Import track"),
+                    )
+                    .clicked()
+                    && let (Some(pattern_id), Some(channel_id)) =
+                        (self.selected_pattern, self.selected_note_channel)
+                {
+                    import_midi_request = Some((
+                        pending.midi.clone(),
+                        pending.selected_track,
+                        pattern_id,
+                        channel_id,
+                    ));
+                }
+                clear_midi_import = ui.button("Clear").clicked();
+            });
+        }
+        if clear_midi_import {
+            self.pending_midi_import = None;
+        }
+        if let Some((midi, track_index, pattern_id, channel_id)) = import_midi_request {
+            let first_note_index = patterns
+                .iter()
+                .find(|pattern| pattern.id == pattern_id)
+                .map(|pattern| {
+                    pattern
+                        .notes
+                        .iter()
+                        .filter(|note| note.channel_id == channel_id)
+                        .count()
+                })
+                .unwrap_or(0);
+            if let Some(document) = &mut self.document {
+                match document.import_midi_track(&midi, track_index, pattern_id, channel_id) {
+                    Ok(imported) => {
+                        if imported > 0 {
+                            self.selected_note = Some((pattern_id, channel_id, first_note_index));
+                            self.dirty = true;
+                        }
+                        self.status =
+                            format!("Imported {imported} MIDI notes into pattern {pattern_id}");
+                    }
+                    Err(error) => self.status = error.to_string(),
+                }
+            }
+        }
 
         if add_note_requested
             && let (Some(pattern_id), Some(channel_id)) =

@@ -1032,10 +1032,19 @@ impl FlpDocument {
         ))
     }
 
-    /// Appends a note to the selected pattern while retaining every unrelated event byte.
+    /// Appends notes to one pattern while retaining every unrelated event byte.
     /// Empty patterns use the note-event opcode observed in the project's other patterns.
-    pub fn add_pattern_note(&mut self, pattern_id: u16, note: PatternNote) -> Result<(), FlpError> {
-        self.require_unique_channel(note.channel_id)?;
+    pub fn add_pattern_notes(
+        &mut self,
+        pattern_id: u16,
+        notes: &[PatternNote],
+    ) -> Result<(), FlpError> {
+        if notes.is_empty() {
+            return Ok(());
+        }
+        for note in notes {
+            self.require_unique_channel(note.channel_id)?;
+        }
 
         let mut target_marker = None;
         let mut target_note_event = None;
@@ -1065,8 +1074,17 @@ impl FlpDocument {
             }
         }
 
-        let mut record = [0u8; FLP_NOTE_RECORD_SIZE];
-        note.encode_into(&mut record);
+        let records_length = notes
+            .len()
+            .checked_mul(FLP_NOTE_RECORD_SIZE)
+            .ok_or(FlpError::LengthOverflow)?;
+        let mut records = Vec::with_capacity(records_length);
+        for note in notes {
+            let mut record = [0u8; FLP_NOTE_RECORD_SIZE];
+            note.encode_into(&mut record);
+            records.extend_from_slice(&record);
+        }
+
         if let Some(event_index) = target_note_event {
             let mut payload = self.events[event_index].payload.clone();
             if !payload.len().is_multiple_of(FLP_NOTE_RECORD_SIZE) {
@@ -1075,7 +1093,11 @@ impl FlpDocument {
                     detail: "pattern note payload is not a whole number of 24-byte records",
                 });
             }
-            payload.extend_from_slice(&record);
+            payload
+                .len()
+                .checked_add(records.len())
+                .ok_or(FlpError::LengthOverflow)?;
+            payload.extend_from_slice(&records);
             self.events[event_index].replace_data_payload(payload)?;
         } else {
             let marker_index = target_marker.ok_or(FlpError::UnsupportedEdit(
@@ -1088,11 +1110,85 @@ impl FlpDocument {
             }
             self.events.insert(
                 marker_index + 1,
-                FlpEvent::new_data(inferred_opcode.expect("checked above"), record.to_vec())?,
+                FlpEvent::new_data(inferred_opcode.expect("checked above"), records)?,
             );
         }
         self.refresh_event_offsets()?;
         Ok(())
+    }
+
+    /// Appends one note to a pattern while retaining every unrelated event byte.
+    pub fn add_pattern_note(&mut self, pattern_id: u16, note: PatternNote) -> Result<(), FlpError> {
+        self.add_pattern_notes(pattern_id, &[note])
+    }
+
+    /// Imports the note events from one Standard MIDI File track into an existing FLP
+    /// pattern and channel. Other MIDI events remain unused, and the FLP tempo is preserved.
+    pub fn import_midi_track(
+        &mut self,
+        midi: &midi::MidiFile,
+        track_index: usize,
+        pattern_id: u16,
+        channel_id: u16,
+    ) -> Result<usize, FlpError> {
+        self.require_unique_channel(channel_id)?;
+        if !self
+            .patterns()?
+            .iter()
+            .any(|pattern| pattern.id == pattern_id)
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested pattern does not exist",
+            ));
+        }
+        let source_ppq = midi
+            .ticks_per_quarter_note()
+            .ok_or(FlpError::UnsupportedEdit(
+                "SMPTE-timed MIDI files are not supported for note import",
+            ))?;
+        if source_ppq == 0 || self.header.ppq == 0 {
+            return Err(FlpError::UnsupportedEdit(
+                "MIDI import requires non-zero source and project PPQ values",
+            ));
+        }
+        let track = midi
+            .tracks()
+            .get(track_index)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested MIDI track does not exist",
+            ))?;
+        let midi_notes = track.notes();
+        if midi_notes.is_empty() {
+            return Ok(0);
+        }
+
+        let mut imported = Vec::with_capacity(midi_notes.len());
+        for midi_note in &midi_notes {
+            let position = scale_midi_ticks(midi_note.start_tick(), source_ppq, self.header.ppq)?;
+            let source_length = midi_note.duration_ticks().unwrap_or_else(|| {
+                let remaining = track.end_tick().saturating_sub(midi_note.start_tick());
+                if remaining == 0 {
+                    u64::from(source_ppq)
+                } else {
+                    remaining
+                }
+            });
+            let length = scale_midi_ticks(source_length, source_ppq, self.header.ppq)?.max(1);
+            imported.push(PatternNote {
+                position,
+                channel_id,
+                length,
+                key: u16::from(midi_note.key()),
+                midi_channel: midi_note.channel(),
+                velocity: midi_note.velocity(),
+                ..PatternNote::default()
+            });
+        }
+
+        let mut candidate = self.clone();
+        candidate.add_pattern_notes(pattern_id, &imported)?;
+        *self = candidate;
+        Ok(imported.len())
     }
 
     /// Removes one channel-scoped note and rewrites only its containing score event.
@@ -1880,6 +1976,17 @@ fn encode_leb128(mut value: u32) -> Vec<u8> {
     }
 }
 
+fn scale_midi_ticks(tick: u64, source_ppq: u16, target_ppq: u16) -> Result<u32, FlpError> {
+    if source_ppq == 0 {
+        return Err(FlpError::UnsupportedEdit(
+            "MIDI import requires a non-zero source PPQ value",
+        ));
+    }
+    let denominator = u128::from(source_ppq);
+    let scaled = (u128::from(tick) * u128::from(target_ppq) + denominator / 2) / denominator;
+    u32::try_from(scaled).map_err(|_| FlpError::LengthOverflow)
+}
+
 fn parse_vst_plugin_state_metadata(payload: &[u8]) -> Option<VstPluginStateMetadata> {
     let marker = u32::from_le_bytes(payload.get(..4)?.try_into().ok()?);
     if !matches!(marker, 8 | 10 | 12) {
@@ -1929,7 +2036,8 @@ fn decode_vst_text(bytes: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        FlpDocument, FlpError, PatternNote, PayloadEncoding, parse_vst_plugin_state_metadata,
+        FlpDocument, FlpError, PatternNote, PayloadEncoding, midi::MidiFile,
+        parse_vst_plugin_state_metadata,
     };
 
     fn flp_fixture(event_stream: &[u8], header_extension: &[u8], trailing: &[u8]) -> Vec<u8> {
@@ -1981,6 +2089,19 @@ mod tests {
         }
         event_stream.extend_from_slice(trailing_event);
         flp_fixture(&event_stream, &[0xA1], &[0xB2])
+    }
+
+    fn midi_fixture(track: &[u8], division: u16) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"MThd");
+        bytes.extend_from_slice(&6u32.to_be_bytes());
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+        bytes.extend_from_slice(&1u16.to_be_bytes());
+        bytes.extend_from_slice(&division.to_be_bytes());
+        bytes.extend_from_slice(b"MTrk");
+        bytes.extend_from_slice(&(track.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(track);
+        bytes
     }
 
     #[test]
@@ -2226,6 +2347,80 @@ mod tests {
         let restored = document.patterns().unwrap();
         assert_eq!(restored[0].notes.len(), 2);
         assert_eq!(restored[0].notes[1].position, 0);
+    }
+
+    #[test]
+    fn imports_midi_track_notes_scaled_to_project_ppq_and_preserves_other_events() {
+        let original_note = note_record(0, 0, 48, 48, 80);
+        let unknown_event = [0xFF, 0x02, 0xAA, 0xBB];
+        let project_bytes = pattern_fixture(&[original_note], &unknown_event);
+        let midi_bytes = midi_fixture(
+            &[
+                0x00, 0x99, 0x3C, 0x64, // Channel 9, key 60, velocity 100 at tick 0.
+                0x83, 0x60, 0x89, 0x3C, 0x20, // Note off at tick 480.
+                0x00, 0x90, 0x43, 0x50, // Channel 0, key 67, velocity 80 at tick 480.
+                0x81, 0x70, 0x80, 0x43, 0x00, // Note off at tick 720.
+                0x00, 0xFF, 0x2F, 0x00,
+            ],
+            480,
+        );
+        let midi = MidiFile::parse(&midi_bytes).expect("MIDI fixture should parse");
+        let mut document = FlpDocument::parse(&project_bytes).expect("project should parse");
+
+        assert_eq!(
+            document
+                .import_midi_track(&midi, 0, 7, 0)
+                .expect("the track notes should import"),
+            2
+        );
+
+        let notes = &document.patterns().unwrap()[0].notes;
+        assert_eq!(notes.len(), 3);
+        assert_eq!(
+            (notes[1].position, notes[1].length, notes[1].key),
+            (0, 96, 60)
+        );
+        assert_eq!(notes[1].velocity, 100);
+        assert_eq!(notes[1].midi_channel, 9);
+        assert_eq!(
+            (notes[2].position, notes[2].length, notes[2].key),
+            (96, 48, 67)
+        );
+        assert_eq!(notes[2].velocity, 80);
+        assert_eq!(notes[2].midi_channel, 0);
+        assert_eq!(
+            document.events().last().unwrap().wire_bytes(),
+            &unknown_event
+        );
+
+        let reparsed = FlpDocument::parse(&document.encode_lossless().unwrap()).unwrap();
+        assert_eq!(reparsed.patterns().unwrap()[0].notes.len(), 3);
+    }
+
+    #[test]
+    fn midi_import_rejects_ambiguous_empty_pattern_encoding_without_mutation() {
+        let note = note_record(0, 0, 48, 60, 100);
+        let mut stream = vec![0x40, 0, 0, 0x41, 7, 0, 0xD0, 0x18];
+        stream.extend_from_slice(&note);
+        stream.extend_from_slice(&[0x41, 8, 0, 0xE0, 0x18]);
+        stream.extend_from_slice(&note);
+        stream.extend_from_slice(&[0x41, 9, 0, 0xA4, 0, 0, 0, 0]);
+        let project_bytes = flp_fixture(&stream, &[], &[]);
+        let midi_bytes = midi_fixture(
+            &[
+                0x00, 0x90, 0x3C, 0x64, 0x81, 0x70, 0x80, 0x3C, 0x00, 0x00, 0xFF, 0x2F, 0x00,
+            ],
+            480,
+        );
+        let midi = MidiFile::parse(&midi_bytes).expect("MIDI fixture should parse");
+        let mut document = FlpDocument::parse(&project_bytes).expect("project should parse");
+
+        let error = document
+            .import_midi_track(&midi, 0, 9, 0)
+            .expect_err("conflicting project encodings must not be guessed");
+
+        assert!(matches!(error, FlpError::UnsupportedEdit(_)));
+        assert_eq!(document.encode_lossless().unwrap(), project_bytes);
     }
 
     #[test]

@@ -30,6 +30,7 @@ flp-rebuild rename-channel <input.flp> <output.flp> <channel-id> <name>
 flp-rebuild edit-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index> <position> <length> <key> <velocity>
 flp-rebuild add-note <input.flp> <output.flp> <pattern-id> <channel-id> <position> <length> <key> <velocity>
 flp-rebuild delete-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index>
+flp-rebuild import-midi <input.flp> <input.mid> <output.flp> <track> <pattern-id> <channel-id>
 flp-rebuild edit-clip <input.flp> <output.flp> <arrangement-id> <clip-index> <position> <length>
 ```
 
@@ -37,9 +38,11 @@ Launch the native desktop shell with `cargo run --release --bin fl-studio-rebuil
 
 The desktop executable also accepts an `.flp` path as its first argument to open that project at startup.
 
+In the desktop Piano roll, **Open MIDI…** loads a MIDI file, lets you choose a track, and imports its notes into the selected pattern and channel. The selected track's note timing is converted from MIDI PPQ to project PPQ. The CLI offers the same import operation for a chosen track and output copy.
+
 This is not yet an audio renderer or a complete music editor. The reader exposes channel summaries, patterns and notes, Playlist track names and arrangement clips, and opaque channel plug-in payloads; most other event meanings remain opaque. `playlist` accepts an optional starting clip and count. `plugin-states` reports channel plug-in payload sizes and event indices without decoding them. `edit-note` changes an existing note's start, length, key, and velocity while retaining its other note fields. `add-note` appends a 24-byte note record to a pattern; for an empty pattern it uses a note-event encoding observed elsewhere in the project and refuses to guess when encodings conflict. `delete-note` removes a channel-scoped note by zero-based index. These note operations rewrite only the affected score event and its length prefix. `edit-clip` changes an existing Playlist clip's position and length while retaining its other record bytes. `set-tempo` and `rename-channel` edit existing fields and preserve every unrelated event's original wire bytes. The CLI does not yet create missing patterns, channels, clips, or other project objects.
 
-The Standard MIDI File reader recognizes the `MThd` header and `MTrk` event streams, including running-status channel messages, meta events, SysEx, and system messages. `midi-info` reports track names, timing, paired note events, and tempo-map spans. The original MIDI byte stream is retained for lossless copying; MIDI editing and conversion into FLP patterns are not implemented yet.
+The Standard MIDI File reader recognizes the `MThd` header and `MTrk` event streams, including running-status channel messages, meta events, SysEx, and system messages. `midi-info` reports track names, timing, paired note events, and tempo-map spans. `import-midi` appends notes from one PPQ-timed MIDI track to an existing FLP pattern and channel, scaling note positions and lengths to the project's PPQ and preserving the FLP tempo and unrelated event bytes. Unclosed MIDI notes use the remaining track duration, or one beat if the track ends at the note start. SMPTE-timed MIDI, tempo-map conversion, and automatic channel/pattern creation are not implemented yet.
 
 `scan <directory>` inventories `.flp` and `.fst` files recursively, grouping successfully parsed files by project version, header format, and PPQ while reporting any unparsed files. `plugin-scan` lists VST3 bundles and VST2 DLL candidates in the conventional Windows plug-in folders without loading their code. `plugin-state-preview` reports a channel's opaque wrapper and plug-in payload sizes and leading bytes. `vst3-state-probe` transiently loads a VST3 and offers the selected FLP channel's plug-in state to it through the host state interface; this is an experiment, not yet project-wide compatibility. In the current ZENOLOGY probe, the VST3 accepted a 164,850-byte FLP payload and produced a 163,256-byte host snapshot. These commands map installed compatibility inputs before deeper project and plug-in support is added.
 
