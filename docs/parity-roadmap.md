@@ -298,7 +298,7 @@ WAV). Full export surface:
 
 ## 15. Desktop shell / UX
 
-- `[partial]` Window management: Playlist, Channel Rack, Piano roll, Mixer, and an Automation view; F5–F9 shortcuts
+- `[partial]` Window management: Playlist, Channel Rack, Piano roll, Mixer, Plug-ins, Audio, and Automation views; F5–F9 shortcuts. The shell uses eframe's WGPU renderer; the Windows project-open view was visually verified with a 96-clip ZENOLOGY project and nine VST3 channel states restored. Mac/Linux visual presentation, FL-style detached windows, scaling, and control parity remain incomplete.
 - `[todo]` Detached windows, multi-monitor layouts, window presets
 - `[todo]` Browser panel, toolbar, hint bar, project picker
 - `[todo]` Touch support

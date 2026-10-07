@@ -68,6 +68,7 @@ fn matching_vst3_candidate<'a>(
 fn main() -> eframe::Result {
     let initial_project = std::env::args_os().nth(1).map(PathBuf::from);
     let options = eframe::NativeOptions {
+        renderer: eframe::Renderer::Wgpu,
         viewport: egui::ViewportBuilder::default()
             .with_title("FL Studio Rebuild")
             .with_inner_size([1440.0, 900.0])
