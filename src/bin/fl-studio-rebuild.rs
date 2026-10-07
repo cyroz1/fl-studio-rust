@@ -18,8 +18,9 @@ use flp_rebuild::sample_render::{
 };
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions, Vst3PatternStreamHandle};
 use flp_rebuild::{
-    AutomationChannel, AutomationPoint, AutomationPointEdit, FlpDocument, Pattern, PatternNote,
-    PatternNoteEdit, PlaylistClip, PlaylistClipEdit, PlaylistTrack, VstPluginStateMetadata,
+    AutomationChannel, AutomationPoint, AutomationPointEdit, ChannelSummary, FlpDocument, Pattern,
+    PatternNote, PatternNoteEdit, PlaylistClip, PlaylistClipEdit, PlaylistTrack,
+    VstPluginStateMetadata,
 };
 
 const PANEL: Color32 = Color32::from_rgb(31, 32, 34);
@@ -1122,9 +1123,11 @@ impl DawUi {
             empty_view(ui, "Open a project to see its Channel Rack");
             return;
         };
+        let channels = document.channels();
         let plugin_states = document.channel_plugin_states();
         let mut open_editor = None;
         let mut level_edits = Vec::new();
+        let mut layer_edits = Vec::new();
         ui.horizontal(|ui| {
             ui.strong("Channel Rack");
             ui.separator();
@@ -1134,12 +1137,13 @@ impl DawUi {
         });
         ui.separator();
         egui::ScrollArea::vertical().show(ui, |ui| {
-            for channel in document.channels() {
+            for channel in &channels {
                 let mut volume = channel.volume().unwrap_or(10_000);
                 let mut pan = channel.pan().unwrap_or(6_400);
                 let levels_editable = channel.levels_editable();
                 let mut volume_changed = false;
                 let mut pan_changed = false;
+                let mut layer_child_apply = None;
                 egui::Frame::new()
                     .fill(PANEL_DARK)
                     .inner_margin(4.0)
@@ -1210,9 +1214,76 @@ impl DawUi {
                                 },
                             );
                         });
+                        if let Some(mut selected_children) =
+                            channel.layer_child_ids().map(<[u16]>::to_vec)
+                        {
+                            let mut children_changed = false;
+                            let selected_text =
+                                layer_child_selection_label(&selected_children, &channels);
+                            ui.horizontal(|ui| {
+                                ui.label("Children");
+                                egui::ComboBox::from_id_salt(("layer-child-select", channel.id()))
+                                    .selected_text(selected_text)
+                                    .show_ui(ui, |ui| {
+                                        for child in &channels {
+                                            let child_id = child.id();
+                                            let mut selected =
+                                                selected_children.contains(&child_id);
+                                            let label = format!(
+                                                "{} (ID {child_id})",
+                                                child.display_name().unwrap_or("(unnamed channel)")
+                                            );
+                                            if ui.checkbox(&mut selected, label).changed() {
+                                                update_layer_child_selection(
+                                                    &mut selected_children,
+                                                    child_id,
+                                                    selected,
+                                                );
+                                                children_changed = true;
+                                            }
+                                        }
+                                        let missing_ids = selected_children
+                                            .iter()
+                                            .copied()
+                                            .filter(|child_id| {
+                                                !channels
+                                                    .iter()
+                                                    .any(|child| child.id() == *child_id)
+                                            })
+                                            .collect::<Vec<_>>();
+                                        for child_id in missing_ids {
+                                            let mut selected = true;
+                                            if ui
+                                                .checkbox(
+                                                    &mut selected,
+                                                    format!("Missing channel (ID {child_id})"),
+                                                )
+                                                .changed()
+                                            {
+                                                update_layer_child_selection(
+                                                    &mut selected_children,
+                                                    child_id,
+                                                    selected,
+                                                );
+                                                children_changed = true;
+                                            }
+                                        }
+                                    });
+                                if ui.small_button("Clear").clicked() {
+                                    selected_children.clear();
+                                    children_changed = true;
+                                }
+                            });
+                            if children_changed {
+                                layer_child_apply = Some(selected_children);
+                            }
+                        }
                     });
                 if volume_changed || pan_changed {
                     level_edits.push((channel.id(), volume, pan));
+                }
+                if let Some(children) = layer_child_apply {
+                    layer_edits.push((channel.id(), children));
                 }
                 ui.add_space(2.0);
             }
@@ -1232,6 +1303,21 @@ impl DawUi {
                         self.status = format!("Channel {channel_id} volume and pan updated");
                     }
                     Err(error) => self.status = format!("Could not update channel levels: {error}"),
+                }
+            }
+        }
+        if !layer_edits.is_empty()
+            && let Some(document) = self.document.as_mut()
+        {
+            for (channel_id, child_ids) in layer_edits {
+                match document.set_layer_child_ids(channel_id, &child_ids) {
+                    Ok(()) => {
+                        self.dirty = true;
+                        self.status = format!("Layer channel {channel_id} children updated");
+                    }
+                    Err(error) => {
+                        self.status = format!("Could not update Layer children: {error}");
+                    }
                 }
             }
         }
@@ -3273,6 +3359,38 @@ fn empty_view(ui: &mut egui::Ui, message: &str) {
     });
 }
 
+fn layer_child_selection_label(child_ids: &[u16], channels: &[ChannelSummary]) -> String {
+    if child_ids.is_empty() {
+        return "No child channels".to_owned();
+    }
+    child_ids
+        .iter()
+        .map(|child_id| {
+            channels
+                .iter()
+                .find(|channel| channel.id() == *child_id)
+                .map(|channel| {
+                    format!(
+                        "{} (ID {child_id})",
+                        channel.display_name().unwrap_or("(unnamed channel)")
+                    )
+                })
+                .unwrap_or_else(|| format!("Missing channel (ID {child_id})"))
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn update_layer_child_selection(child_ids: &mut Vec<u16>, child_id: u16, selected: bool) {
+    if selected {
+        if !child_ids.contains(&child_id) {
+            child_ids.push(child_id);
+        }
+    } else {
+        child_ids.retain(|id| *id != child_id);
+    }
+}
+
 fn automation_point_screen_position(
     point: &AutomationPoint,
     plot_rect: egui::Rect,
@@ -3356,7 +3474,10 @@ fn note_from_grid_position(
 
 #[cfg(test)]
 mod tests {
-    use super::{PianoRollGrid, PianoRollSnap, note_from_grid_position, snap_note_tick};
+    use super::{
+        PianoRollGrid, PianoRollSnap, note_from_grid_position, snap_note_tick,
+        update_layer_child_selection,
+    };
 
     fn test_grid() -> PianoRollGrid {
         PianoRollGrid {
@@ -3382,6 +3503,17 @@ mod tests {
         assert_eq!(PianoRollSnap::Beat.ticks(96, None), 96);
         assert_eq!(PianoRollSnap::TwoBeats.ticks(96, None), 192);
         assert_eq!(PianoRollSnap::Bar.ticks(96, Some((3, 4))), 288);
+    }
+
+    #[test]
+    fn layer_child_editor_adds_and_removes_channel_selections() {
+        let mut child_ids = vec![4, 2];
+        update_layer_child_selection(&mut child_ids, 3, true);
+        assert_eq!(child_ids, [4, 2, 3]);
+        update_layer_child_selection(&mut child_ids, 2, false);
+        assert_eq!(child_ids, [4, 3]);
+        update_layer_child_selection(&mut child_ids, 3, true);
+        assert_eq!(child_ids, [4, 3]);
     }
 
     #[test]

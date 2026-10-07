@@ -68,7 +68,7 @@ The original application's MIDI export experiments and their measured results ar
 
 ## Layer children
 
-Layer child relationships and raw flags are available in the project model. `set-layer-children` replaces a Layer channel's repeated `0x5E` references while retaining other channel events; pass comma-separated child IDs or `-` to clear the list. Layer playback and flag editing remain incomplete.
+Layer child relationships and raw flags are available in the project model. The desktop Channel Rack exposes a child selector with channel names and IDs; `set-layer-children` replaces a Layer channel's repeated `0x5E` references while retaining other channel events. Pass comma-separated child IDs or `-` to clear the list. Layer playback and flag editing remain incomplete.
 
 ## Automation points
 
