@@ -29,7 +29,7 @@ The foundation. Everything else depends on reading projects exactly.
 | Lossless round-trip (unknown events preserved byte-exact) | `[done]` | Core project invariant: never corrupt what you don't understand |
 | FLP versions 1.x–26.x (FruityLoops era through FL Studio 26) | `[partial]` | Modern versions tested; legacy header variants and old PPQ conventions need corpus testing |
 | Header fields: PPQ, tempo, time signature, project metadata | `[partial]` | Basic fields decoded; full metadata surface unmapped |
-| Channel records: all types (sampler, generator, layer, MIDI out, automation clip) | `[partial]` | Known channel kind values 0/2/3/4/5 are named while unknown raw values are retained; Layer child IDs (`0x5E`) and raw flags (`0x90`) are decoded. Legacy channel types and Layer playback/editing remain incomplete. |
+| Channel records: all types (sampler, generator, layer, MIDI out, automation clip) | `[partial]` | Known channel kind values 0/2/3/4/5 are named while unknown raw values are retained; Layer child IDs (`0x5E`) and raw flags (`0x90`) are decoded, and child lists can be edited while preserving other channel events. Legacy channel types, Layer playback, and flag editing remain incomplete. |
 | Pattern/score events: note records, all encodings | `[partial]` | 24-byte records handled; empty-pattern and conflicting-encoding edge cases guarded |
 | Playlist events: clips, tracks, arrangements | `[partial]` | Clip position/length editable; all three record sizes (80/60/32) recognized |
 | Mixer state events | `[partial]` | Reads insert names, raw input/output/color/icon fields from the observed `0x9A`/`0x93`/`0x95` sequence and preserves 12-byte records from `0xE1`; parameter meaning, FX state, and routing edits remain incomplete. |

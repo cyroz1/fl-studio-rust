@@ -35,6 +35,7 @@ flp-rebuild roundtrip <input.flp> <output.flp>
 flp-rebuild set-tempo <input.flp> <output.flp> <bpm>
 flp-rebuild rename-channel <input.flp> <output.flp> <channel-id> <name>
 flp-rebuild set-channel-levels <input.flp> <output.flp> <channel-id> <volume-0..12800> <pan-0..12800>
+flp-rebuild set-layer-children <input.flp> <output.flp> <layer-channel-id> <child-ids-comma-separated|->
 flp-rebuild edit-automation-point <input.flp> <output.flp> <channel-id> <point-index> <position-beats> <value> <tension>
 flp-rebuild edit-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index> <position> <length> <key> <velocity>
 flp-rebuild add-note <input.flp> <output.flp> <pattern-id> <channel-id> <position> <length> <key> <velocity>
@@ -63,7 +64,11 @@ The original application's MIDI export experiments and their measured results ar
 
 ## Channel levels
 
-`channels <file.flp>` reports raw channel volume and pan values when present, along with observed sample source paths. The desktop Channel Rack exposes volume and pan sliders for channels with a valid modern `0xDB` Levels event. `set-channel-levels` edits those first two fields and preserves the remaining event payload. Older byte and word controls are decoded for inspection but remain read-only until their scaling is verified. The audio clip renderer still does not apply channel volume or pan. Layer child relationships and raw Layer flags are available in the project model; Layer playback and editing are still incomplete.
+`channels <file.flp>` reports raw channel volume and pan values when present, along with observed sample source paths. The desktop Channel Rack exposes volume and pan sliders for channels with a valid modern `0xDB` Levels event. `set-channel-levels` edits those first two fields and preserves the remaining event payload. Older byte and word controls are decoded for inspection but remain read-only until their scaling is verified. Playlist audio rendering applies a provisional volume/pan mapping based on observed raw defaults; native FL Studio output has not yet been used to verify the curve.
+
+## Layer children
+
+Layer child relationships and raw flags are available in the project model. `set-layer-children` replaces a Layer channel's repeated `0x5E` references while retaining other channel events; pass comma-separated child IDs or `-` to clear the list. Layer playback and flag editing remain incomplete.
 
 ## Automation points
 

@@ -170,6 +170,14 @@ fn run(args: Vec<String>) -> Result<(), String> {
                     .map_err(|_| "channel pan must be between 0 and 12800".to_owned())?,
             )
         }
+        [command, input, output, channel_id, child_ids] if command == "set-layer-children" => {
+            set_layer_children(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(channel_id, "Layer channel id")?,
+                parse_channel_id_list(child_ids)?,
+            )
+        }
         [command, input, output, channel_id, point_index, position, value, tension]
             if command == "edit-automation-point" =>
         {
@@ -300,6 +308,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild set-tempo <input.flp> <output.flp> <bpm>\n",
             "  flp-rebuild rename-channel <input.flp> <output.flp> <channel-id> <name>\n",
             "  flp-rebuild set-channel-levels <input.flp> <output.flp> <channel-id> <volume-0..12800> <pan-0..12800>\n",
+            "  flp-rebuild set-layer-children <input.flp> <output.flp> <layer-channel-id> <child-ids-comma-separated|->\n",
             "  flp-rebuild edit-automation-point <input.flp> <output.flp> <channel-id> <point-index> <position-beats> <value> <tension>\n",
             "  flp-rebuild insert-automation-point <input.flp> <output.flp> <channel-id> <insertion-slot> <position-beats> <value> <tension>\n",
             "  flp-rebuild delete-automation-point <input.flp> <output.flp> <channel-id> <point-index>\n",
@@ -329,6 +338,21 @@ fn parse_u16(value: &str, description: &str) -> Result<u16, String> {
     value
         .parse::<u16>()
         .map_err(|_| format!("{description} must be an integer from 0 through 65535"))
+}
+
+fn parse_channel_id_list(value: &str) -> Result<Vec<u16>, String> {
+    if value == "-" {
+        return Ok(Vec::new());
+    }
+    value
+        .split(',')
+        .map(|child_id| {
+            if child_id.is_empty() {
+                return Err("child channel IDs must be comma-separated integers".to_owned());
+            }
+            parse_u16(child_id, "child channel id")
+        })
+        .collect()
 }
 
 fn parse_u32(value: &str, description: &str) -> Result<u32, String> {
@@ -1309,6 +1333,28 @@ fn set_channel_levels(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "set channel {channel_id} volume to {volume} and pan to {pan} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn set_layer_children(
+    input: &Path,
+    output: &Path,
+    layer_channel_id: u16,
+    child_channel_ids: Vec<u16>,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .set_layer_child_ids(layer_channel_id, &child_channel_ids)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "set Layer channel {layer_channel_id} children to {child_channel_ids:?} in {}",
         output.display()
     );
     Ok(())

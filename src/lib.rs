@@ -114,6 +114,20 @@ impl FlpEvent {
         event.replace_data_payload(payload)?;
         Ok(event)
     }
+
+    fn new_word(opcode: u8, value: u16) -> Self {
+        let payload = value.to_le_bytes().to_vec();
+        let mut wire_bytes = Vec::with_capacity(3);
+        wire_bytes.push(opcode);
+        wire_bytes.extend_from_slice(&payload);
+        Self {
+            opcode,
+            payload,
+            encoding: PayloadEncoding::Word,
+            wire_bytes,
+            file_offset: 0,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1982,6 +1996,73 @@ impl FlpDocument {
         payload[..4].copy_from_slice(&pan.to_le_bytes());
         payload[4..8].copy_from_slice(&volume.to_le_bytes());
         event.replace_data_payload(payload)?;
+        self.refresh_event_offsets()?;
+        Ok(())
+    }
+
+    /// Replaces the referenced channel IDs for an existing Layer channel.
+    ///
+    /// The IDs are stored as repeated two-byte `0x5E` word events. All other
+    /// channel events retain their original wire bytes. If the Layer has no
+    /// current child references, new events are placed immediately after its
+    /// recognized channel-kind event.
+    pub fn set_layer_child_ids(
+        &mut self,
+        layer_channel_id: u16,
+        child_channel_ids: &[u16],
+    ) -> Result<(), FlpError> {
+        self.require_unique_channel(layer_channel_id)?;
+        let channel = self
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id() == layer_channel_id)
+            .expect("the unique Layer channel was checked above");
+        if channel.kind != Some(ChannelType::Layer.raw()) {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel is not a Layer channel",
+            ));
+        }
+
+        let event_range = channel.event_range();
+        let child_event_indices = event_range
+            .clone()
+            .filter(|index| {
+                let event = &self.events[*index];
+                event.opcode == 0x5E
+                    && event.payload.len() == 2
+                    && event.encoding == PayloadEncoding::Word
+            })
+            .collect::<Vec<_>>();
+        let mut insertion_index = child_event_indices
+            .first()
+            .copied()
+            .or_else(|| {
+                event_range
+                    .clone()
+                    .rfind(|index| {
+                        let event = &self.events[*index];
+                        event.opcode == 0x15
+                            && event.payload.as_slice() == [ChannelType::Layer.raw()]
+                    })
+                    .map(|index| index + 1)
+            })
+            .ok_or(FlpError::UnsupportedEdit(
+                "the selected Layer channel has no recognized channel-kind event",
+            ))?;
+
+        for event_index in child_event_indices.into_iter().rev() {
+            self.events.remove(event_index);
+            if event_index < insertion_index {
+                insertion_index -= 1;
+            }
+        }
+        let replacement = child_channel_ids
+            .iter()
+            .copied()
+            .map(|child_id| FlpEvent::new_word(0x5E, child_id))
+            .collect::<Vec<_>>();
+        self.events
+            .splice(insertion_index..insertion_index, replacement);
         self.refresh_event_offsets()?;
         Ok(())
     }
@@ -3908,6 +3989,78 @@ mod tests {
             Some(super::ChannelType::Instrument)
         );
         assert_eq!(document.encode_lossless().unwrap(), original);
+    }
+
+    #[test]
+    fn editing_layer_children_preserves_other_channel_events() {
+        let original = layer_channel_fixture(0xA500_0003, &[1, 2]);
+        let mut document = FlpDocument::parse(&original).expect("layer fixture should parse");
+        let non_child_events = document
+            .events()
+            .iter()
+            .filter(|event| event.opcode() != 0x5E)
+            .map(|event| event.wire_bytes().to_vec())
+            .collect::<Vec<_>>();
+
+        document
+            .set_layer_child_ids(0, &[2, 1, 2])
+            .expect("Layer child IDs should be editable");
+        assert_eq!(
+            document.channels()[0].layer_child_ids(),
+            Some([2, 1, 2].as_slice())
+        );
+        assert_eq!(document.channels()[0].layer_flags(), Some(0xA500_0003));
+        assert_eq!(
+            document
+                .events()
+                .iter()
+                .filter(|event| event.opcode() != 0x5E)
+                .map(|event| event.wire_bytes().to_vec())
+                .collect::<Vec<_>>(),
+            non_child_events
+        );
+
+        let encoded = document
+            .encode_lossless()
+            .expect("edited Layer should encode");
+        let reopened = FlpDocument::parse(&encoded).expect("edited Layer should parse again");
+        assert_eq!(
+            reopened.channels()[0].layer_child_ids(),
+            Some([2, 1, 2].as_slice())
+        );
+    }
+
+    #[test]
+    fn layer_children_can_be_added_to_and_removed_from_an_empty_list() {
+        let original = layer_channel_fixture(7, &[]);
+        let mut document = FlpDocument::parse(&original).expect("empty Layer fixture should parse");
+
+        document
+            .set_layer_child_ids(0, &[1, 2])
+            .expect("empty Layer child list should accept references");
+        assert_eq!(
+            document.channels()[0].layer_child_ids(),
+            Some([1, 2].as_slice())
+        );
+        document
+            .set_layer_child_ids(0, &[])
+            .expect("Layer child references should be removable");
+        assert_eq!(document.encode_lossless().unwrap(), original);
+    }
+
+    #[test]
+    fn layer_child_edit_rejects_non_layer_and_missing_channels() {
+        let original = layer_channel_fixture(0, &[1]);
+        let mut document = FlpDocument::parse(&original).expect("layer fixture should parse");
+
+        assert!(matches!(
+            document.set_layer_child_ids(1, &[2]),
+            Err(FlpError::UnsupportedEdit(_))
+        ));
+        assert!(matches!(
+            document.set_layer_child_ids(99, &[2]),
+            Err(FlpError::ChannelNotFound(99))
+        ));
     }
 
     #[test]
