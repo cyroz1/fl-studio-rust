@@ -854,6 +854,9 @@ struct BrowserEntry {
     is_directory: bool,
 }
 
+#[derive(Clone, Debug)]
+struct BrowserSampleDrag(PathBuf);
+
 #[derive(Clone)]
 struct FstPresetDetails {
     path: PathBuf,
@@ -5247,8 +5250,19 @@ impl DawUi {
                             .as_ref()
                             .map(|tags| format!("  #{tags}"))
                             .unwrap_or_default();
-                        let response =
-                            ui.selectable_label(selected, format!("{icon} {}{suffix}", entry.name));
+                        let label = format!("{icon} {}{suffix}", entry.name);
+                        let response = if !entry.is_directory
+                            && browser_file_kind(&entry.path) == Some(BrowserFileKind::Audio)
+                        {
+                            ui.dnd_drag_source(
+                                Id::new(("browser-sample-drag", &entry.path)),
+                                BrowserSampleDrag(entry.path.clone()),
+                                |ui| ui.selectable_label(selected, label),
+                            )
+                            .response
+                        } else {
+                            ui.selectable_label(selected, label)
+                        };
                         let clicked = response.clicked();
                         let double_clicked = response.double_clicked();
                         let hover_text = tags.map_or_else(
@@ -6302,6 +6316,7 @@ impl DawUi {
         let mut layer_edits = Vec::new();
         let mut layer_flag_edits = Vec::new();
         let mut step_toggles = Vec::new();
+        let mut dropped_samples = Vec::new();
         ui.horizontal(|ui| {
             ui.strong("Channel Rack");
             ui.separator();
@@ -6372,6 +6387,26 @@ impl DawUi {
                                 )
                                 .fill(if selected { BLUE } else { PANEL_LIGHT }),
                             );
+                            let accepts_sample_drop =
+                                matches!(channel.kind(), Some(0 | 4)) && channel.sample_path().is_some();
+                            if accepts_sample_drop {
+                                if channel_button
+                                    .dnd_hover_payload::<BrowserSampleDrag>()
+                                    .is_some()
+                                {
+                                    ui.painter().rect_stroke(
+                                        channel_button.rect.expand(2.0),
+                                        2.0,
+                                        egui::Stroke::new(2.0, GREEN),
+                                        egui::StrokeKind::Inside,
+                                    );
+                                }
+                                if let Some(sample) = channel_button
+                                    .dnd_release_payload::<BrowserSampleDrag>()
+                                {
+                                    dropped_samples.push((channel.id(), sample.0.clone()));
+                                }
+                            }
                             if channel_button.clicked() {
                                 self.selected_graph_channel = Some(channel.id());
                                 self.selected_note_channel = Some(channel.id());
@@ -6584,6 +6619,9 @@ impl DawUi {
                 }
             }
         });
+        for (channel_id, path) in dropped_samples {
+            self.load_browser_sample_into_channel(channel_id, &path);
+        }
         if let Some(pattern_id) = self.selected_pattern
             && !step_toggles.is_empty()
         {
