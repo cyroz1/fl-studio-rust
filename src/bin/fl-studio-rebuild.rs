@@ -5034,6 +5034,7 @@ impl DawUi {
             })
             .cloned()
             .collect::<Vec<_>>();
+        let sample_target = self.selected_sample_channel();
         let mut advance_search_result =
             ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F3));
         ui.horizontal(|ui| {
@@ -5063,13 +5064,51 @@ impl DawUi {
         } else {
             None
         };
+        let sample_step_direction =
+            if sample_target.is_some() && !ui.ctx().egui_wants_keyboard_input() {
+                ui.input_mut(|input| {
+                    if input.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowUp) {
+                        Some(-1isize)
+                    } else if input.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowDown) {
+                        Some(1isize)
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                None
+            };
+        let step_sample_path = sample_step_direction.and_then(|direction| {
+            let audio_entries = entries
+                .iter()
+                .filter(|entry| {
+                    !entry.is_directory
+                        && browser_file_kind(&entry.path) == Some(BrowserFileKind::Audio)
+                })
+                .collect::<Vec<_>>();
+            let current_index = self.browser_selected.as_ref().and_then(|selected| {
+                audio_entries
+                    .iter()
+                    .position(|entry| &entry.path == selected)
+            })?;
+            let next_index = if direction < 0 {
+                current_index.checked_sub(1)?
+            } else {
+                current_index.checked_add(1)?
+            };
+            audio_entries
+                .get(next_index)
+                .map(|entry| entry.path.clone())
+        });
+        if let Some(path) = &step_sample_path {
+            self.browser_selected = Some(path.clone());
+        }
         let mut activate = None;
         let mut preview = None;
         let mut favorite = None;
         let mut edit_tags = None;
         let mut inspect_preset = None;
         let mut load_sample = None;
-        let sample_target = self.selected_sample_channel();
         egui::ScrollArea::vertical()
             .id_salt("browser-files-list")
             .show(ui, |ui| {
@@ -5135,7 +5174,9 @@ impl DawUi {
                     });
                     let row_rect = row.response.rect;
                     let (clicked, double_clicked, favorite_clicked, edit_tags_clicked) = row.inner;
-                    if next_match_path.as_ref() == Some(&entry.path) {
+                    if step_sample_path.as_ref() == Some(&entry.path)
+                        || next_match_path.as_ref() == Some(&entry.path)
+                    {
                         ui.scroll_to_rect(row_rect, Some(egui::Align::Center));
                     }
                     if double_clicked {
@@ -5173,6 +5214,8 @@ impl DawUi {
             self.inspect_browser_preset(&path);
         }
         if let Some((channel_id, path)) = load_sample {
+            self.load_browser_sample_into_channel(channel_id, &path);
+        } else if let (Some((channel_id, _)), Some(path)) = (sample_target, step_sample_path) {
             self.load_browser_sample_into_channel(channel_id, &path);
         }
     }
