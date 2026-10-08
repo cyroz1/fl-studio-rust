@@ -1195,6 +1195,7 @@ struct DawUi {
     selected_arrangement: Option<u16>,
     selected_clip: Option<usize>,
     selected_time_marker: Option<usize>,
+    selected_mixer_insert: Option<usize>,
     new_time_marker_position: u32,
     new_time_marker_is_signature: bool,
     new_time_marker_numerator: u8,
@@ -1399,6 +1400,7 @@ impl DawUi {
             selected_arrangement: None,
             selected_clip: None,
             selected_time_marker: None,
+            selected_mixer_insert: None,
             new_time_marker_position: 0,
             new_time_marker_is_signature: false,
             new_time_marker_numerator: 4,
@@ -10426,36 +10428,131 @@ impl DawUi {
             return;
         }
 
+        let active_insert = self
+            .selected_mixer_insert
+            .filter(|ordinal| inserts.iter().any(|insert| insert.ordinal() == *ordinal))
+            .or_else(|| inserts.first().map(|insert| insert.ordinal()));
+        self.selected_mixer_insert = active_insert;
+
         let mut rename_edits = Vec::new();
-        ui.label(
-            egui::RichText::new(
-                "Rename inserts here. Faders, effect slots, and routing edits still need format mapping.",
-            )
-            .color(MUTED),
-        );
-        egui::ScrollArea::horizontal()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    for insert in &inserts {
-                        ui.group(|ui| {
-                            ui.set_min_width(168.0);
-                            ui.vertical(|ui| {
-                                let mut name = insert.name().unwrap_or_default().to_owned();
-                                let response = ui.add(
-                                    egui::TextEdit::singleline(&mut name).hint_text("Insert name"),
-                                );
-                                if response.changed() {
-                                    rename_edits.push((insert.ordinal(), name));
+        let available_height = ui.available_height();
+        let inspector_width = 238.0_f32.min((ui.available_width() * 0.3).max(190.0));
+        let bank_width = (ui.available_width() - inspector_width - 10.0).max(180.0);
+        ui.horizontal_top(|ui| {
+            ui.allocate_ui_with_layout(
+                Vec2::new(bank_width, available_height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.horizontal(|ui| {
+                        ui.strong("Insert tracks");
+                        ui.label(egui::RichText::new("Select a strip to inspect it").color(MUTED));
+                    });
+                    ui.separator();
+                    egui::ScrollArea::both()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.horizontal_top(|ui| {
+                                for insert in &inserts {
+                                    let selected = active_insert == Some(insert.ordinal());
+                                    let fill = if selected { PANEL_LIGHT } else { PANEL_DARK };
+                                    let stroke = if selected {
+                                        Stroke::new(1.5, GREEN)
+                                    } else {
+                                        Stroke::new(1.0, GRID)
+                                    };
+                                    egui::Frame::new()
+                                        .fill(fill)
+                                        .stroke(stroke)
+                                        .inner_margin(7.0)
+                                        .show(ui, |ui| {
+                                            ui.set_min_width(104.0);
+                                            ui.set_max_width(104.0);
+                                            ui.set_min_height((available_height - 42.0).max(180.0));
+                                            ui.vertical(|ui| {
+                                                ui.small(format!(
+                                                    "INSERT {:02}",
+                                                    insert.ordinal() + 1
+                                                ));
+                                                let display_name = insert
+                                                    .name()
+                                                    .filter(|name| !name.is_empty())
+                                                    .map(str::to_owned)
+                                                    .unwrap_or_else(|| {
+                                                        format!("Insert {}", insert.ordinal() + 1)
+                                                    });
+                                                if ui
+                                                    .add_sized(
+                                                        [104.0, 26.0],
+                                                        egui::Button::selectable(
+                                                            selected,
+                                                            display_name,
+                                                        ),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    self.selected_mixer_insert =
+                                                        Some(insert.ordinal());
+                                                }
+                                                ui.separator();
+                                                ui.small("INPUT");
+                                                ui.monospace(insert.input_raw().to_string());
+                                                ui.add_space(8.0);
+                                                ui.small("OUTPUT");
+                                                ui.monospace(insert.output_raw().to_string());
+                                                ui.separator();
+                                                ui.centered_and_justified(|ui| {
+                                                    ui.label(
+                                                        egui::RichText::new(
+                                                            "Mixer controls\nnot decoded",
+                                                        )
+                                                        .color(MUTED),
+                                                    );
+                                                });
+                                            });
+                                        });
                                 }
-                                ui.small(format!("Input {}", insert.input_raw()));
-                                ui.small(format!("Output {}", insert.output_raw()));
-                                ui.small(format!("Color 0x{:08X}", insert.color_raw()));
                             });
                         });
+                },
+            );
+            ui.separator();
+            ui.allocate_ui_with_layout(
+                Vec2::new(inspector_width, available_height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.strong("Track inspector");
+                    ui.separator();
+                    if let Some(insert) = inserts
+                        .iter()
+                        .find(|insert| Some(insert.ordinal()) == self.selected_mixer_insert)
+                    {
+                        ui.label(format!("Insert {}", insert.ordinal() + 1));
+                        let mut name = insert.name().unwrap_or_default().to_owned();
+                        if ui
+                            .add(egui::TextEdit::singleline(&mut name).hint_text("Insert name"))
+                            .changed()
+                        {
+                            rename_edits.push((insert.ordinal(), name));
+                        }
+                        ui.add_space(6.0);
+                        ui.label("Routing fields");
+                        ui.small(format!("Input raw: {}", insert.input_raw()));
+                        ui.small(format!("Output raw: {}", insert.output_raw()));
+                        ui.small(format!("Color raw: 0x{:08X}", insert.color_raw()));
+                        ui.small(format!("Icon raw: {:?}", insert.icon_raw()));
+                        ui.small(format!("Events: {:?}", insert.event_range()));
+                        ui.separator();
+                        ui.label("Effects");
+                        ui.label(
+                            egui::RichText::new("Slot contents are preserved but not decoded yet.")
+                                .color(MUTED),
+                        );
+                    } else {
+                        ui.label(egui::RichText::new("Select an insert track").color(MUTED));
                     }
-                });
-            });
+                },
+            );
+        });
 
         if !rename_edits.is_empty()
             && let Some(document) = self.document.as_mut()

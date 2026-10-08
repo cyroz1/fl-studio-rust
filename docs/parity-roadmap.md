@@ -240,7 +240,7 @@ FL Studio's piano roll is famously deep — the full toolset:
 
 ## 9. Mixer
 
-- `[partial]` Full 125-track UI with routing visualization: current view lists recognized insert names and raw route fields, without controls or routing visualization
+- `[partial]` Mixer track view: recognized insert records appear as selectable vertical strips with a focused inspector; existing names are editable and raw route, color, icon, and event-range fields are visible. Mapping records to native track IDs, faders, meters, effect slot contents, and routing controls remain incomplete
 - `[todo]` Per-track EQ, stereo separation, phase invert
 - `[todo]` FX slot management (10 slots/track), drag-reorder, save/load chains
 - `[todo]` Send knobs, sidechain inputs
