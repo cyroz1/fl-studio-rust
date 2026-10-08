@@ -27,9 +27,9 @@ use flp_rebuild::sample_render::{
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions, Vst3PatternStreamHandle};
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, AutomationChannel, AutomationPoint, AutomationPointEdit,
-    ChannelSummary, FlpDocument, Pattern, PatternNote, PatternNoteEdit, PlaylistClip,
-    PlaylistClipEdit, PlaylistTrack, ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions,
-    TimeMarker, TimeMarkerEdit, VstPluginStateMetadata,
+    ChannelSummary, FlpDocument, FstPreset, FstPresetKind, Pattern, PatternNote, PatternNoteEdit,
+    PlaylistClip, PlaylistClipEdit, PlaylistTrack, ProjectInfoEdit, ProjectSettingsEdit,
+    RandomizerOptions, TimeMarker, TimeMarkerEdit, VstPluginStateMetadata,
 };
 
 const PANEL: Color32 = Color32::from_rgb(31, 32, 34);
@@ -854,6 +854,21 @@ struct BrowserEntry {
     is_directory: bool,
 }
 
+#[derive(Clone)]
+struct FstPresetDetails {
+    path: PathBuf,
+    file_size: usize,
+    format: u16,
+    kind: FstPresetKind,
+    version: String,
+    event_count: usize,
+    channel_count: usize,
+    plugin_state_count: usize,
+    mixer_insert_count: usize,
+    automation_channel_count: usize,
+    trailing_byte_count: usize,
+}
+
 struct BrowserTagEditor {
     path: PathBuf,
     tags: String,
@@ -1247,6 +1262,7 @@ struct DawUi {
     browser_active_saved_search: Option<String>,
     browser_search_save_dialog: Option<BrowserSearchSaveDialog>,
     browser_tab_customize_dialog: Option<BrowserTabCustomizeDialog>,
+    browser_fst_details: Option<FstPresetDetails>,
     browser_recent_projects: Vec<PathBuf>,
     browser_error: Option<String>,
     browser_full_sample: bool,
@@ -1452,6 +1468,7 @@ impl DawUi {
             browser_active_saved_search: None,
             browser_search_save_dialog: None,
             browser_tab_customize_dialog: None,
+            browser_fst_details: None,
             browser_recent_projects: load_recent_projects(),
             browser_error: None,
             browser_full_sample: false,
@@ -3691,6 +3708,7 @@ impl DawUi {
             .as_deref()
         {
             Some("flp" | "zip") => self.open_project(&path),
+            Some("fst") => self.inspect_browser_preset(&path),
             Some("mid" | "midi") => match fs::read(&path) {
                 Ok(bytes) => match MidiFile::parse(&bytes) {
                     Ok(midi) if !midi.tracks().is_empty() => {
@@ -3711,6 +3729,84 @@ impl DawUi {
                 self.request_browser_preview(path, self.browser_full_sample);
             }
             _ => self.status = format!("Selected {}", path.display()),
+        }
+    }
+
+    fn inspect_browser_preset(&mut self, path: &Path) {
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.status = format!("Could not read preset {}: {error}", path.display());
+                return;
+            }
+        };
+        let preset = match FstPreset::parse(&bytes) {
+            Ok(preset) => preset,
+            Err(error) => {
+                self.status = format!("Could not inspect preset {}: {error}", path.display());
+                return;
+            }
+        };
+        let document = preset.document();
+        self.browser_fst_details = Some(FstPresetDetails {
+            path: path.to_path_buf(),
+            file_size: bytes.len(),
+            format: document.header().format(),
+            kind: preset.kind(),
+            version: document.project_version().unwrap_or("unknown").to_owned(),
+            event_count: document.events().len(),
+            channel_count: document.channels().len(),
+            plugin_state_count: document.channel_plugin_states().len(),
+            mixer_insert_count: document.mixer_inserts().len(),
+            automation_channel_count: document
+                .automation_channels()
+                .map_or(0, |channels| channels.len()),
+            trailing_byte_count: document.trailing_bytes().len(),
+        });
+        self.status = format!("Inspected preset {}; state was not applied", path.display());
+    }
+
+    fn browser_fst_details_dialog(&mut self, context: &egui::Context) {
+        let Some(details) = self.browser_fst_details.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut close = false;
+        egui::Window::new("FST preset details")
+            .id(Id::new("browser-fst-details-dialog"))
+            .open(&mut open)
+            .resizable(false)
+            .default_width(420.0)
+            .show(context, |ui| {
+                ui.monospace(details.path.display().to_string());
+                ui.separator();
+                ui.label(format!("State kind: {}", details.kind));
+                ui.label(format!("Header format: {}", details.format));
+                ui.label(format!("FL Studio version: {}", details.version));
+                ui.label(format!("Size: {} bytes", details.file_size));
+                ui.separator();
+                ui.label(format!("Events: {}", details.event_count));
+                ui.label(format!("Channel records: {}", details.channel_count));
+                ui.label(format!("Plug-in states: {}", details.plugin_state_count));
+                ui.label(format!("Mixer inserts: {}", details.mixer_insert_count));
+                ui.label(format!(
+                    "Automation channels: {}",
+                    details.automation_channel_count
+                ));
+                ui.label(format!("Trailing bytes: {}", details.trailing_byte_count));
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(
+                        "This view reads preset metadata. Applying the state to a channel is not implemented yet.",
+                    )
+                    .color(MUTED),
+                );
+                if ui.button("Close").clicked() {
+                    close = true;
+                }
+            });
+        if !open || close {
+            self.browser_fst_details = None;
         }
     }
 
@@ -4912,6 +5008,7 @@ impl DawUi {
         let mut preview = None;
         let mut favorite = None;
         let mut edit_tags = None;
+        let mut inspect_preset = None;
         egui::ScrollArea::vertical()
             .id_salt("browser-files-list")
             .show(ui, |ui| {
@@ -4941,6 +5038,17 @@ impl DawUi {
                             |tags| format!("{}\nTags: {tags}", entry.path.display()),
                         );
                         response.on_hover_text(hover_text).context_menu(|ui| {
+                            if !entry.is_directory
+                                && entry
+                                    .path
+                                    .extension()
+                                    .and_then(|extension| extension.to_str())
+                                    .is_some_and(|extension| extension.eq_ignore_ascii_case("fst"))
+                                && ui.button("Inspect preset…").clicked()
+                            {
+                                inspect_preset = Some(entry.path.clone());
+                                ui.close();
+                            }
                             if !entry.is_directory && ui.button("Edit tags…").clicked() {
                                 edit_tags = Some(entry.path.clone());
                                 ui.close();
@@ -4989,6 +5097,9 @@ impl DawUi {
         }
         if let Some(path) = edit_tags {
             self.open_browser_tag_editor(path);
+        }
+        if let Some(path) = inspect_preset {
+            self.inspect_browser_preset(&path);
         }
     }
 
@@ -11527,6 +11638,7 @@ impl eframe::App for DawUi {
         self.browser_tag_editor_dialog(ui.ctx());
         self.browser_search_save_dialog(ui.ctx());
         self.browser_tab_customize_dialog(ui.ctx());
+        self.browser_fst_details_dialog(ui.ctx());
         self.recovery_prompt_dialog(ui.ctx());
         self.unsaved_changes_dialog(ui.ctx());
         self.finish_history_frame(frame_snapshot.take(), pointer_down, history_navigation);
