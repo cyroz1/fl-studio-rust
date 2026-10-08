@@ -107,6 +107,16 @@ struct MidiExportMarker {
     time_signature: Option<(u8, u8)>,
 }
 
+struct MidiExportOptions<'a> {
+    ppq: u16,
+    tempo_bpm: f64,
+    time_signature: Option<(u8, u8)>,
+    channel_mapping: MidiChannelMapping,
+    project_channel_order: &'a [u16],
+    tempo_events: &'a [(u64, f64)],
+    markers: &'a [MidiExportMarker],
+}
+
 impl MidiExportTrack {
     pub fn new(name: impl Into<String>, project_channel_id: Option<u16>) -> Self {
         Self {
@@ -559,13 +569,15 @@ impl MidiFile {
             .collect::<Vec<_>>();
         Self::encode_export_tracks_with_channel_order_and_tempo_events(
             tracks,
-            document.header().ppq(),
-            document.metadata().tempo_bpm().unwrap_or(140.0),
-            document.metadata().time_signature(),
-            channel_mapping,
-            &channel_order,
-            tempo_events,
-            markers,
+            MidiExportOptions {
+                ppq: document.header().ppq(),
+                tempo_bpm: document.metadata().tempo_bpm().unwrap_or(140.0),
+                time_signature: document.metadata().time_signature(),
+                channel_mapping,
+                project_channel_order: &channel_order,
+                tempo_events,
+                markers,
+            },
         )
     }
 
@@ -579,26 +591,31 @@ impl MidiFile {
     ) -> Result<Vec<u8>, MidiError> {
         Self::encode_export_tracks_with_channel_order_and_tempo_events(
             tracks,
-            ppq,
-            tempo_bpm,
-            time_signature,
-            channel_mapping,
-            project_channel_order,
-            &[],
-            &[],
+            MidiExportOptions {
+                ppq,
+                tempo_bpm,
+                time_signature,
+                channel_mapping,
+                project_channel_order,
+                tempo_events: &[],
+                markers: &[],
+            },
         )
     }
 
     fn encode_export_tracks_with_channel_order_and_tempo_events(
         tracks: &[MidiExportTrack],
-        ppq: u16,
-        tempo_bpm: f64,
-        time_signature: Option<(u8, u8)>,
-        channel_mapping: MidiChannelMapping,
-        project_channel_order: &[u16],
-        tempo_events: &[(u64, f64)],
-        markers: &[MidiExportMarker],
+        options: MidiExportOptions<'_>,
     ) -> Result<Vec<u8>, MidiError> {
+        let MidiExportOptions {
+            ppq,
+            tempo_bpm,
+            time_signature,
+            channel_mapping,
+            project_channel_order,
+            tempo_events,
+            markers,
+        } = options;
         if ppq == 0 || ppq & 0x8000 != 0 {
             return Err(MidiError::InvalidExport(
                 "project PPQ must be in the range 1..=32767",

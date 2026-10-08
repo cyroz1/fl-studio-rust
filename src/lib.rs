@@ -625,6 +625,26 @@ pub enum ArpeggioDirection {
     UpDown,
 }
 
+/// Parameters for replacing simultaneous notes with a gated arpeggio sequence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ArpeggioOptions {
+    pub step_ticks: u32,
+    pub range_octaves: u8,
+    pub gate_percent: u8,
+    pub direction: ArpeggioDirection,
+}
+
+/// Parameters for seeded note velocity, pan, and pitch randomization.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RandomizerOptions {
+    pub seed: u64,
+    pub velocity_amount_percent: i16,
+    pub pan_amount_percent: i16,
+    pub pitch_range_semitones: u8,
+    pub bipolar: bool,
+    pub reset_levels: bool,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Arrangement {
     pub id: u16,
@@ -3217,20 +3237,9 @@ impl FlpDocument {
         &mut self,
         pattern_id: u16,
         channel_id: u16,
-        step_ticks: u32,
-        range_octaves: u8,
-        gate_percent: u8,
-        direction: ArpeggioDirection,
+        options: ArpeggioOptions,
     ) -> Result<usize, FlpError> {
-        self.arpeggiate_pattern_notes_in_scope(
-            pattern_id,
-            channel_id,
-            None,
-            step_ticks,
-            range_octaves,
-            gate_percent,
-            direction,
-        )
+        self.arpeggiate_pattern_notes_in_scope(pattern_id, channel_id, None, options)
     }
 
     /// Replaces only selected simultaneous notes with a gated arpeggio sequence.
@@ -3239,20 +3248,9 @@ impl FlpDocument {
         pattern_id: u16,
         channel_id: u16,
         note_indices: &[usize],
-        step_ticks: u32,
-        range_octaves: u8,
-        gate_percent: u8,
-        direction: ArpeggioDirection,
+        options: ArpeggioOptions,
     ) -> Result<usize, FlpError> {
-        self.arpeggiate_pattern_notes_in_scope(
-            pattern_id,
-            channel_id,
-            Some(note_indices),
-            step_ticks,
-            range_octaves,
-            gate_percent,
-            direction,
-        )
+        self.arpeggiate_pattern_notes_in_scope(pattern_id, channel_id, Some(note_indices), options)
     }
 
     fn arpeggiate_pattern_notes_in_scope(
@@ -3260,11 +3258,14 @@ impl FlpDocument {
         pattern_id: u16,
         channel_id: u16,
         note_indices: Option<&[usize]>,
-        step_ticks: u32,
-        range_octaves: u8,
-        gate_percent: u8,
-        direction: ArpeggioDirection,
+        options: ArpeggioOptions,
     ) -> Result<usize, FlpError> {
+        let ArpeggioOptions {
+            step_ticks,
+            range_octaves,
+            gate_percent,
+            direction,
+        } = options;
         if step_ticks == 0 {
             return Err(FlpError::UnsupportedEdit(
                 "arpeggiator step must be greater than zero ticks",
@@ -3488,24 +3489,9 @@ impl FlpDocument {
         &mut self,
         pattern_id: u16,
         channel_id: u16,
-        seed: u64,
-        velocity_amount_percent: i16,
-        pan_amount_percent: i16,
-        pitch_range_semitones: u8,
-        bipolar: bool,
-        reset_levels: bool,
+        options: RandomizerOptions,
     ) -> Result<usize, FlpError> {
-        self.randomize_pattern_notes_in_scope(
-            pattern_id,
-            channel_id,
-            None,
-            seed,
-            velocity_amount_percent,
-            pan_amount_percent,
-            pitch_range_semitones,
-            bipolar,
-            reset_levels,
-        )
+        self.randomize_pattern_notes_in_scope(pattern_id, channel_id, None, options)
     }
 
     /// Randomizes only selected notes, preserving the seeded behavior within that selection.
@@ -3514,24 +3500,9 @@ impl FlpDocument {
         pattern_id: u16,
         channel_id: u16,
         note_indices: &[usize],
-        seed: u64,
-        velocity_amount_percent: i16,
-        pan_amount_percent: i16,
-        pitch_range_semitones: u8,
-        bipolar: bool,
-        reset_levels: bool,
+        options: RandomizerOptions,
     ) -> Result<usize, FlpError> {
-        self.randomize_pattern_notes_in_scope(
-            pattern_id,
-            channel_id,
-            Some(note_indices),
-            seed,
-            velocity_amount_percent,
-            pan_amount_percent,
-            pitch_range_semitones,
-            bipolar,
-            reset_levels,
-        )
+        self.randomize_pattern_notes_in_scope(pattern_id, channel_id, Some(note_indices), options)
     }
 
     fn randomize_pattern_notes_in_scope(
@@ -3539,13 +3510,16 @@ impl FlpDocument {
         pattern_id: u16,
         channel_id: u16,
         note_indices: Option<&[usize]>,
-        seed: u64,
-        velocity_amount_percent: i16,
-        pan_amount_percent: i16,
-        pitch_range_semitones: u8,
-        bipolar: bool,
-        reset_levels: bool,
+        options: RandomizerOptions,
     ) -> Result<usize, FlpError> {
+        let RandomizerOptions {
+            seed,
+            velocity_amount_percent,
+            pan_amount_percent,
+            pitch_range_semitones,
+            bipolar,
+            reset_levels,
+        } = options;
         if !(-100..=100).contains(&velocity_amount_percent)
             || !(-100..=100).contains(&pan_amount_percent)
         {

@@ -968,16 +968,18 @@ where
                 let streaming = playback_for_callback.streaming.load();
                 let browser_preview_samples = playback_for_callback.browser_preview_samples.load();
                 for frame in output.chunks_mut(channels) {
-                    let [left, right] = next_output_frame_with_browser_preview(
-                        &source,
-                        &ring,
-                        playback_samples.as_deref().map(Vec::as_slice),
-                        streaming.as_deref(),
-                        &playback_for_callback,
-                        browser_preview_samples.as_deref().map(Vec::as_slice),
+                    let [left, right] = next_output_frame_with_browser_preview(AudioFrameInputs {
+                        source: &source,
+                        ring: &ring,
+                        project_samples: playback_samples.as_deref().map(Vec::as_slice),
+                        streaming: streaming.as_deref(),
+                        playback: &playback_for_callback,
+                        browser_preview_samples: browser_preview_samples
+                            .as_deref()
+                            .map(Vec::as_slice),
                         sample_rate,
-                        &mut phase,
-                    );
+                        phase: &mut phase,
+                    });
                     for (channel, destination) in frame.iter_mut().enumerate() {
                         let sample = match channel {
                             0 => left,
@@ -1174,16 +1176,28 @@ fn next_output_frame(
     }
 }
 
-fn next_output_frame_with_browser_preview(
-    source: &AtomicU8,
-    ring: &AudioRingBuffer,
-    project_samples: Option<&[f32]>,
-    streaming: Option<&StreamingPlayback>,
-    playback: &PlaybackState,
-    browser_preview_samples: Option<&[f32]>,
+struct AudioFrameInputs<'a> {
+    source: &'a AtomicU8,
+    ring: &'a AudioRingBuffer,
+    project_samples: Option<&'a [f32]>,
+    streaming: Option<&'a StreamingPlayback>,
+    playback: &'a PlaybackState,
+    browser_preview_samples: Option<&'a [f32]>,
     sample_rate: f32,
-    phase: &mut f32,
-) -> [f32; 2] {
+    phase: &'a mut f32,
+}
+
+fn next_output_frame_with_browser_preview(inputs: AudioFrameInputs<'_>) -> [f32; 2] {
+    let AudioFrameInputs {
+        source,
+        ring,
+        project_samples,
+        streaming,
+        playback,
+        browser_preview_samples,
+        sample_rate,
+        phase,
+    } = inputs;
     let project = next_output_frame(
         source,
         ring,
@@ -1714,16 +1728,16 @@ fn render_wasapi_buffer(
     let streaming = playback.streaming.load();
     let browser_preview_samples = playback.browser_preview_samples.load();
     for frame in output.chunks_exact_mut(format.frame_bytes) {
-        let stereo = next_output_frame_with_browser_preview(
+        let stereo = next_output_frame_with_browser_preview(AudioFrameInputs {
             source,
             ring,
-            playback_samples.as_deref().map(Vec::as_slice),
-            streaming.as_deref(),
+            project_samples: playback_samples.as_deref().map(Vec::as_slice),
+            streaming: streaming.as_deref(),
             playback,
-            browser_preview_samples.as_deref().map(Vec::as_slice),
+            browser_preview_samples: browser_preview_samples.as_deref().map(Vec::as_slice),
             sample_rate,
             phase,
-        );
+        });
         for (channel_index, channel) in frame.chunks_exact_mut(format.sample_bytes).enumerate() {
             let sample = match channel_index {
                 0 => stereo[0],

@@ -13,8 +13,9 @@ use flp_rebuild::sample_render::{
 };
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions};
 use flp_rebuild::{
-    ArpeggioDirection, AutomationPointEdit, FlpDocument, PatternNote, PatternNoteEdit,
-    PlaylistClipEdit, ProjectInfoEdit, ProjectSettingsEdit, TimeMarkerEdit,
+    ArpeggioDirection, ArpeggioOptions, AutomationPointEdit, FlpDocument, PatternNote,
+    PatternNoteEdit, PlaylistClipEdit, ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions,
+    TimeMarkerEdit,
 };
 
 fn main() -> ExitCode {
@@ -468,12 +469,14 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 Path::new(output),
                 parse_u16(pattern_id, "pattern id")?,
                 parse_u16(channel_id, "channel id")?,
-                parse_u64(seed, "randomizer seed")?,
-                parse_i16(velocity_amount, "velocity amount")?,
-                parse_i16(pan_amount, "pan amount")?,
-                parse_u8(pitch_range, "pitch range")?,
-                parse_bool(bipolar, "bipolar")?,
-                parse_bool(reset_levels, "reset levels")?,
+                RandomizerOptions {
+                    seed: parse_u64(seed, "randomizer seed")?,
+                    velocity_amount_percent: parse_i16(velocity_amount, "velocity amount")?,
+                    pan_amount_percent: parse_i16(pan_amount, "pan amount")?,
+                    pitch_range_semitones: parse_u8(pitch_range, "pitch range")?,
+                    bipolar: parse_bool(bipolar, "bipolar")?,
+                    reset_levels: parse_bool(reset_levels, "reset levels")?,
+                },
             )
         }
         [command, input, output, pattern_id, channel_id, seed, timing_range, velocity_variation]
@@ -510,10 +513,12 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 Path::new(output),
                 parse_u16(pattern_id, "pattern id")?,
                 parse_u16(channel_id, "channel id")?,
-                parse_u32(step_ticks, "arpeggiator step")?,
-                parse_u8(range_octaves, "arpeggiator range")?,
-                parse_u8(gate, "arpeggiator gate")?,
-                direction,
+                ArpeggioOptions {
+                    step_ticks: parse_u32(step_ticks, "arpeggiator step")?,
+                    range_octaves: parse_u8(range_octaves, "arpeggiator range")?,
+                    gate_percent: parse_u8(gate, "arpeggiator gate")?,
+                    direction,
+                },
             )
         }
         [command, input, output, pattern_id, channel_id, position_ticks]
@@ -2304,25 +2309,11 @@ fn randomize_notes(
     output: &Path,
     pattern_id: u16,
     channel_id: u16,
-    seed: u64,
-    velocity_amount: i16,
-    pan_amount: i16,
-    pitch_range: u8,
-    bipolar: bool,
-    reset_levels: bool,
+    options: RandomizerOptions,
 ) -> Result<(), String> {
     let (_, mut document) = load_document(input)?;
     let changed = document
-        .randomize_pattern_notes(
-            pattern_id,
-            channel_id,
-            seed,
-            velocity_amount,
-            pan_amount,
-            pitch_range,
-            bipolar,
-            reset_levels,
-        )
+        .randomize_pattern_notes(pattern_id, channel_id, options)
         .map_err(|error| error.to_string())?;
     let bytes = document
         .encode_lossless()
@@ -2330,7 +2321,8 @@ fn randomize_notes(
     fs::write(output, bytes)
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
-        "randomized {changed} notes in pattern {pattern_id}, channel {channel_id} with seed {seed} to {}",
+        "randomized {changed} notes in pattern {pattern_id}, channel {channel_id} with seed {} to {}",
+        options.seed,
         output.display()
     );
     Ok(())
@@ -2396,21 +2388,11 @@ fn arpeggiate_notes(
     output: &Path,
     pattern_id: u16,
     channel_id: u16,
-    step_ticks: u32,
-    range_octaves: u8,
-    gate_percent: u8,
-    direction: ArpeggioDirection,
+    options: ArpeggioOptions,
 ) -> Result<(), String> {
     let (_, mut document) = load_document(input)?;
     let created = document
-        .arpeggiate_pattern_notes(
-            pattern_id,
-            channel_id,
-            step_ticks,
-            range_octaves,
-            gate_percent,
-            direction,
-        )
+        .arpeggiate_pattern_notes(pattern_id, channel_id, options)
         .map_err(|error| error.to_string())?;
     let bytes = document
         .encode_lossless()

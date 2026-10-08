@@ -25,10 +25,10 @@ use flp_rebuild::sample_render::{
 };
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions, Vst3PatternStreamHandle};
 use flp_rebuild::{
-    ArpeggioDirection, AutomationChannel, AutomationPoint, AutomationPointEdit, ChannelSummary,
-    FlpDocument, Pattern, PatternNote, PatternNoteEdit, PlaylistClip, PlaylistClipEdit,
-    PlaylistTrack, ProjectInfoEdit, ProjectSettingsEdit, TimeMarker, TimeMarkerEdit,
-    VstPluginStateMetadata,
+    ArpeggioDirection, ArpeggioOptions, AutomationChannel, AutomationPoint, AutomationPointEdit,
+    ChannelSummary, FlpDocument, Pattern, PatternNote, PatternNoteEdit, PlaylistClip,
+    PlaylistClipEdit, PlaylistTrack, ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions,
+    TimeMarker, TimeMarkerEdit, VstPluginStateMetadata,
 };
 
 const PANEL: Color32 = Color32::from_rgb(31, 32, 34);
@@ -3325,41 +3325,41 @@ impl DawUi {
                 Err(TryRecvError::Empty) => None,
             }
         });
-        if let Some(result) = completed {
-            if let Some(pending) = self.browser_preview_pending.take() {
-                let _ = pending.worker.join();
-                if let Some((path, full_sample)) = self.browser_preview_queued.take() {
-                    self.browser_preview_cancelled = false;
-                    self.begin_browser_preview_load(path, full_sample);
-                    return;
-                }
-                if self.browser_preview_cancelled {
-                    self.browser_preview_cancelled = false;
-                    return;
-                }
-                match result {
-                    Ok(samples) => {
-                        let start_result = if let Some(engine) = self.audio_engine.as_ref() {
-                            engine.set_browser_preview_gain(self.browser_preview_volume);
-                            engine.set_browser_preview(samples)
-                        } else {
-                            Err("Audio output is not available".to_owned())
-                        };
-                        match start_result {
-                            Ok(()) => {
-                                self.status = format!("Previewing {}", pending.path.display());
-                                self.browser_preview_path = Some(pending.path);
-                            }
-                            Err(error) => {
-                                self.browser_preview_error = Some(error.clone());
-                                self.status = format!("Could not play sample preview: {error}");
-                            }
+        if let Some(result) = completed
+            && let Some(pending) = self.browser_preview_pending.take()
+        {
+            let _ = pending.worker.join();
+            if let Some((path, full_sample)) = self.browser_preview_queued.take() {
+                self.browser_preview_cancelled = false;
+                self.begin_browser_preview_load(path, full_sample);
+                return;
+            }
+            if self.browser_preview_cancelled {
+                self.browser_preview_cancelled = false;
+                return;
+            }
+            match result {
+                Ok(samples) => {
+                    let start_result = if let Some(engine) = self.audio_engine.as_ref() {
+                        engine.set_browser_preview_gain(self.browser_preview_volume);
+                        engine.set_browser_preview(samples)
+                    } else {
+                        Err("Audio output is not available".to_owned())
+                    };
+                    match start_result {
+                        Ok(()) => {
+                            self.status = format!("Previewing {}", pending.path.display());
+                            self.browser_preview_path = Some(pending.path);
+                        }
+                        Err(error) => {
+                            self.browser_preview_error = Some(error.clone());
+                            self.status = format!("Could not play sample preview: {error}");
                         }
                     }
-                    Err(error) => {
-                        self.browser_preview_error = Some(error.clone());
-                        self.status = format!("Could not decode sample preview: {error}");
-                    }
+                }
+                Err(error) => {
+                    self.browser_preview_error = Some(error.clone());
+                    self.status = format!("Could not decode sample preview: {error}");
                 }
             }
         }
@@ -6798,23 +6798,27 @@ impl DawUi {
                             pattern_id,
                             channel_id,
                             &selected_quantize_indices,
-                            seed,
-                            velocity_amount,
-                            pan_amount,
-                            pitch_range,
-                            bipolar,
-                            reset_levels,
+                            RandomizerOptions {
+                                seed,
+                                velocity_amount_percent: velocity_amount,
+                                pan_amount_percent: pan_amount,
+                                pitch_range_semitones: pitch_range,
+                                bipolar,
+                                reset_levels,
+                            },
                         )
                     } else {
                         document.randomize_pattern_notes(
                             pattern_id,
                             channel_id,
-                            seed,
-                            velocity_amount,
-                            pan_amount,
-                            pitch_range,
-                            bipolar,
-                            reset_levels,
+                            RandomizerOptions {
+                                seed,
+                                velocity_amount_percent: velocity_amount,
+                                pan_amount_percent: pan_amount,
+                                pitch_range_semitones: pitch_range,
+                                bipolar,
+                                reset_levels,
+                            },
                         )
                     };
                     result.map_err(|error| error.to_string())
@@ -6939,19 +6943,23 @@ impl DawUi {
                             pattern_id,
                             channel_id,
                             &selected_quantize_indices,
-                            step_ticks,
-                            range_octaves,
-                            gate_percent,
-                            direction,
+                            ArpeggioOptions {
+                                step_ticks,
+                                range_octaves,
+                                gate_percent,
+                                direction,
+                            },
                         )
                     } else {
                         document.arpeggiate_pattern_notes(
                             pattern_id,
                             channel_id,
-                            step_ticks,
-                            range_octaves,
-                            gate_percent,
-                            direction,
+                            ArpeggioOptions {
+                                step_ticks,
+                                range_octaves,
+                                gate_percent,
+                                direction,
+                            },
                         )
                     };
                     result.map_err(|error| error.to_string())
@@ -8624,10 +8632,9 @@ impl DawUi {
                 && !note_rects
                     .iter()
                     .any(|note_rect| note_rect.contains(pointer))
+                && let Some(note) = note_from_grid_position(pointer, grid_geometry, channel_id)
             {
-                if let Some(note) = note_from_grid_position(pointer, grid_geometry, channel_id) {
-                    notes_to_add.push(note);
-                }
+                notes_to_add.push(note);
             }
         });
         self.piano_roll_grid_viewport = Some(scroll_output.inner_rect);
@@ -8985,7 +8992,6 @@ impl DawUi {
                 pan: pan_changed.then_some(pan),
                 mod_x: mod_x_changed.then_some(mod_x),
                 mod_y: mod_y_changed.then_some(mod_y),
-                ..PatternNoteEdit::default()
             };
             if let Some(document) = &mut self.document
                 && document
@@ -9843,11 +9849,13 @@ impl eframe::App for DawUi {
                 || input.pointer.button_pressed(PointerButton::Secondary)
                 || input.pointer.button_down(PointerButton::Secondary)
                 || input.pointer.button_released(PointerButton::Secondary)
-                || input.events.iter().any(|event| match event {
-                    egui::Event::Key { pressed: true, .. }
-                    | egui::Event::Text(_)
-                    | egui::Event::Paste(_) => true,
-                    _ => false,
+                || input.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        egui::Event::Key { pressed: true, .. }
+                            | egui::Event::Text(_)
+                            | egui::Event::Paste(_)
+                    )
                 })
         });
         let mut frame_snapshot = if !history_navigation
@@ -10528,13 +10536,13 @@ fn browser_file_kind(path: &Path) -> Option<BrowserFileKind> {
 }
 
 fn browser_filter_matches(path: &Path, filter: BrowserFilter) -> bool {
-    match (filter, browser_file_kind(path)) {
-        (BrowserFilter::All, Some(_)) => true,
-        (BrowserFilter::Audio, Some(BrowserFileKind::Audio)) => true,
-        (BrowserFilter::Projects, Some(BrowserFileKind::Project)) => true,
-        (BrowserFilter::Presets, Some(BrowserFileKind::Preset)) => true,
-        _ => false,
-    }
+    matches!(
+        (filter, browser_file_kind(path)),
+        (BrowserFilter::All, Some(_))
+            | (BrowserFilter::Audio, Some(BrowserFileKind::Audio))
+            | (BrowserFilter::Projects, Some(BrowserFileKind::Project))
+            | (BrowserFilter::Presets, Some(BrowserFileKind::Preset))
+    )
 }
 
 fn browser_file_icon(path: &Path) -> &'static str {
