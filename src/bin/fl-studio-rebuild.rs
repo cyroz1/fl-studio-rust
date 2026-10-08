@@ -5281,6 +5281,10 @@ impl DawUi {
         let mut activate = None;
         let mut preview = None;
         let mut remove = None;
+        let mut inspect_preset = None;
+        let mut edit_tags = None;
+        let mut load_sample = None;
+        let sample_target = self.selected_sample_channel();
         egui::ScrollArea::vertical()
             .id_salt("browser-favorites-list")
             .show(ui, |ui| {
@@ -5297,7 +5301,34 @@ impl DawUi {
                             );
                             let clicked = response.clicked();
                             let double_clicked = response.double_clicked();
-                            response.on_hover_text(path.display().to_string());
+                            response
+                                .on_hover_text(path.display().to_string())
+                                .context_menu(|ui| {
+                                    if browser_file_kind(&path) == Some(BrowserFileKind::Audio)
+                                        && let Some((channel_id, channel_name)) = &sample_target
+                                        && ui
+                                            .button(format!(
+                                                "Send to {channel_name} ({channel_id})"
+                                            ))
+                                            .clicked()
+                                    {
+                                        load_sample = Some((*channel_id, path.clone()));
+                                        ui.close();
+                                    }
+                                    if browser_file_kind(&path) == Some(BrowserFileKind::Preset)
+                                        && path.extension().is_some_and(|extension| {
+                                            extension.eq_ignore_ascii_case("fst")
+                                        })
+                                        && ui.button("Inspect preset…").clicked()
+                                    {
+                                        inspect_preset = Some(path.clone());
+                                        ui.close();
+                                    }
+                                    if ui.button("Edit tags…").clicked() {
+                                        edit_tags = Some(path.clone());
+                                        ui.close();
+                                    }
+                                });
                             (clicked, double_clicked, ui.small_button("×").clicked())
                         })
                         .inner;
@@ -5322,6 +5353,15 @@ impl DawUi {
         }
         if let Some(path) = activate {
             self.activate_browser_path(path);
+        }
+        if let Some(path) = edit_tags {
+            self.open_browser_tag_editor(path);
+        }
+        if let Some(path) = inspect_preset {
+            self.inspect_browser_preset(&path);
+        }
+        if let Some((channel_id, path)) = load_sample {
+            self.load_browser_sample_into_channel(channel_id, &path);
         }
     }
 
