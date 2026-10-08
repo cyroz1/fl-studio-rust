@@ -3651,16 +3651,18 @@ impl DawUi {
                     && pending.roots.len() == 1
                     && pending.roots.first() == Some(&self.browser_path)
             });
-        let default_name = if !self.browser_search.trim().is_empty() {
-            self.browser_search.trim().to_owned()
-        } else if all_roots {
-            "All Browser folders".to_owned()
-        } else {
-            self.browser_path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "Browser search".to_owned())
-        };
+        let default_name = self.browser_active_saved_search.clone().unwrap_or_else(|| {
+            if !self.browser_search.trim().is_empty() {
+                self.browser_search.trim().to_owned()
+            } else if all_roots {
+                "All Browser folders".to_owned()
+            } else {
+                self.browser_path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "Browser search".to_owned())
+            }
+        });
         self.browser_search_save_dialog = Some(BrowserSearchSaveDialog {
             name: default_name,
             search: SavedBrowserSearch {
@@ -3790,6 +3792,37 @@ impl DawUi {
             } else {
                 "Moved Browser tab right".to_owned()
             };
+        }
+    }
+
+    fn clone_browser_search(&mut self, index: usize) {
+        let Some(mut clone) = self.browser_saved_searches.get(index).cloned() else {
+            return;
+        };
+        let base_name = format!("{} copy", clone.name);
+        let mut name = base_name.clone();
+        let mut suffix = 2usize;
+        while self
+            .browser_saved_searches
+            .iter()
+            .any(|search| search.name.eq_ignore_ascii_case(&name))
+        {
+            name = format!("{base_name} {suffix}");
+            suffix += 1;
+        }
+        clone.name = name.clone();
+
+        let insert_index = index + 1;
+        self.browser_saved_searches
+            .insert(insert_index, clone.clone());
+        if let Err(error) = save_browser_saved_searches(&self.browser_saved_searches) {
+            self.browser_saved_searches.remove(insert_index);
+            self.status = format!("Could not save Browser tabs: {error}");
+        } else {
+            self.apply_browser_search(clone);
+            if self.browser_active_saved_search.as_deref() == Some(name.as_str()) {
+                self.status = format!("Cloned Browser tab as {name}");
+            }
         }
     }
 
@@ -4067,6 +4100,7 @@ impl DawUi {
         let mut remove_saved_search = None;
         let mut rename_saved_search = None;
         let mut move_saved_search = None;
+        let mut clone_saved_search = None;
         ui.horizontal_wrapped(|ui| {
             for tab in BrowserTab::ALL {
                 let selected =
@@ -4110,6 +4144,10 @@ impl DawUi {
                             ui.close();
                         }
                         ui.separator();
+                        if ui.button("Clone this tab").clicked() {
+                            clone_saved_search = Some(index);
+                            ui.close();
+                        }
                         if ui.button("Delete tab").clicked() {
                             remove_saved_search = Some(index);
                             ui.close();
@@ -4131,6 +4169,8 @@ impl DawUi {
             self.move_browser_search(index, direction);
         } else if let Some(index) = rename_saved_search {
             self.open_browser_search_rename_dialog(index);
+        } else if let Some(index) = clone_saved_search {
+            self.clone_browser_search(index);
         }
         if let Some(search) = apply_saved_search {
             self.apply_browser_search(search);
