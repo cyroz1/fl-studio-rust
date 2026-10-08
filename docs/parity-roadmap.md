@@ -322,7 +322,7 @@ export surface:
 - `[todo]` Themes / UI scaling (HiDPI)
 - `[todo]` Full keyboard shortcut map parity
 - `[partial]` Undo/redo restores lossless FLP document snapshots across editors with a 64 MiB history cap; plug-in-host state and non-project UI state remain outside history
-- `[partial]` Autosave and recovery: configurable 5/10/15-minute autosaves (or off) pause during playback; Frequent mode saves every five minutes during playback and before plug-in loading, while Very frequent mode saves every minute and before plug-in loading. Manual saves retain the prior project, a shared retention limit prunes old backups, startup/open offers recovery from a newer autosave, and File provides Backup now, Revert to last autosave, and numbered Save new version (Ctrl/Cmd+N). Untitled projects cannot autosave; closing with unsaved edits has no warning, and backup location/controls do not yet match FL Studio exactly.
+- `[partial]` Autosave and recovery: configurable 5/10/15-minute autosaves (or off) pause during playback; Frequent mode saves every five minutes during playback and before plug-in loading, while Very frequent mode saves every minute and before plug-in loading. Manual saves retain the prior project, a shared retention limit prunes old backups, startup/open offers recovery from a newer autosave, and File provides Backup now, Revert to last autosave, and numbered Save new version (Ctrl/Cmd+N). Opening another project or closing with unsaved edits now prompts to Save, Don't Save, or Cancel. Untitled projects cannot autosave, and backup location/controls do not yet match FL Studio exactly.
 
 ---
 

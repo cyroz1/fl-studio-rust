@@ -876,6 +876,19 @@ struct RecoveryPrompt {
     is_revert: bool,
 }
 
+#[derive(Clone)]
+enum PendingProjectChange {
+    Open(PathBuf),
+    Exit,
+}
+
+#[derive(Clone, Copy)]
+enum UnsavedChangeChoice {
+    Save,
+    Discard,
+    Cancel,
+}
+
 impl MainView {
     const ALL: [Self; 7] = [
         Self::Playlist,
@@ -917,6 +930,8 @@ struct DawUi {
     pending_backup_write: Option<PendingBackupWrite>,
     last_autosave_path: Option<PathBuf>,
     recovery_prompt: Option<RecoveryPrompt>,
+    pending_project_change: Option<PendingProjectChange>,
+    close_approved: bool,
     history_reset_during_frame: bool,
     history_navigation_during_frame: bool,
     playing: bool,
@@ -1105,6 +1120,8 @@ impl DawUi {
             pending_backup_write: None,
             last_autosave_path: None,
             recovery_prompt: None,
+            pending_project_change: None,
+            close_approved: false,
             history_reset_during_frame: false,
             history_navigation_during_frame: false,
             playing: false,
@@ -1259,7 +1276,12 @@ impl DawUi {
     }
 
     fn open_project(&mut self, path: &Path) {
-        self.load_project_from(path, path, true);
+        if self.dirty {
+            self.recovery_prompt = None;
+            self.pending_project_change = Some(PendingProjectChange::Open(path.to_path_buf()));
+        } else {
+            self.load_project_from(path, path, true);
+        }
     }
 
     fn load_project_from(
@@ -1269,6 +1291,7 @@ impl DawUi {
         check_recovery: bool,
     ) -> bool {
         self.recovery_prompt = None;
+        self.pending_project_change = None;
         match fs::read(project_file)
             .map_err(|error| error.to_string())
             .and_then(|bytes| FlpDocument::parse(&bytes).map_err(|error| error.to_string()))
@@ -1798,6 +1821,106 @@ impl DawUi {
             }
         } else if !open {
             self.recovery_prompt = None;
+        }
+    }
+
+    fn guard_window_close(&mut self, context: &egui::Context) {
+        if !context.input(|input| input.viewport().close_requested()) {
+            return;
+        }
+        if self.close_approved {
+            self.close_approved = false;
+            return;
+        }
+        if self.pending_project_change.is_some() || self.dirty {
+            context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
+        if self.dirty {
+            self.recovery_prompt = None;
+            self.pending_project_change = Some(PendingProjectChange::Exit);
+        }
+    }
+
+    fn unsaved_changes_dialog(&mut self, context: &egui::Context) {
+        let Some(change) = self.pending_project_change.clone() else {
+            return;
+        };
+        let (title, message) = match &change {
+            PendingProjectChange::Open(path) => (
+                "Save changes before opening another project?",
+                format!(
+                    "Save changes to the current project before opening {}?",
+                    path.display()
+                ),
+            ),
+            PendingProjectChange::Exit => (
+                "Save changes before closing?",
+                "Save changes to the current project before closing FL Studio Rebuild?".to_owned(),
+            ),
+        };
+        let mut open = true;
+        let mut action = None;
+        egui::Window::new(title)
+            .id(Id::new("unsaved-project-changes-dialog"))
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(context, |ui| {
+                ui.label(message);
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        action = Some(UnsavedChangeChoice::Save);
+                    }
+                    if ui.button("Don't Save").clicked() {
+                        action = Some(UnsavedChangeChoice::Discard);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        action = Some(UnsavedChangeChoice::Cancel);
+                    }
+                });
+            });
+        match action {
+            Some(UnsavedChangeChoice::Save) => self.save_then_continue_project_change(context),
+            Some(UnsavedChangeChoice::Discard) => {
+                self.discard_then_continue_project_change(context)
+            }
+            Some(UnsavedChangeChoice::Cancel) => self.cancel_project_change(),
+            None if !open => self.cancel_project_change(),
+            None => {}
+        }
+    }
+
+    fn cancel_project_change(&mut self) {
+        self.pending_project_change = None;
+    }
+
+    fn save_then_continue_project_change(&mut self, context: &egui::Context) {
+        if self.dirty {
+            self.save();
+            if self.dirty {
+                return;
+            }
+        }
+        self.perform_pending_project_change(context);
+    }
+
+    fn discard_then_continue_project_change(&mut self, context: &egui::Context) {
+        self.perform_pending_project_change(context);
+    }
+
+    fn perform_pending_project_change(&mut self, context: &egui::Context) {
+        let Some(change) = self.pending_project_change.take() else {
+            return;
+        };
+        match change {
+            PendingProjectChange::Open(path) => {
+                self.load_project_from(&path, &path, true);
+            }
+            PendingProjectChange::Exit => {
+                self.close_approved = true;
+                context.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
         }
     }
 
@@ -9577,6 +9700,7 @@ impl DawUi {
 
 impl eframe::App for DawUi {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.guard_window_close(ui.ctx());
         let save_as_requested = ui.input_mut(|input| {
             input.consume_key(
                 egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
@@ -9742,6 +9866,7 @@ impl eframe::App for DawUi {
         self.project_info_dialog(ui.ctx());
         self.project_settings_dialog(ui.ctx());
         self.recovery_prompt_dialog(ui.ctx());
+        self.unsaved_changes_dialog(ui.ctx());
         self.finish_history_frame(frame_snapshot.take(), pointer_down, history_navigation);
     }
 }
