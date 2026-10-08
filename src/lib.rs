@@ -5,6 +5,7 @@ pub mod audio;
 pub mod media;
 pub mod midi;
 pub mod plugins;
+pub mod project_package;
 pub mod sample_render;
 pub mod vst3;
 

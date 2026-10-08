@@ -2,7 +2,7 @@
 
 ## Parity progress — 2026-10-08
 
-**Early prototype; not yet suitable as a full FL Studio replacement.** The [parity roadmap](docs/parity-roadmap.md) currently marks **12 items done, 71 partial, and 68 todo** (151 checklist entries total). This is an unweighted checklist count: partial items cover only stated subsets, and a completed small item does not count as the same amount of work as a complete subsystem.
+**Early prototype; not yet suitable as a full FL Studio replacement.** The [parity roadmap](docs/parity-roadmap.md) currently marks **12 items done, 72 partial, and 67 todo** (151 checklist entries total). This is an unweighted checklist count: partial items cover only stated subsets, and a completed small item does not count as the same amount of work as a complete subsystem.
 
 - **Working foundations:** lossless FLP parsing and round-trip writing, selected project and note edits, MIDI import and partial export, and cross-platform CI packaging.
 - **Partial runtime and editing:** early Playlist, Channel Rack, Piano roll, Mixer, plug-in, and audio views; Windows shared and exclusive audio; playback and a first combined WAV render for supported audio clips, Sampler notes, and mapped installed VST3 instruments.
@@ -13,6 +13,8 @@ See the roadmap for subsystem-level status and evidence. The counts above are re
 This is a clean-room Rust project started from the FL Studio 26.1.6.5639 installation supplied with the workspace. It is an independent rebuild; it does not load, patch, or link against the installed FL Studio executable or engine. The end goal is to open and modify any FL Studio project with backwards compatibility, matching controls, windows, and editing behavior, installed plug-in hosting, playback, and rendering. The current code contains the lossless file-format core and the first desktop editing shell; it is still far from full parity.
 
 The first milestone is deliberately a compatibility foundation: inspect FL Studio project (`.flp`) files and preserve every event, including data the reader does not understand. The same chunk reader also accepts a bundled `.fst` state preset, though it does not yet interpret most preset state. FL Studio's own documentation describes `.flp` as its native project format, `.fst` as a state/preset format, and ZIP project packages as projects bundled with referenced sample files. The installed projects and presets provide a local compatibility corpus.
+
+The desktop app also opens standard `.zip` project packages, extracts their regular files to a temporary workspace for relative sample lookup, and writes edited FLP data back while retaining the other files. Saving a plain `.flp` as `.zip` currently creates a project-only archive; collecting referenced samples is still outstanding.
 
 ## Current milestone
 
@@ -189,7 +191,7 @@ GitHub Actions runs formatting checks, Clippy, and the Rust test suite on Ubuntu
 
 ## Compatibility plan
 
-1. Project containers: broaden FLP envelope compatibility across releases, add semantic FST preset support, and handle ZIP project packages.
+1. Project containers: broaden FLP envelope compatibility across releases, add semantic FST preset support, and complete ZIP package sample collection and validation.
 2. Musical model: broaden pattern and note editing, then decode channel and plugin state, Playlist clip variants, automation, mixer routing, and audio-channel clip state, while retaining unsupported fields.
 3. Interchange: MIDI import/export and audio export with stable timing and channel mapping.
 4. Playback: connect the shared/exclusive live device engine to transport, tempo clock, sample scheduling, mixing, and automation.

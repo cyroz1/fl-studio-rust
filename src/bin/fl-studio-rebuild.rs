@@ -17,6 +17,7 @@ use flp_rebuild::media::{
 };
 use flp_rebuild::midi::{MidiChannelMapping, MidiFile};
 use flp_rebuild::plugins::{PluginCandidate, PluginFormat, scan_installed_plugins};
+use flp_rebuild::project_package::ProjectPackageWorkspace;
 use flp_rebuild::sample_render::{
     AudioClipRenderOptions, PlaylistRenderOptions, PlaylistRenderSummary,
     SamplerPatternRenderOptions, SamplerPatternRenderSummary, render_audio_clips_to_wav,
@@ -1110,6 +1111,7 @@ impl MainView {
 struct DawUi {
     document: Option<FlpDocument>,
     current_path: Option<PathBuf>,
+    package_workspace: Option<ProjectPackageWorkspace>,
     view: MainView,
     status: String,
     dirty: bool,
@@ -1313,6 +1315,7 @@ impl DawUi {
         let mut app = Self {
             document: None,
             current_path: None,
+            package_workspace: None,
             view: MainView::Playlist,
             status: "Open an FL Studio project to begin".to_owned(),
             dirty: false,
@@ -1488,7 +1491,7 @@ impl DawUi {
     fn open_dialog(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
             .set_title("Open FL Studio project")
-            .add_filter("FL Studio project", &["flp"])
+            .add_filter("FL Studio project", &["flp", "zip"])
             .pick_file()
         {
             self.open_project(&path);
@@ -1512,11 +1515,38 @@ impl DawUi {
     ) -> bool {
         self.recovery_prompt = None;
         self.pending_project_change = None;
-        match fs::read(project_file)
-            .map_err(|error| error.to_string())
-            .and_then(|bytes| FlpDocument::parse(&bytes).map_err(|error| error.to_string()))
-        {
-            Ok(document) => {
+        let package_result = if has_extension(project_file, "zip") {
+            ProjectPackageWorkspace::open(project_file)
+                .map(|(workspace, bytes)| (Some(workspace), bytes))
+        } else {
+            let workspace = if has_extension(target_path, "zip") {
+                if self
+                    .current_path
+                    .as_deref()
+                    .is_some_and(|current| project_paths_equal(current, target_path))
+                {
+                    self.package_workspace.clone().map(Ok).unwrap_or_else(|| {
+                        ProjectPackageWorkspace::open(target_path).map(|(workspace, _)| workspace)
+                    })
+                } else {
+                    ProjectPackageWorkspace::open(target_path).map(|(workspace, _)| workspace)
+                }
+                .map(Some)
+            } else {
+                Ok(None)
+            };
+            workspace.and_then(|workspace| {
+                fs::read(project_file)
+                    .map(|bytes| (workspace, bytes))
+                    .map_err(|error| format!("could not read {}: {error}", project_file.display()))
+            })
+        };
+        match package_result.and_then(|(workspace, bytes)| {
+            FlpDocument::parse(&bytes)
+                .map(|document| (workspace, document))
+                .map_err(|error| error.to_string())
+        }) {
+            Ok((package_workspace, document)) => {
                 self.stop_project_playback();
                 self.clear_history();
                 self.history_reset_during_frame = true;
@@ -1576,6 +1606,7 @@ impl DawUi {
                     arrangements.first().map(|arrangement| arrangement.id)
                 });
                 self.current_path = Some(target_path.to_path_buf());
+                self.package_workspace = package_workspace;
                 self.document = Some(document);
                 self.refresh_audio_waveform_paths();
                 let recent_path =
@@ -1617,7 +1648,7 @@ impl DawUi {
     }
 
     fn refresh_audio_waveform_paths(&mut self) {
-        let Some(project_path) = self.current_path.as_ref() else {
+        let Some(project_path) = self.sample_project_path() else {
             self.audio_waveform_paths.clear();
             return;
         };
@@ -1636,6 +1667,13 @@ impl DawUi {
                 Some((channel.id(), resolved))
             })
             .collect();
+    }
+
+    fn sample_project_path(&self) -> Option<PathBuf> {
+        self.package_workspace
+            .as_ref()
+            .map(|workspace| workspace.sample_project_path().to_path_buf())
+            .or_else(|| self.current_path.clone())
     }
 
     fn request_audio_waveform(&mut self, path: &Path) {
@@ -1796,7 +1834,7 @@ impl DawUi {
     fn save_as(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
             .set_title("Save FL Studio project")
-            .add_filter("FL Studio project", &["flp"])
+            .add_filter("FL Studio project", &["flp", "zip"])
             .save_file()
         {
             self.write_project(&path);
@@ -2560,9 +2598,41 @@ impl DawUi {
         encoded.hash(&mut hasher);
         let saved_hash = hasher.finish();
         let backups = self.backup_before_manual_save(path);
-        match fs::write(path, encoded) {
+        let mut package_workspace_after_save = None;
+        let new_zip_has_only_project =
+            has_extension(path, "zip") && self.package_workspace.is_none();
+        let save_result = if has_extension(path, "zip") {
+            let workspace = if let Some(workspace) = self.package_workspace.as_ref() {
+                Ok(workspace.clone())
+            } else {
+                let project_name = path
+                    .file_stem()
+                    .map(|stem| format!("{}.flp", stem.to_string_lossy()))
+                    .unwrap_or_else(|| "Project.flp".to_owned());
+                let sample_project_path = self
+                    .current_path
+                    .clone()
+                    .unwrap_or_else(|| path.to_path_buf());
+                ProjectPackageWorkspace::single_project(
+                    &project_name,
+                    &encoded,
+                    sample_project_path,
+                )
+            };
+            workspace.and_then(|workspace| {
+                workspace
+                    .write_to(path, &encoded)
+                    .map(|()| package_workspace_after_save = Some(workspace))
+            })
+        } else {
+            fs::write(path, encoded).map_err(|error| error.to_string())
+        };
+        match save_result {
             Ok(()) => {
                 self.current_path = Some(path.to_path_buf());
+                if let Some(workspace) = package_workspace_after_save {
+                    self.package_workspace = Some(workspace);
+                }
                 self.refresh_audio_waveform_paths();
                 self.saved_project_hash = Some(saved_hash);
                 self.dirty = false;
@@ -2578,6 +2648,11 @@ impl DawUi {
                     ),
                     _ => format!("Saved {}", path.display()),
                 };
+                if new_zip_has_only_project {
+                    self.status.push_str(
+                        " · this ZIP contains the FLP only; samples from a plain FLP are not bundled yet",
+                    );
+                }
             }
             Err(error) => {
                 self.status = match backups {
@@ -2644,7 +2719,7 @@ impl DawUi {
             self.status = "Open an FL Studio project before playing".to_owned();
             return;
         }
-        let Some(project_path) = self.current_path.clone() else {
+        let Some(project_path) = self.sample_project_path() else {
             self.status = "Save the project to a file before playing its audio clips".to_owned();
             return;
         };
@@ -3613,7 +3688,7 @@ impl DawUi {
             .map(str::to_ascii_lowercase)
             .as_deref()
         {
-            Some("flp") => self.open_project(&path),
+            Some("flp" | "zip") => self.open_project(&path),
             Some("mid" | "midi") => match fs::read(&path) {
                 Ok(bytes) => match MidiFile::parse(&bytes) {
                     Ok(midi) if !midi.tracks().is_empty() => {
@@ -8599,7 +8674,7 @@ impl DawUi {
             .is_some_and(|channel| channel.kind() == Some(0));
         let instance_id = self.channel_vst3_instances.get(&channel_id).copied();
         let sampler_project = if instance_id.is_none() && is_sampler {
-            let Some(project_path) = self.current_path.clone() else {
+            let Some(project_path) = self.sample_project_path() else {
                 self.status = "Save the project before auditioning its Sampler notes".to_owned();
                 return;
             };
@@ -8928,7 +9003,7 @@ impl DawUi {
             self.status = "Select a pattern before previewing Sampler channels".to_owned();
             return;
         };
-        let Some(project_path) = self.current_path.clone() else {
+        let Some(project_path) = self.sample_project_path() else {
             self.status = "Save the project before previewing Sampler channels".to_owned();
             return;
         };
@@ -9051,7 +9126,10 @@ impl DawUi {
             arrangement_id: self.selected_arrangement.unwrap_or_default(),
             ..AudioClipRenderOptions::default()
         };
-        match render_audio_clips_to_wav(document, project_path, options, &output_path) {
+        let sample_project_path = self
+            .sample_project_path()
+            .unwrap_or_else(|| project_path.to_path_buf());
+        match render_audio_clips_to_wav(document, &sample_project_path, options, &output_path) {
             Ok(summary) => {
                 self.status = format!(
                     "Rendered {} audio clips to {} ({} skipped for non-default scale)",
@@ -9124,7 +9202,9 @@ impl DawUi {
             }
         };
 
-        let project_path = project_path.to_path_buf();
+        let project_path = self
+            .sample_project_path()
+            .unwrap_or_else(|| project_path.to_path_buf());
         let document = document.clone();
         let output_path_for_worker = output_path.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -11650,7 +11730,18 @@ fn write_project_backup(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let path = directory.join(format!("{kind}-{timestamp}-{}.flp", std::process::id()));
+    let extension = if bytes.starts_with(b"PK\x03\x04")
+        || bytes.starts_with(b"PK\x05\x06")
+        || bytes.starts_with(b"PK\x07\x08")
+    {
+        "zip"
+    } else {
+        "flp"
+    };
+    let path = directory.join(format!(
+        "{kind}-{timestamp}-{}.{extension}",
+        std::process::id()
+    ));
     write_file_atomically(&path, bytes)
         .map_err(|error| format!("could not write {}: {error}", path.display()))?;
     prune_global_project_backups(&directory, retention);
@@ -11691,12 +11782,12 @@ fn prune_global_project_backups(project_directory: &Path, retention: usize) {
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| {
-            path.extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("flp"))
-                && path.file_name().is_some_and(|name| {
-                    name.to_string_lossy().starts_with("autosave-")
-                        || name.to_string_lossy().starts_with("backup-")
-                })
+            path.extension().is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("flp") || extension.eq_ignore_ascii_case("zip")
+            }) && path.file_name().is_some_and(|name| {
+                name.to_string_lossy().starts_with("autosave-")
+                    || name.to_string_lossy().starts_with("backup-")
+            })
         })
         .collect::<Vec<_>>();
     backups.sort_by_key(|path| {
@@ -11800,6 +11891,11 @@ fn project_paths_equal(left: &Path, right: &Path) -> bool {
     } else {
         left == right
     }
+}
+
+fn has_extension(path: &Path, extension: &str) -> bool {
+    path.extension()
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(extension))
 }
 
 fn absolute_path(path: &Path) -> PathBuf {
@@ -12240,7 +12336,7 @@ fn browser_file_kind(path: &Path) -> Option<BrowserFileKind> {
         "wav" | "wave" | "mp3" | "m4a" | "ogg" | "flac" | "aif" | "aiff" | "wv" => {
             Some(BrowserFileKind::Audio)
         }
-        "flp" => Some(BrowserFileKind::Project),
+        "flp" | "zip" => Some(BrowserFileKind::Project),
         "fst" | "fxp" | "fxb" | "vstpreset" => Some(BrowserFileKind::Preset),
         "mid" | "midi" => Some(BrowserFileKind::Midi),
         _ => None,
