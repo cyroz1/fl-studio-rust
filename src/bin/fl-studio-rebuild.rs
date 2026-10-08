@@ -47,6 +47,7 @@ const MAX_WAVEFORM_WORKERS: usize = 1;
 const DEFAULT_AUTOSAVE_MINUTES: u8 = 5;
 const DEFAULT_BACKUP_RETENTION: usize = 20;
 const RECENT_PROJECT_LIMIT: usize = 50;
+const BROWSER_SEARCH_ROOT_LIMIT: usize = 64;
 const MAX_BROWSER_RECURSIVE_SCAN_ENTRIES: usize = 20_000;
 const AUTOSAVE_INTERVALS_MINUTES: [u8; 5] = [0, 1, 5, 10, 15];
 const BACKUP_RETENTION_OPTIONS: [usize; 4] = [5, 10, 20, 50];
@@ -1050,6 +1051,7 @@ struct DawUi {
     browser_entries: Vec<BrowserEntry>,
     browser_index: Option<BrowserIndex>,
     pending_browser_index: Option<PendingBrowserIndex>,
+    browser_search_roots: Vec<PathBuf>,
     browser_search: String,
     browser_selected: Option<PathBuf>,
     browser_favorites: BTreeSet<PathBuf>,
@@ -1242,6 +1244,7 @@ impl DawUi {
             browser_entries: Vec::new(),
             browser_index: None,
             pending_browser_index: None,
+            browser_search_roots: load_browser_search_roots(),
             browser_search: String::new(),
             browser_selected: None,
             browser_favorites: load_browser_favorites(),
@@ -3270,6 +3273,48 @@ impl DawUi {
         }
     }
 
+    fn add_browser_search_root(&mut self, path: PathBuf) -> Option<PathBuf> {
+        let root = fs::canonicalize(&path).unwrap_or(path);
+        if !root.is_dir() {
+            self.status = format!("Browser folder is not available: {}", root.display());
+            return None;
+        }
+        if self.browser_search_roots.contains(&root) {
+            self.status = "That folder is already in Browser search folders".to_owned();
+            return Some(root);
+        }
+        if self.browser_search_roots.len() >= BROWSER_SEARCH_ROOT_LIMIT {
+            self.status =
+                format!("Browser supports up to {BROWSER_SEARCH_ROOT_LIMIT} extra search folders");
+            return None;
+        }
+        self.browser_search_roots.push(root.clone());
+        if let Err(error) = save_browser_search_roots(&self.browser_search_roots) {
+            self.browser_search_roots.pop();
+            self.status = format!("Could not save Browser search folders: {error}");
+            return None;
+        }
+        self.status = format!("Added {} to Browser search folders", root.display());
+        Some(root)
+    }
+
+    fn remove_browser_search_root(&mut self, path: &Path) {
+        let Some(index) = self
+            .browser_search_roots
+            .iter()
+            .position(|root| root == path)
+        else {
+            return;
+        };
+        let root = self.browser_search_roots.remove(index);
+        if let Err(error) = save_browser_search_roots(&self.browser_search_roots) {
+            self.browser_search_roots.insert(index, root);
+            self.status = format!("Could not save Browser search folders: {error}");
+        } else {
+            self.status = format!("Removed {} from Browser search folders", root.display());
+        }
+    }
+
     fn set_browser_directory(&mut self, path: PathBuf) {
         if path.is_dir() {
             if path != self.browser_path {
@@ -3605,6 +3650,66 @@ impl DawUi {
                 requested_folder = Some(path.clone());
             }
         });
+
+        let search_roots = self.browser_search_roots.clone();
+        let current_folder = self.browser_path.clone();
+        let mut add_search_root = false;
+        let mut selected_search_root = None;
+        let mut removed_search_root = None;
+        ui.collapsing("Search folders", |ui| {
+            if ui.small_button("+ Add folder").clicked() {
+                add_search_root = true;
+            }
+            if search_roots.is_empty() {
+                ui.small("No extra folders added");
+            } else {
+                egui::ScrollArea::vertical()
+                    .id_salt("browser-search-roots")
+                    .max_height(120.0)
+                    .show(ui, |ui| {
+                        for root in &search_roots {
+                            let name = root
+                                .file_name()
+                                .map(|name| name.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| root.display().to_string());
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .selectable_label(
+                                        current_folder == *root || current_folder.starts_with(root),
+                                        format!("▸ {name}"),
+                                    )
+                                    .on_hover_text(root.display().to_string())
+                                    .clicked()
+                                {
+                                    selected_search_root = Some(root.clone());
+                                }
+                                if ui
+                                    .small_button("×")
+                                    .on_hover_text("Remove this Browser search folder")
+                                    .clicked()
+                                {
+                                    removed_search_root = Some(root.clone());
+                                }
+                            });
+                        }
+                    });
+            }
+        });
+        if let Some(root) = selected_search_root {
+            requested_folder = Some(root);
+        }
+        if let Some(root) = removed_search_root {
+            self.remove_browser_search_root(&root);
+        }
+        if add_search_root
+            && let Some(path) = rfd::FileDialog::new()
+                .set_title("Add Browser search folder")
+                .set_directory(&self.browser_path)
+                .pick_folder()
+            && let Some(root) = self.add_browser_search_root(path)
+        {
+            requested_folder = Some(root);
+        }
 
         let mut refresh = false;
         ui.horizontal(|ui| {
@@ -10293,6 +10398,12 @@ fn browser_favorites_file() -> Option<PathBuf> {
     Some(root.join("fl-studio-rebuild").join("browser-favorites.txt"))
 }
 
+fn browser_search_roots_file() -> Option<PathBuf> {
+    browser_favorites_file()?
+        .parent()
+        .map(|directory| directory.join("browser-search-roots.txt"))
+}
+
 fn recent_projects_file() -> Option<PathBuf> {
     browser_favorites_file()?
         .parent()
@@ -10680,6 +10791,45 @@ fn load_browser_favorites() -> BTreeSet<PathBuf> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn load_browser_search_roots() -> Vec<PathBuf> {
+    let Some(path) = browser_search_roots_file() else {
+        return Vec::new();
+    };
+    let Ok(contents) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut roots = Vec::new();
+    for entry in contents.lines().filter(|entry| !entry.is_empty()) {
+        let path = PathBuf::from(entry);
+        let path = fs::canonicalize(&path).unwrap_or(path);
+        if !roots.contains(&path) {
+            roots.push(path);
+        }
+        if roots.len() >= BROWSER_SEARCH_ROOT_LIMIT {
+            break;
+        }
+    }
+    roots
+}
+
+fn save_browser_search_roots(roots: &[PathBuf]) -> Result<(), String> {
+    let path = browser_search_roots_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the Browser search folders path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    let contents = roots
+        .iter()
+        .take(BROWSER_SEARCH_ROOT_LIMIT)
+        .map(|path| path.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&path, contents)
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
 }
 
 fn save_browser_favorites(favorites: &BTreeSet<PathBuf>) -> Result<(), String> {
