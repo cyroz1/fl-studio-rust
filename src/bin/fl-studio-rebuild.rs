@@ -858,6 +858,22 @@ struct BrowserTagEditor {
     tags: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum BrowserTagLogic {
+    #[default]
+    Any,
+    All,
+}
+
+impl BrowserTagLogic {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Any => "Any",
+            Self::All => "All",
+        }
+    }
+}
+
 #[derive(Clone)]
 struct SavedBrowserSearch {
     name: String,
@@ -866,6 +882,8 @@ struct SavedBrowserSearch {
     all_roots: bool,
     recursive: bool,
     path: PathBuf,
+    tag_logic: BrowserTagLogic,
+    selected_tags: BTreeSet<String>,
 }
 
 struct BrowserSearchSaveDialog {
@@ -1082,6 +1100,8 @@ struct DawUi {
     browser_favorites: BTreeSet<PathBuf>,
     browser_tags: BTreeMap<PathBuf, BTreeSet<String>>,
     browser_tag_editor: Option<BrowserTagEditor>,
+    browser_tag_logic: BrowserTagLogic,
+    browser_selected_tags: BTreeSet<String>,
     browser_saved_searches: Vec<SavedBrowserSearch>,
     browser_search_save_dialog: Option<BrowserSearchSaveDialog>,
     browser_recent_projects: Vec<PathBuf>,
@@ -1281,6 +1301,8 @@ impl DawUi {
             browser_favorites: load_browser_favorites(),
             browser_tags: load_browser_tags(),
             browser_tag_editor: None,
+            browser_tag_logic: BrowserTagLogic::default(),
+            browser_selected_tags: BTreeSet::new(),
             browser_saved_searches: load_browser_saved_searches(),
             browser_search_save_dialog: None,
             browser_recent_projects: load_recent_projects(),
@@ -3548,6 +3570,65 @@ impl DawUi {
         }
     }
 
+    fn browser_tag_search_controls(&mut self, ui: &mut egui::Ui) {
+        let available_tags = self
+            .browser_tags
+            .values()
+            .flat_map(|tags| tags.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        let selected_tags = self.browser_selected_tags.clone();
+        let has_available_tags = !available_tags.is_empty();
+        let available_tags = available_tags
+            .union(&selected_tags)
+            .cloned()
+            .collect::<Vec<_>>();
+        let selected_text = if selected_tags.is_empty() {
+            "Tags".to_owned()
+        } else {
+            format!("Tags ({})", selected_tags.len())
+        };
+        let mut tag_changes = Vec::new();
+        let mut clear_tags = false;
+        egui::ComboBox::from_id_salt("browser-tag-search")
+            .selected_text(selected_text)
+            .show_ui(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.small("Match");
+                    ui.selectable_value(&mut self.browser_tag_logic, BrowserTagLogic::Any, "Any");
+                    ui.selectable_value(&mut self.browser_tag_logic, BrowserTagLogic::All, "All");
+                });
+                ui.separator();
+                if ui
+                    .add_enabled(
+                        !selected_tags.is_empty(),
+                        egui::Button::new("Clear selected tags"),
+                    )
+                    .clicked()
+                {
+                    clear_tags = true;
+                }
+                if !has_available_tags {
+                    ui.small("No file tags available");
+                }
+                for tag in &available_tags {
+                    let mut selected = selected_tags.contains(tag);
+                    if ui.checkbox(&mut selected, tag).changed() {
+                        tag_changes.push((tag.clone(), selected));
+                    }
+                }
+            });
+        if clear_tags {
+            self.browser_selected_tags.clear();
+        }
+        for (tag, selected) in tag_changes {
+            if selected {
+                self.browser_selected_tags.insert(tag);
+            } else {
+                self.browser_selected_tags.remove(&tag);
+            }
+        }
+    }
+
     fn open_browser_search_save_dialog(&mut self) {
         let all_roots = self.browser_search_all_active;
         let recursive = all_roots
@@ -3580,6 +3661,8 @@ impl DawUi {
                 all_roots,
                 recursive,
                 path: self.browser_path.clone(),
+                tag_logic: self.browser_tag_logic,
+                selected_tags: self.browser_selected_tags.clone(),
             },
         });
     }
@@ -3632,6 +3715,8 @@ impl DawUi {
             return;
         }
         self.browser_filter = search.filter;
+        self.browser_tag_logic = search.tag_logic;
+        self.browser_selected_tags = search.selected_tags;
         if search.all_roots {
             self.browser_search = search.query;
             self.start_browser_roots_index();
@@ -3658,8 +3743,23 @@ impl DawUi {
             .show(context, |ui| {
                 ui.label("Name");
                 ui.text_edit_singleline(&mut dialog.name);
+                let tag_summary = if dialog.search.selected_tags.is_empty() {
+                    "no tag filter".to_owned()
+                } else {
+                    format!(
+                        "{} tags: {}",
+                        dialog.search.tag_logic.label(),
+                        dialog
+                            .search
+                            .selected_tags
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
                 ui.small(format!(
-                    "Filter: {} · {}",
+                    "Filter: {} · {} · {tag_summary}",
                     dialog.search.filter.label(),
                     if dialog.search.all_roots {
                         "all saved folders"
@@ -4195,13 +4295,16 @@ impl DawUi {
                 });
             }
         }
-        egui::ComboBox::from_id_salt("browser-file-filter")
-            .selected_text(self.browser_filter.label())
-            .show_ui(ui, |ui| {
-                for filter in BrowserFilter::ALL {
-                    ui.selectable_value(&mut self.browser_filter, filter, filter.label());
-                }
-            });
+        ui.horizontal_wrapped(|ui| {
+            egui::ComboBox::from_id_salt("browser-file-filter")
+                .selected_text(self.browser_filter.label())
+                .show_ui(ui, |ui| {
+                    for filter in BrowserFilter::ALL {
+                        ui.selectable_value(&mut self.browser_filter, filter, filter.label());
+                    }
+                });
+            self.browser_tag_search_controls(ui);
+        });
         if let Some(error) = &self.browser_error {
             ui.label(egui::RichText::new(error).color(ORANGE).small());
         }
@@ -4228,6 +4331,14 @@ impl DawUi {
             .filter(|entry| {
                 (!recursive_results && entry.is_directory)
                     || browser_filter_matches(&entry.path, self.browser_filter)
+            })
+            .filter(|entry| {
+                entry.is_directory
+                    || browser_tag_selection_matches(
+                        self.browser_tag_logic,
+                        &self.browser_selected_tags,
+                        self.browser_tags.get(&entry.path),
+                    )
             })
             .filter(|entry| {
                 query.is_empty()
@@ -4429,6 +4540,7 @@ impl DawUi {
     }
 
     fn browser_favorites_view(&mut self, ui: &mut egui::Ui) {
+        self.browser_tag_search_controls(ui);
         ui.add(
             egui::TextEdit::singleline(&mut self.browser_search)
                 .hint_text("Find favorites")
@@ -4439,11 +4551,15 @@ impl DawUi {
             .browser_favorites
             .iter()
             .filter(|path| {
-                query.is_empty()
+                browser_tag_selection_matches(
+                    self.browser_tag_logic,
+                    &self.browser_selected_tags,
+                    self.browser_tags.get(*path),
+                ) && (query.is_empty()
                     || path.to_string_lossy().to_lowercase().contains(&query)
                     || self.browser_tags.get(*path).is_some_and(|tags| {
                         tags.iter().any(|tag| tag.to_lowercase().contains(&query))
-                    })
+                    }))
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -11429,6 +11545,21 @@ fn parse_browser_search_filter(value: &str) -> Option<BrowserFilter> {
     }
 }
 
+fn browser_tag_logic_key(logic: BrowserTagLogic) -> &'static str {
+    match logic {
+        BrowserTagLogic::Any => "any",
+        BrowserTagLogic::All => "all",
+    }
+}
+
+fn parse_browser_tag_logic(value: &str) -> Option<BrowserTagLogic> {
+    match value {
+        "any" => Some(BrowserTagLogic::Any),
+        "all" => Some(BrowserTagLogic::All),
+        _ => None,
+    }
+}
+
 fn encode_browser_search_field(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for character in value.chars() {
@@ -11473,9 +11604,7 @@ fn load_browser_saved_searches() -> Vec<SavedBrowserSearch> {
     let mut searches = Vec::new();
     for line in contents.lines() {
         let mut fields = line.split('\t');
-        if fields.next() != Some("v1") {
-            continue;
-        }
+        let version = fields.next();
         let (Some(name), Some(query), Some(filter), Some(all_roots), Some(recursive), Some(path)) = (
             fields.next(),
             fields.next(),
@@ -11486,9 +11615,21 @@ fn load_browser_saved_searches() -> Vec<SavedBrowserSearch> {
         ) else {
             continue;
         };
-        if fields.next().is_some() {
-            continue;
-        }
+        let (tag_logic, selected_tags) = match version {
+            Some("v1") if fields.next().is_none() => (BrowserTagLogic::Any, BTreeSet::new()),
+            Some("v2") => {
+                let Some(tag_logic) = fields.next().and_then(parse_browser_tag_logic) else {
+                    continue;
+                };
+                let selected_tags = fields
+                    .map(decode_browser_search_field)
+                    .map(|tag| tag.trim().to_owned())
+                    .filter(|tag| !tag.is_empty())
+                    .collect::<BTreeSet<_>>();
+                (tag_logic, selected_tags)
+            }
+            _ => continue,
+        };
         let name = decode_browser_search_field(name);
         let query = decode_browser_search_field(query);
         let Some(filter) = parse_browser_search_filter(filter) else {
@@ -11513,6 +11654,8 @@ fn load_browser_saved_searches() -> Vec<SavedBrowserSearch> {
             } else {
                 PathBuf::from(path)
             },
+            tag_logic,
+            selected_tags,
         };
         if let Some(existing) = searches
             .iter_mut()
@@ -11544,16 +11687,23 @@ fn save_browser_saved_searches(searches: &[SavedBrowserSearch]) -> Result<(), St
             } else {
                 search.path.to_string_lossy().into_owned()
             };
-            [
-                "v1".to_owned(),
+            let mut fields = vec![
+                "v2".to_owned(),
                 encode_browser_search_field(&search.name),
                 encode_browser_search_field(&search.query),
                 browser_search_filter_key(search.filter).to_owned(),
                 search.all_roots.to_string(),
                 search.recursive.to_string(),
                 encode_browser_search_field(&path),
-            ]
-            .join("\t")
+                browser_tag_logic_key(search.tag_logic).to_owned(),
+            ];
+            fields.extend(
+                search
+                    .selected_tags
+                    .iter()
+                    .map(|tag| encode_browser_search_field(tag)),
+            );
+            fields.join("\t")
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -11608,6 +11758,29 @@ fn browser_filter_matches(path: &Path, filter: BrowserFilter) -> bool {
             | (BrowserFilter::Projects, Some(BrowserFileKind::Project))
             | (BrowserFilter::Presets, Some(BrowserFileKind::Preset))
     )
+}
+
+fn browser_tag_selection_matches(
+    logic: BrowserTagLogic,
+    selected_tags: &BTreeSet<String>,
+    file_tags: Option<&BTreeSet<String>>,
+) -> bool {
+    if selected_tags.is_empty() {
+        return true;
+    }
+    let Some(file_tags) = file_tags else {
+        return false;
+    };
+    match logic {
+        BrowserTagLogic::Any => selected_tags.iter().any(|selected| {
+            let selected = selected.to_lowercase();
+            file_tags.iter().any(|tag| tag.to_lowercase() == selected)
+        }),
+        BrowserTagLogic::All => selected_tags.iter().all(|selected| {
+            let selected = selected.to_lowercase();
+            file_tags.iter().any(|tag| tag.to_lowercase() == selected)
+        }),
+    }
 }
 
 fn browser_file_icon(path: &Path) -> &'static str {
