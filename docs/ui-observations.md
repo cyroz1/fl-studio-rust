@@ -8,6 +8,7 @@ These observations come from the installed FL Studio 2026 desktop application an
 - The top-level menu contains File, Edit, Add, Patterns, View, Options, Tools, and Help.
 - Keyboard shortcuts open the Playlist (F5), Channel Rack (F6), Piano roll (F7), and Mixer (F9).
 - The Browser occupies a narrow left column. The work area to its right changes between editor views.
+- Image-Line documents autosave intervals, playback-aware postponement, backup retention, recovery, and sequential Save new version files ([File Search & Browser Settings](https://ww2.image-line.com/fl-studio-learning/fl-studio-online-manual/html/envsettings_files.htm), [File menu](https://www.image-line.com/fl-studio-learning/fl-studio-online-manual/html/menu_file.htm)). The rewrite now offers 5/10/15-minute autosaves or Never. Regular modes pause during playback; Frequent mode saves every five minutes during playback and before plug-in loads, while Very frequent mode saves every minute and before plug-in loads. It keeps a configurable shared set of backups under the user data folder, backs up existing files on manual save, prompts to recover newer autosaves, and provides Backup now, Revert to last autosave, and Ctrl/Cmd+N numbered versions. Autosave needs a saved project path; closing with unsaved changes is not yet guarded, and its backup location and file controls still differ from FL Studio.
 
 ## Browser
 

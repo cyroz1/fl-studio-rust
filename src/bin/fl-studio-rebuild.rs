@@ -1,11 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui::{self, Align2, Color32, FontId, Id, PointerButton, Sense, Stroke, Vec2};
 use flp_rebuild::audio::{
@@ -43,6 +44,10 @@ const ORANGE: Color32 = Color32::from_rgb(195, 129, 61);
 const HISTORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 const AUDIO_WAVEFORM_BUCKETS: usize = 4096;
 const MAX_WAVEFORM_WORKERS: usize = 1;
+const DEFAULT_AUTOSAVE_MINUTES: u8 = 5;
+const DEFAULT_BACKUP_RETENTION: usize = 20;
+const AUTOSAVE_INTERVALS_MINUTES: [u8; 5] = [0, 1, 5, 10, 15];
+const BACKUP_RETENTION_OPTIONS: [usize; 4] = [5, 10, 20, 50];
 const PITCH_CLASSES: [&str; 12] = [
     "C", "C♯", "D", "D♯", "E", "F", "F♯", "G", "G♯", "A", "A♯", "B",
 ];
@@ -851,6 +856,26 @@ struct PendingBrowserPreview {
     worker: thread::JoinHandle<()>,
 }
 
+struct PendingBackupWrite {
+    source_path: PathBuf,
+    purpose: BackupPurpose,
+    receiver: Receiver<Result<PathBuf, String>>,
+    worker: thread::JoinHandle<()>,
+}
+
+#[derive(Clone, Copy)]
+enum BackupPurpose {
+    Autosave,
+    Manual,
+}
+
+#[derive(Clone)]
+struct RecoveryPrompt {
+    source_path: PathBuf,
+    backup_path: PathBuf,
+    is_revert: bool,
+}
+
 impl MainView {
     const ALL: [Self; 7] = [
         Self::Playlist,
@@ -885,6 +910,13 @@ struct DawUi {
     redo_history: Vec<Vec<u8>>,
     pending_history_snapshot: Option<Vec<u8>>,
     saved_project_hash: Option<u64>,
+    autosave_minutes: u8,
+    autosave_before_risky: bool,
+    backup_retention: usize,
+    autosave_deadline: Option<Instant>,
+    pending_backup_write: Option<PendingBackupWrite>,
+    last_autosave_path: Option<PathBuf>,
+    recovery_prompt: Option<RecoveryPrompt>,
     history_reset_during_frame: bool,
     history_navigation_during_frame: bool,
     playing: bool,
@@ -1066,6 +1098,13 @@ impl DawUi {
             redo_history: Vec::new(),
             pending_history_snapshot: None,
             saved_project_hash: None,
+            autosave_minutes: DEFAULT_AUTOSAVE_MINUTES,
+            autosave_before_risky: false,
+            backup_retention: DEFAULT_BACKUP_RETENTION,
+            autosave_deadline: None,
+            pending_backup_write: None,
+            last_autosave_path: None,
+            recovery_prompt: None,
             history_reset_during_frame: false,
             history_navigation_during_frame: false,
             playing: false,
@@ -1192,9 +1231,19 @@ impl DawUi {
             project_settings_play_truncated: false,
             project_settings_fast_declick: false,
         };
+        if let Some((autosave_minutes, autosave_before_risky, backup_retention)) =
+            load_autosave_settings()
+        {
+            app.autosave_minutes = autosave_minutes;
+            app.autosave_before_risky = autosave_before_risky;
+            app.backup_retention = backup_retention;
+        }
         app.refresh_browser_directory();
         if let Some(path) = initial_project.as_deref() {
             app.open_project(path);
+        } else if let Some(prompt) = latest_recovery_prompt() {
+            app.last_autosave_path = Some(prompt.backup_path.clone());
+            app.recovery_prompt = Some(prompt);
         }
         app
     }
@@ -1210,7 +1259,17 @@ impl DawUi {
     }
 
     fn open_project(&mut self, path: &Path) {
-        match fs::read(path)
+        self.load_project_from(path, path, true);
+    }
+
+    fn load_project_from(
+        &mut self,
+        project_file: &Path,
+        target_path: &Path,
+        check_recovery: bool,
+    ) -> bool {
+        self.recovery_prompt = None;
+        match fs::read(project_file)
             .map_err(|error| error.to_string())
             .and_then(|bytes| FlpDocument::parse(&bytes).map_err(|error| error.to_string()))
         {
@@ -1218,6 +1277,7 @@ impl DawUi {
                 self.stop_project_playback();
                 self.clear_history();
                 self.history_reset_during_frame = true;
+                self.autosave_deadline = None;
                 self.saved_project_hash = project_hash(&document);
                 self.tempo_bpm = document.metadata().tempo_bpm().unwrap_or(140.0);
                 self.project_info_title =
@@ -1272,21 +1332,37 @@ impl DawUi {
                 self.selected_arrangement = document.arrangements().ok().and_then(|arrangements| {
                     arrangements.first().map(|arrangement| arrangement.id)
                 });
-                self.current_path = Some(path.to_path_buf());
+                self.current_path = Some(target_path.to_path_buf());
                 self.document = Some(document);
                 self.refresh_audio_waveform_paths();
-                let recent_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+                let recent_path =
+                    fs::canonicalize(target_path).unwrap_or_else(|_| target_path.to_path_buf());
                 self.browser_recent_projects
                     .retain(|recent| recent != &recent_path);
                 self.browser_recent_projects.insert(0, recent_path);
                 self.browser_recent_projects.truncate(12);
                 self.dirty = false;
+                self.last_autosave_path = latest_project_autosave(target_path);
+                if check_recovery {
+                    self.recovery_prompt = recovery_prompt_for_project(target_path);
+                }
                 let plugin_summary = self
                     .load_project_vst3_channels()
                     .map_or_else(String::new, |summary| format!(" · {summary}"));
-                self.status = format!("Opened {}{plugin_summary}", path.display());
+                if check_recovery {
+                    self.status = format!("Opened {}{plugin_summary}", target_path.display());
+                } else {
+                    self.status = format!(
+                        "Recovered {} from autosave{plugin_summary}",
+                        target_path.display()
+                    );
+                }
+                true
             }
-            Err(error) => self.status = format!("Could not open project: {error}"),
+            Err(error) => {
+                self.status = format!("Could not open project: {error}");
+                false
+            }
         }
     }
 
@@ -1474,6 +1550,267 @@ impl DawUi {
             .save_file()
         {
             self.write_project(&path);
+        }
+    }
+
+    fn save_new_version(&mut self) {
+        let Some(path) = self.current_path.clone() else {
+            self.save_as();
+            return;
+        };
+        self.write_project(&next_project_version_path(&path));
+    }
+
+    fn backup_now(&mut self) {
+        if self.pending_backup_write.is_some() {
+            self.status = "A backup is already being written".to_owned();
+            return;
+        }
+        self.start_backup_write(BackupPurpose::Manual);
+    }
+
+    fn revert_to_last_autosave(&mut self) {
+        let (Some(source_path), Some(backup_path)) =
+            (self.current_path.clone(), self.last_autosave_path.clone())
+        else {
+            self.status = "No autosave is available for this project".to_owned();
+            return;
+        };
+        if !backup_path.is_file() {
+            self.last_autosave_path = None;
+            self.status = "The last autosave is no longer available".to_owned();
+            return;
+        }
+        self.recovery_prompt = Some(RecoveryPrompt {
+            source_path,
+            backup_path,
+            is_revert: true,
+        });
+    }
+
+    fn persist_autosave_settings(&mut self) {
+        self.autosave_deadline = None;
+        if let Err(error) = save_autosave_settings(
+            self.autosave_minutes,
+            self.autosave_before_risky,
+            self.backup_retention,
+        ) {
+            self.status = format!("Could not save autosave settings: {error}");
+        }
+    }
+
+    fn backup_before_risky_operation(&mut self, operation: &str) {
+        if !self.autosave_before_risky {
+            return;
+        }
+        let (Some(source_path), Some(document)) =
+            (self.current_path.clone(), self.document.as_ref())
+        else {
+            return;
+        };
+        let result = document
+            .encode_lossless()
+            .map_err(|error| error.to_string())
+            .and_then(|bytes| {
+                write_project_backup(
+                    &source_path,
+                    &bytes,
+                    BackupPurpose::Autosave,
+                    self.backup_retention,
+                )
+            });
+        match result {
+            Ok(path) => {
+                self.last_autosave_path = Some(path.clone());
+                self.status = format!("Autosaved before {operation}");
+            }
+            Err(error) => self.status = format!("Could not autosave before {operation}: {error}"),
+        }
+    }
+
+    fn start_backup_write(&mut self, purpose: BackupPurpose) {
+        let (Some(source_path), Some(document)) =
+            (self.current_path.clone(), self.document.as_ref())
+        else {
+            self.status = "Save the project before creating a backup".to_owned();
+            return;
+        };
+        let bytes = match document.encode_lossless() {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.status = format!("Could not encode autosave: {error}");
+                return;
+            }
+        };
+        let retention = self.backup_retention;
+        let worker_source = source_path.clone();
+        let (sender, receiver) = mpsc::channel();
+        let worker = match thread::Builder::new()
+            .name("flp-autosave".to_owned())
+            .spawn(move || {
+                let result = write_project_backup(&worker_source, &bytes, purpose, retention);
+                let _ = sender.send(result);
+            }) {
+            Ok(worker) => worker,
+            Err(error) => {
+                self.status = format!("Could not start backup writer: {error}");
+                self.schedule_next_autosave();
+                return;
+            }
+        };
+        self.pending_backup_write = Some(PendingBackupWrite {
+            source_path,
+            purpose,
+            receiver,
+            worker,
+        });
+        if matches!(purpose, BackupPurpose::Autosave) {
+            self.schedule_next_autosave();
+        }
+    }
+
+    fn poll_backup_write(&mut self) {
+        let result = self.pending_backup_write.as_ref().and_then(|pending| {
+            match pending.receiver.try_recv() {
+                Ok(result) => Some((pending.source_path.clone(), pending.purpose, result)),
+                Err(TryRecvError::Disconnected) => Some((
+                    pending.source_path.clone(),
+                    pending.purpose,
+                    Err("backup writer stopped unexpectedly".to_owned()),
+                )),
+                Err(TryRecvError::Empty) => None,
+            }
+        });
+        let Some((source_path, purpose, result)) = result else {
+            return;
+        };
+        if let Some(pending) = self.pending_backup_write.take() {
+            let _ = pending.worker.join();
+        }
+        match (purpose, result) {
+            (BackupPurpose::Autosave, Ok(path)) => {
+                let is_current_project = self
+                    .current_path
+                    .as_deref()
+                    .is_some_and(|current_path| project_paths_equal(current_path, &source_path));
+                if is_current_project {
+                    self.last_autosave_path = Some(path.clone());
+                    self.status = format!("Autosaved to {}", path.display());
+                }
+            }
+            (BackupPurpose::Manual, Ok(path)) => {
+                self.status = format!("Backup created at {}", path.display());
+            }
+            (_, Err(error)) => self.status = format!("Could not write backup: {error}"),
+        }
+    }
+
+    fn schedule_next_autosave(&mut self) {
+        self.autosave_deadline = (self.autosave_minutes > 0)
+            .then(|| Instant::now() + Duration::from_secs(u64::from(self.autosave_minutes) * 60));
+    }
+
+    fn advance_autosave(&mut self, context: &egui::Context) {
+        self.poll_backup_write();
+        if self.pending_backup_write.is_some() {
+            context.request_repaint_after(Duration::from_millis(500));
+            return;
+        }
+        if self.autosave_minutes == 0 || !self.dirty || self.current_path.is_none() {
+            self.autosave_deadline = None;
+            return;
+        }
+        if self.autosave_deadline.is_none() {
+            self.schedule_next_autosave();
+        }
+        if self.playing && !self.autosave_before_risky {
+            context.request_repaint_after(Duration::from_millis(500));
+            return;
+        }
+        let Some(deadline) = self.autosave_deadline else {
+            return;
+        };
+        let now = Instant::now();
+        if now >= deadline {
+            self.start_backup_write(BackupPurpose::Autosave);
+        } else {
+            context.request_repaint_after(deadline.saturating_duration_since(now));
+        }
+    }
+
+    fn recovery_prompt_dialog(&mut self, context: &egui::Context) {
+        let Some(prompt) = self.recovery_prompt.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut recover = false;
+        let mut dismiss = false;
+        egui::Window::new(if prompt.is_revert {
+            "Revert to autosave?"
+        } else {
+            "Recover project?"
+        })
+        .id(Id::new("project-recovery-dialog"))
+        .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+        .collapsible(false)
+        .resizable(false)
+        .open(&mut open)
+        .show(context, |ui| {
+            if prompt.is_revert {
+                ui.label("Replace the current project with its latest autosave?");
+            } else {
+                ui.label("A newer autosave is available for this project.");
+                ui.label(prompt.source_path.display().to_string());
+                ui.label("Recover the autosaved version?");
+            }
+            ui.horizontal(|ui| {
+                if ui
+                    .button(if prompt.is_revert {
+                        "Revert"
+                    } else {
+                        "Recover"
+                    })
+                    .clicked()
+                {
+                    recover = true;
+                }
+                if ui
+                    .button(if prompt.is_revert {
+                        "Cancel"
+                    } else {
+                        "Discard"
+                    })
+                    .clicked()
+                {
+                    dismiss = true;
+                }
+            });
+        });
+        if recover {
+            self.recover_from_backup(&prompt);
+        } else if dismiss {
+            self.recovery_prompt = None;
+            if !prompt.is_revert {
+                let _ = fs::remove_file(&prompt.backup_path);
+                if self.last_autosave_path.as_ref() == Some(&prompt.backup_path) {
+                    self.last_autosave_path = None;
+                }
+            }
+        } else if !open {
+            self.recovery_prompt = None;
+        }
+    }
+
+    fn recover_from_backup(&mut self, prompt: &RecoveryPrompt) {
+        let original_hash = fs::read(&prompt.source_path)
+            .ok()
+            .and_then(|bytes| FlpDocument::parse(&bytes).ok())
+            .and_then(|document| project_hash(&document));
+        if self.load_project_from(&prompt.backup_path, &prompt.source_path, false) {
+            self.saved_project_hash = original_hash;
+            self.dirty = true;
+            self.last_autosave_path = Some(prompt.backup_path.clone());
+            self.status = format!("Recovered autosave for {}", prompt.source_path.display());
         }
     }
 
@@ -1872,16 +2209,60 @@ impl DawUi {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         encoded.hash(&mut hasher);
         let saved_hash = hasher.finish();
+        let backups = self.backup_before_manual_save(path);
         match fs::write(path, encoded) {
             Ok(()) => {
                 self.current_path = Some(path.to_path_buf());
                 self.refresh_audio_waveform_paths();
                 self.saved_project_hash = Some(saved_hash);
                 self.dirty = false;
-                self.status = format!("Saved {}", path.display());
+                self.autosave_deadline = None;
+                self.last_autosave_path = latest_project_autosave(path);
+                self.status = match backups {
+                    Ok(paths) if !paths.is_empty() => {
+                        format!("Saved {} · backup {}", path.display(), paths[0].display())
+                    }
+                    Err(error) => format!(
+                        "Saved {} · previous version backup failed: {error}",
+                        path.display()
+                    ),
+                    _ => format!("Saved {}", path.display()),
+                };
             }
-            Err(error) => self.status = format!("Could not save project: {error}"),
+            Err(error) => {
+                self.status = match backups {
+                    Err(backup_error) => format!(
+                        "Could not save project: {error}; previous version backup failed: {backup_error}"
+                    ),
+                    _ => format!("Could not save project: {error}"),
+                }
+            }
         }
+    }
+
+    fn backup_before_manual_save(&self, target_path: &Path) -> Result<Vec<PathBuf>, String> {
+        let mut paths = Vec::new();
+        if let Some(current_path) = self.current_path.as_deref() {
+            paths.push(current_path.to_path_buf());
+        }
+        if !paths
+            .iter()
+            .any(|existing| project_paths_equal(existing, target_path))
+        {
+            paths.push(target_path.to_path_buf());
+        }
+        let mut backups = Vec::new();
+        for path in paths.into_iter().filter(|path| path.is_file()) {
+            let bytes = fs::read(&path)
+                .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+            backups.push(write_project_backup(
+                &path,
+                &bytes,
+                BackupPurpose::Manual,
+                self.backup_retention,
+            )?);
+        }
+        Ok(backups)
     }
 
     fn update_tempo(&mut self, bpm: f64) {
@@ -2270,18 +2651,117 @@ impl DawUi {
             ui.strong("FL")
                 .on_hover_text("Independent FL Studio project editor");
             ui.separator();
-            if ui.small_button("File").clicked() {
-                self.open_dialog();
-            }
-            if ui.small_button("Open").clicked() {
-                self.open_dialog();
-            }
-            if ui.small_button("Save").clicked() {
-                self.save();
-            }
-            if ui.small_button("Save as").clicked() {
-                self.save_as();
-            }
+            ui.menu_button("File", |ui| {
+                if ui.button("Open…").clicked() {
+                    self.open_dialog();
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        self.document.is_some(),
+                        egui::Button::new("Save (Ctrl/Cmd+S)"),
+                    )
+                    .clicked()
+                {
+                    self.save();
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(self.document.is_some(), egui::Button::new("Save as…"))
+                    .clicked()
+                {
+                    self.save_as();
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        self.document.is_some(),
+                        egui::Button::new("Save new version (Ctrl/Cmd+N)"),
+                    )
+                    .clicked()
+                {
+                    self.save_new_version();
+                    ui.close();
+                }
+                ui.separator();
+                if ui
+                    .add_enabled(
+                        self.document.is_some()
+                            && self.current_path.is_some()
+                            && self.pending_backup_write.is_none(),
+                        egui::Button::new("Backup now"),
+                    )
+                    .clicked()
+                {
+                    self.backup_now();
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        self.document.is_some()
+                            && self
+                                .last_autosave_path
+                                .as_ref()
+                                .is_some_and(|path| path.is_file())
+                            && self.recovery_prompt.is_none(),
+                        egui::Button::new("Revert to last autosave…"),
+                    )
+                    .clicked()
+                {
+                    self.revert_to_last_autosave();
+                    ui.close();
+                }
+                ui.separator();
+                let autosave_label = if self.autosave_minutes == 0 {
+                    "Never".to_owned()
+                } else if self.autosave_before_risky {
+                    format!("{} min + risky operations", self.autosave_minutes)
+                } else {
+                    format!("Every {} minutes", self.autosave_minutes)
+                };
+                ui.menu_button(format!("Autosave: {autosave_label}"), |ui| {
+                    for (minutes, before_risky, label) in [
+                        (0, false, "Never"),
+                        (15, false, "Rarely · every 15 minutes"),
+                        (10, false, "Occasionally · every 10 minutes"),
+                        (5, false, "Regularly · every 5 minutes"),
+                        (
+                            5,
+                            true,
+                            "Frequently · 5 minutes, including playback; before risky operations",
+                        ),
+                        (
+                            1,
+                            true,
+                            "Very frequently · every minute and before risky operations",
+                        ),
+                    ] {
+                        let selected = self.autosave_minutes == minutes
+                            && self.autosave_before_risky == before_risky;
+                        if ui.selectable_label(selected, label).clicked() && !selected {
+                            self.autosave_minutes = minutes;
+                            self.autosave_before_risky = before_risky;
+                            self.persist_autosave_settings();
+                            ui.close();
+                        }
+                    }
+                });
+                ui.menu_button(format!("Keep {} backups", self.backup_retention), |ui| {
+                    for count in BACKUP_RETENTION_OPTIONS {
+                        if ui
+                            .selectable_value(
+                                &mut self.backup_retention,
+                                count,
+                                format!("Keep {count} backups"),
+                            )
+                            .changed()
+                        {
+                            self.persist_autosave_settings();
+                            ui.close();
+                        }
+                    }
+                });
+            });
             if ui
                 .add_enabled(!self.undo_history.is_empty(), egui::Button::new("Undo"))
                 .on_hover_text("Undo the last project edit (Ctrl/Cmd+Z)")
@@ -9041,6 +9521,7 @@ impl DawUi {
             self.last_plugin_action = Some(self.status.clone());
             return;
         }
+        self.backup_before_risky_operation("loading a VST3 plug-in");
         if self.vst3_host.is_none() {
             match Vst3HostRuntime::new(f64::from(self.audio_settings.sample_rate), 512) {
                 Ok(host) => self.vst3_host = Some(host),
@@ -9096,6 +9577,25 @@ impl DawUi {
 
 impl eframe::App for DawUi {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let save_as_requested = ui.input_mut(|input| {
+            input.consume_key(
+                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                egui::Key::S,
+            )
+        });
+        let save_version_requested =
+            ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::N));
+        let save_requested = !save_as_requested
+            && !save_version_requested
+            && ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::S));
+        if save_as_requested {
+            self.save_as();
+        } else if save_version_requested {
+            self.save_new_version();
+        } else if save_requested {
+            self.save();
+        }
+        self.advance_autosave(ui.ctx());
         let redo_requested = ui.input_mut(|input| {
             input.consume_key(
                 egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
@@ -9241,6 +9741,7 @@ impl eframe::App for DawUi {
         });
         self.project_info_dialog(ui.ctx());
         self.project_settings_dialog(ui.ctx());
+        self.recovery_prompt_dialog(ui.ctx());
         self.finish_history_frame(frame_snapshot.take(), pointer_down, history_navigation);
     }
 }
@@ -9259,6 +9760,9 @@ impl Drop for DawUi {
         }
         for worker in self.vst3_workers.drain(..) {
             let _ = worker.join();
+        }
+        if let Some(backup) = self.pending_backup_write.take() {
+            let _ = backup.worker.join();
         }
     }
 }
@@ -9352,6 +9856,335 @@ fn browser_favorites_file() -> Option<PathBuf> {
             })
     }?;
     Some(root.join("fl-studio-rebuild").join("browser-favorites.txt"))
+}
+
+fn autosave_settings_file() -> Option<PathBuf> {
+    browser_favorites_file()?
+        .parent()
+        .map(|directory| directory.join("autosave-settings.txt"))
+}
+
+fn load_autosave_settings() -> Option<(u8, bool, usize)> {
+    let contents = fs::read_to_string(autosave_settings_file()?).ok()?;
+    let mut lines = contents.lines();
+    let autosave_minutes = lines.next()?.parse::<u8>().ok()?;
+    let backup_retention = lines.next()?.parse::<usize>().ok()?;
+    let autosave_before_risky = lines
+        .next()
+        .and_then(|value| value.parse::<bool>().ok())
+        .unwrap_or(false);
+    if !AUTOSAVE_INTERVALS_MINUTES.contains(&autosave_minutes)
+        || !BACKUP_RETENTION_OPTIONS.contains(&backup_retention)
+    {
+        return None;
+    }
+    Some((autosave_minutes, autosave_before_risky, backup_retention))
+}
+
+fn save_autosave_settings(
+    autosave_minutes: u8,
+    autosave_before_risky: bool,
+    backup_retention: usize,
+) -> Result<(), String> {
+    let path = autosave_settings_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the autosave settings path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(
+        &path,
+        format!("{autosave_minutes}\n{backup_retention}\n{autosave_before_risky}\n"),
+    )
+    .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
+fn user_data_directory() -> Option<PathBuf> {
+    if cfg!(target_os = "windows") {
+        std::env::var_os("APPDATA").map(PathBuf::from).or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .map(PathBuf::from)
+                .map(|home| home.join("AppData").join("Roaming"))
+        })
+    } else if cfg!(target_os = "macos") {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join("Library").join("Application Support"))
+    } else {
+        std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .map(|home| home.join(".local").join("share"))
+            })
+    }
+    .map(|root| root.join("fl-studio-rebuild"))
+}
+
+fn project_backup_directory(project_path: &Path) -> Option<PathBuf> {
+    Some(
+        user_data_directory()?
+            .join("Backups")
+            .join(stable_project_id(project_path)),
+    )
+}
+
+fn stable_project_id(project_path: &Path) -> String {
+    let normalized = fs::canonicalize(project_path).unwrap_or_else(|_| {
+        let absolute = normalized_absolute_path(project_path);
+        match (absolute.parent(), absolute.file_name()) {
+            (Some(parent), Some(name)) => fs::canonicalize(parent)
+                .unwrap_or_else(|_| normalized_absolute_path(parent))
+                .join(name),
+            _ => absolute,
+        }
+    });
+    let mut value = normalized.to_string_lossy().into_owned();
+    if cfg!(target_os = "windows") {
+        value.make_ascii_lowercase();
+    }
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn write_project_backup(
+    project_path: &Path,
+    bytes: &[u8],
+    purpose: BackupPurpose,
+    retention: usize,
+) -> Result<PathBuf, String> {
+    let directory = project_backup_directory(project_path)
+        .ok_or_else(|| "the user data folder is not available".to_owned())?;
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("could not create {}: {error}", directory.display()))?;
+    let recorded_path =
+        fs::canonicalize(project_path).unwrap_or_else(|_| normalized_absolute_path(project_path));
+    fs::write(
+        directory.join("project.path"),
+        recorded_path.to_string_lossy().as_bytes(),
+    )
+    .map_err(|error| format!("could not record project path: {error}"))?;
+
+    let kind = match purpose {
+        BackupPurpose::Autosave => "autosave",
+        BackupPurpose::Manual => "backup",
+    };
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let path = directory.join(format!("{kind}-{timestamp}-{}.flp", std::process::id()));
+    write_file_atomically(&path, bytes)
+        .map_err(|error| format!("could not write {}: {error}", path.display()))?;
+    prune_global_project_backups(&directory, retention);
+    Ok(path)
+}
+
+fn write_file_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default();
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = path.with_file_name(format!(".{name}.tmp-{}-{timestamp}", std::process::id()));
+    fs::write(&temporary, bytes)?;
+    match fs::rename(&temporary, path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = fs::remove_file(temporary);
+            Err(error)
+        }
+    }
+}
+
+fn prune_global_project_backups(project_directory: &Path, retention: usize) {
+    let Some(root) = project_directory.parent() else {
+        return;
+    };
+    let mut backups = fs::read_dir(root)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| fs::read_dir(entry.path()).ok())
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("flp"))
+                && path.file_name().is_some_and(|name| {
+                    name.to_string_lossy().starts_with("autosave-")
+                        || name.to_string_lossy().starts_with("backup-")
+                })
+        })
+        .collect::<Vec<_>>();
+    backups.sort_by_key(|path| {
+        fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(UNIX_EPOCH)
+    });
+    let remove_count = backups.len().saturating_sub(retention);
+    for path in backups.into_iter().take(remove_count) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn project_autosave_files(project_path: &Path) -> Vec<PathBuf> {
+    let Some(directory) = project_backup_directory(project_path) else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir(directory) else {
+        return Vec::new();
+    };
+    let mut paths = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("flp"))
+                && path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("autosave-"))
+        })
+        .collect::<Vec<_>>();
+    paths.sort_by_key(|path| {
+        std::cmp::Reverse(
+            fs::metadata(path)
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(UNIX_EPOCH),
+        )
+    });
+    paths
+}
+
+fn latest_project_autosave(project_path: &Path) -> Option<PathBuf> {
+    project_autosave_files(project_path)
+        .into_iter()
+        .find(|path| {
+            fs::read(path)
+                .ok()
+                .is_some_and(|bytes| FlpDocument::parse(&bytes).is_ok())
+        })
+}
+
+fn recovery_prompt_for_project(project_path: &Path) -> Option<RecoveryPrompt> {
+    let directory = project_backup_directory(project_path)?;
+    let recorded_path = fs::read_to_string(directory.join("project.path")).ok()?;
+    if !project_paths_equal(Path::new(recorded_path.trim()), project_path) {
+        return None;
+    }
+    let backup_path = latest_project_autosave(project_path)?;
+    let backup_modified = fs::metadata(&backup_path).ok()?.modified().ok()?;
+    let source_modified = fs::metadata(project_path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok());
+    if source_modified.is_some_and(|modified| backup_modified < modified) {
+        return None;
+    }
+    if fs::read(project_path).ok().is_some_and(|source_bytes| {
+        fs::read(&backup_path).is_ok_and(|backup| backup == source_bytes)
+    }) {
+        return None;
+    }
+    Some(RecoveryPrompt {
+        source_path: project_path.to_path_buf(),
+        backup_path,
+        is_revert: false,
+    })
+}
+
+fn latest_recovery_prompt() -> Option<RecoveryPrompt> {
+    let root = user_data_directory()?.join("Backups");
+    let directories = fs::read_dir(root).ok()?;
+    directories
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let directory = entry.path();
+            let source_path = fs::read_to_string(directory.join("project.path")).ok()?;
+            recovery_prompt_for_project(Path::new(source_path.trim()))
+        })
+        .max_by_key(|prompt| {
+            fs::metadata(&prompt.backup_path)
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(UNIX_EPOCH)
+        })
+}
+
+fn project_paths_equal(left: &Path, right: &Path) -> bool {
+    let left = fs::canonicalize(left).unwrap_or_else(|_| absolute_path(left));
+    let right = fs::canonicalize(right).unwrap_or_else(|_| absolute_path(right));
+    if cfg!(target_os = "windows") {
+        left.to_string_lossy()
+            .eq_ignore_ascii_case(&right.to_string_lossy())
+    } else {
+        left == right
+    }
+}
+
+fn absolute_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|directory| directory.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    }
+}
+
+fn normalized_absolute_path(path: &Path) -> PathBuf {
+    let absolute = absolute_path(path);
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn next_project_version_path(path: &Path) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or_else(|| "project".to_owned());
+    let extension = path
+        .extension()
+        .map(|extension| extension.to_string_lossy().into_owned())
+        .filter(|extension| !extension.is_empty())
+        .unwrap_or_else(|| "flp".to_owned());
+    let (base, mut version) = stem
+        .rsplit_once('_')
+        .and_then(|(base, suffix)| {
+            suffix
+                .parse::<u32>()
+                .ok()
+                .filter(|version| *version >= 2)
+                .map(|version| (base.to_owned(), version + 1))
+        })
+        .unwrap_or((stem, 2));
+    let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    loop {
+        let candidate = directory.join(format!("{base}_{version}.{extension}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+        version = version.saturating_add(1);
+    }
 }
 
 fn load_browser_favorites() -> BTreeSet<PathBuf> {
