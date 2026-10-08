@@ -874,6 +874,134 @@ impl BrowserTagLogic {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum BrowserTabColor {
+    #[default]
+    Default,
+    Red,
+    Orange,
+    Yellow,
+    Green,
+    Blue,
+    Purple,
+}
+
+impl BrowserTabColor {
+    const ALL: [Self; 7] = [
+        Self::Default,
+        Self::Red,
+        Self::Orange,
+        Self::Yellow,
+        Self::Green,
+        Self::Blue,
+        Self::Purple,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Default => "Default",
+            Self::Red => "Red",
+            Self::Orange => "Orange",
+            Self::Yellow => "Yellow",
+            Self::Green => "Green",
+            Self::Blue => "Blue",
+            Self::Purple => "Purple",
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Red => "red",
+            Self::Orange => "orange",
+            Self::Yellow => "yellow",
+            Self::Green => "green",
+            Self::Blue => "blue",
+            Self::Purple => "purple",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|color| color.key() == value)
+    }
+
+    fn text_color(self) -> Option<egui::Color32> {
+        match self {
+            Self::Default => None,
+            Self::Red => Some(egui::Color32::from_rgb(244, 103, 111)),
+            Self::Orange => Some(egui::Color32::from_rgb(242, 164, 91)),
+            Self::Yellow => Some(egui::Color32::from_rgb(229, 199, 87)),
+            Self::Green => Some(egui::Color32::from_rgb(113, 194, 122)),
+            Self::Blue => Some(egui::Color32::from_rgb(105, 170, 224)),
+            Self::Purple => Some(egui::Color32::from_rgb(185, 144, 225)),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum BrowserTabIcon {
+    #[default]
+    None,
+    Folder,
+    Star,
+    Music,
+    Piano,
+    Drum,
+    Wave,
+}
+
+impl BrowserTabIcon {
+    const ALL: [Self; 7] = [
+        Self::None,
+        Self::Folder,
+        Self::Star,
+        Self::Music,
+        Self::Piano,
+        Self::Drum,
+        Self::Wave,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::Folder => "Folder",
+            Self::Star => "Star",
+            Self::Music => "Music",
+            Self::Piano => "Piano",
+            Self::Drum => "Drum",
+            Self::Wave => "Wave",
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Folder => "folder",
+            Self::Star => "star",
+            Self::Music => "music",
+            Self::Piano => "piano",
+            Self::Drum => "drum",
+            Self::Wave => "wave",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|icon| icon.key() == value)
+    }
+
+    fn glyph(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::Folder => Some("▣"),
+            Self::Star => Some("★"),
+            Self::Music => Some("♫"),
+            Self::Piano => Some("▦"),
+            Self::Drum => Some("◉"),
+            Self::Wave => Some("∿"),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct SavedBrowserSearch {
     name: String,
@@ -885,6 +1013,8 @@ struct SavedBrowserSearch {
     tag_logic: BrowserTagLogic,
     selected_tags: BTreeSet<String>,
     hidden: bool,
+    color: BrowserTabColor,
+    icon: BrowserTabIcon,
 }
 
 struct BrowserSearchSaveDialog {
@@ -892,9 +1022,11 @@ struct BrowserSearchSaveDialog {
     search: SavedBrowserSearch,
 }
 
-struct BrowserSearchRenameDialog {
+struct BrowserTabCustomizeDialog {
     index: usize,
     name: String,
+    color: BrowserTabColor,
+    icon: BrowserTabIcon,
 }
 
 struct BrowserIndex {
@@ -1111,7 +1243,7 @@ struct DawUi {
     browser_saved_searches: Vec<SavedBrowserSearch>,
     browser_active_saved_search: Option<String>,
     browser_search_save_dialog: Option<BrowserSearchSaveDialog>,
-    browser_search_rename_dialog: Option<BrowserSearchRenameDialog>,
+    browser_tab_customize_dialog: Option<BrowserTabCustomizeDialog>,
     browser_recent_projects: Vec<PathBuf>,
     browser_error: Option<String>,
     browser_full_sample: bool,
@@ -1314,7 +1446,7 @@ impl DawUi {
             browser_saved_searches: load_browser_saved_searches(),
             browser_active_saved_search: None,
             browser_search_save_dialog: None,
-            browser_search_rename_dialog: None,
+            browser_tab_customize_dialog: None,
             browser_recent_projects: load_recent_projects(),
             browser_error: None,
             browser_full_sample: false,
@@ -3652,6 +3784,16 @@ impl DawUi {
                     && pending.roots.len() == 1
                     && pending.roots.first() == Some(&self.browser_path)
             });
+        let (color, icon) = self
+            .browser_active_saved_search
+            .as_deref()
+            .and_then(|active_name| {
+                self.browser_saved_searches
+                    .iter()
+                    .find(|search| search.name == active_name)
+                    .map(|search| (search.color, search.icon))
+            })
+            .unwrap_or_default();
         let default_name = self.browser_active_saved_search.clone().unwrap_or_else(|| {
             if !self.browser_search.trim().is_empty() {
                 self.browser_search.trim().to_owned()
@@ -3676,6 +3818,8 @@ impl DawUi {
                 tag_logic: self.browser_tag_logic,
                 selected_tags: self.browser_selected_tags.clone(),
                 hidden: false,
+                color,
+                icon,
             },
         });
     }
@@ -3749,17 +3893,25 @@ impl DawUi {
         }
     }
 
-    fn open_browser_search_rename_dialog(&mut self, index: usize) {
+    fn open_browser_tab_customize_dialog(&mut self, index: usize) {
         let Some(search) = self.browser_saved_searches.get(index) else {
             return;
         };
-        self.browser_search_rename_dialog = Some(BrowserSearchRenameDialog {
+        self.browser_tab_customize_dialog = Some(BrowserTabCustomizeDialog {
             index,
             name: search.name.clone(),
+            color: search.color,
+            icon: search.icon,
         });
     }
 
-    fn rename_browser_search(&mut self, index: usize, name: String) -> bool {
+    fn customize_browser_search(
+        &mut self,
+        index: usize,
+        name: String,
+        color: BrowserTabColor,
+        icon: BrowserTabIcon,
+    ) -> bool {
         let name = name.trim().to_owned();
         if name.is_empty() {
             self.status = "Enter a name for this Browser tab".to_owned();
@@ -3784,6 +3936,8 @@ impl DawUi {
         let previous = self.browser_saved_searches.clone();
         let old_name = self.browser_saved_searches[index].name.clone();
         self.browser_saved_searches[index].name = name.clone();
+        self.browser_saved_searches[index].color = color;
+        self.browser_saved_searches[index].icon = icon;
         if let Err(error) = save_browser_saved_searches(&self.browser_saved_searches) {
             self.browser_saved_searches = previous;
             self.status = format!("Could not save Browser tabs: {error}");
@@ -3792,7 +3946,7 @@ impl DawUi {
             if self.browser_active_saved_search.as_deref() == Some(old_name.as_str()) {
                 self.browser_active_saved_search = Some(name.clone());
             }
-            self.status = format!("Renamed Browser tab to {name}");
+            self.status = format!("Updated Browser tab {name}");
             true
         }
     }
@@ -3948,23 +4102,43 @@ impl DawUi {
         }
     }
 
-    fn browser_search_rename_dialog(&mut self, context: &egui::Context) {
-        let Some(mut dialog) = self.browser_search_rename_dialog.take() else {
+    fn browser_tab_customize_dialog(&mut self, context: &egui::Context) {
+        let Some(mut dialog) = self.browser_tab_customize_dialog.take() else {
             return;
         };
         let mut open = true;
-        let mut rename = false;
+        let mut save = false;
         let mut cancel = false;
-        egui::Window::new("Rename Browser tab")
-            .id(Id::new("browser-search-rename-dialog"))
+        egui::Window::new("Customize Browser tab")
+            .id(Id::new("browser-tab-customize-dialog"))
             .open(&mut open)
             .resizable(false)
             .show(context, |ui| {
                 ui.label("Name");
                 ui.text_edit_singleline(&mut dialog.name);
                 ui.horizontal(|ui| {
-                    if ui.button("Rename").clicked() {
-                        rename = true;
+                    ui.label("Color");
+                    egui::ComboBox::from_id_salt(("browser-tab-color", dialog.index))
+                        .selected_text(dialog.color.label())
+                        .show_ui(ui, |ui| {
+                            for color in BrowserTabColor::ALL {
+                                ui.selectable_value(&mut dialog.color, color, color.label());
+                            }
+                        });
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Icon");
+                    egui::ComboBox::from_id_salt(("browser-tab-icon", dialog.index))
+                        .selected_text(dialog.icon.label())
+                        .show_ui(ui, |ui| {
+                            for icon in BrowserTabIcon::ALL {
+                                ui.selectable_value(&mut dialog.icon, icon, icon.label());
+                            }
+                        });
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        save = true;
                     }
                     if ui.button("Cancel").clicked() {
                         cancel = true;
@@ -3972,11 +4146,16 @@ impl DawUi {
                 });
             });
         let mut keep_dialog_open = open && !cancel;
-        if rename {
-            keep_dialog_open = !self.rename_browser_search(dialog.index, dialog.name.clone());
+        if save {
+            keep_dialog_open = !self.customize_browser_search(
+                dialog.index,
+                dialog.name.clone(),
+                dialog.color,
+                dialog.icon,
+            );
         }
         if keep_dialog_open {
-            self.browser_search_rename_dialog = Some(dialog);
+            self.browser_tab_customize_dialog = Some(dialog);
         }
     }
 
@@ -4167,14 +4346,23 @@ impl DawUi {
                     let selected = self.browser_tab == BrowserTab::Files
                         && self.browser_active_saved_search.as_deref()
                             == Some(search.name.as_str());
+                    let label = search.icon.glyph().map_or_else(
+                        || search.name.clone(),
+                        |glyph| format!("{glyph} {}", search.name),
+                    );
+                    let label = egui::RichText::new(label);
+                    let label = search
+                        .color
+                        .text_color()
+                        .map_or(label.clone(), |color| label.color(color));
                     let response = ui
-                        .selectable_label(selected, &search.name)
+                        .selectable_label(selected, label)
                         .on_hover_text("Apply this saved Browser search");
                     if response.clicked() {
                         apply_saved_search = Some(search.clone());
                     }
                     response.context_menu(|ui| {
-                        if ui.button("Rename…").clicked() {
+                        if ui.button("Rename, color and icon…").clicked() {
                             rename_saved_search = Some(index);
                             ui.close();
                         }
@@ -4241,7 +4429,7 @@ impl DawUi {
         } else if let Some((index, direction)) = move_saved_search {
             self.move_browser_search(index, direction);
         } else if let Some(index) = rename_saved_search {
-            self.open_browser_search_rename_dialog(index);
+            self.open_browser_tab_customize_dialog(index);
         } else if let Some(index) = clone_saved_search {
             self.clone_browser_search(index);
         }
@@ -11084,7 +11272,7 @@ impl eframe::App for DawUi {
         self.project_settings_dialog(ui.ctx());
         self.browser_tag_editor_dialog(ui.ctx());
         self.browser_search_save_dialog(ui.ctx());
-        self.browser_search_rename_dialog(ui.ctx());
+        self.browser_tab_customize_dialog(ui.ctx());
         self.recovery_prompt_dialog(ui.ctx());
         self.unsaved_changes_dialog(ui.ctx());
         self.finish_history_frame(frame_snapshot.take(), pointer_down, history_navigation);
@@ -11881,8 +12069,14 @@ fn load_browser_saved_searches() -> Vec<SavedBrowserSearch> {
         ) else {
             continue;
         };
-        let (tag_logic, hidden, selected_tags) = match version {
-            Some("v1") if fields.next().is_none() => (BrowserTagLogic::Any, false, BTreeSet::new()),
+        let (tag_logic, hidden, color, icon, selected_tags) = match version {
+            Some("v1") if fields.next().is_none() => (
+                BrowserTagLogic::Any,
+                false,
+                BrowserTabColor::default(),
+                BrowserTabIcon::default(),
+                BTreeSet::new(),
+            ),
             Some("v2") => {
                 let Some(tag_logic) = fields.next().and_then(parse_browser_tag_logic) else {
                     continue;
@@ -11892,21 +12086,38 @@ fn load_browser_saved_searches() -> Vec<SavedBrowserSearch> {
                     .map(|tag| tag.trim().to_owned())
                     .filter(|tag| !tag.is_empty())
                     .collect::<BTreeSet<_>>();
-                (tag_logic, false, selected_tags)
+                (
+                    tag_logic,
+                    false,
+                    BrowserTabColor::default(),
+                    BrowserTabIcon::default(),
+                    selected_tags,
+                )
             }
-            Some("v3") => {
+            Some(version @ ("v3" | "v4")) => {
                 let Some(tag_logic) = fields.next().and_then(parse_browser_tag_logic) else {
                     continue;
                 };
                 let Some(Ok(hidden)) = fields.next().map(str::parse::<bool>) else {
                     continue;
                 };
+                let (color, icon) = if version == "v4" {
+                    let Some(color) = fields.next().and_then(BrowserTabColor::parse) else {
+                        continue;
+                    };
+                    let Some(icon) = fields.next().and_then(BrowserTabIcon::parse) else {
+                        continue;
+                    };
+                    (color, icon)
+                } else {
+                    (BrowserTabColor::default(), BrowserTabIcon::default())
+                };
                 let selected_tags = fields
                     .map(decode_browser_search_field)
                     .map(|tag| tag.trim().to_owned())
                     .filter(|tag| !tag.is_empty())
                     .collect::<BTreeSet<_>>();
-                (tag_logic, hidden, selected_tags)
+                (tag_logic, hidden, color, icon, selected_tags)
             }
             _ => continue,
         };
@@ -11937,6 +12148,8 @@ fn load_browser_saved_searches() -> Vec<SavedBrowserSearch> {
             tag_logic,
             selected_tags,
             hidden,
+            color,
+            icon,
         };
         if let Some(existing) = searches
             .iter_mut()
@@ -11969,7 +12182,7 @@ fn save_browser_saved_searches(searches: &[SavedBrowserSearch]) -> Result<(), St
                 search.path.to_string_lossy().into_owned()
             };
             let mut fields = vec![
-                "v3".to_owned(),
+                "v4".to_owned(),
                 encode_browser_search_field(&search.name),
                 encode_browser_search_field(&search.query),
                 browser_search_filter_key(search.filter).to_owned(),
@@ -11978,6 +12191,8 @@ fn save_browser_saved_searches(searches: &[SavedBrowserSearch]) -> Result<(), St
                 encode_browser_search_field(&path),
                 browser_tag_logic_key(search.tag_logic).to_owned(),
                 search.hidden.to_string(),
+                search.color.key().to_owned(),
+                search.icon.key().to_owned(),
             ];
             fields.extend(
                 search
