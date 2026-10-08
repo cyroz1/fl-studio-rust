@@ -211,6 +211,77 @@ pub struct FlpDocument {
     trailing_bytes: Vec<u8>,
 }
 
+/// The state-file variant identified by the FL Studio `FLhd` format field.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FstPresetKind {
+    AutomationState,
+    ChannelState,
+    NativePluginState,
+    VstGeneratorState,
+    VstEffectState,
+    MixerInsertState,
+    UnknownFormat(u16),
+}
+
+impl FstPresetKind {
+    pub fn from_format(format: u16) -> Self {
+        match format {
+            24 => Self::AutomationState,
+            32 => Self::ChannelState,
+            48 => Self::NativePluginState,
+            49 => Self::VstGeneratorState,
+            50 => Self::VstEffectState,
+            64 => Self::MixerInsertState,
+            other => Self::UnknownFormat(other),
+        }
+    }
+}
+
+impl fmt::Display for FstPresetKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AutomationState => formatter.write_str("automation state"),
+            Self::ChannelState => formatter.write_str("channel state"),
+            Self::NativePluginState => formatter.write_str("native plug-in state"),
+            Self::VstGeneratorState => formatter.write_str("VST generator state"),
+            Self::VstEffectState => formatter.write_str("VST effect state"),
+            Self::MixerInsertState => formatter.write_str("Mixer insert state"),
+            Self::UnknownFormat(format) => write!(formatter, "unknown state format ({format})"),
+        }
+    }
+}
+
+/// A lossless FL Studio state preset with its container variant identified.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FstPreset {
+    kind: FstPresetKind,
+    document: FlpDocument,
+}
+
+impl FstPreset {
+    pub fn parse(bytes: &[u8]) -> Result<Self, FlpError> {
+        let document = FlpDocument::parse(bytes)?;
+        let kind = FstPresetKind::from_format(document.header().format());
+        Ok(Self { kind, document })
+    }
+
+    pub fn kind(&self) -> FstPresetKind {
+        self.kind
+    }
+
+    pub fn document(&self) -> &FlpDocument {
+        &self.document
+    }
+
+    pub fn into_document(self) -> FlpDocument {
+        self.document
+    }
+
+    pub fn encode_lossless(&self) -> Result<Vec<u8>, FlpError> {
+        self.document.encode_lossless()
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ProjectMetadata {
     tempo_milli_bpm: Option<u32>,
@@ -5892,9 +5963,9 @@ fn decode_vst_text(bytes: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        FlpDocument, FlpError, MixerParameterKind, PatternNote, PayloadEncoding, ProjectInfoEdit,
-        ProjectSettingsEdit, TimeMarkerEdit, midi::MidiChannelMapping, midi::MidiFile,
-        parse_vst_plugin_state_metadata,
+        FlpDocument, FlpError, FstPreset, FstPresetKind, MixerParameterKind, PatternNote,
+        PayloadEncoding, ProjectInfoEdit, ProjectSettingsEdit, TimeMarkerEdit,
+        midi::MidiChannelMapping, midi::MidiFile, parse_vst_plugin_state_metadata,
     };
 
     fn flp_fixture(event_stream: &[u8], header_extension: &[u8], trailing: &[u8]) -> Vec<u8> {
@@ -5910,6 +5981,33 @@ mod tests {
         bytes.extend_from_slice(event_stream);
         bytes.extend_from_slice(trailing);
         bytes
+    }
+
+    fn state_preset_fixture(format: u16) -> Vec<u8> {
+        let mut bytes = flp_fixture(&[], &[], &[]);
+        bytes[8..10].copy_from_slice(&format.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn classifies_state_preset_variants_by_header_format_losslessly() {
+        for (format, expected) in [
+            (24, FstPresetKind::AutomationState),
+            (32, FstPresetKind::ChannelState),
+            (48, FstPresetKind::NativePluginState),
+            (49, FstPresetKind::VstGeneratorState),
+            (50, FstPresetKind::VstEffectState),
+            (64, FstPresetKind::MixerInsertState),
+            (0x1234, FstPresetKind::UnknownFormat(0x1234)),
+        ] {
+            let fixture = state_preset_fixture(format);
+            let preset = FstPreset::parse(&fixture).expect("state preset envelope should parse");
+            assert_eq!(preset.kind(), expected);
+            assert_eq!(
+                preset.encode_lossless().expect("preset should encode"),
+                fixture
+            );
+        }
     }
 
     fn append_data_event(event_stream: &mut Vec<u8>, opcode: u8, payload: &[u8]) {

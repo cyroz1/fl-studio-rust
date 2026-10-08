@@ -2,7 +2,7 @@
 
 ## Parity progress — 2026-10-08
 
-**Early prototype; not yet suitable as a full FL Studio replacement.** The [parity roadmap](docs/parity-roadmap.md) currently marks **12 items done, 72 partial, and 67 todo** (151 checklist entries total). This is an unweighted checklist count: partial items cover only stated subsets, and a completed small item does not count as the same amount of work as a complete subsystem.
+**Early prototype; not yet suitable as a full FL Studio replacement.** The [parity roadmap](docs/parity-roadmap.md) currently marks **12 items done, 73 partial, and 66 todo** (151 checklist entries total). This is an unweighted checklist count: partial items cover only stated subsets, and a completed small item does not count as the same amount of work as a complete subsystem.
 
 - **Working foundations:** lossless FLP parsing and round-trip writing, selected project and note edits, MIDI import and partial export, and cross-platform CI packaging.
 - **Partial runtime and editing:** early Playlist, Channel Rack, Piano roll, Mixer, plug-in, and audio views; Windows shared and exclusive audio; playback and a first combined WAV render for supported audio clips, Sampler notes, and mapped installed VST3 instruments.
@@ -12,16 +12,17 @@ See the roadmap for subsystem-level status and evidence. The counts above are re
 
 This is a clean-room Rust project started from the FL Studio 26.1.6.5639 installation supplied with the workspace. It is an independent rebuild; it does not load, patch, or link against the installed FL Studio executable or engine. The end goal is to open and modify any FL Studio project with backwards compatibility, matching controls, windows, and editing behavior, installed plug-in hosting, playback, and rendering. The current code contains the lossless file-format core and the first desktop editing shell; it is still far from full parity.
 
-The first milestone is deliberately a compatibility foundation: inspect FL Studio project (`.flp`) files and preserve every event, including data the reader does not understand. The same chunk reader also accepts a bundled `.fst` state preset, though it does not yet interpret most preset state. FL Studio's own documentation describes `.flp` as its native project format, `.fst` as a state/preset format, and ZIP project packages as projects bundled with referenced sample files. The installed projects and presets provide a local compatibility corpus.
+The first milestone is deliberately a compatibility foundation: inspect FL Studio project (`.flp`) files and preserve every event, including data the reader does not understand. The reader identifies common `.fst` header variants for channel, native plug-in, VST generator/effect, and Mixer insert states; plugin payloads are still opaque. FL Studio's own documentation describes `.flp` as its native project format, `.fst` as a state/preset format, and ZIP project packages as projects bundled with referenced sample files. The installed projects and presets provide a local compatibility corpus.
 
 The desktop app also opens standard `.zip` project packages, extracts their regular files to a temporary workspace for relative sample lookup, and writes edited FLP data back while retaining the other files. Saving a plain `.flp` as `.zip` currently creates a project-only archive; collecting referenced samples is still outstanding.
 
 ## Current milestone
 
-`flp-rebuild` can read the FLP chunk envelope and event stream, report header information, event counts, channel summaries, and a small set of project fields, and write a lossless round-trip copy. Unknown event payloads and trailing bytes are retained exactly. The command-line surface is:
+`flp-rebuild` can read the FLP chunk envelope and event stream, report header information, event counts, channel summaries, and a small set of project fields, and write a lossless round-trip copy. `preset-info` classifies known FST state-file variants and reports their decoded structure. Unknown event payloads and trailing bytes are retained exactly. The command-line surface is:
 
 ```text
 flp-rebuild info <file.flp>
+flp-rebuild preset-info <file.fst>
 flp-rebuild project-info <file.flp>
 flp-rebuild project-settings <file.flp>
 flp-rebuild midi-info <file.mid>

@@ -112,6 +112,8 @@ Channel plug-in records use adjacent `0xD4` wrapper metadata and `0xD5` variable
 
 The installed `Data/Patches/Channel presets/3x Osc/Bassline.fst` preset is 829 bytes and uses the same `FLhd` and `FLdt` chunk markers. Its header has format value 32, legacy channel count 9, and PPQ 96. The event stream starts with version `3.5.2`, and the reader finds 41 events plus one channel marker. This demonstrates that the generic envelope reader can handle this older state preset; it does not establish compatibility with old `.flp` project files.
 
+The typed state-file reader uses the published reverse-engineered `FileFormat` values for automation (24), channel state (32), native plug-in state (48), VST generator (49), VST effect (50), and Mixer insert state (64) ([PyFLP FileFormat reference](https://pyflp.readthedocs.io/en/latest/reference/project.html#pyflp.project.FileFormat)). Image-Line's manual confirms that `.fst` files store generator and effect presets and that Mixer track state can also be saved, but does not document these numeric identifiers. Classification does not decode plug-in payloads or prove that a preset can be applied successfully in FL Studio.
+
 ## Standard MIDI File observation
 
 The installed `Data/Patches/Scores/FPC drumloops/Ambient Loops/fpc_ambient_groove_01.mid` file is 221 bytes. The reader recognizes it as format 1 with two tracks and a 96-tick-per-quarter-note division. Its first track is named `Tempo` and contains a 120 BPM tempo event. Its second track is named `CB Custom 1`, ends at tick 364, and contains 19 note-on and 19 note-off messages. The MIDI reader now exposes paired channel/key note spans while keeping the raw track event stream and original file bytes available.

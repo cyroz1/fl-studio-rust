@@ -44,8 +44,8 @@ The foundation. Everything else depends on reading projects exactly.
 
 | Item | Status | Notes |
 |---|---|---|
-| `.fst` state preset reading (envelope level) | `[partial]` | Accepted by chunk reader; most state uninterpeted |
-| `.fst` generator vs effect vs mixer-state variants | `[todo]` | |
+| `.fst` state preset reading (envelope level) | `[partial]` | Accepted by the lossless chunk/event reader; most plug-in state remains opaque |
+| `.fst` generator vs effect vs mixer-state variants | `[partial]` | `FstPreset` classifies header formats 32 (channel), 48 (native plug-in), 49 (VST generator), 50 (VST effect), and 64 (Mixer insert); format 24 is identified as automation state. `preset-info` reports the kind and decoded event/channel/insert counts while preserving the complete source stream. Applying presets to hosted plug-ins, interpreting the state payloads, and native FL Studio comparison remain outstanding. |
 | Zipped project packages (`.zip` with bundled samples) | `[partial]` | The desktop app opens standard ZIP packages, prefers a root-level FLP when present, extracts regular files into a temporary workspace for relative sample lookup, and writes edits back while retaining the other files. Plain FLP-to-ZIP save currently writes the FLP without collecting referenced samples; archive metadata, encrypted entries, and native FL Studio validation remain outstanding. |
 | `.flp` "save as" version targeting | `[todo]` | Writing files older FL versions can open |
 

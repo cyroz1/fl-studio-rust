@@ -13,7 +13,7 @@ use flp_rebuild::sample_render::{
 };
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions};
 use flp_rebuild::{
-    ArpeggioDirection, ArpeggioOptions, AutomationPointEdit, FlpDocument, PatternNote,
+    ArpeggioDirection, ArpeggioOptions, AutomationPointEdit, FlpDocument, FstPreset, PatternNote,
     PatternNoteEdit, PlaylistClipEdit, ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions,
     TimeMarkerEdit,
 };
@@ -31,6 +31,7 @@ fn main() -> ExitCode {
 fn run(args: Vec<String>) -> Result<(), String> {
     match args.as_slice() {
         [command, path] if command == "info" => inspect(Path::new(path)),
+        [command, path] if command == "preset-info" => inspect_preset(Path::new(path)),
         [command, path] if command == "project-info" => show_project_info(Path::new(path)),
         [command, path] if command == "project-settings" => {
             show_project_settings(Path::new(path))
@@ -662,6 +663,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
         _ => Err(concat!(
             "usage:\n",
             "  flp-rebuild info <file.flp>\n",
+            "  flp-rebuild preset-info <file.fst>\n",
             "  flp-rebuild project-info <file.flp>\n",
             "  flp-rebuild project-settings <file.flp>\n",
             "  flp-rebuild midi-info <file.mid>\n",
@@ -1062,6 +1064,36 @@ fn inspect(path: &Path) -> Result<(), String> {
     for (opcode, count) in present.into_iter().take(24) {
         println!("  0x{opcode:02X}: {count}");
     }
+    Ok(())
+}
+
+fn inspect_preset(path: &Path) -> Result<(), String> {
+    let bytes =
+        fs::read(path).map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    let preset = FstPreset::parse(&bytes).map_err(|error| error.to_string())?;
+    let document = preset.document();
+    println!("file: {}", path.display());
+    println!("size: {} bytes", bytes.len());
+    println!("state format: {}", document.header().format());
+    println!("state kind: {}", preset.kind());
+    println!(
+        "FL Studio version: {}",
+        document.project_version().unwrap_or("unknown")
+    );
+    println!("events: {}", document.events().len());
+    println!("channel records: {}", document.channels().len());
+    println!(
+        "channel plug-in states: {}",
+        document.channel_plugin_states().len()
+    );
+    println!("Mixer inserts: {}", document.mixer_inserts().len());
+    println!(
+        "automation channels: {}",
+        document
+            .automation_channels()
+            .map_or(0, |items| items.len())
+    );
+    println!("trailing bytes: {}", document.trailing_bytes().len());
     Ok(())
 }
 
