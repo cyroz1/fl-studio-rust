@@ -853,6 +853,11 @@ struct BrowserEntry {
     is_directory: bool,
 }
 
+struct BrowserTagEditor {
+    path: PathBuf,
+    tags: String,
+}
+
 struct BrowserIndex {
     roots: Vec<PathBuf>,
     all_roots: bool,
@@ -1059,6 +1064,8 @@ struct DawUi {
     browser_search: String,
     browser_selected: Option<PathBuf>,
     browser_favorites: BTreeSet<PathBuf>,
+    browser_tags: BTreeMap<PathBuf, BTreeSet<String>>,
+    browser_tag_editor: Option<BrowserTagEditor>,
     browser_recent_projects: Vec<PathBuf>,
     browser_error: Option<String>,
     browser_full_sample: bool,
@@ -1253,6 +1260,8 @@ impl DawUi {
             browser_search: String::new(),
             browser_selected: None,
             browser_favorites: load_browser_favorites(),
+            browser_tags: load_browser_tags(),
+            browser_tag_editor: None,
             browser_recent_projects: load_recent_projects(),
             browser_error: None,
             browser_full_sample: false,
@@ -3431,6 +3440,72 @@ impl DawUi {
         }
     }
 
+    fn open_browser_tag_editor(&mut self, path: PathBuf) {
+        let tags = self
+            .browser_tags
+            .get(&path)
+            .map(|tags| tags.iter().cloned().collect::<Vec<_>>().join(", "))
+            .unwrap_or_default();
+        self.browser_tag_editor = Some(BrowserTagEditor { path, tags });
+    }
+
+    fn save_browser_tag_editor(&mut self, editor: BrowserTagEditor) {
+        let tags = editor
+            .tags
+            .split(',')
+            .map(str::trim)
+            .filter(|tag| !tag.is_empty())
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        let previous = self.browser_tags.clone();
+        if tags.is_empty() {
+            self.browser_tags.remove(&editor.path);
+        } else {
+            self.browser_tags.insert(editor.path.clone(), tags);
+        }
+        if let Err(error) = save_browser_tags(&self.browser_tags) {
+            self.browser_tags = previous;
+            self.status = format!("Could not save Browser tags: {error}");
+        } else {
+            self.status = format!("Saved tags for {}", editor.path.display());
+        }
+    }
+
+    fn browser_tag_editor_dialog(&mut self, context: &egui::Context) {
+        let Some(mut editor) = self.browser_tag_editor.take() else {
+            return;
+        };
+        let mut open = true;
+        let mut save = false;
+        let mut cancel = false;
+        egui::Window::new("Browser tags")
+            .id(Id::new("browser-tag-editor"))
+            .open(&mut open)
+            .resizable(false)
+            .show(context, |ui| {
+                ui.label(editor.path.display().to_string());
+                ui.add(
+                    egui::TextEdit::singleline(&mut editor.tags)
+                        .hint_text("Kick, 808, C#")
+                        .desired_width(360.0),
+                );
+                ui.small("Separate tags with commas");
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        save = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if save {
+            self.save_browser_tag_editor(editor);
+        } else if open && !cancel {
+            self.browser_tag_editor = Some(editor);
+        }
+    }
+
     fn request_browser_preview(&mut self, path: PathBuf, full_sample: bool) {
         self.browser_preview_error = None;
         self.browser_preview_path = None;
@@ -3931,7 +4006,13 @@ impl DawUi {
                 (!recursive_results && entry.is_directory)
                     || browser_filter_matches(&entry.path, self.browser_filter)
             })
-            .filter(|entry| query.is_empty() || entry.name.to_lowercase().contains(&query))
+            .filter(|entry| {
+                query.is_empty()
+                    || entry.name.to_lowercase().contains(&query)
+                    || self.browser_tags.get(&entry.path).is_some_and(|tags| {
+                        tags.iter().any(|tag| tag.to_lowercase().contains(&query))
+                    })
+            })
             .cloned()
             .collect::<Vec<_>>();
         let mut advance_search_result =
@@ -3966,31 +4047,51 @@ impl DawUi {
         let mut activate = None;
         let mut preview = None;
         let mut favorite = None;
+        let mut edit_tags = None;
         egui::ScrollArea::vertical()
             .id_salt("browser-files-list")
             .show(ui, |ui| {
                 for entry in entries {
                     let is_favorite = self.browser_favorites.contains(&entry.path);
                     let selected = self.browser_selected.as_ref() == Some(&entry.path);
+                    let tags = self
+                        .browser_tags
+                        .get(&entry.path)
+                        .map(|tags| tags.iter().cloned().collect::<Vec<_>>().join(", "));
                     let row = ui.horizontal(|ui| {
                         let icon = if entry.is_directory {
                             "▸"
                         } else {
                             browser_file_icon(&entry.path)
                         };
+                        let suffix = tags
+                            .as_ref()
+                            .map(|tags| format!("  #{tags}"))
+                            .unwrap_or_default();
                         let response =
-                            ui.selectable_label(selected, format!("{icon} {}", entry.name));
+                            ui.selectable_label(selected, format!("{icon} {}{suffix}", entry.name));
                         let clicked = response.clicked();
                         let double_clicked = response.double_clicked();
-                        response.on_hover_text(entry.path.display().to_string());
+                        let hover_text = tags.map_or_else(
+                            || entry.path.display().to_string(),
+                            |tags| format!("{}\nTags: {tags}", entry.path.display()),
+                        );
+                        response.on_hover_text(hover_text).context_menu(|ui| {
+                            if !entry.is_directory && ui.button("Edit tags…").clicked() {
+                                edit_tags = Some(entry.path.clone());
+                                ui.close();
+                            }
+                        });
                         let favorite_clicked = !entry.is_directory
                             && ui
                                 .small_button(if is_favorite { "★" } else { "☆" })
                                 .clicked();
-                        (clicked, double_clicked, favorite_clicked)
+                        let edit_tags_clicked = !entry.is_directory
+                            && ui.small_button("#").on_hover_text("Edit tags").clicked();
+                        (clicked, double_clicked, favorite_clicked, edit_tags_clicked)
                     });
                     let row_rect = row.response.rect;
-                    let (clicked, double_clicked, favorite_clicked) = row.inner;
+                    let (clicked, double_clicked, favorite_clicked, edit_tags_clicked) = row.inner;
                     if next_match_path.as_ref() == Some(&entry.path) {
                         ui.scroll_to_rect(row_rect, Some(egui::Align::Center));
                     }
@@ -4006,7 +4107,10 @@ impl DawUi {
                         }
                     }
                     if favorite_clicked {
-                        favorite = Some(entry.path);
+                        favorite = Some(entry.path.clone());
+                    }
+                    if edit_tags_clicked {
+                        edit_tags = Some(entry.path);
                     }
                 }
             });
@@ -4018,6 +4122,9 @@ impl DawUi {
         }
         if let Some(path) = activate {
             self.activate_browser_path(path);
+        }
+        if let Some(path) = edit_tags {
+            self.open_browser_tag_editor(path);
         }
     }
 
@@ -4109,7 +4216,11 @@ impl DawUi {
             .browser_favorites
             .iter()
             .filter(|path| {
-                query.is_empty() || path.to_string_lossy().to_lowercase().contains(&query)
+                query.is_empty()
+                    || path.to_string_lossy().to_lowercase().contains(&query)
+                    || self.browser_tags.get(*path).is_some_and(|tags| {
+                        tags.iter().any(|tag| tag.to_lowercase().contains(&query))
+                    })
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -10367,6 +10478,7 @@ impl eframe::App for DawUi {
         });
         self.project_info_dialog(ui.ctx());
         self.project_settings_dialog(ui.ctx());
+        self.browser_tag_editor_dialog(ui.ctx());
         self.recovery_prompt_dialog(ui.ctx());
         self.unsaved_changes_dialog(ui.ctx());
         self.finish_history_frame(frame_snapshot.take(), pointer_down, history_navigation);
@@ -10564,6 +10676,12 @@ fn browser_search_roots_file() -> Option<PathBuf> {
     browser_favorites_file()?
         .parent()
         .map(|directory| directory.join("browser-search-roots.txt"))
+}
+
+fn browser_tags_file() -> Option<PathBuf> {
+    browser_favorites_file()?
+        .parent()
+        .map(|directory| directory.join("browser-tags.txt"))
 }
 
 fn recent_projects_file() -> Option<PathBuf> {
@@ -11005,6 +11123,57 @@ fn save_browser_favorites(favorites: &BTreeSet<PathBuf>) -> Result<(), String> {
     let contents = favorites
         .iter()
         .map(|path| path.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&path, contents)
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
+fn load_browser_tags() -> BTreeMap<PathBuf, BTreeSet<String>> {
+    let Some(path) = browser_tags_file() else {
+        return BTreeMap::new();
+    };
+    let Ok(contents) = fs::read_to_string(path) else {
+        return BTreeMap::new();
+    };
+    let mut tags_by_path = BTreeMap::new();
+    for line in contents.lines() {
+        let mut fields = line.split('\t');
+        let Some(path) = fields.next().filter(|path| !path.is_empty()) else {
+            continue;
+        };
+        let tags = fields
+            .flat_map(|field| field.split(','))
+            .map(str::trim)
+            .filter(|tag| !tag.is_empty())
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        if !tags.is_empty() {
+            tags_by_path.insert(PathBuf::from(path), tags);
+        }
+    }
+    tags_by_path
+}
+
+fn save_browser_tags(tags_by_path: &BTreeMap<PathBuf, BTreeSet<String>>) -> Result<(), String> {
+    let path = browser_tags_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the Browser tags path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    let contents = tags_by_path
+        .iter()
+        .filter(|(_, tags)| !tags.is_empty())
+        .map(|(path, tags)| {
+            let mut line = path.to_string_lossy().into_owned();
+            for tag in tags {
+                line.push('\t');
+                line.push_str(&tag.replace(['\t', '\n', '\r'], " "));
+            }
+            line
+        })
         .collect::<Vec<_>>()
         .join("\n");
     fs::write(&path, contents)
