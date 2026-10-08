@@ -2884,6 +2884,17 @@ impl DawUi {
                         }
                     }
                 });
+                ui.separator();
+                if ui.button("Exit").clicked() {
+                    if self.dirty {
+                        self.recovery_prompt = None;
+                        self.pending_project_change = Some(PendingProjectChange::Exit);
+                    } else {
+                        self.close_approved = true;
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    ui.close();
+                }
             });
             if ui
                 .add_enabled(!self.undo_history.is_empty(), egui::Button::new("Undo"))
