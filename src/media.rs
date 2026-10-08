@@ -23,6 +23,20 @@ pub struct DecodedAudio {
     pub channels: Vec<Vec<f32>>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct WaveformPeak {
+    pub minimum: f32,
+    pub maximum: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AudioWaveform {
+    pub sample_rate: u32,
+    pub frame_count: u64,
+    /// Per-bucket extrema combined across channels, ordered from the sample start.
+    pub peaks: Vec<WaveformPeak>,
+}
+
 /// FL Studio factory samples can wrap an Ogg stream in a RIFF/WAVE header with a private codec
 /// tag. Present the embedded stream at offset zero so Symphonia can probe it by its Ogg signature.
 struct OffsetMediaSource {
@@ -105,12 +119,109 @@ impl DecodedAudio {
 /// container. The decoded audio is bounded to 512 MiB of `f32` sample data; longer media needs
 /// streaming playback instead of this in-memory helper.
 pub fn decode_audio_file(path: impl AsRef<Path>) -> Result<DecodedAudio, String> {
+    decode_audio_file_for_preview(path.as_ref(), None)
+}
+
+/// Decode an audio file for the Browser and return interleaved stereo samples at the output rate.
+/// A duration limit keeps the default short preview bounded; `None` returns the full sample.
+pub fn decode_audio_preview(
+    path: impl AsRef<Path>,
+    output_sample_rate: u32,
+    maximum_seconds: Option<f64>,
+) -> Result<Vec<f32>, String> {
+    if !(8_000..=384_000).contains(&output_sample_rate) {
+        return Err("Browser preview output rate must be between 8 kHz and 384 kHz".into());
+    }
+    if maximum_seconds.is_some_and(|seconds| !seconds.is_finite() || seconds <= 0.0) {
+        return Err("Browser preview duration must be finite and greater than zero".into());
+    }
     let path = path.as_ref();
+    let audio = decode_audio_file_for_preview(path, maximum_seconds)?;
+    decoded_audio_to_stereo_samples(&audio, output_sample_rate, maximum_seconds).map_err(|error| {
+        format!(
+            "could not prepare sample preview {}: {error}",
+            path.display()
+        )
+    })
+}
+
+fn decoded_audio_to_stereo_samples(
+    audio: &DecodedAudio,
+    output_sample_rate: u32,
+    maximum_seconds: Option<f64>,
+) -> Result<Vec<f32>, String> {
+    if audio.channels.is_empty() || audio.channels.len() > 2 || audio.sample_rate == 0 {
+        return Err("only mono and stereo samples with a valid rate can be previewed".into());
+    }
+    let source_frames = audio.frame_count();
+    if source_frames == 0
+        || audio
+            .channels
+            .iter()
+            .any(|channel| channel.len() != source_frames)
+    {
+        return Err("sample has no complete audio frames".into());
+    }
+    let duration = source_frames as f64 / f64::from(audio.sample_rate);
+    let duration = maximum_seconds.map_or(duration, |maximum| duration.min(maximum));
+    let output_frames_f64 = (duration * f64::from(output_sample_rate)).ceil();
+    let maximum_output_frames = MAX_DECODED_SAMPLE_BYTES / (2 * std::mem::size_of::<f32>());
+    if !output_frames_f64.is_finite() || output_frames_f64 > maximum_output_frames as f64 {
+        return Err(format!(
+            "sample preview exceeds the {} MiB output limit",
+            MAX_DECODED_SAMPLE_BYTES / (1024 * 1024)
+        ));
+    }
+    let output_frames = (output_frames_f64 as usize).min(maximum_output_frames);
+    if output_frames == 0 {
+        return Err("sample preview contains no output frames".into());
+    }
+    let sample_count = output_frames
+        .checked_mul(2)
+        .ok_or_else(|| "sample preview size overflow".to_owned())?;
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(sample_count)
+        .map_err(|error| format!("could not allocate sample preview: {error}"))?;
+    let source_step = f64::from(audio.sample_rate) / f64::from(output_sample_rate);
+    for frame in 0..output_frames {
+        let position = (frame as f64 * source_step).min((source_frames - 1) as f64);
+        let first = position.floor() as usize;
+        let second = (first + 1).min(source_frames - 1);
+        let fraction = (position - first as f64) as f32;
+        let interpolate = |channel: &[f32]| {
+            let left = finite_sample(channel[first]);
+            let right = finite_sample(channel[second]);
+            (left + (right - left) * fraction).clamp(-1.0, 1.0)
+        };
+        let left = interpolate(&audio.channels[0]);
+        let right = if audio.channels.len() == 1 {
+            left
+        } else {
+            interpolate(&audio.channels[1])
+        };
+        output.extend_from_slice(&[left, right]);
+    }
+    Ok(output)
+}
+
+fn finite_sample(sample: f32) -> f32 {
+    if sample.is_finite() {
+        sample.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+fn decode_audio_file_for_preview(
+    path: &Path,
+    maximum_seconds: Option<f64>,
+) -> Result<DecodedAudio, String> {
     let mut file = File::open(path)
         .map_err(|error| format!("could not open sample {}: {error}", path.display()))?;
     let mut signature = [0; 4];
     if file.read_exact(&mut signature).is_ok() && &signature == b"wvpk" {
-        return decode_wavpack_file(file, path);
+        return decode_wavpack_file(file, path, maximum_seconds);
     }
     file.seek(SeekFrom::Start(0))
         .map_err(|error| format!("could not seek sample {}: {error}", path.display()))?;
@@ -193,7 +304,15 @@ pub fn decode_audio_file(path: impl AsRef<Path>) -> Result<DecodedAudio, String>
         }
 
         let frame_count = decoded.frames();
-        let sample_count = frame_count
+        let frames_already_decoded = output_channels.first().map_or(0, Vec::len);
+        let frame_limit = maximum_seconds
+            .map(|seconds| (seconds * f64::from(sample_rate)).ceil() as usize)
+            .unwrap_or(usize::MAX);
+        let frames_to_keep = frame_count.min(frame_limit.saturating_sub(frames_already_decoded));
+        if frames_to_keep == 0 {
+            break;
+        }
+        let sample_count = frames_to_keep
             .checked_mul(channel_count)
             .ok_or_else(|| "decoded sample size overflow".to_owned())?;
         total_samples = total_samples
@@ -212,7 +331,7 @@ pub fn decode_audio_file(path: impl AsRef<Path>) -> Result<DecodedAudio, String>
             })?;
         for channel in &mut output_channels {
             channel
-                .try_reserve(frame_count)
+                .try_reserve(frames_to_keep)
                 .map_err(|error| format!("could not allocate sample buffers: {error}"))?;
         }
 
@@ -222,6 +341,9 @@ pub fn decode_audio_file(path: impl AsRef<Path>) -> Result<DecodedAudio, String>
             for (channel, sample) in output_channels.iter_mut().zip(frame) {
                 channel.push(*sample);
             }
+        }
+        if frames_already_decoded + frames_to_keep >= frame_limit {
+            break;
         }
     }
 
@@ -234,7 +356,56 @@ pub fn decode_audio_file(path: impl AsRef<Path>) -> Result<DecodedAudio, String>
     })
 }
 
-fn decode_wavpack_file(mut file: File, path: &Path) -> Result<DecodedAudio, String> {
+/// Decode an audio source and reduce it to bounded min/max waveform buckets.
+pub fn decode_audio_waveform(
+    path: impl AsRef<Path>,
+    maximum_buckets: usize,
+) -> Result<AudioWaveform, String> {
+    let path = path.as_ref();
+    let audio = decode_audio_file(path)?;
+    let frame_count = audio.frame_count();
+    if frame_count == 0 {
+        return Err(format!(
+            "sample {} contains no audio frames",
+            path.display()
+        ));
+    }
+    let maximum_buckets = maximum_buckets.max(1);
+    let bucket_count = frame_count.min(maximum_buckets);
+    let mut peaks = Vec::new();
+    peaks
+        .try_reserve_exact(bucket_count)
+        .map_err(|error| format!("could not allocate waveform preview: {error}"))?;
+    for bucket_index in 0..bucket_count {
+        let start = bucket_index * frame_count / bucket_count;
+        let end = ((bucket_index + 1) * frame_count / bucket_count).max(start + 1);
+        let mut minimum = f32::INFINITY;
+        let mut maximum = f32::NEG_INFINITY;
+        for channel in &audio.channels {
+            for sample in &channel[start..end] {
+                let sample = if sample.is_finite() {
+                    sample.clamp(-1.0, 1.0)
+                } else {
+                    0.0
+                };
+                minimum = minimum.min(sample);
+                maximum = maximum.max(sample);
+            }
+        }
+        peaks.push(WaveformPeak { minimum, maximum });
+    }
+    Ok(AudioWaveform {
+        sample_rate: audio.sample_rate,
+        frame_count: frame_count as u64,
+        peaks,
+    })
+}
+
+fn decode_wavpack_file(
+    mut file: File,
+    path: &Path,
+    maximum_seconds: Option<f64>,
+) -> Result<DecodedAudio, String> {
     let file_length = file
         .metadata()
         .map_err(|error| {
@@ -274,7 +445,7 @@ fn decode_wavpack_file(mut file: File, path: &Path) -> Result<DecodedAudio, Stri
             path.display()
         ));
     }
-    let output_sample_count = wavicle::Blocks::new(&encoded).try_fold(0u64, |total, block| {
+    let total_sample_count = wavicle::Blocks::new(&encoded).try_fold(0u64, |total, block| {
         let block = block.map_err(|error| error.to_string())?;
         let count = u64::from(block.header.block_samples)
             .checked_mul(u64::from(block.header.flags.output_channels()))
@@ -282,8 +453,40 @@ fn decode_wavpack_file(mut file: File, path: &Path) -> Result<DecodedAudio, Stri
             .ok_or_else(|| "WavPack decoded sample count overflow".to_owned())?;
         Ok::<u64, String>(count)
     })?;
-    let _decoded_bytes = output_sample_count
-        .checked_mul(std::mem::size_of::<f32>() as u64)
+    let channel_count = u64::from(stream_info.channels);
+    let total_frame_count = stream_info
+        .total_samples
+        .unwrap_or(total_sample_count / channel_count);
+    let requested_frames = maximum_seconds
+        .map(|seconds| (seconds * f64::from(stream_info.sample_rate)).ceil() as u64)
+        .unwrap_or(total_frame_count)
+        .min(total_frame_count);
+    if requested_frames == 0 {
+        return Err(format!(
+            "WavPack sample {} contains no audio frames",
+            path.display()
+        ));
+    }
+    let mut prefix_length = 0usize;
+    let mut prefix_frames = 0u64;
+    for block in wavicle::Blocks::new(&encoded) {
+        let block = block.map_err(|error| error.to_string())?;
+        if block.header.block_samples > 0 && block.header.block_index >= requested_frames {
+            break;
+        }
+        prefix_length = prefix_length
+            .checked_add(block.header.block_len())
+            .ok_or_else(|| "WavPack preview size overflow".to_owned())?;
+        let block_end = block
+            .header
+            .block_index
+            .checked_add(u64::from(block.header.block_samples))
+            .ok_or_else(|| "WavPack preview frame count overflow".to_owned())?;
+        prefix_frames = prefix_frames.max(block_end);
+    }
+    let _decoded_bytes = prefix_frames
+        .checked_mul(channel_count)
+        .and_then(|samples| samples.checked_mul(std::mem::size_of::<f32>() as u64))
         .filter(|bytes| *bytes <= MAX_DECODED_SAMPLE_BYTES as u64)
         .ok_or_else(|| {
             format!(
@@ -292,7 +495,7 @@ fn decode_wavpack_file(mut file: File, path: &Path) -> Result<DecodedAudio, Stri
                 MAX_DECODED_SAMPLE_BYTES / (1024 * 1024)
             )
         })?;
-    let decoded = wavicle::decode_stream(&encoded).map_err(|error| {
+    let decoded = wavicle::decode_stream(&encoded[..prefix_length]).map_err(|error| {
         format!(
             "could not decode WavPack sample {}: {error}",
             path.display()
@@ -320,7 +523,11 @@ fn decode_wavpack_file(mut file: File, path: &Path) -> Result<DecodedAudio, Stri
             .map_err(|error| format!("could not allocate decoded WavPack channels: {error}"))?;
     }
     let scale = 2f32.powi((decoded.bits_per_sample.saturating_sub(1)) as i32);
-    for frame in decoded.samples.chunks_exact(channel_count) {
+    for frame in decoded
+        .samples
+        .chunks_exact(channel_count)
+        .take(frame_count)
+    {
         for (channel, sample) in channels.iter_mut().zip(frame) {
             let value = if decoded.is_float {
                 f32::from_bits(*sample as u32)

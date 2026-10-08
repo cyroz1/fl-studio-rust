@@ -30,15 +30,15 @@ The foundation. Everything else depends on reading projects exactly.
 | FLP versions 1.x–26.x (FruityLoops era through FL Studio 26) | `[partial]` | Modern versions tested; legacy header variants and old PPQ conventions need corpus testing |
 | Header fields: PPQ, tempo, time signature, project metadata | `[partial]` | Tempo, meter, build number, and Project Info strings are decoded; swing, master pitch, recording options, and broader version validation remain unmapped. |
 | Project Info: title, author, comments, genre, web link | `[done]` | Read/write through the desktop Project Info dialog and CLI. Metadata events are edited without rewriting unrelated event bytes. |
-| Channel records: all types (sampler, generator, layer, MIDI out, automation clip) | `[partial]` | Known channel kind values 0/2/3/4/5 are named while unknown raw values are retained; `0xC4` sample paths are decoded for kind-0 Sampler and kind-4 sample-backed channels; Layer child IDs (`0x5E`) and raw flags (`0x90`) are decoded, and child lists can be edited in the Channel Rack through named channel choices while preserving other channel events. Legacy channel types, Layer playback, and flag editing remain incomplete. |
+| Channel records: all types (sampler, generator, layer, MIDI out, automation clip) | `[partial]` | Known channel kind values 0/2/3/4/5 are named while unknown raw values are retained; `0xC4` sample paths are decoded for kind-0 Sampler and kind-4 sample-backed channels; Layer child IDs (`0x5E`) and raw flags (`0x90`) are decoded, and child lists can be edited in the Channel Rack through named channel choices while preserving other channel events. The observed Random and Crossfade bits can be edited in the API, CLI, and Channel Rack without changing other flag bits. Legacy channel types and Layer playback remain incomplete. |
 | Pattern/score events: note records, all encodings | `[partial]` | 24-byte records handled; empty-pattern and conflicting-encoding edge cases guarded |
-| Playlist events: clips, tracks, arrangements | `[partial]` | Clip position/length editable; all three record sizes (80/60/32) recognized, with structural inference when the stored version tag disagrees with the record width |
+| Playlist events: clips, tracks, arrangements | `[partial]` | Clip position/length and raw item/track/group/flags, offsets, and established scale field are editable while preserving other record bytes; exact-record clip duplication is available in the API, CLI, and Playlist editor; all three record sizes (80/60/32) are recognized, with structural inference when the stored version tag disagrees with the record width |
 | Mixer state events | `[partial]` | Reads insert fields and raw `0xE1` records, recognizes candidate volume/pan/EQ parameter IDs and target bits, and can edit an existing record's value by exact record index. Insert-name editing is available. Target-to-visible-track mapping, fader UI, FX state, and routing remain incomplete. |
 | Automation events (channel envelopes, event automation) | `[partial]` | Reads type-5 channel automation points from `0xEA` blobs and edits, inserts, or removes points while preserving unmodified point bytes and the opaque header and era trailer. Song MIDI export samples linear type-5 automation on a Playlist clip targeting a channel named `TEMPO` once per tick and restores the project tempo after the clip. The desktop Automation view uses a straight-line preview; native curve tension, realtime tempo playback, event automation, target links, automation-blob creation, and clip creation remain incomplete. |
-| Time markers, song position markers | `[partial]` | Reads arrangement-scoped marker positions, names, and time signatures. The `edit-time-marker` CLI and project API edit position, marker/signature kind, meter, and name while preserving unknown high bits and unrelated events. Creating/deleting markers, a desktop editor, song-position playback, and broader version verification remain incomplete. |
+| Time markers, song position markers | `[partial]` | Reads arrangement-scoped marker positions, names, and time signatures. The project API, CLI, and Playlist editor can edit, create, or delete time/signature markers while preserving unknown high bits and unrelated events. The Playlist playhead follows device-consumed frames at the base tempo; seeking to markers, tempo-automation timing, signature-change bar numbering, and broader version verification remain incomplete. |
 | Project settings: swing, master pitch, metronome, recording settings | `[partial]` | The Project model, CLI, and desktop dialog read and edit the FL Studio 26 Advanced options `Play truncated notes in clips` and `Fast declick for cut groups`. Swing, master pitch, metronome, recording settings, panning law, and other controls remain unmapped. |
 | `set-tempo`, `rename-channel`, note add/edit/delete, clip edit, channel levels | `[done]` | CLI surface; each rewrites only affected bytes |
-| Create missing objects (patterns, channels, clips) | `[partial]` | Creates an empty pattern through the desktop control or CLI when a unique existing `0xD0`/`0xE0` note-event encoding is available. New channels, clips, unsupported/ambiguous layouts, and native FL Studio validation remain outstanding. |
+| Create missing objects (patterns, channels, clips) | `[partial]` | Creates an empty pattern through the desktop control or CLI when a unique existing `0xD0`/`0xE0` note-event encoding is available, and duplicates existing Playlist clips by copying their complete records. New channels, targetless clips, unsupported/ambiguous layouts, and native FL Studio validation remain outstanding. |
 
 ### 1.2 Presets and packages
 
@@ -55,9 +55,9 @@ The foundation. Everything else depends on reading projects exactly.
 |---|---|---|
 | SMF read: MThd/MTrk, running status, meta, SysEx | `[done]` | |
 | MIDI import into pattern/channel with PPQ conversion | `[done]` | |
-| SMPTE-timed MIDI | `[todo]` | |
-| Tempo-map conversion on import | `[todo]` | Currently preserves FLP tempo |
-| MIDI export (File > Export > MIDI) | `[partial]` | Exports pattern notes and arrangement Pattern Clips as SMF format 1 with project PPQ, base tempo, time signature, named channel tracks, measure-aligned inferred pattern repeats, and clip-edge note truncation. NewStuff's five instrument note counts match the prepared FL Studio export. Song export samples linear `TEMPO` automation once per tick and restores project tempo after its clip; a direct export matched event ticks, with up to 9 microseconds-per-quarter differences and three fewer redundant tempo events. Other native export modes/layouts, scaled clips, note properties beyond key/velocity/channel, and markers remain. |
+| SMPTE-timed MIDI | `[done]` | Imports supported -24, -25, drop-frame -29.97, and -30 frame clocks by converting absolute elapsed time into the existing project's tempo/PPQ grid; invalid frame codes and zero ticks-per-frame are rejected. |
+| Tempo-map conversion on import | `[partial]` | PPQ source tempo changes and SMPTE elapsed time are converted to note positions at the existing FLP tempo, preserving note timing while leaving project tempo unchanged. Source tempo-map semantics are baked into note positions rather than imported as editable FL tempo automation. |
+| MIDI export (File > Export > MIDI) | `[partial]` | Exports pattern notes and arrangement Pattern Clips as SMF format 1 with project PPQ, base tempo, time signature, named channel tracks, measure-aligned inferred pattern repeats, clip-edge note truncation, and arrangement time/signature markers on the conductor track. NewStuff's five instrument note counts match the prepared FL Studio export. Song export samples linear `TEMPO` automation once per tick and restores project tempo after its clip; a direct export matched event ticks, with up to 9 microseconds-per-quarter differences and three fewer redundant tempo events. Other native export modes/layouts, scaled clips, and note properties beyond key/velocity/channel remain. |
 | MIDI export options: pattern vs song, channel mapping | `[partial]` | The CLI and desktop expose pattern or arrangement export; channel mapping can preserve each note's stored low four channel bits or assign one MIDI channel per FL channel. Full native export modes and channel mapping behavior remain to be compared against FL Studio. |
 
 ---
@@ -68,7 +68,7 @@ The decoded document must model everything the format can express.
 
 - `[partial]` Channels: summaries, sample paths, plugin state blobs, levels, known kind mapping, and Layer child relationships/raw flags
 - `[partial]` Patterns: note lists per channel; empty patterns can be created when the project supplies an unambiguous note-event encoding
-- `[partial]` Playlist: tracks, arrangements, clips with targets, and editable existing time markers
+- `[partial]` Playlist: tracks, arrangements, clips with targets, and time markers that can be edited, created, and deleted through the API, CLI, and desktop editor
 - `[partial]` Mixer: recognized insert summaries and parameter kinds, with exact-record value editing and insert-name editing; full 125 inserts, master/sends, target mapping, fader UI, effects, and routing remain incomplete
 - `[partial]` Automation: type-5 channel point curves can be read and points in an existing blob edited, inserted, or removed from the desktop view; linear tempo-map conversion is implemented for song MIDI export, while native curve interpolation, realtime tempo playback, parameter links, event automation, LFOs, and new clip creation remain incomplete
 - `[partial]` Tempo automation: linear channel curves named `TEMPO` are sampled for MIDI song export; realtime playback and native tension/easing semantics remain
@@ -180,34 +180,43 @@ decision, not a roadmap item.
 
 ## 6. Piano roll
 
-Current: note create/drag/resize/snap, velocity editing. FL Studio's piano
-roll is famously deep — the full toolset:
+Current: note create/drag/resize/snap, velocity editing, and a selected-note
+inspector for raw flags/group, fine pitch, release, stored MIDI channel, pan,
+and modulation X/Y. Quantize has channel and selected-note actions; Legato,
+Chop, Glue, Flip, Strum, Flam, seeded Randomize and Humanize, pitch Limit,
+Arpeggiate, and Slice can target the channel or selected notes. Scale highlighting, chord labels, ghost
+channels, and MIDI-channel note colors are available in the Piano roll. The
+CLI can edit score fields individually while preserving the reserved byte.
+FL Studio's piano roll is famously deep — the full toolset:
 
-**Tools:** Draw (pencil), Paint, Delete, Mute, Slice, Select, Zoom, Playback
-`[todo]`
+**Tools:** `[partial]` Draw (P), Paint (B), Select (E), Zoom (Z), Playback (Y), Chord Stamp, and Slice-at-tick; single-note delete, modifier and box selection, Select All (Ctrl/Cmd+A), Invert (Shift+I), Deselect (Ctrl/Cmd+D), duplicate-to-right (Ctrl/Cmd+B) for selected notes or all notes in the target channel, group move/resize/delete, drag-to-zoom, background-click zoom out, cursor-centered Page Up/Down, and an independent zoom slider. Duplicate spacing follows the copied notes' time span; timeline-defined repeat intervals remain unsupported. Playback auditions Sampler or loaded VST3 notes on click and while dragging across notes; native instrument preview and continuous playhead scrubbing remain. Mute remains `[todo]`.
 
 **Edit operations:**
-- `[todo]` Quantize (with strength, swing)
-- `[todo]` Chop, Glue, Legato
-- `[todo]` Strum, Flam
-- `[todo]` Arpeggiator, Riff machine, Claw machine
-- `[todo]` Randomize (velocity/pan/pitch), Humanize
-- `[todo]` Scale levels, Articulate (LFO-envelopes on note properties), Limit (note range filter)
-- `[todo]` Score flipper, Claw machine
+- `[partial]` Quantize note starts on a selected snap grid with strength and swing, either channel-wide or on the selected notes; native swing semantics remain
+- `[partial]` Legato extends notes to the next distinct onset, Chop splits eligible notes into equal segments, and Glue joins touching/overlapping notes with matching properties; channel and selected-note scopes are available, while native tool options remain
+- `[partial]` Score flipper mirrors a channel around its latest note end or selected notes within their time bounds; native tool options remain
+- `[partial]` Strum staggers simultaneous notes by pitch across a configurable tick spread within the channel or selection; native velocity and chord-overlap options remain
+- `[partial]` Flam adds a configurable short stroke before or after channel or selected notes; tempo-based time, presets, and grouping remain
+- `[partial]` Randomize applies seeded velocity, pan, and pitch changes with directional or bipolar level offsets and optional default-level reset to the channel or selection; scale-aware note generation remains
+- `[partial]` Humanize applies seeded timing and velocity variation to the channel or selection; tempo-relative timing remains
+- `[partial]` Arpeggiator converts selected same-onset chords to gated up/down runs with configurable step time and octave range; custom score patterns and sync modes remain
+- `[todo]` Riff machine, Claw machine
+- `[partial]` Limit folds channel or selected note pitches into a key range by octave and clamps keys that cannot fit; scale snapping remains
+- `[partial]` Slice-at-tick splits notes crossing the chosen tick in the channel or selection; native directional cut gestures remain
+- `[todo]` Scale levels, Articulate (LFO/envelopes on note properties)
 - `[todo]` Slide notes and portamento (channel pitch slides)
-- `[todo]` Ghost channels (view other patterns' notes)
-- `[todo]` Note colors / MIDI channel grouping
-- `[todo]` Stamp tool (chord/scale stamps)
-- `[todo]` Event editor (per-note velocity/pan/pitch/modulation curves)
-- `[todo]` Helpers: scale highlighting, chord detection display
+- `[partial]` Ghost channels show notes from all channels in the selected pattern with the target channel emphasized; independent ghost editing controls remain
+- `[partial]` Notes can be colored by their stored MIDI channel; native note color groups and color-based selection remain
+- `[partial]` Chord Stamp supports common manual chords and scale-derived triads/sevenths, uses the snap length, and can return to Draw after one stamp; automatic top-down/bottom-up voicing, voice leading, percussion/slide presets, and chord preview remain
+- `[partial]` The integrated Event editor shows and edits per-note velocity, pan, release, fine pitch, Mod X, and Mod Y values as draggable stems; target selection is available in the panel, with Shift+F cycling targets. Pattern-scoped controller automation, interpolation, selection editing for coincident notes, and native scale/target behavior remain incomplete
+- `[partial]` Scale highlighting supports major, natural/harmonic minor, and major/minor pentatonic keys; the selected-note inspector identifies common same-onset chords; automatic scale detection and richer chord analysis remain
 
 ---
 
 ## 7. Step sequencer / Channel rack
 
 - `[partial]` Channel list with plugin names, volume/pan sliders, and editable Layer child IDs
-- `[todo]` Step sequencer grid with per-step velocity/pan
-- `[todo]` Graph editor
+- `[partial]` Pattern/bar step grid toggles notes at sixteenth-note positions; new steps use key 60 and velocity 100. The Ctrl+K Graph Editor draws and edits per-step note key, velocity, pan, release, fine pitch, modulation X/Y, and shift, creates a C5 note on an empty step, and interpolates values when right-dragging across steps. The Rep lane, Ctrl scale-all gesture, Alt reset gesture, and multiple notes at one step remain incomplete
 - `[todo]` Channel grouping, zipping, sorting
 - `[todo]` "Send to piano roll", per-channel swing, time multiplier
 - `[todo]` Keyboard editor view
@@ -216,14 +225,14 @@ roll is famously deep — the full toolset:
 
 ## 8. Playlist
 
-- `[partial]` Clip display, clip select, start/length editing
-- `[todo]` Audio clip waveform rendering with zoom
+- `[partial]` Clip display, clip select, start/length and exposed record-field editing, and exact-record duplicate
+- `[partial]` Audio-channel clips draw a decoded, combined min/max waveform, crop it to the clip's source offsets, and redraw its detail at the current Playlist zoom. Previews decode off the UI thread and cache bounded peak buckets; stereo/spectral view modes, fade and gain previews, and alternate stretch-mode rendering remain
 - `[todo]` Audio clip fades, crossfades, gain envelopes
 - `[todo]` Stretch modes per clip (resample, stretch, e3 generic — needs time-stretch engine)
 - `[partial]` Pattern clips: the selected arrangement expands Sampler and mapped VST3 instrument notes at clip positions, repeats notes to clip length using explicit pattern lengths or an inferred note span, and clips keyed-note ends at the Playlist boundary. Project opening auto-loads matching installed VST3 instances for recognized channels; missing matches and failed loads are reported. Automation clips, clip flags, and non-default scale remain unsupported.
-- `[partial]` Time markers and meter records can be read and listed; marker editing and playback-clock behavior remain incomplete
+- `[partial]` Time markers and meter records can be read, listed, edited, created, and deleted through the API, CLI, and desktop editor; the Playlist playhead follows device-consumed frames at base tempo, while seeking, tempo-automation timing, and signature-change bar numbering remain incomplete
 - `[todo]` Track grouping, mute/solo per playlist track
-- `[todo]` Slip editing, cut/copy/paste/split/merge/join
+- `[partial]` Duplicate/copy of a selected clip preserves its full record; slip editing, clipboard paste, split, merge, and join remain
 - `[todo]` Performance mode (clip launching)
 - `[todo]` Playlist recording (audio + automation)
 
@@ -243,10 +252,10 @@ roll is famously deep — the full toolset:
 
 ## 10. Browser
 
-- `[todo]` File browser: samples, presets, projects, plugin database
-- `[todo]` Audition/preview samples in browser (tempo-synced preview)
-- `[todo]` Search, favorites, tagging
-- `[todo]` Plugin database with favorites and custom categories
+- `[partial]` Local file browser navigates folders and filters audio samples, FLP projects, presets, and MIDI files; FLP projects open from the Browser and MIDI files can be queued for import. Current-project data, scanned plug-in candidates, in-session recent projects, and persisted starred paths have separate Browser tabs. Configurable extra search roots, recursive indexing, opening presets, and drag-and-drop loading remain
+- `[partial]` Clicking supported mono/stereo samples in Files or Favorites opens the bottom Preview player and starts a five-second preview; Full sample, Play-to-end, volume, and Stop are available, and preview mixes with project output. Tempo/pitch synchronization, start-from-mouse-position, seek/loop controls, and broader channel-layout/codec support remain
+- `[partial]` Case-insensitive name filtering applies to the current folder, plug-in list, and favorites; file and plug-in favorites persist in the user config folder. Recursive search, custom tags, and saved searches remain
+- `[partial]` The Browser lists and filters scanned VST2/VST3 candidates and supports persistent favorites; FL Studio's custom plug-in categories, icons, and preset loading remain
 
 ---
 
@@ -312,7 +321,7 @@ export surface:
 - `[todo]` Touch support
 - `[todo]` Themes / UI scaling (HiDPI)
 - `[todo]` Full keyboard shortcut map parity
-- `[todo]` Undo/redo across all editors (global undo history)
+- `[partial]` Undo/redo restores lossless FLP document snapshots across editors with a 64 MiB history cap; plug-in-host state and non-project UI state remain outside history
 - `[todo]` Autosave, backup versions, crash recovery
 
 ---

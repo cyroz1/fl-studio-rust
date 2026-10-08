@@ -13,8 +13,8 @@ use flp_rebuild::sample_render::{
 };
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions};
 use flp_rebuild::{
-    AutomationPointEdit, FlpDocument, PatternNote, PatternNoteEdit, PlaylistClipEdit,
-    ProjectInfoEdit, ProjectSettingsEdit, TimeMarkerEdit,
+    ArpeggioDirection, AutomationPointEdit, FlpDocument, PatternNote, PatternNoteEdit,
+    PlaylistClipEdit, ProjectInfoEdit, ProjectSettingsEdit, TimeMarkerEdit,
 };
 
 fn main() -> ExitCode {
@@ -289,6 +289,17 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_channel_id_list(child_ids)?,
             )
         }
+        [command, input, output, channel_id, random, crossfade]
+            if command == "set-layer-flags" =>
+        {
+            set_layer_flags(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(channel_id, "Layer channel id")?,
+                parse_optional_bool(random, "Layer Random")?,
+                parse_optional_bool(crossfade, "Layer Crossfade")?,
+            )
+        }
         [command, input, output, channel_id, point_index, position, value, tension]
             if command == "edit-automation-point" =>
         {
@@ -343,6 +354,179 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 },
             )
         }
+        [command, input, output, pattern_id, channel_id, note_index, flags, group, fine_pitch, release, midi_channel, pan, mod_x, mod_y]
+            if command == "edit-note-properties" =>
+        {
+            edit_note(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                parse_usize(note_index, "channel note index")?,
+                PatternNoteEdit {
+                    flags: parse_optional_u16(flags, "note flags")?,
+                    group: parse_optional_u16(group, "note group")?,
+                    fine_pitch: parse_optional_u8(fine_pitch, "fine pitch")?,
+                    release: parse_optional_u8(release, "release")?,
+                    midi_channel: parse_optional_u8(midi_channel, "MIDI channel")?,
+                    pan: parse_optional_u8(pan, "note pan")?,
+                    mod_x: parse_optional_u8(mod_x, "modulation X")?,
+                    mod_y: parse_optional_u8(mod_y, "modulation Y")?,
+                    ..PatternNoteEdit::default()
+                },
+            )
+        }
+        [command, input, output, pattern_id, channel_id, grid_ticks, strength, swing]
+            if command == "quantize-notes" =>
+        {
+            quantize_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                parse_u32(grid_ticks, "quantize grid ticks")?,
+                parse_f64(strength, "quantize strength")?,
+                parse_f64(swing, "quantize swing")?,
+            )
+        }
+        [command, input, output, pattern_id, channel_id] if command == "legato-notes" => {
+            legato_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, divisions]
+            if command == "chop-notes" =>
+        {
+            chop_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                parse_u8(divisions, "note chop divisions")?,
+            )
+        }
+        [command, input, output, pattern_id, channel_id] if command == "glue-notes" => {
+            glue_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+            )
+        }
+        [command, input, output, pattern_id, channel_id] if command == "flip-notes" => {
+            flip_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, spread_ticks, direction]
+            if command == "strum-notes" =>
+        {
+            let descending = match direction.as_str() {
+                "up" => false,
+                "down" => true,
+                _ => return Err("strum direction must be 'up' or 'down'".to_owned()),
+            };
+            strum_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                parse_u32(spread_ticks, "strum spread")?,
+                descending,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, stroke_ticks, velocity, placement]
+            if command == "flam-notes" =>
+        {
+            let before = match placement.as_str() {
+                "before" => true,
+                "after" => false,
+                _ => return Err("flam placement must be 'before' or 'after'".to_owned()),
+            };
+            flam_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                parse_u32(stroke_ticks, "flam stroke time")?,
+                parse_u8(velocity, "flam velocity")?,
+                before,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, seed, velocity_amount, pan_amount,
+            pitch_range, bipolar, reset_levels]
+            if command == "randomize-notes" =>
+        {
+            randomize_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                parse_u64(seed, "randomizer seed")?,
+                parse_i16(velocity_amount, "velocity amount")?,
+                parse_i16(pan_amount, "pan amount")?,
+                parse_u8(pitch_range, "pitch range")?,
+                parse_bool(bipolar, "bipolar")?,
+                parse_bool(reset_levels, "reset levels")?,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, seed, timing_range, velocity_variation]
+            if command == "humanize-notes" =>
+        {
+            humanize_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                parse_u64(seed, "humanize seed")?,
+                parse_u32(timing_range, "timing range")?,
+                parse_u8(velocity_variation, "velocity variation")?,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, minimum_key, maximum_key]
+            if command == "limit-notes" =>
+        {
+            limit_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                parse_u16(minimum_key, "minimum key")?,
+                parse_u16(maximum_key, "maximum key")?,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, step_ticks, range_octaves, gate, direction]
+            if command == "arp-notes" =>
+        {
+            let direction = parse_arpeggio_direction(direction)?;
+            arpeggiate_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                parse_u32(step_ticks, "arpeggiator step")?,
+                parse_u8(range_octaves, "arpeggiator range")?,
+                parse_u8(gate, "arpeggiator gate")?,
+                direction,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, position_ticks]
+            if command == "slice-notes" =>
+        {
+            slice_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                parse_u32(position_ticks, "slice position")?,
+            )
+        }
         [command, input, output, pattern_id, channel_id, position, length, key, velocity]
             if command == "add-note" =>
         {
@@ -381,6 +565,38 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u32(length, "clip length")?,
             )
         }
+        [command, input, output, arrangement_id, clip_index, item_index, raw_track_index, group, item_flags, start_offset, end_offset, scale]
+            if command == "edit-clip-properties" =>
+        {
+            edit_clip_properties(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(arrangement_id, "arrangement id")?,
+                parse_usize(clip_index, "clip index")?,
+                PlaylistClipEdit {
+                    item_index: parse_optional_u16(item_index, "raw item index")?,
+                    raw_track_index: parse_optional_u16(raw_track_index, "raw track index")?,
+                    group: parse_optional_u16(group, "raw clip group")?,
+                    item_flags: parse_optional_u16(item_flags, "raw clip flags")?,
+                    start_offset: parse_optional_f32(start_offset, "clip start offset")?,
+                    end_offset: parse_optional_f32(end_offset, "clip end offset")?,
+                    scale: parse_optional_f64(scale, "clip scale")?,
+                    ..PlaylistClipEdit::default()
+                },
+            )
+        }
+        [command, input, output, arrangement_id, clip_index, position, raw_track_index]
+            if command == "duplicate-clip" =>
+        {
+            duplicate_clip(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(arrangement_id, "arrangement id")?,
+                parse_usize(clip_index, "clip index")?,
+                parse_optional_u32(position, "duplicate clip position")?,
+                parse_optional_u16(raw_track_index, "duplicate clip track index")?,
+            )
+        }
         [command, input, output, arrangement_id, marker_index, position, is_signature, numerator, denominator, name]
             if command == "edit-time-marker" =>
         {
@@ -396,6 +612,34 @@ fn run(args: Vec<String>) -> Result<(), String> {
                     denominator: parse_optional_u8(denominator, "time signature denominator")?,
                     name: project_info_argument(name),
                 },
+            )
+        }
+        [command, input, output, arrangement_id, position, is_signature, numerator, denominator, name]
+            if command == "create-time-marker" =>
+        {
+            let is_signature = parse_optional_bool(is_signature, "time signature marker flag")?
+                .ok_or_else(|| "time signature marker flag must be 0 or 1".to_owned())?;
+            create_time_marker(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(arrangement_id, "arrangement id")?,
+                TimeMarkerEdit {
+                    position_ticks: Some(parse_u32(position, "time marker position")?),
+                    is_signature: Some(is_signature),
+                    numerator: parse_optional_u8(numerator, "time signature numerator")?,
+                    denominator: parse_optional_u8(denominator, "time signature denominator")?,
+                    name: project_info_argument(name),
+                },
+            )
+        }
+        [command, input, output, arrangement_id, marker_index]
+            if command == "delete-time-marker" =>
+        {
+            delete_time_marker(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(arrangement_id, "arrangement id")?,
+                parse_usize(marker_index, "time marker index")?,
             )
         }
         [command, input, midi_path, output, track, pattern_id, channel_id]
@@ -445,15 +689,33 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild rename-channel <input.flp> <output.flp> <channel-id> <name>\n",
             "  flp-rebuild set-channel-levels <input.flp> <output.flp> <channel-id> <volume-0..12800> <pan-0..12800>\n",
             "  flp-rebuild set-layer-children <input.flp> <output.flp> <layer-channel-id> <child-ids-comma-separated|->\n",
+            "  flp-rebuild set-layer-flags <input.flp> <output.flp> <layer-channel-id> <random:0|1|-> <crossfade:0|1|->\n",
             "  flp-rebuild edit-automation-point <input.flp> <output.flp> <channel-id> <point-index> <position-beats> <value> <tension>\n",
             "  flp-rebuild insert-automation-point <input.flp> <output.flp> <channel-id> <insertion-slot> <position-beats> <value> <tension>\n",
             "  flp-rebuild delete-automation-point <input.flp> <output.flp> <channel-id> <point-index>\n",
             "  flp-rebuild edit-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index> <position> <length> <key> <velocity>\n",
+            "  flp-rebuild edit-note-properties <input.flp> <output.flp> <pattern-id> <channel-id> <note-index> <flags-raw|-> <group-raw|-> <fine-pitch|-> <release|-> <midi-channel-raw|-> <pan|-> <mod-x|-> <mod-y|->\n",
+            "  flp-rebuild quantize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <grid-ticks> <strength-0..1> <swing-0..1>\n",
+            "  flp-rebuild legato-notes <input.flp> <output.flp> <pattern-id> <channel-id>\n",
+            "  flp-rebuild chop-notes <input.flp> <output.flp> <pattern-id> <channel-id> <divisions-2..64>\n",
+            "  flp-rebuild glue-notes <input.flp> <output.flp> <pattern-id> <channel-id>\n",
+            "  flp-rebuild flip-notes <input.flp> <output.flp> <pattern-id> <channel-id>\n",
+            "  flp-rebuild strum-notes <input.flp> <output.flp> <pattern-id> <channel-id> <spread-ticks> <up|down>\n",
+            "  flp-rebuild flam-notes <input.flp> <output.flp> <pattern-id> <channel-id> <stroke-ticks> <velocity-0..127> <before|after>\n",
+            "  flp-rebuild randomize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <velocity-amount:-100..100> <pan-amount:-100..100> <pitch-range:0..24> <bipolar:0|1> <reset:0|1>\n",
+            "  flp-rebuild humanize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <timing-range-ticks> <velocity-variation-0..100>\n",
+            "  flp-rebuild limit-notes <input.flp> <output.flp> <pattern-id> <channel-id> <minimum-key-0..127> <maximum-key-0..127>\n",
+            "  flp-rebuild arp-notes <input.flp> <output.flp> <pattern-id> <channel-id> <step-ticks> <range-octaves-1..4> <gate-1..100> <up|down|up-down>\n",
+            "  flp-rebuild slice-notes <input.flp> <output.flp> <pattern-id> <channel-id> <position-ticks>\n",
             "  flp-rebuild add-note <input.flp> <output.flp> <pattern-id> <channel-id> <position> <length> <key> <velocity>\n",
             "  flp-rebuild delete-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index>\n",
             "  flp-rebuild import-midi <input.flp> <input.mid> <output.flp> <track> <pattern-id> <channel-id>\n",
             "  flp-rebuild edit-clip <input.flp> <output.flp> <arrangement-id> <clip-index> <position> <length>\n",
-            "  flp-rebuild edit-time-marker <input.flp> <output.flp> <arrangement-id> <marker-index> <position-ticks|-> <signature:0|1|-> <numerator|-> <denominator|-> <name|->"
+            "  flp-rebuild edit-clip-properties <input.flp> <output.flp> <arrangement-id> <clip-index> <item-index-raw|-> <track-index-raw|-> <group-raw|-> <flags-raw|-> <start-offset|-> <end-offset|-> <scale|->\n",
+            "  flp-rebuild duplicate-clip <input.flp> <output.flp> <arrangement-id> <clip-index> <position|-> <track-index-raw|->\n",
+            "  flp-rebuild edit-time-marker <input.flp> <output.flp> <arrangement-id> <marker-index> <position-ticks|-> <signature:0|1|-> <numerator|-> <denominator|-> <name|->\n",
+            "  flp-rebuild create-time-marker <input.flp> <output.flp> <arrangement-id> <position-ticks> <signature:0|1> <numerator|-> <denominator|-> <name|->\n",
+            "  flp-rebuild delete-time-marker <input.flp> <output.flp> <arrangement-id> <marker-index>"
         )
         .to_owned()),
     }
@@ -483,6 +745,35 @@ fn parse_u16(value: &str, description: &str) -> Result<u16, String> {
     value
         .parse::<u16>()
         .map_err(|_| format!("{description} must be an integer from 0 through 65535"))
+}
+
+fn parse_i16(value: &str, description: &str) -> Result<i16, String> {
+    value
+        .parse::<i16>()
+        .map_err(|_| format!("{description} must be an integer from -32768 through 32767"))
+}
+
+fn parse_u64(value: &str, description: &str) -> Result<u64, String> {
+    value
+        .parse::<u64>()
+        .map_err(|_| format!("{description} must be a non-negative 64-bit integer"))
+}
+
+fn parse_bool(value: &str, description: &str) -> Result<bool, String> {
+    match value {
+        "0" | "false" => Ok(false),
+        "1" | "true" => Ok(true),
+        _ => Err(format!("{description} must be 0 or 1")),
+    }
+}
+
+fn parse_arpeggio_direction(value: &str) -> Result<ArpeggioDirection, String> {
+    match value {
+        "up" => Ok(ArpeggioDirection::Up),
+        "down" => Ok(ArpeggioDirection::Down),
+        "up-down" => Ok(ArpeggioDirection::UpDown),
+        _ => Err("arpeggiator direction must be 'up', 'down', or 'up-down'".to_owned()),
+    }
 }
 
 fn parse_channel_id_list(value: &str) -> Result<Vec<u16>, String> {
@@ -521,11 +812,35 @@ fn parse_optional_u8(value: &str, description: &str) -> Result<Option<u8>, Strin
     }
 }
 
+fn parse_optional_u16(value: &str, description: &str) -> Result<Option<u16>, String> {
+    if value == "-" {
+        Ok(None)
+    } else {
+        parse_u16(value, description).map(Some)
+    }
+}
+
 fn parse_optional_u32(value: &str, description: &str) -> Result<Option<u32>, String> {
     if value == "-" {
         Ok(None)
     } else {
         parse_u32(value, description).map(Some)
+    }
+}
+
+fn parse_optional_f32(value: &str, description: &str) -> Result<Option<f32>, String> {
+    if value == "-" {
+        Ok(None)
+    } else {
+        parse_f32(value, description).map(Some)
+    }
+}
+
+fn parse_optional_f64(value: &str, description: &str) -> Result<Option<f64>, String> {
+    if value == "-" {
+        Ok(None)
+    } else {
+        parse_f64(value, description).map(Some)
     }
 }
 
@@ -786,8 +1101,17 @@ fn inspect_midi(path: &Path) -> Result<(), String> {
     println!("tracks: {}", midi.tracks().len());
     if let Some(ppq) = midi.ticks_per_quarter_note() {
         println!("time division: {ppq} ticks per quarter note");
+    } else if let Some(time_base) = midi.smpte_time_base() {
+        println!(
+            "time division: SMPTE {:.3} frames per second, {} ticks per frame",
+            time_base.frames_per_second(),
+            time_base.ticks_per_frame()
+        );
     } else {
-        println!("time division: SMPTE 0x{:04X}", midi.division());
+        println!(
+            "time division: unsupported SMPTE encoding 0x{:04X}",
+            midi.division()
+        );
     }
     for (index, track) in midi.tracks().iter().enumerate() {
         let (note_on, note_off) = track.note_event_counts();
@@ -1689,6 +2013,29 @@ fn set_layer_children(
     Ok(())
 }
 
+fn set_layer_flags(
+    input: &Path,
+    output: &Path,
+    layer_channel_id: u16,
+    random: Option<bool>,
+    crossfade: Option<bool>,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .set_layer_flags(layer_channel_id, random, crossfade)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "updated Layer channel {layer_channel_id} flags in {}",
+        output.display()
+    );
+    Ok(())
+}
+
 fn edit_automation_point(
     input: &Path,
     output: &Path,
@@ -1788,6 +2135,313 @@ fn edit_note(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "edited note {note_index} in pattern {pattern_id}, channel {channel_id} to {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn quantize_notes(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    grid_ticks: u32,
+    strength: f64,
+    swing: f64,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let changed = document
+        .quantize_pattern_notes(pattern_id, channel_id, grid_ticks, strength, swing)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "quantized {changed} notes in pattern {pattern_id}, channel {channel_id} to {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn legato_notes(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let changed = document
+        .legato_pattern_notes(pattern_id, channel_id)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "extended {changed} notes in pattern {pattern_id}, channel {channel_id} to {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn chop_notes(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    divisions: u8,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let created = document
+        .chop_pattern_notes(pattern_id, channel_id, divisions)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "created {created} chopped notes in pattern {pattern_id}, channel {channel_id} using {divisions} divisions in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn glue_notes(input: &Path, output: &Path, pattern_id: u16, channel_id: u16) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let removed = document
+        .glue_pattern_notes(pattern_id, channel_id)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "joined notes and removed {removed} records in pattern {pattern_id}, channel {channel_id} to {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn flip_notes(input: &Path, output: &Path, pattern_id: u16, channel_id: u16) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let changed = document
+        .flip_pattern_notes(pattern_id, channel_id)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "flipped {changed} note positions in pattern {pattern_id}, channel {channel_id} to {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn strum_notes(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    spread_ticks: u32,
+    descending: bool,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let changed = document
+        .strum_pattern_notes(pattern_id, channel_id, spread_ticks, descending)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "strummed {changed} notes in pattern {pattern_id}, channel {channel_id} with {spread_ticks} ticks of spread ({}) to {}",
+        if descending { "down" } else { "up" },
+        output.display()
+    );
+    Ok(())
+}
+
+fn flam_notes(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    stroke_ticks: u32,
+    velocity: u8,
+    before: bool,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let created = document
+        .flam_pattern_notes(pattern_id, channel_id, stroke_ticks, velocity, before)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "added {created} flam strokes in pattern {pattern_id}, channel {channel_id} ({}) to {}",
+        if before {
+            "before notes"
+        } else {
+            "after notes"
+        },
+        output.display()
+    );
+    Ok(())
+}
+
+fn randomize_notes(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    seed: u64,
+    velocity_amount: i16,
+    pan_amount: i16,
+    pitch_range: u8,
+    bipolar: bool,
+    reset_levels: bool,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let changed = document
+        .randomize_pattern_notes(
+            pattern_id,
+            channel_id,
+            seed,
+            velocity_amount,
+            pan_amount,
+            pitch_range,
+            bipolar,
+            reset_levels,
+        )
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "randomized {changed} notes in pattern {pattern_id}, channel {channel_id} with seed {seed} to {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn humanize_notes(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    seed: u64,
+    timing_range_ticks: u32,
+    velocity_variation_percent: u8,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let changed = document
+        .humanize_pattern_notes(
+            pattern_id,
+            channel_id,
+            seed,
+            timing_range_ticks,
+            velocity_variation_percent,
+        )
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "humanized {changed} notes in pattern {pattern_id}, channel {channel_id} with seed {seed} to {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn limit_notes(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    minimum_key: u16,
+    maximum_key: u16,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let changed = document
+        .limit_pattern_note_range(pattern_id, channel_id, minimum_key, maximum_key)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "limited {changed} note pitches in pattern {pattern_id}, channel {channel_id} to {minimum_key}..={maximum_key} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn arpeggiate_notes(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    step_ticks: u32,
+    range_octaves: u8,
+    gate_percent: u8,
+    direction: ArpeggioDirection,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let created = document
+        .arpeggiate_pattern_notes(
+            pattern_id,
+            channel_id,
+            step_ticks,
+            range_octaves,
+            gate_percent,
+            direction,
+        )
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "generated {created} arpeggiated notes in pattern {pattern_id}, channel {channel_id} to {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn slice_notes(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    position_ticks: u32,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let created = document
+        .slice_pattern_notes(pattern_id, channel_id, position_ticks)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "sliced {created} notes at tick {position_ticks} in pattern {pattern_id}, channel {channel_id} to {}",
         output.display()
     );
     Ok(())
@@ -1909,6 +2563,53 @@ fn edit_clip(
     Ok(())
 }
 
+fn edit_clip_properties(
+    input: &Path,
+    output: &Path,
+    arrangement_id: u16,
+    clip_index: usize,
+    edit: PlaylistClipEdit,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .edit_playlist_clip(arrangement_id, clip_index, edit)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "updated arrangement {arrangement_id} clip {clip_index} properties in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn duplicate_clip(
+    input: &Path,
+    output: &Path,
+    arrangement_id: u16,
+    clip_index: usize,
+    position_ticks: Option<u32>,
+    raw_track_index: Option<u16>,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let duplicate_index = document
+        .duplicate_playlist_clip(arrangement_id, clip_index, position_ticks, raw_track_index)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "duplicated arrangement {arrangement_id} clip {clip_index} as clip {duplicate_index} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
 fn edit_time_marker(
     input: &Path,
     output: &Path,
@@ -1927,6 +2628,50 @@ fn edit_time_marker(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "edited time marker {marker_index} in arrangement {arrangement_id} to {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn create_time_marker(
+    input: &Path,
+    output: &Path,
+    arrangement_id: u16,
+    edit: TimeMarkerEdit,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let marker_index = document
+        .create_time_marker(arrangement_id, edit)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "created time marker {marker_index} in arrangement {arrangement_id} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn delete_time_marker(
+    input: &Path,
+    output: &Path,
+    arrangement_id: u16,
+    marker_index: usize,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .delete_time_marker(arrangement_id, marker_index)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "deleted time marker {marker_index} from arrangement {arrangement_id} in {}",
         output.display()
     );
     Ok(())

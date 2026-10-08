@@ -1,14 +1,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 
-use eframe::egui::{self, Align2, Color32, FontId, Id, Sense, Stroke, Vec2};
+use eframe::egui::{self, Align2, Color32, FontId, Id, PointerButton, Sense, Stroke, Vec2};
 use flp_rebuild::audio::{
     AudioAccess, AudioDeviceCatalog, AudioEngine, AudioSettings, enumerate_devices,
+};
+use flp_rebuild::media::{
+    AudioWaveform, SamplePathResolver, decode_audio_preview, decode_audio_waveform,
 };
 use flp_rebuild::midi::{MidiChannelMapping, MidiFile};
 use flp_rebuild::plugins::{PluginCandidate, PluginFormat, scan_installed_plugins};
@@ -20,9 +24,10 @@ use flp_rebuild::sample_render::{
 };
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions, Vst3PatternStreamHandle};
 use flp_rebuild::{
-    AutomationChannel, AutomationPoint, AutomationPointEdit, ChannelSummary, FlpDocument, Pattern,
-    PatternNote, PatternNoteEdit, PlaylistClip, PlaylistClipEdit, PlaylistTrack, ProjectInfoEdit,
-    ProjectSettingsEdit, VstPluginStateMetadata,
+    ArpeggioDirection, AutomationChannel, AutomationPoint, AutomationPointEdit, ChannelSummary,
+    FlpDocument, Pattern, PatternNote, PatternNoteEdit, PlaylistClip, PlaylistClipEdit,
+    PlaylistTrack, ProjectInfoEdit, ProjectSettingsEdit, TimeMarker, TimeMarkerEdit,
+    VstPluginStateMetadata,
 };
 
 const PANEL: Color32 = Color32::from_rgb(31, 32, 34);
@@ -35,6 +40,37 @@ const GREEN: Color32 = Color32::from_rgb(113, 172, 77);
 const BLUE: Color32 = Color32::from_rgb(73, 128, 174);
 const PURPLE: Color32 = Color32::from_rgb(150, 93, 181);
 const ORANGE: Color32 = Color32::from_rgb(195, 129, 61);
+const HISTORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+const AUDIO_WAVEFORM_BUCKETS: usize = 4096;
+const MAX_WAVEFORM_WORKERS: usize = 1;
+const PITCH_CLASSES: [&str; 12] = [
+    "C", "C♯", "D", "D♯", "E", "F", "F♯", "G", "G♯", "A", "A♯", "B",
+];
+const MIDI_CHANNEL_COLORS: [Color32; 16] = [
+    Color32::from_rgb(113, 172, 77),
+    Color32::from_rgb(73, 128, 174),
+    Color32::from_rgb(195, 129, 61),
+    Color32::from_rgb(150, 93, 181),
+    Color32::from_rgb(63, 157, 143),
+    Color32::from_rgb(192, 91, 105),
+    Color32::from_rgb(183, 159, 77),
+    Color32::from_rgb(92, 146, 193),
+    Color32::from_rgb(170, 112, 79),
+    Color32::from_rgb(112, 158, 101),
+    Color32::from_rgb(143, 112, 173),
+    Color32::from_rgb(76, 154, 161),
+    Color32::from_rgb(195, 110, 146),
+    Color32::from_rgb(141, 143, 82),
+    Color32::from_rgb(100, 129, 181),
+    Color32::from_rgb(172, 128, 105),
+];
+
+fn project_hash(document: &FlpDocument) -> Option<u64> {
+    let bytes = document.encode_lossless().ok()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    Some(hasher.finish())
+}
 const FL_GENRES: &[&str] = &[
     "(none)",
     "Acid House",
@@ -116,6 +152,45 @@ fn candidate_matches_vst_metadata(
             .is_some_and(|name| name.eq_ignore_ascii_case(&candidate.name))
 }
 
+fn detect_chord_name(notes: &[PatternNote], channel_id: u16, position: u32) -> String {
+    let pitch_classes = notes
+        .iter()
+        .filter(|note| note.channel_id == channel_id && note.position == position)
+        .map(|note| (note.key % 12) as u8)
+        .collect::<BTreeSet<_>>();
+    if pitch_classes.len() < 2 {
+        return "No chord".to_owned();
+    }
+
+    const QUALITIES: &[(&str, &[u8])] = &[
+        ("major", &[0, 4, 7]),
+        ("minor", &[0, 3, 7]),
+        ("diminished", &[0, 3, 6]),
+        ("augmented", &[0, 4, 8]),
+        ("sus2", &[0, 2, 7]),
+        ("sus4", &[0, 5, 7]),
+        ("7", &[0, 4, 7, 10]),
+        ("maj7", &[0, 4, 7, 11]),
+        ("m7", &[0, 3, 7, 10]),
+        ("m7♭5", &[0, 3, 6, 10]),
+        ("dim7", &[0, 3, 6, 9]),
+        ("5", &[0, 7]),
+    ];
+    for root in &pitch_classes {
+        let mut intervals = pitch_classes
+            .iter()
+            .map(|pitch| (*pitch + 12 - *root) % 12)
+            .collect::<Vec<_>>();
+        intervals.sort_unstable();
+        for (quality, expected) in QUALITIES {
+            if intervals == *expected {
+                return format!("{} {quality}", PITCH_CLASSES[usize::from(*root)]);
+            }
+        }
+    }
+    format!("{} notes", pitch_classes.len())
+}
+
 fn matching_vst3_candidate<'a>(
     candidates: &'a [PluginCandidate],
     metadata: &VstPluginStateMetadata,
@@ -164,6 +239,256 @@ enum PianoRollSnap {
     Bar,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PianoRollEventTarget {
+    Velocity,
+    Pan,
+    Release,
+    Pitch,
+    ModX,
+    ModY,
+}
+
+impl PianoRollEventTarget {
+    const ALL: [Self; 6] = [
+        Self::Velocity,
+        Self::Pan,
+        Self::Release,
+        Self::Pitch,
+        Self::ModX,
+        Self::ModY,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Velocity => "Velocity",
+            Self::Pan => "Pan",
+            Self::Release => "Release",
+            Self::Pitch => "Fine pitch",
+            Self::ModX => "Mod X",
+            Self::ModY => "Mod Y",
+        }
+    }
+
+    fn maximum(self) -> u16 {
+        match self {
+            Self::Velocity | Self::Pan | Self::Release => 128,
+            Self::Pitch => 240,
+            Self::ModX | Self::ModY => 255,
+        }
+    }
+
+    fn value(self, note: &PatternNote) -> u16 {
+        match self {
+            Self::Velocity => u16::from(note.velocity),
+            Self::Pan => u16::from(note.pan),
+            Self::Release => u16::from(note.release),
+            Self::Pitch => u16::from(note.fine_pitch),
+            Self::ModX => u16::from(note.mod_x),
+            Self::ModY => u16::from(note.mod_y),
+        }
+    }
+
+    fn edit(self, value: u16) -> PatternNoteEdit {
+        let value = value.min(self.maximum()) as u8;
+        match self {
+            Self::Velocity => PatternNoteEdit {
+                velocity: Some(value),
+                ..PatternNoteEdit::default()
+            },
+            Self::Pan => PatternNoteEdit {
+                pan: Some(value),
+                ..PatternNoteEdit::default()
+            },
+            Self::Release => PatternNoteEdit {
+                release: Some(value),
+                ..PatternNoteEdit::default()
+            },
+            Self::Pitch => PatternNoteEdit {
+                fine_pitch: Some(value),
+                ..PatternNoteEdit::default()
+            },
+            Self::ModX => PatternNoteEdit {
+                mod_x: Some(value),
+                ..PatternNoteEdit::default()
+            },
+            Self::ModY => PatternNoteEdit {
+                mod_y: Some(value),
+                ..PatternNoteEdit::default()
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PianoRollEditScope {
+    Automatic,
+    Channel,
+    Selection,
+}
+
+impl PianoRollEditScope {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Automatic => "Auto",
+            Self::Channel => "Channel",
+            Self::Selection => "Selected notes",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PianoRollSelectionCommand {
+    All,
+    Invert,
+    Clear,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StepGraphMode {
+    Note,
+    Velocity,
+    Pan,
+    Release,
+    FinePitch,
+    ModX,
+    ModY,
+    Shift,
+}
+
+impl StepGraphMode {
+    const ALL: [Self; 8] = [
+        Self::Note,
+        Self::Velocity,
+        Self::Pan,
+        Self::Release,
+        Self::FinePitch,
+        Self::ModX,
+        Self::ModY,
+        Self::Shift,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Note => "Note",
+            Self::Velocity => "Velocity",
+            Self::Pan => "Pan",
+            Self::Release => "Release",
+            Self::FinePitch => "Fine pitch",
+            Self::ModX => "Mod X",
+            Self::ModY => "Mod Y",
+            Self::Shift => "Shift (%)",
+        }
+    }
+
+    fn maximum(self) -> f32 {
+        match self {
+            Self::Note => 132.0,
+            Self::Velocity | Self::Release | Self::ModX | Self::ModY => 127.0,
+            Self::Pan => 128.0,
+            Self::FinePitch => 255.0,
+            Self::Shift => 100.0,
+        }
+    }
+
+    fn center(self) -> Option<f32> {
+        match self {
+            Self::Pan => Some(64.0),
+            Self::FinePitch => Some(128.0),
+            _ => None,
+        }
+    }
+
+    fn value(self, note: &PatternNote, step_start: u64, step_ticks: u64) -> f32 {
+        match self {
+            Self::Note => f32::from(note.key),
+            Self::Velocity => f32::from(note.velocity),
+            Self::Pan => f32::from(note.pan),
+            Self::Release => f32::from(note.release),
+            Self::FinePitch => f32::from(note.fine_pitch),
+            Self::ModX => f32::from(note.mod_x),
+            Self::ModY => f32::from(note.mod_y),
+            Self::Shift => {
+                let max_shift = (step_ticks.saturating_mul(99) / 100).max(1);
+                let offset = u64::from(note.position).saturating_sub(step_start);
+                (offset as f32 / max_shift as f32 * 100.0).clamp(0.0, 100.0)
+            }
+        }
+    }
+
+    fn edit(self, value: f32, step_start: u64, step_ticks: u64) -> PatternNoteEdit {
+        let value = value.round().clamp(0.0, self.maximum());
+        match self {
+            Self::Note => PatternNoteEdit {
+                key: Some(value as u16),
+                ..PatternNoteEdit::default()
+            },
+            Self::Velocity => PatternNoteEdit {
+                velocity: Some(value as u8),
+                ..PatternNoteEdit::default()
+            },
+            Self::Pan => PatternNoteEdit {
+                pan: Some(value as u8),
+                ..PatternNoteEdit::default()
+            },
+            Self::Release => PatternNoteEdit {
+                release: Some(value as u8),
+                ..PatternNoteEdit::default()
+            },
+            Self::FinePitch => PatternNoteEdit {
+                fine_pitch: Some(value as u8),
+                ..PatternNoteEdit::default()
+            },
+            Self::ModX => PatternNoteEdit {
+                mod_x: Some(value as u8),
+                ..PatternNoteEdit::default()
+            },
+            Self::ModY => PatternNoteEdit {
+                mod_y: Some(value as u8),
+                ..PatternNoteEdit::default()
+            },
+            Self::Shift => {
+                let max_shift = step_ticks.saturating_mul(99) / 100;
+                let offset = (f64::from(value) * max_shift as f64 / 100.0).round() as u64;
+                PatternNoteEdit {
+                    position: Some(
+                        step_start.saturating_add(offset).min(u64::from(u32::MAX)) as u32
+                    ),
+                    ..PatternNoteEdit::default()
+                }
+            }
+        }
+    }
+
+    fn apply_to_note(self, note: &mut PatternNote, value: f32, step_start: u64, step_ticks: u64) {
+        let edit = self.edit(value, step_start, step_ticks);
+        if let Some(value) = edit.position {
+            note.position = value;
+        }
+        if let Some(value) = edit.key {
+            note.key = value;
+        }
+        if let Some(value) = edit.velocity {
+            note.velocity = value;
+        }
+        if let Some(value) = edit.pan {
+            note.pan = value;
+        }
+        if let Some(value) = edit.release {
+            note.release = value;
+        }
+        if let Some(value) = edit.fine_pitch {
+            note.fine_pitch = value;
+        }
+        if let Some(value) = edit.mod_x {
+            note.mod_x = value;
+        }
+        if let Some(value) = edit.mod_y {
+            note.mod_y = value;
+        }
+    }
+}
+
 impl PianoRollSnap {
     const ALL: [Self; 6] = [
         Self::None,
@@ -205,20 +530,220 @@ impl PianoRollSnap {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PianoRollScale {
+    None,
+    Major,
+    NaturalMinor,
+    HarmonicMinor,
+    MajorPentatonic,
+    MinorPentatonic,
+}
+
+impl PianoRollScale {
+    const ALL: [Self; 6] = [
+        Self::None,
+        Self::Major,
+        Self::NaturalMinor,
+        Self::HarmonicMinor,
+        Self::MajorPentatonic,
+        Self::MinorPentatonic,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::Major => "Major",
+            Self::NaturalMinor => "Natural minor",
+            Self::HarmonicMinor => "Harmonic minor",
+            Self::MajorPentatonic => "Major pentatonic",
+            Self::MinorPentatonic => "Minor pentatonic",
+        }
+    }
+
+    fn contains(self, key: u16, root: u8) -> bool {
+        let intervals: &[u8] = match self {
+            Self::None => return true,
+            Self::Major => &[0, 2, 4, 5, 7, 9, 11],
+            Self::NaturalMinor => &[0, 2, 3, 5, 7, 8, 10],
+            Self::HarmonicMinor => &[0, 2, 3, 5, 7, 8, 11],
+            Self::MajorPentatonic => &[0, 2, 4, 7, 9],
+            Self::MinorPentatonic => &[0, 3, 5, 7, 10],
+        };
+        intervals.contains(&(((key % 12 + 12 - u16::from(root)) % 12) as u8))
+    }
+
+    fn intervals(self) -> &'static [u8] {
+        match self {
+            Self::None => &[],
+            Self::Major => &[0, 2, 4, 5, 7, 9, 11],
+            Self::NaturalMinor => &[0, 2, 3, 5, 7, 8, 10],
+            Self::HarmonicMinor => &[0, 2, 3, 5, 7, 8, 11],
+            Self::MajorPentatonic => &[0, 2, 4, 7, 9],
+            Self::MinorPentatonic => &[0, 3, 5, 7, 10],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PianoRollChordStamp {
+    Major,
+    Minor,
+    Diminished,
+    Augmented,
+    Suspended2,
+    Suspended4,
+    Power,
+    Dominant7,
+    Major7,
+    Minor7,
+    ScaleTriad,
+    ScaleSeventh,
+}
+
+impl PianoRollChordStamp {
+    const ALL: [Self; 12] = [
+        Self::Major,
+        Self::Minor,
+        Self::Diminished,
+        Self::Augmented,
+        Self::Suspended2,
+        Self::Suspended4,
+        Self::Power,
+        Self::Dominant7,
+        Self::Major7,
+        Self::Minor7,
+        Self::ScaleTriad,
+        Self::ScaleSeventh,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Major => "Major",
+            Self::Minor => "Minor",
+            Self::Diminished => "Diminished",
+            Self::Augmented => "Augmented",
+            Self::Suspended2 => "Suspended 2",
+            Self::Suspended4 => "Suspended 4",
+            Self::Power => "Power fifth",
+            Self::Dominant7 => "Dominant 7",
+            Self::Major7 => "Major 7",
+            Self::Minor7 => "Minor 7",
+            Self::ScaleTriad => "Scale triad",
+            Self::ScaleSeventh => "Scale seventh",
+        }
+    }
+
+    fn pitches(self, root_key: u16, scale: PianoRollScale, scale_root: u8) -> Vec<u16> {
+        let intervals: &[u8] = match self {
+            Self::Major => &[0, 4, 7],
+            Self::Minor => &[0, 3, 7],
+            Self::Diminished => &[0, 3, 6],
+            Self::Augmented => &[0, 4, 8],
+            Self::Suspended2 => &[0, 2, 7],
+            Self::Suspended4 => &[0, 5, 7],
+            Self::Power => &[0, 7, 12],
+            Self::Dominant7 => &[0, 4, 7, 10],
+            Self::Major7 => &[0, 4, 7, 11],
+            Self::Minor7 => &[0, 3, 7, 10],
+            Self::ScaleTriad | Self::ScaleSeventh => &[],
+        };
+        if !intervals.is_empty() {
+            return intervals
+                .iter()
+                .filter_map(|interval| root_key.checked_add(u16::from(*interval)))
+                .filter(|key| *key <= 127)
+                .collect();
+        }
+
+        let scale_intervals = scale.intervals();
+        if scale_intervals.is_empty() {
+            return [0, 4, 7]
+                .into_iter()
+                .filter_map(|interval| root_key.checked_add(interval))
+                .filter(|key| *key <= 127)
+                .collect();
+        }
+
+        let snapped_root = (0..=127u16)
+            .filter(|key| scale.contains(*key, scale_root))
+            .min_by_key(|key| key.abs_diff(root_key))
+            .unwrap_or(root_key);
+        let scale_degree = scale_intervals
+            .iter()
+            .position(|interval| {
+                (u16::from(scale_root) + u16::from(*interval)) % 12 == snapped_root % 12
+            })
+            .unwrap_or(0);
+        let degrees: &[usize] = if self == Self::ScaleSeventh {
+            &[0, 2, 4, 6]
+        } else {
+            &[0, 2, 4]
+        };
+        let octave_base = (snapped_root / 12) * 12;
+        degrees
+            .iter()
+            .filter_map(|degree| {
+                let scale_index = scale_degree + degree;
+                let octave_offset = (scale_index / scale_intervals.len()) * 12;
+                octave_base
+                    .checked_add(octave_offset as u16)?
+                    .checked_add(u16::from(
+                        scale_intervals[scale_index % scale_intervals.len()],
+                    ))
+            })
+            .filter(|key| *key <= 127)
+            .collect()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NoteDragKind {
     Move,
     Resize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ActiveNoteDrag {
-    pattern_id: u16,
+struct NoteDragTarget {
     channel_id: u16,
     channel_note_index: usize,
     start_position: u32,
     start_length: u32,
     start_key: u16,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ActiveNoteDrag {
+    pattern_id: u16,
+    channel_id: u16,
+    channel_note_index: usize,
+    start_pointer: egui::Pos2,
+    targets: Vec<NoteDragTarget>,
     kind: NoteDragKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PianoRollSelectionDrag {
+    pattern_id: u16,
+    channel_id: u16,
+    start: egui::Pos2,
+    current: egui::Pos2,
+    additive: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PianoRollZoomDrag {
+    pattern_id: u16,
+    start: egui::Pos2,
+    current: egui::Pos2,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StepGraphRamp {
+    pattern_id: u16,
+    channel_id: u16,
+    mode: StepGraphMode,
+    start_step: usize,
+    start_value: f32,
 }
 
 enum AutomationEditAction {
@@ -255,6 +780,77 @@ struct PendingMidiImport {
     selected_track: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BrowserTab {
+    Files,
+    CurrentProject,
+    Plugins,
+    Favorites,
+    Recent,
+}
+
+impl BrowserTab {
+    const ALL: [Self; 5] = [
+        Self::Files,
+        Self::CurrentProject,
+        Self::Plugins,
+        Self::Favorites,
+        Self::Recent,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Files => "Files",
+            Self::CurrentProject => "Project",
+            Self::Plugins => "Plugins",
+            Self::Favorites => "Favorites",
+            Self::Recent => "Recent",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BrowserFilter {
+    All,
+    Audio,
+    Projects,
+    Presets,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BrowserFileKind {
+    Audio,
+    Project,
+    Preset,
+    Midi,
+}
+
+impl BrowserFilter {
+    const ALL: [Self; 4] = [Self::All, Self::Audio, Self::Projects, Self::Presets];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "All files",
+            Self::Audio => "Samples",
+            Self::Projects => "Projects",
+            Self::Presets => "Presets",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BrowserEntry {
+    path: PathBuf,
+    name: String,
+    is_directory: bool,
+}
+
+struct PendingBrowserPreview {
+    path: PathBuf,
+    receiver: Receiver<Result<Vec<f32>, String>>,
+    worker: thread::JoinHandle<()>,
+}
+
 impl MainView {
     const ALL: [Self; 7] = [
         Self::Playlist,
@@ -285,18 +881,82 @@ struct DawUi {
     view: MainView,
     status: String,
     dirty: bool,
+    undo_history: Vec<Vec<u8>>,
+    redo_history: Vec<Vec<u8>>,
+    pending_history_snapshot: Option<Vec<u8>>,
+    saved_project_hash: Option<u64>,
+    history_reset_during_frame: bool,
+    history_navigation_during_frame: bool,
     playing: bool,
     project_playback_loaded: bool,
+    playlist_playback_loaded: bool,
     tempo_bpm: f64,
     selected_pattern: Option<u16>,
     selected_note_channel: Option<u16>,
     selected_note: Option<(u16, u16, usize)>,
+    selected_piano_notes: BTreeSet<(u16, u16, usize)>,
+    piano_roll_select_mode: bool,
+    piano_roll_selection_drag: Option<PianoRollSelectionDrag>,
+    piano_roll_zoom_mode: bool,
+    piano_roll_zoom_drag: Option<PianoRollZoomDrag>,
+    piano_roll_playback_mode: bool,
+    piano_roll_stamp_mode: bool,
+    piano_roll_stamp_only_one: bool,
+    piano_roll_chord_stamp: PianoRollChordStamp,
+    last_piano_roll_audition: Option<(u16, u16, usize)>,
+    piano_roll_zoom: f32,
+    piano_roll_pending_scroll_offset: Option<Vec2>,
+    piano_roll_grid_viewport: Option<egui::Rect>,
+    piano_roll_grid_scroll_offset: Vec2,
+    step_sequencer_bar: u32,
+    selected_graph_channel: Option<u16>,
+    step_graph_mode: StepGraphMode,
+    step_graph_editor_open: bool,
+    step_graph_ramp: Option<StepGraphRamp>,
     active_note_drag: Option<ActiveNoteDrag>,
     piano_roll_snap: PianoRollSnap,
+    piano_roll_edit_scope: PianoRollEditScope,
+    piano_roll_event_editor_open: bool,
+    piano_roll_event_target: PianoRollEventTarget,
+    piano_roll_scale: PianoRollScale,
+    piano_roll_scale_root: u8,
+    piano_roll_ghost_channels: bool,
+    piano_roll_color_by_midi_channel: bool,
+    piano_roll_paint_mode: bool,
+    last_painted_note: Option<(u16, u16, u16, u32)>,
+    quantize_strength_percent: u8,
+    quantize_swing_percent: u8,
+    chop_divisions: u8,
+    strum_spread_ticks: u32,
+    strum_descending: bool,
+    flam_stroke_ticks: u32,
+    flam_velocity: u8,
+    flam_before: bool,
+    randomizer_seed: u64,
+    randomizer_velocity_amount: i16,
+    randomizer_pan_amount: i16,
+    randomizer_pitch_range: u8,
+    randomizer_bipolar: bool,
+    randomizer_reset_levels: bool,
+    humanize_timing_range_ticks: u32,
+    humanize_velocity_variation_percent: u8,
+    note_limit_minimum_key: u8,
+    note_limit_maximum_key: u8,
+    arpeggiator_step_ticks: u32,
+    arpeggiator_range_octaves: u8,
+    arpeggiator_gate_percent: u8,
+    arpeggiator_direction: ArpeggioDirection,
+    piano_roll_slice_position_ticks: u32,
     pending_midi_import: Option<PendingMidiImport>,
     midi_channel_mapping: MidiChannelMapping,
     selected_arrangement: Option<u16>,
     selected_clip: Option<usize>,
+    selected_time_marker: Option<usize>,
+    new_time_marker_position: u32,
+    new_time_marker_is_signature: bool,
+    new_time_marker_numerator: u8,
+    new_time_marker_denominator: u8,
+    new_time_marker_name: String,
     selected_plugin_state_channel: Option<u16>,
     selected_automation_channel: Option<u16>,
     selected_automation_point: Option<usize>,
@@ -319,6 +979,26 @@ struct DawUi {
     vst3_workers: Vec<Vst3PatternStreamHandle>,
     pending_sampler_stream: Option<PendingSamplerStream>,
     sampler_workers: Vec<PendingSamplerStream>,
+    audio_waveform_paths: BTreeMap<u16, PathBuf>,
+    audio_waveforms: BTreeMap<PathBuf, Arc<AudioWaveform>>,
+    waveform_loads: BTreeMap<PathBuf, PendingWaveformLoad>,
+    waveform_errors: BTreeMap<PathBuf, String>,
+    browser_tab: BrowserTab,
+    browser_filter: BrowserFilter,
+    browser_path: PathBuf,
+    browser_entries: Vec<BrowserEntry>,
+    browser_search: String,
+    browser_selected: Option<PathBuf>,
+    browser_favorites: BTreeSet<PathBuf>,
+    browser_recent_projects: Vec<PathBuf>,
+    browser_error: Option<String>,
+    browser_full_sample: bool,
+    browser_preview_volume: f32,
+    browser_preview_pending: Option<PendingBrowserPreview>,
+    browser_preview_queued: Option<(PathBuf, bool)>,
+    browser_preview_cancelled: bool,
+    browser_preview_path: Option<PathBuf>,
+    browser_preview_error: Option<String>,
     audio_test_tone: bool,
     audio_monitor_input: bool,
     project_info_open: bool,
@@ -351,6 +1031,11 @@ struct PendingSamplerStream {
     worker: thread::JoinHandle<()>,
 }
 
+struct PendingWaveformLoad {
+    receiver: Receiver<Result<AudioWaveform, String>>,
+    worker: thread::JoinHandle<()>,
+}
+
 impl DawUi {
     fn new(creation: &eframe::CreationContext<'_>, initial_project: Option<PathBuf>) -> Self {
         let mut visuals = egui::Visuals::dark();
@@ -366,24 +1051,93 @@ impl DawUi {
         if let Some(rate) = audio_catalog.default_sample_rate {
             audio_settings.sample_rate = rate;
         }
+        let browser_path = initial_project
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(default_browser_directory);
         let mut app = Self {
             document: None,
             current_path: None,
             view: MainView::Playlist,
             status: "Open an FL Studio project to begin".to_owned(),
             dirty: false,
+            undo_history: Vec::new(),
+            redo_history: Vec::new(),
+            pending_history_snapshot: None,
+            saved_project_hash: None,
+            history_reset_during_frame: false,
+            history_navigation_during_frame: false,
             playing: false,
             project_playback_loaded: false,
+            playlist_playback_loaded: false,
             tempo_bpm: 140.0,
             selected_pattern: None,
             selected_note_channel: None,
             selected_note: None,
+            selected_piano_notes: BTreeSet::new(),
+            piano_roll_select_mode: false,
+            piano_roll_selection_drag: None,
+            piano_roll_zoom_mode: false,
+            piano_roll_zoom_drag: None,
+            piano_roll_playback_mode: false,
+            piano_roll_stamp_mode: false,
+            piano_roll_stamp_only_one: true,
+            piano_roll_chord_stamp: PianoRollChordStamp::Major,
+            last_piano_roll_audition: None,
+            piano_roll_zoom: 0.10,
+            piano_roll_pending_scroll_offset: None,
+            piano_roll_grid_viewport: None,
+            piano_roll_grid_scroll_offset: Vec2::ZERO,
+            step_sequencer_bar: 0,
+            selected_graph_channel: None,
+            step_graph_mode: StepGraphMode::Velocity,
+            step_graph_editor_open: false,
+            step_graph_ramp: None,
             active_note_drag: None,
             piano_roll_snap: PianoRollSnap::QuarterBeat,
+            piano_roll_edit_scope: PianoRollEditScope::Automatic,
+            piano_roll_event_editor_open: false,
+            piano_roll_event_target: PianoRollEventTarget::Velocity,
+            piano_roll_scale: PianoRollScale::Major,
+            piano_roll_scale_root: 0,
+            piano_roll_ghost_channels: true,
+            piano_roll_color_by_midi_channel: false,
+            piano_roll_paint_mode: false,
+            last_painted_note: None,
+            quantize_strength_percent: 100,
+            quantize_swing_percent: 0,
+            chop_divisions: 4,
+            strum_spread_ticks: 120,
+            strum_descending: false,
+            flam_stroke_ticks: 12,
+            flam_velocity: 80,
+            flam_before: true,
+            randomizer_seed: 1,
+            randomizer_velocity_amount: 0,
+            randomizer_pan_amount: 0,
+            randomizer_pitch_range: 0,
+            randomizer_bipolar: true,
+            randomizer_reset_levels: false,
+            humanize_timing_range_ticks: 12,
+            humanize_velocity_variation_percent: 10,
+            note_limit_minimum_key: 36,
+            note_limit_maximum_key: 83,
+            arpeggiator_step_ticks: 24,
+            arpeggiator_range_octaves: 1,
+            arpeggiator_gate_percent: 80,
+            arpeggiator_direction: ArpeggioDirection::Up,
+            piano_roll_slice_position_ticks: 0,
             pending_midi_import: None,
             midi_channel_mapping: MidiChannelMapping::PreserveNoteChannels,
             selected_arrangement: None,
             selected_clip: None,
+            selected_time_marker: None,
+            new_time_marker_position: 0,
+            new_time_marker_is_signature: false,
+            new_time_marker_numerator: 4,
+            new_time_marker_denominator: 4,
+            new_time_marker_name: String::new(),
             selected_plugin_state_channel: None,
             selected_automation_channel: None,
             selected_automation_point: None,
@@ -406,6 +1160,26 @@ impl DawUi {
             vst3_workers: Vec::new(),
             pending_sampler_stream: None,
             sampler_workers: Vec::new(),
+            audio_waveform_paths: BTreeMap::new(),
+            audio_waveforms: BTreeMap::new(),
+            waveform_loads: BTreeMap::new(),
+            waveform_errors: BTreeMap::new(),
+            browser_tab: BrowserTab::Files,
+            browser_filter: BrowserFilter::All,
+            browser_path,
+            browser_entries: Vec::new(),
+            browser_search: String::new(),
+            browser_selected: None,
+            browser_favorites: load_browser_favorites(),
+            browser_recent_projects: Vec::new(),
+            browser_error: None,
+            browser_full_sample: false,
+            browser_preview_volume: 1.0,
+            browser_preview_pending: None,
+            browser_preview_queued: None,
+            browser_preview_cancelled: false,
+            browser_preview_path: None,
+            browser_preview_error: None,
             audio_test_tone: false,
             audio_monitor_input: false,
             project_info_open: false,
@@ -418,6 +1192,7 @@ impl DawUi {
             project_settings_play_truncated: false,
             project_settings_fast_declick: false,
         };
+        app.refresh_browser_directory();
         if let Some(path) = initial_project.as_deref() {
             app.open_project(path);
         }
@@ -441,6 +1216,9 @@ impl DawUi {
         {
             Ok(document) => {
                 self.stop_project_playback();
+                self.clear_history();
+                self.history_reset_during_frame = true;
+                self.saved_project_hash = project_hash(&document);
                 self.tempo_bpm = document.metadata().tempo_bpm().unwrap_or(140.0);
                 self.project_info_title =
                     document.metadata().title().unwrap_or_default().to_owned();
@@ -472,7 +1250,10 @@ impl DawUi {
                 self.selected_note_channel =
                     document.channels().first().map(|channel| channel.id());
                 self.selected_clip = None;
+                self.selected_time_marker = None;
                 self.selected_note = None;
+                self.selected_piano_notes.clear();
+                self.piano_roll_selection_drag = None;
                 self.active_note_drag = None;
                 self.pending_midi_import = None;
                 self.selected_plugin_state_channel = document
@@ -493,6 +1274,12 @@ impl DawUi {
                 });
                 self.current_path = Some(path.to_path_buf());
                 self.document = Some(document);
+                self.refresh_audio_waveform_paths();
+                let recent_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+                self.browser_recent_projects
+                    .retain(|recent| recent != &recent_path);
+                self.browser_recent_projects.insert(0, recent_path);
+                self.browser_recent_projects.truncate(12);
                 self.dirty = false;
                 let plugin_summary = self
                     .load_project_vst3_channels()
@@ -500,6 +1287,87 @@ impl DawUi {
                 self.status = format!("Opened {}{plugin_summary}", path.display());
             }
             Err(error) => self.status = format!("Could not open project: {error}"),
+        }
+    }
+
+    fn refresh_audio_waveform_paths(&mut self) {
+        let Some(project_path) = self.current_path.as_ref() else {
+            self.audio_waveform_paths.clear();
+            return;
+        };
+        let channels = self
+            .document
+            .as_ref()
+            .map(FlpDocument::channels)
+            .unwrap_or_default();
+        let resolver = SamplePathResolver::new(project_path);
+        self.audio_waveform_paths = channels
+            .iter()
+            .filter(|channel| channel.kind() == Some(4))
+            .filter_map(|channel| {
+                let sample_path = channel.sample_path()?;
+                let resolved = resolver.resolve(sample_path).ok()?;
+                Some((channel.id(), resolved))
+            })
+            .collect();
+    }
+
+    fn request_audio_waveform(&mut self, path: &Path) {
+        if self.audio_waveforms.contains_key(path)
+            || self.waveform_loads.contains_key(path)
+            || self.waveform_errors.contains_key(path)
+            || self.waveform_loads.len() >= MAX_WAVEFORM_WORKERS
+        {
+            return;
+        }
+        let path = path.to_path_buf();
+        let worker_path = path.clone();
+        let (sender, receiver) = mpsc::channel();
+        let worker = match thread::Builder::new()
+            .name("flp-audio-waveform".to_owned())
+            .spawn(move || {
+                let result = decode_audio_waveform(&worker_path, AUDIO_WAVEFORM_BUCKETS);
+                let _ = sender.send(result);
+            }) {
+            Ok(worker) => worker,
+            Err(error) => {
+                self.waveform_errors.insert(path, error.to_string());
+                return;
+            }
+        };
+        self.waveform_loads
+            .insert(path, PendingWaveformLoad { receiver, worker });
+    }
+
+    fn poll_audio_waveforms(&mut self, ctx: &egui::Context) {
+        let completed = self
+            .waveform_loads
+            .iter()
+            .filter_map(|(path, load)| match load.receiver.try_recv() {
+                Ok(result) => Some((path.clone(), result)),
+                Err(TryRecvError::Disconnected) => Some((
+                    path.clone(),
+                    Err("waveform preview worker stopped unexpectedly".to_owned()),
+                )),
+                Err(TryRecvError::Empty) => None,
+            })
+            .collect::<Vec<_>>();
+        for (path, result) in completed {
+            if let Some(load) = self.waveform_loads.remove(&path) {
+                let _ = load.worker.join();
+            }
+            match result {
+                Ok(waveform) => {
+                    self.waveform_errors.remove(&path);
+                    self.audio_waveforms.insert(path, Arc::new(waveform));
+                }
+                Err(error) => {
+                    self.waveform_errors.insert(path, error);
+                }
+            }
+        }
+        if !self.waveform_loads.is_empty() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(80));
         }
     }
 
@@ -792,18 +1660,223 @@ impl DawUi {
         }
     }
 
+    fn clear_history(&mut self) {
+        self.undo_history.clear();
+        self.redo_history.clear();
+        self.pending_history_snapshot = None;
+    }
+
+    fn history_bytes(&self) -> usize {
+        self.undo_history
+            .iter()
+            .chain(&self.redo_history)
+            .map(Vec::len)
+            .fold(0usize, usize::saturating_add)
+    }
+
+    fn trim_history_to_limit(&mut self) {
+        while self.history_bytes() > HISTORY_LIMIT_BYTES {
+            if !self.undo_history.is_empty() {
+                self.undo_history.remove(0);
+            } else if !self.redo_history.is_empty() {
+                self.redo_history.remove(0);
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn remember_undo_snapshot(&mut self, snapshot: Vec<u8>) {
+        if snapshot.len() > HISTORY_LIMIT_BYTES {
+            self.status = "Undo snapshot exceeds the 64 MiB history limit".to_owned();
+            self.redo_history.clear();
+            return;
+        }
+        self.redo_history.clear();
+        self.undo_history.push(snapshot);
+        self.trim_history_to_limit();
+    }
+
+    fn finish_history_frame(
+        &mut self,
+        frame_snapshot: Option<Vec<u8>>,
+        pointer_down: bool,
+        mut history_navigation: bool,
+    ) {
+        history_navigation |= self.history_navigation_during_frame;
+        self.history_navigation_during_frame = false;
+        if history_navigation {
+            self.pending_history_snapshot = None;
+            self.history_reset_during_frame = false;
+            return;
+        }
+        if self.history_reset_during_frame {
+            self.clear_history();
+            self.history_reset_during_frame = false;
+            return;
+        }
+        if pointer_down {
+            if self.pending_history_snapshot.is_none() {
+                self.pending_history_snapshot = frame_snapshot;
+            }
+            return;
+        }
+        let Some(snapshot) = self.pending_history_snapshot.take().or(frame_snapshot) else {
+            return;
+        };
+        let Some(document) = &self.document else {
+            return;
+        };
+        match document.encode_lossless() {
+            Ok(current) if current != snapshot => self.remember_undo_snapshot(snapshot),
+            Ok(_) => {}
+            Err(error) => {
+                self.status = format!("Could not capture undo state: {error}");
+            }
+        }
+    }
+
+    fn undo_document(&mut self) {
+        self.history_navigation_during_frame = true;
+        let Some(snapshot) = self.undo_history.pop() else {
+            self.status = "Nothing to undo".to_owned();
+            return;
+        };
+        let Some(current) = self
+            .document
+            .as_ref()
+            .and_then(|document| document.encode_lossless().ok())
+        else {
+            self.undo_history.push(snapshot);
+            self.status = "Could not capture the current project for redo".to_owned();
+            return;
+        };
+        let restored = match FlpDocument::parse(&snapshot) {
+            Ok(document) => document,
+            Err(error) => {
+                self.undo_history.push(snapshot);
+                self.status = format!("Could not restore undo state: {error}");
+                return;
+            }
+        };
+        self.redo_history.push(current);
+        self.trim_history_to_limit();
+        self.document = Some(restored);
+        self.refresh_after_history_navigation("Undo");
+    }
+
+    fn redo_document(&mut self) {
+        self.history_navigation_during_frame = true;
+        let Some(snapshot) = self.redo_history.pop() else {
+            self.status = "Nothing to redo".to_owned();
+            return;
+        };
+        let Some(current) = self
+            .document
+            .as_ref()
+            .and_then(|document| document.encode_lossless().ok())
+        else {
+            self.redo_history.push(snapshot);
+            self.status = "Could not capture the current project for undo".to_owned();
+            return;
+        };
+        let restored = match FlpDocument::parse(&snapshot) {
+            Ok(document) => document,
+            Err(error) => {
+                self.redo_history.push(snapshot);
+                self.status = format!("Could not restore redo state: {error}");
+                return;
+            }
+        };
+        self.undo_history.push(current);
+        self.trim_history_to_limit();
+        self.document = Some(restored);
+        self.refresh_after_history_navigation("Redo");
+    }
+
+    fn refresh_after_history_navigation(&mut self, action: &str) {
+        self.stop_project_playback();
+        if let Some(document) = &self.document {
+            self.tempo_bpm = document.metadata().tempo_bpm().unwrap_or(140.0);
+            self.project_info_title = document.metadata().title().unwrap_or_default().to_owned();
+            self.project_info_author = document.metadata().author().unwrap_or_default().to_owned();
+            self.project_info_comments = document
+                .metadata()
+                .comments()
+                .unwrap_or_default()
+                .to_owned();
+            self.project_info_genre = document.metadata().genre().unwrap_or_default().to_owned();
+            self.project_info_web_link = document
+                .metadata()
+                .web_link()
+                .unwrap_or_default()
+                .to_owned();
+            if let Some(settings) = document.project_settings() {
+                self.project_settings_play_truncated = settings.play_truncated_notes_in_clips;
+                self.project_settings_fast_declick = settings.fast_declick_for_cut_groups;
+            }
+            let patterns = document.patterns().unwrap_or_default();
+            if self
+                .selected_pattern
+                .is_none_or(|id| !patterns.iter().any(|pattern| pattern.id == id))
+            {
+                self.selected_pattern = patterns.first().map(|pattern| pattern.id);
+            }
+            let channels = document.channels();
+            if self
+                .selected_note_channel
+                .is_none_or(|id| !channels.iter().any(|channel| channel.id() == id))
+            {
+                self.selected_note_channel = channels.first().map(|channel| channel.id());
+            }
+            let arrangements = document.arrangements().unwrap_or_default();
+            if self
+                .selected_arrangement
+                .is_none_or(|id| !arrangements.iter().any(|arrangement| arrangement.id == id))
+            {
+                self.selected_arrangement = arrangements.first().map(|arrangement| arrangement.id);
+            }
+            self.selected_automation_channel = document
+                .automation_channels()
+                .ok()
+                .and_then(|items| items.first().map(AutomationChannel::channel_id));
+        }
+        self.selected_note = None;
+        self.selected_clip = None;
+        self.selected_time_marker = None;
+        self.selected_automation_point = None;
+        self.active_note_drag = None;
+        self.selected_piano_notes.clear();
+        self.piano_roll_selection_drag = None;
+        self.dirty = self
+            .document
+            .as_ref()
+            .and_then(project_hash)
+            .zip(self.saved_project_hash)
+            .is_none_or(|(current, saved)| current != saved);
+        self.status = format!("{action} project edit");
+    }
+
     fn write_project(&mut self, path: &Path) {
         let Some(document) = &self.document else {
             self.status = "Open a project before saving".to_owned();
             return;
         };
-        match document
-            .encode_lossless()
-            .map_err(|error| error.to_string())
-            .and_then(|bytes| fs::write(path, bytes).map_err(|error| error.to_string()))
-        {
+        let encoded = match document.encode_lossless() {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.status = format!("Could not encode project: {error}");
+                return;
+            }
+        };
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        encoded.hash(&mut hasher);
+        let saved_hash = hasher.finish();
+        match fs::write(path, encoded) {
             Ok(()) => {
                 self.current_path = Some(path.to_path_buf());
+                self.refresh_audio_waveform_paths();
+                self.saved_project_hash = Some(saved_hash);
                 self.dirty = false;
                 self.status = format!("Saved {}", path.display());
             }
@@ -939,6 +2012,7 @@ impl DawUi {
             Ok(worker) => {
                 self.playing = true;
                 self.project_playback_loaded = true;
+                self.playlist_playback_loaded = true;
                 self.pending_audio_render = Some(PendingAudioRender {
                     receiver,
                     cancelled,
@@ -1132,6 +2206,7 @@ impl DawUi {
         }
         self.playing = false;
         self.project_playback_loaded = false;
+        self.playlist_playback_loaded = false;
     }
 
     fn reap_vst3_workers(&mut self) {
@@ -1208,6 +2283,20 @@ impl DawUi {
                 self.save_as();
             }
             if ui
+                .add_enabled(!self.undo_history.is_empty(), egui::Button::new("Undo"))
+                .on_hover_text("Undo the last project edit (Ctrl/Cmd+Z)")
+                .clicked()
+            {
+                self.undo_document();
+            }
+            if ui
+                .add_enabled(!self.redo_history.is_empty(), egui::Button::new("Redo"))
+                .on_hover_text("Redo the last undone project edit (Ctrl/Cmd+Shift+Z)")
+                .clicked()
+            {
+                self.redo_document();
+            }
+            if ui
                 .add_enabled(self.document.is_some(), egui::Button::new("Project Info…"))
                 .clicked()
             {
@@ -1274,6 +2363,45 @@ impl DawUi {
         });
     }
 
+    fn current_playhead_tick(&self) -> Option<f64> {
+        if !self.playlist_playback_loaded || !self.tempo_bpm.is_finite() || self.tempo_bpm <= 0.0 {
+            return None;
+        }
+        let document = self.document.as_ref()?;
+        let engine = self.audio_engine.as_ref()?;
+        let sample_rate = engine.sample_rate();
+        if sample_rate == 0 {
+            return None;
+        }
+        let frames = engine.project_playback_position_frames();
+        let ticks = frames as f64 * self.tempo_bpm * f64::from(document.header().ppq().max(1))
+            / (60.0 * f64::from(sample_rate));
+        ticks.is_finite().then_some(ticks)
+    }
+
+    fn song_position_label(&self) -> String {
+        let Some(tick) = self.current_playhead_tick() else {
+            return "1:01:000".to_owned();
+        };
+        let ppq = self
+            .document
+            .as_ref()
+            .map(|document| u64::from(document.header().ppq().max(1)))
+            .unwrap_or(96);
+        let (numerator, denominator) = self
+            .document
+            .as_ref()
+            .and_then(|document| document.metadata().time_signature())
+            .unwrap_or((4, 4));
+        let beat_ticks = ppq as f64 * 4.0 / f64::from(denominator.max(1));
+        let bar_ticks = beat_ticks * f64::from(numerator.max(1));
+        let bar = (tick / bar_ticks).floor() as u64 + 1;
+        let within_bar = tick % bar_ticks;
+        let beat = (within_bar / beat_ticks).floor() as u64 + 1;
+        let tick_in_beat = (within_bar % beat_ticks).floor() as u64;
+        format!("{bar}:{beat:02}:{tick_in_beat:03}")
+    }
+
     fn transport_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_centered(|ui| {
             ui.add_space(4.0);
@@ -1321,7 +2449,7 @@ impl DawUi {
                 self.update_tempo(bpm);
             }
             ui.separator();
-            ui.monospace("1:01:000");
+            ui.monospace(self.song_position_label());
             ui.separator();
             for label in [
                 "Playlist",
@@ -1349,24 +2477,486 @@ impl DawUi {
         });
     }
 
-    fn browser(&self, ui: &mut egui::Ui) {
+    fn refresh_browser_directory(&mut self) {
+        match fs::read_dir(&self.browser_path) {
+            Ok(directory) => {
+                let mut entries = directory
+                    .filter_map(Result::ok)
+                    .filter_map(|entry| {
+                        let path = entry.path();
+                        let name = entry.file_name().to_string_lossy().into_owned();
+                        let is_directory = path.is_dir();
+                        (is_directory || browser_file_kind(&path).is_some()).then_some(
+                            BrowserEntry {
+                                path,
+                                name,
+                                is_directory,
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                entries.sort_by(|left, right| {
+                    right
+                        .is_directory
+                        .cmp(&left.is_directory)
+                        .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+                });
+                self.browser_entries = entries;
+                self.browser_error = None;
+            }
+            Err(error) => {
+                self.browser_entries.clear();
+                self.browser_error = Some(format!(
+                    "Could not read {}: {error}",
+                    self.browser_path.display()
+                ));
+            }
+        }
+    }
+
+    fn set_browser_directory(&mut self, path: PathBuf) {
+        if path.is_dir() {
+            self.browser_path = path;
+            self.browser_selected = None;
+            self.browser_search.clear();
+            self.refresh_browser_directory();
+        } else {
+            self.browser_error = Some(format!("Folder is not available: {}", path.display()));
+        }
+    }
+
+    fn activate_browser_path(&mut self, path: PathBuf) {
+        if path.is_dir() {
+            self.set_browser_directory(path);
+            return;
+        }
+        match path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("flp") => self.open_project(&path),
+            Some("mid" | "midi") => match fs::read(&path) {
+                Ok(bytes) => match MidiFile::parse(&bytes) {
+                    Ok(midi) if !midi.tracks().is_empty() => {
+                        self.pending_midi_import = Some(PendingMidiImport {
+                            path: path.clone(),
+                            midi,
+                            selected_track: 0,
+                        });
+                        self.view = MainView::PianoRoll;
+                        self.status = format!("Loaded MIDI file {}", path.display());
+                    }
+                    Ok(_) => self.status = "The MIDI file contains no tracks".to_owned(),
+                    Err(error) => self.status = format!("Could not parse MIDI file: {error}"),
+                },
+                Err(error) => self.status = format!("Could not read {}: {error}", path.display()),
+            },
+            Some("wav" | "wave" | "mp3" | "m4a" | "ogg" | "flac" | "aif" | "aiff" | "wv") => {
+                self.request_browser_preview(path, self.browser_full_sample);
+            }
+            _ => self.status = format!("Selected {}", path.display()),
+        }
+    }
+
+    fn toggle_browser_favorite(&mut self, path: PathBuf) {
+        if !self.browser_favorites.remove(&path) {
+            self.browser_favorites.insert(path);
+        }
+        if let Err(error) = save_browser_favorites(&self.browser_favorites) {
+            self.status = format!("Could not save Browser favorites: {error}");
+        }
+    }
+
+    fn request_browser_preview(&mut self, path: PathBuf, full_sample: bool) {
+        self.browser_preview_error = None;
+        self.browser_preview_path = None;
+        if let Some(engine) = self.audio_engine.as_ref() {
+            engine.stop_browser_preview();
+        }
+        if self.browser_preview_pending.is_some() {
+            self.browser_preview_queued = Some((path, full_sample));
+            self.browser_preview_cancelled = true;
+            return;
+        }
+        self.browser_preview_cancelled = false;
+        self.begin_browser_preview_load(path, full_sample);
+    }
+
+    fn begin_browser_preview_load(&mut self, path: PathBuf, full_sample: bool) {
+        if self.audio_engine.is_none() {
+            match AudioEngine::start(&self.audio_settings) {
+                Ok(engine) => self.audio_engine = Some(engine),
+                Err(error) => {
+                    self.browser_preview_error = Some(error.clone());
+                    self.status = format!("Could not start sample preview: {error}");
+                    return;
+                }
+            }
+        }
+        let Some(engine) = self.audio_engine.as_ref() else {
+            self.status = "Audio output is not available".to_owned();
+            return;
+        };
+        if !engine.output_active() {
+            let error = "Enable an output device before previewing a sample".to_owned();
+            self.browser_preview_error = Some(error.clone());
+            self.status = error;
+            return;
+        }
+        let output_sample_rate = engine.sample_rate();
+        let maximum_seconds = (!full_sample).then_some(5.0);
+        let worker_path = path.clone();
+        let (sender, receiver) = mpsc::channel();
+        let worker = match thread::Builder::new()
+            .name("browser-sample-preview".to_owned())
+            .spawn(move || {
+                let result =
+                    decode_audio_preview(&worker_path, output_sample_rate, maximum_seconds);
+                let _ = sender.send(result);
+            }) {
+            Ok(worker) => worker,
+            Err(error) => {
+                self.browser_preview_error = Some(error.to_string());
+                self.status = format!("Could not start sample decoder: {error}");
+                return;
+            }
+        };
+        self.browser_preview_pending = Some(PendingBrowserPreview {
+            path,
+            receiver,
+            worker,
+        });
+        self.status = if full_sample {
+            "Loading full sample preview".to_owned()
+        } else {
+            "Loading 5-second sample preview".to_owned()
+        };
+    }
+
+    fn stop_browser_preview(&mut self) {
+        self.browser_preview_queued = None;
+        self.browser_preview_cancelled = self.browser_preview_pending.is_some();
+        self.browser_preview_path = None;
+        if let Some(engine) = self.audio_engine.as_ref() {
+            engine.stop_browser_preview();
+        }
+        self.status = "Stopped Browser sample preview".to_owned();
+    }
+
+    fn poll_browser_preview(&mut self, ctx: &egui::Context) {
+        let completed = self.browser_preview_pending.as_ref().and_then(|pending| {
+            match pending.receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Disconnected) => {
+                    Some(Err("sample preview worker stopped unexpectedly".to_owned()))
+                }
+                Err(TryRecvError::Empty) => None,
+            }
+        });
+        if let Some(result) = completed {
+            if let Some(pending) = self.browser_preview_pending.take() {
+                let _ = pending.worker.join();
+                if let Some((path, full_sample)) = self.browser_preview_queued.take() {
+                    self.browser_preview_cancelled = false;
+                    self.begin_browser_preview_load(path, full_sample);
+                    return;
+                }
+                if self.browser_preview_cancelled {
+                    self.browser_preview_cancelled = false;
+                    return;
+                }
+                match result {
+                    Ok(samples) => {
+                        let start_result = if let Some(engine) = self.audio_engine.as_ref() {
+                            engine.set_browser_preview_gain(self.browser_preview_volume);
+                            engine.set_browser_preview(samples)
+                        } else {
+                            Err("Audio output is not available".to_owned())
+                        };
+                        match start_result {
+                            Ok(()) => {
+                                self.status = format!("Previewing {}", pending.path.display());
+                                self.browser_preview_path = Some(pending.path);
+                            }
+                            Err(error) => {
+                                self.browser_preview_error = Some(error.clone());
+                                self.status = format!("Could not play sample preview: {error}");
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        self.browser_preview_error = Some(error.clone());
+                        self.status = format!("Could not decode sample preview: {error}");
+                    }
+                }
+            }
+        }
+        if self.browser_preview_pending.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(40));
+        }
+        if self.browser_preview_path.is_some()
+            && self
+                .audio_engine
+                .as_ref()
+                .is_none_or(|engine| !engine.browser_preview_active())
+        {
+            self.browser_preview_path = None;
+        }
+    }
+
+    fn browser(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.strong("Browser");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label("⋮");
-            });
+            if self.browser_tab == BrowserTab::Files {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .small_button("↻")
+                        .on_hover_text("Refresh this folder")
+                        .clicked()
+                    {
+                        self.refresh_browser_directory();
+                    }
+                });
+            }
         });
         ui.separator();
-        for entry in [
-            "Current project",
-            "Plugin database",
-            "Plugin scan",
-            "Packs",
-            "Recent files",
-        ] {
-            ui.label(format!("▸ {entry}"));
-        }
+        ui.horizontal_wrapped(|ui| {
+            for tab in BrowserTab::ALL {
+                ui.selectable_value(&mut self.browser_tab, tab, tab.label());
+            }
+        });
         ui.separator();
+
+        match self.browser_tab {
+            BrowserTab::Files => self.browser_files(ui),
+            BrowserTab::CurrentProject => self.browser_current_project(ui),
+            BrowserTab::Plugins => self.browser_plugins(ui),
+            BrowserTab::Favorites => self.browser_favorites_view(ui),
+            BrowserTab::Recent => self.browser_recent_view(ui),
+        }
+
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+            ui.separator();
+            ui.small("Local files · project data stays lossless");
+            self.browser_preview_player(ui);
+        });
+    }
+
+    fn browser_preview_player(&mut self, ui: &mut egui::Ui) {
+        let selected_audio = self
+            .browser_selected
+            .as_ref()
+            .filter(|path| browser_file_kind(path) == Some(BrowserFileKind::Audio))
+            .cloned();
+        let path = selected_audio
+            .or_else(|| {
+                self.browser_preview_pending
+                    .as_ref()
+                    .map(|pending| pending.path.clone())
+            })
+            .or_else(|| self.browser_preview_path.clone());
+        let Some(path) = path else {
+            return;
+        };
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        let display_name = if name.chars().count() > 22 {
+            format!("{}…", name.chars().take(21).collect::<String>())
+        } else {
+            name
+        };
+        let mut play_to_end = false;
+        let mut stop_preview = false;
+        let mut volume_changed = false;
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                ui.strong("Preview");
+                ui.label(egui::RichText::new(display_name).small())
+                    .on_hover_text(path.display().to_string());
+            });
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.browser_full_sample, "Full sample")
+                    .on_hover_text(
+                        "Play the full file on click; otherwise previews stop after five seconds",
+                    );
+                play_to_end = ui
+                    .small_button("▶")
+                    .on_hover_text("Play selected sample to the end")
+                    .clicked();
+                stop_preview = ui.small_button("■").on_hover_text("Stop preview").clicked();
+            });
+            ui.horizontal(|ui| {
+                ui.small("Volume");
+                volume_changed = ui
+                    .add_sized(
+                        Vec2::new(110.0, 18.0),
+                        egui::Slider::new(&mut self.browser_preview_volume, 0.0..=1.0)
+                            .show_value(false),
+                    )
+                    .on_hover_text("Preview volume")
+                    .changed();
+            });
+            if let Some(error) = &self.browser_preview_error {
+                ui.label(egui::RichText::new(error).color(ORANGE).small());
+            } else if self.browser_preview_pending.is_some() && !self.browser_preview_cancelled {
+                ui.small("Loading sample preview…");
+            } else if self.browser_preview_path.as_ref() == Some(&path) {
+                ui.small("Playing");
+            } else {
+                ui.small("Ready");
+            }
+        });
+        if volume_changed && let Some(engine) = self.audio_engine.as_ref() {
+            engine.set_browser_preview_gain(self.browser_preview_volume);
+        }
+        if stop_preview {
+            self.stop_browser_preview();
+        }
+        if play_to_end {
+            self.request_browser_preview(path, true);
+        }
+    }
+
+    fn browser_files(&mut self, ui: &mut egui::Ui) {
+        let home = default_browser_directory();
+        let project_folder = self
+            .current_path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf);
+        let packs_folder = browser_factory_packs_directory();
+        let mut requested_folder = None;
+        ui.horizontal_wrapped(|ui| {
+            if ui.small_button("Home").clicked() {
+                requested_folder = Some(home.clone());
+            }
+            if let Some(path) = project_folder.as_ref()
+                && ui.small_button("Project").clicked()
+            {
+                requested_folder = Some(path.clone());
+            }
+            if let Some(path) = packs_folder.as_ref()
+                && ui.small_button("Packs").clicked()
+            {
+                requested_folder = Some(path.clone());
+            }
+        });
+
+        let mut refresh = false;
+        ui.horizontal(|ui| {
+            let parent = self.browser_path.parent().map(Path::to_path_buf);
+            if ui
+                .add_enabled(parent.is_some(), egui::Button::new("↑"))
+                .on_hover_text("Parent folder")
+                .clicked()
+            {
+                requested_folder = parent;
+            }
+            let path_label = self
+                .browser_path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| self.browser_path.display().to_string());
+            ui.label(egui::RichText::new(path_label).small())
+                .on_hover_text(self.browser_path.display().to_string());
+            refresh = ui
+                .small_button("↻")
+                .on_hover_text("Read this folder again")
+                .clicked();
+        });
+        if let Some(path) = requested_folder {
+            self.set_browser_directory(path);
+        } else if refresh {
+            self.refresh_browser_directory();
+        }
+
+        ui.add(
+            egui::TextEdit::singleline(&mut self.browser_search)
+                .hint_text("Filter this folder")
+                .desired_width(f32::INFINITY),
+        );
+        egui::ComboBox::from_id_salt("browser-file-filter")
+            .selected_text(self.browser_filter.label())
+            .show_ui(ui, |ui| {
+                for filter in BrowserFilter::ALL {
+                    ui.selectable_value(&mut self.browser_filter, filter, filter.label());
+                }
+            });
+        if let Some(error) = &self.browser_error {
+            ui.label(egui::RichText::new(error).color(ORANGE).small());
+        }
+
+        let query = self.browser_search.to_lowercase();
+        let entries = self
+            .browser_entries
+            .iter()
+            .filter(|entry| {
+                entry.is_directory || browser_filter_matches(&entry.path, self.browser_filter)
+            })
+            .filter(|entry| query.is_empty() || entry.name.to_lowercase().contains(&query))
+            .cloned()
+            .collect::<Vec<_>>();
+        ui.small(format!("{} items", entries.len()));
+        let mut activate = None;
+        let mut preview = None;
+        let mut favorite = None;
+        egui::ScrollArea::vertical()
+            .id_salt("browser-files-list")
+            .show(ui, |ui| {
+                for entry in entries {
+                    let is_favorite = self.browser_favorites.contains(&entry.path);
+                    let selected = self.browser_selected.as_ref() == Some(&entry.path);
+                    let (clicked, double_clicked, favorite_clicked) = ui
+                        .horizontal(|ui| {
+                            let icon = if entry.is_directory {
+                                "▸"
+                            } else {
+                                browser_file_icon(&entry.path)
+                            };
+                            let response =
+                                ui.selectable_label(selected, format!("{icon} {}", entry.name));
+                            let clicked = response.clicked();
+                            let double_clicked = response.double_clicked();
+                            response.on_hover_text(entry.path.display().to_string());
+                            let favorite_clicked = !entry.is_directory
+                                && ui
+                                    .small_button(if is_favorite { "★" } else { "☆" })
+                                    .clicked();
+                            (clicked, double_clicked, favorite_clicked)
+                        })
+                        .inner;
+                    if double_clicked {
+                        self.browser_selected = Some(entry.path.clone());
+                        activate = Some(entry.path.clone());
+                    } else if clicked {
+                        self.browser_selected = Some(entry.path.clone());
+                        if !entry.is_directory
+                            && browser_file_kind(&entry.path) == Some(BrowserFileKind::Audio)
+                        {
+                            preview = Some(entry.path.clone());
+                        }
+                    }
+                    if favorite_clicked {
+                        favorite = Some(entry.path);
+                    }
+                }
+            });
+        if let Some(path) = favorite {
+            self.toggle_browser_favorite(path);
+        }
+        if let Some(path) = preview {
+            self.request_browser_preview(path, self.browser_full_sample);
+        }
+        if let Some(path) = activate {
+            self.activate_browser_path(path);
+        }
+    }
+
+    fn browser_current_project(&self, ui: &mut egui::Ui) {
         if let Some(document) = &self.document {
             egui::CollapsingHeader::new("Channels")
                 .default_open(true)
@@ -1396,10 +2986,153 @@ impl DawUi {
         } else {
             ui.label(egui::RichText::new("No project open").color(MUTED));
         }
-        ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-            ui.separator();
-            ui.small("Project data stays in its original FLP event stream");
-        });
+    }
+
+    fn browser_plugins(&mut self, ui: &mut egui::Ui) {
+        ui.add(
+            egui::TextEdit::singleline(&mut self.browser_search)
+                .hint_text("Find installed plug-ins")
+                .desired_width(f32::INFINITY),
+        );
+        let query = self.browser_search.to_lowercase();
+        let candidates = self
+            .plugin_candidates
+            .iter()
+            .filter(|candidate| {
+                query.is_empty()
+                    || candidate.name.to_lowercase().contains(&query)
+                    || candidate
+                        .path
+                        .to_string_lossy()
+                        .to_lowercase()
+                        .contains(&query)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        ui.small(format!("{} installed plug-ins", candidates.len()));
+        let mut favorite = None;
+        egui::ScrollArea::vertical()
+            .id_salt("browser-plugin-list")
+            .show(ui, |ui| {
+                for candidate in candidates {
+                    let is_favorite = self.browser_favorites.contains(&candidate.path);
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{} · {}", candidate.name, candidate.format))
+                            .on_hover_text(candidate.path.display().to_string());
+                        if ui
+                            .small_button(if is_favorite { "★" } else { "☆" })
+                            .clicked()
+                        {
+                            favorite = Some(candidate.path.clone());
+                        }
+                    });
+                }
+            });
+        if let Some(path) = favorite {
+            self.toggle_browser_favorite(path);
+        }
+    }
+
+    fn browser_favorites_view(&mut self, ui: &mut egui::Ui) {
+        ui.add(
+            egui::TextEdit::singleline(&mut self.browser_search)
+                .hint_text("Find favorites")
+                .desired_width(f32::INFINITY),
+        );
+        let query = self.browser_search.to_lowercase();
+        let favorites = self
+            .browser_favorites
+            .iter()
+            .filter(|path| {
+                query.is_empty() || path.to_string_lossy().to_lowercase().contains(&query)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut activate = None;
+        let mut preview = None;
+        let mut remove = None;
+        egui::ScrollArea::vertical()
+            .id_salt("browser-favorites-list")
+            .show(ui, |ui| {
+                for path in favorites {
+                    let name = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string());
+                    let (clicked, double_clicked, remove_clicked) = ui
+                        .horizontal(|ui| {
+                            let response = ui.selectable_label(
+                                self.browser_selected.as_ref() == Some(&path),
+                                format!("★ {name}"),
+                            );
+                            let clicked = response.clicked();
+                            let double_clicked = response.double_clicked();
+                            response.on_hover_text(path.display().to_string());
+                            (clicked, double_clicked, ui.small_button("×").clicked())
+                        })
+                        .inner;
+                    if clicked {
+                        self.browser_selected = Some(path.clone());
+                    }
+                    if double_clicked {
+                        activate = Some(path.clone());
+                    } else if clicked && browser_file_kind(&path) == Some(BrowserFileKind::Audio) {
+                        preview = Some(path.clone());
+                    }
+                    if remove_clicked {
+                        remove = Some(path);
+                    }
+                }
+            });
+        if let Some(path) = remove {
+            self.toggle_browser_favorite(path);
+        }
+        if let Some(path) = preview {
+            self.request_browser_preview(path, self.browser_full_sample);
+        }
+        if let Some(path) = activate {
+            self.activate_browser_path(path);
+        }
+    }
+
+    fn browser_recent_view(&mut self, ui: &mut egui::Ui) {
+        ui.add(
+            egui::TextEdit::singleline(&mut self.browser_search)
+                .hint_text("Find recent projects")
+                .desired_width(f32::INFINITY),
+        );
+        let query = self.browser_search.to_lowercase();
+        let recent = self
+            .browser_recent_projects
+            .iter()
+            .filter(|path| {
+                query.is_empty() || path.to_string_lossy().to_lowercase().contains(&query)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if recent.is_empty() {
+            ui.label(egui::RichText::new("No recent projects").color(MUTED));
+        }
+        let mut activate = None;
+        egui::ScrollArea::vertical()
+            .id_salt("browser-recent-list")
+            .show(ui, |ui| {
+                for path in recent {
+                    let name = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string());
+                    let response = ui
+                        .selectable_label(false, format!("◷ {name}"))
+                        .on_hover_text(path.display().to_string());
+                    if response.double_clicked() {
+                        activate = Some(path);
+                    }
+                }
+            });
+        if let Some(path) = activate {
+            self.open_project(&path);
+        }
     }
 
     fn view_tabs(&mut self, ui: &mut egui::Ui) {
@@ -1442,6 +3175,21 @@ impl DawUi {
             return;
         };
 
+        let waveform_paths = arrangement
+            .clips
+            .iter()
+            .filter_map(|clip| match clip.target() {
+                flp_rebuild::PlaylistClipTarget::Channel { id } => {
+                    self.audio_waveform_paths.get(&id).cloned()
+                }
+                flp_rebuild::PlaylistClipTarget::Pattern { .. } => None,
+            })
+            .collect::<BTreeSet<_>>();
+        for path in &waveform_paths {
+            self.request_audio_waveform(path);
+        }
+        self.poll_audio_waveforms(ui.ctx());
+
         ui.horizontal(|ui| {
             ui.label("Arrangement");
             ui.strong(arrangement.name.as_deref().unwrap_or("Arrangement"));
@@ -1450,11 +3198,18 @@ impl DawUi {
             ui.separator();
             ui.label(format!("{} PPQ", ppq));
         });
+        self.time_marker_editor(ui, arrangement.id, &arrangement.time_markers);
 
         let max_tick = arrangement
             .clips
             .iter()
             .map(|clip| clip.position_ticks.saturating_add(clip.length_ticks))
+            .chain(
+                arrangement
+                    .time_markers
+                    .iter()
+                    .map(TimeMarker::position_ticks),
+            )
             .max()
             .unwrap_or(ppq as u32 * 64)
             .max(ppq as u32 * 16);
@@ -1469,6 +3224,7 @@ impl DawUi {
         let label_width = 178.0;
         let row_height = 27.0;
         let tick_scale = self.timeline_zoom;
+        let playhead_tick = self.current_playhead_tick();
         let bars_per_measure = 4u32;
         let measure_ticks = ppq as u32 * bars_per_measure;
 
@@ -1508,6 +3264,51 @@ impl DawUi {
                                 (measure + 1).to_string(),
                                 FontId::proportional(10.0),
                                 MUTED,
+                            );
+                        }
+                    }
+                    for (marker_index, marker) in arrangement.time_markers.iter().enumerate() {
+                        let x = ruler_rect.left() + marker.position_ticks() as f32 * tick_scale;
+                        let color = if self.selected_time_marker == Some(marker_index) {
+                            ORANGE
+                        } else {
+                            MUTED
+                        };
+                        painter.line_segment(
+                            [
+                                egui::pos2(x, ruler_rect.top()),
+                                egui::pos2(x, ruler_rect.bottom()),
+                            ],
+                            Stroke::new(1.5, color),
+                        );
+                        let label = marker.name().map(str::to_owned).unwrap_or_else(|| {
+                            if marker.is_signature() {
+                                format!(
+                                    "{}/{}",
+                                    marker.numerator().unwrap_or(4),
+                                    marker.denominator().unwrap_or(4)
+                                )
+                            } else {
+                                format!("M{}", marker_index + 1)
+                            }
+                        });
+                        painter.text(
+                            egui::pos2(x + 3.0, ruler_rect.top() + 2.0),
+                            Align2::LEFT_TOP,
+                            label,
+                            FontId::proportional(9.0),
+                            color,
+                        );
+                    }
+                    if let Some(tick) = playhead_tick {
+                        let x = ruler_rect.left() + tick as f32 * tick_scale;
+                        if (ruler_rect.left()..=ruler_rect.right()).contains(&x) {
+                            painter.line_segment(
+                                [
+                                    egui::pos2(x, ruler_rect.top()),
+                                    egui::pos2(x, ruler_rect.bottom()),
+                                ],
+                                Stroke::new(2.0, GREEN),
                             );
                         }
                     }
@@ -1603,6 +3404,21 @@ impl DawUi {
                                 Stroke::new(1.0, color.gamma_multiply(0.65)),
                                 egui::StrokeKind::Inside,
                             );
+                            if let flp_rebuild::PlaylistClipTarget::Channel { id } = clip.target()
+                                && let Some(path) = self.audio_waveform_paths.get(&id)
+                            {
+                                if let Some(waveform) = self.audio_waveforms.get(path).cloned() {
+                                    draw_audio_clip_waveform(&painter, clip_rect, clip, &waveform);
+                                } else if self.waveform_loads.contains_key(path) {
+                                    painter.text(
+                                        clip_rect.center(),
+                                        Align2::CENTER_CENTER,
+                                        "…",
+                                        FontId::proportional(10.0),
+                                        Color32::from_white_alpha(150),
+                                    );
+                                }
+                            }
                             if width > 50.0 {
                                 let name = clip_name(clip, &tracks);
                                 painter.text(
@@ -1618,10 +3434,49 @@ impl DawUi {
                                 Id::new(("playlist-clip", arrangement.id, clip_index)),
                                 Sense::click(),
                             );
+                            let response = if let flp_rebuild::PlaylistClipTarget::Channel { id } =
+                                clip.target()
+                                && let Some(path) = self.audio_waveform_paths.get(&id)
+                                && let Some(error) = self.waveform_errors.get(path)
+                            {
+                                response.on_hover_text(format!("Waveform unavailable: {error}"))
+                            } else {
+                                response
+                            };
                             if response.clicked() {
                                 self.selected_arrangement = Some(arrangement.id);
                                 self.selected_clip = Some(clip_index);
                                 self.status = format!("Selected Playlist clip {}", clip_index + 1);
+                            }
+                        }
+                        for (marker_index, marker) in arrangement.time_markers.iter().enumerate() {
+                            let x = grid_rect.left() + marker.position_ticks() as f32 * tick_scale;
+                            if !(grid_rect.left()..=grid_rect.right()).contains(&x) {
+                                continue;
+                            }
+                            let color = if self.selected_time_marker == Some(marker_index) {
+                                ORANGE
+                            } else {
+                                MUTED.gamma_multiply(0.7)
+                            };
+                            painter.line_segment(
+                                [
+                                    egui::pos2(x, grid_rect.top()),
+                                    egui::pos2(x, grid_rect.bottom()),
+                                ],
+                                Stroke::new(1.0, color),
+                            );
+                        }
+                        if let Some(tick) = playhead_tick {
+                            let x = grid_rect.left() + tick as f32 * tick_scale;
+                            if (grid_rect.left()..=grid_rect.right()).contains(&x) {
+                                painter.line_segment(
+                                    [
+                                        egui::pos2(x, grid_rect.top()),
+                                        egui::pos2(x, grid_rect.bottom()),
+                                    ],
+                                    Stroke::new(2.0, GREEN),
+                                );
                             }
                         }
                     });
@@ -1646,38 +3501,335 @@ impl DawUi {
         };
         let mut position = clip.position_ticks;
         let mut length = clip.length_ticks;
+        let mut item_index = clip.item_index;
+        let mut raw_track_index = clip.raw_track_index;
+        let mut group = clip.group;
+        let mut item_flags = clip.item_flags;
+        let mut start_offset = clip.start_offset;
+        let mut end_offset = clip.end_offset;
+        let mut scale = clip.scale.unwrap_or(1.0);
+        let mut position_changed = false;
+        let mut length_changed = false;
+        let mut item_index_changed = false;
+        let mut raw_track_index_changed = false;
+        let mut group_changed = false;
+        let mut item_flags_changed = false;
+        let mut start_offset_changed = false;
+        let mut end_offset_changed = false;
+        let mut scale_changed = false;
+        let mut duplicate_requested = false;
         ui.separator();
         ui.horizontal(|ui| {
             ui.label(format!("Clip {}", index + 1));
             ui.label("Start");
-            let start_changed = ui
+            position_changed = ui
                 .add(egui::DragValue::new(&mut position).speed(1.0))
                 .changed();
             ui.label("Length");
-            let length_changed = ui
+            length_changed = ui
                 .add(egui::DragValue::new(&mut length).speed(1.0))
                 .changed();
-            if start_changed || length_changed {
-                let edit = PlaylistClipEdit {
-                    position_ticks: start_changed.then_some(position),
-                    length_ticks: length_changed.then_some(length),
-                    ..PlaylistClipEdit::default()
-                };
-                let updated = self.document.as_mut().is_some_and(|document| {
-                    document
-                        .edit_playlist_clip(arrangement_id, index, edit)
-                        .is_ok()
-                });
-                if updated {
-                    self.stop_project_playback();
-                    self.dirty = true;
-                    self.status = "Playlist clip updated".to_owned();
-                }
-            }
+            duplicate_requested = ui.button("Duplicate after").clicked();
             if ui.button("Deselect").clicked() {
                 self.selected_clip = None;
             }
         });
+        ui.collapsing("Clip data fields", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                item_index_changed = ui
+                    .add(
+                        egui::DragValue::new(&mut item_index)
+                            .prefix("Item index raw ")
+                            .speed(0.1),
+                    )
+                    .changed();
+                raw_track_index_changed = ui
+                    .add(
+                        egui::DragValue::new(&mut raw_track_index)
+                            .prefix("Track index raw ")
+                            .speed(0.1),
+                    )
+                    .changed();
+                group_changed = ui
+                    .add(
+                        egui::DragValue::new(&mut group)
+                            .prefix("Group raw ")
+                            .speed(0.1),
+                    )
+                    .changed();
+                item_flags_changed = ui
+                    .add(
+                        egui::DragValue::new(&mut item_flags)
+                            .prefix("Flags raw ")
+                            .speed(0.1),
+                    )
+                    .changed();
+            });
+            ui.horizontal_wrapped(|ui| {
+                start_offset_changed = ui
+                    .add(
+                        egui::DragValue::new(&mut start_offset)
+                            .prefix("Start offset ")
+                            .speed(0.001),
+                    )
+                    .changed();
+                end_offset_changed = ui
+                    .add(
+                        egui::DragValue::new(&mut end_offset)
+                            .prefix("End offset ")
+                            .speed(0.001),
+                    )
+                    .changed();
+                if clip.scale.is_some() {
+                    scale_changed = ui
+                        .add(
+                            egui::DragValue::new(&mut scale)
+                                .prefix("Scale ")
+                                .speed(0.001),
+                        )
+                        .changed();
+                } else {
+                    ui.label("Scale unavailable in this record layout");
+                }
+            });
+        });
+        let mut clip_edit_succeeded = true;
+        if position_changed
+            || length_changed
+            || item_index_changed
+            || raw_track_index_changed
+            || group_changed
+            || item_flags_changed
+            || start_offset_changed
+            || end_offset_changed
+            || scale_changed
+        {
+            let edit = PlaylistClipEdit {
+                position_ticks: position_changed.then_some(position),
+                length_ticks: length_changed.then_some(length),
+                item_index: item_index_changed.then_some(item_index),
+                raw_track_index: raw_track_index_changed.then_some(raw_track_index),
+                group: group_changed.then_some(group),
+                item_flags: item_flags_changed.then_some(item_flags),
+                start_offset: start_offset_changed.then_some(start_offset),
+                end_offset: end_offset_changed.then_some(end_offset),
+                scale: scale_changed.then_some(scale),
+            };
+            if let Some(document) = self.document.as_mut() {
+                match document.edit_playlist_clip(arrangement_id, index, edit) {
+                    Ok(()) => {
+                        self.stop_project_playback();
+                        self.dirty = true;
+                        self.status = "Playlist clip updated".to_owned();
+                    }
+                    Err(error) => {
+                        clip_edit_succeeded = false;
+                        self.status = format!("Could not update Playlist clip: {error}");
+                    }
+                }
+            }
+        }
+        if duplicate_requested && clip_edit_succeeded {
+            let duplicate_position = position.saturating_add(length);
+            if let Some(document) = self.document.as_mut() {
+                match document.duplicate_playlist_clip(
+                    arrangement_id,
+                    index,
+                    Some(duplicate_position),
+                    None,
+                ) {
+                    Ok(duplicate_index) => {
+                        self.stop_project_playback();
+                        self.selected_clip = Some(duplicate_index);
+                        self.dirty = true;
+                        self.status = format!("Duplicated Playlist clip {}", index + 1);
+                    }
+                    Err(error) => {
+                        self.status = format!("Could not duplicate Playlist clip: {error}");
+                    }
+                }
+            }
+        }
+    }
+
+    fn time_marker_editor(
+        &mut self,
+        ui: &mut egui::Ui,
+        arrangement_id: u16,
+        markers: &[TimeMarker],
+    ) {
+        if self
+            .selected_time_marker
+            .is_some_and(|index| index >= markers.len())
+        {
+            self.selected_time_marker = None;
+        }
+
+        let selected_label = self
+            .selected_time_marker
+            .and_then(|index| markers.get(index).map(|marker| (index, marker)))
+            .map(|(index, marker)| {
+                marker.name().map(str::to_owned).unwrap_or_else(|| {
+                    format!("Marker {} at {}", index + 1, marker.position_ticks())
+                })
+            })
+            .unwrap_or_else(|| "Select marker".to_owned());
+
+        let mut delete_selected = false;
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.strong("Time markers");
+            egui::ComboBox::from_id_salt("playlist-time-marker-select")
+                .selected_text(selected_label)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.selected_time_marker, None, "Select marker");
+                    for (index, marker) in markers.iter().enumerate() {
+                        let label = marker.name().map(str::to_owned).unwrap_or_else(|| {
+                            format!("Marker {} at {}", index + 1, marker.position_ticks())
+                        });
+                        ui.selectable_value(&mut self.selected_time_marker, Some(index), label);
+                    }
+                });
+            delete_selected = ui
+                .add_enabled(
+                    self.selected_time_marker.is_some(),
+                    egui::Button::new("Delete marker"),
+                )
+                .clicked();
+        });
+
+        let mut marker_edit = None;
+        if let Some((index, marker)) = self
+            .selected_time_marker
+            .and_then(|index| markers.get(index).map(|marker| (index, marker)))
+        {
+            let mut position = marker.position_ticks();
+            let mut name = marker.name().unwrap_or_default().to_owned();
+            let mut numerator = marker.numerator().unwrap_or(4);
+            let mut denominator = marker.denominator().unwrap_or(4);
+            ui.horizontal(|ui| {
+                ui.label("Position");
+                let position_changed = ui
+                    .add(egui::DragValue::new(&mut position).speed(1.0))
+                    .changed();
+                ui.label(if marker.is_signature() {
+                    "Time signature"
+                } else {
+                    "Time marker"
+                });
+                let mut numerator_changed = false;
+                let mut denominator_changed = false;
+                if marker.is_signature() {
+                    numerator_changed = ui
+                        .add(egui::DragValue::new(&mut numerator).speed(1.0))
+                        .changed();
+                    ui.label("/");
+                    denominator_changed = ui
+                        .add(egui::DragValue::new(&mut denominator).speed(1.0))
+                        .changed();
+                }
+                ui.label("Name");
+                let name_changed = ui.text_edit_singleline(&mut name).changed();
+                if position_changed || numerator_changed || denominator_changed || name_changed {
+                    let meter_changed = numerator_changed || denominator_changed;
+                    marker_edit = Some((
+                        index,
+                        TimeMarkerEdit {
+                            position_ticks: position_changed.then_some(position),
+                            numerator: (marker.is_signature() && meter_changed)
+                                .then_some(numerator),
+                            denominator: (marker.is_signature() && meter_changed)
+                                .then_some(denominator),
+                            name: name_changed.then_some(name),
+                            ..TimeMarkerEdit::default()
+                        },
+                    ));
+                }
+            });
+        }
+
+        let mut create_marker = false;
+        ui.horizontal(|ui| {
+            ui.label("New");
+            ui.label("Position");
+            ui.add(egui::DragValue::new(&mut self.new_time_marker_position).speed(1.0));
+            ui.checkbox(&mut self.new_time_marker_is_signature, "Time signature");
+            if self.new_time_marker_is_signature {
+                ui.add(egui::DragValue::new(&mut self.new_time_marker_numerator).speed(1.0));
+                ui.label("/");
+                ui.add(egui::DragValue::new(&mut self.new_time_marker_denominator).speed(1.0));
+            }
+            ui.text_edit_singleline(&mut self.new_time_marker_name);
+            create_marker = ui.button("Add marker").clicked();
+        });
+
+        if delete_selected {
+            if let Some(marker_index) = self.selected_time_marker {
+                let deleted = self.document.as_mut().is_some_and(|document| {
+                    document
+                        .delete_time_marker(arrangement_id, marker_index)
+                        .is_ok()
+                });
+                if deleted {
+                    self.stop_project_playback();
+                    self.selected_time_marker = None;
+                    self.dirty = true;
+                    self.status = format!("Deleted time marker {}", marker_index + 1);
+                } else {
+                    self.status = "Could not delete the selected time marker".to_owned();
+                }
+            }
+        } else if create_marker {
+            let edit = TimeMarkerEdit {
+                position_ticks: Some(self.new_time_marker_position),
+                is_signature: Some(self.new_time_marker_is_signature),
+                numerator: self
+                    .new_time_marker_is_signature
+                    .then_some(self.new_time_marker_numerator.max(1)),
+                denominator: self
+                    .new_time_marker_is_signature
+                    .then_some(self.new_time_marker_denominator.max(1)),
+                name: (!self.new_time_marker_name.is_empty())
+                    .then(|| self.new_time_marker_name.clone()),
+            };
+            let result = self
+                .document
+                .as_mut()
+                .ok_or_else(|| "no project is open".to_owned())
+                .and_then(|document| {
+                    document
+                        .create_time_marker(arrangement_id, edit)
+                        .map_err(|error| error.to_string())
+                });
+            match result {
+                Ok(marker_index) => {
+                    self.stop_project_playback();
+                    self.selected_time_marker = Some(marker_index);
+                    self.new_time_marker_name.clear();
+                    self.dirty = true;
+                    self.status = format!("Created time marker {}", marker_index + 1);
+                }
+                Err(error) => self.status = format!("Could not create time marker: {error}"),
+            }
+        } else if let Some((marker_index, edit)) = marker_edit {
+            let result = self
+                .document
+                .as_mut()
+                .ok_or_else(|| "no project is open".to_owned())
+                .and_then(|document| {
+                    document
+                        .edit_time_marker(arrangement_id, marker_index, edit)
+                        .map_err(|error| error.to_string())
+                });
+            match result {
+                Ok(()) => {
+                    self.stop_project_playback();
+                    self.dirty = true;
+                    self.status = format!("Updated time marker {}", marker_index + 1);
+                }
+                Err(error) => self.status = format!("Could not update time marker: {error}"),
+            }
+        }
     }
 
     fn channel_rack(&mut self, ui: &mut egui::Ui) {
@@ -1687,16 +3839,74 @@ impl DawUi {
         };
         let channels = document.channels();
         let plugin_states = document.channel_plugin_states();
+        let patterns = document.patterns().unwrap_or_default();
+        if self
+            .selected_graph_channel
+            .is_none_or(|id| !channels.iter().any(|channel| channel.id() == id))
+        {
+            self.selected_graph_channel = channels.first().map(|channel| channel.id());
+        }
+        if self
+            .selected_pattern
+            .is_none_or(|id| !patterns.iter().any(|pattern| pattern.id == id))
+        {
+            self.selected_pattern = patterns.first().map(|pattern| pattern.id);
+        }
+        let ppq = u64::from(document.header().ppq().max(1));
+        let (numerator, denominator) = document.metadata().time_signature().unwrap_or((4, 4));
+        let measure_ticks = ppq
+            .saturating_mul(u64::from(numerator.max(1)))
+            .saturating_mul(4)
+            .checked_div(u64::from(denominator.max(1)))
+            .unwrap_or(1)
+            .max(1);
+        let step_ticks = (ppq / 4).max(1);
+        let steps_per_bar = measure_ticks
+            .saturating_add(step_ticks - 1)
+            .checked_div(step_ticks)
+            .unwrap_or(1)
+            .clamp(1, 64) as usize;
         let mut open_editor = None;
         let mut level_edits = Vec::new();
         let mut layer_edits = Vec::new();
+        let mut layer_flag_edits = Vec::new();
+        let mut step_toggles = Vec::new();
         ui.horizontal(|ui| {
             ui.strong("Channel Rack");
             ui.separator();
-            ui.label("All");
-            ui.label("Audio");
-            ui.label("Automation");
+            ui.label("Pattern");
+            egui::ComboBox::from_id_salt("channel-rack-pattern-picker")
+                .selected_text(format!("Pattern {}", self.selected_pattern.unwrap_or(0)))
+                .show_ui(ui, |ui| {
+                    for pattern in &patterns {
+                        ui.selectable_value(
+                            &mut self.selected_pattern,
+                            Some(pattern.id),
+                            pattern
+                                .name
+                                .as_deref()
+                                .map_or_else(|| format!("Pattern {}", pattern.id), str::to_owned),
+                        );
+                    }
+                });
+            if ui.small_button("◀").clicked() {
+                self.step_sequencer_bar = self.step_sequencer_bar.saturating_sub(1);
+            }
+            if ui.small_button("▶").clicked() {
+                self.step_sequencer_bar = self.step_sequencer_bar.saturating_add(1);
+            }
+            ui.label(format!("Bar {}", self.step_sequencer_bar + 1));
+            if ui
+                .selectable_label(self.step_graph_editor_open, "Graph editor (Ctrl/Cmd+K)")
+                .clicked()
+            {
+                self.step_graph_editor_open = !self.step_graph_editor_open;
+            }
         });
+        let selected_pattern = self
+            .selected_pattern
+            .and_then(|pattern_id| patterns.iter().find(|pattern| pattern.id == pattern_id))
+            .cloned();
         ui.separator();
         egui::ScrollArea::vertical().show(ui, |ui| {
             for channel in &channels {
@@ -1706,6 +3916,10 @@ impl DawUi {
                 let mut volume_changed = false;
                 let mut pan_changed = false;
                 let mut layer_child_apply = None;
+                let mut layer_flags_apply = None;
+                let layer_flags = channel.layer_flags();
+                let mut layer_random = channel.layer_random_enabled().unwrap_or(false);
+                let mut layer_crossfade = channel.layer_crossfade_enabled().unwrap_or(false);
                 egui::Frame::new()
                     .fill(PANEL_DARK)
                     .inner_margin(4.0)
@@ -1840,6 +4054,32 @@ impl DawUi {
                                 layer_child_apply = Some(selected_children);
                             }
                         }
+                        if channel.layer_child_ids().is_some() {
+                            ui.horizontal(|ui| {
+                                ui.label("Layer flags");
+                                let random_changed = ui
+                                    .add_enabled(
+                                        layer_flags.is_some(),
+                                        egui::Checkbox::new(&mut layer_random, "Random"),
+                                    )
+                                    .changed();
+                                let crossfade_changed = ui
+                                    .add_enabled(
+                                        layer_flags.is_some(),
+                                        egui::Checkbox::new(&mut layer_crossfade, "Crossfade"),
+                                    )
+                                    .changed();
+                                if random_changed || crossfade_changed {
+                                    layer_flags_apply = Some((
+                                        random_changed.then_some(layer_random),
+                                        crossfade_changed.then_some(layer_crossfade),
+                                    ));
+                                }
+                                if layer_flags.is_none() {
+                                    ui.small("No recognized flags event");
+                                }
+                            });
+                        }
                     });
                 if volume_changed || pan_changed {
                     level_edits.push((channel.id(), volume, pan));
@@ -1847,14 +4087,117 @@ impl DawUi {
                 if let Some(children) = layer_child_apply {
                     layer_edits.push((channel.id(), children));
                 }
+                if let Some((random, crossfade)) = layer_flags_apply {
+                    layer_flag_edits.push((channel.id(), random, crossfade));
+                }
+                if let Some(pattern) = &selected_pattern {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.small("Steps");
+                        let mut channel_note_index = 0usize;
+                        for step in 0..steps_per_bar {
+                            let tick = u64::from(self.step_sequencer_bar)
+                                .saturating_mul(measure_ticks)
+                                .saturating_add((step as u64).saturating_mul(step_ticks));
+                            let position = tick.min(u64::from(u32::MAX)) as u32;
+                            let step_end = tick.saturating_add(step_ticks);
+                            let mut active_note = None;
+                            for note in pattern
+                                .notes
+                                .iter()
+                                .filter(|note| note.channel_id == channel.id())
+                            {
+                                let note_tick = u64::from(note.position);
+                                if note_tick >= tick && note_tick < step_end {
+                                    active_note = Some(channel_note_index);
+                                    break;
+                                }
+                                channel_note_index += 1;
+                            }
+                            let active = active_note.is_some();
+                            if ui
+                                .selectable_label(active, format!("{:02}", step + 1))
+                                .clicked()
+                            {
+                                step_toggles.push((channel.id(), active_note, position));
+                            }
+                            channel_note_index = 0;
+                        }
+                    });
+                }
                 ui.add_space(2.0);
             }
             ui.separator();
             ui.label(
-                egui::RichText::new("Step data and plug-in editors are not connected yet")
+                egui::RichText::new(
+                    "Click a step to add or remove a C5 note at sixteenth-note resolution. Use the graph editor for note and event values.",
+                )
                     .color(MUTED),
             );
+            if self.step_graph_editor_open {
+                if let Some(pattern) = selected_pattern.as_ref() {
+                    self.step_graph_editor(
+                        ui,
+                        pattern,
+                        &channels,
+                        steps_per_bar,
+                        measure_ticks,
+                        step_ticks,
+                    );
+                } else {
+                    ui.small("Select or create a pattern to edit its Graph Editor values.");
+                }
+            }
         });
+        if let Some(pattern_id) = self.selected_pattern
+            && !step_toggles.is_empty()
+        {
+            let results = if let Some(document) = self.document.as_mut() {
+                step_toggles
+                    .into_iter()
+                    .map(|(channel_id, note_index, position)| {
+                        let removing = note_index.is_some();
+                        let result = if let Some(note_index) = note_index {
+                            document.delete_pattern_note(pattern_id, channel_id, note_index)
+                        } else {
+                            document.add_pattern_note(
+                                pattern_id,
+                                PatternNote {
+                                    position,
+                                    channel_id,
+                                    length: step_ticks.min(u64::from(u32::MAX)) as u32,
+                                    key: 60,
+                                    velocity: 100,
+                                    ..PatternNote::default()
+                                },
+                            )
+                        };
+                        (
+                            channel_id,
+                            removing,
+                            result.map_err(|error| error.to_string()),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            for (channel_id, removing, result) in results {
+                match result {
+                    Ok(()) => {
+                        self.stop_project_playback();
+                        self.dirty = true;
+                        self.status = if removing {
+                            format!("Removed step from pattern {pattern_id}, channel {channel_id}")
+                        } else {
+                            format!("Added step to pattern {pattern_id}, channel {channel_id}")
+                        };
+                    }
+                    Err(error) => {
+                        self.status = format!("Could not edit step: {error}");
+                    }
+                }
+            }
+        }
         if !level_edits.is_empty()
             && let Some(document) = self.document.as_mut()
         {
@@ -1883,12 +4226,372 @@ impl DawUi {
                 }
             }
         }
+        if !layer_flag_edits.is_empty()
+            && let Some(document) = self.document.as_mut()
+        {
+            for (channel_id, random, crossfade) in layer_flag_edits {
+                match document.set_layer_flags(channel_id, random, crossfade) {
+                    Ok(()) => {
+                        self.dirty = true;
+                        self.status = format!("Layer channel {channel_id} flags updated");
+                    }
+                    Err(error) => {
+                        self.status = format!("Could not update Layer flags: {error}");
+                    }
+                }
+            }
+        }
         if let Some(instance_id) = open_editor
             && let Some(host) = &mut self.vst3_host
         {
             match host.open_editor(instance_id) {
                 Ok(()) => self.status = "VST3 editor opened from Channel Rack".to_owned(),
                 Err(error) => self.status = format!("Could not open VST3 editor: {error}"),
+            }
+        }
+    }
+
+    fn step_graph_editor(
+        &mut self,
+        ui: &mut egui::Ui,
+        pattern: &Pattern,
+        channels: &[ChannelSummary],
+        steps_per_bar: usize,
+        measure_ticks: u64,
+        step_ticks: u64,
+    ) {
+        if channels.is_empty() {
+            ui.small("No channels are available for the Graph Editor.");
+            return;
+        }
+        if self
+            .selected_graph_channel
+            .is_none_or(|id| !channels.iter().any(|channel| channel.id() == id))
+        {
+            self.selected_graph_channel = channels.first().map(|channel| channel.id());
+        }
+
+        ui.separator();
+        ui.horizontal_wrapped(|ui| {
+            ui.strong("Graph Editor");
+            ui.separator();
+            let selected_channel_name = self
+                .selected_graph_channel
+                .and_then(|id| channels.iter().find(|channel| channel.id() == id))
+                .and_then(ChannelSummary::display_name)
+                .unwrap_or("Channel");
+            egui::ComboBox::from_id_salt(("step-graph-channel", pattern.id))
+                .selected_text(selected_channel_name)
+                .show_ui(ui, |ui| {
+                    for channel in channels {
+                        ui.selectable_value(
+                            &mut self.selected_graph_channel,
+                            Some(channel.id()),
+                            format!(
+                                "{} · {}",
+                                channel.display_name().unwrap_or("Channel"),
+                                channel.id()
+                            ),
+                        );
+                    }
+                });
+            ui.separator();
+            for mode in StepGraphMode::ALL {
+                ui.selectable_value(&mut self.step_graph_mode, mode, mode.label());
+            }
+        });
+        let Some(channel_id) = self.selected_graph_channel else {
+            return;
+        };
+        let channel_name = channels
+            .iter()
+            .find(|channel| channel.id() == channel_id)
+            .and_then(ChannelSummary::display_name)
+            .unwrap_or("Channel");
+        ui.small(format!(
+            "Pattern {} · {} · bar {} · click or drag to set {}",
+            pattern.id,
+            channel_name,
+            self.step_sequencer_bar + 1,
+            self.step_graph_mode.label().to_lowercase()
+        ));
+
+        let graph_size = Vec2::new(ui.available_width().max(280.0), 142.0);
+        let (graph_rect, graph_response) =
+            ui.allocate_exact_size(graph_size, Sense::click_and_drag());
+        let graph_response = graph_response.on_hover_text(
+            "Left-click or drag to edit. Right-drag ramps values across steps. Clicking an empty step adds a C5 note.",
+        );
+        let painter = ui.painter_at(graph_rect);
+        painter.rect_filled(graph_rect, egui::CornerRadius::same(3), PANEL_DARK);
+        painter.rect_stroke(
+            graph_rect,
+            egui::CornerRadius::same(3),
+            Stroke::new(1.0, GRID),
+            egui::StrokeKind::Inside,
+        );
+        let plot_rect = egui::Rect::from_min_max(
+            egui::pos2(graph_rect.left() + 3.0, graph_rect.top() + 18.0),
+            egui::pos2(graph_rect.right() - 3.0, graph_rect.bottom() - 17.0),
+        );
+        let step_count = steps_per_bar.max(1);
+        let step_width = plot_rect.width() / step_count as f32;
+        let mode = self.step_graph_mode;
+        let maximum = mode.maximum();
+        let notes = pattern
+            .notes
+            .iter()
+            .filter(|note| note.channel_id == channel_id)
+            .enumerate()
+            .collect::<Vec<_>>();
+
+        for step in 0..step_count {
+            let x0 = plot_rect.left() + step as f32 * step_width;
+            let x1 = plot_rect.left() + (step + 1) as f32 * step_width;
+            let cell = egui::Rect::from_min_max(
+                egui::pos2(x0, plot_rect.top()),
+                egui::pos2(x1, plot_rect.bottom()),
+            );
+            painter.rect_filled(
+                cell,
+                0,
+                if step % 2 == 0 {
+                    PANEL_DARK
+                } else {
+                    PANEL.gamma_multiply(0.7)
+                },
+            );
+            let tick = u64::from(self.step_sequencer_bar)
+                .saturating_mul(measure_ticks)
+                .saturating_add((step as u64).saturating_mul(step_ticks));
+            let step_end = tick.saturating_add(step_ticks);
+            let active_note = notes
+                .iter()
+                .find(|(_, note)| {
+                    let note_tick = u64::from(note.position);
+                    note_tick >= tick && note_tick < step_end
+                })
+                .map(|(note_index, note)| (*note_index, *note));
+
+            painter.line_segment(
+                [
+                    egui::pos2(x0, plot_rect.top()),
+                    egui::pos2(x0, plot_rect.bottom()),
+                ],
+                Stroke::new(if step % 4 == 0 { 1.0 } else { 0.5 }, GRID),
+            );
+            if let Some((_, note)) = active_note {
+                let value = mode.value(note, tick, step_ticks);
+                let value_y = plot_rect.bottom() - value / maximum * plot_rect.height();
+                let baseline_y = mode.center().map_or(plot_rect.bottom(), |center| {
+                    plot_rect.bottom() - center / maximum * plot_rect.height()
+                });
+                let mut top = value_y.min(baseline_y);
+                let mut bottom = value_y.max(baseline_y);
+                if bottom - top < 2.0 {
+                    top = (top - 1.0).max(plot_rect.top());
+                    bottom = (bottom + 1.0).min(plot_rect.bottom());
+                }
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(x0 + 2.0, top),
+                        egui::pos2((x1 - 2.0).max(x0 + 3.0), bottom),
+                    ),
+                    1,
+                    ORANGE,
+                );
+            }
+            if step % 4 == 0 || step_count <= 16 {
+                painter.text(
+                    egui::pos2((x0 + x1) * 0.5, plot_rect.bottom() + 3.0),
+                    Align2::CENTER_TOP,
+                    format!("{:02}", step + 1),
+                    FontId::proportional(8.0),
+                    MUTED,
+                );
+            }
+        }
+        painter.line_segment(
+            [
+                egui::pos2(plot_rect.right(), plot_rect.top()),
+                egui::pos2(plot_rect.right(), plot_rect.bottom()),
+            ],
+            Stroke::new(1.0, GRID),
+        );
+        if let Some(center) = mode.center() {
+            let y = plot_rect.bottom() - center / maximum * plot_rect.height();
+            painter.line_segment(
+                [
+                    egui::pos2(plot_rect.left(), y),
+                    egui::pos2(plot_rect.right(), y),
+                ],
+                Stroke::new(1.0, MUTED.gamma_multiply(0.8)),
+            );
+        }
+
+        let pointer = graph_response.interact_pointer_pos();
+        let pointer_value = |pointer: egui::Pos2| {
+            ((plot_rect.bottom() - pointer.y) / plot_rect.height() * maximum).clamp(0.0, maximum)
+        };
+        let step_at = |pointer: egui::Pos2| {
+            (((pointer.x - plot_rect.left()) / step_width).floor() as usize).min(step_count - 1)
+        };
+        let secondary_pressed =
+            ui.input(|input| input.pointer.button_pressed(PointerButton::Secondary));
+        let secondary_down = ui.input(|input| input.pointer.button_down(PointerButton::Secondary));
+        let secondary_released =
+            ui.input(|input| input.pointer.button_released(PointerButton::Secondary));
+        if secondary_pressed
+            && let Some(pointer) = pointer
+            && plot_rect.contains(pointer)
+        {
+            self.step_graph_ramp = None;
+            let start_step = step_at(pointer);
+            let tick = u64::from(self.step_sequencer_bar)
+                .saturating_mul(measure_ticks)
+                .saturating_add((start_step as u64).saturating_mul(step_ticks));
+            let step_end = tick.saturating_add(step_ticks);
+            if let Some((_, note)) = notes.iter().find(|(_, note)| {
+                let note_tick = u64::from(note.position);
+                note_tick >= tick && note_tick < step_end
+            }) {
+                self.step_graph_ramp = Some(StepGraphRamp {
+                    pattern_id: pattern.id,
+                    channel_id,
+                    mode,
+                    start_step,
+                    start_value: mode.value(note, tick, step_ticks),
+                });
+            }
+        }
+        if self.step_graph_ramp.is_some_and(|ramp| {
+            ramp.pattern_id != pattern.id || ramp.channel_id != channel_id || ramp.mode != mode
+        }) {
+            self.step_graph_ramp = None;
+        }
+
+        let mut graph_actions = Vec::new();
+        if (graph_response.clicked_by(PointerButton::Primary)
+            || graph_response.dragged_by(PointerButton::Primary))
+            && let Some(pointer) = graph_response.interact_pointer_pos()
+            && plot_rect.contains(pointer)
+        {
+            let step = step_at(pointer);
+            let tick = u64::from(self.step_sequencer_bar)
+                .saturating_mul(measure_ticks)
+                .saturating_add((step as u64).saturating_mul(step_ticks));
+            let position = tick.min(u64::from(u32::MAX)) as u32;
+            let step_end = tick.saturating_add(step_ticks);
+            let note_index = notes
+                .iter()
+                .find(|(_, note)| {
+                    let note_tick = u64::from(note.position);
+                    note_tick >= tick && note_tick < step_end
+                })
+                .map(|(note_index, _)| *note_index);
+            graph_actions.push((step, position, note_index, pointer_value(pointer)));
+        }
+
+        if graph_response.dragged_by(PointerButton::Secondary)
+            && secondary_down
+            && let (Some(ramp), Some(pointer)) = (self.step_graph_ramp, pointer)
+        {
+            let end_step = step_at(pointer);
+            let end_value = pointer_value(pointer);
+            let denominator = end_step as f32 - ramp.start_step as f32;
+            for step in ramp.start_step.min(end_step)..=ramp.start_step.max(end_step) {
+                let progress = if denominator == 0.0 {
+                    0.0
+                } else {
+                    (step as f32 - ramp.start_step as f32) / denominator
+                };
+                let value = ramp.start_value + (end_value - ramp.start_value) * progress;
+                let tick = u64::from(self.step_sequencer_bar)
+                    .saturating_mul(measure_ticks)
+                    .saturating_add((step as u64).saturating_mul(step_ticks));
+                let step_end = tick.saturating_add(step_ticks);
+                let note_index = notes
+                    .iter()
+                    .find(|(_, note)| {
+                        let note_tick = u64::from(note.position);
+                        note_tick >= tick && note_tick < step_end
+                    })
+                    .map(|(note_index, _)| *note_index);
+                if let Some(note_index) = note_index {
+                    graph_actions.push((
+                        step,
+                        tick.min(u64::from(u32::MAX)) as u32,
+                        Some(note_index),
+                        value.clamp(0.0, maximum),
+                    ));
+                }
+            }
+        }
+        if secondary_released {
+            self.step_graph_ramp = None;
+        }
+
+        if !graph_actions.is_empty() {
+            let pattern_id = pattern.id;
+            let mut updated = self.document.clone();
+            let result = if let Some(document) = updated.as_mut() {
+                graph_actions.iter().try_for_each(
+                    |(_, position, note_index, value)| -> Result<(), _> {
+                        let edit = mode.edit(*value, u64::from(*position), step_ticks);
+                        if let Some(note_index) = note_index {
+                            document.edit_pattern_note(pattern_id, channel_id, *note_index, edit)
+                        } else {
+                            let mut note = PatternNote {
+                                position: *position,
+                                channel_id,
+                                length: step_ticks.min(u64::from(u32::MAX)) as u32,
+                                key: 60,
+                                velocity: 100,
+                                ..PatternNote::default()
+                            };
+                            mode.apply_to_note(&mut note, *value, u64::from(*position), step_ticks);
+                            document.add_pattern_note(pattern_id, note)
+                        }
+                    },
+                )
+            } else {
+                return;
+            };
+            match result {
+                Ok(()) => {
+                    self.document = updated;
+                    self.stop_project_playback();
+                    self.dirty = true;
+                    let first_step = graph_actions
+                        .first()
+                        .map(|action| action.0 + 1)
+                        .unwrap_or(1);
+                    let last_step = graph_actions
+                        .last()
+                        .map(|action| action.0 + 1)
+                        .unwrap_or(first_step);
+                    self.status = if graph_actions.len() > 1 {
+                        format!(
+                            "Ramped {} across bar {} steps {}–{} in pattern {}",
+                            mode.label().to_lowercase(),
+                            self.step_sequencer_bar + 1,
+                            first_step.min(last_step),
+                            first_step.max(last_step),
+                            pattern_id
+                        )
+                    } else {
+                        format!(
+                            "Updated {} on bar {} step {} in pattern {}",
+                            mode.label().to_lowercase(),
+                            self.step_sequencer_bar + 1,
+                            first_step,
+                            pattern_id
+                        )
+                    };
+                }
+                Err(error) => {
+                    self.status = format!("Could not update Graph Editor value: {error}");
+                }
             }
         }
     }
@@ -2253,6 +4956,68 @@ impl DawUi {
         }
     }
 
+    fn apply_piano_roll_selection_command(&mut self, command: PianoRollSelectionCommand) {
+        let target = self.selected_pattern.zip(self.selected_note_channel);
+        let note_ids = target
+            .and_then(|(pattern_id, channel_id)| {
+                self.document.as_ref().and_then(|document| {
+                    document.patterns().ok().and_then(|patterns| {
+                        patterns
+                            .iter()
+                            .find(|pattern| pattern.id == pattern_id)
+                            .map(|pattern| {
+                                pattern
+                                    .notes
+                                    .iter()
+                                    .filter(|note| note.channel_id == channel_id)
+                                    .enumerate()
+                                    .map(|(note_index, _)| (pattern_id, channel_id, note_index))
+                                    .collect::<Vec<_>>()
+                            })
+                    })
+                })
+            })
+            .unwrap_or_default();
+
+        let previous = self
+            .selected_piano_notes
+            .iter()
+            .filter(|(pattern_id, channel_id, _)| {
+                target.is_some_and(|target| (*pattern_id, *channel_id) == target)
+            })
+            .copied()
+            .collect::<BTreeSet<_>>();
+        self.selected_piano_notes.clear();
+        match command {
+            PianoRollSelectionCommand::All => {
+                self.selected_piano_notes.extend(note_ids);
+            }
+            PianoRollSelectionCommand::Invert => {
+                self.selected_piano_notes.extend(
+                    note_ids
+                        .into_iter()
+                        .filter(|note_id| !previous.contains(note_id)),
+                );
+            }
+            PianoRollSelectionCommand::Clear => {}
+        }
+        self.selected_note = self.selected_piano_notes.iter().next_back().copied();
+        self.piano_roll_selection_drag = None;
+        self.active_note_drag = None;
+        self.status = match command {
+            PianoRollSelectionCommand::All => {
+                format!("Selected {} notes", self.selected_piano_notes.len())
+            }
+            PianoRollSelectionCommand::Invert => {
+                format!(
+                    "Inverted selection: {} notes selected",
+                    self.selected_piano_notes.len()
+                )
+            }
+            PianoRollSelectionCommand::Clear => "Note selection cleared".to_owned(),
+        };
+    }
+
     fn piano_roll(&mut self, ui: &mut egui::Ui) {
         let Some(document) = self.document.as_ref() else {
             empty_view(ui, "Open a project to see its Piano roll");
@@ -2274,6 +5039,7 @@ impl DawUi {
         }
         if self
             .active_note_drag
+            .as_ref()
             .is_some_and(|drag| Some(drag.pattern_id) != self.selected_pattern)
         {
             self.active_note_drag = None;
@@ -2283,6 +5049,12 @@ impl DawUi {
             .is_none_or(|id| !channels.iter().any(|channel| channel.id() == id))
         {
             self.selected_note_channel = channels.first().map(|channel| channel.id());
+        }
+        if self
+            .piano_roll_selection_drag
+            .is_some_and(|drag| Some(drag.pattern_id) != self.selected_pattern)
+        {
+            self.piano_roll_selection_drag = None;
         }
         let selected_channel_label = self
             .selected_note_channel
@@ -2315,7 +5087,103 @@ impl DawUi {
         let mut render_requested = false;
         let mut preview_requested = false;
         let mut sampler_preview_requested = false;
-        ui.horizontal(|ui| {
+        let mut quantize_requested = false;
+        let mut legato_requested = false;
+        let mut chop_requested = false;
+        let mut glue_requested = false;
+        let mut flip_requested = false;
+        let mut strum_requested = false;
+        let mut flam_requested = false;
+        let mut randomize_requested = false;
+        let mut humanize_requested = false;
+        let mut limit_requested = false;
+        let mut arpeggiate_requested = false;
+        let mut slice_requested = false;
+        let mut delete_selection_requested = false;
+        let mut duplicate_notes_requested = false;
+        let mut quantize_selected_requested = false;
+        if ui.memory(|memory| memory.focused().is_none()) {
+            let select_all_notes =
+                ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::A));
+            let invert_note_selection =
+                ui.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::I));
+            let clear_note_selection =
+                ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::D));
+            duplicate_notes_requested =
+                ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::B));
+            let select_draw =
+                ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::P));
+            let select_paint =
+                ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::B));
+            let select_select =
+                ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::E));
+            let select_zoom =
+                ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Z));
+            let select_playback =
+                ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Y));
+            let cycle_event_target =
+                ui.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::F));
+            if select_all_notes {
+                self.apply_piano_roll_selection_command(PianoRollSelectionCommand::All);
+            } else if invert_note_selection {
+                self.apply_piano_roll_selection_command(PianoRollSelectionCommand::Invert);
+            } else if clear_note_selection {
+                self.apply_piano_roll_selection_command(PianoRollSelectionCommand::Clear);
+            }
+            if cycle_event_target {
+                let current = PianoRollEventTarget::ALL
+                    .iter()
+                    .position(|target| *target == self.piano_roll_event_target)
+                    .unwrap_or(0);
+                self.piano_roll_event_target =
+                    PianoRollEventTarget::ALL[(current + 1) % PianoRollEventTarget::ALL.len()];
+            }
+            if select_draw {
+                self.piano_roll_paint_mode = false;
+                self.piano_roll_select_mode = false;
+                self.piano_roll_zoom_mode = false;
+                self.piano_roll_playback_mode = false;
+                self.piano_roll_stamp_mode = false;
+            } else if select_paint {
+                self.piano_roll_paint_mode = true;
+                self.piano_roll_select_mode = false;
+                self.piano_roll_zoom_mode = false;
+                self.piano_roll_playback_mode = false;
+                self.piano_roll_stamp_mode = false;
+            } else if select_select {
+                self.piano_roll_paint_mode = false;
+                self.piano_roll_select_mode = true;
+                self.piano_roll_zoom_mode = false;
+                self.piano_roll_playback_mode = false;
+                self.piano_roll_stamp_mode = false;
+            } else if select_zoom {
+                self.piano_roll_paint_mode = false;
+                self.piano_roll_select_mode = false;
+                self.piano_roll_zoom_mode = true;
+                self.piano_roll_playback_mode = false;
+                self.piano_roll_stamp_mode = false;
+            } else if select_playback {
+                self.piano_roll_paint_mode = false;
+                self.piano_roll_select_mode = false;
+                self.piano_roll_zoom_mode = false;
+                self.piano_roll_playback_mode = true;
+                self.piano_roll_stamp_mode = false;
+            }
+        }
+        let selection_pattern_before_toolbar = self.selected_pattern;
+        let selection_channel_before_toolbar = self.selected_note_channel;
+        let selected_quantize_indices = match (self.selected_pattern, self.selected_note_channel) {
+            (Some(pattern_id), Some(channel_id)) => self
+                .selected_piano_notes
+                .iter()
+                .filter(|(selected_pattern, selected_channel, _)| {
+                    *selected_pattern == pattern_id && *selected_channel == channel_id
+                })
+                .map(|(_, _, note_index)| *note_index)
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
+        ui.horizontal_wrapped(|ui| {
             ui.strong("Piano roll");
             ui.separator();
             egui::ComboBox::from_id_salt("pattern-picker")
@@ -2355,6 +5223,289 @@ impl DawUi {
                         ui.selectable_value(&mut self.piano_roll_snap, snap, snap.label());
                     }
                 });
+            egui::ComboBox::from_id_salt("piano-roll-edit-scope")
+                .selected_text(format!("Edit: {}", self.piano_roll_edit_scope.label()))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.piano_roll_edit_scope,
+                        PianoRollEditScope::Automatic,
+                        "Auto (selection if any)",
+                    );
+                    ui.selectable_value(
+                        &mut self.piano_roll_edit_scope,
+                        PianoRollEditScope::Channel,
+                        "Channel",
+                    );
+                    ui.selectable_value(
+                        &mut self.piano_roll_edit_scope,
+                        PianoRollEditScope::Selection,
+                        "Selected notes",
+                    );
+                });
+            egui::ComboBox::from_id_salt("piano-roll-scale-root")
+                .selected_text(format!(
+                    "Key: {}",
+                    PITCH_CLASSES[self.piano_roll_scale_root as usize]
+                ))
+                .show_ui(ui, |ui| {
+                    for (root, label) in PITCH_CLASSES.iter().enumerate() {
+                        ui.selectable_value(&mut self.piano_roll_scale_root, root as u8, *label);
+                    }
+                });
+            egui::ComboBox::from_id_salt("piano-roll-scale")
+                .selected_text(format!("Scale: {}", self.piano_roll_scale.label()))
+                .show_ui(ui, |ui| {
+                    for scale in PianoRollScale::ALL {
+                        ui.selectable_value(&mut self.piano_roll_scale, scale, scale.label());
+                    }
+                });
+            ui.checkbox(&mut self.piano_roll_ghost_channels, "Ghost channels");
+            ui.checkbox(
+                &mut self.piano_roll_color_by_midi_channel,
+                "Color by MIDI channel",
+            );
+            if ui
+                .selectable_label(
+                    !self.piano_roll_paint_mode
+                        && !self.piano_roll_select_mode
+                        && !self.piano_roll_zoom_mode
+                        && !self.piano_roll_playback_mode
+                        && !self.piano_roll_stamp_mode,
+                    "Draw (P)",
+                )
+                .clicked()
+            {
+                self.piano_roll_paint_mode = false;
+                self.piano_roll_select_mode = false;
+                self.piano_roll_zoom_mode = false;
+                self.piano_roll_playback_mode = false;
+                self.piano_roll_stamp_mode = false;
+            }
+            if ui
+                .selectable_label(self.piano_roll_paint_mode, "Paint (B)")
+                .clicked()
+            {
+                self.piano_roll_paint_mode = !self.piano_roll_paint_mode;
+                if self.piano_roll_paint_mode {
+                    self.piano_roll_select_mode = false;
+                    self.piano_roll_zoom_mode = false;
+                    self.piano_roll_playback_mode = false;
+                    self.piano_roll_stamp_mode = false;
+                }
+            }
+            if ui
+                .selectable_label(self.piano_roll_stamp_mode, "Stamp")
+                .clicked()
+            {
+                self.piano_roll_stamp_mode = !self.piano_roll_stamp_mode;
+                if self.piano_roll_stamp_mode {
+                    self.piano_roll_paint_mode = false;
+                    self.piano_roll_select_mode = false;
+                    self.piano_roll_zoom_mode = false;
+                    self.piano_roll_playback_mode = false;
+                }
+            }
+            egui::ComboBox::from_id_salt("piano-roll-chord-stamp")
+                .selected_text(format!("Chord: {}", self.piano_roll_chord_stamp.label()))
+                .show_ui(ui, |ui| {
+                    for stamp in PianoRollChordStamp::ALL {
+                        ui.selectable_value(&mut self.piano_roll_chord_stamp, stamp, stamp.label());
+                    }
+                });
+            if self.piano_roll_stamp_mode {
+                ui.checkbox(&mut self.piano_roll_stamp_only_one, "Only one");
+            }
+            if ui
+                .selectable_label(self.piano_roll_select_mode, "Select (E)")
+                .clicked()
+            {
+                self.piano_roll_select_mode = !self.piano_roll_select_mode;
+                if self.piano_roll_select_mode {
+                    self.piano_roll_paint_mode = false;
+                    self.piano_roll_zoom_mode = false;
+                    self.piano_roll_playback_mode = false;
+                    self.piano_roll_stamp_mode = false;
+                }
+            }
+            ui.menu_button("Selection", |ui| {
+                if ui.button("Select all notes (Ctrl/Cmd+A)").clicked() {
+                    self.apply_piano_roll_selection_command(PianoRollSelectionCommand::All);
+                }
+                if ui.button("Invert selection (Shift+I)").clicked() {
+                    self.apply_piano_roll_selection_command(PianoRollSelectionCommand::Invert);
+                }
+                if ui.button("Deselect notes (Ctrl/Cmd+D)").clicked() {
+                    self.apply_piano_roll_selection_command(PianoRollSelectionCommand::Clear);
+                }
+                if ui.button("Duplicate to right (Ctrl/Cmd+B)").clicked() {
+                    duplicate_notes_requested = true;
+                    ui.close();
+                }
+            });
+            if ui
+                .selectable_label(self.piano_roll_zoom_mode, "Zoom (Z)")
+                .clicked()
+            {
+                self.piano_roll_zoom_mode = !self.piano_roll_zoom_mode;
+                if self.piano_roll_zoom_mode {
+                    self.piano_roll_paint_mode = false;
+                    self.piano_roll_select_mode = false;
+                    self.piano_roll_playback_mode = false;
+                    self.piano_roll_stamp_mode = false;
+                }
+            }
+            if ui
+                .selectable_label(self.piano_roll_playback_mode, "Playback (Y)")
+                .clicked()
+            {
+                self.piano_roll_playback_mode = !self.piano_roll_playback_mode;
+                if self.piano_roll_playback_mode {
+                    self.piano_roll_paint_mode = false;
+                    self.piano_roll_select_mode = false;
+                    self.piano_roll_zoom_mode = false;
+                    self.piano_roll_stamp_mode = false;
+                }
+            }
+            if ui
+                .selectable_label(self.piano_roll_event_editor_open, "Events")
+                .on_hover_text("Show note properties below the grid (Shift+F cycles target)")
+                .clicked()
+            {
+                self.piano_roll_event_editor_open = !self.piano_roll_event_editor_open;
+            }
+            if self.piano_roll_event_editor_open {
+                egui::ComboBox::from_id_salt("piano-roll-event-target")
+                    .selected_text(self.piano_roll_event_target.label())
+                    .show_ui(ui, |ui| {
+                        for target in PianoRollEventTarget::ALL {
+                            ui.selectable_value(
+                                &mut self.piano_roll_event_target,
+                                target,
+                                target.label(),
+                            );
+                        }
+                    });
+            }
+            let zoom_center = self
+                .piano_roll_grid_viewport
+                .map_or(500.0, |viewport| viewport.width() * 0.5);
+            if ui
+                .button("−")
+                .on_hover_text("Zoom out (Page Down)")
+                .clicked()
+            {
+                self.request_piano_roll_zoom(self.piano_roll_zoom / 1.2, zoom_center, zoom_center);
+            }
+            if ui.button("+").on_hover_text("Zoom in (Page Up)").clicked() {
+                self.request_piano_roll_zoom(self.piano_roll_zoom * 1.2, zoom_center, zoom_center);
+            }
+            let mut zoom_slider_value = self.piano_roll_zoom;
+            ui.add(
+                egui::Slider::new(&mut zoom_slider_value, 0.06..=0.24)
+                    .text("Zoom")
+                    .show_value(false),
+            );
+            if (zoom_slider_value - self.piano_roll_zoom).abs() > f32::EPSILON {
+                self.request_piano_roll_zoom(zoom_slider_value, zoom_center, zoom_center);
+            }
+            let edit_selection_only = self.piano_roll_edit_scope == PianoRollEditScope::Selection
+                || (self.piano_roll_edit_scope == PianoRollEditScope::Automatic
+                    && !selected_quantize_indices.is_empty());
+            let edit_target = if edit_selection_only {
+                "selected"
+            } else {
+                "channel"
+            };
+            let edit_scope_available = self.selected_pattern.is_some()
+                && self.selected_note_channel.is_some()
+                && (self.piano_roll_edit_scope != PianoRollEditScope::Selection
+                    || !selected_quantize_indices.is_empty());
+            quantize_requested = ui
+                .add_enabled(
+                    self.selected_pattern.is_some()
+                        && self.selected_note_channel.is_some()
+                        && self.piano_roll_snap != PianoRollSnap::None,
+                    egui::Button::new("Quantize channel"),
+                )
+                .clicked();
+            quantize_selected_requested = ui
+                .add_enabled(
+                    self.selected_pattern.is_some()
+                        && self.selected_note_channel.is_some()
+                        && self.piano_roll_snap != PianoRollSnap::None
+                        && !selected_quantize_indices.is_empty(),
+                    egui::Button::new(format!(
+                        "Quantize selected ({})",
+                        selected_quantize_indices.len()
+                    )),
+                )
+                .clicked();
+            legato_requested = ui
+                .add_enabled(
+                    edit_scope_available,
+                    egui::Button::new(format!("Legato {edit_target}")),
+                )
+                .clicked();
+            chop_requested = ui
+                .add_enabled(
+                    edit_scope_available,
+                    egui::Button::new(format!("Chop {edit_target}")),
+                )
+                .clicked();
+            glue_requested = ui
+                .add_enabled(
+                    edit_scope_available,
+                    egui::Button::new(format!("Glue {edit_target}")),
+                )
+                .clicked();
+            flip_requested = ui
+                .add_enabled(
+                    edit_scope_available,
+                    egui::Button::new(format!("Flip {edit_target}")),
+                )
+                .clicked();
+            strum_requested = ui
+                .add_enabled(
+                    edit_scope_available,
+                    egui::Button::new(format!("Strum {edit_target}")),
+                )
+                .clicked();
+            flam_requested = ui
+                .add_enabled(
+                    edit_scope_available,
+                    egui::Button::new(format!("Flam {edit_target}")),
+                )
+                .clicked();
+            randomize_requested = ui
+                .add_enabled(
+                    edit_scope_available,
+                    egui::Button::new(format!("Randomize {edit_target}")),
+                )
+                .clicked();
+            humanize_requested = ui
+                .add_enabled(
+                    edit_scope_available,
+                    egui::Button::new(format!("Humanize {edit_target}")),
+                )
+                .clicked();
+            limit_requested = ui
+                .add_enabled(
+                    edit_scope_available,
+                    egui::Button::new(format!("Limit {edit_target}")),
+                )
+                .clicked();
+            arpeggiate_requested = ui
+                .add_enabled(
+                    edit_scope_available,
+                    egui::Button::new(format!("Arpeggiate {edit_target}")),
+                )
+                .clicked();
+            slice_requested = ui
+                .add_enabled(
+                    edit_scope_available,
+                    egui::Button::new(format!("Slice {edit_target}")),
+                )
+                .clicked();
             egui::ComboBox::from_id_salt("midi-channel-mapping")
                 .selected_text(match self.midi_channel_mapping {
                     MidiChannelMapping::PreserveNoteChannels => "MIDI channels: Stored",
@@ -2403,6 +5554,277 @@ impl DawUi {
                 .add_enabled(has_sampler_notes, egui::Button::new("Preview Samplers"))
                 .clicked();
             open_midi_requested = ui.button("Open MIDI…").clicked();
+            let selected_note_count = self
+                .selected_pattern
+                .map(|pattern_id| {
+                    self.selected_piano_notes
+                        .iter()
+                        .filter(|(selected_pattern, _, _)| *selected_pattern == pattern_id)
+                        .count()
+                })
+                .unwrap_or(0);
+            delete_selection_requested = ui
+                .add_enabled(
+                    selected_note_count > 0,
+                    egui::Button::new(format!("Delete selection ({selected_note_count})")),
+                )
+                .clicked();
+        });
+
+        if selection_pattern_before_toolbar != self.selected_pattern
+            || selection_channel_before_toolbar != self.selected_note_channel
+        {
+            self.selected_piano_notes.clear();
+            self.selected_note = None;
+            self.piano_roll_selection_drag = None;
+        }
+        if selection_pattern_before_toolbar != self.selected_pattern
+            || selection_channel_before_toolbar != self.selected_note_channel
+        {
+            quantize_selected_requested = false;
+            legato_requested = false;
+            chop_requested = false;
+            glue_requested = false;
+            flip_requested = false;
+            strum_requested = false;
+            flam_requested = false;
+            randomize_requested = false;
+            humanize_requested = false;
+            limit_requested = false;
+            arpeggiate_requested = false;
+            slice_requested = false;
+        }
+
+        let edit_selection_only = self.piano_roll_edit_scope == PianoRollEditScope::Selection
+            || (self.piano_roll_edit_scope == PianoRollEditScope::Automatic
+                && !selected_quantize_indices.is_empty());
+        let edit_scope_description = if edit_selection_only {
+            "selected notes"
+        } else {
+            "channel"
+        };
+
+        if duplicate_notes_requested
+            && let (Some(pattern_id), Some(channel_id)) =
+                (self.selected_pattern, self.selected_note_channel)
+            && let Some(pattern) = patterns.iter().find(|pattern| pattern.id == pattern_id)
+        {
+            let channel_notes = pattern
+                .notes
+                .iter()
+                .filter(|note| note.channel_id == channel_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            let selected_indices = self
+                .selected_piano_notes
+                .iter()
+                .filter(|(selected_pattern, selected_channel, _)| {
+                    *selected_pattern == pattern_id && *selected_channel == channel_id
+                })
+                .map(|(_, _, note_index)| *note_index)
+                .collect::<BTreeSet<_>>();
+            let source_notes = if selected_indices.is_empty() {
+                channel_notes.clone()
+            } else {
+                channel_notes
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| selected_indices.contains(index))
+                    .map(|(_, note)| note.clone())
+                    .collect()
+            };
+            if source_notes.is_empty() {
+                self.status = format!("No notes to duplicate in pattern {pattern_id}");
+            } else {
+                let first_position = source_notes
+                    .iter()
+                    .map(|note| note.position)
+                    .min()
+                    .unwrap_or(0);
+                let last_end = source_notes
+                    .iter()
+                    .map(|note| note.position.saturating_add(note.length))
+                    .max()
+                    .unwrap_or(first_position);
+                let offset = last_end.saturating_sub(first_position).max(1);
+                let duplicates = source_notes
+                    .iter()
+                    .cloned()
+                    .map(|mut note| {
+                        note.position = note.position.saturating_add(offset);
+                        note
+                    })
+                    .collect::<Vec<_>>();
+                let first_note_index = channel_notes.len();
+                let duplicated_count = duplicates.len();
+                if let Some(document) = &mut self.document {
+                    match document.add_pattern_notes(pattern_id, &duplicates) {
+                        Ok(()) => {
+                            self.selected_piano_notes.clear();
+                            self.selected_piano_notes.extend(
+                                (first_note_index..first_note_index + duplicated_count)
+                                    .map(|note_index| (pattern_id, channel_id, note_index)),
+                            );
+                            self.selected_note =
+                                self.selected_piano_notes.iter().next_back().copied();
+                            self.dirty = true;
+                            self.status = format!(
+                                "Duplicated {duplicated_count} notes to the right in pattern {pattern_id}"
+                            );
+                        }
+                        Err(error) => {
+                            self.status = format!("Could not duplicate notes: {error}");
+                        }
+                    }
+                }
+            }
+        }
+
+        if delete_selection_requested
+            && let Some(pattern_id) = self.selected_pattern
+            && let Some(document) = self.document.as_ref()
+        {
+            let mut updated = document.clone();
+            let mut selected_by_channel = BTreeMap::<u16, Vec<usize>>::new();
+            for (selected_pattern, channel_id, note_index) in &self.selected_piano_notes {
+                if *selected_pattern == pattern_id {
+                    selected_by_channel
+                        .entry(*channel_id)
+                        .or_default()
+                        .push(*note_index);
+                }
+            }
+            let result =
+                selected_by_channel
+                    .into_iter()
+                    .try_for_each(|(channel_id, mut note_indices)| {
+                        note_indices.sort_unstable_by(|left, right| right.cmp(left));
+                        note_indices.into_iter().try_for_each(|note_index| {
+                            updated.delete_pattern_note(pattern_id, channel_id, note_index)
+                        })
+                    });
+            match result {
+                Ok(()) => {
+                    self.document = Some(updated);
+                    self.selected_piano_notes.clear();
+                    self.selected_note = None;
+                    self.active_note_drag = None;
+                    self.stop_project_playback();
+                    self.dirty = true;
+                    self.status = format!("Deleted selected notes from pattern {pattern_id}");
+                }
+                Err(error) => {
+                    self.status = format!("Could not delete selected notes: {error}");
+                }
+            }
+        }
+
+        ui.collapsing("Edit tool settings", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.add(
+                    egui::Slider::new(&mut self.quantize_strength_percent, 0..=100)
+                        .text("Strength (%)"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.quantize_swing_percent, 0..=100).text("Swing (%)"),
+                );
+                ui.add(egui::Slider::new(&mut self.chop_divisions, 2..=16).text("Chop divisions"));
+                ui.add(
+                    egui::Slider::new(&mut self.strum_spread_ticks, 0..=1536)
+                        .text("Strum spread (ticks)"),
+                );
+                egui::ComboBox::from_id_salt("piano-roll-strum-direction")
+                    .selected_text(if self.strum_descending {
+                        "Strum: Down"
+                    } else {
+                        "Strum: Up"
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.strum_descending, false, "Low to high");
+                        ui.selectable_value(&mut self.strum_descending, true, "High to low");
+                    });
+                ui.add(
+                    egui::Slider::new(&mut self.flam_stroke_ticks, 1..=384)
+                        .text("Flam time (ticks)"),
+                );
+                ui.add(egui::Slider::new(&mut self.flam_velocity, 0..=127).text("Flam velocity"));
+                ui.checkbox(&mut self.flam_before, "Flam before notes");
+                ui.add(
+                    egui::Slider::new(&mut self.randomizer_velocity_amount, -100..=100)
+                        .text("Velocity randomize (%)"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.randomizer_pan_amount, -100..=100)
+                        .text("Pan randomize (%)"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.randomizer_pitch_range, 0..=24)
+                        .text("Pitch range (semitones)"),
+                );
+                ui.add(egui::DragValue::new(&mut self.randomizer_seed).prefix("Seed "));
+                ui.checkbox(&mut self.randomizer_bipolar, "Bipolar");
+                ui.checkbox(&mut self.randomizer_reset_levels, "Reset levels first");
+                ui.add(
+                    egui::Slider::new(&mut self.humanize_timing_range_ticks, 0..=96)
+                        .text("Humanize timing (± ticks)"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.humanize_velocity_variation_percent, 0..=100)
+                        .text("Humanize velocity (%)"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.note_limit_minimum_key, 0..=127)
+                        .text("Limit lowest key"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.note_limit_maximum_key, 0..=127)
+                        .text("Limit highest key"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.arpeggiator_step_ticks, 1..=384)
+                        .text("Arpeggiator step (ticks)"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.arpeggiator_range_octaves, 1..=4)
+                        .text("Arpeggiator octaves"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.arpeggiator_gate_percent, 1..=100)
+                        .text("Arpeggiator gate (%)"),
+                );
+                egui::ComboBox::from_id_salt("piano-roll-arpeggiator-direction")
+                    .selected_text(match self.arpeggiator_direction {
+                        ArpeggioDirection::Up => "Arpeggiator: Up",
+                        ArpeggioDirection::Down => "Arpeggiator: Down",
+                        ArpeggioDirection::UpDown => "Arpeggiator: Up/Down",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.arpeggiator_direction,
+                            ArpeggioDirection::Up,
+                            "Up",
+                        );
+                        ui.selectable_value(
+                            &mut self.arpeggiator_direction,
+                            ArpeggioDirection::Down,
+                            "Down",
+                        );
+                        ui.selectable_value(
+                            &mut self.arpeggiator_direction,
+                            ArpeggioDirection::UpDown,
+                            "Up / Down",
+                        );
+                    });
+                ui.add(
+                    egui::DragValue::new(&mut self.piano_roll_slice_position_ticks)
+                        .prefix("Slice at tick ")
+                        .speed(1.0),
+                );
+            });
+            ui.small("Quantize uses the selected snap grid and moves note starts only.");
+            ui.small(
+                "Edit: Auto uses the current selection when present; otherwise it affects the channel.",
+            );
         });
 
         if render_requested {
@@ -2416,6 +5838,504 @@ impl DawUi {
         }
         if export_midi_requested {
             self.export_selected_pattern_midi_dialog();
+        }
+        if (quantize_requested || quantize_selected_requested)
+            && let (Some(pattern_id), Some(channel_id)) =
+                (self.selected_pattern, self.selected_note_channel)
+        {
+            let grid_ticks = self.piano_roll_snap.ticks(ppq, time_signature);
+            let strength = f64::from(self.quantize_strength_percent) / 100.0;
+            let swing = f64::from(self.quantize_swing_percent) / 100.0;
+            let result = self
+                .document
+                .as_mut()
+                .ok_or_else(|| "no project is open".to_owned())
+                .and_then(|document| {
+                    let result = if quantize_selected_requested {
+                        document.quantize_pattern_note_selection(
+                            pattern_id,
+                            channel_id,
+                            &selected_quantize_indices,
+                            grid_ticks,
+                            strength,
+                            swing,
+                        )
+                    } else {
+                        document.quantize_pattern_notes(
+                            pattern_id, channel_id, grid_ticks, strength, swing,
+                        )
+                    };
+                    result.map_err(|error| error.to_string())
+                });
+            match result {
+                Ok(changed) => {
+                    if changed > 0 {
+                        self.stop_project_playback();
+                        self.dirty = true;
+                    }
+                    self.status = if quantize_selected_requested {
+                        format!("Quantized {changed} selected note starts in pattern {pattern_id}")
+                    } else {
+                        format!(
+                            "Quantized {changed} note starts in pattern {pattern_id}, channel {channel_id}"
+                        )
+                    };
+                }
+                Err(error) => self.status = format!("Could not quantize notes: {error}"),
+            }
+        }
+        if legato_requested
+            && let (Some(pattern_id), Some(channel_id)) =
+                (self.selected_pattern, self.selected_note_channel)
+        {
+            let result = self
+                .document
+                .as_mut()
+                .ok_or_else(|| "no project is open".to_owned())
+                .and_then(|document| {
+                    let result = if edit_selection_only {
+                        document.legato_pattern_note_selection(
+                            pattern_id,
+                            channel_id,
+                            &selected_quantize_indices,
+                        )
+                    } else {
+                        document.legato_pattern_notes(pattern_id, channel_id)
+                    };
+                    result.map_err(|error| error.to_string())
+                });
+            match result {
+                Ok(changed) => {
+                    if changed > 0 {
+                        self.stop_project_playback();
+                        self.dirty = true;
+                    }
+                    self.status = format!(
+                        "Extended {changed} note lengths in pattern {pattern_id}, {edit_scope_description}"
+                    );
+                }
+                Err(error) => self.status = format!("Could not apply Legato: {error}"),
+            }
+        }
+        if chop_requested
+            && let (Some(pattern_id), Some(channel_id)) =
+                (self.selected_pattern, self.selected_note_channel)
+        {
+            let divisions = self.chop_divisions;
+            let result = self
+                .document
+                .as_mut()
+                .ok_or_else(|| "no project is open".to_owned())
+                .and_then(|document| {
+                    let result = if edit_selection_only {
+                        document.chop_pattern_note_selection(
+                            pattern_id,
+                            channel_id,
+                            &selected_quantize_indices,
+                            divisions,
+                        )
+                    } else {
+                        document.chop_pattern_notes(pattern_id, channel_id, divisions)
+                    };
+                    result.map_err(|error| error.to_string())
+                });
+            match result {
+                Ok(created) => {
+                    if created > 0 {
+                        self.stop_project_playback();
+                        self.dirty = true;
+                    }
+                    self.status = format!(
+                        "Created {created} chopped notes in pattern {pattern_id}, {edit_scope_description}"
+                    );
+                }
+                Err(error) => self.status = format!("Could not chop notes: {error}"),
+            }
+        }
+        if glue_requested
+            && let (Some(pattern_id), Some(channel_id)) =
+                (self.selected_pattern, self.selected_note_channel)
+        {
+            let result = self
+                .document
+                .as_mut()
+                .ok_or_else(|| "no project is open".to_owned())
+                .and_then(|document| {
+                    let result = if edit_selection_only {
+                        document.glue_pattern_note_selection(
+                            pattern_id,
+                            channel_id,
+                            &selected_quantize_indices,
+                        )
+                    } else {
+                        document.glue_pattern_notes(pattern_id, channel_id)
+                    };
+                    result.map_err(|error| error.to_string())
+                });
+            match result {
+                Ok(removed) => {
+                    if removed > 0 {
+                        self.stop_project_playback();
+                        self.dirty = true;
+                        self.selected_piano_notes.clear();
+                        self.selected_note = None;
+                        self.active_note_drag = None;
+                    }
+                    self.status = format!(
+                        "Joined notes and removed {removed} records in pattern {pattern_id}, {edit_scope_description}"
+                    );
+                }
+                Err(error) => self.status = format!("Could not glue notes: {error}"),
+            }
+        }
+        if flip_requested
+            && let (Some(pattern_id), Some(channel_id)) =
+                (self.selected_pattern, self.selected_note_channel)
+        {
+            let result = self
+                .document
+                .as_mut()
+                .ok_or_else(|| "no project is open".to_owned())
+                .and_then(|document| {
+                    let result = if edit_selection_only {
+                        document.flip_pattern_note_selection(
+                            pattern_id,
+                            channel_id,
+                            &selected_quantize_indices,
+                        )
+                    } else {
+                        document.flip_pattern_notes(pattern_id, channel_id)
+                    };
+                    result.map_err(|error| error.to_string())
+                });
+            match result {
+                Ok(changed) => {
+                    if changed > 0 {
+                        self.stop_project_playback();
+                        self.dirty = true;
+                    }
+                    self.status = format!(
+                        "Flipped {changed} note positions in pattern {pattern_id}, {edit_scope_description}"
+                    );
+                }
+                Err(error) => self.status = format!("Could not flip notes: {error}"),
+            }
+        }
+        if strum_requested
+            && let (Some(pattern_id), Some(channel_id)) =
+                (self.selected_pattern, self.selected_note_channel)
+        {
+            let spread_ticks = self.strum_spread_ticks;
+            let descending = self.strum_descending;
+            let result = self
+                .document
+                .as_mut()
+                .ok_or_else(|| "no project is open".to_owned())
+                .and_then(|document| {
+                    let result = if edit_selection_only {
+                        document.strum_pattern_note_selection(
+                            pattern_id,
+                            channel_id,
+                            &selected_quantize_indices,
+                            spread_ticks,
+                            descending,
+                        )
+                    } else {
+                        document.strum_pattern_notes(
+                            pattern_id,
+                            channel_id,
+                            spread_ticks,
+                            descending,
+                        )
+                    };
+                    result.map_err(|error| error.to_string())
+                });
+            match result {
+                Ok(changed) => {
+                    if changed > 0 {
+                        self.stop_project_playback();
+                        self.dirty = true;
+                    }
+                    self.status = format!(
+                        "Strummed {changed} notes in pattern {pattern_id}, {edit_scope_description}"
+                    );
+                }
+                Err(error) => self.status = format!("Could not strum notes: {error}"),
+            }
+        }
+        if flam_requested
+            && let (Some(pattern_id), Some(channel_id)) =
+                (self.selected_pattern, self.selected_note_channel)
+        {
+            let stroke_ticks = self.flam_stroke_ticks;
+            let velocity = self.flam_velocity;
+            let before = self.flam_before;
+            let result = self
+                .document
+                .as_mut()
+                .ok_or_else(|| "no project is open".to_owned())
+                .and_then(|document| {
+                    let result = if edit_selection_only {
+                        document.flam_pattern_note_selection(
+                            pattern_id,
+                            channel_id,
+                            &selected_quantize_indices,
+                            stroke_ticks,
+                            velocity,
+                            before,
+                        )
+                    } else {
+                        document.flam_pattern_notes(
+                            pattern_id,
+                            channel_id,
+                            stroke_ticks,
+                            velocity,
+                            before,
+                        )
+                    };
+                    result.map_err(|error| error.to_string())
+                });
+            match result {
+                Ok(created) => {
+                    if created > 0 {
+                        self.stop_project_playback();
+                        self.dirty = true;
+                    }
+                    self.status = format!(
+                        "Added {created} flam strokes to pattern {pattern_id}, {edit_scope_description}"
+                    );
+                }
+                Err(error) => self.status = format!("Could not add flam strokes: {error}"),
+            }
+        }
+        if randomize_requested
+            && let (Some(pattern_id), Some(channel_id)) =
+                (self.selected_pattern, self.selected_note_channel)
+        {
+            let seed = self.randomizer_seed;
+            let velocity_amount = self.randomizer_velocity_amount;
+            let pan_amount = self.randomizer_pan_amount;
+            let pitch_range = self.randomizer_pitch_range;
+            let bipolar = self.randomizer_bipolar;
+            let reset_levels = self.randomizer_reset_levels;
+            let result = self
+                .document
+                .as_mut()
+                .ok_or_else(|| "no project is open".to_owned())
+                .and_then(|document| {
+                    let result = if edit_selection_only {
+                        document.randomize_pattern_note_selection(
+                            pattern_id,
+                            channel_id,
+                            &selected_quantize_indices,
+                            seed,
+                            velocity_amount,
+                            pan_amount,
+                            pitch_range,
+                            bipolar,
+                            reset_levels,
+                        )
+                    } else {
+                        document.randomize_pattern_notes(
+                            pattern_id,
+                            channel_id,
+                            seed,
+                            velocity_amount,
+                            pan_amount,
+                            pitch_range,
+                            bipolar,
+                            reset_levels,
+                        )
+                    };
+                    result.map_err(|error| error.to_string())
+                });
+            match result {
+                Ok(changed) => {
+                    self.randomizer_seed = seed.saturating_add(1);
+                    if changed > 0 {
+                        self.stop_project_playback();
+                        self.dirty = true;
+                    }
+                    self.status = format!(
+                        "Randomized {changed} notes in pattern {pattern_id}, {edit_scope_description} using seed {seed}"
+                    );
+                }
+                Err(error) => self.status = format!("Could not randomize notes: {error}"),
+            }
+        }
+        if humanize_requested
+            && let (Some(pattern_id), Some(channel_id)) =
+                (self.selected_pattern, self.selected_note_channel)
+        {
+            let seed = self.randomizer_seed;
+            let timing_range_ticks = self.humanize_timing_range_ticks;
+            let velocity_variation_percent = self.humanize_velocity_variation_percent;
+            let result = self
+                .document
+                .as_mut()
+                .ok_or_else(|| "no project is open".to_owned())
+                .and_then(|document| {
+                    let result = if edit_selection_only {
+                        document.humanize_pattern_note_selection(
+                            pattern_id,
+                            channel_id,
+                            &selected_quantize_indices,
+                            seed,
+                            timing_range_ticks,
+                            velocity_variation_percent,
+                        )
+                    } else {
+                        document.humanize_pattern_notes(
+                            pattern_id,
+                            channel_id,
+                            seed,
+                            timing_range_ticks,
+                            velocity_variation_percent,
+                        )
+                    };
+                    result.map_err(|error| error.to_string())
+                });
+            match result {
+                Ok(changed) => {
+                    self.randomizer_seed = seed.saturating_add(1);
+                    if changed > 0 {
+                        self.stop_project_playback();
+                        self.dirty = true;
+                    }
+                    self.status = format!(
+                        "Humanized {changed} notes in pattern {pattern_id}, {edit_scope_description} using seed {seed}"
+                    );
+                }
+                Err(error) => self.status = format!("Could not humanize notes: {error}"),
+            }
+        }
+        if limit_requested
+            && let (Some(pattern_id), Some(channel_id)) =
+                (self.selected_pattern, self.selected_note_channel)
+        {
+            let minimum_key = u16::from(self.note_limit_minimum_key);
+            let maximum_key = u16::from(self.note_limit_maximum_key);
+            let result = self
+                .document
+                .as_mut()
+                .ok_or_else(|| "no project is open".to_owned())
+                .and_then(|document| {
+                    let result = if edit_selection_only {
+                        document.limit_pattern_note_selection_range(
+                            pattern_id,
+                            channel_id,
+                            &selected_quantize_indices,
+                            minimum_key,
+                            maximum_key,
+                        )
+                    } else {
+                        document.limit_pattern_note_range(
+                            pattern_id,
+                            channel_id,
+                            minimum_key,
+                            maximum_key,
+                        )
+                    };
+                    result.map_err(|error| error.to_string())
+                });
+            match result {
+                Ok(changed) => {
+                    if changed > 0 {
+                        self.stop_project_playback();
+                        self.dirty = true;
+                    }
+                    self.status = format!(
+                        "Limited {changed} note pitches in pattern {pattern_id}, {edit_scope_description}"
+                    );
+                }
+                Err(error) => self.status = format!("Could not limit note pitches: {error}"),
+            }
+        }
+        if arpeggiate_requested
+            && let (Some(pattern_id), Some(channel_id)) =
+                (self.selected_pattern, self.selected_note_channel)
+        {
+            let step_ticks = self.arpeggiator_step_ticks;
+            let range_octaves = self.arpeggiator_range_octaves;
+            let gate_percent = self.arpeggiator_gate_percent;
+            let direction = self.arpeggiator_direction;
+            let result = self
+                .document
+                .as_mut()
+                .ok_or_else(|| "no project is open".to_owned())
+                .and_then(|document| {
+                    let result = if edit_selection_only {
+                        document.arpeggiate_pattern_note_selection(
+                            pattern_id,
+                            channel_id,
+                            &selected_quantize_indices,
+                            step_ticks,
+                            range_octaves,
+                            gate_percent,
+                            direction,
+                        )
+                    } else {
+                        document.arpeggiate_pattern_notes(
+                            pattern_id,
+                            channel_id,
+                            step_ticks,
+                            range_octaves,
+                            gate_percent,
+                            direction,
+                        )
+                    };
+                    result.map_err(|error| error.to_string())
+                });
+            match result {
+                Ok(created) => {
+                    if created > 0 {
+                        self.stop_project_playback();
+                        self.dirty = true;
+                        self.selected_piano_notes.clear();
+                        self.selected_note = None;
+                        self.active_note_drag = None;
+                    }
+                    self.status = format!(
+                        "Generated {created} arpeggiated notes in pattern {pattern_id}, {edit_scope_description}"
+                    );
+                }
+                Err(error) => self.status = format!("Could not arpeggiate notes: {error}"),
+            }
+        }
+        if slice_requested
+            && let (Some(pattern_id), Some(channel_id)) =
+                (self.selected_pattern, self.selected_note_channel)
+        {
+            let position_ticks = self.piano_roll_slice_position_ticks;
+            let result = self
+                .document
+                .as_mut()
+                .ok_or_else(|| "no project is open".to_owned())
+                .and_then(|document| {
+                    let result = if edit_selection_only {
+                        document.slice_pattern_note_selection(
+                            pattern_id,
+                            channel_id,
+                            &selected_quantize_indices,
+                            position_ticks,
+                        )
+                    } else {
+                        document.slice_pattern_notes(pattern_id, channel_id, position_ticks)
+                    };
+                    result.map_err(|error| error.to_string())
+                });
+            match result {
+                Ok(created) => {
+                    if created > 0 {
+                        self.stop_project_playback();
+                        self.dirty = true;
+                    }
+                    self.status = format!(
+                        "Sliced {created} notes at tick {position_ticks} in pattern {pattern_id}, {edit_scope_description}"
+                    );
+                }
+                Err(error) => self.status = format!("Could not slice notes: {error}"),
+            }
         }
 
         if open_midi_requested
@@ -2510,6 +6430,12 @@ impl DawUi {
                     Ok(imported) => {
                         if imported > 0 {
                             self.selected_note = Some((pattern_id, channel_id, first_note_index));
+                            self.selected_piano_notes.clear();
+                            self.selected_piano_notes.insert((
+                                pattern_id,
+                                channel_id,
+                                first_note_index,
+                            ));
                             self.dirty = true;
                         }
                         self.status =
@@ -2556,6 +6482,9 @@ impl DawUi {
                 match document.add_pattern_note(pattern_id, note) {
                     Ok(()) => {
                         self.selected_note = Some((pattern_id, channel_id, note_index));
+                        self.selected_piano_notes.clear();
+                        self.selected_piano_notes
+                            .insert((pattern_id, channel_id, note_index));
                         self.dirty = true;
                         self.status = format!("Added note to pattern {pattern_id}");
                     }
@@ -2654,6 +6583,239 @@ impl DawUi {
                 );
             }
             Err(error) => self.status = format!("Could not render pattern channel: {error}"),
+        }
+    }
+
+    fn play_piano_roll_note(&mut self, pattern_id: u16, channel_id: u16, note_index: usize) {
+        let Some(document) = self.document.as_ref() else {
+            self.status = "Open a project before auditioning a Piano roll note".to_owned();
+            return;
+        };
+        let patterns = match document.patterns() {
+            Ok(patterns) => patterns,
+            Err(error) => {
+                self.status = format!("Could not decode Piano roll notes: {error}");
+                return;
+            }
+        };
+        let Some(pattern) = patterns.iter().find(|pattern| pattern.id == pattern_id) else {
+            self.status = format!("Pattern {pattern_id} was not found");
+            return;
+        };
+        let Some(mut note) = pattern
+            .notes
+            .iter()
+            .filter(|note| note.channel_id == channel_id)
+            .nth(note_index)
+            .cloned()
+        else {
+            self.status = format!("Note {note_index} was not found in channel {channel_id}");
+            return;
+        };
+        note.position = 0;
+        note.length = note.length.max(1);
+        let ppq = document.header().ppq();
+        let tempo_bpm = document.metadata().tempo_bpm().unwrap_or(self.tempo_bpm);
+        let is_sampler = document
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id() == channel_id)
+            .is_some_and(|channel| channel.kind() == Some(0));
+        let instance_id = self.channel_vst3_instances.get(&channel_id).copied();
+        let sampler_project = if instance_id.is_none() && is_sampler {
+            let Some(project_path) = self.current_path.clone() else {
+                self.status = "Save the project before auditioning its Sampler notes".to_owned();
+                return;
+            };
+            let mut preview_document = document.clone();
+            if let Err(error) = preview_document.edit_pattern_note(
+                pattern_id,
+                channel_id,
+                note_index,
+                PatternNoteEdit {
+                    position: Some(0),
+                    length: Some(note.length),
+                    ..PatternNoteEdit::default()
+                },
+            ) {
+                self.status = format!("Could not prepare the Sampler note: {error}");
+                return;
+            }
+            let mut channel_indices = BTreeMap::<u16, usize>::new();
+            let mut removals = BTreeMap::<u16, Vec<usize>>::new();
+            for pattern_note in &pattern.notes {
+                let channel_note_index =
+                    channel_indices.entry(pattern_note.channel_id).or_default();
+                if pattern_note.channel_id != channel_id || *channel_note_index != note_index {
+                    removals
+                        .entry(pattern_note.channel_id)
+                        .or_default()
+                        .push(*channel_note_index);
+                }
+                *channel_note_index += 1;
+            }
+            for (remove_channel, mut indices) in removals {
+                indices.sort_unstable_by(|left, right| right.cmp(left));
+                for remove_index in indices {
+                    if let Err(error) = preview_document.delete_pattern_note(
+                        pattern_id,
+                        remove_channel,
+                        remove_index,
+                    ) {
+                        self.status = format!("Could not isolate the Sampler note: {error}");
+                        return;
+                    }
+                }
+            }
+            let project_bytes = match preview_document.encode_lossless() {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    self.status = format!("Could not encode the Sampler note preview: {error}");
+                    return;
+                }
+            };
+            Some((project_path, project_bytes))
+        } else {
+            None
+        };
+        if instance_id.is_none() && !is_sampler {
+            self.status = "Load a VST3 instrument to audition this channel's notes".to_owned();
+            return;
+        }
+        if self.audio_engine.is_none() {
+            match AudioEngine::start(&self.audio_settings) {
+                Ok(engine) => self.audio_engine = Some(engine),
+                Err(error) => {
+                    self.status = format!("Could not start audio output: {error}");
+                    return;
+                }
+            }
+        }
+        let Some(engine) = self.audio_engine.as_ref() else {
+            self.status = "Audio output is not available".to_owned();
+            return;
+        };
+        if !engine.output_active() {
+            self.status = "Enable an output device in Audio settings before auditioning".to_owned();
+            return;
+        }
+        let device_rate = engine.sample_rate();
+        self.stop_project_playback();
+        if let Some(engine) = &self.audio_engine {
+            engine.set_test_tone(false);
+            if self.audio_monitor_input {
+                let _ = engine.set_input_monitor(false);
+            }
+        }
+        self.audio_test_tone = false;
+        self.audio_monitor_input = false;
+
+        if let Some(instance_id) = instance_id {
+            let prepared = self
+                .vst3_host
+                .as_ref()
+                .ok_or_else(|| "VST3 host is not initialized".to_owned())
+                .and_then(|host| {
+                    host.prepare_pattern_channel_stream(
+                        instance_id,
+                        std::slice::from_ref(&note),
+                        Vst3PatternRenderOptions {
+                            channel_id,
+                            ppq,
+                            tempo_bpm,
+                            tail_seconds: 1.0,
+                        },
+                    )
+                });
+            let prepared = match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    self.status = format!("Could not prepare note preview: {error}");
+                    return;
+                }
+            };
+            let writer = match self
+                .audio_engine
+                .as_ref()
+                .ok_or_else(|| "Audio output is not available".to_owned())
+                .and_then(AudioEngine::begin_streaming_playback)
+            {
+                Ok(writer) => writer,
+                Err(error) => {
+                    self.status = format!("Could not start note preview: {error}");
+                    return;
+                }
+            };
+            match prepared.start(writer, device_rate) {
+                Ok(stream) => {
+                    self.pending_vst3_stream = Some(stream);
+                    self.playing = true;
+                    self.project_playback_loaded = true;
+                    self.status = format!("Auditioning note {} on channel {channel_id}", note.key);
+                }
+                Err(error) => {
+                    self.stop_project_playback();
+                    self.status = format!("Could not start note preview: {error}");
+                }
+            }
+            return;
+        }
+
+        let Some((project_path, project_bytes)) = sampler_project else {
+            self.status = "Could not prepare the Sampler note preview".to_owned();
+            return;
+        };
+        let writer = match self
+            .audio_engine
+            .as_ref()
+            .ok_or_else(|| "Audio output is not available".to_owned())
+            .and_then(AudioEngine::begin_streaming_playback)
+        {
+            Ok(writer) => writer,
+            Err(error) => {
+                self.status = format!("Could not start Sampler note preview: {error}");
+                return;
+            }
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name("sampler-note-preview".to_owned())
+            .spawn(move || {
+                let result = FlpDocument::parse(&project_bytes)
+                    .map_err(|error| error.to_string())
+                    .and_then(|document| {
+                        stream_sampler_pattern_to_device(
+                            &document,
+                            &project_path,
+                            SamplerPatternRenderOptions {
+                                pattern_id,
+                                sample_rate: device_rate,
+                                ..SamplerPatternRenderOptions::default()
+                            },
+                            &writer,
+                            &worker_cancelled,
+                        )
+                    });
+                writer.finish();
+                let _ = sender.send(result);
+            });
+        match worker {
+            Ok(worker) => {
+                self.pending_sampler_stream = Some(PendingSamplerStream {
+                    receiver,
+                    cancelled,
+                    worker,
+                });
+                self.playing = true;
+                self.project_playback_loaded = true;
+                self.status = format!("Auditioning note {} on channel {channel_id}", note.key);
+            }
+            Err(error) => {
+                self.stop_project_playback();
+                self.status = format!("Could not start Sampler note preview: {error}");
+            }
         }
     }
 
@@ -3161,12 +7323,49 @@ impl DawUi {
         }
     }
 
+    fn request_piano_roll_zoom(&mut self, zoom: f32, source_view_x: f32, target_view_x: f32) {
+        let old_zoom = self.piano_roll_zoom.clamp(0.06, 0.24);
+        let new_zoom = zoom.clamp(0.06, 0.24);
+        if (new_zoom - old_zoom).abs() <= f32::EPSILON {
+            return;
+        }
+        let old_scale = (old_zoom * 0.9).clamp(0.05, 0.22);
+        let new_scale = (new_zoom * 0.9).clamp(0.05, 0.22);
+        let scale_ratio = new_scale / old_scale;
+        let source_content_x = self.piano_roll_grid_scroll_offset.x + source_view_x;
+        let anchored_content_x = 68.0 + (source_content_x - 68.0) * scale_ratio;
+        let offset_x = (anchored_content_x - target_view_x).max(0.0);
+        self.piano_roll_zoom = new_zoom;
+        self.piano_roll_pending_scroll_offset =
+            Some(Vec2::new(offset_x, self.piano_roll_grid_scroll_offset.y));
+    }
+
     fn draw_notes(&mut self, ui: &mut egui::Ui, pattern: &Pattern, ppq: u16, snap_ticks: u32) {
         let key_low = 36u16;
         let key_high = 83u16;
         let key_height = 13.0;
         let keyboard_width = 68.0;
-        let tick_scale = (self.timeline_zoom * 0.9).clamp(0.05, 0.22);
+        if let (Some(viewport), Some(pointer)) = (
+            self.piano_roll_grid_viewport,
+            ui.input(|input| input.pointer.hover_pos()),
+        ) && viewport.contains(pointer)
+        {
+            let zoom_in = ui.input(|input| input.key_pressed(egui::Key::PageUp));
+            let zoom_out = ui.input(|input| input.key_pressed(egui::Key::PageDown));
+            if zoom_in || zoom_out {
+                let anchor = pointer.x - viewport.left();
+                self.request_piano_roll_zoom(
+                    if zoom_in {
+                        self.piano_roll_zoom * 1.2
+                    } else {
+                        self.piano_roll_zoom / 1.2
+                    },
+                    anchor,
+                    anchor,
+                );
+            }
+        }
+        let tick_scale = (self.piano_roll_zoom * 0.9).clamp(0.05, 0.22);
         let max_tick = pattern
             .notes
             .iter()
@@ -3176,231 +7375,783 @@ impl DawUi {
             .max(ppq as u32 * 16);
         let grid_width = (max_tick as f32 * tick_scale + 160.0).clamp(1400.0, 30000.0);
         let grid_height = f32::from(key_high - key_low + 1) * key_height;
-        let mut note_to_add = None;
-        egui::ScrollArea::both()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                let size = Vec2::new(keyboard_width + grid_width, grid_height);
-                let (rect, grid_response) = ui.allocate_exact_size(size, Sense::click());
-                let grid_geometry = PianoRollGrid {
-                    rect,
-                    keyboard_width,
-                    tick_scale,
-                    key_height,
-                    key_low,
-                    key_high,
-                    snap_ticks,
-                    ppq,
-                };
-                let painter = ui.painter_at(rect);
-                painter.rect_filled(rect, 0, PANEL_DARK);
-                let measure_ticks = ppq as u32 * 4;
-                let measure_width = measure_ticks as f32 * tick_scale;
-                if measure_width > 0.0 {
-                    let measures = (grid_width / measure_width).ceil() as u32;
-                    for measure in 0..=measures {
-                        let x = rect.left() + keyboard_width + measure as f32 * measure_width;
-                        painter.line_segment(
-                            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                            Stroke::new(1.0, GRID),
-                        );
-                    }
-                }
+        let mut notes_to_add = Vec::new();
+        let pending_scroll_offset = self.piano_roll_pending_scroll_offset.take();
+        let mut scroll_area = egui::ScrollArea::both()
+            .id_salt("piano-roll-grid")
+            .auto_shrink([false, false]);
+        if self.piano_roll_event_editor_open {
+            scroll_area = scroll_area.max_height((ui.available_height() - 142.0).max(180.0));
+        }
+        if let Some(offset) = pending_scroll_offset {
+            scroll_area = scroll_area.scroll_offset(offset);
+        }
+        let scroll_output = scroll_area.show(ui, |ui| {
+            let size = Vec2::new(keyboard_width + grid_width, grid_height);
+            let (rect, grid_response) = ui.allocate_exact_size(size, Sense::click_and_drag());
+            let grid_geometry = PianoRollGrid {
+                rect,
+                keyboard_width,
+                tick_scale,
+                key_height,
+                key_low,
+                key_high,
+                snap_ticks,
+                ppq,
+            };
+            let painter = ui.painter_at(rect);
+            painter.rect_filled(rect, 0, PANEL_DARK);
+            if self.piano_roll_scale != PianoRollScale::None {
                 for key in key_low..=key_high {
+                    if !self
+                        .piano_roll_scale
+                        .contains(key, self.piano_roll_scale_root)
+                    {
+                        continue;
+                    }
                     let row = key_high - key;
                     let y = rect.top() + f32::from(row) * key_height;
-                    let keyboard_rect = egui::Rect::from_min_size(
-                        egui::pos2(rect.left(), y),
-                        Vec2::new(keyboard_width, key_height),
+                    let scale_row = egui::Rect::from_min_size(
+                        egui::pos2(rect.left() + keyboard_width, y),
+                        Vec2::new(grid_width, key_height),
                     );
-                    let is_black = matches!(key % 12, 1 | 3 | 6 | 8 | 10);
+                    let is_root = key % 12 == u16::from(self.piano_roll_scale_root);
                     painter.rect_filled(
-                        keyboard_rect,
+                        scale_row,
                         0,
-                        if is_black {
-                            PANEL_LIGHT
+                        if is_root {
+                            Color32::from_rgb(41, 63, 47)
                         } else {
-                            Color32::from_rgb(188, 190, 193)
+                            Color32::from_rgb(33, 47, 37)
                         },
                     );
-                    painter.text(
-                        egui::pos2(keyboard_rect.left() + 5.0, keyboard_rect.center().y),
-                        Align2::LEFT_CENTER,
-                        note_name(key),
-                        FontId::proportional(9.0),
-                        if is_black {
-                            TEXT
-                        } else {
-                            Color32::from_rgb(38, 39, 41)
-                        },
-                    );
+                }
+            }
+            let measure_ticks = ppq as u32 * 4;
+            let measure_width = measure_ticks as f32 * tick_scale;
+            if measure_width > 0.0 {
+                let measures = (grid_width / measure_width).ceil() as u32;
+                for measure in 0..=measures {
+                    let x = rect.left() + keyboard_width + measure as f32 * measure_width;
                     painter.line_segment(
-                        [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+                        [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
                         Stroke::new(1.0, GRID),
                     );
                 }
+            }
+            for key in key_low..=key_high {
+                let row = key_high - key;
+                let y = rect.top() + f32::from(row) * key_height;
+                let keyboard_rect = egui::Rect::from_min_size(
+                    egui::pos2(rect.left(), y),
+                    Vec2::new(keyboard_width, key_height),
+                );
+                let is_black = matches!(key % 12, 1 | 3 | 6 | 8 | 10);
+                painter.rect_filled(
+                    keyboard_rect,
+                    0,
+                    if is_black {
+                        PANEL_LIGHT
+                    } else {
+                        Color32::from_rgb(188, 190, 193)
+                    },
+                );
+                painter.text(
+                    egui::pos2(keyboard_rect.left() + 5.0, keyboard_rect.center().y),
+                    Align2::LEFT_CENTER,
+                    note_name(key),
+                    FontId::proportional(9.0),
+                    if is_black {
+                        TEXT
+                    } else {
+                        Color32::from_rgb(38, 39, 41)
+                    },
+                );
+                painter.line_segment(
+                    [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+                    Stroke::new(1.0, GRID),
+                );
+            }
 
-                let mut per_channel = BTreeMap::<u16, usize>::new();
-                let mut note_rects = Vec::with_capacity(pattern.notes.len());
-                for (note_index, note) in pattern.notes.iter().enumerate() {
-                    let channel_index = per_channel.entry(note.channel_id).or_default();
-                    let left = rect.left() + keyboard_width + note.position as f32 * tick_scale;
-                    let y = rect.top()
-                        + f32::from(key_high.saturating_sub(note.key)) * key_height
-                        + 1.0;
-                    let note_rect = egui::Rect::from_min_size(
-                        egui::pos2(left, y),
-                        Vec2::new((note.length as f32 * tick_scale).max(4.0), key_height - 2.0),
-                    );
-                    note_rects.push(note_rect);
-                    let selected =
-                        self.selected_note == Some((pattern.id, note.channel_id, *channel_index));
-                    painter.rect_filled(
-                        note_rect,
-                        egui::CornerRadius::same(2),
-                        if selected {
-                            GREEN.gamma_multiply(1.3)
-                        } else {
-                            GREEN
-                        },
-                    );
-                    let resize_handle = egui::Rect::from_min_max(
-                        egui::pos2(
-                            (note_rect.right() - 5.0).max(note_rect.left()),
-                            note_rect.top(),
-                        ),
-                        note_rect.right_bottom(),
-                    );
-                    painter.rect_filled(
-                        resize_handle,
-                        egui::CornerRadius::same(1),
-                        Color32::from_white_alpha(if selected { 100 } else { 45 }),
-                    );
-                    let response = ui.interact(
-                        note_rect,
-                        Id::new(("piano-note", pattern.id, note.channel_id, *channel_index)),
-                        Sense::click_and_drag(),
-                    );
-                    if response.clicked() {
-                        self.selected_note = Some((pattern.id, note.channel_id, *channel_index));
-                        self.selected_note_channel = Some(note.channel_id);
-                        self.status = format!("Selected note {}", note_index + 1);
-                    }
-                    if response.is_pointer_button_down_on() && self.active_note_drag.is_none() {
-                        let resize = response
-                            .interact_pointer_pos()
-                            .is_some_and(|pointer| pointer.x >= note_rect.right() - 6.0);
-                        self.active_note_drag = Some(ActiveNoteDrag {
-                            pattern_id: pattern.id,
-                            channel_id: note.channel_id,
-                            channel_note_index: *channel_index,
-                            start_position: note.position,
-                            start_length: note.length,
-                            start_key: note.key,
-                            kind: if resize {
-                                NoteDragKind::Resize
-                            } else {
-                                NoteDragKind::Move
-                            },
-                        });
-                        self.selected_note = Some((pattern.id, note.channel_id, *channel_index));
-                        self.selected_note_channel = Some(note.channel_id);
-                    }
-                    if response.dragged()
-                        && let Some(drag) = self.active_note_drag.filter(|drag| {
-                            drag.pattern_id == pattern.id
-                                && drag.channel_id == note.channel_id
-                                && drag.channel_note_index == *channel_index
-                        })
+            let mut per_channel = BTreeMap::<u16, usize>::new();
+            let mut note_rects = Vec::with_capacity(pattern.notes.len());
+            let mut note_selection_rects = Vec::with_capacity(pattern.notes.len());
+            for note in &pattern.notes {
+                let channel_index = per_channel.entry(note.channel_id).or_default();
+                let left = rect.left() + keyboard_width + note.position as f32 * tick_scale;
+                let y =
+                    rect.top() + f32::from(key_high.saturating_sub(note.key)) * key_height + 1.0;
+                let note_rect = egui::Rect::from_min_size(
+                    egui::pos2(left, y),
+                    Vec2::new((note.length as f32 * tick_scale).max(4.0), key_height - 2.0),
+                );
+                note_rects.push(note_rect);
+                note_selection_rects.push((note.channel_id, *channel_index, note_rect));
+                let ghost = self.selected_note_channel != Some(note.channel_id);
+                if ghost && !self.piano_roll_ghost_channels {
+                    *channel_index += 1;
+                    continue;
+                }
+                let selected = self.selected_piano_notes.contains(&(
+                    pattern.id,
+                    note.channel_id,
+                    *channel_index,
+                ));
+                let channel_color = if self.piano_roll_color_by_midi_channel {
+                    MIDI_CHANNEL_COLORS[usize::from(note.midi_channel & 0x0f)]
+                } else {
+                    GREEN
+                };
+                painter.rect_filled(
+                    note_rect,
+                    egui::CornerRadius::same(2),
+                    if selected {
+                        channel_color.gamma_multiply(1.3)
+                    } else if ghost {
+                        Color32::from_rgb(99, 112, 136)
+                    } else {
+                        channel_color
+                    },
+                );
+                let resize_handle = egui::Rect::from_min_max(
+                    egui::pos2(
+                        (note_rect.right() - 5.0).max(note_rect.left()),
+                        note_rect.top(),
+                    ),
+                    note_rect.right_bottom(),
+                );
+                painter.rect_filled(
+                    resize_handle,
+                    egui::CornerRadius::same(1),
+                    Color32::from_white_alpha(if selected { 100 } else { 45 }),
+                );
+                let response = ui.interact(
+                    note_rect,
+                    Id::new(("piano-note", pattern.id, note.channel_id, *channel_index)),
+                    if self.piano_roll_zoom_mode {
+                        Sense::hover()
+                    } else {
+                        Sense::click_and_drag()
+                    },
+                );
+                let note_id = (pattern.id, note.channel_id, *channel_index);
+                let modifiers = ui.input(|input| input.modifiers);
+                let audition_gesture = response.clicked()
+                    || (ui.input(|input| input.pointer.primary_down()) && response.hovered());
+                if self.piano_roll_playback_mode
+                    && audition_gesture
+                    && self.last_piano_roll_audition != Some(note_id)
+                {
+                    self.last_piano_roll_audition = Some(note_id);
+                    self.play_piano_roll_note(pattern.id, note.channel_id, *channel_index);
+                }
+                if response.clicked()
+                    && !self.piano_roll_zoom_mode
+                    && !self.piano_roll_playback_mode
+                {
+                    let additive = modifiers.shift || modifiers.command;
+                    if !additive
+                        || self
+                            .selected_piano_notes
+                            .iter()
+                            .any(|(_, channel_id, _)| *channel_id != note.channel_id)
                     {
-                        let delta = response.drag_delta();
-                        let tick_delta = (delta.x / tick_scale).round() as i64;
-                        let edit = match drag.kind {
-                            NoteDragKind::Move => {
-                                let position = snap_note_tick(
-                                    i64::from(drag.start_position).saturating_add(tick_delta),
-                                    snap_ticks,
-                                    0,
-                                );
-                                let semitones = (-delta.y / key_height).round() as i32;
-                                let key = i32::from(drag.start_key)
-                                    .saturating_add(semitones)
-                                    .clamp(i32::from(key_low), i32::from(key_high))
-                                    as u16;
-                                PatternNoteEdit {
-                                    position: Some(position),
-                                    key: Some(key),
+                        self.selected_piano_notes.clear();
+                    }
+                    if additive && self.selected_piano_notes.remove(&note_id) {
+                        self.selected_note = self
+                            .selected_piano_notes
+                            .iter()
+                            .rev()
+                            .find(|(selected_pattern, _, _)| *selected_pattern == pattern.id)
+                            .copied();
+                    } else {
+                        self.selected_piano_notes.insert(note_id);
+                        self.selected_note = Some(note_id);
+                    }
+                    self.selected_note_channel = Some(note.channel_id);
+                    let selected_count = self
+                        .selected_piano_notes
+                        .iter()
+                        .filter(|(selected_pattern, _, _)| *selected_pattern == pattern.id)
+                        .count();
+                    self.status = format!(
+                        "Selected {} note{}",
+                        selected_count,
+                        if selected_count == 1 { "" } else { "s" }
+                    );
+                }
+                if response.is_pointer_button_down_on()
+                    && !self.piano_roll_zoom_mode
+                    && !self.piano_roll_playback_mode
+                    && self.active_note_drag.is_none()
+                    && !modifiers.command
+                    && !modifiers.shift
+                {
+                    let resize = response
+                        .interact_pointer_pos()
+                        .is_some_and(|pointer| pointer.x >= note_rect.right() - 6.0);
+                    if !self.selected_piano_notes.contains(&note_id)
+                        || self
+                            .selected_piano_notes
+                            .iter()
+                            .any(|(_, channel_id, _)| *channel_id != note.channel_id)
+                    {
+                        self.selected_piano_notes
+                            .retain(|(selected_pattern, _, _)| *selected_pattern != pattern.id);
+                        self.selected_piano_notes.insert(note_id);
+                    }
+                    let mut selected_note_indices = BTreeMap::<u16, usize>::new();
+                    let mut targets = Vec::new();
+                    for selected_note in &pattern.notes {
+                        let selected_channel_index = selected_note_indices
+                            .entry(selected_note.channel_id)
+                            .or_default();
+                        if self.selected_piano_notes.contains(&(
+                            pattern.id,
+                            selected_note.channel_id,
+                            *selected_channel_index,
+                        )) {
+                            targets.push(NoteDragTarget {
+                                channel_id: selected_note.channel_id,
+                                channel_note_index: *selected_channel_index,
+                                start_position: selected_note.position,
+                                start_length: selected_note.length,
+                                start_key: selected_note.key,
+                            });
+                        }
+                        *selected_channel_index += 1;
+                    }
+                    let start_pointer = response
+                        .interact_pointer_pos()
+                        .unwrap_or(note_rect.center());
+                    self.active_note_drag = Some(ActiveNoteDrag {
+                        pattern_id: pattern.id,
+                        channel_id: note.channel_id,
+                        channel_note_index: *channel_index,
+                        start_pointer,
+                        targets,
+                        kind: if resize {
+                            NoteDragKind::Resize
+                        } else {
+                            NoteDragKind::Move
+                        },
+                    });
+                    self.selected_note = Some((pattern.id, note.channel_id, *channel_index));
+                    self.selected_note_channel = Some(note.channel_id);
+                }
+                if response.dragged()
+                    && !self.piano_roll_zoom_mode
+                    && !self.piano_roll_playback_mode
+                    && let Some(drag) = self.active_note_drag.as_ref().filter(|drag| {
+                        drag.pattern_id == pattern.id
+                            && drag.channel_id == note.channel_id
+                            && drag.channel_note_index == *channel_index
+                    })
+                    && let Some(pointer) = response.interact_pointer_pos()
+                {
+                    let tick_delta =
+                        ((pointer.x - drag.start_pointer.x) / tick_scale).round() as i64;
+                    let semitones =
+                        ((drag.start_pointer.y - pointer.y) / key_height).round() as i32;
+                    let mut updated = self.document.clone();
+                    let result = if let Some(document) = updated.as_mut() {
+                        drag.targets.iter().try_for_each(|target| {
+                            let edit = match drag.kind {
+                                NoteDragKind::Move => PatternNoteEdit {
+                                    position: Some(snap_note_tick(
+                                        i64::from(target.start_position).saturating_add(tick_delta),
+                                        snap_ticks,
+                                        0,
+                                    )),
+                                    key: Some(
+                                        i32::from(target.start_key)
+                                            .saturating_add(semitones)
+                                            .clamp(i32::from(key_low), i32::from(key_high))
+                                            as u16,
+                                    ),
                                     ..PatternNoteEdit::default()
-                                }
-                            }
-                            NoteDragKind::Resize => PatternNoteEdit {
-                                length: Some(snap_note_tick(
-                                    i64::from(drag.start_length).saturating_add(tick_delta),
-                                    snap_ticks,
-                                    1,
-                                )),
-                                ..PatternNoteEdit::default()
-                            },
-                        };
-                        if let Some(document) = &mut self.document
-                            && document
-                                .edit_pattern_note(
-                                    drag.pattern_id,
-                                    drag.channel_id,
-                                    drag.channel_note_index,
-                                    edit,
-                                )
-                                .is_ok()
-                        {
-                            self.dirty = true;
-                            self.status = match drag.kind {
+                                },
+                                NoteDragKind::Resize => PatternNoteEdit {
+                                    length: Some(snap_note_tick(
+                                        i64::from(target.start_length).saturating_add(tick_delta),
+                                        snap_ticks,
+                                        1,
+                                    )),
+                                    ..PatternNoteEdit::default()
+                                },
+                            };
+                            document.edit_pattern_note(
+                                drag.pattern_id,
+                                target.channel_id,
+                                target.channel_note_index,
+                                edit,
+                            )
+                        })
+                    } else {
+                        return;
+                    };
+                    if result.is_ok() {
+                        self.document = updated;
+                        self.dirty = true;
+                        self.status = if drag.targets.len() > 1 {
+                            let action = match drag.kind {
+                                NoteDragKind::Move => "Moved",
+                                NoteDragKind::Resize => "Resized",
+                            };
+                            format!("{action} {} selected notes", drag.targets.len())
+                        } else {
+                            match drag.kind {
                                 NoteDragKind::Move => "Piano roll note moved".to_owned(),
                                 NoteDragKind::Resize => "Piano roll note length changed".to_owned(),
-                            };
-                        }
+                            }
+                        };
+                    } else if let Err(error) = result {
+                        self.status = format!("Could not edit selected notes: {error}");
                     }
-                    if response.drag_stopped()
-                        && self.active_note_drag.is_some_and(|drag| {
-                            drag.pattern_id == pattern.id
-                                && drag.channel_id == note.channel_id
-                                && drag.channel_note_index == *channel_index
-                        })
-                    {
-                        self.active_note_drag = None;
-                    }
-                    *channel_index += 1;
                 }
-                if grid_response.double_clicked()
-                    && let (Some(pointer), Some(channel_id)) = (
-                        grid_response.interact_pointer_pos(),
-                        self.selected_note_channel,
-                    )
-                    && !note_rects
-                        .iter()
-                        .any(|note_rect| note_rect.contains(pointer))
+                if response.drag_stopped()
+                    && self.active_note_drag.as_ref().is_some_and(|drag| {
+                        drag.pattern_id == pattern.id
+                            && drag.channel_id == note.channel_id
+                            && drag.channel_note_index == *channel_index
+                    })
                 {
-                    note_to_add = note_from_grid_position(pointer, grid_geometry, channel_id);
+                    self.active_note_drag = None;
                 }
-            });
+                *channel_index += 1;
+            }
+            let modifiers = ui.input(|input| input.modifiers);
+            if self.piano_roll_zoom_mode
+                && grid_response.drag_started_by(PointerButton::Primary)
+                && let Some(origin) = ui
+                    .input(|input| input.pointer.press_origin())
+                    .or_else(|| grid_response.interact_pointer_pos())
+            {
+                let grid_body = egui::Rect::from_min_max(
+                    egui::pos2(rect.left() + keyboard_width, rect.top()),
+                    rect.right_bottom(),
+                );
+                if grid_body.contains(origin) {
+                    self.piano_roll_zoom_drag = Some(PianoRollZoomDrag {
+                        pattern_id: pattern.id,
+                        start: origin,
+                        current: origin,
+                    });
+                }
+            }
+            if let Some(mut zoom_drag) = self
+                .piano_roll_zoom_drag
+                .filter(|drag| drag.pattern_id == pattern.id)
+            {
+                let grid_body = egui::Rect::from_min_max(
+                    egui::pos2(rect.left() + keyboard_width, rect.top()),
+                    rect.right_bottom(),
+                );
+                if let Some(pointer) = grid_response
+                    .interact_pointer_pos()
+                    .or_else(|| ui.input(|input| input.pointer.interact_pos()))
+                {
+                    zoom_drag.current = egui::pos2(
+                        pointer.x.clamp(grid_body.left(), grid_body.right()),
+                        pointer.y.clamp(grid_body.top(), grid_body.bottom()),
+                    );
+                }
+                let zoom_rect = egui::Rect::from_two_pos(zoom_drag.start, zoom_drag.current);
+                painter.rect_filled(
+                    zoom_rect,
+                    0,
+                    Color32::from_rgba_unmultiplied(73, 128, 174, 36),
+                );
+                painter.rect_stroke(
+                    zoom_rect,
+                    egui::CornerRadius::ZERO,
+                    Stroke::new(1.0, BLUE),
+                    egui::StrokeKind::Inside,
+                );
+                if grid_response.drag_stopped_by(PointerButton::Primary) {
+                    if zoom_rect.width() >= 12.0
+                        && let Some(viewport) = self.piano_roll_grid_viewport
+                    {
+                        let visible_grid_width = (viewport.width() - keyboard_width).max(1.0);
+                        let zoom_factor = visible_grid_width / zoom_rect.width();
+                        self.request_piano_roll_zoom(
+                            self.piano_roll_zoom * zoom_factor,
+                            zoom_rect.left() - viewport.left(),
+                            keyboard_width,
+                        );
+                        self.status = "Zoomed to Piano roll selection".to_owned();
+                    }
+                    self.piano_roll_zoom_drag = None;
+                } else {
+                    self.piano_roll_zoom_drag = Some(zoom_drag);
+                }
+            }
+            if self.piano_roll_zoom_mode
+                && grid_response.clicked_by(PointerButton::Primary)
+                && let Some(pointer) = grid_response.interact_pointer_pos()
+                && pointer.x >= rect.left() + keyboard_width
+                && !note_rects
+                    .iter()
+                    .any(|note_rect| note_rect.contains(pointer))
+                && let Some(viewport) = self.piano_roll_grid_viewport
+            {
+                let anchor = pointer.x - viewport.left();
+                self.request_piano_roll_zoom(self.piano_roll_zoom / 1.2, anchor, anchor);
+                self.status = "Zoomed out around cursor".to_owned();
+            }
+            if grid_response.drag_started_by(PointerButton::Primary)
+                && !self.piano_roll_zoom_mode
+                && (self.piano_roll_select_mode || modifiers.command)
+                && let Some(origin) = ui
+                    .input(|input| input.pointer.press_origin())
+                    .or_else(|| grid_response.interact_pointer_pos())
+                && let Some(channel_id) = self.selected_note_channel
+            {
+                let grid_body = egui::Rect::from_min_max(
+                    egui::pos2(rect.left() + keyboard_width, rect.top()),
+                    rect.right_bottom(),
+                );
+                if grid_body.contains(origin) {
+                    let additive = modifiers.shift;
+                    if !additive {
+                        self.selected_piano_notes
+                            .retain(|(selected_pattern, _, _)| *selected_pattern != pattern.id);
+                    }
+                    self.piano_roll_selection_drag = Some(PianoRollSelectionDrag {
+                        pattern_id: pattern.id,
+                        channel_id,
+                        start: origin,
+                        current: origin,
+                        additive,
+                    });
+                }
+            }
+            if let Some(mut selection) = self
+                .piano_roll_selection_drag
+                .filter(|selection| selection.pattern_id == pattern.id)
+            {
+                let grid_body = egui::Rect::from_min_max(
+                    egui::pos2(rect.left() + keyboard_width, rect.top()),
+                    rect.right_bottom(),
+                );
+                if let Some(pointer) = grid_response
+                    .interact_pointer_pos()
+                    .or_else(|| ui.input(|input| input.pointer.interact_pos()))
+                {
+                    selection.current = egui::pos2(
+                        pointer.x.clamp(grid_body.left(), grid_body.right()),
+                        pointer.y.clamp(grid_body.top(), grid_body.bottom()),
+                    );
+                }
+                let selection_rect = egui::Rect::from_two_pos(selection.start, selection.current);
+                painter.rect_filled(
+                    selection_rect,
+                    0,
+                    Color32::from_rgba_unmultiplied(73, 128, 174, 36),
+                );
+                painter.rect_stroke(
+                    selection_rect,
+                    egui::CornerRadius::ZERO,
+                    Stroke::new(1.0, BLUE),
+                    egui::StrokeKind::Inside,
+                );
+                if grid_response.drag_stopped_by(PointerButton::Primary) {
+                    let enclosed = note_selection_rects
+                        .iter()
+                        .filter(|(channel_id, _, note_rect)| {
+                            *channel_id == selection.channel_id
+                                && note_rect.intersects(selection_rect)
+                        })
+                        .map(|(channel_id, channel_note_index, _)| {
+                            (pattern.id, *channel_id, *channel_note_index)
+                        })
+                        .collect::<Vec<_>>();
+                    for note_id in enclosed {
+                        if selection.additive && self.selected_piano_notes.remove(&note_id) {
+                            continue;
+                        }
+                        self.selected_piano_notes.insert(note_id);
+                    }
+                    self.selected_note = self
+                        .selected_piano_notes
+                        .iter()
+                        .rev()
+                        .find(|(selected_pattern, _, _)| *selected_pattern == pattern.id)
+                        .copied();
+                    self.selected_note_channel = Some(selection.channel_id);
+                    let selected_count = self
+                        .selected_piano_notes
+                        .iter()
+                        .filter(|(selected_pattern, _, _)| *selected_pattern == pattern.id)
+                        .count();
+                    self.status = format!("Selected {selected_count} notes");
+                    self.piano_roll_selection_drag = None;
+                } else {
+                    self.piano_roll_selection_drag = Some(selection);
+                }
+            }
+            if self.piano_roll_stamp_mode
+                && !self.piano_roll_select_mode
+                && !self.piano_roll_zoom_mode
+                && grid_response.clicked_by(PointerButton::Primary)
+                && let (Some(pointer), Some(channel_id)) = (
+                    grid_response.interact_pointer_pos(),
+                    self.selected_note_channel,
+                )
+                && !note_rects
+                    .iter()
+                    .any(|note_rect| note_rect.contains(pointer))
+                && let Some(mut root_note) =
+                    note_from_grid_position(pointer, grid_geometry, channel_id)
+            {
+                root_note.length = snap_ticks.max(1);
+                let chord_pitches = self.piano_roll_chord_stamp.pitches(
+                    root_note.key,
+                    self.piano_roll_scale,
+                    self.piano_roll_scale_root,
+                );
+                notes_to_add.extend(chord_pitches.into_iter().map(|key| {
+                    let mut note = root_note.clone();
+                    note.key = key;
+                    note
+                }));
+            }
+            if self.piano_roll_paint_mode
+                && !(self.piano_roll_select_mode || self.piano_roll_zoom_mode || modifiers.command)
+                && ui.input(|input| input.pointer.primary_down())
+                && let (Some(pointer), Some(channel_id)) = (
+                    grid_response.interact_pointer_pos(),
+                    self.selected_note_channel,
+                )
+                && !note_rects
+                    .iter()
+                    .any(|note_rect| note_rect.contains(pointer))
+                && let Some(mut note) = note_from_grid_position(pointer, grid_geometry, channel_id)
+            {
+                note.length = snap_ticks.max(1);
+                let note_key = (pattern.id, channel_id, note.key, note.position);
+                let already_exists = pattern.notes.iter().any(|existing| {
+                    existing.channel_id == channel_id
+                        && existing.key == note.key
+                        && existing.position == note.position
+                });
+                if !already_exists && self.last_painted_note != Some(note_key) {
+                    self.last_painted_note = Some(note_key);
+                    notes_to_add.push(note);
+                }
+            }
+            if !self.piano_roll_paint_mode
+                && !self.piano_roll_stamp_mode
+                && !self.piano_roll_select_mode
+                && !self.piano_roll_zoom_mode
+                && !modifiers.command
+                && grid_response.double_clicked()
+                && let (Some(pointer), Some(channel_id)) = (
+                    grid_response.interact_pointer_pos(),
+                    self.selected_note_channel,
+                )
+                && !note_rects
+                    .iter()
+                    .any(|note_rect| note_rect.contains(pointer))
+            {
+                if let Some(note) = note_from_grid_position(pointer, grid_geometry, channel_id) {
+                    notes_to_add.push(note);
+                }
+            }
+        });
+        self.piano_roll_grid_viewport = Some(scroll_output.inner_rect);
+        self.piano_roll_grid_scroll_offset = scroll_output.state.offset;
+        if self.piano_roll_event_editor_open {
+            self.draw_piano_roll_event_editor(
+                ui,
+                pattern,
+                ppq,
+                tick_scale,
+                keyboard_width,
+                scroll_output.state.offset.x,
+            );
+        }
+        if !ui.input(|input| input.pointer.primary_down()) {
+            self.last_painted_note = None;
+            self.last_piano_roll_audition = None;
+        }
         if !ui.input(|input| input.pointer.primary_down()) {
             self.active_note_drag = None;
+            self.piano_roll_selection_drag = None;
+            self.piano_roll_zoom_drag = None;
         }
-        if let Some(note) = note_to_add {
-            let note_index = pattern
+        if !notes_to_add.is_empty() {
+            let stamped_chord = self.piano_roll_stamp_mode;
+            let only_one = self.piano_roll_stamp_only_one;
+            let channel_id = notes_to_add[0].channel_id;
+            let first_note_index = pattern
                 .notes
                 .iter()
-                .filter(|existing| existing.channel_id == note.channel_id)
+                .filter(|existing| existing.channel_id == channel_id)
                 .count();
-            let channel_id = note.channel_id;
+            let added_count = notes_to_add.len();
             if let Some(document) = &mut self.document {
-                match document.add_pattern_note(pattern.id, note) {
+                match document.add_pattern_notes(pattern.id, &notes_to_add) {
                     Ok(()) => {
-                        self.selected_note = Some((pattern.id, channel_id, note_index));
+                        self.selected_piano_notes.clear();
+                        self.selected_piano_notes.extend(
+                            (first_note_index..first_note_index + added_count)
+                                .map(|note_index| (pattern.id, channel_id, note_index)),
+                        );
+                        self.selected_note = self.selected_piano_notes.iter().next_back().copied();
                         self.selected_note_channel = Some(channel_id);
                         self.dirty = true;
-                        self.status = format!("Added note to pattern {}", pattern.id);
+                        if stamped_chord && only_one {
+                            self.piano_roll_stamp_mode = false;
+                        }
+                        self.status = if stamped_chord {
+                            format!("Stamped {} notes in pattern {}", added_count, pattern.id)
+                        } else if self.piano_roll_paint_mode {
+                            format!("Painted note in pattern {}", pattern.id)
+                        } else {
+                            format!("Added note to pattern {}", pattern.id)
+                        };
                     }
                     Err(error) => self.status = error.to_string(),
+                }
+            }
+        }
+    }
+
+    fn draw_piano_roll_event_editor(
+        &mut self,
+        ui: &mut egui::Ui,
+        pattern: &Pattern,
+        ppq: u16,
+        tick_scale: f32,
+        keyboard_width: f32,
+        horizontal_scroll: f32,
+    ) {
+        ui.horizontal(|ui| {
+            ui.strong(format!("{} events", self.piano_roll_event_target.label()));
+            ui.label("Drag stems to change note properties · Shift+F cycles targets");
+        });
+        let size = Vec2::new(ui.available_width().max(1.0), 102.0);
+        let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+        let plot_rect = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + keyboard_width, rect.top() + 8.0),
+            egui::pos2(rect.right(), rect.bottom() - 8.0),
+        );
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 0, PANEL_DARK);
+        painter.rect_filled(
+            egui::Rect::from_min_max(rect.min, egui::pos2(plot_rect.left(), rect.bottom())),
+            0,
+            PANEL_LIGHT,
+        );
+        painter.rect_stroke(
+            rect,
+            egui::CornerRadius::ZERO,
+            Stroke::new(1.0, GRID),
+            egui::StrokeKind::Inside,
+        );
+        painter.text(
+            egui::pos2(rect.left() + 6.0, rect.top() + 14.0),
+            Align2::LEFT_TOP,
+            self.piano_roll_event_target.label(),
+            FontId::proportional(10.0),
+            TEXT,
+        );
+        let maximum = self.piano_roll_event_target.maximum();
+        let baseline = plot_rect.bottom() - 1.0;
+        painter.line_segment(
+            [
+                egui::pos2(plot_rect.left(), baseline),
+                egui::pos2(plot_rect.right(), baseline),
+            ],
+            Stroke::new(1.0, GRID),
+        );
+        let measure_ticks = u32::from(ppq).saturating_mul(4).max(1);
+        let measure_width = measure_ticks as f32 * tick_scale;
+        if measure_width > 0.0 {
+            let measure_count = (rect.width() / measure_width).ceil() as u32 + 2;
+            for measure in 0..measure_count {
+                let x = plot_rect.left() + measure as f32 * measure_width - horizontal_scroll;
+                if x >= plot_rect.left() && x <= plot_rect.right() {
+                    painter.line_segment(
+                        [egui::pos2(x, plot_rect.top()), egui::pos2(x, baseline)],
+                        Stroke::new(1.0, GRID),
+                    );
+                }
+            }
+        }
+
+        let Some(channel_id) = self.selected_note_channel else {
+            return;
+        };
+        let mut same_onset_count = BTreeMap::<u32, u32>::new();
+        let target = self.piano_roll_event_target;
+        for (note_index, note) in pattern
+            .notes
+            .iter()
+            .filter(|note| note.channel_id == channel_id)
+            .enumerate()
+        {
+            let occurrence = same_onset_count.entry(note.position).or_default();
+            let stagger = (*occurrence as f32 * 4.0).min(28.0);
+            *occurrence = occurrence.saturating_add(1);
+            let x =
+                plot_rect.left() + note.position as f32 * tick_scale - horizontal_scroll + stagger;
+            if x < plot_rect.left() - 8.0 || x > plot_rect.right() + 8.0 {
+                continue;
+            }
+            let value = target.value(note).min(maximum);
+            let normalized = value as f32 / f32::from(maximum.max(1));
+            let point = egui::pos2(
+                x,
+                egui::lerp(plot_rect.bottom()..=plot_rect.top(), normalized),
+            );
+            let note_id = (pattern.id, channel_id, note_index);
+            let selected = self.selected_piano_notes.contains(&note_id);
+            let color = if selected { BLUE } else { GREEN };
+            painter.line_segment(
+                [egui::pos2(x, baseline), point],
+                Stroke::new(if selected { 2.0 } else { 1.5 }, color),
+            );
+            painter.circle_filled(point, if selected { 4.5 } else { 3.5 }, color);
+            let hit_rect = egui::Rect::from_min_max(
+                egui::pos2(x - 6.0, point.y - 7.0),
+                egui::pos2(x + 6.0, baseline + 2.0),
+            );
+            let response = ui.interact(
+                hit_rect,
+                Id::new(("piano-note-event", pattern.id, channel_id, note_index)),
+                Sense::click_and_drag(),
+            );
+            if response.clicked() {
+                self.selected_piano_notes.clear();
+                self.selected_piano_notes.insert(note_id);
+                self.selected_note = Some(note_id);
+                self.selected_note_channel = Some(channel_id);
+            }
+            if response.dragged()
+                && let Some(pointer) = response.interact_pointer_pos()
+            {
+                let normalized = ((baseline - pointer.y) / plot_rect.height()).clamp(0.0, 1.0);
+                let value = (normalized * f32::from(maximum)).round() as u16;
+                if value != target.value(note).min(maximum)
+                    && let Some(document) = &mut self.document
+                {
+                    match document.edit_pattern_note(
+                        pattern.id,
+                        channel_id,
+                        note_index,
+                        target.edit(value),
+                    ) {
+                        Ok(()) => {
+                            self.dirty = true;
+                            self.status = format!("Updated note {}", target.label());
+                        }
+                        Err(error) => {
+                            self.status = format!("Could not update note event: {error}");
+                        }
+                    }
                 }
             }
         }
@@ -3427,32 +8178,50 @@ impl DawUi {
             self.selected_note = None;
             return;
         };
+        ui.small(format!(
+            "Chord at this onset: {}",
+            detect_chord_name(&pattern.notes, channel_id, note.position)
+        ));
         let mut position = note.position;
         let mut length = note.length;
         let mut key = note.key;
         let mut velocity = note.velocity;
+        let mut flags = note.flags;
+        let mut group = note.group;
+        let mut fine_pitch = note.fine_pitch;
+        let mut release = note.release;
+        let mut midi_channel = note.midi_channel;
+        let mut pan = note.pan;
+        let mut mod_x = note.mod_x;
+        let mut mod_y = note.mod_y;
         let mut delete_requested = false;
+        let mut position_changed = false;
+        let mut length_changed = false;
+        let mut key_changed = false;
+        let mut velocity_changed = false;
+        let mut flags_changed = false;
+        let mut group_changed = false;
         ui.separator();
         ui.horizontal(|ui| {
             ui.label("Note");
-            let position_changed = ui
+            position_changed = ui
                 .add(
                     egui::DragValue::new(&mut position)
                         .prefix("Start ")
                         .speed(1.0),
                 )
                 .changed();
-            let length_changed = ui
+            length_changed = ui
                 .add(
                     egui::DragValue::new(&mut length)
                         .prefix("Length ")
                         .speed(1.0),
                 )
                 .changed();
-            let key_changed = ui
+            key_changed = ui
                 .add(egui::DragValue::new(&mut key).prefix("Key ").speed(0.1))
                 .changed();
-            let velocity_changed = ui
+            velocity_changed = ui
                 .add(
                     egui::DragValue::new(&mut velocity)
                         .prefix("Velocity ")
@@ -3460,33 +8229,108 @@ impl DawUi {
                 )
                 .changed();
             delete_requested = ui.button("Delete note").clicked();
-            if !delete_requested
-                && (position_changed || length_changed || key_changed || velocity_changed)
-            {
-                let edit = PatternNoteEdit {
-                    position: position_changed.then_some(position),
-                    length: length_changed.then_some(length),
-                    key: key_changed.then_some(key),
-                    velocity: velocity_changed.then_some(velocity),
-                    ..PatternNoteEdit::default()
-                };
-                if let Some(document) = &mut self.document
-                    && document
-                        .edit_pattern_note(pattern_id, channel_id, channel_note_index, edit)
-                        .is_ok()
-                {
-                    self.dirty = true;
-                    self.status = "Piano roll note updated".to_owned();
-                }
-            }
             if ui.button("Deselect").clicked() {
                 self.selected_note = None;
+                self.selected_piano_notes.clear();
             }
         });
+        let mut fine_pitch_changed = false;
+        let mut release_changed = false;
+        let mut midi_channel_changed = false;
+        let mut pan_changed = false;
+        let mut mod_x_changed = false;
+        let mut mod_y_changed = false;
+        ui.collapsing("Advanced note properties", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                flags_changed = ui
+                    .add(
+                        egui::DragValue::new(&mut flags)
+                            .prefix("Flags raw ")
+                            .speed(0.1),
+                    )
+                    .changed();
+                group_changed = ui
+                    .add(
+                        egui::DragValue::new(&mut group)
+                            .prefix("Group raw ")
+                            .speed(0.1),
+                    )
+                    .changed();
+                fine_pitch_changed = ui
+                    .add(
+                        egui::DragValue::new(&mut fine_pitch)
+                            .prefix("Fine pitch ")
+                            .speed(0.1),
+                    )
+                    .changed();
+                release_changed = ui
+                    .add(
+                        egui::DragValue::new(&mut release)
+                            .prefix("Release ")
+                            .speed(0.1),
+                    )
+                    .changed();
+                midi_channel_changed = ui
+                    .add(
+                        egui::DragValue::new(&mut midi_channel)
+                            .prefix("MIDI channel raw ")
+                            .speed(0.1),
+                    )
+                    .changed();
+                pan_changed = ui
+                    .add(egui::DragValue::new(&mut pan).prefix("Pan ").speed(0.1))
+                    .changed();
+                mod_x_changed = ui
+                    .add(egui::DragValue::new(&mut mod_x).prefix("Mod X ").speed(0.1))
+                    .changed();
+                mod_y_changed = ui
+                    .add(egui::DragValue::new(&mut mod_y).prefix("Mod Y ").speed(0.1))
+                    .changed();
+            });
+        });
+        if !delete_requested
+            && (position_changed
+                || length_changed
+                || key_changed
+                || velocity_changed
+                || flags_changed
+                || group_changed
+                || fine_pitch_changed
+                || release_changed
+                || midi_channel_changed
+                || pan_changed
+                || mod_x_changed
+                || mod_y_changed)
+        {
+            let edit = PatternNoteEdit {
+                position: position_changed.then_some(position),
+                length: length_changed.then_some(length),
+                key: key_changed.then_some(key),
+                velocity: velocity_changed.then_some(velocity),
+                flags: flags_changed.then_some(flags),
+                group: group_changed.then_some(group),
+                fine_pitch: fine_pitch_changed.then_some(fine_pitch),
+                release: release_changed.then_some(release),
+                midi_channel: midi_channel_changed.then_some(midi_channel),
+                pan: pan_changed.then_some(pan),
+                mod_x: mod_x_changed.then_some(mod_x),
+                mod_y: mod_y_changed.then_some(mod_y),
+                ..PatternNoteEdit::default()
+            };
+            if let Some(document) = &mut self.document
+                && document
+                    .edit_pattern_note(pattern_id, channel_id, channel_note_index, edit)
+                    .is_ok()
+            {
+                self.dirty = true;
+                self.status = "Piano roll note updated".to_owned();
+            }
+        }
         if delete_requested && let Some(document) = &mut self.document {
             match document.delete_pattern_note(pattern_id, channel_id, channel_note_index) {
                 Ok(()) => {
                     self.selected_note = None;
+                    self.selected_piano_notes.clear();
                     self.dirty = true;
                     self.status = format!("Deleted note from pattern {pattern_id}");
                 }
@@ -4252,10 +9096,52 @@ impl DawUi {
 
 impl eframe::App for DawUi {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let redo_requested = ui.input_mut(|input| {
+            input.consume_key(
+                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                egui::Key::Z,
+            ) || input.consume_key(egui::Modifiers::COMMAND, egui::Key::Y)
+        });
+        let undo_requested = !redo_requested
+            && ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::Z));
+        if undo_requested {
+            self.undo_document();
+        } else if redo_requested {
+            self.redo_document();
+        }
+        let history_navigation = undo_requested || redo_requested;
+        let pointer_down = ui.input(|input| {
+            input.pointer.primary_down() || input.pointer.button_down(PointerButton::Secondary)
+        });
+        let edit_input_received = ui.input(|input| {
+            input.pointer.primary_pressed()
+                || input.pointer.primary_down()
+                || input.pointer.primary_released()
+                || input.pointer.button_pressed(PointerButton::Secondary)
+                || input.pointer.button_down(PointerButton::Secondary)
+                || input.pointer.button_released(PointerButton::Secondary)
+                || input.events.iter().any(|event| match event {
+                    egui::Event::Key { pressed: true, .. }
+                    | egui::Event::Text(_)
+                    | egui::Event::Paste(_) => true,
+                    _ => false,
+                })
+        });
+        let mut frame_snapshot = if !history_navigation
+            && self.pending_history_snapshot.is_none()
+            && edit_input_received
+        {
+            self.document
+                .as_ref()
+                .and_then(|document| document.encode_lossless().ok())
+        } else {
+            None
+        };
         self.poll_project_audio_render();
         self.poll_song_render();
         self.poll_vst3_stream();
         self.poll_sampler_stream();
+        self.poll_browser_preview(ui.ctx());
         self.reap_audio_render_workers();
         self.reap_song_render_workers();
         self.reap_vst3_workers();
@@ -4269,6 +9155,11 @@ impl eframe::App for DawUi {
             if ui.input(|input| input.key_pressed(key)) {
                 self.view = view;
             }
+        }
+        if self.view == MainView::ChannelRack
+            && ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::K))
+        {
+            self.step_graph_editor_open = !self.step_graph_editor_open;
         }
         if let Some(host) = &mut self.vst3_host
             && let Err(error) = host.service_editors()
@@ -4286,6 +9177,7 @@ impl eframe::App for DawUi {
         {
             self.playing = false;
             self.project_playback_loaded = false;
+            self.playlist_playback_loaded = false;
             self.status = "Project playback reached the end".to_owned();
         }
         if self.audio_engine.is_some() {
@@ -4349,6 +9241,7 @@ impl eframe::App for DawUi {
         });
         self.project_info_dialog(ui.ctx());
         self.project_settings_dialog(ui.ctx());
+        self.finish_history_frame(frame_snapshot.take(), pointer_down, history_navigation);
     }
 }
 
@@ -4429,6 +9322,129 @@ fn automation_point_screen_position(
     )
 }
 
+fn default_browser_directory() -> PathBuf {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir())
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_default()
+}
+
+fn browser_favorites_file() -> Option<PathBuf> {
+    let root = if cfg!(target_os = "windows") {
+        std::env::var_os("APPDATA").map(PathBuf::from).or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .map(PathBuf::from)
+                .map(|home| home.join("AppData").join("Roaming"))
+        })
+    } else if cfg!(target_os = "macos") {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join("Library").join("Application Support"))
+    } else {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .map(|home| home.join(".config"))
+            })
+    }?;
+    Some(root.join("fl-studio-rebuild").join("browser-favorites.txt"))
+}
+
+fn load_browser_favorites() -> BTreeSet<PathBuf> {
+    let Some(path) = browser_favorites_file() else {
+        return BTreeSet::new();
+    };
+    fs::read_to_string(path)
+        .map(|contents| {
+            contents
+                .lines()
+                .filter(|line| !line.is_empty())
+                .map(PathBuf::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn save_browser_favorites(favorites: &BTreeSet<PathBuf>) -> Result<(), String> {
+    let path = browser_favorites_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the user configuration path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    let contents = favorites
+        .iter()
+        .map(|path| path.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&path, contents)
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
+fn browser_factory_packs_directory() -> Option<PathBuf> {
+    let resolver = SamplePathResolver::new(Path::new("browser-root.flp"));
+    for root in resolver.factory_roots() {
+        for candidate in [
+            root.join("Data").join("Patches").join("Packs"),
+            root.join("Patches").join("Packs"),
+            root.join("Packs"),
+        ] {
+            if candidate.is_dir() {
+                return Some(candidate);
+            }
+        }
+        if root
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("Packs"))
+            && root.is_dir()
+        {
+            return Some(root.clone());
+        }
+    }
+    None
+}
+
+fn browser_file_kind(path: &Path) -> Option<BrowserFileKind> {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())?
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "wav" | "wave" | "mp3" | "m4a" | "ogg" | "flac" | "aif" | "aiff" | "wv" => {
+            Some(BrowserFileKind::Audio)
+        }
+        "flp" => Some(BrowserFileKind::Project),
+        "fst" | "fxp" | "fxb" | "vstpreset" => Some(BrowserFileKind::Preset),
+        "mid" | "midi" => Some(BrowserFileKind::Midi),
+        _ => None,
+    }
+}
+
+fn browser_filter_matches(path: &Path, filter: BrowserFilter) -> bool {
+    match (filter, browser_file_kind(path)) {
+        (BrowserFilter::All, Some(_)) => true,
+        (BrowserFilter::Audio, Some(BrowserFileKind::Audio)) => true,
+        (BrowserFilter::Projects, Some(BrowserFileKind::Project)) => true,
+        (BrowserFilter::Presets, Some(BrowserFileKind::Preset)) => true,
+        _ => false,
+    }
+}
+
+fn browser_file_icon(path: &Path) -> &'static str {
+    match browser_file_kind(path) {
+        Some(BrowserFileKind::Audio) => "♫",
+        Some(BrowserFileKind::Project) => "FLP",
+        Some(BrowserFileKind::Preset) => "FST",
+        Some(BrowserFileKind::Midi) => "MIDI",
+        None => "·",
+    }
+}
+
 fn clip_name(clip: &PlaylistClip, tracks: &[PlaylistTrack]) -> String {
     match clip.target() {
         flp_rebuild::PlaylistClipTarget::Pattern { id } => format!("Pattern {}", id),
@@ -4446,6 +9462,67 @@ fn note_name(key: u16) -> String {
         "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
     ];
     format!("{}{}", NAMES[(key % 12) as usize], key / 12)
+}
+
+fn draw_audio_clip_waveform(
+    painter: &egui::Painter,
+    clip_rect: egui::Rect,
+    clip: &PlaylistClip,
+    waveform: &AudioWaveform,
+) {
+    if waveform.peaks.is_empty() || waveform.frame_count == 0 || waveform.sample_rate == 0 {
+        return;
+    }
+    let full_frame_count = waveform.frame_count;
+    let to_frame = |milliseconds: f32| -> Option<u64> {
+        let frame = f64::from(milliseconds) * f64::from(waveform.sample_rate) / 1000.0;
+        (frame.is_finite() && frame >= 0.0 && frame <= u64::MAX as f64)
+            .then_some(frame.round() as u64)
+    };
+    let source_window = if clip.start_offset == -1.0 && clip.end_offset == -1.0 {
+        Some((0, full_frame_count))
+    } else {
+        to_frame(clip.start_offset)
+            .zip(to_frame(clip.end_offset))
+            .map(|(start, end)| (start.min(full_frame_count), end.min(full_frame_count)))
+            .filter(|(start, end)| start < end)
+    };
+    let Some((source_start, source_end)) = source_window else {
+        return;
+    };
+    let columns = clip_rect.width().ceil().clamp(1.0, 1024.0) as usize;
+    let peak_count = waveform.peaks.len() as u128;
+    let frame_count = u128::from(full_frame_count);
+    let amplitude = (clip_rect.height() * 0.42).max(1.0);
+    let center_y = clip_rect.center().y;
+    let color = Color32::from_rgba_unmultiplied(238, 243, 248, 132);
+    for column in 0..columns {
+        let frame_start = u128::from(source_start)
+            + u128::from(source_end - source_start) * column as u128 / columns as u128;
+        let frame_end = u128::from(source_start)
+            + u128::from(source_end - source_start) * (column + 1) as u128 / columns as u128;
+        let first_peak = (frame_start * peak_count / frame_count) as usize;
+        let last_peak = ((frame_end * peak_count / frame_count) as usize)
+            .max(first_peak + 1)
+            .min(waveform.peaks.len());
+        let mut minimum = f32::INFINITY;
+        let mut maximum = f32::NEG_INFINITY;
+        for peak in &waveform.peaks[first_peak.min(waveform.peaks.len() - 1)..last_peak] {
+            minimum = minimum.min(peak.minimum);
+            maximum = maximum.max(peak.maximum);
+        }
+        if !minimum.is_finite() || !maximum.is_finite() {
+            continue;
+        }
+        let x = clip_rect.left() + (column as f32 + 0.5) * clip_rect.width() / columns as f32;
+        painter.line_segment(
+            [
+                egui::pos2(x, center_y - maximum * amplitude),
+                egui::pos2(x, center_y - minimum * amplitude),
+            ],
+            Stroke::new(1.0, color),
+        );
+    }
 }
 
 fn snap_note_tick(value: i64, quantum: u32, minimum: u32) -> u32 {

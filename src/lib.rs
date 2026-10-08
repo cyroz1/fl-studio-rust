@@ -139,6 +139,20 @@ impl FlpEvent {
         }
     }
 
+    fn new_dword(opcode: u8, value: u32) -> Self {
+        let payload = value.to_le_bytes().to_vec();
+        let mut wire_bytes = Vec::with_capacity(5);
+        wire_bytes.push(opcode);
+        wire_bytes.extend_from_slice(&payload);
+        Self {
+            opcode,
+            payload,
+            encoding: PayloadEncoding::Dword,
+            wire_bytes,
+            file_offset: 0,
+        }
+    }
+
     fn new_byte(opcode: u8, value: u8) -> Self {
         Self {
             opcode,
@@ -604,6 +618,13 @@ pub struct PatternNoteEdit {
     pub mod_y: Option<u8>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArpeggioDirection {
+    Up,
+    Down,
+    UpDown,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Arrangement {
     pub id: u16,
@@ -695,6 +716,33 @@ fn time_marker_at_mut<'a>(
             .get_mut(marker_index),
         TimeMarkerTarget::Pending { marker_index } => pending.get_mut(marker_index),
     }
+}
+
+fn next_randomizer_value(state: &mut u64) -> u64 {
+    let mut value = *state;
+    value ^= value >> 12;
+    value ^= value << 25;
+    value ^= value >> 27;
+    *state = value;
+    value.wrapping_mul(0x2545_f491_4f6c_dd1d)
+}
+
+fn randomizer_offset(state: &mut u64, range: i32, negative: bool, bipolar: bool) -> i32 {
+    if range == 0 {
+        return 0;
+    }
+    if bipolar {
+        let width = u64::try_from(range * 2 + 1).expect("randomizer range is bounded");
+        (next_randomizer_value(state) % width) as i32 - range
+    } else {
+        let width = u64::try_from(range + 1).expect("randomizer range is bounded");
+        let value = (next_randomizer_value(state) % width) as i32;
+        if negative { -value } else { value }
+    }
+}
+
+fn note_index_in_scope(note_index: usize, selected_indices: Option<&HashSet<usize>>) -> bool {
+    selected_indices.is_none_or(|indices| indices.contains(&note_index))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1664,6 +1712,226 @@ impl FlpDocument {
         Ok(())
     }
 
+    /// Creates a Playlist time or signature marker in an arrangement.
+    /// Marker fields use the same validation and wire representation as marker edits.
+    pub fn create_time_marker(
+        &mut self,
+        arrangement_id: u16,
+        edit: TimeMarkerEdit,
+    ) -> Result<usize, FlpError> {
+        if edit.name.as_deref().is_some_and(|name| name.contains('\0')) {
+            return Err(FlpError::UnsupportedEdit(
+                "time marker names cannot contain an embedded NUL character",
+            ));
+        }
+        if edit
+            .position_ticks
+            .is_some_and(|position| position > TIME_MARKER_TICK_MASK)
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "time marker positions must fit in the low 27 position bits",
+            ));
+        }
+        if edit.numerator == Some(0) || edit.denominator == Some(0) {
+            return Err(FlpError::UnsupportedEdit(
+                "time signature numerator and denominator must be positive",
+            ));
+        }
+
+        let is_signature = edit.is_signature.unwrap_or(false);
+        if is_signature {
+            if edit.numerator.is_none() || edit.denominator.is_none() {
+                return Err(FlpError::UnsupportedEdit(
+                    "creating a time-signature marker requires numerator and denominator values",
+                ));
+            }
+        } else if edit.numerator.is_some() || edit.denominator.is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "numerator and denominator can only be set on a time-signature marker",
+            ));
+        }
+
+        let arrangements = self.arrangements_impl(false)?;
+        let mut matching_arrangements = arrangements
+            .iter()
+            .filter(|arrangement| arrangement.id == arrangement_id);
+        let arrangement = matching_arrangements.next();
+        if matching_arrangements.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested Playlist arrangement id is ambiguous",
+            ));
+        }
+        let has_arrangement_markers = self
+            .events
+            .iter()
+            .any(|event| event.opcode == 0x63 && event.payload.len() == 2);
+        if arrangement.is_none() && (has_arrangement_markers || arrangement_id != 0) {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested Playlist arrangement does not exist",
+            ));
+        }
+
+        let (region_start, region_end) = if has_arrangement_markers {
+            let start = self
+                .events
+                .iter()
+                .position(|event| {
+                    event.opcode == 0x63
+                        && event.payload.len() == 2
+                        && u16::from_le_bytes([event.payload[0], event.payload[1]])
+                            == arrangement_id
+                })
+                .ok_or(FlpError::UnsupportedEdit(
+                    "the requested Playlist arrangement does not exist",
+                ))?;
+            let region_start = start + 1;
+            let region_end = self.events[region_start..]
+                .iter()
+                .position(|event| {
+                    event.opcode == 0x62 || (event.opcode == 0x63 && event.payload.len() == 2)
+                })
+                .map_or(self.events.len(), |offset| region_start + offset);
+            (region_start, region_end)
+        } else {
+            let region_end = self
+                .events
+                .iter()
+                .rposition(|event| event.opcode == 0x62)
+                .unwrap_or(self.events.len());
+            (0, region_end)
+        };
+
+        let position_ticks = edit.position_ticks.unwrap_or(0);
+        let markers =
+            arrangement.map_or(&[][..], |arrangement| arrangement.time_markers.as_slice());
+        let later_marker = markers
+            .iter()
+            .filter(|marker| marker.position_ticks() > position_ticks)
+            .filter_map(|marker| marker.source_events.position)
+            .find(|event_index| *event_index >= region_start && *event_index < region_end);
+        let last_marker_end = markers
+            .iter()
+            .filter_map(|marker| {
+                [
+                    marker.source_events.position,
+                    marker.source_events.numerator,
+                    marker.source_events.denominator,
+                    marker.source_events.name,
+                ]
+                .into_iter()
+                .flatten()
+                .max()
+            })
+            .map(|event_index| event_index + 1)
+            .filter(|event_index| *event_index >= region_start && *event_index <= region_end);
+        let first_clip_event = self.events[region_start..region_end]
+            .iter()
+            .position(|event| event.opcode == 0xE9)
+            .map(|offset| region_start + offset);
+        let insertion_index = later_marker
+            .or_else(|| last_marker_end.max())
+            .or(first_clip_event)
+            .unwrap_or(region_end);
+
+        let mut raw_position = position_ticks;
+        if is_signature {
+            raw_position |= TIME_MARKER_SIGNATURE_BIT;
+        }
+        let mut inserted = vec![FlpEvent::new_dword(0x94, raw_position)];
+        if is_signature {
+            inserted.push(FlpEvent::new_byte(
+                0x21,
+                edit.numerator.expect("signature numerator validated"),
+            ));
+            inserted.push(FlpEvent::new_byte(
+                0x22,
+                edit.denominator.expect("signature denominator validated"),
+            ));
+        }
+        if let Some(name) = edit.name {
+            let payload = encode_project_string(&name, self.project_strings_use_utf16())?;
+            inserted.push(FlpEvent::new_data(0xCD, payload)?);
+        }
+
+        let mut candidate = self.clone();
+        for (offset, event) in inserted.into_iter().enumerate() {
+            candidate.events.insert(insertion_index + offset, event);
+        }
+        candidate.refresh_event_offsets()?;
+        let marker_index = candidate
+            .arrangements_impl(false)?
+            .into_iter()
+            .find(|arrangement| arrangement.id == arrangement_id)
+            .and_then(|arrangement| {
+                arrangement
+                    .time_markers
+                    .iter()
+                    .position(|marker| marker.source_events.position == Some(insertion_index))
+            })
+            .ok_or(FlpError::UnsupportedEdit(
+                "the new Playlist marker could not be resolved after insertion",
+            ))?;
+        *self = candidate;
+        Ok(marker_index)
+    }
+
+    /// Removes one marker's recognized source events while preserving unrelated events.
+    pub fn delete_time_marker(
+        &mut self,
+        arrangement_id: u16,
+        marker_index: usize,
+    ) -> Result<(), FlpError> {
+        let arrangements = self.arrangements_impl(false)?;
+        let mut matching_arrangements = arrangements
+            .iter()
+            .filter(|arrangement| arrangement.id == arrangement_id);
+        let Some(arrangement) = matching_arrangements.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested Playlist arrangement does not exist",
+            ));
+        };
+        if matching_arrangements.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested Playlist arrangement id is ambiguous",
+            ));
+        }
+        let marker =
+            arrangement
+                .time_markers
+                .get(marker_index)
+                .ok_or(FlpError::UnsupportedEdit(
+                    "the requested time marker does not exist",
+                ))?;
+        let mut source_event_indices = [
+            marker.source_events.position,
+            marker.source_events.numerator,
+            marker.source_events.denominator,
+            marker.source_events.name,
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        if !source_event_indices.iter().any(|index| {
+            self.events
+                .get(*index)
+                .is_some_and(|event| event.opcode == 0x94)
+        }) {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected time marker has no source position event",
+            ));
+        }
+        source_event_indices.sort_unstable();
+        source_event_indices.dedup();
+
+        let mut candidate = self.clone();
+        for event_index in source_event_indices.into_iter().rev() {
+            candidate.events.remove(event_index);
+        }
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
     fn arrangements_impl(&self, include_clips: bool) -> Result<Vec<Arrangement>, FlpError> {
         let mut arrangements = Vec::<Arrangement>::new();
         let mut current_arrangement = None;
@@ -2148,6 +2416,14 @@ impl FlpDocument {
                 "the requested playlist clip does not exist",
             ));
         };
+        if edit.start_offset.is_some_and(|value| !value.is_finite())
+            || edit.end_offset.is_some_and(|value| !value.is_finite())
+            || edit.scale.is_some_and(|value| !value.is_finite())
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "playlist clip offsets and scale must be finite numbers",
+            ));
+        }
         let record_start = clip
             .source_record_index
             .checked_mul(clip.record_size)
@@ -2193,6 +2469,73 @@ impl FlpDocument {
             write_event_payload_bytes(&mut self.events[event_index], payload_offset, &bytes)?;
         }
         Ok(())
+    }
+
+    /// Duplicates one clip's complete stored record into the same Playlist event.
+    /// The duplicate is inserted immediately after the source record.
+    pub fn duplicate_playlist_clip(
+        &mut self,
+        arrangement_id: u16,
+        clip_index: usize,
+        position_ticks: Option<u32>,
+        raw_track_index: Option<u16>,
+    ) -> Result<usize, FlpError> {
+        let arrangements = self.arrangements()?;
+        let mut matching_arrangements = arrangements
+            .iter()
+            .filter(|arrangement| arrangement.id == arrangement_id);
+        let Some(arrangement) = matching_arrangements.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested arrangement does not exist",
+            ));
+        };
+        if matching_arrangements.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested arrangement id is ambiguous",
+            ));
+        }
+        let Some(clip) = arrangement.clips.get(clip_index) else {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested playlist clip does not exist",
+            ));
+        };
+        let record_size = clip.record_size;
+        let record_start = clip
+            .source_record_index
+            .checked_mul(record_size)
+            .ok_or(FlpError::LengthOverflow)?;
+        let event_index = clip.source_event_index;
+        let event = self
+            .events
+            .get(event_index)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the source Playlist event no longer exists",
+            ))?;
+        if event.opcode != 0xE9 || !matches!(event.encoding, PayloadEncoding::Data { .. }) {
+            return Err(FlpError::UnsupportedEdit(
+                "the source Playlist clip is not in a length-prefixed data event",
+            ));
+        }
+        let record_end = record_start
+            .checked_add(record_size)
+            .ok_or(FlpError::LengthOverflow)?;
+        if record_end > event.payload.len() || !event.payload.len().is_multiple_of(record_size) {
+            return Err(FlpError::UnsupportedEdit(
+                "the source Playlist record does not fit its event payload",
+            ));
+        }
+        let mut duplicate = event.payload[record_start..record_end].to_vec();
+        let position =
+            position_ticks.unwrap_or_else(|| clip.position_ticks.saturating_add(clip.length_ticks));
+        duplicate[..4].copy_from_slice(&position.to_le_bytes());
+        if let Some(raw_track_index) = raw_track_index {
+            duplicate[12..14].copy_from_slice(&raw_track_index.to_le_bytes());
+        }
+        let mut payload = event.payload.clone();
+        payload.splice(record_end..record_end, duplicate);
+        self.events[event_index].replace_data_payload(payload)?;
+        self.refresh_event_offsets()?;
+        Ok(clip_index.saturating_add(1))
     }
 
     /// Edits selected fields of one existing note without changing the event's wire length.
@@ -2272,6 +2615,1350 @@ impl FlpDocument {
         Err(FlpError::UnsupportedEdit(
             "the requested pattern, channel, or note index does not exist",
         ))
+    }
+
+    /// Moves selected channel notes toward the closest grid point with optional strength and swing.
+    /// Only note positions change; all other score fields and bytes remain intact.
+    pub fn quantize_pattern_notes(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        grid_ticks: u32,
+        strength: f64,
+        swing: f64,
+    ) -> Result<usize, FlpError> {
+        self.quantize_pattern_notes_in_scope(
+            pattern_id, channel_id, None, grid_ticks, strength, swing,
+        )
+    }
+
+    /// Moves only the supplied channel-note indices toward the closest grid points.
+    /// The indices are channel-local and all non-position fields remain unchanged.
+    pub fn quantize_pattern_note_selection(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: &[usize],
+        grid_ticks: u32,
+        strength: f64,
+        swing: f64,
+    ) -> Result<usize, FlpError> {
+        self.quantize_pattern_notes_in_scope(
+            pattern_id,
+            channel_id,
+            Some(note_indices),
+            grid_ticks,
+            strength,
+            swing,
+        )
+    }
+
+    fn quantize_pattern_notes_in_scope(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: Option<&[usize]>,
+        grid_ticks: u32,
+        strength: f64,
+        swing: f64,
+    ) -> Result<usize, FlpError> {
+        if grid_ticks == 0 {
+            return Err(FlpError::UnsupportedEdit(
+                "quantize grid must be greater than zero ticks",
+            ));
+        }
+        if !strength.is_finite() || !(0.0..=1.0).contains(&strength) {
+            return Err(FlpError::UnsupportedEdit(
+                "quantize strength must be between 0 and 1",
+            ));
+        }
+        if !swing.is_finite() || !(0.0..=1.0).contains(&swing) {
+            return Err(FlpError::UnsupportedEdit(
+                "quantize swing must be between 0 and 1",
+            ));
+        }
+        let patterns = self.patterns()?;
+        let pattern = patterns
+            .iter()
+            .find(|pattern| pattern.id == pattern_id)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested pattern does not exist",
+            ))?;
+        let grid = u64::from(grid_ticks);
+        let selected_indices =
+            note_indices.map(|indices| indices.iter().copied().collect::<HashSet<_>>());
+        let edits = pattern
+            .notes
+            .iter()
+            .filter(|note| note.channel_id == channel_id)
+            .enumerate()
+            .filter(|(note_index, _)| {
+                selected_indices
+                    .as_ref()
+                    .is_none_or(|indices| indices.contains(note_index))
+            })
+            .filter_map(|(note_index, note)| {
+                let position = u64::from(note.position);
+                let grid_index = position.saturating_add(grid / 2) / grid;
+                let straight_target = grid_index.saturating_mul(grid);
+                let swing_offset = if grid_index % 2 == 1 {
+                    (grid as f64 * 0.5 * swing).round() as u64
+                } else {
+                    0
+                };
+                let target = straight_target
+                    .saturating_add(swing_offset)
+                    .min(u64::from(u32::MAX)) as f64;
+                let next_position = (position as f64 + (target - position as f64) * strength)
+                    .round()
+                    .clamp(0.0, f64::from(u32::MAX)) as u32;
+                (next_position != note.position).then_some((note_index, next_position))
+            })
+            .collect::<Vec<_>>();
+        if edits.is_empty() {
+            return Ok(0);
+        }
+
+        let mut updated = self.clone();
+        for (note_index, position) in &edits {
+            updated.edit_pattern_note(
+                pattern_id,
+                channel_id,
+                *note_index,
+                PatternNoteEdit {
+                    position: Some(*position),
+                    ..PatternNoteEdit::default()
+                },
+            )?;
+        }
+        *self = updated;
+        Ok(edits.len())
+    }
+
+    /// Extends each onset group to the next distinct onset on the selected channel.
+    /// Notes in the final onset group retain their original lengths.
+    pub fn legato_pattern_notes(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+    ) -> Result<usize, FlpError> {
+        self.legato_pattern_notes_in_scope(pattern_id, channel_id, None)
+    }
+
+    /// Extends only the supplied channel-local note indices to their next distinct channel onset.
+    pub fn legato_pattern_note_selection(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: &[usize],
+    ) -> Result<usize, FlpError> {
+        self.legato_pattern_notes_in_scope(pattern_id, channel_id, Some(note_indices))
+    }
+
+    fn legato_pattern_notes_in_scope(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: Option<&[usize]>,
+    ) -> Result<usize, FlpError> {
+        let patterns = self.patterns()?;
+        let pattern = patterns
+            .iter()
+            .find(|pattern| pattern.id == pattern_id)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested pattern does not exist",
+            ))?;
+        let mut onset_positions = pattern
+            .notes
+            .iter()
+            .filter(|note| note.channel_id == channel_id)
+            .map(|note| note.position)
+            .collect::<Vec<_>>();
+        onset_positions.sort_unstable();
+        onset_positions.dedup();
+
+        let selected_indices =
+            note_indices.map(|indices| indices.iter().copied().collect::<HashSet<_>>());
+        let edits = pattern
+            .notes
+            .iter()
+            .filter(|note| note.channel_id == channel_id)
+            .enumerate()
+            .filter(|(note_index, _)| note_index_in_scope(*note_index, selected_indices.as_ref()))
+            .filter_map(|(note_index, note)| {
+                let next_onset =
+                    onset_positions.partition_point(|position| *position <= note.position);
+                let next_position = *onset_positions.get(next_onset)?;
+                let next_length = next_position.saturating_sub(note.position);
+                (next_length != note.length).then_some((note_index, next_length))
+            })
+            .collect::<Vec<_>>();
+        if edits.is_empty() {
+            return Ok(0);
+        }
+
+        let mut updated = self.clone();
+        for (note_index, length) in &edits {
+            updated.edit_pattern_note(
+                pattern_id,
+                channel_id,
+                *note_index,
+                PatternNoteEdit {
+                    length: Some(*length),
+                    ..PatternNoteEdit::default()
+                },
+            )?;
+        }
+        *self = updated;
+        Ok(edits.len())
+    }
+
+    /// Splits eligible channel notes into equal-duration segments without changing note properties.
+    /// The remainder of a non-divisible length is assigned to the final segment.
+    pub fn chop_pattern_notes(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        divisions: u8,
+    ) -> Result<usize, FlpError> {
+        self.chop_pattern_notes_in_scope(pattern_id, channel_id, None, divisions)
+    }
+
+    /// Splits only the supplied channel-local note indices into equal-duration segments.
+    pub fn chop_pattern_note_selection(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: &[usize],
+        divisions: u8,
+    ) -> Result<usize, FlpError> {
+        self.chop_pattern_notes_in_scope(pattern_id, channel_id, Some(note_indices), divisions)
+    }
+
+    fn chop_pattern_notes_in_scope(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: Option<&[usize]>,
+        divisions: u8,
+    ) -> Result<usize, FlpError> {
+        if !(2..=64).contains(&divisions) {
+            return Err(FlpError::UnsupportedEdit(
+                "note chop divisions must be between 2 and 64",
+            ));
+        }
+        let patterns = self.patterns()?;
+        let pattern = patterns
+            .iter()
+            .find(|pattern| pattern.id == pattern_id)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested pattern does not exist",
+            ))?;
+        let divisions = u32::from(divisions);
+        let selected_indices =
+            note_indices.map(|indices| indices.iter().copied().collect::<HashSet<_>>());
+        let mut first_lengths = Vec::new();
+        let mut additions = Vec::new();
+        for (note_index, note) in pattern
+            .notes
+            .iter()
+            .filter(|note| note.channel_id == channel_id)
+            .enumerate()
+            .filter(|(note_index, _)| note_index_in_scope(*note_index, selected_indices.as_ref()))
+        {
+            let segment_length = note.length / divisions;
+            if segment_length == 0 {
+                continue;
+            }
+            let remainder = note.length % divisions;
+            first_lengths.push((note_index, segment_length));
+            for segment in 1..divisions {
+                let offset = segment_length
+                    .checked_mul(segment)
+                    .ok_or(FlpError::LengthOverflow)?;
+                let position = note
+                    .position
+                    .checked_add(offset)
+                    .ok_or(FlpError::LengthOverflow)?;
+                let mut chopped = note.clone();
+                chopped.position = position;
+                chopped.length = segment_length
+                    + if segment == divisions - 1 {
+                        remainder
+                    } else {
+                        0
+                    };
+                additions.push(chopped);
+            }
+        }
+        if additions.is_empty() {
+            return Ok(0);
+        }
+
+        let mut updated = self.clone();
+        for (note_index, length) in &first_lengths {
+            updated.edit_pattern_note(
+                pattern_id,
+                channel_id,
+                *note_index,
+                PatternNoteEdit {
+                    length: Some(*length),
+                    ..PatternNoteEdit::default()
+                },
+            )?;
+        }
+        updated.add_pattern_notes(pattern_id, &additions)?;
+        *self = updated;
+        Ok(additions.len())
+    }
+
+    /// Joins touching or overlapping notes when every stored property except position and length
+    /// matches. The earliest record keeps its properties; later records in each joined group are
+    /// removed.
+    pub fn glue_pattern_notes(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+    ) -> Result<usize, FlpError> {
+        self.glue_pattern_notes_in_scope(pattern_id, channel_id, None)
+    }
+
+    /// Joins touching or overlapping notes only within the supplied channel-local selection.
+    pub fn glue_pattern_note_selection(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: &[usize],
+    ) -> Result<usize, FlpError> {
+        self.glue_pattern_notes_in_scope(pattern_id, channel_id, Some(note_indices))
+    }
+
+    fn glue_pattern_notes_in_scope(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: Option<&[usize]>,
+    ) -> Result<usize, FlpError> {
+        let patterns = self.patterns()?;
+        let pattern = patterns
+            .iter()
+            .find(|pattern| pattern.id == pattern_id)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested pattern does not exist",
+            ))?;
+        let selected_indices =
+            note_indices.map(|indices| indices.iter().copied().collect::<HashSet<_>>());
+        let mut notes = pattern
+            .notes
+            .iter()
+            .filter(|note| note.channel_id == channel_id)
+            .cloned()
+            .enumerate()
+            .filter(|(note_index, _)| note_index_in_scope(*note_index, selected_indices.as_ref()))
+            .collect::<Vec<_>>();
+        notes.sort_by_key(|(index, note)| (note.position, *index));
+        let properties_match = |left: &PatternNote, right: &PatternNote| {
+            let mut left = left.clone();
+            let mut right = right.clone();
+            left.position = 0;
+            left.length = 0;
+            right.position = 0;
+            right.length = 0;
+            left == right
+        };
+
+        let mut updates = Vec::new();
+        let mut removals = Vec::new();
+        let Some((mut first_index, mut first_note)) = notes.first().cloned() else {
+            return Ok(0);
+        };
+        let mut group_end = u64::from(first_note.position) + u64::from(first_note.length);
+        for (note_index, note) in notes.into_iter().skip(1) {
+            let note_start = u64::from(note.position);
+            let note_end = note_start + u64::from(note.length);
+            if properties_match(&first_note, &note) && note_start <= group_end {
+                group_end = group_end.max(note_end);
+                removals.push(note_index);
+            } else {
+                if group_end > u64::from(first_note.position) + u64::from(first_note.length) {
+                    let merged_length = group_end - u64::from(first_note.position);
+                    let merged_length =
+                        u32::try_from(merged_length).map_err(|_| FlpError::LengthOverflow)?;
+                    updates.push((first_index, merged_length));
+                }
+                first_index = note_index;
+                first_note = note;
+                group_end = note_end;
+            }
+        }
+        if group_end > u64::from(first_note.position) + u64::from(first_note.length) {
+            let merged_length = group_end - u64::from(first_note.position);
+            let merged_length =
+                u32::try_from(merged_length).map_err(|_| FlpError::LengthOverflow)?;
+            updates.push((first_index, merged_length));
+        }
+        if removals.is_empty() {
+            return Ok(0);
+        }
+
+        let mut updated = self.clone();
+        for (note_index, length) in &updates {
+            updated.edit_pattern_note(
+                pattern_id,
+                channel_id,
+                *note_index,
+                PatternNoteEdit {
+                    length: Some(*length),
+                    ..PatternNoteEdit::default()
+                },
+            )?;
+        }
+        removals.sort_unstable_by(|left, right| right.cmp(left));
+        for note_index in &removals {
+            updated.delete_pattern_note(pattern_id, channel_id, *note_index)?;
+        }
+        *self = updated;
+        Ok(removals.len())
+    }
+
+    /// Mirrors one channel's note positions around the end of its latest note.
+    /// Note lengths and every other score field remain unchanged.
+    pub fn flip_pattern_notes(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+    ) -> Result<usize, FlpError> {
+        self.flip_pattern_notes_in_scope(pattern_id, channel_id, None)
+    }
+
+    /// Mirrors only the supplied selected notes around their own time-and-length bounds.
+    pub fn flip_pattern_note_selection(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: &[usize],
+    ) -> Result<usize, FlpError> {
+        self.flip_pattern_notes_in_scope(pattern_id, channel_id, Some(note_indices))
+    }
+
+    fn flip_pattern_notes_in_scope(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: Option<&[usize]>,
+    ) -> Result<usize, FlpError> {
+        let patterns = self.patterns()?;
+        let pattern = patterns
+            .iter()
+            .find(|pattern| pattern.id == pattern_id)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested pattern does not exist",
+            ))?;
+        let selected_indices =
+            note_indices.map(|indices| indices.iter().copied().collect::<HashSet<_>>());
+        let notes = pattern
+            .notes
+            .iter()
+            .filter(|note| note.channel_id == channel_id)
+            .enumerate()
+            .filter(|(note_index, _)| note_index_in_scope(*note_index, selected_indices.as_ref()))
+            .collect::<Vec<_>>();
+        let Some(extent) = notes
+            .iter()
+            .map(|(_, note)| u64::from(note.position) + u64::from(note.length))
+            .max()
+        else {
+            return Ok(0);
+        };
+        let start = if note_indices.is_some() {
+            notes
+                .iter()
+                .map(|(_, note)| note.position)
+                .min()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        if extent > u64::from(u32::MAX) {
+            return Err(FlpError::LengthOverflow);
+        }
+        let extent = u32::try_from(extent).map_err(|_| FlpError::LengthOverflow)?;
+        let edits = notes
+            .iter()
+            .filter_map(|(note_index, note)| {
+                let end = note.position.checked_add(note.length)?;
+                let position = start.checked_add(extent.checked_sub(end)?)?;
+                (position != note.position).then_some((note_index, position))
+            })
+            .collect::<Vec<_>>();
+        if edits.is_empty() {
+            return Ok(0);
+        }
+        let mut updated = self.clone();
+        for (note_index, position) in &edits {
+            updated.edit_pattern_note(
+                pattern_id,
+                channel_id,
+                **note_index,
+                PatternNoteEdit {
+                    position: Some(*position),
+                    ..PatternNoteEdit::default()
+                },
+            )?;
+        }
+        *self = updated;
+        Ok(edits.len())
+    }
+
+    /// Staggers simultaneous notes by pitch order, spreading each chord across `spread_ticks`.
+    /// Note lengths and every other score field remain unchanged.
+    pub fn strum_pattern_notes(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        spread_ticks: u32,
+        descending: bool,
+    ) -> Result<usize, FlpError> {
+        self.strum_pattern_notes_in_scope(pattern_id, channel_id, None, spread_ticks, descending)
+    }
+
+    /// Staggers simultaneous notes only within the supplied channel-local selection.
+    pub fn strum_pattern_note_selection(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: &[usize],
+        spread_ticks: u32,
+        descending: bool,
+    ) -> Result<usize, FlpError> {
+        self.strum_pattern_notes_in_scope(
+            pattern_id,
+            channel_id,
+            Some(note_indices),
+            spread_ticks,
+            descending,
+        )
+    }
+
+    fn strum_pattern_notes_in_scope(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: Option<&[usize]>,
+        spread_ticks: u32,
+        descending: bool,
+    ) -> Result<usize, FlpError> {
+        let patterns = self.patterns()?;
+        let pattern = patterns
+            .iter()
+            .find(|pattern| pattern.id == pattern_id)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested pattern does not exist",
+            ))?;
+        let mut onset_groups = std::collections::BTreeMap::<u32, Vec<(usize, u16)>>::new();
+        let selected_indices =
+            note_indices.map(|indices| indices.iter().copied().collect::<HashSet<_>>());
+        for (note_index, note) in pattern
+            .notes
+            .iter()
+            .filter(|note| note.channel_id == channel_id)
+            .enumerate()
+        {
+            if !note_index_in_scope(note_index, selected_indices.as_ref()) {
+                continue;
+            }
+            onset_groups
+                .entry(note.position)
+                .or_default()
+                .push((note_index, note.key));
+        }
+
+        let mut edits = Vec::new();
+        for (onset, mut group) in onset_groups {
+            if group.len() < 2 || spread_ticks == 0 {
+                continue;
+            }
+            group.sort_by_key(|(note_index, key)| {
+                (if descending { u16::MAX - *key } else { *key }, *note_index)
+            });
+            let steps = u64::try_from(group.len() - 1).map_err(|_| FlpError::LengthOverflow)?;
+            for (rank, (note_index, _)) in group.into_iter().enumerate() {
+                let rank = u64::try_from(rank).map_err(|_| FlpError::LengthOverflow)?;
+                let offset = u64::from(spread_ticks) * rank / steps;
+                let position = u64::from(onset) + offset;
+                let position = u32::try_from(position).map_err(|_| FlpError::LengthOverflow)?;
+                if position != onset {
+                    edits.push((note_index, position));
+                }
+            }
+        }
+        if edits.is_empty() {
+            return Ok(0);
+        }
+
+        let mut updated = self.clone();
+        for (note_index, position) in &edits {
+            updated.edit_pattern_note(
+                pattern_id,
+                channel_id,
+                *note_index,
+                PatternNoteEdit {
+                    position: Some(*position),
+                    ..PatternNoteEdit::default()
+                },
+            )?;
+        }
+        *self = updated;
+        Ok(edits.len())
+    }
+
+    /// Replaces simultaneous channel chords with a gated, repeating arpeggio sequence.
+    pub fn arpeggiate_pattern_notes(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        step_ticks: u32,
+        range_octaves: u8,
+        gate_percent: u8,
+        direction: ArpeggioDirection,
+    ) -> Result<usize, FlpError> {
+        self.arpeggiate_pattern_notes_in_scope(
+            pattern_id,
+            channel_id,
+            None,
+            step_ticks,
+            range_octaves,
+            gate_percent,
+            direction,
+        )
+    }
+
+    /// Replaces only selected simultaneous notes with a gated arpeggio sequence.
+    pub fn arpeggiate_pattern_note_selection(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: &[usize],
+        step_ticks: u32,
+        range_octaves: u8,
+        gate_percent: u8,
+        direction: ArpeggioDirection,
+    ) -> Result<usize, FlpError> {
+        self.arpeggiate_pattern_notes_in_scope(
+            pattern_id,
+            channel_id,
+            Some(note_indices),
+            step_ticks,
+            range_octaves,
+            gate_percent,
+            direction,
+        )
+    }
+
+    fn arpeggiate_pattern_notes_in_scope(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: Option<&[usize]>,
+        step_ticks: u32,
+        range_octaves: u8,
+        gate_percent: u8,
+        direction: ArpeggioDirection,
+    ) -> Result<usize, FlpError> {
+        if step_ticks == 0 {
+            return Err(FlpError::UnsupportedEdit(
+                "arpeggiator step must be greater than zero ticks",
+            ));
+        }
+        if !(1..=4).contains(&range_octaves) {
+            return Err(FlpError::UnsupportedEdit(
+                "arpeggiator range must be between 1 and 4 octaves",
+            ));
+        }
+        if !(1..=100).contains(&gate_percent) {
+            return Err(FlpError::UnsupportedEdit(
+                "arpeggiator gate must be between 1 and 100 percent",
+            ));
+        }
+        let patterns = self.patterns()?;
+        let pattern = patterns
+            .iter()
+            .find(|pattern| pattern.id == pattern_id)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested pattern does not exist",
+            ))?;
+        let selected_indices =
+            note_indices.map(|indices| indices.iter().copied().collect::<HashSet<_>>());
+        let mut onset_groups = std::collections::BTreeMap::<u32, Vec<(usize, PatternNote)>>::new();
+        for (note_index, note) in pattern
+            .notes
+            .iter()
+            .filter(|note| note.channel_id == channel_id)
+            .enumerate()
+        {
+            if !note_index_in_scope(note_index, selected_indices.as_ref()) {
+                continue;
+            }
+            onset_groups
+                .entry(note.position)
+                .or_default()
+                .push((note_index, note.clone()));
+        }
+
+        let mut remove_indices = Vec::new();
+        let mut additions = Vec::new();
+        for (onset, group) in onset_groups {
+            let mut chord = std::collections::BTreeMap::<u16, PatternNote>::new();
+            for (_, note) in &group {
+                chord.entry(note.key).or_insert_with(|| note.clone());
+            }
+            if chord.len() < 2 {
+                continue;
+            }
+            let end = group
+                .iter()
+                .map(|(_, note)| u64::from(note.position) + u64::from(note.length))
+                .max()
+                .unwrap_or(u64::from(onset));
+            let duration = end.saturating_sub(u64::from(onset));
+            if duration == 0 {
+                continue;
+            }
+            remove_indices.extend(group.iter().map(|(note_index, _)| *note_index));
+            let step_count = duration.div_ceil(u64::from(step_ticks));
+            if step_count > 1_000_000
+                || additions.len().saturating_add(step_count as usize) > 1_000_000
+            {
+                return Err(FlpError::UnsupportedEdit(
+                    "arpeggiator would create more than one million notes",
+                ));
+            }
+
+            let mut pitches = Vec::with_capacity(chord.len() * usize::from(range_octaves));
+            for octave in 0..range_octaves {
+                let octave_offset = u16::from(octave)
+                    .checked_mul(12)
+                    .ok_or(FlpError::LengthOverflow)?;
+                for (key, note) in &chord {
+                    let key = key
+                        .checked_add(octave_offset)
+                        .ok_or(FlpError::LengthOverflow)?;
+                    let mut pitch = note.clone();
+                    pitch.key = key;
+                    pitches.push(pitch);
+                }
+            }
+            if direction == ArpeggioDirection::Down {
+                pitches.reverse();
+            }
+            let mut order = (0..pitches.len()).collect::<Vec<_>>();
+            if direction == ArpeggioDirection::UpDown && pitches.len() > 2 {
+                order.extend((1..pitches.len() - 1).rev());
+            }
+            let note_length = (u64::from(step_ticks) * u64::from(gate_percent) / 100).max(1);
+            for step_index in 0..step_count {
+                let offset = step_index * u64::from(step_ticks);
+                let position = u64::from(onset) + offset;
+                let position = u32::try_from(position).map_err(|_| FlpError::LengthOverflow)?;
+                let remaining = duration - offset;
+                let length = u32::try_from(note_length.min(remaining))
+                    .map_err(|_| FlpError::LengthOverflow)?;
+                let pitch_index = order[(step_index as usize) % order.len()];
+                let mut note = pitches[pitch_index].clone();
+                note.position = position;
+                note.length = length;
+                additions.push(note);
+            }
+        }
+        if additions.is_empty() {
+            return Ok(0);
+        }
+
+        let mut updated = self.clone();
+        remove_indices.sort_unstable_by(|left, right| right.cmp(left));
+        for note_index in remove_indices {
+            updated.delete_pattern_note(pattern_id, channel_id, note_index)?;
+        }
+        updated.add_pattern_notes(pattern_id, &additions)?;
+        *self = updated;
+        Ok(additions.len())
+    }
+
+    /// Adds a short, same-pitch stroke before or after every note in a channel.
+    /// The original notes are retained and the new strokes use the requested velocity.
+    pub fn flam_pattern_notes(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        stroke_ticks: u32,
+        velocity: u8,
+        before: bool,
+    ) -> Result<usize, FlpError> {
+        self.flam_pattern_notes_in_scope(
+            pattern_id,
+            channel_id,
+            None,
+            stroke_ticks,
+            velocity,
+            before,
+        )
+    }
+
+    /// Adds flam strokes only for the supplied selected channel-local note indices.
+    pub fn flam_pattern_note_selection(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: &[usize],
+        stroke_ticks: u32,
+        velocity: u8,
+        before: bool,
+    ) -> Result<usize, FlpError> {
+        self.flam_pattern_notes_in_scope(
+            pattern_id,
+            channel_id,
+            Some(note_indices),
+            stroke_ticks,
+            velocity,
+            before,
+        )
+    }
+
+    fn flam_pattern_notes_in_scope(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: Option<&[usize]>,
+        stroke_ticks: u32,
+        velocity: u8,
+        before: bool,
+    ) -> Result<usize, FlpError> {
+        if stroke_ticks == 0 {
+            return Err(FlpError::UnsupportedEdit(
+                "flam stroke time must be greater than zero ticks",
+            ));
+        }
+        if velocity > 127 {
+            return Err(FlpError::UnsupportedEdit(
+                "flam velocity must be between 0 and 127",
+            ));
+        }
+        let patterns = self.patterns()?;
+        let pattern = patterns
+            .iter()
+            .find(|pattern| pattern.id == pattern_id)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested pattern does not exist",
+            ))?;
+        let selected_indices =
+            note_indices.map(|indices| indices.iter().copied().collect::<HashSet<_>>());
+        let strokes = pattern
+            .notes
+            .iter()
+            .filter(|note| note.channel_id == channel_id)
+            .enumerate()
+            .filter(|(note_index, _)| note_index_in_scope(*note_index, selected_indices.as_ref()))
+            .map(|(_, note)| {
+                let mut stroke = note.clone();
+                stroke.position = if before {
+                    note.position.saturating_sub(stroke_ticks)
+                } else {
+                    note.position
+                        .checked_add(stroke_ticks)
+                        .ok_or(FlpError::LengthOverflow)?
+                };
+                stroke.length = stroke_ticks;
+                stroke.velocity = velocity;
+                Ok(stroke)
+            })
+            .collect::<Result<Vec<_>, FlpError>>()?;
+        if strokes.is_empty() {
+            return Ok(0);
+        }
+
+        let mut updated = self.clone();
+        updated.add_pattern_notes(pattern_id, &strokes)?;
+        *self = updated;
+        Ok(strokes.len())
+    }
+
+    /// Randomizes channel note velocity, pan, and pitch from a repeatable seed.
+    /// Negative level amounts favor lower values; bipolar mode applies offsets in either direction.
+    pub fn randomize_pattern_notes(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        seed: u64,
+        velocity_amount_percent: i16,
+        pan_amount_percent: i16,
+        pitch_range_semitones: u8,
+        bipolar: bool,
+        reset_levels: bool,
+    ) -> Result<usize, FlpError> {
+        self.randomize_pattern_notes_in_scope(
+            pattern_id,
+            channel_id,
+            None,
+            seed,
+            velocity_amount_percent,
+            pan_amount_percent,
+            pitch_range_semitones,
+            bipolar,
+            reset_levels,
+        )
+    }
+
+    /// Randomizes only selected notes, preserving the seeded behavior within that selection.
+    pub fn randomize_pattern_note_selection(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: &[usize],
+        seed: u64,
+        velocity_amount_percent: i16,
+        pan_amount_percent: i16,
+        pitch_range_semitones: u8,
+        bipolar: bool,
+        reset_levels: bool,
+    ) -> Result<usize, FlpError> {
+        self.randomize_pattern_notes_in_scope(
+            pattern_id,
+            channel_id,
+            Some(note_indices),
+            seed,
+            velocity_amount_percent,
+            pan_amount_percent,
+            pitch_range_semitones,
+            bipolar,
+            reset_levels,
+        )
+    }
+
+    fn randomize_pattern_notes_in_scope(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: Option<&[usize]>,
+        seed: u64,
+        velocity_amount_percent: i16,
+        pan_amount_percent: i16,
+        pitch_range_semitones: u8,
+        bipolar: bool,
+        reset_levels: bool,
+    ) -> Result<usize, FlpError> {
+        if !(-100..=100).contains(&velocity_amount_percent)
+            || !(-100..=100).contains(&pan_amount_percent)
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "randomizer velocity and pan amounts must be between -100 and 100",
+            ));
+        }
+        if pitch_range_semitones > 24 {
+            return Err(FlpError::UnsupportedEdit(
+                "randomizer pitch range must be between 0 and 24 semitones",
+            ));
+        }
+        let patterns = self.patterns()?;
+        let pattern = patterns
+            .iter()
+            .find(|pattern| pattern.id == pattern_id)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested pattern does not exist",
+            ))?;
+
+        let mut state = if seed == 0 {
+            0x9e37_79b9_7f4a_7c15
+        } else {
+            seed
+        };
+        let selected_indices =
+            note_indices.map(|indices| indices.iter().copied().collect::<HashSet<_>>());
+        let mut edits = Vec::new();
+        for (note_index, note) in pattern
+            .notes
+            .iter()
+            .filter(|note| note.channel_id == channel_id)
+            .enumerate()
+            .filter(|(note_index, _)| note_index_in_scope(*note_index, selected_indices.as_ref()))
+        {
+            let velocity_base = if reset_levels {
+                100
+            } else {
+                i32::from(note.velocity)
+            };
+            let pan_base = if reset_levels {
+                64
+            } else {
+                i32::from(note.pan)
+            };
+            let velocity_range =
+                (127 * i32::from(velocity_amount_percent.unsigned_abs()) + 50) / 100;
+            let pan_range = (127 * i32::from(pan_amount_percent.unsigned_abs()) + 50) / 100;
+            let velocity_offset = randomizer_offset(
+                &mut state,
+                velocity_range,
+                velocity_amount_percent.is_negative(),
+                bipolar,
+            );
+            let pan_offset = randomizer_offset(
+                &mut state,
+                pan_range,
+                pan_amount_percent.is_negative(),
+                bipolar,
+            );
+            let pitch_offset =
+                randomizer_offset(&mut state, i32::from(pitch_range_semitones), false, bipolar);
+            let velocity = if !reset_levels && velocity_amount_percent == 0 {
+                note.velocity
+            } else {
+                (velocity_base + velocity_offset).clamp(0, 127) as u8
+            };
+            let pan = if !reset_levels && pan_amount_percent == 0 {
+                note.pan
+            } else {
+                (pan_base + pan_offset).clamp(0, 127) as u8
+            };
+            let key = if pitch_range_semitones == 0 {
+                note.key
+            } else {
+                (i32::from(note.key) + pitch_offset).clamp(0, i32::from(u16::MAX)) as u16
+            };
+            if velocity != note.velocity || pan != note.pan || key != note.key {
+                edits.push((note_index, velocity, pan, key));
+            }
+        }
+        if edits.is_empty() {
+            return Ok(0);
+        }
+
+        let mut updated = self.clone();
+        for (note_index, velocity, pan, key) in &edits {
+            updated.edit_pattern_note(
+                pattern_id,
+                channel_id,
+                *note_index,
+                PatternNoteEdit {
+                    velocity: Some(*velocity),
+                    pan: Some(*pan),
+                    key: Some(*key),
+                    ..PatternNoteEdit::default()
+                },
+            )?;
+        }
+        *self = updated;
+        Ok(edits.len())
+    }
+
+    /// Adds deterministic timing and velocity variation to channel notes.
+    pub fn humanize_pattern_notes(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        seed: u64,
+        timing_range_ticks: u32,
+        velocity_variation_percent: u8,
+    ) -> Result<usize, FlpError> {
+        self.humanize_pattern_notes_in_scope(
+            pattern_id,
+            channel_id,
+            None,
+            seed,
+            timing_range_ticks,
+            velocity_variation_percent,
+        )
+    }
+
+    /// Adds timing and velocity variation only to selected notes.
+    pub fn humanize_pattern_note_selection(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: &[usize],
+        seed: u64,
+        timing_range_ticks: u32,
+        velocity_variation_percent: u8,
+    ) -> Result<usize, FlpError> {
+        self.humanize_pattern_notes_in_scope(
+            pattern_id,
+            channel_id,
+            Some(note_indices),
+            seed,
+            timing_range_ticks,
+            velocity_variation_percent,
+        )
+    }
+
+    fn humanize_pattern_notes_in_scope(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: Option<&[usize]>,
+        seed: u64,
+        timing_range_ticks: u32,
+        velocity_variation_percent: u8,
+    ) -> Result<usize, FlpError> {
+        if velocity_variation_percent > 100 {
+            return Err(FlpError::UnsupportedEdit(
+                "humanize velocity variation must be between 0 and 100 percent",
+            ));
+        }
+        if timing_range_ticks > i32::MAX as u32 {
+            return Err(FlpError::UnsupportedEdit(
+                "humanize timing range must fit a signed 32-bit tick offset",
+            ));
+        }
+        let patterns = self.patterns()?;
+        let pattern = patterns
+            .iter()
+            .find(|pattern| pattern.id == pattern_id)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested pattern does not exist",
+            ))?;
+        let mut state = if seed == 0 {
+            0x9e37_79b9_7f4a_7c15
+        } else {
+            seed
+        };
+        let velocity_range = (127 * i32::from(velocity_variation_percent) + 50) / 100;
+        let selected_indices =
+            note_indices.map(|indices| indices.iter().copied().collect::<HashSet<_>>());
+        let mut edits = Vec::new();
+        for (note_index, note) in pattern
+            .notes
+            .iter()
+            .filter(|note| note.channel_id == channel_id)
+            .enumerate()
+            .filter(|(note_index, _)| note_index_in_scope(*note_index, selected_indices.as_ref()))
+        {
+            let timing_offset = randomizer_offset(
+                &mut state,
+                i32::try_from(timing_range_ticks).map_err(|_| FlpError::LengthOverflow)?,
+                false,
+                true,
+            );
+            let position = (i64::from(note.position) + i64::from(timing_offset))
+                .clamp(0, i64::from(u32::MAX)) as u32;
+            let velocity_offset = randomizer_offset(&mut state, velocity_range, false, true);
+            let velocity = if velocity_variation_percent == 0 {
+                note.velocity
+            } else {
+                (i32::from(note.velocity) + velocity_offset).clamp(0, 127) as u8
+            };
+            if position != note.position || velocity != note.velocity {
+                edits.push((note_index, position, velocity));
+            }
+        }
+        if edits.is_empty() {
+            return Ok(0);
+        }
+
+        let mut updated = self.clone();
+        for (note_index, position, velocity) in &edits {
+            updated.edit_pattern_note(
+                pattern_id,
+                channel_id,
+                *note_index,
+                PatternNoteEdit {
+                    position: Some(*position),
+                    velocity: Some(*velocity),
+                    ..PatternNoteEdit::default()
+                },
+            )?;
+        }
+        *self = updated;
+        Ok(edits.len())
+    }
+
+    /// Folds channel note pitches by octaves into a key range, then clamps any pitch that cannot fit.
+    pub fn limit_pattern_note_range(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        minimum_key: u16,
+        maximum_key: u16,
+    ) -> Result<usize, FlpError> {
+        self.limit_pattern_note_range_in_scope(
+            pattern_id,
+            channel_id,
+            None,
+            minimum_key,
+            maximum_key,
+        )
+    }
+
+    /// Folds or clamps only selected note pitches into the requested key range.
+    pub fn limit_pattern_note_selection_range(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: &[usize],
+        minimum_key: u16,
+        maximum_key: u16,
+    ) -> Result<usize, FlpError> {
+        self.limit_pattern_note_range_in_scope(
+            pattern_id,
+            channel_id,
+            Some(note_indices),
+            minimum_key,
+            maximum_key,
+        )
+    }
+
+    fn limit_pattern_note_range_in_scope(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: Option<&[usize]>,
+        minimum_key: u16,
+        maximum_key: u16,
+    ) -> Result<usize, FlpError> {
+        if minimum_key > maximum_key || maximum_key > 127 {
+            return Err(FlpError::UnsupportedEdit(
+                "note range must be ordered and remain within keys 0 through 127",
+            ));
+        }
+        let patterns = self.patterns()?;
+        let pattern = patterns
+            .iter()
+            .find(|pattern| pattern.id == pattern_id)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested pattern does not exist",
+            ))?;
+        let selected_indices =
+            note_indices.map(|indices| indices.iter().copied().collect::<HashSet<_>>());
+        let mut edits = Vec::new();
+        for (note_index, note) in pattern
+            .notes
+            .iter()
+            .filter(|note| note.channel_id == channel_id)
+            .enumerate()
+            .filter(|(note_index, _)| note_index_in_scope(*note_index, selected_indices.as_ref()))
+        {
+            let mut key = i32::from(note.key);
+            let minimum = i32::from(minimum_key);
+            let maximum = i32::from(maximum_key);
+            while key > maximum && key - 12 >= minimum {
+                key -= 12;
+            }
+            while key < minimum && key + 12 <= maximum {
+                key += 12;
+            }
+            if key < minimum || key > maximum {
+                key = if (key - minimum).abs() <= (key - maximum).abs() {
+                    minimum
+                } else {
+                    maximum
+                };
+            }
+            let key = u16::try_from(key).map_err(|_| FlpError::LengthOverflow)?;
+            if key != note.key {
+                edits.push((note_index, key));
+            }
+        }
+        if edits.is_empty() {
+            return Ok(0);
+        }
+
+        let mut updated = self.clone();
+        for (note_index, key) in &edits {
+            updated.edit_pattern_note(
+                pattern_id,
+                channel_id,
+                *note_index,
+                PatternNoteEdit {
+                    key: Some(*key),
+                    ..PatternNoteEdit::default()
+                },
+            )?;
+        }
+        *self = updated;
+        Ok(edits.len())
+    }
+
+    /// Splits channel notes that cross `position_ticks`, preserving all note properties.
+    pub fn slice_pattern_notes(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        position_ticks: u32,
+    ) -> Result<usize, FlpError> {
+        self.slice_pattern_notes_in_scope(pattern_id, channel_id, None, position_ticks)
+    }
+
+    /// Splits only selected channel-local notes that cross `position_ticks`.
+    pub fn slice_pattern_note_selection(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: &[usize],
+        position_ticks: u32,
+    ) -> Result<usize, FlpError> {
+        self.slice_pattern_notes_in_scope(
+            pattern_id,
+            channel_id,
+            Some(note_indices),
+            position_ticks,
+        )
+    }
+
+    fn slice_pattern_notes_in_scope(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: Option<&[usize]>,
+        position_ticks: u32,
+    ) -> Result<usize, FlpError> {
+        let patterns = self.patterns()?;
+        let pattern = patterns
+            .iter()
+            .find(|pattern| pattern.id == pattern_id)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested pattern does not exist",
+            ))?;
+        let cut = u64::from(position_ticks);
+        let selected_indices =
+            note_indices.map(|indices| indices.iter().copied().collect::<HashSet<_>>());
+        let mut edits = Vec::new();
+        let mut right_segments = Vec::new();
+        for (note_index, note) in pattern
+            .notes
+            .iter()
+            .filter(|note| note.channel_id == channel_id)
+            .enumerate()
+            .filter(|(note_index, _)| note_index_in_scope(*note_index, selected_indices.as_ref()))
+        {
+            let start = u64::from(note.position);
+            let end = start + u64::from(note.length);
+            if cut <= start || cut >= end {
+                continue;
+            }
+            let left_length = u32::try_from(cut - start).map_err(|_| FlpError::LengthOverflow)?;
+            let right_length = u32::try_from(end - cut).map_err(|_| FlpError::LengthOverflow)?;
+            edits.push((note_index, left_length));
+            let mut right = note.clone();
+            right.position = position_ticks;
+            right.length = right_length;
+            right_segments.push(right);
+        }
+        if right_segments.is_empty() {
+            return Ok(0);
+        }
+
+        let mut updated = self.clone();
+        for (note_index, length) in &edits {
+            updated.edit_pattern_note(
+                pattern_id,
+                channel_id,
+                *note_index,
+                PatternNoteEdit {
+                    length: Some(*length),
+                    ..PatternNoteEdit::default()
+                },
+            )?;
+        }
+        updated.add_pattern_notes(pattern_id, &right_segments)?;
+        *self = updated;
+        Ok(right_segments.len())
     }
 
     /// Appends notes to one pattern while retaining every unrelated event byte.
@@ -2365,7 +4052,8 @@ impl FlpDocument {
     }
 
     /// Imports the note events from one Standard MIDI File track into an existing FLP
-    /// pattern and channel. Other MIDI events remain unused, and the FLP tempo is preserved.
+    /// pattern and channel. Note times are converted through the MIDI tempo map or
+    /// SMPTE clock, then expressed against the existing FLP tempo.
     pub fn import_midi_track(
         &mut self,
         midi: &midi::MidiFile,
@@ -2383,22 +4071,31 @@ impl FlpDocument {
                 "the requested pattern does not exist",
             ));
         }
-        let source_ppq = midi
-            .ticks_per_quarter_note()
-            .ok_or(FlpError::UnsupportedEdit(
-                "SMPTE-timed MIDI files are not supported for note import",
-            ))?;
-        if source_ppq == 0 || self.header.ppq == 0 {
+        if self.header.ppq == 0 {
             return Err(FlpError::UnsupportedEdit(
-                "MIDI import requires non-zero source and project PPQ values",
+                "MIDI import requires a non-zero project PPQ value",
             ));
         }
+        let project_tempo_milli_bpm = self.metadata.tempo_milli_bpm.unwrap_or(140_000);
+        if project_tempo_milli_bpm == 0 {
+            return Err(FlpError::UnsupportedEdit(
+                "MIDI import requires a positive project tempo",
+            ));
+        }
+        let default_microseconds_per_quarter =
+            60_000_000_000.0 / f64::from(project_tempo_milli_bpm);
         let track = midi
             .tracks()
             .get(track_index)
             .ok_or(FlpError::UnsupportedEdit(
                 "the requested MIDI track does not exist",
             ))?;
+        midi.elapsed_microseconds_at_tick(0, track_index, default_microseconds_per_quarter)
+            .map_err(|_| {
+                FlpError::UnsupportedEdit(
+                    "MIDI import requires a supported time division and valid tempo map",
+                )
+            })?;
         let midi_notes = track.notes();
         if midi_notes.is_empty() {
             return Ok(0);
@@ -2406,16 +4103,55 @@ impl FlpDocument {
 
         let mut imported = Vec::with_capacity(midi_notes.len());
         for midi_note in &midi_notes {
-            let position = scale_midi_ticks(midi_note.start_tick(), source_ppq, self.header.ppq)?;
-            let source_length = midi_note.duration_ticks().unwrap_or_else(|| {
-                let remaining = track.end_tick().saturating_sub(midi_note.start_tick());
-                if remaining == 0 {
-                    u64::from(source_ppq)
-                } else {
-                    remaining
-                }
-            });
-            let length = scale_midi_ticks(source_length, source_ppq, self.header.ppq)?.max(1);
+            let start_microseconds = midi
+                .elapsed_microseconds_at_tick(
+                    midi_note.start_tick(),
+                    track_index,
+                    default_microseconds_per_quarter,
+                )
+                .map_err(|_| FlpError::UnsupportedEdit("could not convert MIDI note start time"))?;
+            let position = scale_midi_microseconds_to_project_ticks(
+                start_microseconds,
+                project_tempo_milli_bpm,
+                self.header.ppq,
+            )?;
+
+            let end_microseconds = if let Some(end_tick) = midi_note.end_tick() {
+                midi.elapsed_microseconds_at_tick(
+                    end_tick,
+                    track_index,
+                    default_microseconds_per_quarter,
+                )
+                .map_err(|_| FlpError::UnsupportedEdit("could not convert MIDI note end time"))?
+            } else if track.end_tick() > midi_note.start_tick() {
+                midi.elapsed_microseconds_at_tick(
+                    track.end_tick(),
+                    track_index,
+                    default_microseconds_per_quarter,
+                )
+                .map_err(|_| FlpError::UnsupportedEdit("could not convert MIDI track end time"))?
+            } else if let Some(source_ppq) = midi.ticks_per_quarter_note() {
+                let fallback_end_tick = midi_note
+                    .start_tick()
+                    .checked_add(u64::from(source_ppq))
+                    .ok_or(FlpError::LengthOverflow)?;
+                midi.elapsed_microseconds_at_tick(
+                    fallback_end_tick,
+                    track_index,
+                    default_microseconds_per_quarter,
+                )
+                .map_err(|_| {
+                    FlpError::UnsupportedEdit("could not convert MIDI fallback note end time")
+                })?
+            } else {
+                start_microseconds + default_microseconds_per_quarter
+            };
+            let end_position = scale_midi_microseconds_to_project_ticks(
+                end_microseconds,
+                project_tempo_milli_bpm,
+                self.header.ppq,
+            )?;
+            let length = end_position.saturating_sub(position).max(1);
             imported.push(PatternNote {
                 position,
                 channel_id,
@@ -2827,6 +4563,53 @@ impl FlpDocument {
             .collect::<Vec<_>>();
         self.events
             .splice(insertion_index..insertion_index, replacement);
+        self.refresh_event_offsets()?;
+        Ok(())
+    }
+
+    /// Edits the observed Layer Random and Crossfade bits in an existing `0x90` flags dword.
+    /// Every other bit in the raw field is retained.
+    pub fn set_layer_flags(
+        &mut self,
+        layer_channel_id: u16,
+        random: Option<bool>,
+        crossfade: Option<bool>,
+    ) -> Result<(), FlpError> {
+        if random.is_none() && crossfade.is_none() {
+            return Err(FlpError::UnsupportedEdit(
+                "at least one Layer flag must be provided",
+            ));
+        }
+        self.require_unique_channel(layer_channel_id)?;
+        let channel = self
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id() == layer_channel_id)
+            .expect("the unique Layer channel was checked above");
+        if channel.kind != Some(ChannelType::Layer.raw()) {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel is not a Layer channel",
+            ));
+        }
+        let flags_event_index = channel
+            .event_range()
+            .find(|index| {
+                let event = &self.events[*index];
+                event.opcode == 0x90
+                    && event.payload.len() == 4
+                    && event.encoding == PayloadEncoding::Dword
+            })
+            .ok_or(FlpError::UnsupportedEdit(
+                "the selected Layer channel has no recognized dword flags event",
+            ))?;
+        let mut flags = channel.layer_flags.unwrap_or_default();
+        if let Some(enabled) = random {
+            flags = (flags & !1) | u32::from(enabled);
+        }
+        if let Some(enabled) = crossfade {
+            flags = (flags & !2) | (u32::from(enabled) << 1);
+        }
+        self.events[flags_event_index].replace_dword_payload(flags)?;
         self.refresh_event_offsets()?;
         Ok(())
     }
@@ -4061,15 +5844,26 @@ fn encode_leb128(mut value: u32) -> Vec<u8> {
     }
 }
 
-fn scale_midi_ticks(tick: u64, source_ppq: u16, target_ppq: u16) -> Result<u32, FlpError> {
-    if source_ppq == 0 {
+fn scale_midi_microseconds_to_project_ticks(
+    microseconds: f64,
+    project_tempo_milli_bpm: u32,
+    project_ppq: u16,
+) -> Result<u32, FlpError> {
+    if !microseconds.is_finite() || microseconds < 0.0 || project_tempo_milli_bpm == 0 {
         return Err(FlpError::UnsupportedEdit(
-            "MIDI import requires a non-zero source PPQ value",
+            "MIDI note time or project tempo is invalid",
         ));
     }
-    let denominator = u128::from(source_ppq);
-    let scaled = (u128::from(tick) * u128::from(target_ppq) + denominator / 2) / denominator;
-    u32::try_from(scaled).map_err(|_| FlpError::LengthOverflow)
+    let ticks = microseconds * f64::from(project_tempo_milli_bpm) * f64::from(project_ppq)
+        / 60_000_000_000.0;
+    if !ticks.is_finite() || ticks < 0.0 {
+        return Err(FlpError::LengthOverflow);
+    }
+    let rounded_ticks = ticks.round();
+    if rounded_ticks > f64::from(u32::MAX) {
+        return Err(FlpError::LengthOverflow);
+    }
+    Ok(rounded_ticks as u32)
 }
 
 fn parse_vst_plugin_state_metadata(payload: &[u8]) -> Option<VstPluginStateMetadata> {

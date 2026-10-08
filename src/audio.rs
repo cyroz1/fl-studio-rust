@@ -84,6 +84,10 @@ struct PlaybackState {
     streaming: ArcSwapOption<StreamingPlayback>,
     cursor_frames: AtomicU64,
     active: AtomicBool,
+    browser_preview_samples: ArcSwapOption<Vec<f32>>,
+    browser_preview_cursor_frames: AtomicU64,
+    browser_preview_active: AtomicBool,
+    browser_preview_gain: AtomicU32,
 }
 
 struct StreamingPlayback {
@@ -93,6 +97,7 @@ struct StreamingPlayback {
     finished: AtomicBool,
     cancelled: AtomicBool,
     underrun_frames: AtomicU64,
+    consumed_frames: AtomicU64,
 }
 
 /// The producer side of audio streamed into an active device callback.
@@ -148,6 +153,10 @@ impl PlaybackState {
             streaming: ArcSwapOption::empty(),
             cursor_frames: AtomicU64::new(0),
             active: AtomicBool::new(false),
+            browser_preview_samples: ArcSwapOption::empty(),
+            browser_preview_cursor_frames: AtomicU64::new(0),
+            browser_preview_active: AtomicBool::new(false),
+            browser_preview_gain: AtomicU32::new(1.0_f32.to_bits()),
         }
     }
 
@@ -156,6 +165,49 @@ impl PlaybackState {
         self.samples.store(Some(Arc::new(samples)));
         self.cursor_frames.store(0, Ordering::Release);
         self.active.store(true, Ordering::Release);
+    }
+
+    fn start_browser_preview(&self, samples: Vec<f32>) {
+        self.stop_browser_preview();
+        self.browser_preview_samples.store(Some(Arc::new(samples)));
+        self.browser_preview_cursor_frames
+            .store(0, Ordering::Release);
+        self.browser_preview_active.store(true, Ordering::Release);
+    }
+
+    fn stop_browser_preview(&self) {
+        self.browser_preview_active.store(false, Ordering::Release);
+        self.browser_preview_cursor_frames
+            .store(0, Ordering::Release);
+        self.browser_preview_samples.store(None);
+    }
+
+    fn browser_preview_active(&self) -> bool {
+        self.browser_preview_active.load(Ordering::Acquire)
+    }
+
+    fn next_browser_preview_frame(&self, samples: Option<&[f32]>) -> [f32; 2] {
+        if !self.browser_preview_active.load(Ordering::Acquire) {
+            return [0.0, 0.0];
+        }
+        let frame = self
+            .browser_preview_cursor_frames
+            .fetch_add(1, Ordering::Relaxed);
+        let Some(offset) = usize::try_from(frame)
+            .ok()
+            .and_then(|frame| frame.checked_mul(2))
+        else {
+            self.browser_preview_active.store(false, Ordering::Release);
+            return [0.0, 0.0];
+        };
+        let Some(samples) =
+            samples.and_then(|samples| samples.get(offset..offset.saturating_add(2)))
+        else {
+            self.browser_preview_active.store(false, Ordering::Release);
+            return [0.0, 0.0];
+        };
+        let gain = f32::from_bits(self.browser_preview_gain.load(Ordering::Relaxed));
+        [samples[0] * gain, samples[1] * gain]
     }
 
     fn start_streaming(&self) -> StreamingAudioWriter {
@@ -167,6 +219,7 @@ impl PlaybackState {
             finished: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
             underrun_frames: AtomicU64::new(0),
+            consumed_frames: AtomicU64::new(0),
         });
         self.streaming.store(Some(Arc::clone(&playback)));
         StreamingAudioWriter { playback }
@@ -237,6 +290,13 @@ impl PlaybackState {
 
     fn is_streaming(&self) -> bool {
         self.streaming.load().is_some()
+    }
+
+    fn position_frames(&self) -> u64 {
+        self.streaming.load().as_deref().map_or_else(
+            || self.cursor_frames.load(Ordering::Acquire),
+            |streaming| streaming.consumed_frames.load(Ordering::Acquire),
+        )
     }
 }
 
@@ -371,6 +431,38 @@ impl AudioEngine {
         Ok(())
     }
 
+    /// Play a browser sample preview alongside any active project audio.
+    pub fn set_browser_preview(&self, samples: Vec<f32>) -> Result<(), String> {
+        if !self.output_active {
+            return Err("Start an output device before previewing a sample".into());
+        }
+        if samples.is_empty() || !samples.len().is_multiple_of(2) {
+            return Err("Sample preview audio must contain stereo frames".into());
+        }
+        self.playback.start_browser_preview(samples);
+        Ok(())
+    }
+
+    /// Stop the independent Browser preview voice without stopping project playback.
+    pub fn stop_browser_preview(&self) {
+        self.playback.stop_browser_preview();
+    }
+
+    pub fn browser_preview_active(&self) -> bool {
+        self.playback.browser_preview_active()
+    }
+
+    pub fn set_browser_preview_gain(&self, gain: f32) {
+        let gain = if gain.is_finite() {
+            gain.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        self.playback
+            .browser_preview_gain
+            .store(gain.to_bits(), Ordering::Release);
+    }
+
     /// Begin consuming interleaved stereo samples from a bounded producer ring.
     ///
     /// VST3 and other block processors can render on a worker thread while the shared or
@@ -422,6 +514,11 @@ impl AudioEngine {
             .as_deref()
             .map(|streaming| streaming.underrun_frames.load(Ordering::Acquire))
             .unwrap_or(0)
+    }
+
+    /// Number of project audio frames consumed by the device since the current play started.
+    pub fn project_playback_position_frames(&self) -> u64 {
+        self.playback.position_frames()
     }
 
     pub fn input_peak(&self) -> f32 {
@@ -869,13 +966,15 @@ where
             move |output, _| {
                 let playback_samples = playback_for_callback.samples.load();
                 let streaming = playback_for_callback.streaming.load();
+                let browser_preview_samples = playback_for_callback.browser_preview_samples.load();
                 for frame in output.chunks_mut(channels) {
-                    let [left, right] = next_output_frame(
+                    let [left, right] = next_output_frame_with_browser_preview(
                         &source,
                         &ring,
                         playback_samples.as_deref().map(Vec::as_slice),
                         streaming.as_deref(),
                         &playback_for_callback,
+                        browser_preview_samples.as_deref().map(Vec::as_slice),
                         sample_rate,
                         &mut phase,
                     );
@@ -1060,17 +1159,45 @@ fn next_output_frame(
                 streaming.active.store(true, Ordering::Release);
             }
             if let Some(frame) = streaming.ring.pop_stereo_frame() {
+                streaming.consumed_frames.fetch_add(1, Ordering::Relaxed);
                 frame
             } else if streaming.finished.load(Ordering::Acquire) {
                 streaming.active.store(false, Ordering::Release);
                 [0.0, 0.0]
             } else {
                 streaming.underrun_frames.fetch_add(1, Ordering::Relaxed);
+                streaming.consumed_frames.fetch_add(1, Ordering::Relaxed);
                 [0.0, 0.0]
             }
         }
         _ => [0.0, 0.0],
     }
+}
+
+fn next_output_frame_with_browser_preview(
+    source: &AtomicU8,
+    ring: &AudioRingBuffer,
+    project_samples: Option<&[f32]>,
+    streaming: Option<&StreamingPlayback>,
+    playback: &PlaybackState,
+    browser_preview_samples: Option<&[f32]>,
+    sample_rate: f32,
+    phase: &mut f32,
+) -> [f32; 2] {
+    let project = next_output_frame(
+        source,
+        ring,
+        project_samples,
+        streaming,
+        playback,
+        sample_rate,
+        phase,
+    );
+    let preview = playback.next_browser_preview_frame(browser_preview_samples);
+    [
+        (project[0] + preview[0]).clamp(-1.0, 1.0),
+        (project[1] + preview[1]).clamp(-1.0, 1.0),
+    ]
 }
 
 fn tone_sample(phase: f32, sample_rate: f32) -> (f32, f32) {
@@ -1585,13 +1712,15 @@ fn render_wasapi_buffer(
     let sample_rate = format.get_sample_rate();
     let playback_samples = playback.samples.load();
     let streaming = playback.streaming.load();
+    let browser_preview_samples = playback.browser_preview_samples.load();
     for frame in output.chunks_exact_mut(format.frame_bytes) {
-        let stereo = next_output_frame(
+        let stereo = next_output_frame_with_browser_preview(
             source,
             ring,
             playback_samples.as_deref().map(Vec::as_slice),
             streaming.as_deref(),
             playback,
+            browser_preview_samples.as_deref().map(Vec::as_slice),
             sample_rate,
             phase,
         );

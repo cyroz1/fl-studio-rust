@@ -8,6 +8,7 @@ const MTRK: &[u8; 4] = b"MTrk";
 const MAX_VLQ: u64 = 0x0FFF_FFFF;
 const MAX_EXPORTED_NOTES: usize = 1_000_000;
 const MAX_EXPORTED_TEMPO_EVENTS: usize = 1_000_000;
+const MAX_EXPORTED_MARKERS: usize = 1_000_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MidiFile {
@@ -47,6 +48,24 @@ pub struct MidiTempoEvent {
     microseconds_per_quarter: u32,
 }
 
+/// The real-time clock encoded by an SMPTE MIDI time division.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MidiSmpteTimeBase {
+    frames_per_second_numerator: u32,
+    frames_per_second_denominator: u32,
+    ticks_per_frame: u8,
+}
+
+impl MidiSmpteTimeBase {
+    pub fn frames_per_second(self) -> f64 {
+        f64::from(self.frames_per_second_numerator) / f64::from(self.frames_per_second_denominator)
+    }
+
+    pub fn ticks_per_frame(self) -> u8 {
+        self.ticks_per_frame
+    }
+}
+
 /// Selects how FL Studio channels are assigned to MIDI channels during export.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum MidiChannelMapping {
@@ -80,6 +99,12 @@ struct TimedMidiBytes {
     tick: u64,
     order: u8,
     bytes: Vec<u8>,
+}
+
+struct MidiExportMarker {
+    tick: u64,
+    name: String,
+    time_signature: Option<(u8, u8)>,
 }
 
 impl MidiExportTrack {
@@ -181,6 +206,118 @@ impl MidiFile {
 
     pub fn ticks_per_quarter_note(&self) -> Option<u16> {
         (self.division & 0x8000 == 0).then_some(self.division)
+    }
+
+    /// Returns the SMPTE frame clock when the encoded frame code is supported.
+    /// The -29 code uses the SMPTE drop-frame rate of 30000/1001 frames per second.
+    pub fn smpte_time_base(&self) -> Option<MidiSmpteTimeBase> {
+        if self.division & 0x8000 == 0 {
+            return None;
+        }
+        let frame_code = ((self.division >> 8) as u8) as i8;
+        let ticks_per_frame = (self.division & 0x00FF) as u8;
+        if ticks_per_frame == 0 {
+            return None;
+        }
+        let (frames_per_second_numerator, frames_per_second_denominator) = match frame_code {
+            -24 => (24, 1),
+            -25 => (25, 1),
+            -29 => (30_000, 1_001),
+            -30 => (30, 1),
+            _ => return None,
+        };
+        Some(MidiSmpteTimeBase {
+            frames_per_second_numerator,
+            frames_per_second_denominator,
+            ticks_per_frame,
+        })
+    }
+
+    /// Converts an absolute MIDI tick into elapsed microseconds.
+    ///
+    /// PPQ files use their tempo map, with `default_microseconds_per_quarter` before
+    /// the first tempo event. Format-2 files use only the selected track's tempo
+    /// events. SMPTE files use their encoded real-time frame clock and ignore tempo
+    /// events, as required by their time division.
+    pub fn elapsed_microseconds_at_tick(
+        &self,
+        tick: u64,
+        selected_track: usize,
+        default_microseconds_per_quarter: f64,
+    ) -> Result<f64, MidiError> {
+        if self.ticks_per_quarter_note().is_some() {
+            let ppq = self.division;
+            if ppq == 0 {
+                return Err(MidiError::InvalidTimeDivision(self.division));
+            }
+            if !default_microseconds_per_quarter.is_finite()
+                || default_microseconds_per_quarter <= 0.0
+            {
+                return Err(MidiError::InvalidTimeDivision(self.division));
+            }
+            if selected_track >= self.tracks.len() {
+                return Err(MidiError::InvalidTrackIndex(selected_track));
+            }
+
+            let mut tempo_events = Vec::new();
+            for (track_index, track) in self.tracks.iter().enumerate() {
+                if self.format == 2 && track_index != selected_track {
+                    continue;
+                }
+                for (event_index, event) in track.events.iter().enumerate() {
+                    if let MidiEventKind::Meta {
+                        meta_type: 0x51,
+                        data,
+                    } = &event.kind
+                        && data.len() == 3
+                    {
+                        let microseconds_per_quarter = (u32::from(data[0]) << 16)
+                            | (u32::from(data[1]) << 8)
+                            | u32::from(data[2]);
+                        if microseconds_per_quarter != 0 {
+                            tempo_events.push((
+                                event.absolute_tick,
+                                track_index,
+                                event_index,
+                                f64::from(microseconds_per_quarter),
+                            ));
+                        }
+                    }
+                }
+            }
+            tempo_events.sort_by_key(|(event_tick, track_index, event_index, _)| {
+                (*event_tick, *track_index, *event_index)
+            });
+
+            let mut elapsed_microseconds = 0.0;
+            let mut previous_tick = 0u64;
+            let mut current_tempo = default_microseconds_per_quarter;
+            for (tempo_tick, _, _, microseconds_per_quarter) in tempo_events {
+                if tempo_tick > tick {
+                    break;
+                }
+                elapsed_microseconds +=
+                    (tempo_tick - previous_tick) as f64 * current_tempo / f64::from(ppq);
+                previous_tick = tempo_tick;
+                current_tempo = microseconds_per_quarter;
+            }
+            elapsed_microseconds += (tick - previous_tick) as f64 * current_tempo / f64::from(ppq);
+            if !elapsed_microseconds.is_finite() {
+                return Err(MidiError::LengthOverflow);
+            }
+            Ok(elapsed_microseconds)
+        } else if let Some(time_base) = self.smpte_time_base() {
+            let ticks_per_second = f64::from(time_base.frames_per_second_numerator)
+                * f64::from(time_base.ticks_per_frame)
+                / f64::from(time_base.frames_per_second_denominator);
+            let elapsed_microseconds = tick as f64 * 1_000_000.0 / ticks_per_second;
+            if !elapsed_microseconds.is_finite() {
+                return Err(MidiError::LengthOverflow);
+            }
+            Ok(elapsed_microseconds)
+        } else {
+            Err(MidiError::InvalidTimeDivision(self.division))
+        }
     }
 
     pub fn tracks(&self) -> &[MidiTrack] {
@@ -338,11 +475,32 @@ impl MidiFile {
             track.end_tick = song_end_tick;
         }
         let tempo_events = song_tempo_events(document, &arrangement.clips)?;
-        Self::encode_project_export_tracks_with_tempo_events(
+        let mut markers = Vec::with_capacity(arrangement.time_markers.len());
+        for marker in &arrangement.time_markers {
+            let time_signature = if marker.is_signature() {
+                Some((
+                    marker.numerator().ok_or(MidiError::InvalidExport(
+                        "a Playlist signature marker has no numerator",
+                    ))?,
+                    marker.denominator().ok_or(MidiError::InvalidExport(
+                        "a Playlist signature marker has no denominator",
+                    ))?,
+                ))
+            } else {
+                None
+            };
+            markers.push(MidiExportMarker {
+                tick: u64::from(marker.position_ticks()),
+                name: marker.name().unwrap_or_default().to_owned(),
+                time_signature,
+            });
+        }
+        Self::encode_project_export_tracks_with_tempo_events_and_markers(
             document,
             &tracks,
             channel_mapping,
             &tempo_events,
+            &markers,
         )
     }
 
@@ -378,6 +536,22 @@ impl MidiFile {
         channel_mapping: MidiChannelMapping,
         tempo_events: &[(u64, f64)],
     ) -> Result<Vec<u8>, MidiError> {
+        Self::encode_project_export_tracks_with_tempo_events_and_markers(
+            document,
+            tracks,
+            channel_mapping,
+            tempo_events,
+            &[],
+        )
+    }
+
+    fn encode_project_export_tracks_with_tempo_events_and_markers(
+        document: &FlpDocument,
+        tracks: &[MidiExportTrack],
+        channel_mapping: MidiChannelMapping,
+        tempo_events: &[(u64, f64)],
+        markers: &[MidiExportMarker],
+    ) -> Result<Vec<u8>, MidiError> {
         let channel_order = document
             .channels()
             .into_iter()
@@ -391,6 +565,7 @@ impl MidiFile {
             channel_mapping,
             &channel_order,
             tempo_events,
+            markers,
         )
     }
 
@@ -410,6 +585,7 @@ impl MidiFile {
             channel_mapping,
             project_channel_order,
             &[],
+            &[],
         )
     }
 
@@ -421,6 +597,7 @@ impl MidiFile {
         channel_mapping: MidiChannelMapping,
         project_channel_order: &[u16],
         tempo_events: &[(u64, f64)],
+        markers: &[MidiExportMarker],
     ) -> Result<Vec<u8>, MidiError> {
         if ppq == 0 || ppq & 0x8000 != 0 {
             return Err(MidiError::InvalidExport(
@@ -474,25 +651,57 @@ impl MidiFile {
         output.extend_from_slice(&ppq.to_be_bytes());
 
         let mut conductor = Vec::new();
-        push_meta_event(&mut conductor, 0, 0x03, b"Tempo and meter")?;
+        let mut conductor_events = vec![TimedMidiBytes {
+            tick: 0,
+            order: 0,
+            bytes: meta_event_bytes(0x03, b"Tempo and meter")?,
+        }];
         if let Some((numerator, denominator)) = time_signature {
-            let exponent = denominator.trailing_zeros() as u8;
-            push_meta_event(&mut conductor, 0, 0x58, &[numerator, exponent, 24, 8])?;
+            let signature = midi_time_signature_bytes(numerator, denominator)?;
+            conductor_events.push(TimedMidiBytes {
+                tick: 0,
+                order: 1,
+                bytes: meta_event_bytes(0x58, &signature)?,
+            });
         }
         let mut ordered_tempo_events = Vec::with_capacity(tempo_events.len().saturating_add(1));
         ordered_tempo_events.push((0, tempo_bpm));
         ordered_tempo_events.extend_from_slice(tempo_events);
         ordered_tempo_events.sort_by_key(|(tick, _)| *tick);
-        let mut previous_tempo_tick = 0u64;
         for (tick, bpm) in ordered_tempo_events {
             let tempo_bytes = midi_tempo_microseconds_per_quarter(bpm)?.to_be_bytes();
-            push_meta_event(
-                &mut conductor,
-                tick.saturating_sub(previous_tempo_tick),
-                0x51,
-                &tempo_bytes[1..],
-            )?;
-            previous_tempo_tick = tick;
+            conductor_events.push(TimedMidiBytes {
+                tick,
+                order: 2,
+                bytes: meta_event_bytes(0x51, &tempo_bytes[1..])?,
+            });
+        }
+        if markers.len() > MAX_EXPORTED_MARKERS {
+            return Err(MidiError::InvalidExport(
+                "the arrangement has more than one million time markers",
+            ));
+        }
+        for marker in markers {
+            conductor_events.push(TimedMidiBytes {
+                tick: marker.tick,
+                order: 3,
+                bytes: meta_event_bytes(0x06, marker.name.as_bytes())?,
+            });
+            if let Some((numerator, denominator)) = marker.time_signature {
+                let signature = midi_time_signature_bytes(numerator, denominator)?;
+                conductor_events.push(TimedMidiBytes {
+                    tick: marker.tick,
+                    order: 4,
+                    bytes: meta_event_bytes(0x58, &signature)?,
+                });
+            }
+        }
+        conductor_events.sort_by_key(|event| (event.tick, event.order));
+        let mut previous_tick = 0u64;
+        for event in conductor_events {
+            write_delta(&mut conductor, event.tick.saturating_sub(previous_tick))?;
+            conductor.extend_from_slice(&event.bytes);
+            previous_tick = event.tick;
         }
         write_end_of_track(&mut conductor, 0)?;
         append_track_chunk(&mut output, conductor)?;
@@ -741,6 +950,15 @@ fn midi_tempo_microseconds_per_quarter(bpm: f64) -> Result<u32, MidiError> {
     Ok(micros_per_quarter as u32)
 }
 
+fn midi_time_signature_bytes(numerator: u8, denominator: u8) -> Result<[u8; 4], MidiError> {
+    if numerator == 0 || denominator == 0 || !denominator.is_power_of_two() {
+        return Err(MidiError::InvalidExport(
+            "time signatures must have a positive numerator and power-of-two denominator",
+        ));
+    }
+    Ok([numerator, denominator.trailing_zeros() as u8, 24, 8])
+}
+
 fn inferred_pattern_loop_length(
     inferred_length: u64,
     clip_length: u64,
@@ -908,6 +1126,8 @@ pub enum MidiError {
         expected: &'static str,
     },
     InvalidHeaderLength(u32),
+    InvalidTimeDivision(u16),
+    InvalidTrackIndex(usize),
     InvalidVlq {
         offset: usize,
     },
@@ -940,6 +1160,15 @@ impl fmt::Display for MidiError {
                     formatter,
                     "invalid MThd length {length}; expected at least 6"
                 )
+            }
+            Self::InvalidTimeDivision(division) => {
+                write!(
+                    formatter,
+                    "unsupported or invalid MIDI time division 0x{division:04X}"
+                )
+            }
+            Self::InvalidTrackIndex(index) => {
+                write!(formatter, "MIDI track index {index} does not exist")
             }
             Self::InvalidVlq { offset } => {
                 write!(
@@ -1017,17 +1246,6 @@ fn export_note(note: &PatternNote, start_tick: u64, end_tick: u64) -> MidiExport
         start_tick,
         end_tick,
     }
-}
-
-fn push_meta_event(
-    output: &mut Vec<u8>,
-    delta_ticks: u64,
-    meta_type: u8,
-    data: &[u8],
-) -> Result<(), MidiError> {
-    write_delta(output, delta_ticks)?;
-    output.extend_from_slice(&meta_event_bytes(meta_type, data)?);
-    Ok(())
 }
 
 fn meta_event_bytes(meta_type: u8, data: &[u8]) -> Result<Vec<u8>, MidiError> {
