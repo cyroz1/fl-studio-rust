@@ -180,7 +180,7 @@ Layer child relationships and raw flags are available in the project model. The 
 
 ## Mixer
 
-The `mixer <file.flp>` command reports recognized insert fields and counts known `0xE1` parameter IDs. The desktop Mixer presents recognized insert records as selectable vertical strips, with a Track Inspector for existing names and raw route, color, icon, and event-range fields. Names can be edited through their `0xCC` events while retaining the project's string encoding and unrelated bytes. Its expandable `0xE1` record list edits raw signed values by exact event and record index, and shows target and slot bits as candidates. Faders, meters, effect-slot contents, and native track-number mapping remain incomplete.
+The `mixer <file.flp>` command reports recognized insert fields and counts known `0xE1` parameter IDs. The desktop Mixer presents recognized insert records as selectable vertical strips, with a Track Inspector for existing names and raw route, color, icon, and event-range fields. Names can be edited through their `0xCC` events while retaining the project's string encoding and unrelated bytes. The inspector shows ten disabled effect-slot placeholders while the slot data remains opaque. Its expandable `0xE1` record list edits raw signed values by exact event and record index, and shows target and slot bits as candidates. Faders, meters, effect identity/state, and native track-number mapping remain incomplete.
 
 ## Automation points
 

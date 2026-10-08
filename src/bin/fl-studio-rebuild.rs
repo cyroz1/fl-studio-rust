@@ -10541,11 +10541,19 @@ impl DawUi {
                         ui.small(format!("Icon raw: {:?}", insert.icon_raw()));
                         ui.small(format!("Events: {:?}", insert.event_range()));
                         ui.separator();
-                        ui.label("Effects");
+                        ui.label("Effect slots");
                         ui.label(
                             egui::RichText::new("Slot contents are preserved but not decoded yet.")
                                 .color(MUTED),
                         );
+                        for slot in 1..=10 {
+                            let width = ui.available_width();
+                            ui.add_enabled(
+                                false,
+                                egui::Button::new(format!("{slot:02}   State opaque"))
+                                    .min_size(Vec2::new(width, 22.0)),
+                            );
+                        }
                         ui.collapsing(
                             format!("Project 0xE1 records ({})", parameters.len()),
                             |ui| {
