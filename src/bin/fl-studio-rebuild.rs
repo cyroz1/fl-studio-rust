@@ -47,7 +47,7 @@ const MAX_WAVEFORM_WORKERS: usize = 1;
 const DEFAULT_AUTOSAVE_MINUTES: u8 = 5;
 const DEFAULT_BACKUP_RETENTION: usize = 20;
 const RECENT_PROJECT_LIMIT: usize = 50;
-const BROWSER_SEARCH_ROOT_LIMIT: usize = 64;
+const BROWSER_SEARCH_ROOT_LIMIT: usize = 30;
 const MAX_BROWSER_RECURSIVE_SCAN_ENTRIES: usize = 20_000;
 const AUTOSAVE_INTERVALS_MINUTES: [u8; 5] = [0, 1, 5, 10, 15];
 const BACKUP_RETENTION_OPTIONS: [usize; 4] = [5, 10, 20, 50];
@@ -854,13 +854,16 @@ struct BrowserEntry {
 }
 
 struct BrowserIndex {
-    root: PathBuf,
+    roots: Vec<PathBuf>,
+    all_roots: bool,
     entries: Vec<BrowserEntry>,
     truncated: bool,
+    unavailable_roots: Vec<PathBuf>,
 }
 
 struct PendingBrowserIndex {
-    root: PathBuf,
+    roots: Vec<PathBuf>,
+    all_roots: bool,
     receiver: Receiver<Result<BrowserIndex, String>>,
     worker: thread::JoinHandle<()>,
 }
@@ -1052,6 +1055,7 @@ struct DawUi {
     browser_index: Option<BrowserIndex>,
     pending_browser_index: Option<PendingBrowserIndex>,
     browser_search_roots: Vec<PathBuf>,
+    browser_search_all_active: bool,
     browser_search: String,
     browser_selected: Option<PathBuf>,
     browser_favorites: BTreeSet<PathBuf>,
@@ -1245,6 +1249,7 @@ impl DawUi {
             browser_index: None,
             pending_browser_index: None,
             browser_search_roots: load_browser_search_roots(),
+            browser_search_all_active: false,
             browser_search: String::new(),
             browser_selected: None,
             browser_favorites: load_browser_favorites(),
@@ -3168,13 +3173,8 @@ impl DawUi {
     }
 
     fn refresh_browser_directory(&mut self) {
-        if self
-            .browser_index
-            .as_ref()
-            .is_some_and(|index| index.root == self.browser_path)
-        {
-            self.browser_index = None;
-        }
+        self.browser_index = None;
+        self.browser_search_all_active = false;
         match fs::read_dir(&self.browser_path) {
             Ok(directory) => {
                 let mut entries = directory
@@ -3212,23 +3212,39 @@ impl DawUi {
     }
 
     fn start_browser_index(&mut self) {
+        self.browser_search_all_active = false;
+        self.start_browser_index_for(vec![self.browser_path.clone()], false);
+    }
+
+    fn start_browser_roots_index(&mut self) {
+        if self.browser_search_roots.is_empty() {
+            self.browser_search_all_active = false;
+            self.browser_error =
+                Some("Add Browser search folders before searching all folders".to_owned());
+            return;
+        }
+        self.browser_search_all_active = true;
+        self.start_browser_index_for(self.browser_search_roots.clone(), true);
+    }
+
+    fn start_browser_index_for(&mut self, roots: Vec<PathBuf>, all_roots: bool) {
         if self.pending_browser_index.is_some()
             || self
                 .browser_index
                 .as_ref()
-                .is_some_and(|index| index.root == self.browser_path)
+                .is_some_and(|index| index.roots == roots && index.all_roots == all_roots)
         {
             return;
         }
-        let root = self.browser_path.clone();
-        let worker_root = root.clone();
+        let worker_roots = roots.clone();
         let (sender, receiver) = mpsc::channel();
         let worker = thread::spawn(move || {
-            let _ = sender.send(index_browser_tree(worker_root));
+            let _ = sender.send(index_browser_folders(worker_roots, all_roots));
         });
         self.browser_error = None;
         self.pending_browser_index = Some(PendingBrowserIndex {
-            root,
+            roots,
+            all_roots,
             receiver,
             worker,
         });
@@ -3244,18 +3260,22 @@ impl DawUi {
                     .pending_browser_index
                     .take()
                     .expect("the completed Browser index is still pending");
+                let active = self.browser_index_request_is_active(&pending);
                 if pending.worker.join().is_err() {
-                    self.browser_error =
-                        Some("Recursive Browser indexing stopped unexpectedly".to_owned());
+                    if active {
+                        self.browser_error =
+                            Some("Recursive Browser indexing stopped unexpectedly".to_owned());
+                    }
                     return;
                 }
                 match result {
-                    Ok(index) => {
+                    Ok(index) if active => {
                         self.browser_index = Some(index);
                     }
-                    Err(error) => {
+                    Err(error) if active => {
                         self.browser_error = Some(error);
                     }
+                    Ok(_) | Err(_) => {}
                 }
             }
             Err(TryRecvError::Disconnected) => {
@@ -3263,13 +3283,34 @@ impl DawUi {
                     .pending_browser_index
                     .take()
                     .expect("the disconnected Browser index is still pending");
+                let active = self.browser_index_request_is_active(&pending);
                 let _ = pending.worker.join();
-                self.browser_error = Some(format!(
-                    "Could not finish recursive indexing of {}",
-                    pending.root.display()
-                ));
+                if active {
+                    self.browser_error = Some(format!(
+                        "Could not finish recursive indexing of {}",
+                        if pending.all_roots {
+                            "Browser search folders".to_owned()
+                        } else {
+                            pending
+                                .roots
+                                .first()
+                                .map(|root| root.display().to_string())
+                                .unwrap_or_else(|| "the selected folder".to_owned())
+                        }
+                    ));
+                }
             }
             Err(TryRecvError::Empty) => {}
+        }
+    }
+
+    fn browser_index_request_is_active(&self, pending: &PendingBrowserIndex) -> bool {
+        if pending.all_roots {
+            self.browser_search_all_active && pending.roots == self.browser_search_roots
+        } else {
+            !self.browser_search_all_active
+                && pending.roots.len() == 1
+                && pending.roots.first() == Some(&self.browser_path)
         }
     }
 
@@ -3294,6 +3335,14 @@ impl DawUi {
             self.status = format!("Could not save Browser search folders: {error}");
             return None;
         }
+        if self
+            .browser_index
+            .as_ref()
+            .is_some_and(|index| index.all_roots)
+        {
+            self.browser_index = None;
+        }
+        self.browser_search_all_active = false;
         self.status = format!("Added {} to Browser search folders", root.display());
         Some(root)
     }
@@ -3311,6 +3360,14 @@ impl DawUi {
             self.browser_search_roots.insert(index, root);
             self.status = format!("Could not save Browser search folders: {error}");
         } else {
+            if self
+                .browser_index
+                .as_ref()
+                .is_some_and(|index| index.all_roots)
+            {
+                self.browser_index = None;
+            }
+            self.browser_search_all_active = false;
             self.status = format!("Removed {} from Browser search folders", root.display());
         }
     }
@@ -3319,6 +3376,7 @@ impl DawUi {
         if path.is_dir() {
             if path != self.browser_path {
                 self.browser_index = None;
+                self.browser_search_all_active = false;
             }
             self.browser_path = path;
             self.browser_selected = None;
@@ -3739,17 +3797,33 @@ impl DawUi {
             self.refresh_browser_directory();
         }
 
+        let current_indexed = self.browser_index.as_ref().is_some_and(|index| {
+            !self.browser_search_all_active
+                && !index.all_roots
+                && index.roots.len() == 1
+                && index.roots.first() == Some(&self.browser_path)
+        });
+        let all_roots_indexed = self.browser_index.as_ref().is_some_and(|index| {
+            self.browser_search_all_active
+                && index.all_roots
+                && index.roots == self.browser_search_roots
+        });
+        let scan_running = self.pending_browser_index.is_some();
+        let search_all_requested =
+            ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::F));
         ui.horizontal_wrapped(|ui| {
-            ui.add(
+            let search_field = ui.add(
                 egui::TextEdit::singleline(&mut self.browser_search)
-                    .hint_text("Filter this folder")
+                    .hint_text(if self.browser_search_all_active || search_all_requested {
+                        "Filter all Browser folders"
+                    } else {
+                        "Filter this folder"
+                    })
                     .desired_width(f32::INFINITY),
             );
-            let current_indexed = self
-                .browser_index
-                .as_ref()
-                .is_some_and(|index| index.root == self.browser_path);
-            let scan_running = self.pending_browser_index.is_some();
+            if search_all_requested {
+                search_field.request_focus();
+            }
             if ui
                 .add_enabled(
                     !scan_running && !current_indexed,
@@ -3760,32 +3834,68 @@ impl DawUi {
             {
                 self.start_browser_index();
             }
+            if ui
+                .add_enabled(
+                    !scan_running && !all_roots_indexed && !self.browser_search_roots.is_empty(),
+                    egui::Button::new("⌕ All folders"),
+                )
+                .on_hover_text(
+                    "Search supported files in every saved Browser folder and its subfolders",
+                )
+                .clicked()
+            {
+                self.start_browser_roots_index();
+            }
         });
-        if self
-            .pending_browser_index
-            .as_ref()
-            .is_some_and(|pending| pending.root == self.browser_path)
-        {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.small("Indexing this folder and its subfolders…");
-            });
+        if search_all_requested {
+            self.start_browser_roots_index();
+        }
+        if let Some(pending) = self.pending_browser_index.as_ref() {
+            if self.browser_index_request_is_active(pending) && pending.all_roots {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.small("Indexing all Browser folders and their subfolders…");
+                });
+            } else if self.browser_index_request_is_active(pending) {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.small("Indexing this folder and its subfolders…");
+                });
+            } else {
+                ui.small("Another recursive search is still indexing…");
+            }
             ui.ctx().request_repaint_after(Duration::from_millis(80));
-        } else if self.pending_browser_index.is_some() {
-            ui.small("Another recursive search is still indexing…");
-            ui.ctx().request_repaint_after(Duration::from_millis(80));
-        } else if let Some(index) = self
-            .browser_index
-            .as_ref()
-            .filter(|index| index.root == self.browser_path)
-        {
+        } else if let Some(index) = self.browser_index.as_ref().filter(|index| {
+            (!self.browser_search_all_active
+                && !index.all_roots
+                && index.roots.len() == 1
+                && index.roots.first() == Some(&self.browser_path))
+                || (self.browser_search_all_active
+                    && index.all_roots
+                    && index.roots == self.browser_search_roots)
+        }) {
             let indexed_count = index.entries.len();
             let truncated = index.truncated;
-            ui.small(if truncated {
-                format!("Recursive index · scan limit reached ({indexed_count} files)")
+            if index.all_roots {
+                let mut summary = if truncated {
+                    format!("All folders · scan limit reached ({indexed_count} files)")
+                } else {
+                    format!(
+                        "All folders · {indexed_count} supported files in {} roots",
+                        index.roots.len()
+                    )
+                };
+                if !index.unavailable_roots.is_empty() {
+                    summary.push_str(&format!(" · {} unavailable", index.unavailable_roots.len()));
+                }
+                ui.small(summary);
             } else {
-                format!("Recursive index · {indexed_count} supported files")
-            });
+                ui.small(if truncated {
+                    format!("Recursive index · scan limit reached ({indexed_count} files)")
+                } else {
+                    format!("Recursive index · {indexed_count} supported files")
+                });
+            }
         }
         egui::ComboBox::from_id_salt("browser-file-filter")
             .selected_text(self.browser_filter.label())
@@ -3799,16 +3909,22 @@ impl DawUi {
         }
 
         let query = self.browser_search.to_lowercase();
+        let index_is_active = self.browser_index.as_ref().is_some_and(|index| {
+            (self.browser_search_all_active
+                && index.all_roots
+                && index.roots == self.browser_search_roots)
+                || (!self.browser_search_all_active
+                    && !index.all_roots
+                    && index.roots.len() == 1
+                    && index.roots.first() == Some(&self.browser_path))
+        });
         let source_entries = self
             .browser_index
             .as_ref()
-            .filter(|index| index.root == self.browser_path)
+            .filter(|_| index_is_active)
             .map(|index| &index.entries)
             .unwrap_or(&self.browser_entries);
-        let recursive_results = self
-            .browser_index
-            .as_ref()
-            .is_some_and(|index| index.root == self.browser_path);
+        let recursive_results = index_is_active;
         let entries = source_entries
             .iter()
             .filter(|entry| {
@@ -10310,45 +10426,62 @@ fn automation_point_screen_position(
     )
 }
 
-fn index_browser_tree(root: PathBuf) -> Result<BrowserIndex, String> {
-    let mut directories = VecDeque::from([root.clone()]);
+fn index_browser_folders(roots: Vec<PathBuf>, all_roots: bool) -> Result<BrowserIndex, String> {
     let mut entries = Vec::new();
+    let mut seen_paths = BTreeSet::new();
     let mut scan_entries = 0usize;
     let mut truncated = false;
+    let mut unavailable_roots = Vec::new();
 
-    'scan: while let Some(directory) = directories.pop_front() {
-        let children = match fs::read_dir(&directory) {
-            Ok(children) => children,
-            Err(error) if directory == root => {
-                return Err(format!("Could not search {}: {error}", root.display()));
-            }
-            Err(_) => continue,
-        };
-        for child in children {
-            let Ok(child) = child else {
-                continue;
+    'roots: for root in &roots {
+        let mut directories = VecDeque::from([root.clone()]);
+        'tree: while let Some(directory) = directories.pop_front() {
+            let children = match fs::read_dir(&directory) {
+                Ok(children) => children,
+                Err(error) if directory == *root => {
+                    if all_roots {
+                        unavailable_roots.push(root.clone());
+                        break 'tree;
+                    }
+                    return Err(format!("Could not search {}: {error}", root.display()));
+                }
+                Err(_) => continue,
             };
-            let Ok(file_type) = child.file_type() else {
-                continue;
-            };
-            let path = child.path();
-            if scan_entries >= MAX_BROWSER_RECURSIVE_SCAN_ENTRIES {
-                truncated = true;
-                break 'scan;
-            }
-            scan_entries += 1;
-            if file_type.is_dir() {
-                directories.push_back(path);
-            } else if file_type.is_file() && browser_file_kind(&path).is_some() {
-                entries.push(BrowserEntry {
-                    name: path
-                        .strip_prefix(&root)
-                        .unwrap_or(&path)
-                        .to_string_lossy()
-                        .into_owned(),
-                    path,
-                    is_directory: false,
-                });
+            for child in children {
+                let Ok(child) = child else {
+                    continue;
+                };
+                let Ok(file_type) = child.file_type() else {
+                    continue;
+                };
+                let path = child.path();
+                if scan_entries >= MAX_BROWSER_RECURSIVE_SCAN_ENTRIES {
+                    truncated = true;
+                    break 'roots;
+                }
+                scan_entries += 1;
+                if file_type.is_dir() {
+                    directories.push_back(path);
+                } else if file_type.is_file()
+                    && browser_file_kind(&path).is_some()
+                    && seen_paths.insert(path.clone())
+                {
+                    let relative_path = path.strip_prefix(root).unwrap_or(&path);
+                    let name = if all_roots {
+                        let root_name = root
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| root.display().to_string());
+                        format!("{root_name}/{}", relative_path.display())
+                    } else {
+                        relative_path.to_string_lossy().into_owned()
+                    };
+                    entries.push(BrowserEntry {
+                        name,
+                        path,
+                        is_directory: false,
+                    });
+                }
             }
         }
     }
@@ -10360,9 +10493,11 @@ fn index_browser_tree(root: PathBuf) -> Result<BrowserIndex, String> {
             .then_with(|| left.path.cmp(&right.path))
     });
     Ok(BrowserIndex {
-        root,
+        roots,
+        all_roots,
         entries,
         truncated,
+        unavailable_roots,
     })
 }
 
