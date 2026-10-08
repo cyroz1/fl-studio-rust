@@ -10401,10 +10401,8 @@ impl DawUi {
             return;
         };
         let inserts = document.mixer_inserts();
-        let parameter_count = document
-            .mixer_parameter_records()
-            .map(|records| records.len())
-            .unwrap_or(0);
+        let parameters = document.mixer_parameter_records().unwrap_or_default();
+        let parameter_count = parameters.len();
         ui.horizontal(|ui| {
             ui.strong("Mixer");
             ui.separator();
@@ -10435,6 +10433,7 @@ impl DawUi {
         self.selected_mixer_insert = active_insert;
 
         let mut rename_edits = Vec::new();
+        let mut parameter_edits = Vec::new();
         let available_height = ui.available_height();
         let inspector_width = 238.0_f32.min((ui.available_width() * 0.3).max(190.0));
         let bank_width = (ui.available_width() - inspector_width - 10.0).max(180.0);
@@ -10547,6 +10546,59 @@ impl DawUi {
                             egui::RichText::new("Slot contents are preserved but not decoded yet.")
                                 .color(MUTED),
                         );
+                        ui.collapsing(
+                            format!("Project 0xE1 records ({})", parameters.len()),
+                            |ui| {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Values are raw signed integers. Target and slot bits are candidate fields.",
+                                    )
+                                    .color(MUTED),
+                                );
+                                egui::ScrollArea::vertical()
+                                    .id_salt("mixer-parameter-records")
+                                    .max_height(280.0)
+                                    .show(ui, |ui| {
+                                        for record in &parameters {
+                                            ui.horizontal(|ui| {
+                                                ui.vertical(|ui| {
+                                                    ui.small(format!(
+                                                        "Event {} / record {}",
+                                                        record.event_index(),
+                                                        record.record_index()
+                                                    ));
+                                                    ui.small(format!(
+                                                        "ID {} · {:?}",
+                                                        record.parameter_id(),
+                                                        record.kind()
+                                                    ));
+                                                    ui.small(format!(
+                                                        "Target bits {} · slot bits {} · scope {}",
+                                                        record.target_index(),
+                                                        record.slot_index(),
+                                                        record.target_scope_raw()
+                                                    ));
+                                                });
+                                                let mut value = record.value();
+                                                if ui
+                                                    .add(
+                                                        egui::DragValue::new(&mut value)
+                                                            .speed(1.0),
+                                                    )
+                                                    .changed()
+                                                {
+                                                    parameter_edits.push((
+                                                        record.event_index(),
+                                                        record.record_index(),
+                                                        value,
+                                                    ));
+                                                }
+                                            });
+                                            ui.separator();
+                                        }
+                                    });
+                            },
+                        );
                     } else {
                         ui.label(egui::RichText::new("Select an insert track").color(MUTED));
                     }
@@ -10565,6 +10617,23 @@ impl DawUi {
                     }
                     Err(error) => {
                         self.status = format!("Could not rename Mixer insert: {error}");
+                    }
+                }
+            }
+        }
+        if !parameter_edits.is_empty()
+            && let Some(document) = self.document.as_mut()
+        {
+            for (event_index, record_index, value) in parameter_edits {
+                match document.set_mixer_parameter_record_value(event_index, record_index, value) {
+                    Ok(()) => {
+                        self.dirty = true;
+                        self.status = format!(
+                            "Edited Mixer parameter event {event_index}, record {record_index}"
+                        );
+                    }
+                    Err(error) => {
+                        self.status = format!("Could not edit Mixer parameter: {error}");
                     }
                 }
             }

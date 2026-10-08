@@ -49,7 +49,7 @@ These observations come from the installed FL Studio 2026 desktop application an
 - Mixer inserts are displayed as vertical strips with color, names, pan controls, volume faders, meters, and routing controls.
 - The selected insert exposes ten effect slots in a right-side panel, with equalizer controls below.
 - The observed project used many named, color-coded inserts and several effects per insert.
-- Image-Line documents a selectable track bank and a Track Inspector that exposes track properties and effect slots ([Mixer Explained](https://www.image-line.com/fl-studio-learning/fl-studio-online-manual/html/mixer.htm), [Effects Slots](https://www.image-line.com/fl-studio-learning/fl-studio-online-manual/html/mixer_plugin.htm)). The rewrite now displays recognized inserts as selectable vertical strips and shows the selected insert's editable name and preserved raw fields in an inspector. Effect contents, faders, meters, and native track-number mapping are not decoded yet.
+- Image-Line documents a selectable track bank and a Track Inspector that exposes track properties and effect slots ([Mixer Explained](https://www.image-line.com/fl-studio-learning/fl-studio-online-manual/html/mixer.htm), [Effects Slots](https://www.image-line.com/fl-studio-learning/fl-studio-online-manual/html/mixer_plugin.htm)). The rewrite now displays recognized inserts as selectable vertical strips and shows the selected insert's editable name and preserved raw fields in an inspector. Its expandable project-wide `0xE1` list can edit signed values by event and record index, and labels target/slot fields as candidates. Effect contents, faders, meters, and native track-number mapping are not decoded yet.
 
 ## Current rewrite gap
 
