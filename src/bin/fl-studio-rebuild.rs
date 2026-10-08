@@ -863,9 +863,13 @@ struct FstPresetDetails {
     version: String,
     event_count: usize,
     channel_count: usize,
+    channel_summaries: Vec<String>,
     plugin_state_count: usize,
+    plugin_state_summaries: Vec<String>,
     mixer_insert_count: usize,
+    mixer_insert_summaries: Vec<String>,
     automation_channel_count: usize,
+    automation_summaries: Vec<String>,
     trailing_byte_count: usize,
 }
 
@@ -3750,6 +3754,82 @@ impl DawUi {
             }
         };
         let document = preset.document();
+        let channels = document.channels();
+        let channel_summaries = channels
+            .iter()
+            .map(|channel| {
+                let channel_type = channel.channel_type().map_or_else(
+                    || "unknown".to_owned(),
+                    |kind| format!("{kind:?} ({})", kind.raw()),
+                );
+                let mut summary = format!(
+                    "ID {} · {} · {channel_type}",
+                    channel.id(),
+                    channel.display_name().unwrap_or("(unnamed channel)")
+                );
+                if let Some(identifier) = channel.plugin_identifier() {
+                    summary.push_str(&format!(" · plug-in {identifier}"));
+                }
+                if let Some(sample_path) = channel.sample_path() {
+                    summary.push_str(&format!(" · sample {sample_path}"));
+                }
+                summary
+            })
+            .collect::<Vec<_>>();
+        let plugin_states = document.channel_plugin_states();
+        let plugin_state_summaries = plugin_states
+            .iter()
+            .map(|state| {
+                let metadata = state.vst_metadata();
+                let plugin_name = metadata
+                    .and_then(VstPluginStateMetadata::name)
+                    .or_else(|| state.display_name())
+                    .or_else(|| state.plugin_identifier())
+                    .unwrap_or("opaque plug-in state");
+                let mut summary = format!("Channel {} · {plugin_name}", state.channel_id());
+                if let Some(vendor) = metadata.and_then(VstPluginStateMetadata::vendor) {
+                    summary.push_str(&format!(" · {vendor}"));
+                }
+                if let Some(marker) = metadata.map(VstPluginStateMetadata::format_marker) {
+                    summary.push_str(&format!(" · wrapper marker {marker}"));
+                }
+                if let Some(state_bytes) = metadata.and_then(VstPluginStateMetadata::state_bytes) {
+                    summary.push_str(&format!(" · recognized state {state_bytes} bytes"));
+                } else {
+                    summary.push_str(&format!(
+                        " · opaque payload {} bytes",
+                        state.data_payload().len()
+                    ));
+                }
+                summary
+            })
+            .collect::<Vec<_>>();
+        let mixer_inserts = document.mixer_inserts();
+        let mixer_insert_summaries = mixer_inserts
+            .iter()
+            .map(|insert| {
+                format!(
+                    "Record {} · {} · input {} · output {} · color {:#010x}",
+                    insert.ordinal(),
+                    insert.name().unwrap_or("(unnamed insert)"),
+                    insert.input_raw(),
+                    insert.output_raw(),
+                    insert.color_raw()
+                )
+            })
+            .collect::<Vec<_>>();
+        let automation_channels = document.automation_channels().unwrap_or_default();
+        let automation_summaries = automation_channels
+            .iter()
+            .map(|channel| {
+                format!(
+                    "Channel {} · {} · {} decoded points",
+                    channel.channel_id(),
+                    channel.display_name().unwrap_or("(unnamed channel)"),
+                    channel.points().len()
+                )
+            })
+            .collect::<Vec<_>>();
         self.browser_fst_details = Some(FstPresetDetails {
             path: path.to_path_buf(),
             file_size: bytes.len(),
@@ -3757,12 +3837,14 @@ impl DawUi {
             kind: preset.kind(),
             version: document.project_version().unwrap_or("unknown").to_owned(),
             event_count: document.events().len(),
-            channel_count: document.channels().len(),
-            plugin_state_count: document.channel_plugin_states().len(),
-            mixer_insert_count: document.mixer_inserts().len(),
-            automation_channel_count: document
-                .automation_channels()
-                .map_or(0, |channels| channels.len()),
+            channel_count: channels.len(),
+            channel_summaries,
+            plugin_state_count: plugin_states.len(),
+            plugin_state_summaries,
+            mixer_insert_count: mixer_inserts.len(),
+            mixer_insert_summaries,
+            automation_channel_count: automation_channels.len(),
+            automation_summaries,
             trailing_byte_count: document.trailing_bytes().len(),
         });
         self.status = format!("Inspected preset {}; state was not applied", path.display());
@@ -3834,8 +3916,8 @@ impl DawUi {
         egui::Window::new("FST preset details")
             .id(Id::new("browser-fst-details-dialog"))
             .open(&mut open)
-            .resizable(false)
-            .default_width(420.0)
+            .resizable(true)
+            .default_width(480.0)
             .show(context, |ui| {
                 ui.monospace(details.path.display().to_string());
                 ui.separator();
@@ -3853,6 +3935,42 @@ impl DawUi {
                     details.automation_channel_count
                 ));
                 ui.label(format!("Trailing bytes: {}", details.trailing_byte_count));
+                ui.separator();
+                ui.collapsing(
+                    format!("Decoded channels ({})", details.channel_summaries.len()),
+                    |ui| {
+                        for summary in &details.channel_summaries {
+                            ui.label(summary);
+                        }
+                    },
+                );
+                ui.collapsing(
+                    format!(
+                        "Plug-in state records ({})",
+                        details.plugin_state_summaries.len()
+                    ),
+                    |ui| {
+                        for summary in &details.plugin_state_summaries {
+                            ui.label(summary);
+                        }
+                    },
+                );
+                ui.collapsing(
+                    format!("Mixer insert records ({})", details.mixer_insert_summaries.len()),
+                    |ui| {
+                        for summary in &details.mixer_insert_summaries {
+                            ui.label(summary);
+                        }
+                    },
+                );
+                ui.collapsing(
+                    format!("Automation channels ({})", details.automation_summaries.len()),
+                    |ui| {
+                        for summary in &details.automation_summaries {
+                            ui.label(summary);
+                        }
+                    },
+                );
                 ui.separator();
                 ui.label(
                     egui::RichText::new(
