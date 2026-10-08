@@ -3934,11 +3934,35 @@ impl DawUi {
             .filter(|entry| query.is_empty() || entry.name.to_lowercase().contains(&query))
             .cloned()
             .collect::<Vec<_>>();
-        ui.small(if recursive_results {
-            format!("{} recursive matches", entries.len())
-        } else {
-            format!("{} items", entries.len())
+        let mut advance_search_result =
+            ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F3));
+        ui.horizontal(|ui| {
+            ui.small(if recursive_results {
+                format!("{} recursive matches", entries.len())
+            } else {
+                format!("{} items", entries.len())
+            });
+            if ui
+                .add_enabled(!entries.is_empty(), egui::Button::new("Next"))
+                .on_hover_text("Select the next result (F3)")
+                .clicked()
+            {
+                advance_search_result = true;
+            }
         });
+        let next_match_path = if advance_search_result && !entries.is_empty() {
+            let next_index = self
+                .browser_selected
+                .as_ref()
+                .and_then(|selected| entries.iter().position(|entry| &entry.path == selected))
+                .map(|index| (index + 1) % entries.len())
+                .unwrap_or(0);
+            let path = entries[next_index].path.clone();
+            self.browser_selected = Some(path.clone());
+            Some(path)
+        } else {
+            None
+        };
         let mut activate = None;
         let mut preview = None;
         let mut favorite = None;
@@ -3948,25 +3972,28 @@ impl DawUi {
                 for entry in entries {
                     let is_favorite = self.browser_favorites.contains(&entry.path);
                     let selected = self.browser_selected.as_ref() == Some(&entry.path);
-                    let (clicked, double_clicked, favorite_clicked) = ui
-                        .horizontal(|ui| {
-                            let icon = if entry.is_directory {
-                                "▸"
-                            } else {
-                                browser_file_icon(&entry.path)
-                            };
-                            let response =
-                                ui.selectable_label(selected, format!("{icon} {}", entry.name));
-                            let clicked = response.clicked();
-                            let double_clicked = response.double_clicked();
-                            response.on_hover_text(entry.path.display().to_string());
-                            let favorite_clicked = !entry.is_directory
-                                && ui
-                                    .small_button(if is_favorite { "★" } else { "☆" })
-                                    .clicked();
-                            (clicked, double_clicked, favorite_clicked)
-                        })
-                        .inner;
+                    let row = ui.horizontal(|ui| {
+                        let icon = if entry.is_directory {
+                            "▸"
+                        } else {
+                            browser_file_icon(&entry.path)
+                        };
+                        let response =
+                            ui.selectable_label(selected, format!("{icon} {}", entry.name));
+                        let clicked = response.clicked();
+                        let double_clicked = response.double_clicked();
+                        response.on_hover_text(entry.path.display().to_string());
+                        let favorite_clicked = !entry.is_directory
+                            && ui
+                                .small_button(if is_favorite { "★" } else { "☆" })
+                                .clicked();
+                        (clicked, double_clicked, favorite_clicked)
+                    });
+                    let row_rect = row.response.rect;
+                    let (clicked, double_clicked, favorite_clicked) = row.inner;
+                    if next_match_path.as_ref() == Some(&entry.path) {
+                        ui.scroll_to_rect(row_rect, Some(egui::Align::Center));
+                    }
                     if double_clicked {
                         self.browser_selected = Some(entry.path.clone());
                         activate = Some(entry.path.clone());
