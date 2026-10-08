@@ -858,6 +858,21 @@ struct BrowserTagEditor {
     tags: String,
 }
 
+#[derive(Clone)]
+struct SavedBrowserSearch {
+    name: String,
+    query: String,
+    filter: BrowserFilter,
+    all_roots: bool,
+    recursive: bool,
+    path: PathBuf,
+}
+
+struct BrowserSearchSaveDialog {
+    name: String,
+    search: SavedBrowserSearch,
+}
+
 struct BrowserIndex {
     roots: Vec<PathBuf>,
     all_roots: bool,
@@ -1059,6 +1074,7 @@ struct DawUi {
     browser_entries: Vec<BrowserEntry>,
     browser_index: Option<BrowserIndex>,
     pending_browser_index: Option<PendingBrowserIndex>,
+    browser_index_after_pending: Option<(Vec<PathBuf>, bool)>,
     browser_search_roots: Vec<PathBuf>,
     browser_search_all_active: bool,
     browser_search: String,
@@ -1066,6 +1082,8 @@ struct DawUi {
     browser_favorites: BTreeSet<PathBuf>,
     browser_tags: BTreeMap<PathBuf, BTreeSet<String>>,
     browser_tag_editor: Option<BrowserTagEditor>,
+    browser_saved_searches: Vec<SavedBrowserSearch>,
+    browser_search_save_dialog: Option<BrowserSearchSaveDialog>,
     browser_recent_projects: Vec<PathBuf>,
     browser_error: Option<String>,
     browser_full_sample: bool,
@@ -1255,6 +1273,7 @@ impl DawUi {
             browser_entries: Vec::new(),
             browser_index: None,
             pending_browser_index: None,
+            browser_index_after_pending: None,
             browser_search_roots: load_browser_search_roots(),
             browser_search_all_active: false,
             browser_search: String::new(),
@@ -1262,6 +1281,8 @@ impl DawUi {
             browser_favorites: load_browser_favorites(),
             browser_tags: load_browser_tags(),
             browser_tag_editor: None,
+            browser_saved_searches: load_browser_saved_searches(),
+            browser_search_save_dialog: None,
             browser_recent_projects: load_recent_projects(),
             browser_error: None,
             browser_full_sample: false,
@@ -3184,6 +3205,7 @@ impl DawUi {
     fn refresh_browser_directory(&mut self) {
         self.browser_index = None;
         self.browser_search_all_active = false;
+        self.browser_index_after_pending = None;
         match fs::read_dir(&self.browser_path) {
             Ok(directory) => {
                 let mut entries = directory
@@ -3237,12 +3259,21 @@ impl DawUi {
     }
 
     fn start_browser_index_for(&mut self, roots: Vec<PathBuf>, all_roots: bool) {
-        if self.pending_browser_index.is_some()
-            || self
-                .browser_index
-                .as_ref()
-                .is_some_and(|index| index.roots == roots && index.all_roots == all_roots)
+        if self
+            .browser_index
+            .as_ref()
+            .is_some_and(|index| index.roots == roots && index.all_roots == all_roots)
         {
+            self.browser_index_after_pending = None;
+            return;
+        }
+        if let Some(pending) = self.pending_browser_index.as_ref() {
+            self.browser_index_after_pending =
+                if pending.roots == roots && pending.all_roots == all_roots {
+                    None
+                } else {
+                    Some((roots, all_roots))
+                };
             return;
         }
         let worker_roots = roots.clone();
@@ -3275,6 +3306,7 @@ impl DawUi {
                         self.browser_error =
                             Some("Recursive Browser indexing stopped unexpectedly".to_owned());
                     }
+                    self.start_browser_index_after_pending();
                     return;
                 }
                 match result {
@@ -3286,6 +3318,7 @@ impl DawUi {
                     }
                     Ok(_) | Err(_) => {}
                 }
+                self.start_browser_index_after_pending();
             }
             Err(TryRecvError::Disconnected) => {
                 let pending = self
@@ -3308,8 +3341,15 @@ impl DawUi {
                         }
                     ));
                 }
+                self.start_browser_index_after_pending();
             }
             Err(TryRecvError::Empty) => {}
+        }
+    }
+
+    fn start_browser_index_after_pending(&mut self) {
+        if let Some((roots, all_roots)) = self.browser_index_after_pending.take() {
+            self.start_browser_index_for(roots, all_roots);
         }
     }
 
@@ -3351,6 +3391,7 @@ impl DawUi {
         {
             self.browser_index = None;
         }
+        self.browser_index_after_pending = None;
         self.browser_search_all_active = false;
         self.status = format!("Added {} to Browser search folders", root.display());
         Some(root)
@@ -3376,6 +3417,7 @@ impl DawUi {
             {
                 self.browser_index = None;
             }
+            self.browser_index_after_pending = None;
             self.browser_search_all_active = false;
             self.status = format!("Removed {} from Browser search folders", root.display());
         }
@@ -3503,6 +3545,146 @@ impl DawUi {
             self.save_browser_tag_editor(editor);
         } else if open && !cancel {
             self.browser_tag_editor = Some(editor);
+        }
+    }
+
+    fn open_browser_search_save_dialog(&mut self) {
+        let all_roots = self.browser_search_all_active;
+        let recursive = all_roots
+            || self.browser_index.as_ref().is_some_and(|index| {
+                !index.all_roots
+                    && index.roots.len() == 1
+                    && index.roots.first() == Some(&self.browser_path)
+            })
+            || self.pending_browser_index.as_ref().is_some_and(|pending| {
+                !pending.all_roots
+                    && pending.roots.len() == 1
+                    && pending.roots.first() == Some(&self.browser_path)
+            });
+        let default_name = if !self.browser_search.trim().is_empty() {
+            self.browser_search.trim().to_owned()
+        } else if all_roots {
+            "All Browser folders".to_owned()
+        } else {
+            self.browser_path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "Browser search".to_owned())
+        };
+        self.browser_search_save_dialog = Some(BrowserSearchSaveDialog {
+            name: default_name,
+            search: SavedBrowserSearch {
+                name: String::new(),
+                query: self.browser_search.clone(),
+                filter: self.browser_filter,
+                all_roots,
+                recursive,
+                path: self.browser_path.clone(),
+            },
+        });
+    }
+
+    fn save_browser_search(&mut self, mut search: SavedBrowserSearch) -> bool {
+        search.name = search.name.trim().to_owned();
+        if search.name.is_empty() {
+            self.status = "Enter a name for this Browser search".to_owned();
+            return false;
+        }
+        let previous = self.browser_saved_searches.clone();
+        if let Some(index) = self
+            .browser_saved_searches
+            .iter()
+            .position(|saved| saved.name.eq_ignore_ascii_case(&search.name))
+        {
+            self.browser_saved_searches[index] = search.clone();
+        } else {
+            self.browser_saved_searches.push(search.clone());
+        }
+        if let Err(error) = save_browser_saved_searches(&self.browser_saved_searches) {
+            self.browser_saved_searches = previous;
+            self.status = format!("Could not save Browser searches: {error}");
+            false
+        } else {
+            self.status = format!("Saved Browser search {}", search.name);
+            true
+        }
+    }
+
+    fn remove_browser_search(&mut self, index: usize) {
+        if index >= self.browser_saved_searches.len() {
+            return;
+        }
+        let search = self.browser_saved_searches.remove(index);
+        if let Err(error) = save_browser_saved_searches(&self.browser_saved_searches) {
+            self.browser_saved_searches.insert(index, search);
+            self.status = format!("Could not save Browser searches: {error}");
+        } else {
+            self.status = "Removed saved Browser search".to_owned();
+        }
+    }
+
+    fn apply_browser_search(&mut self, search: SavedBrowserSearch) {
+        if !search.all_roots && !search.path.is_dir() {
+            self.status = format!(
+                "Saved Browser folder is not available: {}",
+                search.path.display()
+            );
+            return;
+        }
+        self.browser_filter = search.filter;
+        if search.all_roots {
+            self.browser_search = search.query;
+            self.start_browser_roots_index();
+        } else {
+            self.set_browser_directory(search.path);
+            self.browser_search = search.query;
+            if search.recursive {
+                self.start_browser_index();
+            }
+        }
+    }
+
+    fn browser_search_save_dialog(&mut self, context: &egui::Context) {
+        let Some(mut dialog) = self.browser_search_save_dialog.take() else {
+            return;
+        };
+        let mut open = true;
+        let mut save = false;
+        let mut cancel = false;
+        egui::Window::new("Save Browser search")
+            .id(Id::new("browser-search-save-dialog"))
+            .open(&mut open)
+            .resizable(false)
+            .show(context, |ui| {
+                ui.label("Name");
+                ui.text_edit_singleline(&mut dialog.name);
+                ui.small(format!(
+                    "Filter: {} · {}",
+                    dialog.search.filter.label(),
+                    if dialog.search.all_roots {
+                        "all saved folders"
+                    } else if dialog.search.recursive {
+                        "recursive current folder"
+                    } else {
+                        "current folder"
+                    }
+                ));
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        save = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        let mut keep_dialog_open = open && !cancel;
+        if save {
+            dialog.search.name = dialog.name.clone();
+            keep_dialog_open = !self.save_browser_search(dialog.search.clone());
+        }
+        if keep_dialog_open {
+            self.browser_search_save_dialog = Some(dialog);
         }
     }
 
@@ -3870,6 +4052,47 @@ impl DawUi {
             self.set_browser_directory(path);
         } else if refresh {
             self.refresh_browser_directory();
+        }
+
+        let saved_searches = self.browser_saved_searches.clone();
+        let mut save_search_requested = false;
+        let mut apply_search_requested = None;
+        let mut remove_search_requested = None;
+        ui.horizontal_wrapped(|ui| {
+            if ui.small_button("Save search").clicked() {
+                save_search_requested = true;
+            }
+            if !saved_searches.is_empty() {
+                egui::ComboBox::from_id_salt("browser-saved-searches")
+                    .selected_text("Saved searches")
+                    .show_ui(ui, |ui| {
+                        for (index, search) in saved_searches.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                if ui.selectable_label(false, &search.name).clicked() {
+                                    apply_search_requested = Some(search.clone());
+                                    ui.close();
+                                }
+                                if ui
+                                    .small_button("×")
+                                    .on_hover_text("Remove saved search")
+                                    .clicked()
+                                {
+                                    remove_search_requested = Some(index);
+                                    ui.close();
+                                }
+                            });
+                        }
+                    });
+            }
+        });
+        if let Some(search) = apply_search_requested {
+            self.apply_browser_search(search);
+        }
+        if let Some(index) = remove_search_requested {
+            self.remove_browser_search(index);
+        }
+        if save_search_requested {
+            self.open_browser_search_save_dialog();
         }
 
         let current_indexed = self.browser_index.as_ref().is_some_and(|index| {
@@ -10479,6 +10702,7 @@ impl eframe::App for DawUi {
         self.project_info_dialog(ui.ctx());
         self.project_settings_dialog(ui.ctx());
         self.browser_tag_editor_dialog(ui.ctx());
+        self.browser_search_save_dialog(ui.ctx());
         self.recovery_prompt_dialog(ui.ctx());
         self.unsaved_changes_dialog(ui.ctx());
         self.finish_history_frame(frame_snapshot.take(), pointer_down, history_navigation);
@@ -10682,6 +10906,12 @@ fn browser_tags_file() -> Option<PathBuf> {
     browser_favorites_file()?
         .parent()
         .map(|directory| directory.join("browser-tags.txt"))
+}
+
+fn browser_saved_searches_file() -> Option<PathBuf> {
+    browser_favorites_file()?
+        .parent()
+        .map(|directory| directory.join("browser-saved-searches.txt"))
 }
 
 fn recent_projects_file() -> Option<PathBuf> {
@@ -11173,6 +11403,157 @@ fn save_browser_tags(tags_by_path: &BTreeMap<PathBuf, BTreeSet<String>>) -> Resu
                 line.push_str(&tag.replace(['\t', '\n', '\r'], " "));
             }
             line
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&path, contents)
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
+fn browser_search_filter_key(filter: BrowserFilter) -> &'static str {
+    match filter {
+        BrowserFilter::All => "all",
+        BrowserFilter::Audio => "audio",
+        BrowserFilter::Projects => "projects",
+        BrowserFilter::Presets => "presets",
+    }
+}
+
+fn parse_browser_search_filter(value: &str) -> Option<BrowserFilter> {
+    match value {
+        "all" => Some(BrowserFilter::All),
+        "audio" => Some(BrowserFilter::Audio),
+        "projects" => Some(BrowserFilter::Projects),
+        "presets" => Some(BrowserFilter::Presets),
+        _ => None,
+    }
+}
+
+fn encode_browser_search_field(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '%' => encoded.push_str("%25"),
+            '\t' => encoded.push_str("%09"),
+            '\n' => encoded.push_str("%0A"),
+            '\r' => encoded.push_str("%0D"),
+            _ => encoded.push(character),
+        }
+    }
+    encoded
+}
+
+fn decode_browser_search_field(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let high = (bytes[index + 1] as char).to_digit(16);
+            let low = (bytes[index + 2] as char).to_digit(16);
+            if let (Some(high), Some(low)) = (high, low) {
+                decoded.push(((high << 4) | low) as u8);
+                index += 3;
+                continue;
+            }
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+fn load_browser_saved_searches() -> Vec<SavedBrowserSearch> {
+    let Some(path) = browser_saved_searches_file() else {
+        return Vec::new();
+    };
+    let Ok(contents) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut searches = Vec::new();
+    for line in contents.lines() {
+        let mut fields = line.split('\t');
+        if fields.next() != Some("v1") {
+            continue;
+        }
+        let (Some(name), Some(query), Some(filter), Some(all_roots), Some(recursive), Some(path)) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        ) else {
+            continue;
+        };
+        if fields.next().is_some() {
+            continue;
+        }
+        let name = decode_browser_search_field(name);
+        let query = decode_browser_search_field(query);
+        let Some(filter) = parse_browser_search_filter(filter) else {
+            continue;
+        };
+        let (Ok(all_roots), Ok(recursive)) = (all_roots.parse::<bool>(), recursive.parse::<bool>())
+        else {
+            continue;
+        };
+        let path = decode_browser_search_field(path);
+        if name.trim().is_empty() || (!all_roots && path.is_empty()) {
+            continue;
+        }
+        let search = SavedBrowserSearch {
+            name: name.trim().to_owned(),
+            query,
+            filter,
+            all_roots,
+            recursive,
+            path: if all_roots {
+                PathBuf::new()
+            } else {
+                PathBuf::from(path)
+            },
+        };
+        if let Some(existing) = searches
+            .iter_mut()
+            .find(|existing: &&mut SavedBrowserSearch| {
+                existing.name.eq_ignore_ascii_case(&search.name)
+            })
+        {
+            *existing = search;
+        } else {
+            searches.push(search);
+        }
+    }
+    searches
+}
+
+fn save_browser_saved_searches(searches: &[SavedBrowserSearch]) -> Result<(), String> {
+    let path = browser_saved_searches_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the Browser saved searches path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    let contents = searches
+        .iter()
+        .map(|search| {
+            let path = if search.all_roots {
+                String::new()
+            } else {
+                search.path.to_string_lossy().into_owned()
+            };
+            [
+                "v1".to_owned(),
+                encode_browser_search_field(&search.name),
+                encode_browser_search_field(&search.query),
+                browser_search_filter_key(search.filter).to_owned(),
+                search.all_roots.to_string(),
+                search.recursive.to_string(),
+                encode_browser_search_field(&path),
+            ]
+            .join("\t")
         })
         .collect::<Vec<_>>()
         .join("\n");
