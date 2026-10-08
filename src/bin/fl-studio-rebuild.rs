@@ -2885,6 +2885,31 @@ impl DawUi {
                     }
                 });
                 ui.separator();
+                let recent_projects = self.browser_recent_projects.clone();
+                ui.menu_button("Recent projects", |ui| {
+                    if recent_projects.is_empty() {
+                        ui.label("No recent projects");
+                    }
+                    let mut open_path = None;
+                    for (index, path) in recent_projects.iter().take(10).enumerate() {
+                        let name = path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| path.display().to_string());
+                        if ui
+                            .button(format!("{}. {name}", index + 1))
+                            .on_hover_text(path.display().to_string())
+                            .clicked()
+                        {
+                            open_path = Some(path.clone());
+                            ui.close();
+                        }
+                    }
+                    if let Some(path) = open_path {
+                        self.open_project(&path);
+                    }
+                });
+                ui.separator();
                 if ui.button("Exit").clicked() {
                     if self.dirty {
                         self.recovery_prompt = None;

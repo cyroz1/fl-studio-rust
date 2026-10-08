@@ -6,6 +6,7 @@ These observations come from the installed FL Studio 2026 desktop application an
 
 - The main window fills the display and keeps the project name, transport, tempo, elapsed time, and view controls in a narrow top area.
 - The top-level menu contains File, Edit, Add, Patterns, View, Options, Tools, and Help.
+- FL Studio's File menu shows up to 10 recent projects ([Image-Line File menu](https://www.image-line.com/fl-studio-learning/fl-studio-online-manual/html/menu_file.htm)); the rewrite now exposes its current-session recent-project list there as well as in the Browser.
 - Keyboard shortcuts open the Playlist (F5), Channel Rack (F6), Piano roll (F7), and Mixer (F9).
 - The Browser occupies a narrow left column. The work area to its right changes between editor views.
 - Image-Line's File menu includes New and Exit commands that prompt to save changes ([Image-Line File menu](https://www.image-line.com/fl-studio-learning/fl-studio-online-manual/html/menu_file.htm)). The rewrite now presents Save, Don't Save, and Cancel before opening another project, using File > Exit, or closing the window with unsaved edits.
