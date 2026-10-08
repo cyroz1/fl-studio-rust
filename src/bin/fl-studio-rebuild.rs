@@ -891,6 +891,11 @@ struct BrowserSearchSaveDialog {
     search: SavedBrowserSearch,
 }
 
+struct BrowserSearchRenameDialog {
+    index: usize,
+    name: String,
+}
+
 struct BrowserIndex {
     roots: Vec<PathBuf>,
     all_roots: bool,
@@ -1105,6 +1110,7 @@ struct DawUi {
     browser_saved_searches: Vec<SavedBrowserSearch>,
     browser_active_saved_search: Option<String>,
     browser_search_save_dialog: Option<BrowserSearchSaveDialog>,
+    browser_search_rename_dialog: Option<BrowserSearchRenameDialog>,
     browser_recent_projects: Vec<PathBuf>,
     browser_error: Option<String>,
     browser_full_sample: bool,
@@ -1307,6 +1313,7 @@ impl DawUi {
             browser_saved_searches: load_browser_saved_searches(),
             browser_active_saved_search: None,
             browser_search_save_dialog: None,
+            browser_search_rename_dialog: None,
             browser_recent_projects: load_recent_projects(),
             browser_error: None,
             browser_full_sample: false,
@@ -3713,6 +3720,79 @@ impl DawUi {
         }
     }
 
+    fn open_browser_search_rename_dialog(&mut self, index: usize) {
+        let Some(search) = self.browser_saved_searches.get(index) else {
+            return;
+        };
+        self.browser_search_rename_dialog = Some(BrowserSearchRenameDialog {
+            index,
+            name: search.name.clone(),
+        });
+    }
+
+    fn rename_browser_search(&mut self, index: usize, name: String) -> bool {
+        let name = name.trim().to_owned();
+        if name.is_empty() {
+            self.status = "Enter a name for this Browser tab".to_owned();
+            return false;
+        }
+        if index >= self.browser_saved_searches.len() {
+            self.status = "Browser tab no longer exists".to_owned();
+            return false;
+        }
+        if self
+            .browser_saved_searches
+            .iter()
+            .enumerate()
+            .any(|(other_index, search)| {
+                other_index != index && search.name.eq_ignore_ascii_case(&name)
+            })
+        {
+            self.status = "Browser tab names must be unique".to_owned();
+            return false;
+        }
+
+        let previous = self.browser_saved_searches.clone();
+        let old_name = self.browser_saved_searches[index].name.clone();
+        self.browser_saved_searches[index].name = name.clone();
+        if let Err(error) = save_browser_saved_searches(&self.browser_saved_searches) {
+            self.browser_saved_searches = previous;
+            self.status = format!("Could not save Browser tabs: {error}");
+            false
+        } else {
+            if self.browser_active_saved_search.as_deref() == Some(old_name.as_str()) {
+                self.browser_active_saved_search = Some(name.clone());
+            }
+            self.status = format!("Renamed Browser tab to {name}");
+            true
+        }
+    }
+
+    fn move_browser_search(&mut self, index: usize, direction: isize) {
+        let Some(target) = index.checked_add_signed(direction) else {
+            return;
+        };
+        if index >= self.browser_saved_searches.len()
+            || target >= self.browser_saved_searches.len()
+            || direction == 0
+        {
+            return;
+        }
+
+        let previous = self.browser_saved_searches.clone();
+        self.browser_saved_searches.swap(index, target);
+        if let Err(error) = save_browser_saved_searches(&self.browser_saved_searches) {
+            self.browser_saved_searches = previous;
+            self.status = format!("Could not save Browser tabs: {error}");
+        } else {
+            self.status = if direction < 0 {
+                "Moved Browser tab left".to_owned()
+            } else {
+                "Moved Browser tab right".to_owned()
+            };
+        }
+    }
+
     fn apply_browser_search(&mut self, search: SavedBrowserSearch) {
         if !search.all_roots && !search.path.is_dir() {
             self.status = format!(
@@ -3794,6 +3874,38 @@ impl DawUi {
         }
         if keep_dialog_open {
             self.browser_search_save_dialog = Some(dialog);
+        }
+    }
+
+    fn browser_search_rename_dialog(&mut self, context: &egui::Context) {
+        let Some(mut dialog) = self.browser_search_rename_dialog.take() else {
+            return;
+        };
+        let mut open = true;
+        let mut rename = false;
+        let mut cancel = false;
+        egui::Window::new("Rename Browser tab")
+            .id(Id::new("browser-search-rename-dialog"))
+            .open(&mut open)
+            .resizable(false)
+            .show(context, |ui| {
+                ui.label("Name");
+                ui.text_edit_singleline(&mut dialog.name);
+                ui.horizontal(|ui| {
+                    if ui.button("Rename").clicked() {
+                        rename = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        let mut keep_dialog_open = open && !cancel;
+        if rename {
+            keep_dialog_open = !self.rename_browser_search(dialog.index, dialog.name.clone());
+        }
+        if keep_dialog_open {
+            self.browser_search_rename_dialog = Some(dialog);
         }
     }
 
@@ -3953,6 +4065,8 @@ impl DawUi {
         let saved_searches = self.browser_saved_searches.clone();
         let mut apply_saved_search = None;
         let mut remove_saved_search = None;
+        let mut rename_saved_search = None;
+        let mut move_saved_search = None;
         ui.horizontal_wrapped(|ui| {
             for tab in BrowserTab::ALL {
                 let selected =
@@ -3967,13 +4081,40 @@ impl DawUi {
                     let selected = self.browser_tab == BrowserTab::Files
                         && self.browser_active_saved_search.as_deref()
                             == Some(search.name.as_str());
-                    if ui
+                    let response = ui
                         .selectable_label(selected, &search.name)
-                        .on_hover_text("Apply this saved Browser search")
-                        .clicked()
-                    {
+                        .on_hover_text("Apply this saved Browser search");
+                    if response.clicked() {
                         apply_saved_search = Some(search.clone());
                     }
+                    response.context_menu(|ui| {
+                        if ui.button("Rename…").clicked() {
+                            rename_saved_search = Some(index);
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(index > 0, egui::Button::new("Move left"))
+                            .clicked()
+                        {
+                            move_saved_search = Some((index, -1));
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(
+                                index + 1 < saved_searches.len(),
+                                egui::Button::new("Move right"),
+                            )
+                            .clicked()
+                        {
+                            move_saved_search = Some((index, 1));
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui.button("Delete tab").clicked() {
+                            remove_saved_search = Some(index);
+                            ui.close();
+                        }
+                    });
                     if ui
                         .small_button("×")
                         .on_hover_text("Delete this saved Browser tab")
@@ -3986,6 +4127,10 @@ impl DawUi {
         });
         if let Some(index) = remove_saved_search {
             self.remove_browser_search(index);
+        } else if let Some((index, direction)) = move_saved_search {
+            self.move_browser_search(index, direction);
+        } else if let Some(index) = rename_saved_search {
+            self.open_browser_search_rename_dialog(index);
         }
         if let Some(search) = apply_saved_search {
             self.apply_browser_search(search);
@@ -10826,6 +10971,7 @@ impl eframe::App for DawUi {
         self.project_settings_dialog(ui.ctx());
         self.browser_tag_editor_dialog(ui.ctx());
         self.browser_search_save_dialog(ui.ctx());
+        self.browser_search_rename_dialog(ui.ctx());
         self.recovery_prompt_dialog(ui.ctx());
         self.unsaved_changes_dialog(ui.ctx());
         self.finish_history_frame(frame_snapshot.take(), pointer_down, history_navigation);
