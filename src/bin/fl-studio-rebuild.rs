@@ -884,6 +884,7 @@ struct SavedBrowserSearch {
     path: PathBuf,
     tag_logic: BrowserTagLogic,
     selected_tags: BTreeSet<String>,
+    hidden: bool,
 }
 
 struct BrowserSearchSaveDialog {
@@ -3674,6 +3675,7 @@ impl DawUi {
                 path: self.browser_path.clone(),
                 tag_logic: self.browser_tag_logic,
                 selected_tags: self.browser_selected_tags.clone(),
+                hidden: false,
             },
         });
     }
@@ -3719,6 +3721,31 @@ impl DawUi {
                 self.browser_active_saved_search = None;
             }
             self.status = "Removed saved Browser search".to_owned();
+        }
+    }
+
+    fn set_browser_search_hidden(&mut self, index: usize, hidden: bool) {
+        let Some(search) = self.browser_saved_searches.get_mut(index) else {
+            return;
+        };
+        if search.hidden == hidden {
+            return;
+        }
+        let name = search.name.clone();
+        let previous = self.browser_saved_searches.clone();
+        self.browser_saved_searches[index].hidden = hidden;
+        if let Err(error) = save_browser_saved_searches(&self.browser_saved_searches) {
+            self.browser_saved_searches = previous;
+            self.status = format!("Could not save Browser tabs: {error}");
+        } else {
+            if hidden && self.browser_active_saved_search.as_deref() == Some(name.as_str()) {
+                self.browser_active_saved_search = None;
+            }
+            self.status = if hidden {
+                format!("Hidden Browser tab {name}")
+            } else {
+                format!("Showed Browser tab {name}")
+            };
         }
     }
 
@@ -3771,15 +3798,26 @@ impl DawUi {
     }
 
     fn move_browser_search(&mut self, index: usize, direction: isize) {
-        let Some(target) = index.checked_add_signed(direction) else {
-            return;
-        };
         if index >= self.browser_saved_searches.len()
-            || target >= self.browser_saved_searches.len()
+            || self.browser_saved_searches[index].hidden
             || direction == 0
         {
             return;
         }
+        let target = if direction < 0 {
+            self.browser_saved_searches[..index]
+                .iter()
+                .rposition(|search| !search.hidden)
+        } else {
+            self.browser_saved_searches
+                .iter()
+                .enumerate()
+                .skip(index + 1)
+                .find_map(|(index, search)| (!search.hidden).then_some(index))
+        };
+        let Some(target) = target else {
+            return;
+        };
 
         let previous = self.browser_saved_searches.clone();
         self.browser_saved_searches.swap(index, target);
@@ -4098,6 +4136,8 @@ impl DawUi {
         let saved_searches = self.browser_saved_searches.clone();
         let mut apply_saved_search = None;
         let mut remove_saved_search = None;
+        let mut hide_saved_search = None;
+        let mut show_saved_search = None;
         let mut rename_saved_search = None;
         let mut move_saved_search = None;
         let mut clone_saved_search = None;
@@ -4110,7 +4150,19 @@ impl DawUi {
                     self.browser_active_saved_search = None;
                 }
             }
-            for (index, search) in saved_searches.iter().enumerate() {
+            for (index, search) in saved_searches
+                .iter()
+                .enumerate()
+                .filter(|(_, search)| !search.hidden)
+            {
+                let can_move_left = saved_searches
+                    .iter()
+                    .take(index)
+                    .any(|search| !search.hidden);
+                let can_move_right = saved_searches
+                    .iter()
+                    .skip(index + 1)
+                    .any(|search| !search.hidden);
                 ui.horizontal(|ui| {
                     let selected = self.browser_tab == BrowserTab::Files
                         && self.browser_active_saved_search.as_deref()
@@ -4127,17 +4179,14 @@ impl DawUi {
                             ui.close();
                         }
                         if ui
-                            .add_enabled(index > 0, egui::Button::new("Move left"))
+                            .add_enabled(can_move_left, egui::Button::new("Move left"))
                             .clicked()
                         {
                             move_saved_search = Some((index, -1));
                             ui.close();
                         }
                         if ui
-                            .add_enabled(
-                                index + 1 < saved_searches.len(),
-                                egui::Button::new("Move right"),
-                            )
+                            .add_enabled(can_move_right, egui::Button::new("Move right"))
                             .clicked()
                         {
                             move_saved_search = Some((index, 1));
@@ -4146,6 +4195,10 @@ impl DawUi {
                         ui.separator();
                         if ui.button("Clone this tab").clicked() {
                             clone_saved_search = Some(index);
+                            ui.close();
+                        }
+                        if ui.button("Hide tab").clicked() {
+                            hide_saved_search = Some(index);
                             ui.close();
                         }
                         if ui.button("Delete tab").clicked() {
@@ -4162,9 +4215,29 @@ impl DawUi {
                     }
                 });
             }
+            if saved_searches.iter().any(|search| search.hidden) {
+                ui.menu_button("Other tabs", |ui| {
+                    ui.small("Show hidden");
+                    ui.separator();
+                    for (index, search) in saved_searches
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, search)| search.hidden)
+                    {
+                        if ui.button(&search.name).clicked() {
+                            show_saved_search = Some(index);
+                            ui.close();
+                        }
+                    }
+                });
+            }
         });
         if let Some(index) = remove_saved_search {
             self.remove_browser_search(index);
+        } else if let Some(index) = hide_saved_search {
+            self.set_browser_search_hidden(index, true);
+        } else if let Some(index) = show_saved_search {
+            self.set_browser_search_hidden(index, false);
         } else if let Some((index, direction)) = move_saved_search {
             self.move_browser_search(index, direction);
         } else if let Some(index) = rename_saved_search {
@@ -11808,8 +11881,8 @@ fn load_browser_saved_searches() -> Vec<SavedBrowserSearch> {
         ) else {
             continue;
         };
-        let (tag_logic, selected_tags) = match version {
-            Some("v1") if fields.next().is_none() => (BrowserTagLogic::Any, BTreeSet::new()),
+        let (tag_logic, hidden, selected_tags) = match version {
+            Some("v1") if fields.next().is_none() => (BrowserTagLogic::Any, false, BTreeSet::new()),
             Some("v2") => {
                 let Some(tag_logic) = fields.next().and_then(parse_browser_tag_logic) else {
                     continue;
@@ -11819,7 +11892,21 @@ fn load_browser_saved_searches() -> Vec<SavedBrowserSearch> {
                     .map(|tag| tag.trim().to_owned())
                     .filter(|tag| !tag.is_empty())
                     .collect::<BTreeSet<_>>();
-                (tag_logic, selected_tags)
+                (tag_logic, false, selected_tags)
+            }
+            Some("v3") => {
+                let Some(tag_logic) = fields.next().and_then(parse_browser_tag_logic) else {
+                    continue;
+                };
+                let Some(Ok(hidden)) = fields.next().map(str::parse::<bool>) else {
+                    continue;
+                };
+                let selected_tags = fields
+                    .map(decode_browser_search_field)
+                    .map(|tag| tag.trim().to_owned())
+                    .filter(|tag| !tag.is_empty())
+                    .collect::<BTreeSet<_>>();
+                (tag_logic, hidden, selected_tags)
             }
             _ => continue,
         };
@@ -11849,6 +11936,7 @@ fn load_browser_saved_searches() -> Vec<SavedBrowserSearch> {
             },
             tag_logic,
             selected_tags,
+            hidden,
         };
         if let Some(existing) = searches
             .iter_mut()
@@ -11881,7 +11969,7 @@ fn save_browser_saved_searches(searches: &[SavedBrowserSearch]) -> Result<(), St
                 search.path.to_string_lossy().into_owned()
             };
             let mut fields = vec![
-                "v2".to_owned(),
+                "v3".to_owned(),
                 encode_browser_search_field(&search.name),
                 encode_browser_search_field(&search.query),
                 browser_search_filter_key(search.filter).to_owned(),
@@ -11889,6 +11977,7 @@ fn save_browser_saved_searches(searches: &[SavedBrowserSearch]) -> Result<(), St
                 search.recursive.to_string(),
                 encode_browser_search_field(&path),
                 browser_tag_logic_key(search.tag_logic).to_owned(),
+                search.hidden.to_string(),
             ];
             fields.extend(
                 search
