@@ -1103,6 +1103,7 @@ struct DawUi {
     browser_tag_logic: BrowserTagLogic,
     browser_selected_tags: BTreeSet<String>,
     browser_saved_searches: Vec<SavedBrowserSearch>,
+    browser_active_saved_search: Option<String>,
     browser_search_save_dialog: Option<BrowserSearchSaveDialog>,
     browser_recent_projects: Vec<PathBuf>,
     browser_error: Option<String>,
@@ -1304,6 +1305,7 @@ impl DawUi {
             browser_tag_logic: BrowserTagLogic::default(),
             browser_selected_tags: BTreeSet::new(),
             browser_saved_searches: load_browser_saved_searches(),
+            browser_active_saved_search: None,
             browser_search_save_dialog: None,
             browser_recent_projects: load_recent_projects(),
             browser_error: None,
@@ -3688,6 +3690,8 @@ impl DawUi {
             self.status = format!("Could not save Browser searches: {error}");
             false
         } else {
+            self.browser_tab = BrowserTab::Files;
+            self.browser_active_saved_search = Some(search.name.clone());
             self.status = format!("Saved Browser search {}", search.name);
             true
         }
@@ -3702,6 +3706,9 @@ impl DawUi {
             self.browser_saved_searches.insert(index, search);
             self.status = format!("Could not save Browser searches: {error}");
         } else {
+            if self.browser_active_saved_search.as_deref() == Some(search.name.as_str()) {
+                self.browser_active_saved_search = None;
+            }
             self.status = "Removed saved Browser search".to_owned();
         }
     }
@@ -3714,6 +3721,8 @@ impl DawUi {
             );
             return;
         }
+        self.browser_tab = BrowserTab::Files;
+        self.browser_active_saved_search = Some(search.name.clone());
         self.browser_filter = search.filter;
         self.browser_tag_logic = search.tag_logic;
         self.browser_selected_tags = search.selected_tags;
@@ -3941,11 +3950,46 @@ impl DawUi {
             }
         });
         ui.separator();
+        let saved_searches = self.browser_saved_searches.clone();
+        let mut apply_saved_search = None;
+        let mut remove_saved_search = None;
         ui.horizontal_wrapped(|ui| {
             for tab in BrowserTab::ALL {
-                ui.selectable_value(&mut self.browser_tab, tab, tab.label());
+                let selected =
+                    self.browser_tab == tab && self.browser_active_saved_search.is_none();
+                if ui.selectable_label(selected, tab.label()).clicked() {
+                    self.browser_tab = tab;
+                    self.browser_active_saved_search = None;
+                }
+            }
+            for (index, search) in saved_searches.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    let selected = self.browser_tab == BrowserTab::Files
+                        && self.browser_active_saved_search.as_deref()
+                            == Some(search.name.as_str());
+                    if ui
+                        .selectable_label(selected, &search.name)
+                        .on_hover_text("Apply this saved Browser search")
+                        .clicked()
+                    {
+                        apply_saved_search = Some(search.clone());
+                    }
+                    if ui
+                        .small_button("×")
+                        .on_hover_text("Delete this saved Browser tab")
+                        .clicked()
+                    {
+                        remove_saved_search = Some(index);
+                    }
+                });
             }
         });
+        if let Some(index) = remove_saved_search {
+            self.remove_browser_search(index);
+        }
+        if let Some(search) = apply_saved_search {
+            self.apply_browser_search(search);
+        }
         ui.separator();
 
         match self.browser_tab {
@@ -4154,44 +4198,7 @@ impl DawUi {
             self.refresh_browser_directory();
         }
 
-        let saved_searches = self.browser_saved_searches.clone();
-        let mut save_search_requested = false;
-        let mut apply_search_requested = None;
-        let mut remove_search_requested = None;
-        ui.horizontal_wrapped(|ui| {
-            if ui.small_button("Save search").clicked() {
-                save_search_requested = true;
-            }
-            if !saved_searches.is_empty() {
-                egui::ComboBox::from_id_salt("browser-saved-searches")
-                    .selected_text("Saved searches")
-                    .show_ui(ui, |ui| {
-                        for (index, search) in saved_searches.iter().enumerate() {
-                            ui.horizontal(|ui| {
-                                if ui.selectable_label(false, &search.name).clicked() {
-                                    apply_search_requested = Some(search.clone());
-                                    ui.close();
-                                }
-                                if ui
-                                    .small_button("×")
-                                    .on_hover_text("Remove saved search")
-                                    .clicked()
-                                {
-                                    remove_search_requested = Some(index);
-                                    ui.close();
-                                }
-                            });
-                        }
-                    });
-            }
-        });
-        if let Some(search) = apply_search_requested {
-            self.apply_browser_search(search);
-        }
-        if let Some(index) = remove_search_requested {
-            self.remove_browser_search(index);
-        }
-        if save_search_requested {
+        if ui.small_button("Save search").clicked() {
             self.open_browser_search_save_dialog();
         }
 
