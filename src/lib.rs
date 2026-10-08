@@ -4964,6 +4964,50 @@ impl FlpDocument {
         Ok(())
     }
 
+    /// Replaces the source path in an existing sample-bearing channel's `0xC4` event.
+    /// The channel's string encoding and bytes after the terminator are preserved.
+    /// This does not create a missing sample-path event.
+    pub fn set_channel_sample_path(&mut self, channel_id: u16, path: &str) -> Result<(), FlpError> {
+        if path.contains('\0') {
+            return Err(FlpError::UnsupportedEdit(
+                "sample paths cannot contain an embedded NUL character",
+            ));
+        }
+
+        let channels = self.channels();
+        let mut matching = channels.iter().filter(|channel| channel.id == channel_id);
+        let Some(channel) = matching.next() else {
+            return Err(FlpError::ChannelNotFound(channel_id));
+        };
+        if matching.next().is_some() {
+            return Err(FlpError::AmbiguousChannelId(channel_id));
+        }
+        if !matches!(channel.kind, Some(0 | 4)) {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel is not a sample-bearing channel",
+            ));
+        }
+
+        let event_index = channel
+            .event_range()
+            .find(|index| self.events[*index].opcode == 0xC4)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the selected sample-bearing channel has no recognized 0xC4 sample-path event",
+            ))?;
+        let event = &self.events[event_index];
+        if !matches!(event.encoding, PayloadEncoding::Data { .. }) {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel's 0xC4 sample-path event is not length-prefixed",
+            ));
+        }
+
+        let utf16 = project_string_is_utf16(&event.payload, self.project_version.as_deref());
+        let payload = replace_project_string_payload(&event.payload, path, utf16)?;
+        self.events[event_index].replace_data_payload(payload)?;
+        self.refresh_event_offsets()?;
+        Ok(())
+    }
+
     /// Renames a channel through its verified UTF-16LE `0xCB` display-name event.
     /// Unedited event bytes are retained; the edited event is resized if needed.
     pub fn set_channel_name(&mut self, channel_id: u16, name: &str) -> Result<(), FlpError> {
@@ -5595,7 +5639,7 @@ fn encode_project_string(value: &str, utf16: bool) -> Result<Vec<u8>, FlpError> 
     } else {
         for character in value.chars() {
             let byte = windows_1252_byte(character).ok_or(FlpError::UnsupportedEdit(
-                "the Project Info text contains a character unavailable in the project's legacy encoding",
+                "the string contains a character unavailable in the project's legacy encoding",
             ))?;
             payload.push(byte);
         }
@@ -5638,7 +5682,7 @@ fn replace_project_string_payload(
     } else {
         for character in value.chars() {
             let byte = windows_1252_byte(character).ok_or(FlpError::UnsupportedEdit(
-                "the Project Info text contains a character unavailable in the project's legacy encoding",
+                "the string contains a character unavailable in the project's legacy encoding",
             ))?;
             payload.push(byte);
         }

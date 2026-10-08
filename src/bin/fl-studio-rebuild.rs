@@ -1601,6 +1601,8 @@ impl DawUi {
                     .and_then(|patterns| patterns.first().map(|pattern| pattern.id));
                 self.selected_note_channel =
                     document.channels().first().map(|channel| channel.id());
+                self.selected_graph_channel =
+                    document.channels().first().map(|channel| channel.id());
                 self.selected_clip = None;
                 self.selected_time_marker = None;
                 self.selected_note = None;
@@ -3766,6 +3768,63 @@ impl DawUi {
         self.status = format!("Inspected preset {}; state was not applied", path.display());
     }
 
+    fn selected_sample_channel(&self) -> Option<(u16, String)> {
+        let channel_id = self.selected_graph_channel?;
+        let channel = self
+            .document
+            .as_ref()?
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id() == channel_id)?;
+        if !matches!(channel.kind(), Some(0 | 4)) || channel.sample_path().is_none() {
+            return None;
+        }
+        Some((
+            channel_id,
+            channel
+                .display_name()
+                .unwrap_or("Sample channel")
+                .to_owned(),
+        ))
+    }
+
+    fn load_browser_sample_into_channel(&mut self, channel_id: u16, path: &Path) {
+        let path_string = path.to_string_lossy().into_owned();
+        let result = self
+            .document
+            .as_mut()
+            .ok_or_else(|| "no project is open".to_owned())
+            .and_then(|document| {
+                document
+                    .set_channel_sample_path(channel_id, &path_string)
+                    .map_err(|error| error.to_string())
+            });
+        match result {
+            Ok(()) => {
+                self.stop_project_playback();
+                self.dirty = true;
+                let channel_name = self
+                    .document
+                    .as_ref()
+                    .and_then(|document| {
+                        document
+                            .channels()
+                            .into_iter()
+                            .find(|channel| channel.id() == channel_id)
+                    })
+                    .and_then(|channel| channel.display_name().map(str::to_owned))
+                    .unwrap_or_else(|| format!("channel {channel_id}"));
+                let file_name = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                self.status = format!("Loaded sample {file_name} into {channel_name}");
+                self.refresh_audio_waveform_paths();
+            }
+            Err(error) => self.status = format!("Could not load sample into channel: {error}"),
+        }
+    }
+
     fn browser_fst_details_dialog(&mut self, context: &egui::Context) {
         let Some(details) = self.browser_fst_details.clone() else {
             return;
@@ -5009,6 +5068,8 @@ impl DawUi {
         let mut favorite = None;
         let mut edit_tags = None;
         let mut inspect_preset = None;
+        let mut load_sample = None;
+        let sample_target = self.selected_sample_channel();
         egui::ScrollArea::vertical()
             .id_salt("browser-files-list")
             .show(ui, |ui| {
@@ -5038,6 +5099,16 @@ impl DawUi {
                             |tags| format!("{}\nTags: {tags}", entry.path.display()),
                         );
                         response.on_hover_text(hover_text).context_menu(|ui| {
+                            if !entry.is_directory
+                                && browser_file_kind(&entry.path) == Some(BrowserFileKind::Audio)
+                                && let Some((channel_id, channel_name)) = &sample_target
+                                && ui
+                                    .button(format!("Send to {channel_name} ({channel_id})"))
+                                    .clicked()
+                            {
+                                load_sample = Some((*channel_id, entry.path.clone()));
+                                ui.close();
+                            }
                             if !entry.is_directory
                                 && entry
                                     .path
@@ -5100,6 +5171,9 @@ impl DawUi {
         }
         if let Some(path) = inspect_preset {
             self.inspect_browser_preset(&path);
+        }
+        if let Some((channel_id, path)) = load_sample {
+            self.load_browser_sample_into_channel(channel_id, &path);
         }
     }
 
@@ -6089,13 +6163,18 @@ impl DawUi {
                             let plugin_state = plugin_states
                                 .iter()
                                 .find(|state| state.channel_id() == channel.id());
-                            ui.add_sized(
+                            let selected = self.selected_graph_channel == Some(channel.id());
+                            let channel_button = ui.add_sized(
                                 [190.0, 24.0],
                                 egui::Button::new(
                                     channel.display_name().unwrap_or("(unnamed channel)"),
                                 )
-                                .fill(PANEL_LIGHT),
+                                .fill(if selected { BLUE } else { PANEL_LIGHT }),
                             );
+                            if channel_button.clicked() {
+                                self.selected_graph_channel = Some(channel.id());
+                                self.selected_note_channel = Some(channel.id());
+                            }
                             ui.label(
                                 plugin_state
                                     .and_then(|state| state.vst_metadata())
