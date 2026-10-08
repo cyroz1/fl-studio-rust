@@ -46,6 +46,7 @@ const AUDIO_WAVEFORM_BUCKETS: usize = 4096;
 const MAX_WAVEFORM_WORKERS: usize = 1;
 const DEFAULT_AUTOSAVE_MINUTES: u8 = 5;
 const DEFAULT_BACKUP_RETENTION: usize = 20;
+const RECENT_PROJECT_LIMIT: usize = 50;
 const AUTOSAVE_INTERVALS_MINUTES: [u8; 5] = [0, 1, 5, 10, 15];
 const BACKUP_RETENTION_OPTIONS: [usize; 4] = [5, 10, 20, 50];
 const PITCH_CLASSES: [&str; 12] = [
@@ -1227,7 +1228,7 @@ impl DawUi {
             browser_search: String::new(),
             browser_selected: None,
             browser_favorites: load_browser_favorites(),
-            browser_recent_projects: Vec::new(),
+            browser_recent_projects: load_recent_projects(),
             browser_error: None,
             browser_full_sample: false,
             browser_preview_volume: 1.0,
@@ -1363,7 +1364,9 @@ impl DawUi {
                 self.browser_recent_projects
                     .retain(|recent| recent != &recent_path);
                 self.browser_recent_projects.insert(0, recent_path);
-                self.browser_recent_projects.truncate(12);
+                self.browser_recent_projects.truncate(RECENT_PROJECT_LIMIT);
+                let recent_project_save_error =
+                    save_recent_projects(&self.browser_recent_projects).err();
                 self.dirty = false;
                 self.last_autosave_path = latest_project_autosave(target_path);
                 if check_recovery {
@@ -1379,6 +1382,11 @@ impl DawUi {
                         "Recovered {} from autosave{plugin_summary}",
                         target_path.display()
                     );
+                }
+                if let Some(error) = recent_project_save_error {
+                    self.status.push_str(&format!(
+                        " · recent project list could not be saved: {error}"
+                    ));
                 }
                 true
             }
@@ -2902,10 +2910,33 @@ impl DawUi {
                             .clicked()
                         {
                             open_path = Some(path.clone());
-                            ui.close();
                         }
                     }
+                    if recent_projects.len() > 10 {
+                        ui.menu_button("More…", |ui| {
+                            for (index, path) in recent_projects
+                                .iter()
+                                .enumerate()
+                                .skip(10)
+                                .take(RECENT_PROJECT_LIMIT - 10)
+                            {
+                                let name = path
+                                    .file_name()
+                                    .map(|name| name.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| path.display().to_string());
+                                if ui
+                                    .button(format!("{}. {name}", index + 1))
+                                    .on_hover_text(path.display().to_string())
+                                    .clicked()
+                                {
+                                    open_path = Some(path.clone());
+                                    ui.close();
+                                }
+                            }
+                        });
+                    }
                     if let Some(path) = open_path {
+                        ui.close();
                         self.open_project(&path);
                     }
                 });
@@ -10049,6 +10080,51 @@ fn browser_favorites_file() -> Option<PathBuf> {
             })
     }?;
     Some(root.join("fl-studio-rebuild").join("browser-favorites.txt"))
+}
+
+fn recent_projects_file() -> Option<PathBuf> {
+    browser_favorites_file()?
+        .parent()
+        .map(|directory| directory.join("recent-projects.txt"))
+}
+
+fn load_recent_projects() -> Vec<PathBuf> {
+    let Some(path) = recent_projects_file() else {
+        return Vec::new();
+    };
+    let Ok(contents) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut recent = Vec::new();
+    for entry in contents.lines().filter(|entry| !entry.is_empty()) {
+        let path = PathBuf::from(entry);
+        let path = fs::canonicalize(&path).unwrap_or(path);
+        if !recent.contains(&path) {
+            recent.push(path);
+        }
+        if recent.len() >= RECENT_PROJECT_LIMIT {
+            break;
+        }
+    }
+    recent
+}
+
+fn save_recent_projects(projects: &[PathBuf]) -> Result<(), String> {
+    let path = recent_projects_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the recent projects path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    let contents = projects
+        .iter()
+        .take(RECENT_PROJECT_LIMIT)
+        .map(|path| path.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&path, contents)
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
 }
 
 fn autosave_settings_file() -> Option<PathBuf> {
