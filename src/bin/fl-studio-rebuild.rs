@@ -9737,6 +9737,38 @@ impl DawUi {
 impl eframe::App for DawUi {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.guard_window_close(ui.ctx());
+        let recent_project_index = ui.input_mut(|input| {
+            if !input.modifiers.alt
+                || input.modifiers.ctrl
+                || input.modifiers.command
+                || input.modifiers.shift
+            {
+                return None;
+            }
+            [
+                (egui::Key::Num1, 0),
+                (egui::Key::Num2, 1),
+                (egui::Key::Num3, 2),
+                (egui::Key::Num4, 3),
+                (egui::Key::Num5, 4),
+                (egui::Key::Num6, 5),
+                (egui::Key::Num7, 6),
+                (egui::Key::Num8, 7),
+                (egui::Key::Num9, 8),
+                (egui::Key::Num0, 9),
+            ]
+            .into_iter()
+            .find_map(|(key, index)| {
+                input
+                    .consume_key(egui::Modifiers::ALT, key)
+                    .then_some(index)
+            })
+        });
+        if let Some(index) = recent_project_index
+            && let Some(path) = self.browser_recent_projects.get(index).cloned()
+        {
+            self.open_project(&path);
+        }
         let save_as_requested = ui.input_mut(|input| {
             input.consume_key(
                 egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
