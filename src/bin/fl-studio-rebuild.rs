@@ -250,6 +250,7 @@ enum MainView {
 enum PlaylistWaveformMode {
     Combined,
     Stereo,
+    Spectral,
 }
 
 impl PlaylistWaveformMode {
@@ -257,6 +258,7 @@ impl PlaylistWaveformMode {
         match self {
             Self::Combined => "Combined",
             Self::Stereo => "Stereo",
+            Self::Spectral => "Spectral",
         }
     }
 }
@@ -5948,7 +5950,11 @@ impl DawUi {
             egui::ComboBox::from_id_salt("playlist-waveform-mode")
                 .selected_text(self.playlist_waveform_mode.label())
                 .show_ui(ui, |ui| {
-                    for mode in [PlaylistWaveformMode::Combined, PlaylistWaveformMode::Stereo] {
+                    for mode in [
+                        PlaylistWaveformMode::Combined,
+                        PlaylistWaveformMode::Stereo,
+                        PlaylistWaveformMode::Spectral,
+                    ] {
                         ui.selectable_value(&mut self.playlist_waveform_mode, mode, mode.label());
                     }
                 });
@@ -13740,6 +13746,10 @@ fn draw_audio_clip_waveform(
     let Some((source_start, source_end)) = source_window else {
         return;
     };
+    if mode == PlaylistWaveformMode::Spectral {
+        draw_spectral_audio_clip(painter, clip_rect, waveform, source_start, source_end);
+        return;
+    }
     let columns = clip_rect.width().ceil().clamp(1.0, 1024.0) as usize;
     let frame_count = u128::from(full_frame_count);
     let stereo = mode == PlaylistWaveformMode::Stereo && waveform.channel_peaks.len() >= 2;
@@ -13814,6 +13824,80 @@ fn draw_audio_clip_waveform(
             );
         }
     }
+}
+
+fn draw_spectral_audio_clip(
+    painter: &egui::Painter,
+    clip_rect: egui::Rect,
+    waveform: &AudioWaveform,
+    source_start: u64,
+    source_end: u64,
+) {
+    if waveform.spectral_bands.is_empty() || source_start >= source_end {
+        return;
+    }
+    let column_count = waveform.spectral_bands.len();
+    let Some(first_bands) = waveform.spectral_bands.first() else {
+        return;
+    };
+    let band_count = first_bands.len();
+    if band_count == 0 {
+        return;
+    }
+    let total_frames = u128::from(waveform.frame_count);
+    let first_column = (u128::from(source_start) * column_count as u128 / total_frames) as usize;
+    let last_column = ((u128::from(source_end) * column_count as u128).div_ceil(total_frames)
+        as usize)
+        .clamp(first_column + 1, column_count);
+    let visible_columns = last_column.saturating_sub(first_column).max(1);
+    let source_span = u128::from(source_end - source_start);
+    let band_height = clip_rect.height() / band_count as f32;
+
+    for column_index in first_column.min(column_count - 1)..last_column {
+        let center_frame = ((column_index as f64 + 0.5) * waveform.frame_count as f64
+            / column_count as f64) as u64;
+        let position = u128::from(
+            center_frame
+                .saturating_sub(source_start)
+                .min(source_end - 1),
+        );
+        let x = clip_rect.left() + position as f32 * clip_rect.width() / source_span as f32;
+        let width = (clip_rect.width() / visible_columns as f32).max(1.0);
+        let left = (x - width * 0.5).max(clip_rect.left());
+        let right = (x + width * 0.5).min(clip_rect.right());
+        if right <= left {
+            continue;
+        }
+        for band in 0..band_count {
+            let intensity = f32::from(waveform.spectral_bands[column_index][band]) / 255.0;
+            if intensity < 0.02 {
+                continue;
+            }
+            let color = if intensity < 0.62 {
+                blend_color(PANEL_DARK, PURPLE, intensity / 0.62)
+            } else {
+                blend_color(PURPLE, BLUE, (intensity - 0.62) / 0.38)
+            };
+            let top = clip_rect.bottom() - (band + 1) as f32 * band_height;
+            let cell = egui::Rect::from_min_max(
+                egui::pos2(left, top),
+                egui::pos2(right, top + band_height + 0.5),
+            );
+            painter.rect_filled(cell, egui::CornerRadius::ZERO, color);
+        }
+    }
+}
+
+fn blend_color(start: Color32, end: Color32, amount: f32) -> Color32 {
+    let amount = amount.clamp(0.0, 1.0);
+    let blend = |first: u8, second: u8| {
+        (f32::from(first) + (f32::from(second) - f32::from(first)) * amount).round() as u8
+    };
+    Color32::from_rgb(
+        blend(start.r(), end.r()),
+        blend(start.g(), end.g()),
+        blend(start.b(), end.b()),
+    )
 }
 
 fn snap_note_tick(value: i64, quantum: u32, minimum: u32) -> u32 {

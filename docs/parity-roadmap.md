@@ -227,7 +227,7 @@ FL Studio's piano roll is famously deep — the full toolset:
 ## 8. Playlist
 
 - `[partial]` Clip display, clip select, start/length and exposed record-field editing, and exact-record duplicate
-- `[partial]` Audio-channel clips draw decoded min/max waveforms, crop them to the clip's source offsets, and redraw detail at the current Playlist zoom. Previews decode off the UI thread and cache bounded combined and per-channel peak buckets; Combined and Stereo views are available, while spectral view, fade and gain previews, and alternate stretch-mode rendering remain
+- `[partial]` Audio-channel clips draw decoded min/max waveforms or a bounded log-frequency spectral preview, crop them to the clip's source offsets, and redraw detail at the current Playlist zoom. Previews decode off the UI thread and cache combined/per-channel peak buckets plus 128 columns of 32-band spectral intensity; Combined, Stereo, and Spectral views are available. The local windowed FFT display does not reproduce FL Studio's exact spectral coloring or analysis, while fade/gain previews and alternate stretch-mode rendering remain
 - `[todo]` Audio clip fades, crossfades, gain envelopes
 - `[todo]` Stretch modes per clip (resample, stretch, e3 generic — needs time-stretch engine)
 - `[partial]` Pattern clips: the selected arrangement expands Sampler and mapped VST3 instrument notes at clip positions, repeats notes to clip length using explicit pattern lengths or an inferred note span, and clips keyed-note ends at the Playlist boundary. Project opening auto-loads matching installed VST3 instances for recognized channels; missing matches and failed loads are reported. Automation clips, clip flags, and non-default scale remain unsupported.

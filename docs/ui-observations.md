@@ -43,7 +43,7 @@ These observations come from the installed FL Studio 2026 desktop application an
 - Pattern, audio, automation, and tempo content appear on separate tracks. Track names and clip names can differ.
 - The arrangement selector and Playlist tools live in the view toolbar above the timeline.
 - The observed project used colored track groups and displayed a long arrangement across more than one hundred bars.
-- FL Studio displays audio samples as waveforms inside Playlist clips and offers stereo, combined, and spectral preview modes; its clip view also reflects audio fades and gain previews ([Image-Line Audio Clips manual](https://www.image-line.com/fl-studio-learning-content/fl-studio-online-manual/html/playlist_audioclip.htm)). The rewrite draws a combined or separate-channel min/max waveform for resolved audio clips, crops to source offsets, and scales visible detail with Playlist zoom. Spectral mode and fade/gain previews remain incomplete.
+- FL Studio displays audio samples as waveforms inside Playlist clips and offers stereo, combined, and spectral preview modes; its clip view also reflects audio fades and gain previews ([Image-Line Audio Clips manual](https://www.image-line.com/fl-studio-learning-content/fl-studio-online-manual/html/playlist_audioclip.htm)). The rewrite offers combined or separate-channel min/max waveforms and a coarse log-frequency spectral preview for resolved audio clips, crops to source offsets, and scales visible detail with Playlist zoom. Its spectral coloring/analysis and fade/gain previews do not match FL Studio yet.
 
 ## Piano roll
 

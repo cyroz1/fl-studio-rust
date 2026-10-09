@@ -14,6 +14,9 @@ use symphonia::core::meta::MetadataOptions;
 
 const FACTORY_DATA_MACRO: &str = "%FLStudioFactoryData%";
 const MAX_DECODED_SAMPLE_BYTES: usize = 512 * 1024 * 1024;
+const WAVEFORM_SPECTRUM_WINDOW: usize = 256;
+const WAVEFORM_SPECTRUM_COLUMNS: usize = 128;
+const WAVEFORM_SPECTRUM_BANDS: usize = 32;
 
 /// Fully decoded, deinterleaved audio for sample preview and offline processing.
 #[derive(Clone, Debug, PartialEq)]
@@ -37,6 +40,8 @@ pub struct AudioWaveform {
     pub peaks: Vec<WaveformPeak>,
     /// Per-channel extrema for separate stereo displays, ordered from the sample start.
     pub channel_peaks: Vec<Vec<WaveformPeak>>,
+    /// Quantized log-frequency spectral intensity by time column and low-to-high frequency band.
+    pub spectral_bands: Vec<Vec<u8>>,
 }
 
 /// FL Studio factory samples can wrap an Ogg stream in a RIFF/WAVE header with a private codec
@@ -425,12 +430,134 @@ fn summarize_audio_waveform(
             maximum: combined_maximum,
         });
     }
+    let spectral_bands = summarize_spectral_bands(audio)?;
     Ok(AudioWaveform {
         sample_rate: audio.sample_rate,
         frame_count: frame_count as u64,
         peaks,
         channel_peaks,
+        spectral_bands,
     })
+}
+
+fn summarize_spectral_bands(audio: &DecodedAudio) -> Result<Vec<Vec<u8>>, String> {
+    let frame_count = audio.frame_count();
+    if frame_count == 0 || audio.channels.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut columns = Vec::new();
+    columns
+        .try_reserve_exact(WAVEFORM_SPECTRUM_COLUMNS)
+        .map_err(|error| format!("could not allocate spectral preview: {error}"))?;
+    let mut mono_window = [0.0; WAVEFORM_SPECTRUM_WINDOW];
+    for column in 0..WAVEFORM_SPECTRUM_COLUMNS {
+        let center = (frame_count as u128 * (2 * column + 1) as u128
+            / (2 * WAVEFORM_SPECTRUM_COLUMNS) as u128) as isize;
+        let start = center - (WAVEFORM_SPECTRUM_WINDOW / 2) as isize;
+        for (window_index, destination) in mono_window.iter_mut().enumerate() {
+            let source_index = start + window_index as isize;
+            *destination = if (0..frame_count as isize).contains(&source_index) {
+                let sum = audio
+                    .channels
+                    .iter()
+                    .map(|channel| finite_audio_value(channel[source_index as usize]))
+                    .sum::<f32>();
+                sum / audio.channels.len() as f32
+            } else {
+                0.0
+            };
+        }
+        columns.push(spectral_band_intensities(&mono_window));
+    }
+    Ok(columns)
+}
+
+fn spectral_band_intensities(samples: &[f32; WAVEFORM_SPECTRUM_WINDOW]) -> Vec<u8> {
+    let magnitudes = windowed_fft_magnitudes(samples);
+    let mut bands = Vec::with_capacity(WAVEFORM_SPECTRUM_BANDS);
+    for band in 0..WAVEFORM_SPECTRUM_BANDS {
+        let first_bin = (2.0f64
+            .powf(band as f64 * 7.0 / WAVEFORM_SPECTRUM_BANDS as f64)
+            .floor() as usize)
+            .clamp(1, magnitudes.len() - 1);
+        let end_bin = (2.0f64
+            .powf((band + 1) as f64 * 7.0 / WAVEFORM_SPECTRUM_BANDS as f64)
+            .ceil() as usize)
+            .clamp(first_bin + 1, magnitudes.len());
+        let magnitude = magnitudes[first_bin..end_bin]
+            .iter()
+            .copied()
+            .fold(0.0f32, f32::max);
+        let decibels = 20.0 * magnitude.max(1.0e-6).log10();
+        let intensity = ((decibels + 72.0) / 72.0).clamp(0.0, 1.0);
+        bands.push((intensity * 255.0).round() as u8);
+    }
+    bands
+}
+
+fn windowed_fft_magnitudes(samples: &[f32; WAVEFORM_SPECTRUM_WINDOW]) -> Vec<f32> {
+    let mut real = [0.0; WAVEFORM_SPECTRUM_WINDOW];
+    let mut imaginary = [0.0; WAVEFORM_SPECTRUM_WINDOW];
+    let mut window_sum = 0.0;
+    for (index, &sample) in samples.iter().enumerate() {
+        let window = 0.5
+            - 0.5
+                * (2.0 * std::f64::consts::PI * index as f64
+                    / (WAVEFORM_SPECTRUM_WINDOW - 1) as f64)
+                    .cos();
+        real[index] = f64::from(finite_audio_value(sample)) * window;
+        window_sum += window;
+    }
+
+    let mut reversed = 0;
+    for index in 1..WAVEFORM_SPECTRUM_WINDOW {
+        let mut bit = WAVEFORM_SPECTRUM_WINDOW >> 1;
+        while reversed & bit != 0 {
+            reversed ^= bit;
+            bit >>= 1;
+        }
+        reversed ^= bit;
+        if index < reversed {
+            real.swap(index, reversed);
+            imaginary.swap(index, reversed);
+        }
+    }
+
+    let mut stage_size = 2;
+    while stage_size <= WAVEFORM_SPECTRUM_WINDOW {
+        let angle = -2.0 * std::f64::consts::PI / stage_size as f64;
+        let step_real = angle.cos();
+        let step_imaginary = angle.sin();
+        for stage_start in (0..WAVEFORM_SPECTRUM_WINDOW).step_by(stage_size) {
+            let mut twiddle_real = 1.0;
+            let mut twiddle_imaginary = 0.0;
+            for offset in 0..stage_size / 2 {
+                let even = stage_start + offset;
+                let odd = even + stage_size / 2;
+                let odd_real = real[odd] * twiddle_real - imaginary[odd] * twiddle_imaginary;
+                let odd_imaginary = real[odd] * twiddle_imaginary + imaginary[odd] * twiddle_real;
+                real[odd] = real[even] - odd_real;
+                imaginary[odd] = imaginary[even] - odd_imaginary;
+                real[even] += odd_real;
+                imaginary[even] += odd_imaginary;
+                let next_real = twiddle_real * step_real - twiddle_imaginary * step_imaginary;
+                twiddle_imaginary = twiddle_real * step_imaginary + twiddle_imaginary * step_real;
+                twiddle_real = next_real;
+            }
+        }
+        stage_size *= 2;
+    }
+
+    let scale = 2.0 / window_sum.max(1.0);
+    real[..WAVEFORM_SPECTRUM_WINDOW / 2]
+        .iter()
+        .zip(&imaginary[..WAVEFORM_SPECTRUM_WINDOW / 2])
+        .map(|(&real, &imaginary)| (real.hypot(imaginary) * scale) as f32)
+        .collect()
+}
+
+fn finite_audio_value(sample: f32) -> f32 {
+    if sample.is_finite() { sample } else { 0.0 }
 }
 
 fn decode_wavpack_file(
@@ -890,6 +1017,44 @@ mod tests {
                     maximum: 0.75
                 }]
             ]
+        );
+    }
+
+    #[test]
+    fn waveform_spectrum_places_high_tones_above_low_tones() {
+        let make_tone = |frequency: f64| DecodedAudio {
+            sample_rate: 22_050,
+            channels: vec![
+                (0..4_096)
+                    .map(|frame| {
+                        (2.0 * std::f64::consts::PI * frequency * frame as f64 / 22_050.0).sin()
+                            as f32
+                            * 0.5
+                    })
+                    .collect(),
+            ],
+        };
+        let strongest_band = |waveform: &AudioWaveform| {
+            (0..WAVEFORM_SPECTRUM_BANDS)
+                .max_by_key(|&band| {
+                    waveform
+                        .spectral_bands
+                        .iter()
+                        .map(|column| column[band])
+                        .max()
+                        .unwrap_or_default()
+                })
+                .unwrap()
+        };
+
+        let low = summarize_audio_waveform(&make_tone(440.0), 32).unwrap();
+        let high = summarize_audio_waveform(&make_tone(3_520.0), 32).unwrap();
+
+        assert!(
+            strongest_band(&high) >= strongest_band(&low) + 8,
+            "high-frequency band did not move upward: low={} high={}",
+            strongest_band(&low),
+            strongest_band(&high)
         );
     }
 
