@@ -3728,6 +3728,13 @@ impl DawUi {
                     ui.close();
                 }
                 if ui
+                    .add_enabled(self.document.is_some(), egui::Button::new("Project Info…"))
+                    .clicked()
+                {
+                    self.open_project_info();
+                    ui.close();
+                }
+                if ui
                     .add_enabled(
                         self.document.is_some(),
                         egui::Button::new("Save new version (Ctrl/Cmd+N)"),
@@ -3863,6 +3870,40 @@ impl DawUi {
                         self.open_project(&path);
                     }
                 });
+                ui.menu_button("Export", |ui| {
+                    if ui
+                        .add_enabled(
+                            self.document.is_some()
+                                && self.current_path.is_some()
+                                && self.pending_song_render.is_none(),
+                            egui::Button::new("Render Playlist mix…"),
+                        )
+                        .clicked()
+                    {
+                        self.playlist_render_options_open = true;
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.document.is_some() && self.current_path.is_some(),
+                            egui::Button::new("Render audio clips…"),
+                        )
+                        .clicked()
+                    {
+                        self.render_audio_clips_dialog();
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.document.is_some(),
+                            egui::Button::new("Export song MIDI…"),
+                        )
+                        .clicked()
+                    {
+                        self.export_song_midi_dialog();
+                        ui.close();
+                    }
+                });
                 ui.separator();
                 if ui.button("Exit").clicked() {
                     if self.dirty {
@@ -3875,75 +3916,128 @@ impl DawUi {
                     ui.close();
                 }
             });
-            if ui
-                .add_enabled(!self.undo_history.is_empty(), egui::Button::new("Undo"))
-                .on_hover_text("Undo the last project edit (Ctrl/Cmd+Z)")
-                .clicked()
-            {
-                self.undo_document();
-            }
-            if ui
-                .add_enabled(!self.redo_history.is_empty(), egui::Button::new("Redo"))
-                .on_hover_text("Redo the last undone project edit (Ctrl/Cmd+Shift+Z)")
-                .clicked()
-            {
-                self.redo_document();
-            }
-            if ui
-                .add_enabled(self.document.is_some(), egui::Button::new("Project Info…"))
-                .clicked()
-            {
-                self.open_project_info();
-            }
-            if ui
-                .add_enabled(self.document.is_some(), egui::Button::new("New pattern"))
-                .clicked()
-            {
-                self.create_pattern();
-            }
-            if ui
-                .add_enabled(
-                    self.document.is_some(),
-                    egui::Button::new("Project settings…"),
-                )
-                .clicked()
-            {
-                self.open_project_settings();
-            }
-            if ui
-                .add_enabled(
-                    self.document.is_some()
-                        && self.current_path.is_some()
-                        && self.pending_song_render.is_none(),
-                    egui::Button::new("Render Playlist mix…"),
-                )
-                .clicked()
-            {
-                self.playlist_render_options_open = true;
-            }
-            if ui
-                .add_enabled(
-                    self.document.is_some() && self.current_path.is_some(),
-                    egui::Button::new("Render audio clips…"),
-                )
-                .clicked()
-            {
-                self.render_audio_clips_dialog();
-            }
-            if ui
-                .add_enabled(
-                    self.document.is_some(),
-                    egui::Button::new("Export song MIDI…"),
-                )
-                .clicked()
-            {
-                self.export_song_midi_dialog();
-            }
-            for item in [
-                "Edit", "Add", "Patterns", "View", "Options", "Tools", "Help",
-            ] {
-                ui.label(item);
-            }
+            ui.menu_button("Edit", |ui| {
+                if ui
+                    .add_enabled(
+                        !self.undo_history.is_empty(),
+                        egui::Button::new("Undo (Ctrl/Cmd+Z)"),
+                    )
+                    .clicked()
+                {
+                    self.undo_document();
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        !self.redo_history.is_empty(),
+                        egui::Button::new("Redo (Ctrl/Cmd+Shift+Z)"),
+                    )
+                    .clicked()
+                {
+                    self.redo_document();
+                    ui.close();
+                }
+            });
+            ui.menu_button("Add", |ui| {
+                if ui
+                    .add_enabled(self.document.is_some(), egui::Button::new("New pattern"))
+                    .clicked()
+                {
+                    self.create_pattern();
+                    ui.close();
+                }
+            });
+            let patterns = self
+                .document
+                .as_ref()
+                .and_then(|document| document.patterns().ok())
+                .unwrap_or_default();
+            ui.menu_button("Patterns", |ui| {
+                if patterns.is_empty() {
+                    ui.label("Open a project to choose a pattern");
+                } else {
+                    for pattern in &patterns {
+                        let label = pattern
+                            .name
+                            .as_deref()
+                            .map_or_else(|| format!("Pattern {}", pattern.id), str::to_owned);
+                        if ui
+                            .selectable_value(&mut self.selected_pattern, Some(pattern.id), label)
+                            .clicked()
+                        {
+                            ui.close();
+                        }
+                    }
+                }
+            });
+            ui.menu_button("View", |ui| {
+                for view in MainView::ALL {
+                    let shortcut = match view {
+                        MainView::Playlist => "  F5",
+                        MainView::ChannelRack => "  F6",
+                        MainView::PianoRoll => "  F7",
+                        MainView::Mixer => "  F9",
+                        _ => "",
+                    };
+                    if ui
+                        .selectable_value(
+                            &mut self.view,
+                            view,
+                            format!("{}{shortcut}", view.label()),
+                        )
+                        .clicked()
+                    {
+                        ui.close();
+                    }
+                }
+            });
+            ui.menu_button("Options", |ui| {
+                if ui
+                    .add_enabled(
+                        self.document.is_some(),
+                        egui::Button::new("Project settings…"),
+                    )
+                    .clicked()
+                {
+                    self.open_project_settings();
+                    ui.close();
+                }
+                if ui.button("Audio settings").clicked() {
+                    self.view = MainView::Audio;
+                    ui.close();
+                }
+            });
+            ui.menu_button("Tools", |ui| {
+                if ui.button("Channel Rack Graph Editor").clicked() {
+                    self.view = MainView::ChannelRack;
+                    self.step_graph_editor_open = true;
+                    ui.close();
+                }
+                if ui.button("Piano roll Event Editor").clicked() {
+                    self.view = MainView::PianoRoll;
+                    self.piano_roll_event_editor_open = true;
+                    ui.close();
+                }
+            });
+            ui.menu_button("Help", |ui| {
+                ui.strong("Keyboard shortcuts");
+                ui.separator();
+                for (shortcut, action) in [
+                    ("F5", "Playlist"),
+                    ("F6", "Channel Rack"),
+                    ("F7", "Piano roll"),
+                    ("F9", "Mixer"),
+                    ("Ctrl/Cmd+S", "Save project"),
+                    ("Ctrl/Cmd+Z", "Undo"),
+                    ("Ctrl/Cmd+Shift+Z", "Redo"),
+                ] {
+                    ui.horizontal(|ui| {
+                        ui.label(shortcut);
+                        ui.separator();
+                        ui.label(action);
+                    });
+                }
+            });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let title = self
                     .current_path
