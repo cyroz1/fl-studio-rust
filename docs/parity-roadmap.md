@@ -306,7 +306,16 @@ automation, Mixer routing/effects, or PDC. Full export surface:
 - `[partial]` Formats: the desktop Playlist renderer writes 16/24-bit integer PCM or 32-bit float WAV, with stereo, merged mono, left-only, or right-only channels as documented by [Image-Line](https://www.image-line.com/fl-studio-learning/fl-studio-online-manual/html/fformats_save_export.htm); MP3, OGG, and FLAC export remain todo
 - `[partial]` Render options: the Playlist mix dialog offers channel modes, 0/1/2/5-second output tails for VST instrument releases, optional unshaped TPDF dither for 16-bit PCM, and Linear or 64-point windowed-sinc resampling. Image-Line documents high-frequency shaped dither and Linear, 6-point Hermite, and selectable sinc quality settings, so matching its noise-shaping profile, interpolation kernels, and full quality range remains todo; normalize and effect-based tail detection are also incomplete. The sinc choice is a local 64-tap Blackman-windowed kernel, not a claim of bit-identical FL Studio output ([Image-Line export manual](https://www.image-line.com/fl-studio-learning/fl-studio-online-manual/html/fformats_save_export.htm)).
 - `[todo]` Stem export: split mixer tracks, "split channel tracks"
-- `[todo]` Playlist selection render, pattern render
+- `[todo]` Selected Playlist clip consolidation, including selection-start or
+  song-start placement and muting the source clips ([Image-Line Playlist
+  manual](https://www.image-line.com/fl-studio-learning-content/fl-studio-online-manual/html/playlist.htm)).
+- `[partial]` Pattern render: the Piano roll can render enabled Sampler notes
+  from the selected pattern to float stereo WAV, and a mapped VST3 channel can
+  render its selected pattern notes to WAV. FL Studio renders selected patterns
+  to audio clips with configurable render settings; this app's Sampler export is
+  a separate WAV file and does not render every instrument, add an Audio Clip,
+  apply native render options, or include Mixer routing/effects ([Image-Line
+  Patterns manual](https://www.image-line.com/fl-studio-learning-content/fl-studio-online-manual/html/menu_patterns.htm)).
 - `[todo]` Burn to CD-era options: skip (obsolete)
 
 ---

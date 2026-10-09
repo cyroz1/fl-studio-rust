@@ -22,7 +22,8 @@ use flp_rebuild::sample_render::{
     AudioClipRenderOptions, PlaylistRenderOptions, PlaylistRenderSummary, ResamplingQuality,
     SamplerPatternRenderOptions, SamplerPatternRenderSummary, WavChannelMode, WavDitherMode,
     WavSampleFormat, render_audio_clips_to_wav, render_playlist_with_vst3_to_wav_cancellable,
-    stream_playlist_with_vst3_to_device, stream_sampler_pattern_to_device,
+    render_sampler_pattern_to_wav, stream_playlist_with_vst3_to_device,
+    stream_sampler_pattern_to_device,
 };
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions, Vst3PatternStreamHandle};
 use flp_rebuild::{
@@ -1409,6 +1410,7 @@ struct DawUi {
     audio_render_workers: Vec<PendingAudioRender>,
     pending_song_render: Option<PendingSongRender>,
     song_render_workers: Vec<PendingSongRender>,
+    pending_sampler_pattern_render: Option<PendingSamplerPatternRender>,
     pending_vst3_stream: Option<Vst3PatternStreamHandle>,
     vst3_workers: Vec<Vst3PatternStreamHandle>,
     pending_sampler_stream: Option<PendingSamplerStream>,
@@ -1479,6 +1481,13 @@ struct PendingSongRender {
     cancelled: Arc<AtomicBool>,
     worker: thread::JoinHandle<()>,
     output_path: PathBuf,
+}
+
+struct PendingSamplerPatternRender {
+    receiver: Receiver<Result<SamplerPatternRenderSummary, String>>,
+    worker: thread::JoinHandle<()>,
+    output_path: PathBuf,
+    pattern_id: u16,
 }
 
 struct PendingSamplerStream {
@@ -1694,6 +1703,7 @@ impl DawUi {
             audio_render_workers: Vec::new(),
             pending_song_render: None,
             song_render_workers: Vec::new(),
+            pending_sampler_pattern_render: None,
             pending_vst3_stream: None,
             vst3_workers: Vec::new(),
             pending_sampler_stream: None,
@@ -3922,6 +3932,19 @@ impl DawUi {
                         .clicked()
                     {
                         self.render_audio_clips_dialog();
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.document.is_some()
+                                && self.selected_pattern.is_some()
+                                && self.sample_project_path().is_some()
+                                && self.pending_sampler_pattern_render.is_none(),
+                            egui::Button::new("Render Sampler pattern…"),
+                        )
+                        .clicked()
+                    {
+                        self.render_selected_sampler_pattern_dialog();
                         ui.close();
                     }
                     if ui
@@ -11666,6 +11689,112 @@ impl DawUi {
         }
     }
 
+    fn render_selected_sampler_pattern_dialog(&mut self) {
+        let Some(pattern_id) = self.selected_pattern else {
+            self.status = "Select a pattern before rendering Sampler channels".to_owned();
+            return;
+        };
+        let Some(project_path) = self.sample_project_path() else {
+            self.status = "Save the project before rendering its Sampler channels".to_owned();
+            return;
+        };
+        let Some(document) = self.document.as_ref() else {
+            self.status = "Open a project before rendering Sampler channels".to_owned();
+            return;
+        };
+        if self.pending_sampler_pattern_render.is_some() {
+            self.status = "A Sampler pattern render is already running".to_owned();
+            return;
+        }
+        let Some(output_path) = rfd::FileDialog::new()
+            .set_title("Render Sampler pattern")
+            .set_file_name(format!("Pattern_{pattern_id}_Samplers.wav"))
+            .add_filter("WAV audio", &["wav"])
+            .save_file()
+        else {
+            return;
+        };
+
+        let options = SamplerPatternRenderOptions {
+            pattern_id,
+            sample_rate: self.audio_settings.sample_rate,
+            ..SamplerPatternRenderOptions::default()
+        };
+        let document = document.clone();
+        let package_workspace = self.package_workspace.clone();
+        let output_path_for_worker = output_path.clone();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name("sampler-pattern-wav-render".to_owned())
+            .spawn(move || {
+                let _package_workspace = package_workspace;
+                let result = render_sampler_pattern_to_wav(
+                    &document,
+                    &project_path,
+                    options,
+                    &output_path_for_worker,
+                );
+                let _ = sender.send(result);
+            });
+        match worker {
+            Ok(worker) => {
+                self.pending_sampler_pattern_render = Some(PendingSamplerPatternRender {
+                    receiver,
+                    worker,
+                    output_path: output_path.clone(),
+                    pattern_id,
+                });
+                self.status = format!(
+                    "Rendering Sampler notes in pattern {pattern_id} to {}…",
+                    output_path.display()
+                );
+            }
+            Err(error) => {
+                self.status = format!("Could not start Sampler pattern render: {error}");
+            }
+        }
+    }
+
+    fn poll_sampler_pattern_render(&mut self) {
+        let completed = self
+            .pending_sampler_pattern_render
+            .as_ref()
+            .and_then(|pending| match pending.receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Disconnected) => Some(Err(
+                    "Sampler pattern render worker stopped unexpectedly".to_owned(),
+                )),
+                Err(TryRecvError::Empty) => None,
+            });
+        let Some(result) = completed else {
+            return;
+        };
+        let Some(pending) = self.pending_sampler_pattern_render.take() else {
+            return;
+        };
+        if pending.worker.join().is_err() {
+            self.status = "Sampler pattern render worker panicked".to_owned();
+            return;
+        }
+        match result {
+            Ok(summary) => {
+                self.status = format!(
+                    "Rendered pattern {} Sampler notes to {} at {} Hz ({} channels, {} source files, {} unresolved notes, {} voices stolen)",
+                    pending.pattern_id,
+                    pending.output_path.display(),
+                    summary.sample_rate,
+                    summary.sampler_channels_rendered,
+                    summary.source_files,
+                    summary.notes_skipped_unresolved_sample,
+                    summary.voices_stolen,
+                );
+            }
+            Err(error) => {
+                self.status = format!("Could not render Sampler pattern: {error}");
+            }
+        }
+    }
+
     fn export_selected_pattern_midi_dialog(&mut self) {
         let Some(pattern_id) = self.selected_pattern else {
             self.status = "Select a pattern before exporting MIDI".to_owned();
@@ -13858,6 +13987,7 @@ impl eframe::App for DawUi {
         };
         self.poll_project_audio_render();
         self.poll_song_render();
+        self.poll_sampler_pattern_render();
         self.poll_vst3_stream();
         self.poll_sampler_stream();
         self.poll_browser_preview(ui.ctx());
