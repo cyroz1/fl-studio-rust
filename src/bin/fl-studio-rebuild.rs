@@ -19,7 +19,7 @@ use flp_rebuild::midi::{MidiChannelMapping, MidiFile};
 use flp_rebuild::plugins::{PluginCandidate, PluginFormat, scan_installed_plugins};
 use flp_rebuild::project_package::ProjectPackageWorkspace;
 use flp_rebuild::sample_render::{
-    AudioClipRenderOptions, PlaylistRenderOptions, PlaylistRenderSummary,
+    AudioClipRenderOptions, PlaylistRenderOptions, PlaylistRenderSummary, ResamplingQuality,
     SamplerPatternRenderOptions, SamplerPatternRenderSummary, WavChannelMode, WavDitherMode,
     WavSampleFormat, render_audio_clips_to_wav, render_playlist_with_vst3_to_wav_cancellable,
     stream_playlist_with_vst3_to_device, stream_sampler_pattern_to_device,
@@ -1303,6 +1303,7 @@ struct DawUi {
     playlist_render_options_open: bool,
     playlist_render_format: WavSampleFormat,
     playlist_render_dither: bool,
+    playlist_render_quality: ResamplingQuality,
     playlist_render_channel_mode: WavChannelMode,
     playlist_render_tail_seconds: u8,
 }
@@ -1568,6 +1569,7 @@ impl DawUi {
             playlist_render_options_open: false,
             playlist_render_format: WavSampleFormat::Float32,
             playlist_render_dither: false,
+            playlist_render_quality: ResamplingQuality::Linear,
             playlist_render_channel_mode: WavChannelMode::Stereo,
             playlist_render_tail_seconds: 0,
         };
@@ -2528,6 +2530,24 @@ impl DawUi {
                     ui.checkbox(&mut self.playlist_render_dither, "TPDF dither");
                 });
                 ui.label("Adds triangular dither during 16-bit output only.");
+                ui.horizontal(|ui| {
+                    ui.label("Resampling");
+                    egui::ComboBox::from_id_salt("playlist-render-resampling-quality")
+                        .selected_text(self.playlist_render_quality.label())
+                        .show_ui(ui, |ui| {
+                            for quality in [
+                                ResamplingQuality::Linear,
+                                ResamplingQuality::Sinc64,
+                            ] {
+                                ui.selectable_value(
+                                    &mut self.playlist_render_quality,
+                                    quality,
+                                    quality.label(),
+                                );
+                            }
+                        });
+                });
+                ui.label("Sinc uses more CPU and reduces aliasing when samples are pitched or downsampled.");
                 ui.horizontal(|ui| {
                     ui.label("Channels");
                     egui::ComboBox::from_id_salt("playlist-render-channel-mode")
@@ -10183,6 +10203,7 @@ impl DawUi {
             } else {
                 WavDitherMode::Off
             },
+            resampling_quality: self.playlist_render_quality,
             wav_channel_mode: self.playlist_render_channel_mode,
             tail_seconds: self.playlist_render_tail_seconds,
             ..PlaylistRenderOptions::default()

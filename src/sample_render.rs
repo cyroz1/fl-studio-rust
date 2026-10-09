@@ -119,6 +119,21 @@ pub enum WavDitherMode {
     Tpdf,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResamplingQuality {
+    Linear,
+    Sinc64,
+}
+
+impl ResamplingQuality {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Linear => "Linear",
+            Self::Sinc64 => "64-point sinc",
+        }
+    }
+}
+
 impl WavDitherMode {
     pub const fn label(self) -> &'static str {
         match self {
@@ -161,6 +176,7 @@ pub struct PlaylistRenderOptions {
     pub sampler_voice_limit: usize,
     pub wav_sample_format: WavSampleFormat,
     pub wav_dither_mode: WavDitherMode,
+    pub resampling_quality: ResamplingQuality,
     pub wav_channel_mode: WavChannelMode,
     pub tail_seconds: u8,
 }
@@ -173,6 +189,7 @@ impl Default for PlaylistRenderOptions {
             sampler_voice_limit: DEFAULT_SAMPLER_VOICE_LIMIT,
             wav_sample_format: WavSampleFormat::Float32,
             wav_dither_mode: WavDitherMode::Off,
+            resampling_quality: ResamplingQuality::Linear,
             wav_channel_mode: WavChannelMode::Stereo,
             tail_seconds: 0,
         }
@@ -701,12 +718,13 @@ fn stream_prepared_playlist_render(
     let release_frames = (f64::from(options.sample_rate) * SAMPLER_RELEASE_SECONDS)
         .round()
         .max(1.0) as usize;
-    let mut sampler_engine = SamplerVoiceEngine::new(
+    let mut sampler_engine = SamplerVoiceEngine::with_resampling_quality(
         &render.sampler.sources_by_channel,
         &render.sampler.notes,
         options.sampler_voice_limit,
         release_frames,
         options.sample_rate,
+        options.resampling_quality,
     );
     if let Some(processor) = render.vst3_processor.as_deref_mut() {
         processor.start_processing()?;
@@ -730,12 +748,13 @@ fn stream_prepared_playlist_render(
                     .decoded_by_path
                     .get(&clip.path)
                     .expect("prepared audio clips have decoded sources");
-                mix_clip_window_into_stereo(
+                mix_clip_window_into_stereo_with_quality(
                     block,
                     block_start,
                     source,
                     clip,
                     options.sample_rate,
+                    options.resampling_quality,
                     Some(cancelled),
                 )
                 .map_err(|error| {
@@ -1693,6 +1712,7 @@ struct SamplerVoiceEngine<'a> {
     voices: Vec<Option<SamplerVoice>>,
     release_frames: usize,
     output_sample_rate: u32,
+    resampling_quality: ResamplingQuality,
     voices_stolen: usize,
 }
 
@@ -1716,6 +1736,24 @@ impl<'a> SamplerVoiceEngine<'a> {
         release_frames: usize,
         output_sample_rate: u32,
     ) -> Self {
+        Self::with_resampling_quality(
+            sources_by_channel,
+            notes,
+            voice_limit,
+            release_frames,
+            output_sample_rate,
+            ResamplingQuality::Linear,
+        )
+    }
+
+    fn with_resampling_quality(
+        sources_by_channel: &'a HashMap<u16, SamplerVoiceSource>,
+        notes: &'a [ScheduledSamplerNote],
+        voice_limit: usize,
+        release_frames: usize,
+        output_sample_rate: u32,
+        resampling_quality: ResamplingQuality,
+    ) -> Self {
         Self {
             sources_by_channel,
             notes,
@@ -1723,6 +1761,7 @@ impl<'a> SamplerVoiceEngine<'a> {
             voices: std::iter::repeat_with(|| None).take(voice_limit).collect(),
             release_frames,
             output_sample_rate,
+            resampling_quality,
             voices_stolen: 0,
         }
     }
@@ -1766,22 +1805,20 @@ impl<'a> SamplerVoiceEngine<'a> {
                     *voice_slot = None;
                     continue;
                 }
-                let next_index = source_index.saturating_add(1).min(source_frames - 1);
-                let fraction = (voice.source_position - source_index as f64) as f32;
-                let left = interpolate_sample_at(
+                let left = resample_sample(
                     &voice.source.channels[0],
-                    source_index,
-                    next_index,
-                    fraction,
+                    voice.source_position,
+                    voice.source_step,
+                    self.resampling_quality,
                 );
                 let right = if voice.source.channels.len() == 1 {
                     left
                 } else {
-                    interpolate_sample_at(
+                    resample_sample(
                         &voice.source.channels[1],
-                        source_index,
-                        next_index,
-                        fraction,
+                        voice.source_position,
+                        voice.source_step,
+                        self.resampling_quality,
                     )
                 };
                 let gain = voice.gain * fade;
@@ -1859,12 +1896,73 @@ fn sampler_source_step(source_rate: u32, output_rate: u32, key: u16) -> f64 {
         * 2.0f64.powf(f64::from(semitones) / 12.0)
 }
 
-fn interpolate_sample_at(samples: &[f32], first: usize, second: usize, fraction: f32) -> f32 {
-    let first = samples[first];
-    let second = samples[second];
-    let first = if first.is_finite() { first } else { 0.0 };
-    let second = if second.is_finite() { second } else { 0.0 };
-    first + (second - first) * fraction
+fn resample_sample(
+    channel: &[f32],
+    position: f64,
+    source_step: f64,
+    quality: ResamplingQuality,
+) -> f32 {
+    if channel.is_empty() || !position.is_finite() {
+        return 0.0;
+    }
+    match quality {
+        ResamplingQuality::Linear => {
+            let first_index = (position.floor() as usize).min(channel.len() - 1);
+            let second_index = (first_index + 1).min(channel.len() - 1);
+            let fraction = (position - first_index as f64) as f32;
+            let first = finite_audio_sample(channel[first_index]);
+            let second = finite_audio_sample(channel[second_index]);
+            first + (second - first) * fraction
+        }
+        ResamplingQuality::Sinc64 => windowed_sinc64_sample(channel, position, source_step),
+    }
+}
+
+fn finite_audio_sample(sample: f32) -> f32 {
+    if sample.is_finite() { sample } else { 0.0 }
+}
+
+fn windowed_sinc64_sample(channel: &[f32], position: f64, source_step: f64) -> f32 {
+    const TAPS: isize = 64;
+    const LEFT_TAPS: isize = 31;
+    let center = position.floor() as isize;
+    let last_index = (channel.len() - 1) as isize;
+    let cutoff = if source_step.is_finite() && source_step > 1.0 {
+        (1.0 / source_step).clamp(1.0e-6, 1.0)
+    } else {
+        1.0
+    };
+    let mut weighted_sample = 0.0;
+    let mut weight_sum = 0.0;
+
+    for tap in 0..TAPS {
+        let source_index = center + tap - LEFT_TAPS;
+        let distance = source_index as f64 - position;
+        let window_position = distance / 32.0;
+        if window_position.abs() >= 1.0 {
+            continue;
+        }
+        let window = 0.42
+            + 0.5 * (std::f64::consts::PI * window_position).cos()
+            + 0.08 * (2.0 * std::f64::consts::PI * window_position).cos();
+        let scaled_distance = cutoff * distance;
+        let sinc = if scaled_distance.abs() < 1.0e-12 {
+            1.0
+        } else {
+            (std::f64::consts::PI * scaled_distance).sin()
+                / (std::f64::consts::PI * scaled_distance)
+        };
+        let weight = cutoff * sinc * window;
+        let sample_index = source_index.clamp(0, last_index) as usize;
+        weighted_sample += f64::from(finite_audio_sample(channel[sample_index])) * weight;
+        weight_sum += weight;
+    }
+
+    if weight_sum.abs() < 1.0e-12 {
+        finite_audio_sample(channel[center.clamp(0, last_index) as usize])
+    } else {
+        (weighted_sample / weight_sum) as f32
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1995,6 +2093,26 @@ fn mix_clip_window_into_stereo(
     output_rate: u32,
     cancelled: Option<&AtomicBool>,
 ) -> Result<(), String> {
+    mix_clip_window_into_stereo_with_quality(
+        mix,
+        mix_start_frame,
+        source,
+        clip,
+        output_rate,
+        ResamplingQuality::Linear,
+        cancelled,
+    )
+}
+
+fn mix_clip_window_into_stereo_with_quality(
+    mix: &mut [f32],
+    mix_start_frame: u64,
+    source: &DecodedAudio,
+    clip: &PreparedClip,
+    output_rate: u32,
+    resampling_quality: ResamplingQuality,
+    cancelled: Option<&AtomicBool>,
+) -> Result<(), String> {
     if source.channels.is_empty() || source.channels.len() > 2 {
         return Err("source must have one or two channels".to_owned());
     }
@@ -2039,11 +2157,22 @@ fn mix_clip_window_into_stereo(
         let position = (clip.source_bounds.start as f64
             + output_offset as f64 * source_frames_per_output)
             .min((clip.source_bounds.end - 1) as f64);
-        let left = interpolate_sample(&source.channels[0], position);
+        let source_position = position - clip.source_bounds.start as f64;
+        let left = resample_sample(
+            &source.channels[0][clip.source_bounds.start..clip.source_bounds.end],
+            source_position,
+            source_frames_per_output,
+            resampling_quality,
+        );
         let right = if source.channels.len() == 1 {
             left
         } else {
-            interpolate_sample(&source.channels[1], position)
+            resample_sample(
+                &source.channels[1][clip.source_bounds.start..clip.source_bounds.end],
+                source_position,
+                source_frames_per_output,
+                resampling_quality,
+            )
         };
         let output_index = usize::try_from(output_frame - mix_start_frame)
             .map_err(|_| "audio output frame index exceeds this platform".to_owned())?
@@ -2052,13 +2181,6 @@ fn mix_clip_window_into_stereo(
         mix[output_index + 1] += right * right_gain;
     }
     Ok(())
-}
-
-fn interpolate_sample(channel: &[f32], position: f64) -> f32 {
-    let first_index = (position.floor() as usize).min(channel.len() - 1);
-    let second_index = (first_index + 1).min(channel.len() - 1);
-    let fraction = (position - first_index as f64) as f32;
-    channel[first_index] + (channel[second_index] - channel[first_index]) * fraction
 }
 
 fn decoded_audio_bytes(audio: &DecodedAudio) -> Result<usize, String> {
@@ -2257,6 +2379,38 @@ mod tests {
     }
 
     #[test]
+    fn linear_resampling_preserves_existing_interpolation() {
+        let samples = [0.0, 1.0, -1.0];
+        assert_eq!(
+            resample_sample(&samples, 0.25, 1.0, ResamplingQuality::Linear),
+            0.25
+        );
+        assert_eq!(
+            resample_sample(&samples, 1.5, 1.0, ResamplingQuality::Linear),
+            0.0
+        );
+    }
+
+    #[test]
+    fn sinc_resampling_preserves_dc_at_fractional_positions() {
+        let samples = vec![0.375; 1024];
+        let rendered = resample_sample(&samples, 512.25, 1.0, ResamplingQuality::Sinc64);
+        assert!((rendered - 0.375).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn sinc_resampling_attenuates_nyquist_tone_when_downsampling() {
+        let samples = (0usize..2048)
+            .map(|index| if index.is_multiple_of(2) { 1.0 } else { -1.0 })
+            .collect::<Vec<_>>();
+        let rendered = resample_sample(&samples, 1024.0, 2.0, ResamplingQuality::Sinc64);
+        assert!(
+            rendered.abs() < 0.01,
+            "unexpected aliased output: {rendered}"
+        );
+    }
+
+    #[test]
     fn converts_project_ticks_to_output_frames() {
         assert_eq!(ticks_to_frames(192, 96, 120.0, 48_000).unwrap(), 48_000);
     }
@@ -2413,6 +2567,7 @@ mod tests {
                     sampler_voice_limit: 4,
                     wav_sample_format: WavSampleFormat::Float32,
                     wav_dither_mode: WavDitherMode::Off,
+                    resampling_quality: ResamplingQuality::Linear,
                     wav_channel_mode: WavChannelMode::Stereo,
                     tail_seconds: 0,
                 },
