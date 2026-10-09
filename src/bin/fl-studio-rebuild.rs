@@ -7286,6 +7286,7 @@ impl DawUi {
         let mut channel_order_edits = Vec::new();
         let mut channel_sort = None;
         let mut level_edits = Vec::new();
+        let mut channel_swing_edits = Vec::new();
         let mut layer_edits = Vec::new();
         let mut layer_flag_edits = Vec::new();
         let mut step_toggles = Vec::new();
@@ -7703,6 +7704,86 @@ impl DawUi {
                                 } else {
                                     self.selected_rack_channels.iter().copied().collect()
                                 };
+                                if matches!(channel.kind(), Some(0 | 2)) {
+                                    let swing_is_valid = channel
+                                        .swing_mix_raw()
+                                        .is_none_or(|swing_mix| swing_mix <= 128);
+                                    if swing_is_valid {
+                                        let current_percent = ((u32::from(channel.swing_mix())
+                                            * 100
+                                            + 64)
+                                            / 128)
+                                            as u8;
+                                        let swing_targets = selected_ids
+                                            .iter()
+                                            .copied()
+                                            .filter(|selected_id| {
+                                                channels.iter().any(|selected_channel| {
+                                                    selected_channel.id() == *selected_id
+                                                        && matches!(selected_channel.kind(), Some(0 | 2))
+                                                        && selected_channel
+                                                            .swing_mix_raw()
+                                                            .is_none_or(|swing_mix| swing_mix <= 128)
+                                                })
+                                            })
+                                            .collect::<Vec<_>>();
+                                        ui.menu_button("Swing mix", |ui| {
+                                            for percent in [0u8, 25, 50, 75, 100] {
+                                                if ui
+                                                    .selectable_label(
+                                                        current_percent == percent,
+                                                        format!("{percent}%"),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    let swing_mix = ((u32::from(percent) * 128
+                                                        + 50)
+                                                        / 100)
+                                                        as u16;
+                                                    channel_swing_edits.extend(
+                                                        swing_targets.iter().copied().map(|id| {
+                                                            (id, swing_mix)
+                                                        }),
+                                                    );
+                                                    ui.close();
+                                                }
+                                            }
+                                            ui.separator();
+                                            let mut custom_percent = current_percent;
+                                            ui.horizontal(|ui| {
+                                                ui.label("Custom");
+                                                let changed = ui
+                                                    .add_sized(
+                                                        [112.0, 20.0],
+                                                        egui::Slider::new(
+                                                            &mut custom_percent,
+                                                            0..=100,
+                                                        )
+                                                        .show_value(false),
+                                                    )
+                                                    .changed();
+                                                ui.label(format!("{custom_percent}%"));
+                                                if changed {
+                                                    let swing_mix = ((u32::from(custom_percent)
+                                                        * 128
+                                                        + 50)
+                                                        / 100)
+                                                        as u16;
+                                                    channel_swing_edits.extend(
+                                                        swing_targets.iter().copied().map(|id| {
+                                                            (id, swing_mix)
+                                                        }),
+                                                    );
+                                                }
+                                            });
+                                        });
+                                    } else {
+                                        ui.add_enabled(
+                                            false,
+                                            egui::Button::new("Swing mix (invalid stored value)"),
+                                        );
+                                    }
+                                }
                                 if ui.button("Mute selected channels").clicked() {
                                     channel_enabled_edits.extend(
                                         selected_ids.iter().copied().map(|id| (id, false)),
@@ -8033,6 +8114,23 @@ impl DawUi {
                 }
                 Some(Err(error)) => {
                     self.status = format!("Could not change channel compact state: {error}");
+                }
+                None => {}
+            }
+        }
+        for (channel_id, swing_mix) in channel_swing_edits {
+            let result = self
+                .document
+                .as_mut()
+                .map(|document| document.set_channel_swing_mix(channel_id, swing_mix));
+            match result {
+                Some(Ok(())) => {
+                    self.dirty = true;
+                    let percent = (u32::from(swing_mix) * 100 + 64) / 128;
+                    self.status = format!("Channel {channel_id} swing mix set to {percent}%");
+                }
+                Some(Err(error)) => {
+                    self.status = format!("Could not change channel swing mix: {error}");
                 }
                 None => {}
             }

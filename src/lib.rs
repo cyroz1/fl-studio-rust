@@ -182,6 +182,25 @@ impl FlpEvent {
         Ok(())
     }
 
+    fn replace_word_payload(&mut self, value: u16) -> Result<(), FlpError> {
+        if self.encoding != PayloadEncoding::Word || self.payload.len() != 2 {
+            return Err(FlpError::InvalidEvent {
+                offset: self.file_offset,
+                detail: "event does not have a two-byte payload",
+            });
+        }
+        let encoded = value.to_le_bytes();
+        let Some(wire_payload) = self.wire_bytes.get_mut(1..3) else {
+            return Err(FlpError::InvalidEvent {
+                offset: self.file_offset,
+                detail: "word event does not contain its payload",
+            });
+        };
+        wire_payload.copy_from_slice(&encoded);
+        self.payload.copy_from_slice(&encoded);
+        Ok(())
+    }
+
     fn replace_dword_payload(&mut self, value: u32) -> Result<(), FlpError> {
         if self.encoding != PayloadEncoding::Dword || self.payload.len() != 4 {
             return Err(FlpError::InvalidEvent {
@@ -374,6 +393,7 @@ pub struct ChannelSummary {
     zipped: bool,
     color: Option<u32>,
     mixer_track: Option<i8>,
+    swing_mix: Option<u16>,
     group_number: Option<i32>,
     volume: Option<u32>,
     pan: Option<i32>,
@@ -586,6 +606,17 @@ impl ChannelSummary {
     /// Raw FL channel pan value, in the project's 0..=12800 control range.
     pub fn pan(&self) -> Option<i32> {
         self.pan
+    }
+
+    /// Raw per-channel swing mix from the `0x61` word event.
+    /// A missing event uses FL Studio's default of 128 (100%).
+    pub fn swing_mix_raw(&self) -> Option<u16> {
+        self.swing_mix
+    }
+
+    /// Per-channel swing mix in FL Studio's 0..=128 range, defaulting to 128 (100%).
+    pub fn swing_mix(&self) -> u16 {
+        self.swing_mix.unwrap_or(128)
     }
 
     /// Whether this channel has a recognized modern levels event that can be edited losslessly.
@@ -1456,6 +1487,13 @@ impl FlpDocument {
                 }
                 0x16 if event.encoding == PayloadEncoding::Byte && event.payload.len() == 1 => {
                     channel.mixer_track = Some(event.payload[0] as i8);
+                }
+                0x61 if event.encoding == PayloadEncoding::Word
+                    && event.payload.len() == 2
+                    && channel.swing_mix.is_none() =>
+                {
+                    channel.swing_mix =
+                        Some(u16::from_le_bytes([event.payload[0], event.payload[1]]));
                 }
                 0x91 if event.encoding == PayloadEncoding::Dword
                     && event.payload.len() == 4
@@ -5550,6 +5588,93 @@ impl FlpDocument {
         Ok(())
     }
 
+    /// Sets the per-channel multiplier for Channel Rack swing in FL's 0..=128 range.
+    /// The `0x61` word event defaults to 128 (100%) when absent. Sampler and Native instrument (generator)
+    /// channels can be edited; audio, Layer, Automation, and unknown channel types are not supported.
+    pub fn set_channel_swing_mix(
+        &mut self,
+        channel_id: u16,
+        swing_mix: u16,
+    ) -> Result<(), FlpError> {
+        if swing_mix > 128 {
+            return Err(FlpError::UnsupportedEdit(
+                "channel swing mix must be in the 0..=128 range",
+            ));
+        }
+
+        self.require_unique_channel(channel_id)?;
+        let channel = self
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id == channel_id)
+            .expect("the unique channel was checked above");
+        if !matches!(channel.kind, Some(0 | 2)) {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel type does not support swing mix",
+            ));
+        }
+
+        let mut swing_events = channel
+            .event_range()
+            .filter(|index| self.events[*index].opcode == 0x61);
+        let existing_event = swing_events.next();
+        if swing_events.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel has multiple 0x61 swing-mix events",
+            ));
+        }
+
+        let Some(event_index) = existing_event else {
+            if swing_mix == 128 {
+                return Ok(());
+            }
+
+            let mut kind_events = channel
+                .event_range()
+                .filter(|index| self.events[*index].opcode == 0x15);
+            let Some(kind_index) = kind_events.next() else {
+                return Err(FlpError::UnsupportedEdit(
+                    "the selected channel has no recognized 0x15 kind event",
+                ));
+            };
+            if kind_events.next().is_some() {
+                return Err(FlpError::UnsupportedEdit(
+                    "the selected channel has multiple 0x15 kind events",
+                ));
+            }
+            let kind_event = &self.events[kind_index];
+            if kind_event.encoding != PayloadEncoding::Byte || kind_event.payload.len() != 1 {
+                return Err(FlpError::UnsupportedEdit(
+                    "the selected channel's 0x15 kind event is not a one-byte value",
+                ));
+            }
+
+            let mut candidate = self.clone();
+            candidate
+                .events
+                .insert(kind_index + 1, FlpEvent::new_word(0x61, swing_mix));
+            candidate.refresh_event_offsets()?;
+            *self = candidate;
+            return Ok(());
+        };
+
+        let event = &self.events[event_index];
+        if event.encoding != PayloadEncoding::Word || event.payload.len() != 2 {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel's 0x61 swing-mix event is not a two-byte word",
+            ));
+        }
+        if channel.swing_mix_raw() == Some(swing_mix) {
+            return Ok(());
+        }
+
+        let mut candidate = self.clone();
+        candidate.events[event_index].replace_word_payload(swing_mix)?;
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
     /// Sets the Channel Rack compact (zipped) state using the observed `0x0F` event.
     /// Existing events are edited in place; zipping a channel without one inserts a byte event
     /// after its recognized `0x15` kind event. Other channel events are retained.
@@ -7976,6 +8101,89 @@ mod tests {
             let round_trip = FlpDocument::parse(&encoded).expect("muted project should parse");
             assert_eq!(round_trip.channels()[0].enabled(), Some(false));
         }
+    }
+
+    #[test]
+    fn reads_and_sets_channel_swing_mix_losslessly() {
+        let tail = [0xDE, 0xAD];
+        for (kind, initial_mix, requested_mix, expected_mix, inserted) in [
+            (0, None, 32u16, Some(32u16), true),
+            (2, Some(40u16), 77, Some(77u16), false),
+            (0, None, 128, None, false),
+        ] {
+            let mut event_stream = vec![0x40, 7, 0, 0x15, kind];
+            if let Some(initial_mix) = initial_mix {
+                event_stream.extend_from_slice(&[0x61]);
+                event_stream.extend_from_slice(&initial_mix.to_le_bytes());
+            }
+            event_stream.extend_from_slice(&[0x48, 0x34, 0x12, 0x62, 0, 0]);
+            let input = flp_fixture(&event_stream, &[], &tail);
+            let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+            assert_eq!(document.channels()[0].swing_mix_raw(), initial_mix);
+            assert_eq!(
+                document.channels()[0].swing_mix(),
+                initial_mix.unwrap_or(128)
+            );
+            assert_eq!(document.encode_lossless().unwrap(), input);
+
+            document
+                .set_channel_swing_mix(7, requested_mix)
+                .expect("channel swing mix should update");
+
+            let channel = &document.channels()[0];
+            assert_eq!(channel.swing_mix_raw(), expected_mix);
+            assert_eq!(channel.swing_mix(), expected_mix.unwrap_or(128));
+            let swing_events = document
+                .events()
+                .iter()
+                .filter(|event| event.opcode() == 0x61)
+                .collect::<Vec<_>>();
+            if let Some(expected_mix) = expected_mix {
+                assert_eq!(swing_events.len(), 1);
+                assert_eq!(swing_events[0].payload(), &expected_mix.to_le_bytes());
+            } else {
+                assert!(swing_events.is_empty());
+            }
+            if inserted {
+                let opcodes = document
+                    .events()
+                    .iter()
+                    .map(FlpEvent::opcode)
+                    .collect::<Vec<_>>();
+                assert_eq!(opcodes[1..3], [0x15, 0x61]);
+            }
+
+            let encoded = document.encode_lossless().expect("document should encode");
+            assert!(encoded.ends_with(&tail));
+            let round_trip = FlpDocument::parse(&encoded).expect("edited project should parse");
+            assert_eq!(round_trip.channels()[0].swing_mix_raw(), expected_mix);
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_or_ambiguous_channel_swing_mix_edits() {
+        let mut out_of_range =
+            FlpDocument::parse(&flp_fixture(&[0x40, 7, 0, 0x15, 0, 0x62, 0, 0], &[], &[]))
+                .expect("fixture should parse");
+        assert!(out_of_range.set_channel_swing_mix(7, 129).is_err());
+
+        let mut layer =
+            FlpDocument::parse(&flp_fixture(&[0x40, 7, 0, 0x15, 3, 0x62, 0, 0], &[], &[]))
+                .expect("fixture should parse");
+        assert!(layer.set_channel_swing_mix(7, 64).is_err());
+
+        let mut audio =
+            FlpDocument::parse(&flp_fixture(&[0x40, 7, 0, 0x15, 4, 0x62, 0, 0], &[], &[]))
+                .expect("fixture should parse");
+        assert!(audio.set_channel_swing_mix(7, 64).is_err());
+
+        let mut duplicate = FlpDocument::parse(&flp_fixture(
+            &[0x40, 7, 0, 0x15, 0, 0x61, 32, 0, 0x61, 64, 0, 0x62, 0, 0],
+            &[],
+            &[],
+        ))
+        .expect("fixture should parse");
+        assert!(duplicate.set_channel_swing_mix(7, 96).is_err());
     }
 
     #[test]
