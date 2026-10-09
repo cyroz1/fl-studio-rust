@@ -13,7 +13,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crate::audio::StreamingAudioWriter;
-use crate::sample_render::{channel_gain_pan, schedule_playlist_pattern_notes};
+use crate::sample_render::{
+    channel_gain_pan, schedule_playlist_pattern_notes, swing_note_start_tick,
+};
 use crate::{ChannelNoteRouter, ChannelPluginState, FlpDocument};
 use vst3_host::audio::AudioBuffers;
 use vst3_host::midi::{MidiChannel, MidiEvent};
@@ -118,6 +120,8 @@ pub struct Vst3PatternRenderOptions {
     pub ppq: u16,
     pub tempo_bpm: f64,
     pub tail_seconds: f64,
+    pub global_swing_mix_raw: u8,
+    pub channel_swing_mix_raw: u16,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -825,14 +829,24 @@ impl Vst3HostRuntime {
                 })
                 .map(|channel| channel.id()),
         );
-        let schedule =
-            schedule_playlist_pattern_notes(&patterns, &arrangement, |channel_id, seed| {
+        let schedule = schedule_playlist_pattern_notes(
+            &patterns,
+            &arrangement,
+            ppq,
+            document.metadata().global_swing_mix(),
+            |channel_id| {
+                channels_by_id
+                    .get(&channel_id)
+                    .map_or(128, |channel| channel.swing_mix())
+            },
+            |channel_id, seed| {
                 channel_router
                     .targets(channel_id, seed)
                     .into_iter()
                     .filter(|target_channel_id| plugin_channels.contains(target_channel_id))
                     .collect()
-            })?;
+            },
+        )?;
 
         let mut notes_by_channel = BTreeMap::<u16, Vec<PlaylistMidiNote>>::new();
         for placed in &schedule.notes {
@@ -1121,6 +1135,8 @@ fn prepare_pattern_render(
         ppq,
         tempo_bpm,
         tail_seconds,
+        global_swing_mix_raw,
+        channel_swing_mix_raw,
     } = options;
     if ppq == 0 {
         return Err("project PPQ must be greater than zero".to_owned());
@@ -1146,8 +1162,15 @@ fn prepare_pattern_render(
         return Err("VST3 instrument has no supported audio output buses".to_owned());
     }
 
-    let (events, note_count) =
-        scheduled_pattern_events(notes, channel_id, ppq, tempo_bpm, sample_rate)?;
+    let (events, note_count) = scheduled_pattern_events(
+        notes,
+        channel_id,
+        ppq,
+        tempo_bpm,
+        sample_rate,
+        global_swing_mix_raw,
+        channel_swing_mix_raw,
+    )?;
     if note_count == 0 {
         return Err(format!(
             "pattern channel {channel_id} has no notes to render"
@@ -1481,7 +1504,12 @@ fn scheduled_pattern_events(
     ppq: u16,
     tempo_bpm: f64,
     sample_rate: f64,
+    global_swing_mix_raw: u8,
+    channel_swing_mix_raw: u16,
 ) -> Result<(Vec<ScheduledMidiEvent>, usize), String> {
+    if ppq == 0 {
+        return Err("project PPQ must be greater than zero".to_owned());
+    }
     if !sample_rate.is_finite() || sample_rate <= 0.0 {
         return Err("VST3 host sample rate must be finite and positive".to_owned());
     }
@@ -1511,9 +1539,17 @@ fn scheduled_pattern_events(
                 note.midi_channel
             )
         })?;
-        let start_tick = u64::from(note.position);
-        let end_tick = start_tick
+        let nominal_start_tick = u64::from(note.position);
+        let start_tick = swing_note_start_tick(
+            nominal_start_tick,
+            ppq,
+            global_swing_mix_raw,
+            channel_swing_mix_raw,
+        )?;
+        let swing_offset = start_tick.saturating_sub(nominal_start_tick);
+        let end_tick = nominal_start_tick
             .checked_add(u64::from(note.length))
+            .and_then(|tick| tick.checked_add(swing_offset))
             .ok_or_else(|| "note end position overflow".to_owned())?;
         let frame_for_tick =
             |tick: u64| ((tick as f64 / f64::from(ppq)) * (60.0 / tempo_bpm) * sample_rate).round();
@@ -1746,7 +1782,7 @@ mod tests {
             ..PatternNote::default()
         };
         let (events, note_count) =
-            scheduled_pattern_events(&[note], 7, 480, 120.0, 48_000.0).unwrap();
+            scheduled_pattern_events(&[note], 7, 480, 120.0, 48_000.0, 0, 128).unwrap();
         assert_eq!(note_count, 1);
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].frame, 24_000);
@@ -1770,6 +1806,24 @@ mod tests {
     }
 
     #[test]
+    fn pattern_scheduler_applies_channel_rack_swing_to_note_on_and_off() {
+        let note = PatternNote {
+            position: 120,
+            length: 120,
+            channel_id: 3,
+            key: 60,
+            velocity: 100,
+            ..PatternNote::default()
+        };
+        let (events, note_count) =
+            scheduled_pattern_events(&[note], 3, 480, 120.0, 48_000.0, 128, 128).unwrap();
+
+        assert_eq!(note_count, 1);
+        assert_eq!(events[0].frame, 8_000);
+        assert_eq!(events[1].frame, 14_000);
+    }
+
+    #[test]
     fn note_off_precedes_note_on_at_a_shared_frame() {
         let notes = [
             PatternNote {
@@ -1789,7 +1843,8 @@ mod tests {
                 ..PatternNote::default()
             },
         ];
-        let (events, _) = scheduled_pattern_events(&notes, 3, 480, 120.0, 48_000.0).unwrap();
+        let (events, _) =
+            scheduled_pattern_events(&notes, 3, 480, 120.0, 48_000.0, 0, 128).unwrap();
         assert_eq!(events[1].frame, events[2].frame);
         assert!(matches!(events[1].event, MidiEvent::NoteOff { .. }));
         assert!(matches!(events[2].event, MidiEvent::NoteOn { .. }));
@@ -1938,7 +1993,7 @@ mod tests {
             velocity: 100,
             ..PatternNote::default()
         };
-        let error = scheduled_pattern_events(&[note], 2, 480, 120.0, 48_000.0).unwrap_err();
+        let error = scheduled_pattern_events(&[note], 2, 480, 120.0, 48_000.0, 0, 128).unwrap_err();
         assert!(error.contains("outside the MIDI note range"));
     }
 

@@ -973,6 +973,11 @@ fn render_pattern_vst3(
     }
 
     let class_uid = matching_project_class_uid(&document, channel_id, bundle_path);
+    let channel_swing_mix_raw = document
+        .channels()
+        .into_iter()
+        .find(|channel| channel.id() == channel_id)
+        .map_or(128, |channel| channel.swing_mix());
     let mut host = Vst3HostRuntime::new(48_000.0, 512)?;
     let plugin = host.load(bundle_path, class_uid.as_deref())?;
     let summary = host.render_pattern_channel_to_wav(
@@ -983,6 +988,8 @@ fn render_pattern_vst3(
             ppq: document.header().ppq(),
             tempo_bpm: document.metadata().tempo_bpm().unwrap_or(120.0),
             tail_seconds,
+            global_swing_mix_raw: document.metadata().global_swing_mix(),
+            channel_swing_mix_raw,
         },
         output_path,
     )?;

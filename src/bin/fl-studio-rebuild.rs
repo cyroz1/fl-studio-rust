@@ -108,6 +108,14 @@ fn project_hash(document: &FlpDocument) -> Option<u64> {
     bytes.hash(&mut hasher);
     Some(hasher.finish())
 }
+
+fn project_channel_swing_mix_raw(document: &FlpDocument, channel_id: u16) -> u16 {
+    document
+        .channels()
+        .into_iter()
+        .find(|channel| channel.id() == channel_id)
+        .map_or(128, |channel| channel.swing_mix())
+}
 const FL_GENRES: &[&str] = &[
     "(none)",
     "Acid House",
@@ -7404,9 +7412,7 @@ impl DawUi {
                 },
             )
             .response
-            .on_hover_text(
-                "Set project-wide swing mix. Playback scheduling does not apply swing yet.",
-            );
+            .on_hover_text("Set swing for every second 16th step across the project.");
             if ui.small_button("◀").clicked() {
                 self.step_sequencer_bar = self.step_sequencer_bar.saturating_sub(1);
             }
@@ -8176,9 +8182,7 @@ impl DawUi {
             match result {
                 Some(Ok(())) => {
                     self.dirty = true;
-                    self.status = format!(
-                        "Global swing mix set to {percent}%; playback scheduling is not implemented"
-                    );
+                    self.status = format!("Global swing mix set to {percent}%");
                 }
                 Some(Err(error)) => {
                     self.status = format!("Could not change global swing mix: {error}");
@@ -10963,6 +10967,8 @@ impl DawUi {
         };
         let ppq = document.header().ppq();
         let tempo_bpm = document.metadata().tempo_bpm().unwrap_or(self.tempo_bpm);
+        let global_swing_mix_raw = document.metadata().global_swing_mix();
+        let channel_swing_mix_raw = project_channel_swing_mix_raw(document, channel_id);
         let Some(path) = rfd::FileDialog::new()
             .set_title("Render selected pattern channel")
             .set_file_name(format!("Pattern_{pattern_id}_Channel_{channel_id}.wav"))
@@ -10985,6 +10991,8 @@ impl DawUi {
                         ppq,
                         tempo_bpm,
                         tail_seconds: 2.0,
+                        global_swing_mix_raw,
+                        channel_swing_mix_raw,
                     },
                     &path,
                 )
@@ -11139,6 +11147,8 @@ impl DawUi {
                             ppq,
                             tempo_bpm,
                             tail_seconds: 1.0,
+                            global_swing_mix_raw: 0,
+                            channel_swing_mix_raw: 128,
                         },
                     )
                 });
@@ -11267,6 +11277,8 @@ impl DawUi {
         };
         let ppq = document.header().ppq();
         let tempo_bpm = document.metadata().tempo_bpm().unwrap_or(self.tempo_bpm);
+        let global_swing_mix_raw = document.metadata().global_swing_mix();
+        let channel_swing_mix_raw = project_channel_swing_mix_raw(document, channel_id);
 
         if self.audio_engine.is_none() {
             match AudioEngine::start(&self.audio_settings) {
@@ -11310,6 +11322,8 @@ impl DawUi {
                         ppq,
                         tempo_bpm,
                         tail_seconds: 2.0,
+                        global_swing_mix_raw,
+                        channel_swing_mix_raw,
                     },
                 )
             });

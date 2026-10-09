@@ -1147,6 +1147,38 @@ fn require_audio_clips(render: &PreparedAudioClipRender) -> Result<(), String> {
 
 const MAX_SCHEDULED_PLAYLIST_NOTES: usize = 2_000_000;
 
+/// Shifts an onset on an even-numbered sixteenth step by the combined global
+/// and per-channel swing mix. The full mix places the onset one third of a
+/// sixteenth step late, matching a triplet swing ratio.
+pub(crate) fn swing_note_start_tick(
+    tick: u64,
+    ppq: u16,
+    global_mix_raw: u8,
+    channel_mix_raw: u16,
+) -> Result<u64, String> {
+    if ppq == 0 || global_mix_raw == 0 || channel_mix_raw == 0 {
+        return Ok(tick);
+    }
+    if global_mix_raw > 128 || channel_mix_raw > 128 {
+        return Ok(tick);
+    }
+
+    let ppq = u128::from(ppq);
+    let scaled_tick = u128::from(tick) * 4;
+    let step_index = (scaled_tick + ppq / 2) / ppq;
+    let step_tick = (step_index * ppq + 2) / 4;
+    if step_tick != u128::from(tick) || step_index % 2 == 0 {
+        return Ok(tick);
+    }
+
+    let denominator = 4 * 128 * 128 * 3;
+    let numerator = ppq * u128::from(global_mix_raw) * u128::from(channel_mix_raw);
+    let delay_ticks = (numerator + denominator / 2) / denominator;
+    let shifted_tick = u128::from(tick) + delay_ticks;
+    u64::try_from(shifted_tick)
+        .map_err(|_| "swing-adjusted note position exceeds the supported tick range".to_owned())
+}
+
 pub(crate) struct PlaylistPatternNote<'a> {
     pub(crate) note: &'a PatternNote,
     pub(crate) target_channel_id: u16,
@@ -1163,6 +1195,9 @@ pub(crate) struct PlaylistPatternSchedule<'a> {
 pub(crate) fn schedule_playlist_pattern_notes<'a>(
     patterns: &'a [Pattern],
     arrangement: &Arrangement,
+    ppq: u16,
+    global_swing_mix_raw: u8,
+    mut channel_swing_mix_raw: impl FnMut(u16) -> u16,
     mut resolve_targets: impl FnMut(u16, u64) -> Vec<u16>,
 ) -> Result<PlaylistPatternSchedule<'a>, String> {
     let patterns_by_id: HashMap<_, _> = patterns
@@ -1229,15 +1264,29 @@ pub(crate) fn schedule_playlist_pattern_notes<'a>(
                 if relative_start >= clip_length {
                     continue;
                 }
-                let start_tick = u64::from(clip.position_ticks)
+                let nominal_start_tick = u64::from(clip.position_ticks)
                     .checked_add(relative_start)
                     .ok_or_else(|| "Playlist pattern note position overflow".to_owned())?;
+                let swung_relative_start = swing_note_start_tick(
+                    relative_start,
+                    ppq,
+                    global_swing_mix_raw,
+                    channel_swing_mix_raw(note.channel_id),
+                )?;
+                let swing_offset = swung_relative_start.saturating_sub(relative_start);
+                let start_tick = u64::from(clip.position_ticks)
+                    .checked_add(swung_relative_start)
+                    .ok_or_else(|| "swung Playlist pattern note position overflow".to_owned())?;
+                if start_tick >= clip_end {
+                    continue;
+                }
                 let clipped_stop_tick = if note.length == 0 {
                     None
                 } else {
                     Some(
-                        start_tick
+                        nominal_start_tick
                             .checked_add(u64::from(note.length))
+                            .and_then(|stop_tick| stop_tick.checked_add(swing_offset))
                             .ok_or_else(|| {
                                 "Playlist pattern note end position overflow".to_owned()
                             })?
@@ -1247,7 +1296,7 @@ pub(crate) fn schedule_playlist_pattern_notes<'a>(
                 let note_seed = (clip_index as u64).rotate_left(32)
                     ^ repetition.rotate_left(17)
                     ^ (note_index as u64).rotate_left(3)
-                    ^ start_tick.rotate_left(47);
+                    ^ nominal_start_tick.rotate_left(47);
                 for target_channel_id in resolve_targets(note.channel_id, note_seed) {
                     if schedule.notes.len() >= MAX_SCHEDULED_PLAYLIST_NOTES {
                         return Err(format!(
@@ -1316,19 +1365,30 @@ fn prepare_sampler_arrangement(
         .map(|channel| (channel.id(), channel))
         .collect();
     let channel_router = ChannelNoteRouter::new(channels.clone());
-    let schedule = schedule_playlist_pattern_notes(&patterns, &arrangement, |channel_id, seed| {
-        channel_router
-            .targets(channel_id, seed)
-            .into_iter()
-            .filter(|target_channel_id| {
-                channels_by_id
-                    .get(target_channel_id)
-                    .is_some_and(|channel| {
-                        channel.kind() == Some(0) && channel.enabled() != Some(false)
-                    })
-            })
-            .collect()
-    })?;
+    let schedule = schedule_playlist_pattern_notes(
+        &patterns,
+        &arrangement,
+        ppq,
+        document.metadata().global_swing_mix(),
+        |channel_id| {
+            channels_by_id
+                .get(&channel_id)
+                .map_or(128, |channel| channel.swing_mix())
+        },
+        |channel_id, seed| {
+            channel_router
+                .targets(channel_id, seed)
+                .into_iter()
+                .filter(|target_channel_id| {
+                    channels_by_id
+                        .get(target_channel_id)
+                        .is_some_and(|channel| {
+                            channel.kind() == Some(0) && channel.enabled() != Some(false)
+                        })
+                })
+                .collect()
+        },
+    )?;
     let sampler_note_count = schedule.notes.len();
     if sampler_note_count == 0 {
         return Ok(PreparedSamplerArrangement {
@@ -1545,6 +1605,7 @@ fn prepare_sampler_pattern(
         .into_iter()
         .find(|pattern| pattern.id == options.pattern_id)
         .ok_or_else(|| format!("pattern {} was not found", options.pattern_id))?;
+    let global_swing_mix_raw = document.metadata().global_swing_mix();
     let channels = document.channels();
     let channels_by_id: HashMap<_, _> = channels
         .iter()
@@ -1650,12 +1711,18 @@ fn prepare_sampler_pattern(
         let Some(source) = sources_by_channel.get(&target_channel_id) else {
             continue;
         };
-        let start_frame = ticks_to_frames(
-            u64::from(note.position),
+        let channel_swing_mix_raw = channels_by_id
+            .get(&note.channel_id)
+            .map_or(128, |channel| channel.swing_mix());
+        let nominal_start_tick = u64::from(note.position);
+        let swung_start_tick = swing_note_start_tick(
+            nominal_start_tick,
             ppq,
-            tempo_bpm,
-            options.sample_rate,
+            global_swing_mix_raw,
+            channel_swing_mix_raw,
         )?;
+        let swing_offset = swung_start_tick.saturating_sub(nominal_start_tick);
+        let start_frame = ticks_to_frames(swung_start_tick, ppq, tempo_bpm, options.sample_rate)?;
         // Reading the source here also validates that each prepared channel has usable frames.
         if source.audio.frame_count() == 0 {
             return Err(format!(
@@ -1666,8 +1733,9 @@ fn prepare_sampler_pattern(
         let stop_frame = if note.length == 0 {
             None
         } else {
-            let end_tick = u64::from(note.position)
+            let end_tick = nominal_start_tick
                 .checked_add(u64::from(note.length))
+                .and_then(|tick| tick.checked_add(swing_offset))
                 .ok_or_else(|| "Sampler note end position overflow".to_owned())?;
             Some(
                 ticks_to_frames(end_tick, ppq, tempo_bpm, options.sample_rate)?
@@ -2448,6 +2516,18 @@ mod tests {
     }
 
     #[test]
+    fn channel_rack_swing_shifts_even_sixteenth_onsets_by_the_combined_mix() {
+        assert_eq!(swing_note_start_tick(0, 96, 128, 128).unwrap(), 0);
+        assert_eq!(swing_note_start_tick(24, 96, 128, 128).unwrap(), 32);
+        assert_eq!(swing_note_start_tick(48, 96, 128, 128).unwrap(), 48);
+        assert_eq!(swing_note_start_tick(25, 96, 128, 128).unwrap(), 25);
+        assert_eq!(swing_note_start_tick(24, 96, 64, 64).unwrap(), 26);
+        assert_eq!(swing_note_start_tick(24, 96, 128, 0).unwrap(), 24);
+        assert_eq!(swing_note_start_tick(24, 96, 0, 128).unwrap(), 24);
+        assert_eq!(swing_note_start_tick(24, 96, 129, 128).unwrap(), 24);
+    }
+
+    #[test]
     fn adds_render_tail_frames_with_overflow_checks() {
         assert_eq!(add_render_tail_frames(12_000, 48_000, 0).unwrap(), 12_000);
         assert_eq!(add_render_tail_frames(12_000, 48_000, 2).unwrap(), 108_000);
@@ -2485,9 +2565,14 @@ mod tests {
         };
 
         let patterns = [pattern];
-        let schedule = schedule_playlist_pattern_notes(&patterns, &arrangement, |channel_id, _| {
-            vec![channel_id]
-        })
+        let schedule = schedule_playlist_pattern_notes(
+            &patterns,
+            &arrangement,
+            96,
+            0,
+            |_| 128,
+            |channel_id, _| vec![channel_id],
+        )
         .unwrap();
         assert_eq!(
             schedule
@@ -2523,13 +2608,20 @@ mod tests {
         };
 
         let patterns = [pattern];
-        let schedule = schedule_playlist_pattern_notes(&patterns, &arrangement, |channel_id, _| {
-            if channel_id == 7 {
-                vec![2, 5]
-            } else {
-                vec![channel_id]
-            }
-        })
+        let schedule = schedule_playlist_pattern_notes(
+            &patterns,
+            &arrangement,
+            96,
+            0,
+            |_| 128,
+            |channel_id, _| {
+                if channel_id == 7 {
+                    vec![2, 5]
+                } else {
+                    vec![channel_id]
+                }
+            },
+        )
         .unwrap();
         assert_eq!(
             schedule
@@ -2559,13 +2651,51 @@ mod tests {
         };
 
         let patterns = [pattern];
-        let schedule = schedule_playlist_pattern_notes(&patterns, &arrangement, |channel_id, _| {
-            vec![channel_id]
-        })
+        let schedule = schedule_playlist_pattern_notes(
+            &patterns,
+            &arrangement,
+            96,
+            0,
+            |_| 128,
+            |channel_id, _| vec![channel_id],
+        )
         .unwrap();
         assert_eq!(schedule.notes.len(), 1);
         assert_eq!(schedule.notes[0].start_tick, 12);
         assert_eq!(schedule.notes[0].clipped_stop_tick, None);
+    }
+
+    #[test]
+    fn playlist_pattern_schedule_applies_global_and_source_channel_swing() {
+        let pattern = Pattern {
+            id: 4,
+            length_ticks: Some(96),
+            notes: vec![PatternNote {
+                position: 24,
+                length: 24,
+                channel_id: 7,
+                ..PatternNote::default()
+            }],
+            ..Pattern::default()
+        };
+        let arrangement = Arrangement {
+            clips: vec![test_pattern_clip(4, 12, 96)],
+            ..Arrangement::default()
+        };
+
+        let patterns = [pattern];
+        let schedule = schedule_playlist_pattern_notes(
+            &patterns,
+            &arrangement,
+            96,
+            128,
+            |channel_id| if channel_id == 7 { 128 } else { 0 },
+            |channel_id, _| vec![channel_id],
+        )
+        .unwrap();
+        assert_eq!(schedule.notes.len(), 1);
+        assert_eq!(schedule.notes[0].start_tick, 44);
+        assert_eq!(schedule.notes[0].clipped_stop_tick, Some(68));
     }
 
     #[test]
