@@ -85,14 +85,15 @@ const MIDI_CHANNEL_COLORS: [Color32; 16] = [
 fn install_ui_fonts(context: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
-        "Inter".to_owned(),
-        egui::FontData::from_static(include_bytes!("../../assets/fonts/InterVariable.ttf")).into(),
+        "Source Sans 3".to_owned(),
+        egui::FontData::from_static(include_bytes!("../../assets/fonts/SourceSans3Variable.ttf"))
+            .into(),
     );
     fonts
         .families
         .entry(egui::FontFamily::Proportional)
         .or_default()
-        .insert(0, "Inter".to_owned());
+        .insert(0, "Source Sans 3".to_owned());
     context.set_fonts(fonts);
 }
 
