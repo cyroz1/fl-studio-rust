@@ -20,7 +20,7 @@ use flp_rebuild::plugins::{PluginCandidate, PluginFormat, scan_installed_plugins
 use flp_rebuild::project_package::ProjectPackageWorkspace;
 use flp_rebuild::sample_render::{
     AudioClipRenderOptions, PlaylistRenderOptions, PlaylistRenderSummary,
-    SamplerPatternRenderOptions, SamplerPatternRenderSummary, WavSampleFormat,
+    SamplerPatternRenderOptions, SamplerPatternRenderSummary, WavChannelMode, WavSampleFormat,
     render_audio_clips_to_wav, render_playlist_with_vst3_to_wav_cancellable,
     stream_playlist_with_vst3_to_device, stream_sampler_pattern_to_device,
 };
@@ -1297,6 +1297,7 @@ struct DawUi {
     project_settings_fast_declick: bool,
     playlist_render_options_open: bool,
     playlist_render_format: WavSampleFormat,
+    playlist_render_channel_mode: WavChannelMode,
     playlist_render_tail_seconds: u8,
 }
 
@@ -1560,6 +1561,7 @@ impl DawUi {
             project_settings_fast_declick: false,
             playlist_render_options_open: false,
             playlist_render_format: WavSampleFormat::Float32,
+            playlist_render_channel_mode: WavChannelMode::Stereo,
             playlist_render_tail_seconds: 0,
         };
         if let Some((autosave_minutes, autosave_before_risky, backup_retention)) =
@@ -2514,6 +2516,26 @@ impl DawUi {
                             }
                         });
                 });
+                ui.horizontal(|ui| {
+                    ui.label("Channels");
+                    egui::ComboBox::from_id_salt("playlist-render-channel-mode")
+                        .selected_text(self.playlist_render_channel_mode.label())
+                        .show_ui(ui, |ui| {
+                            for mode in [
+                                WavChannelMode::Stereo,
+                                WavChannelMode::MonoMerged,
+                                WavChannelMode::MonoLeft,
+                                WavChannelMode::MonoRight,
+                            ] {
+                                ui.selectable_value(
+                                    &mut self.playlist_render_channel_mode,
+                                    mode,
+                                    mode.label(),
+                                );
+                            }
+                        });
+                });
+                ui.label("Merged mono averages both channels; left/right modes select one side.");
                 ui.horizontal(|ui| {
                     ui.label("Tail length");
                     egui::ComboBox::from_id_salt("playlist-render-tail-length")
@@ -10131,6 +10153,7 @@ impl DawUi {
             arrangement_id: self.selected_arrangement.unwrap_or_default(),
             sample_rate: self.audio_settings.sample_rate,
             wav_sample_format: self.playlist_render_format,
+            wav_channel_mode: self.playlist_render_channel_mode,
             tail_seconds: self.playlist_render_tail_seconds,
             ..PlaylistRenderOptions::default()
         };

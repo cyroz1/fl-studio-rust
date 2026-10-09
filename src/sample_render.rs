@@ -113,11 +113,38 @@ impl WavSampleFormat {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WavChannelMode {
+    Stereo,
+    MonoMerged,
+    MonoLeft,
+    MonoRight,
+}
+
+impl WavChannelMode {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Stereo => "Stereo",
+            Self::MonoMerged => "Mono (merged)",
+            Self::MonoLeft => "Mono (left only)",
+            Self::MonoRight => "Mono (right only)",
+        }
+    }
+
+    const fn channel_count(self) -> u16 {
+        match self {
+            Self::Stereo => 2,
+            Self::MonoMerged | Self::MonoLeft | Self::MonoRight => 1,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PlaylistRenderOptions {
     pub arrangement_id: u16,
     pub sample_rate: u32,
     pub sampler_voice_limit: usize,
     pub wav_sample_format: WavSampleFormat,
+    pub wav_channel_mode: WavChannelMode,
     pub tail_seconds: u8,
 }
 
@@ -128,6 +155,7 @@ impl Default for PlaylistRenderOptions {
             sample_rate: DEFAULT_SAMPLE_RATE,
             sampler_voice_limit: DEFAULT_SAMPLER_VOICE_LIMIT,
             wav_sample_format: WavSampleFormat::Float32,
+            wav_channel_mode: WavChannelMode::Stereo,
             tail_seconds: 0,
         }
     }
@@ -388,7 +416,8 @@ pub fn render_playlist_with_vst3_to_wav_cancellable(
     }
     let frames_u32 =
         u32::try_from(frames).map_err(|_| "render is too long for a RIFF/WAVE file".to_owned())?;
-    let block_align = options.wav_sample_format.bytes_per_sample() * 2;
+    let block_align =
+        options.wav_sample_format.bytes_per_sample() * options.wav_channel_mode.channel_count();
     let data_bytes = frames_u32
         .checked_mul(u32::from(block_align))
         .filter(|bytes| *bytes <= u32::MAX - 36)
@@ -422,15 +451,18 @@ pub fn render_playlist_with_vst3_to_wav_cancellable(
     let mut temporary = TemporaryWav::create(output_path)?;
     {
         let file = temporary.file.as_mut().expect("temporary WAV is open");
-        write_stereo_wav_header(
+        write_wav_header(
             file,
             options.sample_rate,
             frames_u32,
             data_bytes,
             options.wav_sample_format,
+            options.wav_channel_mode,
         )?;
         let mut bytes = Vec::with_capacity(
-            STREAM_BLOCK_FRAMES * 2 * usize::from(options.wav_sample_format.bytes_per_sample()),
+            STREAM_BLOCK_FRAMES
+                * usize::from(options.wav_channel_mode.channel_count())
+                * usize::from(options.wav_sample_format.bytes_per_sample()),
         );
         summary.voices_stolen = stream_prepared_playlist_render(
             PreparedPlaylistBlockMix {
@@ -444,9 +476,12 @@ pub fn render_playlist_with_vst3_to_wav_cancellable(
             || false,
             |block| {
                 bytes.clear();
-                for sample in block {
-                    append_wav_sample(*sample, options.wav_sample_format, &mut bytes);
-                }
+                append_wav_block_samples(
+                    block,
+                    options.wav_sample_format,
+                    options.wav_channel_mode,
+                    &mut bytes,
+                )?;
                 file.write_all(&bytes)
                     .map_err(|error| format!("could not write rendered WAV data: {error}"))
             },
@@ -456,14 +491,16 @@ pub fn render_playlist_with_vst3_to_wav_cancellable(
     Ok(summary)
 }
 
-fn write_stereo_wav_header(
+fn write_wav_header(
     file: &mut File,
     sample_rate: u32,
     frames: u32,
     data_bytes: u32,
     sample_format: WavSampleFormat,
+    channel_mode: WavChannelMode,
 ) -> Result<(), String> {
-    let block_align = sample_format.bytes_per_sample() * 2;
+    let channels = channel_mode.channel_count();
+    let block_align = sample_format.bytes_per_sample() * channels;
     let byte_rate = sample_rate
         .checked_mul(u32::from(block_align))
         .ok_or_else(|| "rendered WAV byte rate overflow".to_owned())?;
@@ -472,7 +509,7 @@ fn write_stereo_wav_header(
         .and_then(|()| file.write_all(b"WAVEfmt "))
         .and_then(|()| file.write_all(&16u32.to_le_bytes()))
         .and_then(|()| file.write_all(&sample_format.format_code().to_le_bytes()))
-        .and_then(|()| file.write_all(&2u16.to_le_bytes()))
+        .and_then(|()| file.write_all(&channels.to_le_bytes()))
         .and_then(|()| file.write_all(&sample_rate.to_le_bytes()))
         .and_then(|()| file.write_all(&byte_rate.to_le_bytes()))
         .and_then(|()| file.write_all(&block_align.to_le_bytes()))
@@ -499,6 +536,32 @@ fn append_wav_sample(sample: f32, format: WavSampleFormat, output: &mut Vec<u8>)
             output.extend_from_slice(&packed.to_le_bytes()[..3]);
         }
     }
+}
+
+fn append_wav_block_samples(
+    stereo_block: &[f32],
+    sample_format: WavSampleFormat,
+    channel_mode: WavChannelMode,
+    output: &mut Vec<u8>,
+) -> Result<(), String> {
+    if !stereo_block.len().is_multiple_of(2) {
+        return Err("render block must contain interleaved stereo frames".to_owned());
+    }
+    for frame in stereo_block.chunks_exact(2) {
+        match channel_mode {
+            WavChannelMode::Stereo => {
+                append_wav_sample(frame[0], sample_format, output);
+                append_wav_sample(frame[1], sample_format, output);
+            }
+            WavChannelMode::MonoMerged => {
+                let merged = frame[0] * 0.5 + frame[1] * 0.5;
+                append_wav_sample(merged, sample_format, output);
+            }
+            WavChannelMode::MonoLeft => append_wav_sample(frame[0], sample_format, output),
+            WavChannelMode::MonoRight => append_wav_sample(frame[1], sample_format, output),
+        }
+    }
+    Ok(())
 }
 
 fn quantize_signed_pcm(sample: f32, negative_scale: f64, positive_scale: f64) -> i64 {
@@ -2258,6 +2321,7 @@ mod tests {
                     sample_rate: 4,
                     sampler_voice_limit: 4,
                     wav_sample_format: WavSampleFormat::Float32,
+                    wav_channel_mode: WavChannelMode::Stereo,
                     tail_seconds: 0,
                 },
                 frames: 2,
@@ -2675,7 +2739,15 @@ mod tests {
             for sample in [-1.0, 1.0, 0.5, -0.5] {
                 append_wav_sample(sample, format, &mut samples);
             }
-            write_stereo_wav_header(&mut file, 48_000, 2, samples.len() as u32, format).unwrap();
+            write_wav_header(
+                &mut file,
+                48_000,
+                2,
+                samples.len() as u32,
+                format,
+                WavChannelMode::Stereo,
+            )
+            .unwrap();
             file.write_all(&samples).unwrap();
             drop(file);
 
@@ -2718,6 +2790,77 @@ mod tests {
         );
         assert_eq!(quantize_signed_pcm(f32::NAN, 32_768.0, 32_767.0), 0);
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn writes_wav_channel_modes_with_correct_mono_samples_and_headers() {
+        let root = std::env::temp_dir().join(format!(
+            "flp-channel-render-test-{}-{}",
+            std::process::id(),
+            NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let stereo_block = [-0.5, 0.5, 0.25, 0.75];
+        let cases: [(WavChannelMode, u16, &[f32]); 4] = [
+            (WavChannelMode::Stereo, 2, &[-0.5, 0.5, 0.25, 0.75]),
+            (WavChannelMode::MonoMerged, 1, &[0.0, 0.5]),
+            (WavChannelMode::MonoLeft, 1, &[-0.5, 0.25]),
+            (WavChannelMode::MonoRight, 1, &[0.5, 0.75]),
+        ];
+
+        for (index, (mode, channels, expected_samples)) in cases.into_iter().enumerate() {
+            let output = root.join(format!("channels-{index}.wav"));
+            let mut samples = Vec::new();
+            append_wav_block_samples(&stereo_block, WavSampleFormat::Float32, mode, &mut samples)
+                .unwrap();
+            let block_align = channels * 4;
+            let mut file = File::create(&output).unwrap();
+            write_wav_header(
+                &mut file,
+                48_000,
+                2,
+                samples.len() as u32,
+                WavSampleFormat::Float32,
+                mode,
+            )
+            .unwrap();
+            file.write_all(&samples).unwrap();
+            drop(file);
+
+            let bytes = fs::read(&output).unwrap();
+            assert_eq!(
+                u16::from_le_bytes(bytes[22..24].try_into().unwrap()),
+                channels
+            );
+            assert_eq!(
+                u32::from_le_bytes(bytes[28..32].try_into().unwrap()),
+                48_000 * u32::from(block_align)
+            );
+            assert_eq!(
+                u16::from_le_bytes(bytes[32..34].try_into().unwrap()),
+                block_align
+            );
+            assert_eq!(
+                u32::from_le_bytes(bytes[40..44].try_into().unwrap()),
+                samples.len() as u32
+            );
+            let decoded = bytes[44..]
+                .chunks_exact(4)
+                .map(|sample| f32::from_le_bytes(sample.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            assert_eq!(decoded, expected_samples);
+        }
+
+        assert!(
+            append_wav_block_samples(
+                &[0.25],
+                WavSampleFormat::Float32,
+                WavChannelMode::MonoMerged,
+                &mut Vec::new()
+            )
+            .is_err()
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }
