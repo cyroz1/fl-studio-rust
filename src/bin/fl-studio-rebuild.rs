@@ -4075,6 +4075,9 @@ impl DawUi {
                     .filter_map(|entry| {
                         let path = entry.path();
                         let name = entry.file_name().to_string_lossy().into_owned();
+                        if browser_entry_is_hidden(&name) {
+                            return None;
+                        }
                         let is_directory = path.is_dir();
                         (is_directory || browser_file_kind(&path).is_some()).then_some(
                             BrowserEntry {
@@ -13652,6 +13655,10 @@ fn index_browser_folders(roots: Vec<PathBuf>, all_roots: bool) -> Result<Browser
                     continue;
                 };
                 let path = child.path();
+                let name = child.file_name().to_string_lossy().into_owned();
+                if browser_entry_is_hidden(&name) {
+                    continue;
+                }
                 if scan_entries >= MAX_BROWSER_RECURSIVE_SCAN_ENTRIES {
                     truncated = true;
                     break 'roots;
@@ -13696,6 +13703,10 @@ fn index_browser_folders(roots: Vec<PathBuf>, all_roots: bool) -> Result<Browser
         truncated,
         unavailable_roots,
     })
+}
+
+fn browser_entry_is_hidden(name: &str) -> bool {
+    name.starts_with('.')
 }
 
 fn default_browser_directory() -> PathBuf {
