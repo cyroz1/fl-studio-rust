@@ -50,6 +50,8 @@ const RED: Color32 = Color32::from_rgb(252, 67, 46);
 const MENU_BAR_HEIGHT: f32 = 32.0;
 const TRANSPORT_BAR_HEIGHT: f32 = 46.0;
 const STATUS_BAR_HEIGHT: f32 = 27.0;
+const MIN_WINDOW_INNER_WIDTH: f32 = 960.0;
+const MIN_WINDOW_INNER_HEIGHT: f32 = 640.0;
 const DEFAULT_BROWSER_COLUMN_WIDTH: f32 = 232.0;
 const MIN_BROWSER_COLUMN_WIDTH: f32 = 180.0;
 const MAX_BROWSER_COLUMN_WIDTH: f32 = 500.0;
@@ -237,12 +239,16 @@ fn matching_vst3_candidate<'a>(
 
 fn main() -> eframe::Result {
     let initial_project = std::env::args_os().nth(1).map(PathBuf::from);
+    let ui_scale = load_ui_scale();
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
         viewport: egui::ViewportBuilder::default()
             .with_title("FL Studio Rebuild")
             .with_inner_size([1440.0, 900.0])
-            .with_min_inner_size([960.0, 640.0])
+            .with_min_inner_size([
+                MIN_WINDOW_INNER_WIDTH / ui_scale,
+                MIN_WINDOW_INNER_HEIGHT / ui_scale,
+            ])
             .with_maximized(true),
         ..Default::default()
     };
@@ -1482,6 +1488,14 @@ impl DawUi {
     fn new(creation: &eframe::CreationContext<'_>, initial_project: Option<PathBuf>) -> Self {
         install_ui_fonts(&creation.egui_ctx);
         creation.egui_ctx.set_theme(egui::Theme::Dark);
+        let ui_scale = load_ui_scale();
+        creation.egui_ctx.set_zoom_factor(ui_scale);
+        creation
+            .egui_ctx
+            .send_viewport_cmd(egui::ViewportCommand::MinInnerSize(Vec2::new(
+                MIN_WINDOW_INNER_WIDTH / ui_scale,
+                MIN_WINDOW_INNER_HEIGHT / ui_scale,
+            )));
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = APP_BACKGROUND;
         visuals.window_fill = PANEL;
@@ -1553,8 +1567,6 @@ impl DawUi {
             .and_then(Path::parent)
             .map(Path::to_path_buf)
             .unwrap_or_else(default_browser_directory);
-        let ui_scale = load_ui_scale();
-        creation.egui_ctx.set_zoom_factor(ui_scale);
         let mut app = Self {
             document: None,
             current_path: None,
@@ -4035,6 +4047,11 @@ impl DawUi {
                         {
                             self.ui_scale = scale;
                             ui.ctx().set_zoom_factor(scale);
+                            ui.ctx()
+                                .send_viewport_cmd(egui::ViewportCommand::MinInnerSize(Vec2::new(
+                                    MIN_WINDOW_INNER_WIDTH / scale,
+                                    MIN_WINDOW_INNER_HEIGHT / scale,
+                                )));
                             if let Err(error) = save_ui_scale(scale) {
                                 self.status = format!("Could not save UI scale: {error}");
                             }
@@ -13690,7 +13707,6 @@ impl eframe::App for DawUi {
                 .request_repaint_after(std::time::Duration::from_millis(33));
         }
         let width = ui.available_width();
-        let full_height = ui.available_height();
         ui.vertical(|ui| {
             ui.allocate_ui_with_layout(
                 Vec2::new(width, MENU_BAR_HEIGHT),
@@ -13714,9 +13730,19 @@ impl eframe::App for DawUi {
             );
             ui.separator();
             let content_height =
-                (full_height - MENU_BAR_HEIGHT - TRANSPORT_BAR_HEIGHT - STATUS_BAR_HEIGHT - 8.0)
+                (ui.available_height() - STATUS_BAR_HEIGHT - ui.spacing().item_spacing.y)
                     .max(100.0);
-            ui.horizontal(|ui| {
+            let (_, workspace_rect) = ui.allocate_space(Vec2::new(width, content_height));
+            let workspace_clip_rect = ui.clip_rect().intersect(workspace_rect);
+            let mut workspace_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .id_salt("main-workspace")
+                    .max_rect(workspace_rect)
+                    .layout(egui::Layout::left_to_right(egui::Align::Min)),
+            );
+            workspace_ui.set_clip_rect(workspace_clip_rect);
+            {
+                let ui = &mut workspace_ui;
                 if self.browser_visible {
                     let browser_max_width =
                         (width - 700.0).clamp(MIN_BROWSER_COLUMN_WIDTH, MAX_BROWSER_COLUMN_WIDTH);
@@ -13730,7 +13756,12 @@ impl eframe::App for DawUi {
                             egui::Frame::new()
                                 .fill(PANEL)
                                 .inner_margin(egui::Margin::same(8))
-                                .show(ui, |ui| self.browser(ui));
+                                .show(ui, |ui| {
+                                    egui::ScrollArea::vertical()
+                                        .id_salt("browser-panel-content")
+                                        .auto_shrink([false, false])
+                                        .show(ui, |ui| self.browser(ui));
+                                });
                         },
                     );
                     let (_, splitter) = ui.allocate_exact_size(
@@ -13780,14 +13811,14 @@ impl eframe::App for DawUi {
                         }
                     },
                 );
-            });
-            ui.separator();
+            }
             ui.allocate_ui_with_layout(
                 Vec2::new(width, STATUS_BAR_HEIGHT),
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| {
                     egui::Frame::new()
                         .fill(PANEL)
+                        .stroke(Stroke::new(1.0, BORDER))
                         .inner_margin(egui::Margin::symmetric(8, 0))
                         .show(ui, |ui| {
                             ui.horizontal_centered(|ui| {
