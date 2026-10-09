@@ -33,6 +33,7 @@ These observations come from the installed FL Studio 2026 desktop application an
 - Instrument, sample, automation, and pattern-linked channels share the rack, while row controls and color vary by channel type.
 - A channel's instrument or effect opens in its own floating window; the project observed here had an instrument window over the Channel Rack.
 - The Graph Editor opens with Ctrl+K and displays per-step note properties as bars. Left-click and drag edits a bar; right-drag interpolates a ramp across steps; Ctrl adjusts all values together; Alt-click resets values. The documented properties include Note, Velocity, Release, Fine Pitch, Mod X/Y, Shift, Pan, and Rep ([Image-Line Channel Rack manual](https://www.image-line.com/fl-studio-learning-content/fl-studio-online-manual/html/channelrack.htm)).
+- The current Channel Rack manual documents an integrated Graph Editor and Step/Piano roll view, and directs melodic entry to the Piano roll. It no longer documents a separate Keyboard editor; an Image-Line site administrator said the old standalone editor windows were removed ([current Channel Rack manual](https://www.image-line.com/fl-studio-learning-content/fl-studio-online-manual/html/channelrack.htm), [Image-Line forum response](https://forum.image-line.com/viewtopic.php?p=1927605)); the roadmap treats that historical view as obsolete.
 
 ## Playlist
 

@@ -10,6 +10,7 @@ Status legend:
 - `[done]` — implemented and working
 - `[partial]` — started; works for a subset of cases
 - `[todo]` — not started
+- `[obsolete]` — removed from current FL Studio; not a current parity target
 
 > Scope note: this covers the desktop DAW. FL Cloud, FL Studio Mobile, and
 > online services are explicitly out of scope (see Non-goals).
@@ -219,7 +220,7 @@ FL Studio's piano roll is famously deep — the full toolset:
 - `[partial]` Pattern/bar step grid toggles notes at sixteenth-note positions; new steps use key 60 and velocity 100. The Ctrl+K Graph Editor draws and edits per-step note key, velocity, pan, release, fine pitch, modulation X/Y, and shift, creates a C5 note on an empty step, and interpolates values when right-dragging across steps. The Rep lane, Ctrl scale-all gesture, Alt reset gesture, and multiple notes at one step remain incomplete
 - `[todo]` Channel grouping and zipping; sorting by color and Mixer track
 - `[partial]` Right-clicking a Channel Rack channel name opens that channel in the Piano roll for the selected pattern; per-channel swing and time multiplier remain
-- `[todo]` Keyboard editor view
+- `[obsolete]` Separate Keyboard editor window: the current Channel Rack uses its integrated Graph Editor and Step/Piano roll view, and directs melodic entry to the Piano roll; Image-Line's forum response says the old standalone editor windows were removed ([current Channel Rack manual](https://www.image-line.com/fl-studio-learning-content/fl-studio-online-manual/html/channelrack.htm), [Image-Line forum response](https://forum.image-line.com/viewtopic.php?p=1927605))
 
 ---
 
