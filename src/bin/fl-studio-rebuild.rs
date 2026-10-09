@@ -294,23 +294,23 @@ impl ChannelDisplayFilter {
         }
     }
 
-    fn step_group(self, groups: &[ChannelGroupSummary], direction: i32) -> Self {
-        if groups.is_empty() {
+    fn step_group(self, group_indices: &[i32], direction: i32) -> Self {
+        if group_indices.is_empty() {
             return self;
         }
         let current = match self {
-            Self::Group(index) => groups.iter().position(|group| group.index() == index),
+            Self::Group(index) => group_indices.iter().position(|group| *group == index),
             Self::All | Self::Unsorted => None,
         };
         let next = match (current, direction.signum()) {
-            (Some(index), 1) => (index + 1) % groups.len(),
-            (Some(index), -1) => (index + groups.len() - 1) % groups.len(),
+            (Some(index), 1) => (index + 1) % group_indices.len(),
+            (Some(index), -1) => (index + group_indices.len() - 1) % group_indices.len(),
             (None, 1) => 0,
-            (None, -1) => groups.len() - 1,
+            (None, -1) => group_indices.len() - 1,
             (_, 0) => return self,
             _ => unreachable!("direction was normalized above"),
         };
-        Self::Group(groups[next].index())
+        Self::Group(group_indices[next])
     }
 }
 
@@ -6920,6 +6920,10 @@ impl DawUi {
         };
         let channels = document.channels();
         let channel_groups = document.channel_groups();
+        let group_indices = channel_groups
+            .iter()
+            .map(ChannelGroupSummary::index)
+            .collect::<Vec<_>>();
         let known_group_indices = channel_groups
             .iter()
             .map(ChannelGroupSummary::index)
@@ -6995,10 +6999,9 @@ impl DawUi {
         open_group_dialog |= group_selected;
         if previous_group {
             self.channel_display_filter =
-                self.channel_display_filter.step_group(&channel_groups, -1);
+                self.channel_display_filter.step_group(&group_indices, -1);
         } else if next_group {
-            self.channel_display_filter =
-                self.channel_display_filter.step_group(&channel_groups, 1);
+            self.channel_display_filter = self.channel_display_filter.step_group(&group_indices, 1);
         }
         if zip_selected {
             channel_zipped_edits.extend(
@@ -14588,9 +14591,8 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::{
-        ChannelDisplayFilter, ChannelGroupSummary, PianoRollGrid, PianoRollSnap,
-        note_from_grid_position, snap_note_tick, update_channel_rack_selection,
-        update_layer_child_selection,
+        ChannelDisplayFilter, PianoRollGrid, PianoRollSnap, note_from_grid_position,
+        snap_note_tick, update_channel_rack_selection, update_layer_child_selection,
     };
 
     fn test_grid() -> PianoRollGrid {
@@ -14635,16 +14637,7 @@ mod tests {
 
     #[test]
     fn page_navigation_cycles_named_groups_from_all_or_unsorted() {
-        let groups = [
-            ChannelGroupSummary {
-                index: 0,
-                name: Some("Drums".to_owned()),
-            },
-            ChannelGroupSummary {
-                index: 1,
-                name: Some("Keys".to_owned()),
-            },
-        ];
+        let groups = [0, 1];
         assert_eq!(
             ChannelDisplayFilter::All.step_group(&groups, 1),
             ChannelDisplayFilter::Group(0)
