@@ -6649,6 +6649,18 @@ impl DawUi {
                                 self.selected_graph_channel = Some(channel.id());
                                 self.selected_note_channel = Some(channel.id());
                             }
+                            channel_button.context_menu(|ui| {
+                                if ui.button("Piano roll").clicked() {
+                                    self.selected_graph_channel = Some(channel.id());
+                                    self.selected_note_channel = Some(channel.id());
+                                    self.view = MainView::PianoRoll;
+                                    self.status = format!(
+                                        "Opened Piano roll for {}",
+                                        channel.display_name().unwrap_or("channel")
+                                    );
+                                    ui.close();
+                                }
+                            });
                             ui.label(
                                 plugin_state
                                     .and_then(|state| state.vst_metadata())
