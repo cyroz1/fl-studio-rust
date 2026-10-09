@@ -4,6 +4,7 @@
 //! streams are opened directly with WASAPI so the requested endpoint format and
 //! exclusive-access errors are visible to the application.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -18,6 +19,7 @@ const AUDIO_SOURCE_INPUT_MONITOR: u8 = 2;
 const AUDIO_SOURCE_PROJECT: u8 = 3;
 const AUDIO_SOURCE_STREAM: u8 = 4;
 const AUDIO_RING_CAPACITY: usize = 65_536;
+const AUDIO_ERROR_HISTORY_LIMIT: usize = 16;
 const STREAM_PREFILL_FRAMES: usize = 512;
 const TEST_TONE_HZ: f32 = 440.0;
 const TEST_TONE_LEVEL: f32 = 0.12;
@@ -152,6 +154,48 @@ struct StreamingPlayback {
     cancelled: AtomicBool,
     underrun_frames: AtomicU64,
     consumed_frames: AtomicU64,
+}
+
+#[derive(Default)]
+struct AudioErrorState {
+    latest: Mutex<Option<String>>,
+    recent: Mutex<VecDeque<String>>,
+    count: AtomicU64,
+}
+
+impl AudioErrorState {
+    fn report(&self, message: String) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        *self
+            .latest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(message.clone());
+
+        let mut recent = self
+            .recent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if recent.len() == AUDIO_ERROR_HISTORY_LIMIT {
+            recent.pop_front();
+        }
+        recent.push_back(message);
+    }
+
+    fn take_latest(&self) -> Option<String> {
+        self.latest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    fn recent(&self) -> Vec<String> {
+        self.recent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect()
+    }
 }
 
 /// The producer side of audio streamed into an active device callback.
@@ -418,7 +462,7 @@ pub struct AudioEngine {
     playback: Arc<PlaybackState>,
     sample_rate: u32,
     input_peak: Arc<AtomicU32>,
-    error: Arc<Mutex<Option<String>>>,
+    error: Arc<AudioErrorState>,
     input_stream: Option<Stream>,
     output_stream: Option<Stream>,
     input_active: bool,
@@ -588,6 +632,16 @@ impl AudioEngine {
         self.input_active
     }
 
+    /// Number of device stream errors reported since this engine started.
+    pub fn stream_error_count(&self) -> u64 {
+        self.error.count.load(Ordering::Relaxed)
+    }
+
+    /// Recent device stream error messages, oldest first.
+    pub fn stream_error_history(&self) -> Vec<String> {
+        self.error.recent()
+    }
+
     pub fn output_active(&self) -> bool {
         self.output_active
     }
@@ -597,10 +651,7 @@ impl AudioEngine {
     }
 
     pub fn take_error(&self) -> Option<String> {
-        self.error
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
+        self.error.take_latest()
     }
 
     fn stop_playback_source(&self) {
@@ -620,7 +671,7 @@ impl AudioEngine {
         let source = Arc::new(AtomicU8::new(AUDIO_SOURCE_SILENT));
         let playback = Arc::new(PlaybackState::new());
         let input_peak = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
-        let error = Arc::new(Mutex::new(None));
+        let error = Arc::new(AudioErrorState::default());
 
         let output_device = if settings.enable_output {
             resolve_device(&host, settings.output_device_id.as_deref(), false)?
@@ -695,7 +746,7 @@ impl AudioEngine {
         let source = Arc::new(AtomicU8::new(AUDIO_SOURCE_SILENT));
         let playback = Arc::new(PlaybackState::new());
         let input_peak = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
-        let error = Arc::new(Mutex::new(None));
+        let error = Arc::new(AudioErrorState::default());
         let stop = Arc::new(AtomicBool::new(false));
         let mut threads: Vec<thread::JoinHandle<()>> = Vec::new();
         let mut receivers = Vec::new();
@@ -933,7 +984,7 @@ fn build_output_stream(
     source: Arc<AtomicU8>,
     playback: Arc<PlaybackState>,
     ring: Arc<AudioRingBuffer>,
-    error: Arc<Mutex<Option<String>>>,
+    error: Arc<AudioErrorState>,
 ) -> Result<Stream, String> {
     let supported = select_config(device, false, settings.sample_rate)?;
     let format = supported.sample_format();
@@ -973,7 +1024,7 @@ fn build_typed_output(
     source: Arc<AtomicU8>,
     playback: Arc<PlaybackState>,
     ring: Arc<AudioRingBuffer>,
-    error: Arc<Mutex<Option<String>>>,
+    error: Arc<AudioErrorState>,
 ) -> Result<Stream, String> {
     macro_rules! build {
         ($sample:ty) => {
@@ -1005,7 +1056,7 @@ fn build_tone_stream<T>(
     source: Arc<AtomicU8>,
     playback: Arc<PlaybackState>,
     ring: Arc<AudioRingBuffer>,
-    error: Arc<Mutex<Option<String>>>,
+    error: Arc<AudioErrorState>,
 ) -> Result<Stream, String>
 where
     T: cpal::SizedSample + FromSample<f32>,
@@ -1058,7 +1109,7 @@ fn build_input_stream(
     ring: Arc<AudioRingBuffer>,
     peak: Arc<AtomicU32>,
     source: Arc<AtomicU8>,
-    error: Arc<Mutex<Option<String>>>,
+    error: Arc<AudioErrorState>,
 ) -> Result<Stream, String> {
     let supported = select_config(device, true, settings.sample_rate)?;
     let format = supported.sample_format();
@@ -1091,7 +1142,7 @@ fn build_typed_input(
     ring: Arc<AudioRingBuffer>,
     peak: Arc<AtomicU32>,
     source: Arc<AtomicU8>,
-    error: Arc<Mutex<Option<String>>>,
+    error: Arc<AudioErrorState>,
 ) -> Result<Stream, String> {
     macro_rules! build {
         ($sample:ty) => {
@@ -1123,7 +1174,7 @@ fn build_capture_stream<T>(
     ring: Arc<AudioRingBuffer>,
     peak: Arc<AtomicU32>,
     source: Arc<AtomicU8>,
-    error: Arc<Mutex<Option<String>>>,
+    error: Arc<AudioErrorState>,
 ) -> Result<Stream, String>
 where
     T: cpal::SizedSample + Copy,
@@ -1276,10 +1327,8 @@ fn tone_sample(phase: f32, sample_rate: f32) -> (f32, f32) {
     (value, next_phase)
 }
 
-fn set_error(error: &Mutex<Option<String>>, message: String) {
-    *error
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(message);
+fn set_error(error: &AudioErrorState, message: String) {
+    error.report(message);
 }
 
 struct AudioRingBuffer {
@@ -1374,7 +1423,7 @@ fn wasapi_device_id(cpal_id: &str) -> Result<&str, String> {
 }
 
 #[cfg(windows)]
-fn set_wasapi_error(error: &Mutex<Option<String>>, message: String) {
+fn set_wasapi_error(error: &AudioErrorState, message: String) {
     set_error(error, message);
 }
 
@@ -1384,7 +1433,7 @@ struct WasapiWorkerState {
     playback: Arc<PlaybackState>,
     ring: Arc<AudioRingBuffer>,
     input_peak: Arc<AtomicU32>,
-    error: Arc<Mutex<Option<String>>>,
+    error: Arc<AudioErrorState>,
     stop: Arc<std::sync::atomic::AtomicBool>,
 }
 

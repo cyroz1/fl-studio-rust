@@ -13058,6 +13058,23 @@ impl DawUi {
         }
 
         if let Some(engine) = &self.audio_engine {
+            let stream_error_count = engine.stream_error_count();
+            let underrun_frames = engine.streaming_underrun_frames();
+            ui.horizontal(|ui| {
+                ui.label(format!("Device stream errors: {stream_error_count}"));
+                if underrun_frames > 0 {
+                    ui.separator();
+                    ui.label(format!("Stream underruns: {underrun_frames} frames"));
+                }
+            });
+            if stream_error_count > 0 {
+                ui.collapsing("Recent device errors", |ui| {
+                    for message in engine.stream_error_history().iter().rev().take(6) {
+                        ui.label(egui::RichText::new(message).color(ORANGE));
+                    }
+                });
+            }
+
             ui.horizontal(|ui| {
                 if ui
                     .add_enabled(
