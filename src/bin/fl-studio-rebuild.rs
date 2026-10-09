@@ -27,10 +27,9 @@ use flp_rebuild::sample_render::{
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions, Vst3PatternStreamHandle};
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, AutomationChannel, AutomationPoint, AutomationPointEdit,
-    ChannelSortOrder, ChannelSummary, FlpDocument, FstPreset, FstPresetKind,
-    PATTERN_NOTE_SLIDE_FLAG, Pattern, PatternNote, PatternNoteEdit, PlaylistClip, PlaylistClipEdit,
-    PlaylistTrack, ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions, TimeMarker,
-    TimeMarkerEdit, VstPluginStateMetadata,
+    ChannelSortOrder, ChannelSummary, FlpDocument, FstPreset, FstPresetKind, Pattern, PatternNote,
+    PatternNoteEdit, PlaylistClip, PlaylistClipEdit, PlaylistTrack, ProjectInfoEdit,
+    ProjectSettingsEdit, RandomizerOptions, TimeMarker, TimeMarkerEdit, VstPluginStateMetadata,
 };
 
 const APP_BACKGROUND: Color32 = Color32::from_rgb(27, 27, 27);
