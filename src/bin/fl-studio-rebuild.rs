@@ -1685,7 +1685,7 @@ impl DawUi {
             browser_tab: BrowserTab::Files,
             browser_filter: BrowserFilter::All,
             browser_path,
-            browser_visible: true,
+            browser_visible: load_browser_visibility(),
             browser_column_width: load_browser_column_width(),
             browser_entries: Vec::new(),
             browser_index: None,
@@ -4006,7 +4006,7 @@ impl DawUi {
                     .selectable_label(self.browser_visible, "Browser  Alt/Opt+F8")
                     .clicked()
                 {
-                    self.browser_visible = !self.browser_visible;
+                    self.set_browser_visibility(!self.browser_visible);
                     ui.close();
                 }
             });
@@ -4275,6 +4275,16 @@ impl DawUi {
                     self.browser_path.display()
                 ));
             }
+        }
+    }
+
+    fn set_browser_visibility(&mut self, visible: bool) {
+        if self.browser_visible == visible {
+            return;
+        }
+        self.browser_visible = visible;
+        if let Err(error) = save_browser_visibility(visible) {
+            self.status = format!("Could not save Browser visibility: {error}");
         }
     }
 
@@ -13536,7 +13546,7 @@ impl eframe::App for DawUi {
         let toggle_browser_requested = !ui.ctx().egui_wants_keyboard_input()
             && ui.input_mut(|input| input.consume_key(egui::Modifiers::ALT, egui::Key::F8));
         if toggle_browser_requested {
-            self.browser_visible = !self.browser_visible;
+            self.set_browser_visibility(!self.browser_visible);
         }
         let recent_project_index = ui.input_mut(|input| {
             if !input.modifiers.alt
@@ -14138,6 +14148,31 @@ fn browser_column_width_settings_file() -> Option<PathBuf> {
     browser_favorites_file()?
         .parent()
         .map(|directory| directory.join("browser-column-width.txt"))
+}
+
+fn browser_visibility_settings_file() -> Option<PathBuf> {
+    browser_favorites_file()?
+        .parent()
+        .map(|directory| directory.join("browser-visible.txt"))
+}
+
+fn load_browser_visibility() -> bool {
+    browser_visibility_settings_file()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|contents| contents.trim().parse::<bool>().ok())
+        .unwrap_or(true)
+}
+
+fn save_browser_visibility(visible: bool) -> Result<(), String> {
+    let path = browser_visibility_settings_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the Browser visibility settings path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(&path, format!("{visible}\n"))
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
 }
 
 fn load_browser_column_width() -> f32 {
