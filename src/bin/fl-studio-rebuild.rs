@@ -1406,6 +1406,7 @@ struct DawUi {
     browser_tab: BrowserTab,
     browser_filter: BrowserFilter,
     browser_path: PathBuf,
+    browser_visible: bool,
     browser_column_width: f32,
     browser_entries: Vec<BrowserEntry>,
     browser_index: Option<BrowserIndex>,
@@ -1684,6 +1685,7 @@ impl DawUi {
             browser_tab: BrowserTab::Files,
             browser_filter: BrowserFilter::All,
             browser_path,
+            browser_visible: true,
             browser_column_width: load_browser_column_width(),
             browser_entries: Vec::new(),
             browser_index: None,
@@ -3999,6 +4001,14 @@ impl DawUi {
                         ui.close();
                     }
                 }
+                ui.separator();
+                if ui
+                    .selectable_label(self.browser_visible, "Browser  Alt/Opt+F8")
+                    .clicked()
+                {
+                    self.browser_visible = !self.browser_visible;
+                    ui.close();
+                }
             });
             ui.menu_button("Options", |ui| {
                 if ui
@@ -4053,6 +4063,7 @@ impl DawUi {
                     ("F6", "Channel Rack"),
                     ("F7", "Piano roll"),
                     ("F9", "Mixer"),
+                    ("Alt/Opt+F8", "Browser"),
                     ("Space", "Play / pause"),
                     ("Ctrl/Cmd+S", "Save project"),
                     ("Ctrl/Cmd+Z", "Undo"),
@@ -13522,6 +13533,11 @@ impl eframe::App for DawUi {
         if play_pause_requested {
             self.toggle_project_playback();
         }
+        let toggle_browser_requested = !ui.ctx().egui_wants_keyboard_input()
+            && ui.input_mut(|input| input.consume_key(egui::Modifiers::ALT, egui::Key::F8));
+        if toggle_browser_requested {
+            self.browser_visible = !self.browser_visible;
+        }
         let recent_project_index = ui.input_mut(|input| {
             if !input.modifiers.alt
                 || input.modifiers.ctrl
@@ -13691,47 +13707,51 @@ impl eframe::App for DawUi {
                 (full_height - MENU_BAR_HEIGHT - TRANSPORT_BAR_HEIGHT - STATUS_BAR_HEIGHT - 8.0)
                     .max(100.0);
             ui.horizontal(|ui| {
-                let browser_max_width =
-                    (width - 700.0).clamp(MIN_BROWSER_COLUMN_WIDTH, MAX_BROWSER_COLUMN_WIDTH);
-                self.browser_column_width = self
-                    .browser_column_width
-                    .clamp(MIN_BROWSER_COLUMN_WIDTH, browser_max_width);
-                ui.allocate_ui_with_layout(
-                    Vec2::new(self.browser_column_width, content_height),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        egui::Frame::new()
-                            .fill(PANEL)
-                            .inner_margin(egui::Margin::same(8))
-                            .show(ui, |ui| self.browser(ui));
-                    },
-                );
-                let (_, splitter) =
-                    ui.allocate_exact_size(Vec2::new(8.0, content_height), Sense::click_and_drag());
-                let splitter = splitter.on_hover_text("Drag to resize Browser");
-                if splitter.hovered() || splitter.dragged() {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-                }
-                let delta = splitter.drag_delta().x;
-                if delta != 0.0 {
-                    self.browser_column_width = (self.browser_column_width + delta)
+                if self.browser_visible {
+                    let browser_max_width =
+                        (width - 700.0).clamp(MIN_BROWSER_COLUMN_WIDTH, MAX_BROWSER_COLUMN_WIDTH);
+                    self.browser_column_width = self
+                        .browser_column_width
                         .clamp(MIN_BROWSER_COLUMN_WIDTH, browser_max_width);
-                }
-                let divider_color = if splitter.hovered() || splitter.dragged() {
-                    BLUE
-                } else {
-                    BORDER
-                };
-                let divider = egui::Rect::from_center_size(
-                    splitter.rect.center(),
-                    Vec2::new(1.0, content_height - 8.0),
-                );
-                ui.painter()
-                    .rect_filled(divider, egui::CornerRadius::same(1), divider_color);
-                if splitter.drag_stopped()
-                    && let Err(error) = save_browser_column_width(self.browser_column_width)
-                {
-                    self.status = format!("Could not save Browser width: {error}");
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(self.browser_column_width, content_height),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            egui::Frame::new()
+                                .fill(PANEL)
+                                .inner_margin(egui::Margin::same(8))
+                                .show(ui, |ui| self.browser(ui));
+                        },
+                    );
+                    let (_, splitter) = ui.allocate_exact_size(
+                        Vec2::new(8.0, content_height),
+                        Sense::click_and_drag(),
+                    );
+                    let splitter = splitter.on_hover_text("Drag to resize Browser");
+                    if splitter.hovered() || splitter.dragged() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                    }
+                    let delta = splitter.drag_delta().x;
+                    if delta != 0.0 {
+                        self.browser_column_width = (self.browser_column_width + delta)
+                            .clamp(MIN_BROWSER_COLUMN_WIDTH, browser_max_width);
+                    }
+                    let divider_color = if splitter.hovered() || splitter.dragged() {
+                        BLUE
+                    } else {
+                        BORDER
+                    };
+                    let divider = egui::Rect::from_center_size(
+                        splitter.rect.center(),
+                        Vec2::new(1.0, content_height - 8.0),
+                    );
+                    ui.painter()
+                        .rect_filled(divider, egui::CornerRadius::same(1), divider_color);
+                    if splitter.drag_stopped()
+                        && let Err(error) = save_browser_column_width(self.browser_column_width)
+                    {
+                        self.status = format!("Could not save Browser width: {error}");
+                    }
                 }
                 let content_width = ui.available_width().max(100.0);
                 ui.allocate_ui_with_layout(
