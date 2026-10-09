@@ -25,6 +25,7 @@ These observations come from the installed FL Studio 2026 desktop application an
 ## Channel Rack
 
 - Each channel row combines enable/mute and pan controls, a mixer assignment, a colored channel name, and a step-sequencer lane.
+- The Image-Line Channel Rack manual lists Mute as the first row control and describes muting/unmuting channels ([Channel Rack manual](https://www.image-line.com/fl-studio-learning-content/fl-studio-online-manual/html/channelrack.htm)). The rewrite now makes the left row indicator clickable and persists the state through `0x00`; supported song playback/render paths honor muted channels. The virtual-display check covers the rewrite only because an original FL Studio executable/project fixture is not installed here.
 - Instrument, sample, automation, and pattern-linked channels share the rack, while row controls and color vary by channel type.
 - A channel's instrument or effect opens in its own floating window; the project observed here had an instrument window over the Channel Rack.
 - The Graph Editor opens with Ctrl+K and displays per-step note properties as bars. Left-click and drag edits a bar; right-drag interpolates a ramp across steps; Ctrl adjusts all values together; Alt-click resets values. The documented properties include Note, Velocity, Release, Fine Pitch, Mod X/Y, Shift, Pan, and Rep ([Image-Line Channel Rack manual](https://www.image-line.com/fl-studio-learning-content/fl-studio-online-manual/html/channelrack.htm)).

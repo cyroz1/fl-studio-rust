@@ -6376,6 +6376,7 @@ impl DawUi {
             .unwrap_or(1)
             .clamp(1, 64) as usize;
         let mut open_editor = None;
+        let mut channel_enabled_edits = Vec::new();
         let mut level_edits = Vec::new();
         let mut layer_edits = Vec::new();
         let mut layer_flag_edits = Vec::new();
@@ -6436,11 +6437,37 @@ impl DawUi {
                     .inner_margin(4.0)
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            ui.label(if channel.enabled() == Some(false) {
-                                "○"
-                            } else {
-                                "●"
-                            });
+                            let is_enabled = channel.enabled() != Some(false);
+                            let (mute_rect, mute_response) =
+                                ui.allocate_exact_size(Vec2::splat(18.0), Sense::click());
+                            let mute_center = mute_rect.center();
+                            ui.painter().circle_filled(
+                                mute_center,
+                                5.0,
+                                if is_enabled { GREEN } else { PANEL_LIGHT },
+                            );
+                            ui.painter().circle_stroke(
+                                mute_center,
+                                5.0,
+                                Stroke::new(1.0, if is_enabled { TEXT } else { MUTED }),
+                            );
+                            if mute_response.hovered() {
+                                ui.painter().circle_stroke(
+                                    mute_center,
+                                    7.0,
+                                    Stroke::new(1.0, BLUE),
+                                );
+                            }
+                            if mute_response
+                                .on_hover_text(if is_enabled {
+                                    "Mute channel"
+                                } else {
+                                    "Unmute channel"
+                                })
+                                .clicked()
+                            {
+                                channel_enabled_edits.push((channel.id(), !is_enabled));
+                            }
                             let plugin_state = plugin_states
                                 .iter()
                                 .find(|state| state.channel_id() == channel.id());
@@ -6702,6 +6729,26 @@ impl DawUi {
         }
         if let Some(path) = new_sampler_sample {
             self.create_browser_sampler_channel(&path);
+        }
+        for (channel_id, enabled) in channel_enabled_edits {
+            let result = self
+                .document
+                .as_mut()
+                .map(|document| document.set_channel_enabled(channel_id, enabled));
+            match result {
+                Some(Ok(())) => {
+                    self.stop_project_playback();
+                    self.dirty = true;
+                    self.status = format!(
+                        "Channel {channel_id} {}",
+                        if enabled { "unmuted" } else { "muted" }
+                    );
+                }
+                Some(Err(error)) => {
+                    self.status = format!("Could not change channel mute state: {error}");
+                }
+                None => {}
+            }
         }
         if let Some(pattern_id) = self.selected_pattern
             && !step_toggles.is_empty()

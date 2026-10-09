@@ -5008,6 +5008,61 @@ impl FlpDocument {
         Ok(())
     }
 
+    /// Sets a channel's enabled state, which controls whether the Channel Rack row is muted.
+    /// Existing `0x00` events are edited in place; channels without one get a byte event after
+    /// their recognized `0x15` kind event. Other channel events are retained.
+    pub fn set_channel_enabled(&mut self, channel_id: u16, enabled: bool) -> Result<(), FlpError> {
+        let channels = self.channels();
+        let mut matching = channels.iter().filter(|channel| channel.id == channel_id);
+        let Some(channel) = matching.next() else {
+            return Err(FlpError::ChannelNotFound(channel_id));
+        };
+        if matching.next().is_some() {
+            return Err(FlpError::AmbiguousChannelId(channel_id));
+        }
+
+        let mut enable_events = channel
+            .event_range()
+            .filter(|index| self.events[*index].opcode == 0x00);
+        let existing_event = enable_events.next();
+        if enable_events.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel has multiple 0x00 enabled-state events",
+            ));
+        }
+
+        let mut candidate = self.clone();
+        if let Some(event_index) = existing_event {
+            candidate.events[event_index].replace_byte_payload(u8::from(enabled))?;
+        } else {
+            let mut kind_events = channel
+                .event_range()
+                .filter(|index| self.events[*index].opcode == 0x15);
+            let Some(kind_index) = kind_events.next() else {
+                return Err(FlpError::UnsupportedEdit(
+                    "the selected channel has no recognized 0x15 kind event",
+                ));
+            };
+            if kind_events.next().is_some() {
+                return Err(FlpError::UnsupportedEdit(
+                    "the selected channel has multiple 0x15 kind events",
+                ));
+            }
+            let kind_event = &candidate.events[kind_index];
+            if kind_event.encoding != PayloadEncoding::Byte || kind_event.payload.len() != 1 {
+                return Err(FlpError::UnsupportedEdit(
+                    "the selected channel's 0x15 kind event is not a one-byte event",
+                ));
+            }
+            candidate
+                .events
+                .insert(kind_index + 1, FlpEvent::new_byte(0x00, u8::from(enabled)));
+        }
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
     /// Adds a Sampler channel with the given source path and display name.
     ///
     /// The channel uses the project's recognized string encoding, gets the next available
@@ -7079,6 +7134,60 @@ mod tests {
             assert_eq!(channels.len(), 1);
             assert_eq!(channels[0].sample_path(), Some(path));
             assert_eq!(document.encode_lossless().unwrap(), input);
+        }
+    }
+
+    #[test]
+    fn sets_channel_enabled_by_updating_or_inserting_its_event_losslessly() {
+        let tail = [0xA5, 0x5A];
+        for has_enabled_event in [false, true] {
+            let mut event_stream = vec![0x40, 7, 0, 0x15, 0];
+            if has_enabled_event {
+                event_stream.extend_from_slice(&[0x00, 1]);
+            }
+            event_stream.extend_from_slice(&[0x48, 0x34, 0x12, 0x62, 0, 0]);
+            let input = flp_fixture(&event_stream, &[], &tail);
+            let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+            let mut expected_events = document
+                .events()
+                .iter()
+                .map(|event| event.wire_bytes.clone())
+                .collect::<Vec<_>>();
+
+            if has_enabled_event {
+                let enabled_index = document
+                    .events()
+                    .iter()
+                    .position(|event| event.opcode() == 0x00)
+                    .expect("fixture should have an enabled event");
+                expected_events[enabled_index] = vec![0x00, 0];
+            } else {
+                let kind_index = document
+                    .events()
+                    .iter()
+                    .position(|event| event.opcode() == 0x15)
+                    .expect("fixture should have a channel kind event");
+                expected_events.insert(kind_index + 1, vec![0x00, 0]);
+            }
+
+            document
+                .set_channel_enabled(7, false)
+                .expect("channel should be muted");
+
+            assert_eq!(document.channels()[0].enabled(), Some(false));
+            assert_eq!(document.channels()[0].volume(), Some(0x1234));
+            assert_eq!(
+                document
+                    .events()
+                    .iter()
+                    .map(|event| event.wire_bytes.clone())
+                    .collect::<Vec<_>>(),
+                expected_events
+            );
+            let encoded = document.encode_lossless().expect("document should encode");
+            assert!(encoded.ends_with(&tail));
+            let round_trip = FlpDocument::parse(&encoded).expect("muted project should parse");
+            assert_eq!(round_trip.channels()[0].enabled(), Some(false));
         }
     }
 
