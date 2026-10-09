@@ -30,10 +30,8 @@ const TEST_TONE_LEVEL: f32 = 0.12;
 pub(crate) fn enable_denormal_protection() {
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        use std::arch::x86_64::{_mm_getcsr, _mm_setcsr};
-
         const FTZ_AND_DAZ: u32 = (1 << 15) | (1 << 6);
-        _mm_setcsr(_mm_getcsr() | FTZ_AND_DAZ);
+        write_mxcsr(read_mxcsr() | FTZ_AND_DAZ);
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -47,6 +45,32 @@ pub(crate) fn enable_denormal_protection() {
         std::arch::asm!(
             "msr fpcr, {control}",
             control = in(reg) (control | (1 << 24)),
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn read_mxcsr() -> u32 {
+    let mut value = 0_u32;
+    unsafe {
+        std::arch::asm!(
+            "stmxcsr [{address}]",
+            address = in(reg) &mut value,
+            options(nostack, preserves_flags)
+        );
+    }
+    value
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn write_mxcsr(value: u32) {
+    unsafe {
+        std::arch::asm!(
+            "ldmxcsr [{address}]",
+            address = in(reg) &value,
             options(nostack, preserves_flags)
         );
     }
@@ -1806,13 +1830,12 @@ mod tests {
     fn denormal_protection_enables_the_architecture_flush_mode() {
         #[cfg(target_arch = "x86_64")]
         {
-            use std::arch::x86_64::{_mm_getcsr, _mm_setcsr};
-
+            use super::{read_mxcsr, write_mxcsr};
             const FTZ_AND_DAZ: u32 = (1 << 15) | (1 << 6);
-            let previous = unsafe { _mm_getcsr() };
+            let previous = read_mxcsr();
             enable_denormal_protection();
-            let enabled = unsafe { _mm_getcsr() };
-            unsafe { _mm_setcsr(previous) };
+            let enabled = read_mxcsr();
+            write_mxcsr(previous);
             assert_eq!(enabled & FTZ_AND_DAZ, FTZ_AND_DAZ);
         }
 
