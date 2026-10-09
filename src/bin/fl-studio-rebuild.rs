@@ -7080,23 +7080,25 @@ impl DawUi {
                 ChannelDisplayFilter::Group(index) => Some(index),
                 ChannelDisplayFilter::All | ChannelDisplayFilter::Unsorted => None,
             };
-            display_filter.response.context_menu(|ui| {
-                if ui.button("Add Filter Group…").clicked() {
-                    open_empty_group_dialog = true;
-                    ui.close();
-                }
-                if let Some(group_index) = selected_group {
-                    ui.separator();
-                    if ui.button("Rename Group…").clicked() {
-                        rename_group_dialog = Some(group_index);
+            egui::Popup::context_menu(&display_filter.response)
+                .id(Id::new("channel-rack-display-filter-context"))
+                .show(|ui| {
+                    if ui.button("Add Filter Group…").clicked() {
+                        open_empty_group_dialog = true;
                         ui.close();
                     }
-                    if ui.button("Delete Group").clicked() {
-                        delete_group = Some(group_index);
-                        ui.close();
+                    if let Some(group_index) = selected_group {
+                        ui.separator();
+                        if ui.button("Rename Group…").clicked() {
+                            rename_group_dialog = Some(group_index);
+                            ui.close();
+                        }
+                        if ui.button("Delete Group").clicked() {
+                            delete_group = Some(group_index);
+                            ui.close();
+                        }
                     }
-                }
-            });
+                });
             if ui.small_button("◀").clicked() {
                 self.step_sequencer_bar = self.step_sequencer_bar.saturating_sub(1);
             }
