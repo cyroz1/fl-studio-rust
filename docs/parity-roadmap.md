@@ -216,7 +216,7 @@ FL Studio's piano roll is famously deep — the full toolset:
 
 ## 7. Step sequencer / Channel rack
 
-- `[partial]` Channel list with plugin names, volume/pan sliders, per-channel mute buttons backed by `0x00`, Ctrl/Cmd-toggle and Shift-range multi-selection plus context-menu selection and batch mute/unmute, up/down reordering that moves complete channel event blocks without changing IDs, stable name/type sorting, and editable Layer child IDs
+- `[partial]` Channel list with plugin names, volume/pan sliders, per-channel mute buttons backed by `0x00`, Ctrl/Cmd-toggle and Shift-range multi-selection, double-click select-all, context-menu selection and batch mute/unmute, up/down reordering that moves complete channel event blocks without changing IDs, stable name/type sorting, and editable Layer child IDs
 - `[partial]` Pattern/bar step grid toggles notes at sixteenth-note positions; new steps use key 60 and velocity 100. The Ctrl+K Graph Editor draws and edits per-step note key, velocity, pan, release, fine pitch, modulation X/Y, and shift, creates a C5 note on an empty step, and interpolates values when right-dragging across steps. The Rep lane, Ctrl scale-all gesture, Alt reset gesture, and multiple notes at one step remain incomplete
 - `[todo]` Channel grouping and zipping; sorting by color and Mixer track
 - `[partial]` Right-clicking a Channel Rack channel name opens that channel in the Piano roll for the selected pattern; per-channel swing and time multiplier remain

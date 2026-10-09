@@ -6688,6 +6688,12 @@ impl DawUi {
                                 self.selected_graph_channel = Some(channel.id());
                                 self.selected_note_channel = Some(channel.id());
                             }
+                            if channel_button.double_clicked() {
+                                self.selected_rack_channels = channel_ids.iter().copied().collect();
+                                self.rack_selection_anchor = Some(channel.id());
+                                self.selected_graph_channel = Some(channel.id());
+                                self.selected_note_channel = Some(channel.id());
+                            }
                             channel_button.context_menu(|ui| {
                                 let channel_selected =
                                     self.selected_rack_channels.contains(&channel.id());
