@@ -498,9 +498,9 @@ impl StepGraphMode {
     fn maximum(self) -> f32 {
         match self {
             Self::Note => 132.0,
-            Self::Velocity | Self::Release | Self::ModX | Self::ModY => 127.0,
+            Self::Velocity | Self::Release => 127.0,
             Self::Pan => 128.0,
-            Self::FinePitch => 255.0,
+            Self::FinePitch | Self::ModX | Self::ModY => 255.0,
             Self::Shift => 100.0,
         }
     }
@@ -508,8 +508,18 @@ impl StepGraphMode {
     fn center(self) -> Option<f32> {
         match self {
             Self::Pan => Some(64.0),
-            Self::FinePitch => Some(128.0),
+            Self::FinePitch | Self::ModX | Self::ModY => Some(128.0),
             _ => None,
+        }
+    }
+
+    fn reset_value(self) -> f32 {
+        match self {
+            Self::Note => 60.0,
+            Self::Velocity => 100.0,
+            Self::Pan => 64.0,
+            Self::Release | Self::Shift => 0.0,
+            Self::FinePitch | Self::ModX | Self::ModY => 128.0,
         }
     }
 
@@ -858,6 +868,34 @@ struct StepGraphRamp {
     mode: StepGraphMode,
     start_step: usize,
     start_value: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StepGraphScaleValue {
+    step: usize,
+    note_index: usize,
+    start_value: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct StepGraphScale {
+    pattern_id: u16,
+    channel_id: u16,
+    mode: StepGraphMode,
+    bar_index: u32,
+    start_step: usize,
+    start_value: f32,
+    last_value: f32,
+    values: Vec<StepGraphScaleValue>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StepGraphReset {
+    pattern_id: u16,
+    channel_id: u16,
+    mode: StepGraphMode,
+    bar_index: u32,
+    last_step: usize,
 }
 
 enum AutomationEditAction {
@@ -1287,6 +1325,8 @@ struct DawUi {
     step_graph_mode: StepGraphMode,
     step_graph_editor_open: bool,
     step_graph_ramp: Option<StepGraphRamp>,
+    step_graph_scale: Option<StepGraphScale>,
+    step_graph_reset: Option<StepGraphReset>,
     active_note_drag: Option<ActiveNoteDrag>,
     piano_roll_snap: PianoRollSnap,
     piano_roll_edit_scope: PianoRollEditScope,
@@ -1559,6 +1599,8 @@ impl DawUi {
             step_graph_mode: StepGraphMode::Velocity,
             step_graph_editor_open: false,
             step_graph_ramp: None,
+            step_graph_scale: None,
+            step_graph_reset: None,
             active_note_drag: None,
             piano_roll_snap: PianoRollSnap::QuarterBeat,
             piano_roll_edit_scope: PianoRollEditScope::Automatic,
@@ -8059,7 +8101,7 @@ impl DawUi {
         let (graph_rect, graph_response) =
             ui.allocate_exact_size(graph_size, Sense::click_and_drag());
         let graph_response = graph_response.on_hover_text(
-            "Left-click or drag to edit. Right-drag ramps values across steps. Clicking an empty step adds a C5 note.",
+            "Left-click or drag to edit. Ctrl-drag adjusts all active values together. Alt-click or drag resets active values. Right-drag ramps values across steps. Clicking an empty step adds a C5 note.",
         );
         let painter = ui.painter_at(graph_rect);
         painter.rect_filled(graph_rect, egui::CornerRadius::same(3), PANEL_DARK);
@@ -8175,6 +8217,69 @@ impl DawUi {
         let step_at = |pointer: egui::Pos2| {
             (((pointer.x - plot_rect.left()) / step_width).floor() as usize).min(step_count - 1)
         };
+        let bar_index = self.step_sequencer_bar;
+        let bar_start = u64::from(bar_index).saturating_mul(measure_ticks);
+        let tick_at_step =
+            |step: usize| bar_start.saturating_add((step as u64).saturating_mul(step_ticks));
+        let active_note_at_step = |step: usize| {
+            let tick = tick_at_step(step);
+            let step_end = tick.saturating_add(step_ticks);
+            notes
+                .iter()
+                .find(|(_, note)| {
+                    let note_tick = u64::from(note.position);
+                    note_tick >= tick && note_tick < step_end
+                })
+                .map(|(note_index, note)| (*note_index, *note))
+        };
+        let (primary_pressed, primary_down, primary_released, modifiers) = ui.input(|input| {
+            (
+                input.pointer.button_pressed(PointerButton::Primary),
+                input.pointer.button_down(PointerButton::Primary),
+                input.pointer.button_released(PointerButton::Primary),
+                input.modifiers,
+            )
+        });
+        let scale_all_modifier = modifiers.ctrl || modifiers.command;
+        if primary_pressed
+            && let Some(pointer) = pointer
+            && plot_rect.contains(pointer)
+        {
+            self.step_graph_scale = None;
+            self.step_graph_reset = None;
+            self.step_graph_ramp = None;
+            let start_step = step_at(pointer);
+            if modifiers.alt {
+                self.step_graph_reset = Some(StepGraphReset {
+                    pattern_id: pattern.id,
+                    channel_id,
+                    mode,
+                    bar_index,
+                    last_step: start_step,
+                });
+            } else if scale_all_modifier && let Some((_, note)) = active_note_at_step(start_step) {
+                let start_value = mode.value(note, tick_at_step(start_step), step_ticks);
+                let values = (0..step_count)
+                    .filter_map(|step| {
+                        active_note_at_step(step).map(|(note_index, note)| StepGraphScaleValue {
+                            step,
+                            note_index,
+                            start_value: mode.value(note, tick_at_step(step), step_ticks),
+                        })
+                    })
+                    .collect();
+                self.step_graph_scale = Some(StepGraphScale {
+                    pattern_id: pattern.id,
+                    channel_id,
+                    mode,
+                    bar_index,
+                    start_step,
+                    start_value,
+                    last_value: start_value,
+                    values,
+                });
+            }
+        }
         let secondary_pressed =
             ui.input(|input| input.pointer.button_pressed(PointerButton::Secondary));
         let secondary_down = ui.input(|input| input.pointer.button_down(PointerButton::Secondary));
@@ -8208,26 +8313,91 @@ impl DawUi {
         }) {
             self.step_graph_ramp = None;
         }
+        if self.step_graph_scale.as_ref().is_some_and(|scale| {
+            scale.pattern_id != pattern.id
+                || scale.channel_id != channel_id
+                || scale.mode != mode
+                || scale.bar_index != bar_index
+        }) {
+            self.step_graph_scale = None;
+        }
+        if self.step_graph_reset.is_some_and(|reset| {
+            reset.pattern_id != pattern.id
+                || reset.channel_id != channel_id
+                || reset.mode != mode
+                || reset.bar_index != bar_index
+        }) {
+            self.step_graph_reset = None;
+        }
 
         let mut graph_actions = Vec::new();
-        if (graph_response.clicked_by(PointerButton::Primary)
-            || graph_response.dragged_by(PointerButton::Primary))
+        let reset_gesture = self.step_graph_reset;
+        let scale_gesture = self.step_graph_scale.clone();
+        if let Some(reset) = reset_gesture
+            && (primary_pressed || primary_down || primary_released)
+            && let Some(pointer) = pointer
+            && plot_rect.contains(pointer)
+        {
+            let current_step = step_at(pointer);
+            let lower = reset.last_step.min(current_step);
+            let upper = reset.last_step.max(current_step);
+            for step in lower..=upper {
+                if step == reset.last_step && !primary_pressed {
+                    continue;
+                }
+                if let Some((note_index, note)) = active_note_at_step(step) {
+                    let tick = tick_at_step(step);
+                    let reset_value = mode.reset_value();
+                    if (mode.value(note, tick, step_ticks) - reset_value).abs() > 0.01 {
+                        graph_actions.push((
+                            step,
+                            tick.min(u64::from(u32::MAX)) as u32,
+                            Some(note_index),
+                            reset_value,
+                        ));
+                    }
+                }
+            }
+            self.step_graph_reset = Some(StepGraphReset {
+                last_step: current_step,
+                ..reset
+            });
+        } else if let Some(scale) = scale_gesture.as_ref()
+            && (primary_pressed || primary_down || primary_released)
+            && let Some(pointer) = pointer
+            && plot_rect.contains(pointer)
+        {
+            let target_value = pointer_value(pointer);
+            let change = target_value - scale.start_value;
+            if (target_value - scale.last_value).abs() > 0.01 {
+                for value in &scale.values {
+                    let scaled_value = (value.start_value + change).clamp(0.0, maximum);
+                    if (value.start_value - scaled_value).abs() > 0.01 {
+                        let tick = tick_at_step(value.step);
+                        graph_actions.push((
+                            value.step,
+                            tick.min(u64::from(u32::MAX)) as u32,
+                            Some(value.note_index),
+                            scaled_value,
+                        ));
+                    }
+                }
+            }
+            self.step_graph_scale = Some(StepGraphScale {
+                last_value: target_value,
+                ..scale.clone()
+            });
+        } else if self.step_graph_reset.is_none()
+            && self.step_graph_scale.is_none()
+            && (graph_response.clicked_by(PointerButton::Primary)
+                || graph_response.dragged_by(PointerButton::Primary))
             && let Some(pointer) = graph_response.interact_pointer_pos()
             && plot_rect.contains(pointer)
         {
             let step = step_at(pointer);
-            let tick = u64::from(self.step_sequencer_bar)
-                .saturating_mul(measure_ticks)
-                .saturating_add((step as u64).saturating_mul(step_ticks));
+            let tick = tick_at_step(step);
             let position = tick.min(u64::from(u32::MAX)) as u32;
-            let step_end = tick.saturating_add(step_ticks);
-            let note_index = notes
-                .iter()
-                .find(|(_, note)| {
-                    let note_tick = u64::from(note.position);
-                    note_tick >= tick && note_tick < step_end
-                })
-                .map(|(note_index, _)| *note_index);
+            let note_index = active_note_at_step(step).map(|(note_index, _)| note_index);
             graph_actions.push((step, position, note_index, pointer_value(pointer)));
         }
 
@@ -8269,6 +8439,10 @@ impl DawUi {
         if secondary_released {
             self.step_graph_ramp = None;
         }
+        if primary_released {
+            self.step_graph_scale = None;
+            self.step_graph_reset = None;
+        }
 
         if !graph_actions.is_empty() {
             let pattern_id = pattern.id;
@@ -8309,7 +8483,40 @@ impl DawUi {
                         .last()
                         .map(|action| action.0 + 1)
                         .unwrap_or(first_step);
-                    self.status = if graph_actions.len() > 1 {
+                    let first_step = graph_actions
+                        .iter()
+                        .map(|action| action.0 + 1)
+                        .min()
+                        .unwrap_or(first_step);
+                    let last_step = graph_actions
+                        .iter()
+                        .map(|action| action.0 + 1)
+                        .max()
+                        .unwrap_or(last_step);
+                    self.status = if reset_gesture.is_some() {
+                        format!(
+                            "Reset {} on bar {} steps {}–{} in pattern {}",
+                            mode.label().to_lowercase(),
+                            bar_index + 1,
+                            first_step,
+                            last_step,
+                            pattern_id
+                        )
+                    } else if scale_gesture.is_some() {
+                        let start_step = scale_gesture
+                            .as_ref()
+                            .map(|scale| scale.start_step + 1)
+                            .unwrap_or(first_step);
+                        format!(
+                            "Scaled {} values from step {} across bar {} steps {}–{} in pattern {}",
+                            mode.label().to_lowercase(),
+                            start_step,
+                            bar_index + 1,
+                            first_step,
+                            last_step,
+                            pattern_id
+                        )
+                    } else if graph_actions.len() > 1 {
                         format!(
                             "Ramped {} across bar {} steps {}–{} in pattern {}",
                             mode.label().to_lowercase(),
