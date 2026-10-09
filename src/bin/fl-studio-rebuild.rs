@@ -50,7 +50,9 @@ const RED: Color32 = Color32::from_rgb(252, 67, 46);
 const MENU_BAR_HEIGHT: f32 = 32.0;
 const TRANSPORT_BAR_HEIGHT: f32 = 46.0;
 const STATUS_BAR_HEIGHT: f32 = 27.0;
-const BROWSER_COLUMN_WIDTH: f32 = 232.0;
+const DEFAULT_BROWSER_COLUMN_WIDTH: f32 = 232.0;
+const MIN_BROWSER_COLUMN_WIDTH: f32 = 180.0;
+const MAX_BROWSER_COLUMN_WIDTH: f32 = 500.0;
 const HISTORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 const AUDIO_WAVEFORM_BUCKETS: usize = 4096;
 const MAX_WAVEFORM_WORKERS: usize = 1;
@@ -1404,6 +1406,7 @@ struct DawUi {
     browser_tab: BrowserTab,
     browser_filter: BrowserFilter,
     browser_path: PathBuf,
+    browser_column_width: f32,
     browser_entries: Vec<BrowserEntry>,
     browser_index: Option<BrowserIndex>,
     pending_browser_index: Option<PendingBrowserIndex>,
@@ -1681,6 +1684,7 @@ impl DawUi {
             browser_tab: BrowserTab::Files,
             browser_filter: BrowserFilter::All,
             browser_path,
+            browser_column_width: load_browser_column_width(),
             browser_entries: Vec::new(),
             browser_index: None,
             pending_browser_index: None,
@@ -13640,8 +13644,14 @@ impl eframe::App for DawUi {
                 (full_height - MENU_BAR_HEIGHT - TRANSPORT_BAR_HEIGHT - STATUS_BAR_HEIGHT - 8.0)
                     .max(100.0);
             ui.horizontal(|ui| {
+                let browser_max_width = (width - 700.0)
+                    .max(MIN_BROWSER_COLUMN_WIDTH)
+                    .min(MAX_BROWSER_COLUMN_WIDTH);
+                self.browser_column_width = self
+                    .browser_column_width
+                    .clamp(MIN_BROWSER_COLUMN_WIDTH, browser_max_width);
                 ui.allocate_ui_with_layout(
-                    Vec2::new(BROWSER_COLUMN_WIDTH, content_height),
+                    Vec2::new(self.browser_column_width, content_height),
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
                         egui::Frame::new()
@@ -13650,7 +13660,33 @@ impl eframe::App for DawUi {
                             .show(ui, |ui| self.browser(ui));
                     },
                 );
-                ui.separator();
+                let (_, splitter) =
+                    ui.allocate_exact_size(Vec2::new(8.0, content_height), Sense::click_and_drag());
+                let splitter = splitter.on_hover_text("Drag to resize Browser");
+                if splitter.hovered() || splitter.dragged() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                }
+                let delta = splitter.drag_delta().x;
+                if delta != 0.0 {
+                    self.browser_column_width = (self.browser_column_width + delta)
+                        .clamp(MIN_BROWSER_COLUMN_WIDTH, browser_max_width);
+                }
+                let divider_color = if splitter.hovered() || splitter.dragged() {
+                    BLUE
+                } else {
+                    BORDER
+                };
+                let divider = egui::Rect::from_center_size(
+                    splitter.rect.center(),
+                    Vec2::new(1.0, content_height - 8.0),
+                );
+                ui.painter()
+                    .rect_filled(divider, egui::CornerRadius::same(1), divider_color);
+                if splitter.drag_stopped()
+                    && let Err(error) = save_browser_column_width(self.browser_column_width)
+                {
+                    self.status = format!("Could not save Browser width: {error}");
+                }
                 let content_width = ui.available_width().max(100.0);
                 ui.allocate_ui_with_layout(
                     Vec2::new(content_width, content_height),
@@ -14030,6 +14066,42 @@ fn ui_scale_settings_file() -> Option<PathBuf> {
     browser_favorites_file()?
         .parent()
         .map(|directory| directory.join("ui-scale.txt"))
+}
+
+fn browser_column_width_settings_file() -> Option<PathBuf> {
+    browser_favorites_file()?
+        .parent()
+        .map(|directory| directory.join("browser-column-width.txt"))
+}
+
+fn load_browser_column_width() -> f32 {
+    let Some(path) = browser_column_width_settings_file() else {
+        return DEFAULT_BROWSER_COLUMN_WIDTH;
+    };
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|contents| contents.trim().parse::<f32>().ok())
+        .filter(|width| {
+            width.is_finite()
+                && (MIN_BROWSER_COLUMN_WIDTH..=MAX_BROWSER_COLUMN_WIDTH).contains(width)
+        })
+        .unwrap_or(DEFAULT_BROWSER_COLUMN_WIDTH)
+}
+
+fn save_browser_column_width(width: f32) -> Result<(), String> {
+    if !width.is_finite() || !(MIN_BROWSER_COLUMN_WIDTH..=MAX_BROWSER_COLUMN_WIDTH).contains(&width)
+    {
+        return Err(format!("unsupported Browser width: {width}"));
+    }
+    let path = browser_column_width_settings_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the Browser width settings path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(&path, format!("{width:.1}\n"))
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
 }
 
 fn load_ui_scale() -> f32 {
