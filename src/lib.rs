@@ -6463,9 +6463,9 @@ fn decode_vst_text(bytes: &[u8]) -> Option<String> {
 mod tests {
     use super::{
         ChannelNoteRouter, ChannelSortOrder, ChannelSummary, FlpDocument, FlpError, FstPreset,
-        FstPresetKind, MixerParameterKind, PatternNote, PayloadEncoding, ProjectInfoEdit,
-        ProjectSettingsEdit, TimeMarkerEdit, midi::MidiChannelMapping, midi::MidiFile,
-        parse_vst_plugin_state_metadata,
+        FstPresetKind, MixerParameterKind, PATTERN_NOTE_SLIDE_FLAG, PatternNote, PatternNoteEdit,
+        PayloadEncoding, ProjectInfoEdit, ProjectSettingsEdit, TimeMarkerEdit,
+        midi::MidiChannelMapping, midi::MidiFile, parse_vst_plugin_state_metadata,
     };
 
     fn flp_fixture(event_stream: &[u8], header_extension: &[u8], trailing: &[u8]) -> Vec<u8> {
