@@ -6665,6 +6665,7 @@ impl DawUi {
             .clamp(1, 64) as usize;
         let mut open_editor = None;
         let mut channel_enabled_edits = Vec::new();
+        let mut channel_zipped_edits = Vec::new();
         let mut channel_color_edits = Vec::new();
         let mut channel_order_edits = Vec::new();
         let mut channel_sort = None;
@@ -6719,6 +6720,50 @@ impl DawUi {
                     ui.close();
                 }
             });
+            ui.menu_button("Channels", |ui| {
+                let selected_ids = self
+                    .selected_rack_channels
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>();
+                if ui.button("Zip selected").clicked() {
+                    channel_zipped_edits.extend(
+                        selected_ids
+                            .iter()
+                            .copied()
+                            .filter(|id| {
+                                channels
+                                    .iter()
+                                    .any(|channel| channel.id() == *id && !channel.zipped())
+                            })
+                            .map(|id| (id, true)),
+                    );
+                    ui.close();
+                }
+                if ui.button("Unzip selected").clicked() {
+                    channel_zipped_edits.extend(
+                        selected_ids
+                            .iter()
+                            .copied()
+                            .filter(|id| {
+                                channels
+                                    .iter()
+                                    .any(|channel| channel.id() == *id && channel.zipped())
+                            })
+                            .map(|id| (id, false)),
+                    );
+                    ui.close();
+                }
+                if ui.button("Unzip all").clicked() {
+                    channel_zipped_edits.extend(
+                        channels
+                            .iter()
+                            .filter(|channel| channel.zipped())
+                            .map(|channel| (channel.id(), false)),
+                    );
+                    ui.close();
+                }
+            });
         });
         let selected_pattern = self
             .selected_pattern
@@ -6729,6 +6774,7 @@ impl DawUi {
             for (channel_index, channel) in channels.iter().enumerate() {
                 let mut volume = channel.volume().unwrap_or(10_000);
                 let mut pan = channel.pan().unwrap_or(6_400);
+                let zipped = channel.zipped();
                 let levels_editable = channel.levels_editable();
                 let mut volume_changed = false;
                 let mut pan_changed = false;
@@ -6742,6 +6788,7 @@ impl DawUi {
                     .inner_margin(4.0)
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
+                            if !zipped {
                             let is_enabled = channel.enabled() != Some(false);
                             let (mute_rect, mute_response) =
                                 ui.allocate_exact_size(Vec2::splat(18.0), Sense::click());
@@ -6853,6 +6900,7 @@ impl DawUi {
                             if move_down_response.clicked() {
                                 channel_order_edits.push((channel.id(), channel_index + 1));
                             }
+                            }
                             let plugin_state = plugin_states
                                 .iter()
                                 .find(|state| state.channel_id() == channel.id());
@@ -6870,7 +6918,12 @@ impl DawUi {
                                 } else {
                                     PANEL_LIGHT
                                 }),
-                            );
+                            )
+                            .on_hover_text(if zipped {
+                                "Zipped channel · right-click to unzip"
+                            } else {
+                                "Channel · right-click for options"
+                            });
                             let accepts_sample_drop =
                                 matches!(channel.kind(), Some(0 | 4)) && channel.sample_path().is_some();
                             if accepts_sample_drop {
@@ -6944,6 +6997,16 @@ impl DawUi {
                                     ui.close();
                                 }
                                 ui.separator();
+                                if zipped {
+                                    if ui.button("Unzip channel").clicked() {
+                                        channel_zipped_edits.push((channel.id(), false));
+                                        ui.close();
+                                    }
+                                } else if ui.button("Zip channel").clicked() {
+                                    channel_zipped_edits.push((channel.id(), true));
+                                    ui.close();
+                                }
+                                ui.separator();
                                 let selected_ids = if self.selected_rack_channels.is_empty() {
                                     vec![channel.id()]
                                 } else {
@@ -6976,6 +7039,44 @@ impl DawUi {
                                     ui.close();
                                 }
                             });
+                            if zipped && let Some(pattern) = &selected_pattern {
+                                    ui.separator();
+                                    ui.small("Steps");
+                                    let channel_notes = pattern
+                                        .notes
+                                        .iter()
+                                        .filter(|note| note.channel_id == channel.id())
+                                        .collect::<Vec<_>>();
+                                    for step in 0..steps_per_bar {
+                                        let tick = u64::from(self.step_sequencer_bar)
+                                            .saturating_mul(measure_ticks)
+                                            .saturating_add((step as u64).saturating_mul(step_ticks));
+                                        let position = tick.min(u64::from(u32::MAX)) as u32;
+                                        let step_end = tick.saturating_add(step_ticks);
+                                        let active_note = channel_notes
+                                            .iter()
+                                            .enumerate()
+                                            .find_map(|(index, note)| {
+                                                let note_tick = u64::from(note.position);
+                                                (note_tick >= tick && note_tick < step_end)
+                                                    .then_some(index)
+                                            });
+                                        if ui
+                                            .selectable_label(
+                                                active_note.is_some(),
+                                                format!("{:02}", step + 1),
+                                            )
+                                            .clicked()
+                                        {
+                                            step_toggles.push((
+                                                channel.id(),
+                                                active_note,
+                                                position,
+                                            ));
+                                        }
+                                    }
+                                }
+                            if !zipped {
                             ui.label(
                                 plugin_state
                                     .and_then(|state| state.vst_metadata())
@@ -7025,7 +7126,9 @@ impl DawUi {
                                     }
                                 },
                             );
+                            }
                         });
+                        if !zipped {
                         if let Some(mut selected_children) =
                             channel.layer_child_ids().map(<[u16]>::to_vec)
                         {
@@ -7116,6 +7219,7 @@ impl DawUi {
                                 }
                             });
                         }
+                        }
                     });
                 if volume_changed || pan_changed {
                     level_edits.push((channel.id(), volume, pan));
@@ -7126,7 +7230,7 @@ impl DawUi {
                 if let Some((random, crossfade)) = layer_flags_apply {
                     layer_flag_edits.push((channel.id(), random, crossfade));
                 }
-                if let Some(pattern) = &selected_pattern {
+                if !zipped && let Some(pattern) = &selected_pattern {
                     ui.horizontal_wrapped(|ui| {
                         ui.small("Steps");
                         let mut channel_note_index = 0usize;
@@ -7219,6 +7323,25 @@ impl DawUi {
                 }
                 Some(Err(error)) => {
                     self.status = format!("Could not change channel mute state: {error}");
+                }
+                None => {}
+            }
+        }
+        for (channel_id, zipped) in channel_zipped_edits {
+            let result = self
+                .document
+                .as_mut()
+                .map(|document| document.set_channel_zipped(channel_id, zipped));
+            match result {
+                Some(Ok(())) => {
+                    self.dirty = true;
+                    self.status = format!(
+                        "Channel {channel_id} {}",
+                        if zipped { "zipped" } else { "unzipped" }
+                    );
+                }
+                Some(Err(error)) => {
+                    self.status = format!("Could not change channel compact state: {error}");
                 }
                 None => {}
             }

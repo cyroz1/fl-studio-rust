@@ -370,6 +370,7 @@ pub struct ChannelSummary {
     id: u16,
     kind: Option<u8>,
     enabled: Option<bool>,
+    zipped: bool,
     color: Option<u32>,
     volume: Option<u32>,
     pan: Option<i32>,
@@ -531,6 +532,12 @@ impl ChannelSummary {
 
     pub fn enabled(&self) -> Option<bool> {
         self.enabled
+    }
+
+    /// Whether FL Studio saved this channel in compact (zipped) Channel Rack mode.
+    /// A missing `0x0F` event defaults to false.
+    pub fn zipped(&self) -> bool {
+        self.zipped
     }
 
     /// Raw four-byte channel color value, in little-endian RGBA byte order.
@@ -1410,6 +1417,9 @@ impl FlpDocument {
                 }
                 0x00 if event.payload.len() == 1 => {
                     channel.enabled = Some(event.payload[0] != 0);
+                }
+                0x0F if event.payload.len() == 1 => {
+                    channel.zipped = event.payload[0] != 0;
                 }
                 0x15 if event.payload.len() == 1 => channel.kind = Some(event.payload[0]),
                 0x5E if event.payload.len() == 2 => {
@@ -5160,6 +5170,64 @@ impl FlpDocument {
         Ok(())
     }
 
+    /// Sets the Channel Rack compact (zipped) state using the observed `0x0F` event.
+    /// Existing events are edited in place; zipping a channel without one inserts a byte event
+    /// after its recognized `0x15` kind event. Other channel events are retained.
+    pub fn set_channel_zipped(&mut self, channel_id: u16, zipped: bool) -> Result<(), FlpError> {
+        let channels = self.channels();
+        let mut matching = channels.iter().filter(|channel| channel.id == channel_id);
+        let Some(channel) = matching.next() else {
+            return Err(FlpError::ChannelNotFound(channel_id));
+        };
+        if matching.next().is_some() {
+            return Err(FlpError::AmbiguousChannelId(channel_id));
+        }
+
+        let mut zip_events = channel
+            .event_range()
+            .filter(|index| self.events[*index].opcode == 0x0F);
+        let existing_event = zip_events.next();
+        if zip_events.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel has multiple 0x0F zipped-state events",
+            ));
+        }
+        if channel.zipped == zipped {
+            return Ok(());
+        }
+
+        let mut candidate = self.clone();
+        if let Some(event_index) = existing_event {
+            candidate.events[event_index].replace_byte_payload(u8::from(zipped))?;
+        } else {
+            let mut kind_events = channel
+                .event_range()
+                .filter(|index| self.events[*index].opcode == 0x15);
+            let Some(kind_index) = kind_events.next() else {
+                return Err(FlpError::UnsupportedEdit(
+                    "the selected channel has no recognized 0x15 kind event",
+                ));
+            };
+            if kind_events.next().is_some() {
+                return Err(FlpError::UnsupportedEdit(
+                    "the selected channel has multiple 0x15 kind events",
+                ));
+            }
+            let kind_event = &candidate.events[kind_index];
+            if kind_event.encoding != PayloadEncoding::Byte || kind_event.payload.len() != 1 {
+                return Err(FlpError::UnsupportedEdit(
+                    "the selected channel's 0x15 kind event is not a one-byte event",
+                ));
+            }
+            candidate
+                .events
+                .insert(kind_index + 1, FlpEvent::new_byte(0x0F, u8::from(zipped)));
+        }
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
     /// Sets the RGB components of a channel's `0x80` color event while retaining its fourth
     /// byte. Channels without a color event receive one immediately after their kind event.
     pub fn set_channel_color(&mut self, channel_id: u16, rgb: [u8; 3]) -> Result<(), FlpError> {
@@ -7516,6 +7584,69 @@ mod tests {
             assert!(encoded.ends_with(&tail));
             let round_trip = FlpDocument::parse(&encoded).expect("muted project should parse");
             assert_eq!(round_trip.channels()[0].enabled(), Some(false));
+        }
+    }
+
+    #[test]
+    fn reads_and_edits_channel_zipped_state_losslessly() {
+        let tail = [0xDE, 0xAD];
+        for (stored_zip, requested_zip, initial_zip) in [
+            (None, false, false),
+            (None, true, false),
+            (Some(0), true, false),
+            (Some(1), false, true),
+            (Some(2), true, true),
+        ] {
+            let mut event_stream = vec![0x40, 7, 0, 0x15, 0];
+            if let Some(stored_zip) = stored_zip {
+                event_stream.extend_from_slice(&[0x0F, stored_zip]);
+            }
+            event_stream.extend_from_slice(&[0x48, 0x34, 0x12, 0x62, 0, 0]);
+            let input = flp_fixture(&event_stream, &[], &tail);
+            let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+            assert_eq!(document.channels()[0].zipped(), initial_zip);
+
+            let mut expected_events = document
+                .events()
+                .iter()
+                .map(|event| event.wire_bytes.clone())
+                .collect::<Vec<_>>();
+            if let Some(stored_zip) = stored_zip {
+                let zip_index = document
+                    .events()
+                    .iter()
+                    .position(|event| event.opcode() == 0x0F)
+                    .expect("fixture should have a zipped-state event");
+                if (stored_zip != 0) != requested_zip {
+                    expected_events[zip_index] = vec![0x0F, u8::from(requested_zip)];
+                }
+            } else if requested_zip {
+                let kind_index = document
+                    .events()
+                    .iter()
+                    .position(|event| event.opcode() == 0x15)
+                    .expect("fixture should have a channel kind event");
+                expected_events.insert(kind_index + 1, vec![0x0F, 1]);
+            }
+
+            document
+                .set_channel_zipped(7, requested_zip)
+                .expect("channel compact state should update");
+
+            assert_eq!(document.channels()[0].zipped(), requested_zip);
+            assert_eq!(document.channels()[0].volume(), Some(0x1234));
+            assert_eq!(
+                document
+                    .events()
+                    .iter()
+                    .map(|event| event.wire_bytes.clone())
+                    .collect::<Vec<_>>(),
+                expected_events
+            );
+            let encoded = document.encode_lossless().expect("document should encode");
+            assert!(encoded.ends_with(&tail));
+            let round_trip = FlpDocument::parse(&encoded).expect("edited project should parse");
+            assert_eq!(round_trip.channels()[0].zipped(), requested_zip);
         }
     }
 
