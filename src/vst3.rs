@@ -213,6 +213,7 @@ impl Vst3PlaylistStreamProcessor {
     }
 
     pub fn mix_next_block(&mut self, output: &mut [f32]) -> Result<(), String> {
+        crate::audio::enable_denormal_protection();
         if !output.len().is_multiple_of(2) {
             return Err("VST3 Playlist mix buffer must contain stereo frames".to_owned());
         }
@@ -294,6 +295,7 @@ impl PlaylistPluginStream {
                             .map_err(|error| error.to_string())?;
                         self.next_event += 1;
                     }
+                    crate::audio::enable_denormal_protection();
                     plugin
                         .process_audio(&mut buffers)
                         .map_err(|error| error.to_string())?;
@@ -1180,6 +1182,7 @@ fn process_pattern_render(
     render: &PreparedPatternRender,
     mut consume: impl FnMut(&[f32]) -> Result<(), String>,
 ) -> Result<(), String> {
+    crate::audio::enable_denormal_protection();
     plugin
         .start_processing()
         .map_err(|error| error.to_string())?;
@@ -1207,6 +1210,7 @@ fn process_pattern_render(
 
             let mut buffers =
                 AudioBuffers::new(0, render.output_channels, frame_count, render.sample_rate);
+            crate::audio::enable_denormal_protection();
             plugin
                 .process_audio(&mut buffers)
                 .map_err(|error| error.to_string())?;
@@ -1241,6 +1245,7 @@ fn stream_pattern_render(
     writer: &StreamingAudioWriter,
     output_sample_rate: u32,
 ) -> Result<Vst3RenderSummary, String> {
+    crate::audio::enable_denormal_protection();
     let mut resampler = StereoStreamResampler::new(render.sample_rate_u32, output_sample_rate)?;
     {
         let mut plugin = plugin
@@ -1276,6 +1281,7 @@ fn stream_pattern_render(
                         .map_err(|error| error.to_string())?;
                     event_index += 1;
                 }
+                crate::audio::enable_denormal_protection();
                 plugin
                     .process_audio(&mut buffers)
                     .map_err(|error| error.to_string())?;

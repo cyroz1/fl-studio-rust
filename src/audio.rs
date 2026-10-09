@@ -22,6 +22,36 @@ const STREAM_PREFILL_FRAMES: usize = 512;
 const TEST_TONE_HZ: f32 = 440.0;
 const TEST_TONE_LEVEL: f32 = 0.12;
 
+/// Enable flush-to-zero for floating-point work on the current audio/render thread.
+///
+/// x86-64 uses MXCSR.FTZ and MXCSR.DAZ; AArch64 uses FPCR.FZ. The floating-point
+/// control state belongs to the calling thread and is left enabled for its lifetime.
+#[inline]
+pub(crate) fn enable_denormal_protection() {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use std::arch::x86_64::{_mm_getcsr, _mm_setcsr};
+
+        const FTZ_AND_DAZ: u32 = (1 << 15) | (1 << 6);
+        _mm_setcsr(_mm_getcsr() | FTZ_AND_DAZ);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        let control: u64;
+        std::arch::asm!(
+            "mrs {control}, fpcr",
+            control = out(reg) control,
+            options(nostack, preserves_flags)
+        );
+        std::arch::asm!(
+            "msr fpcr, {control}",
+            control = in(reg) (control | (1 << 24)),
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum AudioAccess {
     #[default]
@@ -964,6 +994,7 @@ where
         .build_output_stream::<T, _, _>(
             config,
             move |output, _| {
+                enable_denormal_protection();
                 let playback_samples = playback_for_callback.samples.load();
                 let streaming = playback_for_callback.streaming.load();
                 let browser_preview_samples = playback_for_callback.browser_preview_samples.load();
@@ -1079,6 +1110,7 @@ where
         .build_input_stream::<T, _, _>(
             config,
             move |input, _| {
+                enable_denormal_protection();
                 let mut max_peak = 0.0_f32;
                 for frame in input.chunks(channels) {
                     if frame.is_empty() {
@@ -1339,6 +1371,7 @@ fn wasapi_exclusive_output_worker(
     state: WasapiWorkerState,
     ready: std::sync::mpsc::SyncSender<Result<(), String>>,
 ) {
+    enable_denormal_protection();
     let WasapiWorkerState {
         source,
         playback,
@@ -1447,6 +1480,7 @@ fn wasapi_exclusive_input_worker(
     state: WasapiWorkerState,
     ready: std::sync::mpsc::SyncSender<Result<(), String>>,
 ) {
+    enable_denormal_protection();
     let WasapiWorkerState {
         ring,
         input_peak: peak,
@@ -1763,8 +1797,48 @@ mod tests {
 
     use super::{
         AUDIO_SOURCE_PROJECT, AUDIO_SOURCE_STREAM, AudioAccess, AudioRingBuffer, AudioSettings,
-        PlaybackState, next_output_frame, tone_sample, validate_settings,
+        PlaybackState, enable_denormal_protection, next_output_frame, tone_sample,
+        validate_settings,
     };
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn denormal_protection_enables_the_architecture_flush_mode() {
+        #[cfg(target_arch = "x86_64")]
+        {
+            use std::arch::x86_64::{_mm_getcsr, _mm_setcsr};
+
+            const FTZ_AND_DAZ: u32 = (1 << 15) | (1 << 6);
+            let previous = unsafe { _mm_getcsr() };
+            enable_denormal_protection();
+            let enabled = unsafe { _mm_getcsr() };
+            unsafe { _mm_setcsr(previous) };
+            assert_eq!(enabled & FTZ_AND_DAZ, FTZ_AND_DAZ);
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            let previous: u64;
+            std::arch::asm!(
+                "mrs {control}, fpcr",
+                control = out(reg) previous,
+                options(nostack, preserves_flags)
+            );
+            enable_denormal_protection();
+            let enabled: u64;
+            std::arch::asm!(
+                "mrs {control}, fpcr",
+                control = out(reg) enabled,
+                options(nostack, preserves_flags)
+            );
+            std::arch::asm!(
+                "msr fpcr, {control}",
+                control = in(reg) previous,
+                options(nostack, preserves_flags)
+            );
+            assert_ne!(enabled & (1 << 24), 0);
+        }
+    }
 
     #[test]
     fn shared_is_the_default_access_mode_and_device_settings_are_sane() {

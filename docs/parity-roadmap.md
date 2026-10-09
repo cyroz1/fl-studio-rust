@@ -103,7 +103,7 @@ where real-time constraints punish sloppy code.
 - `[partial]` Lock-free metering/state queue (audio thread → UI thread): input peak is published through an atomic value; a general state queue is not implemented
 - `[partial]` Sample-accurate event scheduling within a buffer: selected-pattern previews and Playlist Pattern Clip Sampler notes schedule at device-frame offsets, while VST3 notes are timestamped in plug-in sample frames before resampling to the device rate; Layer Pattern notes route to enabled Sampler and mapped VST3 child channels, with Random making a stable pseudo-random choice per placed note. Project opening loads matching installed VST3 channel instances and attempts marker-12 component/controller restore from nested field-53 records. Native Random sequence equivalence, other wrapper/state layouts, a shared transport command queue, and automation scheduling are not implemented
 - `[partial]` Underrun/dropout detection and reporting: shared stream errors and exclusive worker errors reach the UI; counting, history, and recovery are not implemented
-- `[todo]` Denormal protection in DSP code
+- `[partial]` Denormal protection: DAW-owned x86-64 audio, render, and VST3 processing threads enable MXCSR flush-to-zero/denormals-are-zero; AArch64 enables FPCR flush-to-zero. Threads created and managed internally by plug-ins remain outside the host's control ([Intel FTZ/DAZ guidance](https://www.intel.com/content/www/us/en/docs/dpcpp-cpp-compiler/developer-guide-reference/2023-0/set-the-ftz-and-daz-flags.html), [Arm FPCR definition](https://documentation-service.arm.com/static/64a3e7fcdf6cd61d528c478f)).
 
 ### 3.3 Mixer graph
 
@@ -339,7 +339,7 @@ automation, Mixer routing/effects, or PDC. Full export surface:
 | Item | Status | Notes |
 |---|---|---|
 | Windows installer (NSIS/WiX) | `[partial]` | CI builds installers; verify signed + working |
-| macOS app bundle, notarization | `[partial]` | CI runs macOS checks and, without signing secrets, builds an unsigned app bundle and verifies its executable and `.flp` registration without uploading it. Installer publication waits for Developer ID signing and Apple notarization secrets; signed builds are checked with Apple's signature, stapler, and Gatekeeper tools. AU hosting + CoreAudio remain pending. |
+| macOS app bundle, notarization | `[partial]` | CI runs macOS checks and, without signing secrets, builds an unsigned app bundle, verifies its executable and `.flp` registration, then archives and uploads it as a 14-day `macos-unsigned-gui-preview` artifact for local UI review. Installer publication waits for Developer ID signing and Apple notarization secrets; signed builds are checked with Apple's signature, stapler, and Gatekeeper tools. AU hosting + CoreAudio remain pending. |
 | Linux builds (AppImage/deb) | `[partial]` | CI builds; XCB headers handled |
 | Windows: ASIO support | `[todo]` | Pro-audio requirement on Windows |
 | macOS: native menu bar, file associations | `[partial]` | The packaged app registers `.flp` project files and the application opens a project path passed on launch. Functional command menus remain in the app window; a native macOS menu bar and macOS file-open event handling while the app is already running remain. |

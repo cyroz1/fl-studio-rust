@@ -716,6 +716,7 @@ fn stream_prepared_playlist_render(
     mut stream_cancelled: impl FnMut() -> bool,
     mut write_block: impl FnMut(&[f32]) -> Result<(), String>,
 ) -> Result<usize, String> {
+    crate::audio::enable_denormal_protection();
     let frames = render.frames;
     let options = render.options;
     let release_frames = (f64::from(options.sample_rate) * SAMPLER_RELEASE_SECONDS)
@@ -875,6 +876,7 @@ fn stream_prepared_sampler_pattern(
     mut stream_cancelled: impl FnMut() -> bool,
     mut write_block: impl FnMut(&[f32]) -> Result<(), String>,
 ) -> Result<SamplerPatternRenderSummary, String> {
+    crate::audio::enable_denormal_protection();
     let release_frames = (f64::from(render.summary.sample_rate) * SAMPLER_RELEASE_SECONDS)
         .round()
         .max(1.0) as usize;
@@ -912,6 +914,7 @@ fn stream_prepared_audio_clip_render(
     mut stream_cancelled: impl FnMut() -> bool,
     mut write_block: impl FnMut(&[f32]) -> Result<(), String>,
 ) -> Result<(), String> {
+    crate::audio::enable_denormal_protection();
     if block_frames == 0 {
         return Err("audio stream block size must be greater than zero".to_owned());
     }
@@ -957,6 +960,7 @@ fn render_audio_clips_to_stereo_buffer_inner(
     options: AudioClipRenderOptions,
     cancelled: Option<&AtomicBool>,
 ) -> Result<(Vec<f32>, AudioClipRenderSummary), String> {
+    crate::audio::enable_denormal_protection();
     let render = prepare_audio_clip_render(document, project_path, options, cancelled)?;
     require_audio_clips(&render)?;
     let output_frames = render.summary.frames;
