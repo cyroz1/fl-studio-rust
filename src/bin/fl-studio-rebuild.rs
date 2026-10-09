@@ -3135,7 +3135,7 @@ impl DawUi {
     }
 
     fn write_project(&mut self, path: &Path) {
-        let Some(document) = &self.document else {
+        let Some(document) = self.document.as_ref().cloned() else {
             self.status = "Open a project before saving".to_owned();
             return;
         };
@@ -3147,13 +3147,17 @@ impl DawUi {
             }
         };
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        encoded.hash(&mut hasher);
-        let saved_hash = hasher.finish();
         let backups = self.backup_before_manual_save(path);
         let mut package_workspace_after_save = None;
-        let new_zip_has_only_project =
-            has_extension(path, "zip") && self.package_workspace.is_none();
+        let mut document_after_save = None;
+        let mut sample_bundle_summary = None;
+        let mut saved_bytes = encoded.clone();
         let save_result = if has_extension(path, "zip") {
+            let source_project_path = self
+                .sample_project_path()
+                .or_else(|| self.current_path.clone())
+                .unwrap_or_else(|| path.to_path_buf());
+            let use_existing_workspace = self.package_workspace.is_some();
             let workspace = if let Some(workspace) = self.package_workspace.as_ref() {
                 Ok(workspace.clone())
             } else {
@@ -3161,29 +3165,44 @@ impl DawUi {
                     .file_stem()
                     .map(|stem| format!("{}.flp", stem.to_string_lossy()))
                     .unwrap_or_else(|| "Project.flp".to_owned());
-                let sample_project_path = self
-                    .current_path
-                    .clone()
-                    .unwrap_or_else(|| path.to_path_buf());
                 ProjectPackageWorkspace::single_project(
                     &project_name,
                     &encoded,
-                    sample_project_path,
+                    &source_project_path,
                 )
             };
             workspace.and_then(|workspace| {
-                workspace
-                    .write_to(path, &encoded)
-                    .map(|()| package_workspace_after_save = Some(workspace))
+                let mut packaged_document = document.clone();
+                let summary = workspace
+                    .bundle_channel_samples(&mut packaged_document, &source_project_path)?;
+                let packaged_bytes = packaged_document
+                    .encode_lossless()
+                    .map_err(|error| error.to_string())?;
+                workspace.write_to(path, &packaged_bytes)?;
+                let saved_workspace = if use_existing_workspace {
+                    workspace
+                } else {
+                    ProjectPackageWorkspace::open(path).map(|(workspace, _)| workspace)?
+                };
+                saved_bytes = packaged_bytes;
+                package_workspace_after_save = Some(saved_workspace);
+                document_after_save = Some(packaged_document);
+                sample_bundle_summary = Some(summary);
+                Ok(())
             })
         } else {
-            fs::write(path, encoded).map_err(|error| error.to_string())
+            fs::write(path, &encoded).map_err(|error| error.to_string())
         };
         match save_result {
             Ok(()) => {
+                saved_bytes.hash(&mut hasher);
+                let saved_hash = hasher.finish();
                 self.current_path = Some(path.to_path_buf());
                 if let Some(workspace) = package_workspace_after_save {
                     self.package_workspace = Some(workspace);
+                }
+                if let Some(document) = document_after_save {
+                    self.document = Some(document);
                 }
                 self.refresh_audio_waveform_paths();
                 self.saved_project_hash = Some(saved_hash);
@@ -3200,10 +3219,25 @@ impl DawUi {
                     ),
                     _ => format!("Saved {}", path.display()),
                 };
-                if new_zip_has_only_project {
-                    self.status.push_str(
-                        " · this ZIP contains the FLP only; samples from a plain FLP are not bundled yet",
-                    );
+                if let Some(summary) = sample_bundle_summary {
+                    if summary.bundled_files > 0 {
+                        self.status.push_str(&format!(
+                            " · bundled {} channel sample{}",
+                            summary.bundled_files,
+                            if summary.bundled_files == 1 { "" } else { "s" }
+                        ));
+                    }
+                    if summary.unresolved_references > 0 {
+                        self.status.push_str(&format!(
+                            " · {} channel sample reference{} not found",
+                            summary.unresolved_references,
+                            if summary.unresolved_references == 1 {
+                                " was"
+                            } else {
+                                "s were"
+                            }
+                        ));
+                    }
                 }
             }
             Err(error) => {
