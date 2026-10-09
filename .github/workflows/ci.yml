@@ -76,7 +76,7 @@ jobs:
             {
               echo "### macOS installer skipped"
               echo
-              echo "The macOS tests have passed. CI will build and inspect an unsigned app bundle, but it will not upload that bundle because macOS may reject it. Configure signing and notarization credentials to publish a verified disk image; see [macOS CI packaging](docs/macos-ci-packaging.md)."
+              echo "The macOS tests have passed. CI will build and inspect the unsigned app bundle, then upload it as a short-lived GUI preview artifact for local testing. The preview is not a distributable installer; configure signing and notarization credentials to publish a verified disk image. See [macOS CI packaging](docs/macos-ci-packaging.md)."
             } >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
@@ -169,6 +169,18 @@ jobs:
           print("Unsigned macOS app bundle and .flp association are valid")
           PY
 
+      - name: Archive unsigned macOS GUI preview
+        if: runner.os == 'macOS' && steps.macos-signing.outputs.configured == 'false'
+        shell: bash
+        run: |
+          app_path="$(find dist -maxdepth 1 -type d -name '*.app' -print -quit)"
+          if [[ -z "$app_path" ]]; then
+            echo "::error::Cargo Packager did not produce a macOS app bundle."
+            exit 1
+          fi
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$app_path" dist/fl-studio-rebuild-macos-unsigned-preview.zip
+
       - name: Verify macOS signature and notarization
         if: runner.os == 'macOS' && steps.macos-signing.outputs.configured == 'true'
         shell: bash
@@ -197,6 +209,15 @@ jobs:
         with:
           name: installers-${{ matrix.os }}
           path: dist/*.dmg
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload unsigned macOS GUI preview
+        if: runner.os == 'macOS' && steps.macos-signing.outputs.configured == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-unsigned-gui-preview
+          path: dist/fl-studio-rebuild-macos-unsigned-preview.zip
           if-no-files-found: error
           retention-days: 14
 
