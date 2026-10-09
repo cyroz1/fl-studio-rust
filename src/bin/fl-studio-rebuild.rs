@@ -5460,6 +5460,39 @@ impl DawUi {
         let mut edit_tags = None;
         let mut load_sample = None;
         let sample_target = self.selected_sample_channel();
+        let sample_step_direction =
+            if sample_target.is_some() && !ui.ctx().egui_wants_keyboard_input() {
+                ui.input_mut(|input| {
+                    if input.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowUp) {
+                        Some(-1isize)
+                    } else if input.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowDown) {
+                        Some(1isize)
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                None
+            };
+        let audio_favorites = favorites
+            .iter()
+            .filter(|path| browser_file_kind(path) == Some(BrowserFileKind::Audio))
+            .collect::<Vec<_>>();
+        let step_sample_path = sample_step_direction.and_then(|direction| {
+            let current_index = self
+                .browser_selected
+                .as_ref()
+                .and_then(|selected| audio_favorites.iter().position(|path| *path == selected))?;
+            let next_index = if direction < 0 {
+                current_index.checked_sub(1)?
+            } else {
+                current_index.checked_add(1)?
+            };
+            audio_favorites.get(next_index).map(|path| (*path).clone())
+        });
+        if let Some(path) = &step_sample_path {
+            self.browser_selected = Some(path.clone());
+        }
         egui::ScrollArea::vertical()
             .id_salt("browser-favorites-list")
             .show(ui, |ui| {
@@ -5468,45 +5501,45 @@ impl DawUi {
                         .file_name()
                         .map(|name| name.to_string_lossy().into_owned())
                         .unwrap_or_else(|| path.display().to_string());
-                    let (clicked, double_clicked, remove_clicked) = ui
-                        .horizontal(|ui| {
-                            let response = ui.selectable_label(
-                                self.browser_selected.as_ref() == Some(&path),
-                                format!("★ {name}"),
-                            );
-                            let clicked = response.clicked();
-                            let double_clicked = response.double_clicked();
-                            response
-                                .on_hover_text(path.display().to_string())
-                                .context_menu(|ui| {
-                                    if browser_file_kind(&path) == Some(BrowserFileKind::Audio)
-                                        && let Some((channel_id, channel_name)) = &sample_target
-                                        && ui
-                                            .button(format!(
-                                                "Send to {channel_name} ({channel_id})"
-                                            ))
-                                            .clicked()
-                                    {
-                                        load_sample = Some((*channel_id, path.clone()));
-                                        ui.close();
-                                    }
-                                    if browser_file_kind(&path) == Some(BrowserFileKind::Preset)
-                                        && path.extension().is_some_and(|extension| {
-                                            extension.eq_ignore_ascii_case("fst")
-                                        })
-                                        && ui.button("Inspect preset…").clicked()
-                                    {
-                                        inspect_preset = Some(path.clone());
-                                        ui.close();
-                                    }
-                                    if ui.button("Edit tags…").clicked() {
-                                        edit_tags = Some(path.clone());
-                                        ui.close();
-                                    }
-                                });
-                            (clicked, double_clicked, ui.small_button("×").clicked())
-                        })
-                        .inner;
+                    let row = ui.horizontal(|ui| {
+                        let response = ui.selectable_label(
+                            self.browser_selected.as_ref() == Some(&path),
+                            format!("★ {name}"),
+                        );
+                        let clicked = response.clicked();
+                        let double_clicked = response.double_clicked();
+                        response
+                            .on_hover_text(path.display().to_string())
+                            .context_menu(|ui| {
+                                if browser_file_kind(&path) == Some(BrowserFileKind::Audio)
+                                    && let Some((channel_id, channel_name)) = &sample_target
+                                    && ui
+                                        .button(format!("Send to {channel_name} ({channel_id})"))
+                                        .clicked()
+                                {
+                                    load_sample = Some((*channel_id, path.clone()));
+                                    ui.close();
+                                }
+                                if browser_file_kind(&path) == Some(BrowserFileKind::Preset)
+                                    && path.extension().is_some_and(|extension| {
+                                        extension.eq_ignore_ascii_case("fst")
+                                    })
+                                    && ui.button("Inspect preset…").clicked()
+                                {
+                                    inspect_preset = Some(path.clone());
+                                    ui.close();
+                                }
+                                if ui.button("Edit tags…").clicked() {
+                                    edit_tags = Some(path.clone());
+                                    ui.close();
+                                }
+                            });
+                        (clicked, double_clicked, ui.small_button("×").clicked())
+                    });
+                    if step_sample_path.as_ref() == Some(&path) {
+                        ui.scroll_to_rect(row.response.rect, Some(egui::Align::Center));
+                    }
+                    let (clicked, double_clicked, remove_clicked) = row.inner;
                     if clicked {
                         self.browser_selected = Some(path.clone());
                     }
@@ -5536,6 +5569,8 @@ impl DawUi {
             self.inspect_browser_preset(&path);
         }
         if let Some((channel_id, path)) = load_sample {
+            self.load_browser_sample_into_channel(channel_id, &path);
+        } else if let (Some((channel_id, _)), Some(path)) = (sample_target, step_sample_path) {
             self.load_browser_sample_into_channel(channel_id, &path);
         }
     }
