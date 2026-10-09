@@ -1,6 +1,6 @@
 # macOS CI packaging
 
-The macOS CI job always runs formatting, Clippy, and tests. It only creates or uploads a macOS installer when it can sign the app with a Developer ID Application certificate and notarize it with Apple. This prevents CI from publishing an unsigned bundle that macOS reports as damaged. The packaged app registers `.flp` project files and opens a project passed as its launch argument.
+The macOS CI job always runs formatting, Clippy, and tests. Without signing credentials, it builds an unsigned `.app` for CI inspection, checks that its executable and `.flp` file association are present, and does not upload the bundle. It creates and uploads a disk image only when it can sign the app with a Developer ID Application certificate and notarize it with Apple, preventing CI from publishing an unsigned bundle that macOS reports as damaged. The packaged app registers `.flp` project files and opens a project passed as its launch argument.
 
 Add these repository Actions secrets under **Settings → Secrets and variables → Actions**:
 
