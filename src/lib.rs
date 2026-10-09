@@ -336,6 +336,7 @@ pub enum ChannelType {
 /// Channel Rack ordering used by [`FlpDocument::sort_channels`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChannelSortOrder {
+    Color,
     Name,
     Type,
 }
@@ -369,6 +370,7 @@ pub struct ChannelSummary {
     id: u16,
     kind: Option<u8>,
     enabled: Option<bool>,
+    color: Option<u32>,
     volume: Option<u32>,
     pan: Option<i32>,
     levels_editable: bool,
@@ -529,6 +531,11 @@ impl ChannelSummary {
 
     pub fn enabled(&self) -> Option<bool> {
         self.enabled
+    }
+
+    /// Raw four-byte channel color value, in little-endian RGBA byte order.
+    pub fn color(&self) -> Option<[u8; 4]> {
+        self.color.map(u32::to_le_bytes)
     }
 
     /// Raw FL channel volume value, in the project's 0..=12800 control range.
@@ -1318,6 +1325,13 @@ impl FlpDocument {
                 continue;
             };
             match event.opcode {
+                0x80 if event.encoding == PayloadEncoding::Dword && event.payload.len() == 4 => {
+                    channel.color = Some(u32::from_le_bytes(
+                        event.payload[..4]
+                            .try_into()
+                            .expect("a dword event has four payload bytes"),
+                    ));
+                }
                 0x00 if event.payload.len() == 1 => {
                     channel.enabled = Some(event.payload[0] != 0);
                 }
@@ -5070,6 +5084,70 @@ impl FlpDocument {
         Ok(())
     }
 
+    /// Sets the RGB components of a channel's `0x80` color event while retaining its fourth
+    /// byte. Channels without a color event receive one immediately after their kind event.
+    pub fn set_channel_color(&mut self, channel_id: u16, rgb: [u8; 3]) -> Result<(), FlpError> {
+        let channels = self.channels();
+        let mut matching = channels.iter().filter(|channel| channel.id == channel_id);
+        let Some(channel) = matching.next() else {
+            return Err(FlpError::ChannelNotFound(channel_id));
+        };
+        if matching.next().is_some() {
+            return Err(FlpError::AmbiguousChannelId(channel_id));
+        }
+
+        let mut color_events = channel
+            .event_range()
+            .filter(|index| self.events[*index].opcode == 0x80);
+        let existing_event = color_events.next();
+        if color_events.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel has multiple 0x80 color events",
+            ));
+        }
+
+        let mut candidate = self.clone();
+        if let Some(event_index) = existing_event {
+            let event = &candidate.events[event_index];
+            if event.encoding != PayloadEncoding::Dword || event.payload.len() != 4 {
+                return Err(FlpError::UnsupportedEdit(
+                    "the selected channel's 0x80 color event is not a four-byte value",
+                ));
+            }
+            let fourth_byte = event.payload[3];
+            let value = u32::from_le_bytes([rgb[0], rgb[1], rgb[2], fourth_byte]);
+            candidate.events[event_index].replace_dword_payload(value)?;
+        } else {
+            let mut kind_events = channel
+                .event_range()
+                .filter(|index| self.events[*index].opcode == 0x15);
+            let Some(kind_index) = kind_events.next() else {
+                return Err(FlpError::UnsupportedEdit(
+                    "the selected channel has no recognized 0x15 kind event",
+                ));
+            };
+            if kind_events.next().is_some() {
+                return Err(FlpError::UnsupportedEdit(
+                    "the selected channel has multiple 0x15 kind events",
+                ));
+            }
+            if candidate.events[kind_index].encoding != PayloadEncoding::Byte
+                || candidate.events[kind_index].payload.len() != 1
+            {
+                return Err(FlpError::UnsupportedEdit(
+                    "the selected channel's 0x15 kind event is not a one-byte value",
+                ));
+            }
+            candidate.events.insert(
+                kind_index + 1,
+                FlpEvent::new_dword(0x80, u32::from_le_bytes([rgb[0], rgb[1], rgb[2], 0])),
+            );
+        }
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
     /// Moves a channel to `target_index` in Channel Rack order without changing its ID or event
     /// bytes. The complete event range for the channel is moved as one block.
     pub fn move_channel(&mut self, channel_id: u16, target_index: usize) -> Result<(), FlpError> {
@@ -5120,11 +5198,15 @@ impl FlpDocument {
     }
 
     /// Reorders every channel using a stable Channel Rack sort while preserving each channel's
-    /// complete event block and ID. Name sorting is case-insensitive; type sorting follows the
+    /// complete event block and ID. Name sorting is case-insensitive; color sorting follows hue
+    /// from red through violet, then achromatic and uncolored channels; type sorting follows the
     /// documented Layer, generator, Sampler, audio-channel, and automation grouping.
     pub fn sort_channels(&mut self, order: ChannelSortOrder) -> Result<(), FlpError> {
         let mut channels = self.channels();
         match order {
+            ChannelSortOrder::Color => {
+                channels.sort_by_key(|channel| channel_color_sort_key(channel.color()));
+            }
             ChannelSortOrder::Name => {
                 channels.sort_by_key(|channel| {
                     channel.display_name().unwrap_or_default().to_lowercase()
@@ -5402,6 +5484,29 @@ impl FlpDocument {
     fn is_pattern_note_event(event: &FlpEvent) -> bool {
         matches!(event.opcode, 0xD0 | 0xE0)
     }
+}
+
+fn channel_color_sort_key(color: Option<[u8; 4]>) -> (u8, u16, u8, u8, u8) {
+    let Some([red, green, blue, _]) = color else {
+        return (2, 0, 0, 0, 0);
+    };
+    let red_f = f32::from(red) / 255.0;
+    let green_f = f32::from(green) / 255.0;
+    let blue_f = f32::from(blue) / 255.0;
+    let maximum = red_f.max(green_f).max(blue_f);
+    let minimum = red_f.min(green_f).min(blue_f);
+    let delta = maximum - minimum;
+    if delta <= f32::EPSILON {
+        return (1, 0, red, green, blue);
+    }
+    let hue = if maximum == red_f {
+        60.0 * ((green_f - blue_f) / delta).rem_euclid(6.0)
+    } else if maximum == green_f {
+        60.0 * ((blue_f - red_f) / delta + 2.0)
+    } else {
+        60.0 * ((red_f - green_f) / delta + 4.0)
+    };
+    (0, (hue * 10.0).round() as u16, red, green, blue)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -7335,6 +7440,107 @@ mod tests {
             let round_trip = FlpDocument::parse(&encoded).expect("muted project should parse");
             assert_eq!(round_trip.channels()[0].enabled(), Some(false));
         }
+    }
+
+    #[test]
+    fn reads_and_sets_channel_rgb_while_preserving_the_fourth_color_byte() {
+        let mut event_stream = vec![0x40, 7, 0, 0x15, 0, 0x80, 0x11, 0x22, 0x33, 0xA5];
+        event_stream.extend_from_slice(&[0x48, 0x34, 0x12, 0x62, 0, 0]);
+        let tail = [0xDE, 0xAD];
+        let input = flp_fixture(&event_stream, &[], &tail);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+        assert_eq!(
+            document.channels()[0].color(),
+            Some([0x11, 0x22, 0x33, 0xA5])
+        );
+
+        document
+            .set_channel_color(7, [0xAA, 0xBB, 0xCC])
+            .expect("existing channel color should update");
+        assert_eq!(
+            document.channels()[0].color(),
+            Some([0xAA, 0xBB, 0xCC, 0xA5])
+        );
+        assert!(
+            document
+                .events()
+                .iter()
+                .any(|event| event.opcode() == 0x80 && event.payload() == [0xAA, 0xBB, 0xCC, 0xA5])
+        );
+
+        let encoded = document.encode_lossless().expect("document should encode");
+        assert!(encoded.ends_with(&tail));
+        let round_trip = FlpDocument::parse(&encoded).expect("updated project should parse");
+        assert_eq!(
+            round_trip.channels()[0].color(),
+            Some([0xAA, 0xBB, 0xCC, 0xA5])
+        );
+
+        let missing_color_stream = vec![0x40, 8, 0, 0x15, 0, 0x48, 0x34, 0x12, 0x62, 0, 0];
+        let input = flp_fixture(&missing_color_stream, &[], &[]);
+        let mut missing_color = FlpDocument::parse(&input).expect("fixture should parse");
+        missing_color
+            .set_channel_color(8, [0x10, 0x20, 0x30])
+            .expect("missing color should be inserted");
+        assert_eq!(
+            missing_color.channels()[0].color(),
+            Some([0x10, 0x20, 0x30, 0])
+        );
+        let event_bytes = missing_color
+            .events()
+            .iter()
+            .map(|event| event.wire_bytes.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(event_bytes[2], [0x80, 0x10, 0x20, 0x30, 0]);
+        assert_eq!(event_bytes[3], [0x48, 0x34, 0x12]);
+    }
+
+    #[test]
+    fn sorts_channels_by_hue_then_achromatic_then_uncolored() {
+        let mut event_stream = Vec::new();
+        for (id, color) in [
+            (7, Some([0, 0, 255, 0])),
+            (8, Some([255, 0, 0, 0])),
+            (9, Some([255, 0, 255, 0])),
+            (10, Some([0, 255, 0, 0])),
+            (11, Some([70, 70, 70, 0])),
+            (12, None),
+        ] {
+            event_stream.extend_from_slice(&[0x40, id, 0, 0x15, 0]);
+            if let Some([red, green, blue, alpha]) = color {
+                event_stream.extend_from_slice(&[0x80, red, green, blue, alpha]);
+            }
+        }
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        let input = flp_fixture(&event_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+        document
+            .sort_channels(ChannelSortOrder::Color)
+            .expect("color sort should succeed");
+
+        assert_eq!(
+            document
+                .channels()
+                .iter()
+                .map(ChannelSummary::id)
+                .collect::<Vec<_>>(),
+            [8, 10, 7, 9, 11, 12]
+        );
+        assert_eq!(
+            document
+                .channels()
+                .iter()
+                .map(ChannelSummary::color)
+                .collect::<Vec<_>>(),
+            [
+                Some([255, 0, 0, 0]),
+                Some([0, 255, 0, 0]),
+                Some([0, 0, 255, 0]),
+                Some([255, 0, 255, 0]),
+                Some([70, 70, 70, 0]),
+                None,
+            ]
+        );
     }
 
     #[test]

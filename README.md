@@ -1,14 +1,14 @@
 # Rust DAW compatibility rebuild
 
-## Parity progress — 2026-10-08
+## Parity progress — 2026-10-09
 
-**Early prototype; not yet suitable as a full FL Studio replacement.** The [parity roadmap](docs/parity-roadmap.md) currently marks **12 items done, 73 partial, and 66 todo** (151 checklist entries total). This is an unweighted checklist count: partial items cover only stated subsets, and a completed small item does not count as the same amount of work as a complete subsystem.
+**Early prototype; not yet suitable as a full FL Studio replacement.** The [parity roadmap](docs/parity-roadmap.md) is an unweighted checklist: partial items cover only their stated subsets, and a completed small item does not count as the same amount of work as a complete subsystem.
 
 - **Working foundations:** lossless FLP parsing and round-trip writing, selected project and note edits, MIDI import and partial export, and cross-platform CI packaging.
 - **Partial runtime and editing:** early Playlist, Channel Rack, Piano roll, Mixer, plug-in, and audio views; Windows shared and exclusive audio; playback and a first combined WAV render for supported audio clips, Sampler notes, and mapped installed VST3 instruments.
 - **Major parity gaps:** complete song rendering through automation, Mixer routing/effects, and PDC; automation playback; broad VST compatibility and state write-back; full FL Studio window/control behavior; and verified compatibility across FL Studio versions.
 
-See the roadmap for subsystem-level status and evidence. The counts above are refreshed manually when the roadmap changes.
+See the roadmap for subsystem-level status and evidence.
 
 This is a clean-room Rust project started from the FL Studio 26.1.6.5639 installation supplied with the workspace. It is an independent rebuild; it does not load, patch, or link against the installed FL Studio executable or engine. The end goal is to open and modify any FL Studio project with backwards compatibility, matching controls, windows, and editing behavior, installed plug-in hosting, playback, and rendering. The current code contains the lossless file-format core and the first desktop editing shell; it is still far from full parity.
 
@@ -55,6 +55,7 @@ flp-rebuild create-pattern <input.flp> <output.flp>
 flp-rebuild set-project-info <input.flp> <output.flp> <title|-> <author|-> <genre|-> <comments|-> <web-link|->
 flp-rebuild set-project-settings <input.flp> <output.flp> <play-truncated:0|1|-> <fast-declick:0|1|->
 flp-rebuild rename-channel <input.flp> <output.flp> <channel-id> <name>
+flp-rebuild set-channel-color <input.flp> <output.flp> <channel-id> <RRGGBB>
 flp-rebuild set-channel-levels <input.flp> <output.flp> <channel-id> <volume-0..12800> <pan-0..12800>
 flp-rebuild set-layer-children <input.flp> <output.flp> <layer-channel-id> <child-ids-comma-separated|->
 flp-rebuild set-layer-flags <input.flp> <output.flp> <layer-channel-id> <random:0|1|-> <crossfade:0|1|->
@@ -168,9 +169,9 @@ The Standard MIDI File reader recognizes the `MThd` header and `MTrk` event stre
 
 The original application's MIDI export experiments and their measured results are recorded in [`docs/oracle-experiments.md`](docs/oracle-experiments.md). `midi-events` displays a selected MIDI track's decoded events, including tempo and marker metadata, for further format comparison.
 
-## Channel levels
+## Channel Rack colors and levels
 
-`channels <file.flp>` reports raw channel volume and pan values when present, along with observed sample source paths. The desktop Channel Rack exposes volume and pan sliders for channels with a valid modern `0xDB` Levels event. Its left row button toggles mute by editing an existing `0x00` enabled event or inserting one after the channel kind event; supported Sampler, audio-channel, and loaded VST3 song playback/rendering honor muted channels. Click a channel name to select it, Ctrl/Cmd-click to toggle it in the selection, Shift-click to extend a contiguous selection, or double-click to select all channels. The row context menu can add/remove a channel from the selection, select only that channel, and mute/unmute all selected channels. Per-row Up/Down controls reorder complete channel event blocks without changing channel IDs, and the Sort by menu orders channels by name or type. Right-click a channel name and choose Piano roll to open that channel in the selected pattern. `set-channel-levels` edits those first two fields and preserves the remaining event payload. Older byte and word controls are decoded for inspection but remain read-only until their scaling is verified. Playlist audio and Sampler playback apply provisional volume/pan mappings based on observed raw defaults; native FL Studio output has not yet been used to verify the curves.
+`channels <file.flp>` reports raw channel color, volume, and pan values when present, along with observed sample source paths. The desktop Channel Rack exposes a per-row color swatch and picker. `set-channel-color <input.flp> <output.flp> <channel-id> <RRGGBB>` edits the RGB components and retains the fourth color byte. Color sorting follows hue from red through violet, with achromatic and uncolored channels afterward. Click a channel name to select it, Ctrl/Cmd-click to toggle it in the selection, Shift-click to extend a contiguous selection, or double-click to select all channels. The row context menu can add/remove a channel from the selection, select only that channel, and mute/unmute all selected channels. Per-row Up/Down controls reorder complete channel event blocks without changing channel IDs, and the Sort by menu orders channels by color, name, or type. Right-click a channel name and choose Piano roll to open that channel in the selected pattern. `set-channel-levels` edits those first two fields and preserves the remaining event payload. Older byte and word controls are decoded for inspection but remain read-only until their scaling is verified. Playlist audio and Sampler playback apply provisional volume/pan mappings based on observed raw defaults; native FL Studio output has not yet been used to verify the curves.
 
 The Channel Rack step grid selects a pattern and bar, then toggles notes at sixteenth-note positions. New steps use key 60, one step of length, and velocity 100. Open the Graph Editor with Ctrl/Cmd+K to view and edit per-step note key, velocity, pan, release, fine pitch, modulation X/Y, and shift; drawing on an empty step creates a C5 note, and right-dragging across steps interpolates a ramp.
 

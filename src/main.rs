@@ -273,6 +273,14 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 .map_err(|_| "channel id must be an integer from 0 through 65535".to_owned())?;
             rename_channel(Path::new(input), Path::new(output), channel_id, name)
         }
+        [command, input, output, channel_id, color] if command == "set-channel-color" => {
+            set_channel_color(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(channel_id, "channel id")?,
+                parse_rgb_hex(color)?,
+            )
+        }
         [command, input, output, channel_id, volume, pan] if command == "set-channel-levels" => {
             set_channel_levels(
                 Path::new(input),
@@ -694,6 +702,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild set-project-info <input.flp> <output.flp> <title|-> <author|-> <genre|-> <comments|-> <web-link|->\n",
             "  flp-rebuild set-project-settings <input.flp> <output.flp> <play-truncated:0|1|-> <fast-declick:0|1|->\n",
             "  flp-rebuild rename-channel <input.flp> <output.flp> <channel-id> <name>\n",
+            "  flp-rebuild set-channel-color <input.flp> <output.flp> <channel-id> <RRGGBB>\n",
             "  flp-rebuild set-channel-levels <input.flp> <output.flp> <channel-id> <volume-0..12800> <pan-0..12800>\n",
             "  flp-rebuild set-layer-children <input.flp> <output.flp> <layer-channel-id> <child-ids-comma-separated|->\n",
             "  flp-rebuild set-layer-flags <input.flp> <output.flp> <layer-channel-id> <random:0|1|-> <crossfade:0|1|->\n",
@@ -855,6 +864,22 @@ fn parse_u32(value: &str, description: &str) -> Result<u32, String> {
     value
         .parse::<u32>()
         .map_err(|_| format!("{description} must be a non-negative 32-bit integer"))
+}
+
+fn parse_rgb_hex(value: &str) -> Result<[u8; 3], String> {
+    let digits = value.strip_prefix('#').unwrap_or(value);
+    if digits.len() != 6 || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("channel color must be six hexadecimal digits (RRGGBB)".to_owned());
+    }
+    let parse_component = |start| {
+        u8::from_str_radix(&digits[start..start + 2], 16)
+            .map_err(|_| "channel color must be six hexadecimal digits (RRGGBB)".to_owned())
+    };
+    Ok([
+        parse_component(0)?,
+        parse_component(2)?,
+        parse_component(4)?,
+    ])
 }
 
 fn parse_f64(value: &str, description: &str) -> Result<f64, String> {
@@ -1483,7 +1508,7 @@ fn list_channels(path: &Path) -> Result<(), String> {
     println!("channels: {}", channels.len());
     for channel in channels {
         println!(
-            "id={} kind={} type={:?} enabled={} volume={:?} pan={:?} layer_children={:?} layer_flags={:?} plugin={} name={} sample_path={:?} events={:?}",
+            "id={} kind={} type={:?} enabled={} color={:?} volume={:?} pan={:?} layer_children={:?} layer_flags={:?} plugin={} name={} sample_path={:?} events={:?}",
             channel.id(),
             channel
                 .kind()
@@ -1492,6 +1517,7 @@ fn list_channels(path: &Path) -> Result<(), String> {
             channel
                 .enabled()
                 .map_or_else(|| "unknown".to_owned(), |enabled| enabled.to_string()),
+            channel.color(),
             channel.volume(),
             channel.pan(),
             channel.layer_child_ids(),
@@ -2000,6 +2026,31 @@ fn rename_channel(input: &Path, output: &Path, channel_id: u16, name: &str) -> R
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "renamed channel {channel_id} to {name:?} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn set_channel_color(
+    input: &Path,
+    output: &Path,
+    channel_id: u16,
+    rgb: [u8; 3],
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .set_channel_color(channel_id, rgb)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "set channel {channel_id} color to #{:02X}{:02X}{:02X} in {}",
+        rgb[0],
+        rgb[1],
+        rgb[2],
         output.display()
     );
     Ok(())
@@ -2689,4 +2740,17 @@ fn delete_time_marker(
         output.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_rgb_hex;
+
+    #[test]
+    fn parses_channel_rgb_in_hex_form_with_optional_prefix() {
+        assert_eq!(parse_rgb_hex("1aB2c3"), Ok([0x1A, 0xB2, 0xC3]));
+        assert_eq!(parse_rgb_hex("#102030"), Ok([0x10, 0x20, 0x30]));
+        assert!(parse_rgb_hex("#12345").is_err());
+        assert!(parse_rgb_hex("xyzxyz").is_err());
+    }
 }

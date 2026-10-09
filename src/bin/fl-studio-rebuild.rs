@@ -6649,6 +6649,7 @@ impl DawUi {
             .clamp(1, 64) as usize;
         let mut open_editor = None;
         let mut channel_enabled_edits = Vec::new();
+        let mut channel_color_edits = Vec::new();
         let mut channel_order_edits = Vec::new();
         let mut channel_sort = None;
         let mut level_edits = Vec::new();
@@ -6689,6 +6690,10 @@ impl DawUi {
                 self.step_graph_editor_open = !self.step_graph_editor_open;
             }
             ui.menu_button("Sort by", |ui| {
+                if ui.button("Color").clicked() {
+                    channel_sort = Some(ChannelSortOrder::Color);
+                    ui.close();
+                }
                 if ui.button("Name").clicked() {
                     channel_sort = Some(ChannelSortOrder::Name);
                     ui.close();
@@ -6751,6 +6756,23 @@ impl DawUi {
                                 .clicked()
                             {
                                 channel_enabled_edits.push((channel.id(), !is_enabled));
+                            }
+                            let stored_color = channel.color();
+                            let mut display_color = stored_color.map_or(PANEL_LIGHT, |[r, g, b, _]| {
+                                Color32::from_rgb(r, g, b)
+                            });
+                            if egui::color_picker::color_edit_button_srgba(
+                                ui,
+                                &mut display_color,
+                                egui::color_picker::Alpha::Opaque,
+                            )
+                            .on_hover_text("Change channel color")
+                            .changed()
+                            {
+                                channel_color_edits.push((
+                                    channel.id(),
+                                    [display_color.r(), display_color.g(), display_color.b()],
+                                ));
                             }
                             let move_up_enabled = channel_index > 0;
                             let move_up_response = ui
@@ -7185,6 +7207,22 @@ impl DawUi {
                 None => {}
             }
         }
+        for (channel_id, rgb) in channel_color_edits {
+            let result = self
+                .document
+                .as_mut()
+                .map(|document| document.set_channel_color(channel_id, rgb));
+            match result {
+                Some(Ok(())) => {
+                    self.dirty = true;
+                    self.status = format!("Updated channel {channel_id} color");
+                }
+                Some(Err(error)) => {
+                    self.status = format!("Could not change channel color: {error}");
+                }
+                None => {}
+            }
+        }
         for (channel_id, target_index) in channel_order_edits {
             let result = self
                 .document
@@ -7230,6 +7268,7 @@ impl DawUi {
                         })
                     });
                     let sort_name = match order {
+                        ChannelSortOrder::Color => "color",
                         ChannelSortOrder::Name => "name",
                         ChannelSortOrder::Type => "type",
                     };
