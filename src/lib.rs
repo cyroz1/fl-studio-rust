@@ -748,10 +748,14 @@ pub struct PatternNote {
     pub mod_y: u8,
 }
 
+/// FL Studio score-note flag for slide notes.
+pub const PATTERN_NOTE_SLIDE_FLAG: u16 = 1 << 3;
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PatternNoteEdit {
     pub position: Option<u32>,
     pub flags: Option<u16>,
+    pub slide: Option<bool>,
     pub length: Option<u32>,
     pub key: Option<u16>,
     pub group: Option<u16>,
@@ -1138,6 +1142,11 @@ pub struct PlaylistClipEdit {
 }
 
 impl PatternNote {
+    /// Whether this note carries FL Studio's slide-note flag.
+    pub fn is_slide_note(&self) -> bool {
+        self.flags & PATTERN_NOTE_SLIDE_FLAG != 0
+    }
+
     fn decode(bytes: &[u8]) -> Self {
         debug_assert_eq!(bytes.len(), FLP_NOTE_RECORD_SIZE);
         Self {
@@ -1182,6 +1191,13 @@ impl PatternNote {
         }
         if let Some(value) = edit.flags {
             self.flags = value;
+        }
+        if let Some(value) = edit.slide {
+            if value {
+                self.flags |= PATTERN_NOTE_SLIDE_FLAG;
+            } else {
+                self.flags &= !PATTERN_NOTE_SLIDE_FLAG;
+            }
         }
         if let Some(value) = edit.length {
             self.length = value;
@@ -7975,6 +7991,51 @@ mod tests {
         let reparsed = FlpDocument::parse(&encoded).expect("edited file should parse");
         assert_eq!(reparsed.patterns().unwrap()[0].notes.len(), 2);
         assert_eq!(reparsed.trailing_bytes(), &[0xB2]);
+    }
+
+    #[test]
+    fn slide_note_edits_toggle_only_the_slide_flag_and_roundtrip() {
+        let mut original_note = note_record(0, 0, 48, 60, 100);
+        let original_flags = 0xA5A5_u16;
+        original_note[4..6].copy_from_slice(&original_flags.to_le_bytes());
+        let mut document = FlpDocument::parse(&pattern_fixture(&[original_note], &[0xFF, 1, 0xAA]))
+            .expect("fixture should parse");
+
+        document
+            .edit_pattern_note(
+                7,
+                0,
+                0,
+                PatternNoteEdit {
+                    slide: Some(true),
+                    ..PatternNoteEdit::default()
+                },
+            )
+            .expect("slide flag should be set");
+        let note = &document.patterns().unwrap()[0].notes[0];
+        assert!(note.is_slide_note());
+        assert_eq!(note.flags, original_flags | PATTERN_NOTE_SLIDE_FLAG);
+
+        document
+            .edit_pattern_note(
+                7,
+                0,
+                0,
+                PatternNoteEdit {
+                    slide: Some(false),
+                    ..PatternNoteEdit::default()
+                },
+            )
+            .expect("slide flag should be cleared");
+        let encoded = document.encode_lossless().unwrap();
+        let reparsed = FlpDocument::parse(&encoded).expect("edited project should parse");
+        let note = &reparsed.patterns().unwrap()[0].notes[0];
+        assert!(!note.is_slide_note());
+        assert_eq!(note.flags, original_flags);
+        assert_eq!(
+            reparsed.events().last().unwrap().wire_bytes(),
+            &[0xFF, 1, 0xAA]
+        );
     }
 
     #[test]

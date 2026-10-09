@@ -27,9 +27,10 @@ use flp_rebuild::sample_render::{
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions, Vst3PatternStreamHandle};
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, AutomationChannel, AutomationPoint, AutomationPointEdit,
-    ChannelSortOrder, ChannelSummary, FlpDocument, FstPreset, FstPresetKind, Pattern, PatternNote,
-    PatternNoteEdit, PlaylistClip, PlaylistClipEdit, PlaylistTrack, ProjectInfoEdit,
-    ProjectSettingsEdit, RandomizerOptions, TimeMarker, TimeMarkerEdit, VstPluginStateMetadata,
+    ChannelSortOrder, ChannelSummary, FlpDocument, FstPreset, FstPresetKind,
+    PATTERN_NOTE_SLIDE_FLAG, Pattern, PatternNote, PatternNoteEdit, PlaylistClip, PlaylistClipEdit,
+    PlaylistTrack, ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions, TimeMarker,
+    TimeMarkerEdit, VstPluginStateMetadata,
 };
 
 const APP_BACKGROUND: Color32 = Color32::from_rgb(27, 27, 27);
@@ -10688,6 +10689,18 @@ impl DawUi {
                         channel_color
                     },
                 );
+                if note.is_slide_note() {
+                    let marker_color = if selected { Color32::WHITE } else { TEXT };
+                    painter.add(egui::Shape::convex_polygon(
+                        vec![
+                            egui::pos2(note_rect.left() + 2.0, note_rect.top() + 2.0),
+                            egui::pos2(note_rect.left() + 7.0, note_rect.center().y),
+                            egui::pos2(note_rect.left() + 2.0, note_rect.bottom() - 2.0),
+                        ],
+                        marker_color,
+                        Stroke::NONE,
+                    ));
+                }
                 let resize_handle = egui::Rect::from_min_max(
                     egui::pos2(
                         (note_rect.right() - 5.0).max(note_rect.left()),
@@ -11361,6 +11374,7 @@ impl DawUi {
         let mut key = note.key;
         let mut velocity = note.velocity;
         let mut flags = note.flags;
+        let mut slide_note = note.is_slide_note();
         let mut group = note.group;
         let mut fine_pitch = note.fine_pitch;
         let mut release = note.release;
@@ -11374,6 +11388,7 @@ impl DawUi {
         let mut key_changed = false;
         let mut velocity_changed = false;
         let mut flags_changed = false;
+        let mut slide_changed = false;
         let mut group_changed = false;
         ui.separator();
         ui.horizontal(|ui| {
@@ -11423,6 +11438,12 @@ impl DawUi {
                             .speed(0.1),
                     )
                     .changed();
+                slide_changed = ui
+                    .checkbox(&mut slide_note, "Slide")
+                    .on_hover_text(
+                        "Stores FL Studio's slide-note flag. Glide rendering for native instruments is not implemented yet.",
+                    )
+                    .changed();
                 group_changed = ui
                     .add(
                         egui::DragValue::new(&mut group)
@@ -11468,6 +11489,7 @@ impl DawUi {
                 || key_changed
                 || velocity_changed
                 || flags_changed
+                || slide_changed
                 || group_changed
                 || fine_pitch_changed
                 || release_changed
@@ -11482,6 +11504,7 @@ impl DawUi {
                 key: key_changed.then_some(key),
                 velocity: velocity_changed.then_some(velocity),
                 flags: flags_changed.then_some(flags),
+                slide: slide_changed.then_some(slide_note),
                 group: group_changed.then_some(group),
                 fine_pitch: fine_pitch_changed.then_some(fine_pitch),
                 release: release_changed.then_some(release),

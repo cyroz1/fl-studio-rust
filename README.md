@@ -103,6 +103,8 @@ The Piano roll's **Selection** menu provides Select all, Invert selection, and D
 
 The Piano roll's **Events** panel displays per-note velocity, pan, release, fine pitch, Mod X, or Mod Y as draggable stems. Select a target from the toolbar menu or press Shift+F to cycle through them. Pattern-scoped controller automation and event interpolation are not implemented yet.
 
+The selected-note inspector can toggle a **Slide** note flag and shows a small marker at the start of the note. The flag is preserved in the FLP, but native-instrument glide playback and portamento remain unsupported.
+
 Use Ctrl/Cmd+B or **Selection → Duplicate to right** to copy the selected notes, or all notes in the current channel when nothing is selected. The copy preserves note properties and moves right by the notes' combined time span; a separate time-range repeat interval is not available yet.
 
 **Slice channel/selected** and `slice-notes` split targeted notes that cross the chosen tick into two notes. Both pieces retain the source note's properties.

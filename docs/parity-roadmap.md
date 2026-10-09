@@ -182,8 +182,8 @@ decision, not a roadmap item.
 ## 6. Piano roll
 
 Current: note create/drag/resize/snap, velocity editing, and a selected-note
-inspector for raw flags/group, fine pitch, release, stored MIDI channel, pan,
-and modulation X/Y. Quantize has channel and selected-note actions; Legato,
+inspector for raw flags/group, the per-note slide flag, fine pitch, release,
+stored MIDI channel, pan, and modulation X/Y. Quantize has channel and selected-note actions; Legato,
 Chop, Glue, Flip, Strum, Flam, seeded Randomize and Humanize, pitch Limit,
 Arpeggiate, and Slice can target the channel or selected notes. Scale highlighting, chord labels, ghost
 channels, and MIDI-channel note colors are available in the Piano roll. The
@@ -205,7 +205,7 @@ FL Studio's piano roll is famously deep — the full toolset:
 - `[partial]` Limit folds channel or selected note pitches into a key range by octave and clamps keys that cannot fit; scale snapping remains
 - `[partial]` Slice-at-tick splits notes crossing the chosen tick in the channel or selection; native directional cut gestures remain
 - `[todo]` Scale levels, Articulate (LFO/envelopes on note properties)
-- `[todo]` Slide notes and portamento (channel pitch slides)
+- `[partial]` The Piano roll displays the observed per-note slide flag as a start marker and can toggle it while preserving other flag bits; native-instrument slide playback, portamento flag encoding, and portamento playback remain unsupported
 - `[partial]` Ghost channels show notes from all channels in the selected pattern with the target channel emphasized; independent ghost editing controls remain
 - `[partial]` Notes can be colored by their stored MIDI channel; native note color groups and color-based selection remain
 - `[partial]` Chord Stamp supports common manual chords and scale-derived triads/sevenths, uses the snap length, and can return to Draw after one stamp; automatic top-down/bottom-up voicing, voice leading, percussion/slide presets, and chord preview remain
