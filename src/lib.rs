@@ -1729,6 +1729,170 @@ impl FlpDocument {
         Ok(group_index)
     }
 
+    /// Adds an empty Channel Rack display group and returns its zero-based index.
+    pub fn add_channel_group(&mut self, name: &str) -> Result<i32, FlpError> {
+        if name.trim().is_empty() || name.contains('\0') {
+            return Err(FlpError::UnsupportedEdit(
+                "a Channel Rack group needs a non-empty name without embedded NUL characters",
+            ));
+        }
+        let groups = self.channel_groups();
+        if groups.iter().any(|group| group.name() == Some(name)) {
+            return Err(FlpError::UnsupportedEdit(
+                "a Channel Rack group already has the requested name",
+            ));
+        }
+        let group_index = i32::try_from(groups.len()).map_err(|_| {
+            FlpError::UnsupportedEdit("the project has too many Channel Rack groups")
+        })?;
+        let utf16 = self
+            .project_string_encoding()
+            .ok_or(FlpError::UnsupportedEdit(
+                "the project's string encoding cannot be inferred for a new Channel Rack group",
+            ))?;
+        let group_event = FlpEvent::new_data(0xE7, encode_project_string(name, utf16)?)?;
+        let mut candidate = self.clone();
+        let first_channel = candidate
+            .events
+            .iter()
+            .position(|event| event.opcode == 0x40)
+            .unwrap_or(candidate.events.len());
+        let insertion_index = candidate.events[..first_channel]
+            .iter()
+            .rposition(|event| {
+                event.opcode == 0xE7 && matches!(event.encoding, PayloadEncoding::Data { .. })
+            })
+            .map_or(first_channel, |index| index + 1);
+        candidate.events.insert(insertion_index, group_event);
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(group_index)
+    }
+
+    /// Renames a Channel Rack display group without changing its channel assignments.
+    pub fn rename_channel_group(&mut self, group_index: i32, name: &str) -> Result<(), FlpError> {
+        if name.trim().is_empty() || name.contains('\0') {
+            return Err(FlpError::UnsupportedEdit(
+                "a Channel Rack group needs a non-empty name without embedded NUL characters",
+            ));
+        }
+        let groups = self.channel_groups();
+        let Some(group) = groups.iter().find(|group| group.index() == group_index) else {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested Channel Rack group does not exist",
+            ));
+        };
+        if group.name() == Some(name) {
+            return Ok(());
+        }
+        if groups
+            .iter()
+            .any(|other| other.index() != group_index && other.name() == Some(name))
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "a Channel Rack group already has the requested name",
+            ));
+        }
+        let utf16 = self
+            .project_string_encoding()
+            .ok_or(FlpError::UnsupportedEdit(
+                "the project's string encoding cannot be inferred for a renamed Channel Rack group",
+            ))?;
+        let first_channel = self
+            .events
+            .iter()
+            .position(|event| event.opcode == 0x40)
+            .unwrap_or(self.events.len());
+        let group_event_index = self.events[..first_channel]
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| {
+                event.opcode == 0xE7 && matches!(event.encoding, PayloadEncoding::Data { .. })
+            })
+            .nth(usize::try_from(group_index).map_err(|_| {
+                FlpError::UnsupportedEdit("the requested Channel Rack group does not exist")
+            })?)
+            .map(|(index, _)| index)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested Channel Rack group does not exist",
+            ))?;
+        let mut candidate = self.clone();
+        candidate.events[group_event_index]
+            .replace_data_payload(encode_project_string(name, utf16)?)?;
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    /// Deletes a Channel Rack group, unassigns its channels, and shifts higher group indexes down.
+    pub fn delete_channel_group(&mut self, group_index: i32) -> Result<(), FlpError> {
+        if !self
+            .channel_groups()
+            .iter()
+            .any(|group| group.index() == group_index)
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested Channel Rack group does not exist",
+            ));
+        }
+        let first_channel = self
+            .events
+            .iter()
+            .position(|event| event.opcode == 0x40)
+            .unwrap_or(self.events.len());
+        let group_event_index = self.events[..first_channel]
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| {
+                event.opcode == 0xE7 && matches!(event.encoding, PayloadEncoding::Data { .. })
+            })
+            .nth(usize::try_from(group_index).map_err(|_| {
+                FlpError::UnsupportedEdit("the requested Channel Rack group does not exist")
+            })?)
+            .map(|(index, _)| index)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested Channel Rack group does not exist",
+            ))?;
+
+        let mut candidate = self.clone();
+        candidate.events.remove(group_event_index);
+        let mut channels = candidate.channels();
+        channels.sort_by_key(|channel| std::cmp::Reverse(channel.first_event_index));
+        for channel in channels {
+            let mut group_events = channel
+                .event_range()
+                .filter(|index| candidate.events[*index].opcode == 0x91);
+            let existing_index = group_events.next();
+            if group_events.next().is_some() {
+                return Err(FlpError::UnsupportedEdit(
+                    "a channel has multiple display-group events",
+                ));
+            }
+            let Some(event_index) = existing_index else {
+                continue;
+            };
+            let event = &candidate.events[event_index];
+            if event.encoding != PayloadEncoding::Dword || event.payload.len() != 4 {
+                return Err(FlpError::UnsupportedEdit(
+                    "a channel's display-group event is not a dword",
+                ));
+            }
+            let current_index = i32::from_le_bytes(
+                event.payload[..4]
+                    .try_into()
+                    .expect("a dword event has four payload bytes"),
+            );
+            if current_index == group_index {
+                candidate.events.remove(event_index);
+            } else if current_index > group_index {
+                candidate.events[event_index].replace_dword_payload((current_index - 1) as u32)?;
+            }
+        }
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
     /// Returns the points found in each type-5 automation channel's `0xEA` blob.
     /// The full event remains byte-exact in `events()`; the 17-byte header,
     /// per-point trailing bytes, and any era-specific trailer are not discarded.
@@ -8186,6 +8350,100 @@ mod tests {
                 .encode_lossless()
                 .expect("grouped project should roundtrip"),
             after_create
+        );
+    }
+
+    #[test]
+    fn adds_and_renames_empty_channel_groups_without_changing_assignments() {
+        let mut event_stream = Vec::new();
+        append_project_info_string(&mut event_stream, 0xE7, "Drums");
+        append_project_info_string(&mut event_stream, 0xE7, "Synths");
+        event_stream.extend_from_slice(&[
+            0x40, 7, 0, 0x15, 0, 0x91, 1, 0, 0, 0, 0x90, 0x78, 0x56, 0x34, 0x12,
+        ]);
+        let input = flp_fixture(&event_stream, &[], &[0xA5, 0x5A]);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+
+        assert_eq!(
+            document
+                .add_channel_group("Empty")
+                .expect("an empty display group should be added"),
+            2
+        );
+        document
+            .rename_channel_group(1, "Keys")
+            .expect("a display group should be renamed");
+        let renamed = document.encode_lossless().expect("renamed project encodes");
+        assert_eq!(
+            document
+                .channel_groups()
+                .iter()
+                .map(ChannelGroupSummary::name)
+                .collect::<Vec<_>>(),
+            [Some("Drums"), Some("Keys"), Some("Empty")]
+        );
+        assert_eq!(document.channels()[0].group_number(), Some(1));
+        assert!(document.rename_channel_group(2, "Drums").is_err());
+        assert_eq!(
+            document
+                .encode_lossless()
+                .expect("rejected rename is atomic"),
+            renamed
+        );
+        assert!(document.events().iter().any(|event| {
+            event.opcode() == 0x90 && event.wire_bytes() == [0x90, 0x78, 0x56, 0x34, 0x12]
+        }));
+        assert_eq!(
+            FlpDocument::parse(&renamed)
+                .expect("renamed project parses")
+                .encode_lossless()
+                .expect("renamed project roundtrips"),
+            renamed
+        );
+    }
+
+    #[test]
+    fn deleting_channel_group_unassigns_channels_and_reindexes_later_groups() {
+        let mut event_stream = Vec::new();
+        append_project_info_string(&mut event_stream, 0xE7, "Drums");
+        append_project_info_string(&mut event_stream, 0xE7, "Synths");
+        append_project_info_string(&mut event_stream, 0xE7, "Effects");
+        event_stream.extend_from_slice(&[
+            0x40, 7, 0, 0x15, 0, 0x91, 0, 0, 0, 0, 0x90, 0x11, 0x22, 0x33, 0x44, 0x40, 8, 0, 0x15,
+            0, 0x91, 1, 0, 0, 0, 0x40, 9, 0, 0x15, 0, 0x91, 2, 0, 0, 0,
+        ]);
+        let input = flp_fixture(&event_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+
+        document
+            .delete_channel_group(1)
+            .expect("a display group should be deleted");
+        assert_eq!(
+            document
+                .channel_groups()
+                .iter()
+                .map(ChannelGroupSummary::name)
+                .collect::<Vec<_>>(),
+            [Some("Drums"), Some("Effects")]
+        );
+        assert_eq!(
+            document
+                .channels()
+                .iter()
+                .map(ChannelSummary::group_number)
+                .collect::<Vec<_>>(),
+            [Some(0), None, Some(1)]
+        );
+        assert!(document.events().iter().any(|event| {
+            event.opcode() == 0x90 && event.wire_bytes() == [0x90, 0x11, 0x22, 0x33, 0x44]
+        }));
+        let encoded = document.encode_lossless().expect("deleted project encodes");
+        assert_eq!(
+            FlpDocument::parse(&encoded)
+                .expect("deleted project parses")
+                .encode_lossless()
+                .expect("deleted project roundtrips"),
+            encoded
         );
     }
 

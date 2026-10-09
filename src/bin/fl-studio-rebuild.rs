@@ -293,11 +293,37 @@ impl ChannelDisplayFilter {
             Self::Group(index) => group_number == Some(index),
         }
     }
+
+    fn step_group(self, groups: &[ChannelGroupSummary], direction: i32) -> Self {
+        if groups.is_empty() {
+            return self;
+        }
+        let current = match self {
+            Self::Group(index) => groups.iter().position(|group| group.index() == index),
+            Self::All | Self::Unsorted => None,
+        };
+        let next = match (current, direction.signum()) {
+            (Some(index), 1) => (index + 1) % groups.len(),
+            (Some(index), -1) => (index + groups.len() - 1) % groups.len(),
+            (None, 1) => 0,
+            (None, -1) => groups.len() - 1,
+            (_, 0) => return self,
+            _ => unreachable!("direction was normalized above"),
+        };
+        Self::Group(groups[next].index())
+    }
+}
+
+#[derive(Clone)]
+enum ChannelGroupDialogAction {
+    AssignSelected(Vec<u16>),
+    CreateEmpty,
+    Rename(i32),
 }
 
 #[derive(Clone)]
 struct ChannelGroupDialog {
-    channel_ids: Vec<u16>,
+    action: ChannelGroupDialogAction,
     name: String,
 }
 
@@ -1710,7 +1736,43 @@ impl DawUi {
             })
             .unwrap_or_default()
             .to_owned();
-        self.channel_group_dialog = Some(ChannelGroupDialog { channel_ids, name });
+        self.channel_group_dialog = Some(ChannelGroupDialog {
+            action: ChannelGroupDialogAction::AssignSelected(channel_ids),
+            name,
+        });
+    }
+
+    fn open_empty_channel_group_dialog(&mut self) {
+        if self.document.is_none() {
+            self.status = "Open a project before adding a display group".to_owned();
+            return;
+        }
+        self.channel_group_dialog = Some(ChannelGroupDialog {
+            action: ChannelGroupDialogAction::CreateEmpty,
+            name: String::new(),
+        });
+    }
+
+    fn open_rename_channel_group_dialog(&mut self, group_index: i32) {
+        let Some(document) = &self.document else {
+            self.status = "Open a project before renaming a display group".to_owned();
+            return;
+        };
+        let Some(group) = document
+            .channel_groups()
+            .into_iter()
+            .find(|group| group.index() == group_index)
+        else {
+            self.status = "The selected display group no longer exists".to_owned();
+            return;
+        };
+        self.channel_group_dialog = Some(ChannelGroupDialog {
+            action: ChannelGroupDialogAction::Rename(group_index),
+            name: group
+                .name()
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("Group {}", group_index.saturating_add(1))),
+        });
     }
 
     fn apply_channel_group_dialog(&mut self, dialog: ChannelGroupDialog) {
@@ -1718,10 +1780,15 @@ impl DawUi {
             .document
             .as_ref()
             .and_then(|document| document.encode_lossless().ok());
-        let result = self
-            .document
-            .as_mut()
-            .map(|document| document.group_channels(&dialog.channel_ids, &dialog.name));
+        let result = self.document.as_mut().map(|document| match &dialog.action {
+            ChannelGroupDialogAction::AssignSelected(channel_ids) => {
+                document.group_channels(channel_ids, &dialog.name)
+            }
+            ChannelGroupDialogAction::CreateEmpty => document.add_channel_group(&dialog.name),
+            ChannelGroupDialogAction::Rename(group_index) => document
+                .rename_channel_group(*group_index, &dialog.name)
+                .map(|()| *group_index),
+        });
         match result {
             Some(Ok(group_index)) => {
                 let changed = self
@@ -1733,21 +1800,80 @@ impl DawUi {
                 if changed {
                     self.stop_project_playback();
                     self.dirty = true;
-                    self.status = format!(
-                        "Grouped {} channel(s) in {}",
-                        dialog.channel_ids.len(),
-                        dialog.name
-                    );
+                    self.status = match &dialog.action {
+                        ChannelGroupDialogAction::AssignSelected(channel_ids) => format!(
+                            "Grouped {} channel(s) in {}",
+                            channel_ids.len(),
+                            dialog.name
+                        ),
+                        ChannelGroupDialogAction::CreateEmpty => {
+                            format!("Added empty display group {}", dialog.name)
+                        }
+                        ChannelGroupDialogAction::Rename(_) => {
+                            format!("Renamed display group to {}", dialog.name)
+                        }
+                    };
                 } else {
-                    self.status = format!("Channels already belong to {}", dialog.name);
+                    self.status = match &dialog.action {
+                        ChannelGroupDialogAction::AssignSelected(_) => {
+                            format!("Channels already belong to {}", dialog.name)
+                        }
+                        ChannelGroupDialogAction::CreateEmpty => {
+                            format!("Display group {} already exists", dialog.name)
+                        }
+                        ChannelGroupDialogAction::Rename(_) => {
+                            format!("Display group is already named {}", dialog.name)
+                        }
+                    };
                 }
                 self.channel_display_filter = ChannelDisplayFilter::Group(group_index);
             }
             Some(Err(error)) => {
-                self.status = format!("Could not group selected channels: {error}");
+                self.status = format!("Could not update display group: {error}");
                 self.channel_group_dialog = Some(dialog);
             }
-            None => self.status = "Open a project before grouping channels".to_owned(),
+            None => self.status = "Open a project before updating display groups".to_owned(),
+        }
+    }
+
+    fn delete_channel_group_from_ui(&mut self, group_index: i32) {
+        let group_name = self
+            .document
+            .as_ref()
+            .and_then(|document| {
+                document
+                    .channel_groups()
+                    .into_iter()
+                    .find(|group| group.index() == group_index)
+            })
+            .and_then(|group| group.name().map(str::to_owned))
+            .unwrap_or_else(|| format!("Group {}", group_index.saturating_add(1)));
+        let result = self
+            .document
+            .as_mut()
+            .map(|document| document.delete_channel_group(group_index));
+        match result {
+            Some(Ok(())) => {
+                self.stop_project_playback();
+                self.dirty = true;
+                self.status = format!(
+                    "Deleted display group {}; its channels are now unsorted",
+                    group_name
+                );
+                self.channel_display_filter = match self.channel_display_filter {
+                    ChannelDisplayFilter::Group(index) if index == group_index => {
+                        ChannelDisplayFilter::All
+                    }
+                    ChannelDisplayFilter::Group(index) if index > group_index => {
+                        ChannelDisplayFilter::Group(index - 1)
+                    }
+                    filter => filter,
+                };
+            }
+            Some(Err(error)) => {
+                self.status = format!("Could not delete display group: {error}");
+            }
+            None => self.status = "Open a project before deleting a display group".to_owned(),
         }
     }
 
@@ -1758,18 +1884,35 @@ impl DawUi {
         let mut open = true;
         let mut apply = false;
         let mut cancel = false;
-        egui::Window::new("Group selected channels")
+        let (title, description, submit_label) = match &dialog.action {
+            ChannelGroupDialogAction::AssignSelected(_) => (
+                "Group selected channels",
+                "Enter a group name. An existing name moves channels into that group.",
+                "Assign selected",
+            ),
+            ChannelGroupDialogAction::CreateEmpty => (
+                "Add display group",
+                "Enter a name for the empty display group.",
+                "Add group",
+            ),
+            ChannelGroupDialogAction::Rename(_) => (
+                "Rename display group",
+                "Enter a new name for this display group.",
+                "Rename group",
+            ),
+        };
+        egui::Window::new(title)
             .id(Id::new("channel-group-dialog"))
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
             .default_width(340.0)
             .show(context, |ui| {
-                ui.label("Enter a group name. An existing name moves channels into that group.");
+                ui.label(description);
                 ui.label("Group name");
                 ui.text_edit_singleline(&mut dialog.name);
                 ui.horizontal(|ui| {
-                    if ui.button("Assign selected").clicked() {
+                    if ui.button(submit_label).clicked() {
                         apply = true;
                     }
                     if ui.button("Cancel").clicked() {
@@ -6830,21 +6973,33 @@ impl DawUi {
             .clamp(1, 64) as usize;
         let mut open_editor = None;
         let mut open_group_dialog = false;
+        let mut open_empty_group_dialog = false;
+        let mut rename_group_dialog = None;
+        let mut delete_group = None;
         let mut channel_enabled_edits = Vec::new();
         let mut channel_zipped_edits = Vec::new();
-        let (zip_selected, unzip_all, group_selected) =
+        let (zip_selected, unzip_all, group_selected, previous_group, next_group) =
             if ui.memory(|memory| memory.focused().is_none()) {
                 ui.input_mut(|input| {
                     (
                         input.consume_key(egui::Modifiers::ALT, egui::Key::Z),
                         input.consume_key(egui::Modifiers::ALT, egui::Key::U),
                         input.consume_key(egui::Modifiers::ALT, egui::Key::G),
+                        input.consume_key(egui::Modifiers::NONE, egui::Key::PageUp),
+                        input.consume_key(egui::Modifiers::NONE, egui::Key::PageDown),
                     )
                 })
             } else {
-                (false, false, false)
+                (false, false, false, false, false)
             };
         open_group_dialog |= group_selected;
+        if previous_group {
+            self.channel_display_filter =
+                self.channel_display_filter.step_group(&channel_groups, -1);
+        } else if next_group {
+            self.channel_display_filter =
+                self.channel_display_filter.step_group(&channel_groups, 1);
+        }
         if zip_selected {
             channel_zipped_edits.extend(
                 self.selected_rack_channels
@@ -6894,7 +7049,7 @@ impl DawUi {
                     }
                 });
             ui.label("Display");
-            egui::ComboBox::from_id_salt("channel-rack-display-filter")
+            let display_filter = egui::ComboBox::from_id_salt("channel-rack-display-filter")
                 .selected_text(self.channel_display_filter.label(&channel_groups))
                 .show_ui(ui, |ui| {
                     ui.selectable_value(
@@ -6918,6 +7073,27 @@ impl DawUi {
                         );
                     }
                 });
+            let selected_group = match self.channel_display_filter {
+                ChannelDisplayFilter::Group(index) => Some(index),
+                ChannelDisplayFilter::All | ChannelDisplayFilter::Unsorted => None,
+            };
+            display_filter.response.context_menu(|ui| {
+                if ui.button("Add Filter Group…").clicked() {
+                    open_empty_group_dialog = true;
+                    ui.close();
+                }
+                if let Some(group_index) = selected_group {
+                    ui.separator();
+                    if ui.button("Rename Group…").clicked() {
+                        rename_group_dialog = Some(group_index);
+                        ui.close();
+                    }
+                    if ui.button("Delete Group").clicked() {
+                        delete_group = Some(group_index);
+                        ui.close();
+                    }
+                }
+            });
             if ui.small_button("◀").clicked() {
                 self.step_sequencer_bar = self.step_sequencer_bar.saturating_sub(1);
             }
@@ -7781,6 +7957,15 @@ impl DawUi {
         }
         if open_group_dialog {
             self.open_channel_group_dialog();
+        }
+        if open_empty_group_dialog {
+            self.open_empty_channel_group_dialog();
+        }
+        if let Some(group_index) = rename_group_dialog {
+            self.open_rename_channel_group_dialog(group_index);
+        }
+        if let Some(group_index) = delete_group {
+            self.delete_channel_group_from_ui(group_index);
         }
     }
 
@@ -14403,8 +14588,9 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::{
-        ChannelDisplayFilter, PianoRollGrid, PianoRollSnap, note_from_grid_position,
-        snap_note_tick, update_channel_rack_selection, update_layer_child_selection,
+        ChannelDisplayFilter, ChannelGroupSummary, PianoRollGrid, PianoRollSnap,
+        note_from_grid_position, snap_note_tick, update_channel_rack_selection,
+        update_layer_child_selection,
     };
 
     fn test_grid() -> PianoRollGrid {
@@ -14445,6 +14631,40 @@ mod tests {
         assert!(ChannelDisplayFilter::Group(1).shows(Some(1), &known_groups));
         assert!(!ChannelDisplayFilter::Group(1).shows(Some(0), &known_groups));
         assert!(!ChannelDisplayFilter::Group(1).shows(None, &known_groups));
+    }
+
+    #[test]
+    fn page_navigation_cycles_named_groups_from_all_or_unsorted() {
+        let groups = [
+            ChannelGroupSummary {
+                index: 0,
+                name: Some("Drums".to_owned()),
+            },
+            ChannelGroupSummary {
+                index: 1,
+                name: Some("Keys".to_owned()),
+            },
+        ];
+        assert_eq!(
+            ChannelDisplayFilter::All.step_group(&groups, 1),
+            ChannelDisplayFilter::Group(0)
+        );
+        assert_eq!(
+            ChannelDisplayFilter::Unsorted.step_group(&groups, -1),
+            ChannelDisplayFilter::Group(1)
+        );
+        assert_eq!(
+            ChannelDisplayFilter::Group(1).step_group(&groups, 1),
+            ChannelDisplayFilter::Group(0)
+        );
+        assert_eq!(
+            ChannelDisplayFilter::Group(0).step_group(&groups, -1),
+            ChannelDisplayFilter::Group(1)
+        );
+        assert_eq!(
+            ChannelDisplayFilter::All.step_group(&[], 1),
+            ChannelDisplayFilter::All
+        );
     }
 
     #[test]
