@@ -57,6 +57,7 @@ const MAX_WAVEFORM_WORKERS: usize = 1;
 const DEFAULT_AUTOSAVE_MINUTES: u8 = 5;
 const DEFAULT_BACKUP_RETENTION: usize = 20;
 const RECENT_PROJECT_LIMIT: usize = 50;
+const UI_SCALE_STEPS: [f32; 7] = [0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4];
 const BROWSER_SEARCH_ROOT_LIMIT: usize = 30;
 const MAX_BROWSER_RECURSIVE_SCAN_ENTRIES: usize = 20_000;
 const AUTOSAVE_INTERVALS_MINUTES: [u8; 5] = [0, 1, 5, 10, 15];
@@ -1278,6 +1279,7 @@ struct DawUi {
     current_path: Option<PathBuf>,
     package_workspace: Option<ProjectPackageWorkspace>,
     view: MainView,
+    ui_scale: f32,
     status: String,
     dirty: bool,
     undo_history: Vec<Vec<u8>>,
@@ -1547,11 +1549,14 @@ impl DawUi {
             .and_then(Path::parent)
             .map(Path::to_path_buf)
             .unwrap_or_else(default_browser_directory);
+        let ui_scale = load_ui_scale();
+        creation.egui_ctx.set_zoom_factor(ui_scale);
         let mut app = Self {
             document: None,
             current_path: None,
             package_workspace: None,
             view: MainView::Playlist,
+            ui_scale,
             status: "Open an FL Studio project to begin".to_owned(),
             dirty: false,
             undo_history: Vec::new(),
@@ -4006,6 +4011,23 @@ impl DawUi {
                     self.view = MainView::Audio;
                     ui.close();
                 }
+                ui.separator();
+                ui.menu_button("UI scale", |ui| {
+                    for scale in UI_SCALE_STEPS {
+                        let selected = (self.ui_scale - scale).abs() < f32::EPSILON;
+                        if ui
+                            .selectable_label(selected, format!("{:.0}%", scale * 100.0))
+                            .clicked()
+                        {
+                            self.ui_scale = scale;
+                            ui.ctx().set_zoom_factor(scale);
+                            if let Err(error) = save_ui_scale(scale) {
+                                self.status = format!("Could not save UI scale: {error}");
+                            }
+                            ui.close();
+                        }
+                    }
+                });
             });
             ui.menu_button("Tools", |ui| {
                 if ui.button("Channel Rack Graph Editor").clicked() {
@@ -13902,6 +13924,38 @@ fn autosave_settings_file() -> Option<PathBuf> {
     browser_favorites_file()?
         .parent()
         .map(|directory| directory.join("autosave-settings.txt"))
+}
+
+fn ui_scale_settings_file() -> Option<PathBuf> {
+    browser_favorites_file()?
+        .parent()
+        .map(|directory| directory.join("ui-scale.txt"))
+}
+
+fn load_ui_scale() -> f32 {
+    let Some(path) = ui_scale_settings_file() else {
+        return 1.0;
+    };
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|contents| contents.trim().parse::<f32>().ok())
+        .filter(|scale| UI_SCALE_STEPS.contains(scale))
+        .unwrap_or(1.0)
+}
+
+fn save_ui_scale(scale: f32) -> Result<(), String> {
+    if !UI_SCALE_STEPS.contains(&scale) {
+        return Err(format!("unsupported UI scale: {scale}"));
+    }
+    let path = ui_scale_settings_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the UI scale settings path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(&path, format!("{scale:.1}\n"))
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
 }
 
 fn load_autosave_settings() -> Option<(u8, bool, usize)> {
