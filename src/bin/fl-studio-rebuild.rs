@@ -4172,11 +4172,6 @@ impl DawUi {
             }
             ui.separator();
             ui.monospace(self.song_position_label());
-            ui.separator();
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label("00:00:00");
-                ui.label("CPU --%  voices --");
-            });
         });
     }
 
