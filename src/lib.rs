@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 
 pub mod audio;
@@ -331,6 +331,13 @@ pub enum ChannelType {
     Instrument,
     Automation,
     Unknown(u8),
+}
+
+/// Channel Rack ordering used by [`FlpDocument::sort_channels`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChannelSortOrder {
+    Name,
+    Type,
 }
 
 impl ChannelType {
@@ -5112,6 +5119,96 @@ impl FlpDocument {
         Ok(())
     }
 
+    /// Reorders every channel using a stable Channel Rack sort while preserving each channel's
+    /// complete event block and ID. Name sorting is case-insensitive; type sorting follows the
+    /// documented Layer, generator, Sampler, audio-channel, and automation grouping.
+    pub fn sort_channels(&mut self, order: ChannelSortOrder) -> Result<(), FlpError> {
+        let mut channels = self.channels();
+        match order {
+            ChannelSortOrder::Name => {
+                channels.sort_by_key(|channel| {
+                    channel.display_name().unwrap_or_default().to_lowercase()
+                });
+            }
+            ChannelSortOrder::Type => {
+                channels.sort_by_key(|channel| match channel.channel_type() {
+                    Some(ChannelType::Layer) => (0, 0),
+                    Some(ChannelType::Native) => (1, 0),
+                    Some(ChannelType::Sampler) => (2, 0),
+                    Some(ChannelType::Instrument) => (3, 0),
+                    Some(ChannelType::Automation) => (4, 0),
+                    Some(ChannelType::Unknown(raw)) => (5, raw),
+                    None => (5, u8::MAX),
+                })
+            }
+        }
+        let ordered_ids = channels.iter().map(ChannelSummary::id).collect::<Vec<_>>();
+        self.reorder_channels(&ordered_ids)
+    }
+
+    /// Applies a complete Channel Rack order without changing channel IDs or event bytes.
+    /// Every existing channel ID must appear exactly once in `channel_ids`.
+    pub fn reorder_channels(&mut self, channel_ids: &[u16]) -> Result<(), FlpError> {
+        let channels = self.channels();
+        if channel_ids.len() != channels.len() {
+            return Err(FlpError::UnsupportedEdit(
+                "a complete order for every Channel Rack channel is required",
+            ));
+        }
+        let mut channel_indices = BTreeMap::new();
+        for (index, channel) in channels.iter().enumerate() {
+            if channel_indices.insert(channel.id(), index).is_some() {
+                return Err(FlpError::AmbiguousChannelId(channel.id()));
+            }
+        }
+        let mut seen = BTreeSet::new();
+        for channel_id in channel_ids {
+            if !seen.insert(*channel_id) {
+                return Err(FlpError::AmbiguousChannelId(*channel_id));
+            }
+            if !channel_indices.contains_key(channel_id) {
+                return Err(FlpError::ChannelNotFound(*channel_id));
+            }
+        }
+        if channels.is_empty()
+            || channels
+                .iter()
+                .map(ChannelSummary::id)
+                .eq(channel_ids.iter().copied())
+        {
+            return Ok(());
+        }
+        if channels
+            .windows(2)
+            .any(|pair| pair[0].end_event_index != pair[1].first_event_index)
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "Channel Rack event ranges are not contiguous",
+            ));
+        }
+
+        let first_event_index = channels[0].first_event_index;
+        let trailing_event_index = channels[channels.len() - 1].end_event_index;
+        if first_event_index > trailing_event_index || trailing_event_index > self.events.len() {
+            return Err(FlpError::UnsupportedEdit(
+                "Channel Rack event ranges are inconsistent",
+            ));
+        }
+
+        let mut candidate = self.clone();
+        let mut reordered_events = Vec::with_capacity(self.events.len());
+        reordered_events.extend_from_slice(&self.events[..first_event_index]);
+        for channel_id in channel_ids {
+            let channel = &channels[channel_indices[channel_id]];
+            reordered_events.extend_from_slice(&self.events[channel.event_range()]);
+        }
+        reordered_events.extend_from_slice(&self.events[trailing_event_index..]);
+        candidate.events = reordered_events;
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
     /// Adds a Sampler channel with the given source path and display name.
     ///
     /// The channel uses the project's recognized string encoding, gets the next available
@@ -6184,9 +6281,9 @@ fn decode_vst_text(bytes: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        FlpDocument, FlpError, FstPreset, FstPresetKind, MixerParameterKind, PatternNote,
-        PayloadEncoding, ProjectInfoEdit, ProjectSettingsEdit, TimeMarkerEdit,
-        midi::MidiChannelMapping, midi::MidiFile, parse_vst_plugin_state_metadata,
+        ChannelSortOrder, ChannelSummary, FlpDocument, FlpError, FstPreset, FstPresetKind,
+        MixerParameterKind, PatternNote, PayloadEncoding, ProjectInfoEdit, ProjectSettingsEdit,
+        TimeMarkerEdit, midi::MidiChannelMapping, midi::MidiFile, parse_vst_plugin_state_metadata,
     };
 
     fn flp_fixture(event_stream: &[u8], header_extension: &[u8], trailing: &[u8]) -> Vec<u8> {
@@ -7334,6 +7431,104 @@ mod tests {
                 .collect::<Vec<_>>(),
             expected_up_events
         );
+    }
+
+    #[test]
+    fn sorts_channel_event_blocks_by_name_and_type_without_changing_data() {
+        let mut event_stream = vec![0x17, 0xA1];
+        for (id, kind, name) in [
+            (7, 4, "Zulu"),
+            (8, 0, "Kick"),
+            (9, 2, "Synth"),
+            (10, 3, "Layer"),
+            (11, 5, "Automation"),
+        ] {
+            event_stream.extend_from_slice(&[0x40, id, 0, 0x15, kind, 0x48, id, 0]);
+            append_project_info_string(&mut event_stream, 0xCB, name);
+        }
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        let tail = [0xA5, 0x5A];
+        let input = flp_fixture(&event_stream, &[], &tail);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+        let original_blocks = document
+            .channels()
+            .iter()
+            .map(|channel| {
+                channel
+                    .event_range()
+                    .map(|index| document.events()[index].wire_bytes.clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let prefix = vec![vec![0x17, 0xA1]];
+        let terminator = vec![vec![0x62, 0, 0]];
+
+        document
+            .sort_channels(ChannelSortOrder::Type)
+            .expect("type sort should succeed");
+
+        let typed_channels = document.channels();
+        assert_eq!(
+            typed_channels
+                .iter()
+                .map(ChannelSummary::id)
+                .collect::<Vec<_>>(),
+            [10, 9, 8, 7, 11]
+        );
+        let mut expected_type_events = prefix.clone();
+        for index in [3, 2, 1, 0, 4] {
+            expected_type_events.extend(original_blocks[index].clone());
+        }
+        expected_type_events.extend(terminator.clone());
+        assert_eq!(
+            document
+                .events()
+                .iter()
+                .map(|event| event.wire_bytes.clone())
+                .collect::<Vec<_>>(),
+            expected_type_events
+        );
+
+        document
+            .sort_channels(ChannelSortOrder::Name)
+            .expect("name sort should succeed");
+
+        let named_channels = document.channels();
+        assert_eq!(
+            named_channels
+                .iter()
+                .map(ChannelSummary::id)
+                .collect::<Vec<_>>(),
+            [11, 8, 10, 9, 7]
+        );
+        assert_eq!(
+            named_channels
+                .iter()
+                .map(ChannelSummary::display_name)
+                .collect::<Vec<_>>(),
+            [
+                Some("Automation"),
+                Some("Kick"),
+                Some("Layer"),
+                Some("Synth"),
+                Some("Zulu")
+            ]
+        );
+        let mut expected_name_events = prefix;
+        for index in [4, 1, 3, 2, 0] {
+            expected_name_events.extend(original_blocks[index].clone());
+        }
+        expected_name_events.extend(terminator);
+        assert_eq!(
+            document
+                .events()
+                .iter()
+                .map(|event| event.wire_bytes.clone())
+                .collect::<Vec<_>>(),
+            expected_name_events
+        );
+        let encoded = document.encode_lossless().expect("document should encode");
+        assert!(encoded.ends_with(&tail));
     }
 
     #[test]

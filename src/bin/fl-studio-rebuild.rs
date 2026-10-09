@@ -27,9 +27,9 @@ use flp_rebuild::sample_render::{
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions, Vst3PatternStreamHandle};
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, AutomationChannel, AutomationPoint, AutomationPointEdit,
-    ChannelSummary, FlpDocument, FstPreset, FstPresetKind, Pattern, PatternNote, PatternNoteEdit,
-    PlaylistClip, PlaylistClipEdit, PlaylistTrack, ProjectInfoEdit, ProjectSettingsEdit,
-    RandomizerOptions, TimeMarker, TimeMarkerEdit, VstPluginStateMetadata,
+    ChannelSortOrder, ChannelSummary, FlpDocument, FstPreset, FstPresetKind, Pattern, PatternNote,
+    PatternNoteEdit, PlaylistClip, PlaylistClipEdit, PlaylistTrack, ProjectInfoEdit,
+    ProjectSettingsEdit, RandomizerOptions, TimeMarker, TimeMarkerEdit, VstPluginStateMetadata,
 };
 
 const APP_BACKGROUND: Color32 = Color32::from_rgb(27, 27, 27);
@@ -6449,6 +6449,7 @@ impl DawUi {
         let mut open_editor = None;
         let mut channel_enabled_edits = Vec::new();
         let mut channel_order_edits = Vec::new();
+        let mut channel_sort = None;
         let mut level_edits = Vec::new();
         let mut layer_edits = Vec::new();
         let mut layer_flag_edits = Vec::new();
@@ -6486,6 +6487,16 @@ impl DawUi {
             {
                 self.step_graph_editor_open = !self.step_graph_editor_open;
             }
+            ui.menu_button("Sort by", |ui| {
+                if ui.button("Name").clicked() {
+                    channel_sort = Some(ChannelSortOrder::Name);
+                    ui.close();
+                }
+                if ui.button("Type").clicked() {
+                    channel_sort = Some(ChannelSortOrder::Type);
+                    ui.close();
+                }
+            });
         });
         let selected_pattern = self
             .selected_pattern
@@ -6901,6 +6912,48 @@ impl DawUi {
                 }
                 Some(Err(error)) => {
                     self.status = format!("Could not reorder Channel Rack row: {error}");
+                }
+                None => {}
+            }
+        }
+        if let Some(order) = channel_sort {
+            let previous_order = self.document.as_ref().map(|document| {
+                document
+                    .channels()
+                    .iter()
+                    .map(ChannelSummary::id)
+                    .collect::<Vec<_>>()
+            });
+            let result = self
+                .document
+                .as_mut()
+                .map(|document| document.sort_channels(order));
+            match result {
+                Some(Ok(())) => {
+                    let changed = self.document.as_ref().is_some_and(|document| {
+                        previous_order.as_ref().is_some_and(|previous| {
+                            previous
+                                != &document
+                                    .channels()
+                                    .iter()
+                                    .map(ChannelSummary::id)
+                                    .collect::<Vec<_>>()
+                        })
+                    });
+                    let sort_name = match order {
+                        ChannelSortOrder::Name => "name",
+                        ChannelSortOrder::Type => "type",
+                    };
+                    if changed {
+                        self.stop_project_playback();
+                        self.dirty = true;
+                        self.status = format!("Sorted Channel Rack by {sort_name}");
+                    } else {
+                        self.status = format!("Channel Rack is already sorted by {sort_name}");
+                    }
+                }
+                Some(Err(error)) => {
+                    self.status = format!("Could not sort Channel Rack channels: {error}");
                 }
                 None => {}
             }
