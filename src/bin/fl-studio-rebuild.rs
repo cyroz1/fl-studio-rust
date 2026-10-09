@@ -32,14 +32,17 @@ use flp_rebuild::{
     RandomizerOptions, TimeMarker, TimeMarkerEdit, VstPluginStateMetadata,
 };
 
-const PANEL: Color32 = Color32::from_rgb(31, 32, 34);
-const PANEL_DARK: Color32 = Color32::from_rgb(24, 25, 27);
-const PANEL_LIGHT: Color32 = Color32::from_rgb(43, 44, 47);
-const GRID: Color32 = Color32::from_rgb(56, 58, 61);
-const TEXT: Color32 = Color32::from_rgb(220, 221, 224);
-const MUTED: Color32 = Color32::from_rgb(139, 142, 147);
-const GREEN: Color32 = Color32::from_rgb(113, 172, 77);
-const BLUE: Color32 = Color32::from_rgb(73, 128, 174);
+const APP_BACKGROUND: Color32 = Color32::from_rgb(27, 27, 27);
+const PANEL: Color32 = Color32::from_rgb(34, 34, 34);
+const PANEL_DARK: Color32 = Color32::from_rgb(17, 17, 17);
+const PANEL_LIGHT: Color32 = Color32::from_rgb(44, 44, 44);
+const GRID: Color32 = Color32::from_rgb(57, 57, 57);
+const BORDER: Color32 = Color32::from_rgb(68, 68, 68);
+const TEXT: Color32 = Color32::from_rgb(242, 242, 242);
+const MUTED: Color32 = Color32::from_rgb(175, 175, 175);
+const GREEN: Color32 = Color32::from_rgb(14, 175, 98);
+const BLUE: Color32 = Color32::from_rgb(86, 129, 255);
+const BLUE_SELECTION: Color32 = Color32::from_rgb(15, 28, 82);
 const PURPLE: Color32 = Color32::from_rgb(150, 93, 181);
 const ORANGE: Color32 = Color32::from_rgb(195, 129, 61);
 const HISTORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
@@ -1319,12 +1322,64 @@ struct PendingWaveformLoad {
 impl DawUi {
     fn new(creation: &eframe::CreationContext<'_>, initial_project: Option<PathBuf>) -> Self {
         let mut visuals = egui::Visuals::dark();
-        visuals.panel_fill = PANEL;
+        visuals.panel_fill = APP_BACKGROUND;
         visuals.window_fill = PANEL;
         visuals.extreme_bg_color = PANEL_DARK;
+        visuals.text_edit_bg_color = Some(PANEL_DARK);
         visuals.faint_bg_color = PANEL_LIGHT;
+        visuals.code_bg_color = PANEL_DARK;
         visuals.override_text_color = Some(TEXT);
+        visuals.weak_text_color = Some(MUTED);
+        visuals.hyperlink_color = BLUE;
+        visuals.selection.bg_fill = BLUE_SELECTION;
+        visuals.selection.stroke = Stroke::new(1.0, TEXT);
+        visuals.window_corner_radius = egui::CornerRadius::same(4);
+        visuals.menu_corner_radius = egui::CornerRadius::same(3);
+        visuals.window_shadow = egui::Shadow::NONE;
+        visuals.popup_shadow = egui::Shadow::NONE;
+        visuals.window_stroke = Stroke::new(1.0, BORDER);
+        visuals.button_frame = true;
+        visuals.striped = true;
+
+        let widgets = &mut visuals.widgets;
+        widgets.noninteractive.bg_fill = APP_BACKGROUND;
+        widgets.noninteractive.weak_bg_fill = PANEL;
+        widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
+        widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT);
+        widgets.noninteractive.corner_radius = egui::CornerRadius::same(3);
+
+        widgets.inactive.bg_fill = PANEL_LIGHT;
+        widgets.inactive.weak_bg_fill = PANEL_LIGHT;
+        widgets.inactive.bg_stroke = Stroke::new(1.0, GRID);
+        widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT);
+        widgets.inactive.corner_radius = egui::CornerRadius::same(3);
+
+        widgets.hovered.bg_fill = GRID;
+        widgets.hovered.weak_bg_fill = GRID;
+        widgets.hovered.bg_stroke = Stroke::new(1.0, BLUE);
+        widgets.hovered.fg_stroke = Stroke::new(1.0, TEXT);
+        widgets.hovered.corner_radius = egui::CornerRadius::same(3);
+
+        widgets.active.bg_fill = BLUE_SELECTION;
+        widgets.active.weak_bg_fill = BLUE_SELECTION;
+        widgets.active.bg_stroke = Stroke::new(1.0, BLUE);
+        widgets.active.fg_stroke = Stroke::new(1.0, TEXT);
+        widgets.active.corner_radius = egui::CornerRadius::same(3);
+
+        widgets.open.bg_fill = BLUE_SELECTION;
+        widgets.open.weak_bg_fill = BLUE_SELECTION;
+        widgets.open.bg_stroke = Stroke::new(1.0, BLUE);
+        widgets.open.fg_stroke = Stroke::new(1.0, TEXT);
+        widgets.open.corner_radius = egui::CornerRadius::same(3);
+
         creation.egui_ctx.set_visuals(visuals);
+        creation.egui_ctx.all_styles_mut(|style| {
+            style.spacing.item_spacing = Vec2::new(5.0, 4.0);
+            style.spacing.button_padding = Vec2::new(8.0, 4.0);
+            style.spacing.window_margin = egui::Margin::same(12);
+            style.spacing.menu_margin = egui::Margin::same(6);
+            style.spacing.slider_rail_height = 4.0;
+        });
         let plugin_candidates = scan_installed_plugins().candidates;
         let audio_catalog = enumerate_devices();
         let mut audio_settings = AudioSettings::default();
@@ -5645,19 +5700,35 @@ impl DawUi {
     }
 
     fn view_tabs(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            for view in MainView::ALL {
-                if ui
-                    .selectable_label(self.view == view, view.label())
-                    .clicked()
-                {
-                    self.view = view;
-                }
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add(egui::Slider::new(&mut self.timeline_zoom, 0.04..=0.24).text("Zoom"));
+        egui::Frame::new()
+            .fill(PANEL)
+            .inner_margin(egui::Margin::symmetric(8, 0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for view in MainView::ALL {
+                        let selected = self.view == view;
+                        let response = ui.selectable_label(selected, view.label());
+                        if selected {
+                            let indicator = egui::Rect::from_min_max(
+                                egui::pos2(
+                                    response.rect.left() + 4.0,
+                                    response.rect.bottom() - 2.0,
+                                ),
+                                egui::pos2(response.rect.right() - 4.0, response.rect.bottom()),
+                            );
+                            ui.painter().rect_filled(indicator, 0, BLUE);
+                        }
+                        if response.clicked() {
+                            self.view = view;
+                        }
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add(
+                            egui::Slider::new(&mut self.timeline_zoom, 0.04..=0.24).text("Zoom"),
+                        );
+                    });
+                });
             });
-        });
         ui.separator();
     }
 
@@ -11967,6 +12038,8 @@ impl DawUi {
 impl eframe::App for DawUi {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.guard_window_close(ui.ctx());
+        ui.painter()
+            .rect_filled(ui.max_rect(), egui::CornerRadius::ZERO, APP_BACKGROUND);
         let recent_project_index = ui.input_mut(|input| {
             if !input.modifiers.alt
                 || input.modifiers.ctrl
@@ -12114,12 +12187,22 @@ impl eframe::App for DawUi {
             ui.allocate_ui_with_layout(
                 Vec2::new(width, 29.0),
                 egui::Layout::left_to_right(egui::Align::Center),
-                |ui| self.top_menu(ui),
+                |ui| {
+                    egui::Frame::new()
+                        .fill(PANEL)
+                        .inner_margin(egui::Margin::symmetric(8, 0))
+                        .show(ui, |ui| self.top_menu(ui));
+                },
             );
             ui.allocate_ui_with_layout(
                 Vec2::new(width, 43.0),
                 egui::Layout::left_to_right(egui::Align::Center),
-                |ui| self.transport_bar(ui),
+                |ui| {
+                    egui::Frame::new()
+                        .fill(PANEL)
+                        .inner_margin(egui::Margin::symmetric(8, 0))
+                        .show(ui, |ui| self.transport_bar(ui));
+                },
             );
             ui.separator();
             let content_height = (full_height - 29.0 - 43.0 - 23.0 - 8.0).max(100.0);
@@ -12127,7 +12210,12 @@ impl eframe::App for DawUi {
                 ui.allocate_ui_with_layout(
                     Vec2::new(218.0, content_height),
                     egui::Layout::top_down(egui::Align::Min),
-                    |ui| self.browser(ui),
+                    |ui| {
+                        egui::Frame::new()
+                            .fill(PANEL)
+                            .inner_margin(egui::Margin::same(8))
+                            .show(ui, |ui| self.browser(ui));
+                    },
                 );
                 ui.separator();
                 let content_width = ui.available_width().max(100.0);
@@ -12153,13 +12241,25 @@ impl eframe::App for DawUi {
                 Vec2::new(width, 23.0),
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| {
-                    ui.horizontal_centered(|ui| {
-                        ui.label(if self.dirty { "●" } else { "" });
-                        ui.label(&self.status);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label("FLP compatibility foundation");
+                    egui::Frame::new()
+                        .fill(PANEL)
+                        .inner_margin(egui::Margin::symmetric(8, 0))
+                        .show(ui, |ui| {
+                            ui.horizontal_centered(|ui| {
+                                ui.label(if self.dirty { "●" } else { "" })
+                                    .on_hover_text("Unsaved project changes");
+                                ui.label(&self.status);
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.label(
+                                            egui::RichText::new("FLP compatibility foundation")
+                                                .color(MUTED),
+                                        );
+                                    },
+                                );
+                            });
                         });
-                    });
                 },
             );
         });
