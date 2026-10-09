@@ -342,7 +342,7 @@ automation, Mixer routing/effects, or PDC. Full export surface:
 | macOS app bundle, notarization | `[partial]` | CI runs macOS checks and skips installer publication until Developer ID signing and Apple notarization secrets are configured; signed builds are checked with Apple's signature, stapler, and Gatekeeper tools. AU hosting + CoreAudio remain pending. |
 | Linux builds (AppImage/deb) | `[partial]` | CI builds; XCB headers handled |
 | Windows: ASIO support | `[todo]` | Pro-audio requirement on Windows |
-| macOS: native menu bar, file associations | `[todo]` | |
+| macOS: native menu bar, file associations | `[partial]` | The packaged app registers `.flp` project files and the application opens a project path passed on launch. Functional command menus remain in the app window; a native macOS menu bar and macOS file-open event handling while the app is already running remain. |
 | Cross-platform CI | `[done]` | |
 
 ---

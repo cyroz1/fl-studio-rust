@@ -10,3 +10,9 @@ icons = ["assets/icon.png"]
 resources = ["assets/fonts/Inter-OFL.txt"]
 binaries = [{ path = "fl-studio-rebuild", main = true }]
 before-packaging-command = "cargo build --release --bin fl-studio-rebuild"
+
+[[file-associations]]
+extensions = ["flp"]
+name = "FL Studio project"
+description = "FL Studio project file"
+role = "editor"
