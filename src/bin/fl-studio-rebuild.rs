@@ -1380,7 +1380,7 @@ impl DawUi {
         widgets.active.corner_radius = egui::CornerRadius::same(4);
 
         widgets.open.bg_fill = BLUE_SELECTION;
-        widgets.open.weak_bg_fill = BLUE_SELECTION;
+        widgets.open.weak_bg_fill = PANEL_LIGHT;
         widgets.open.bg_stroke = Stroke::new(1.0, BLUE);
         widgets.open.fg_stroke = Stroke::new(1.0, TEXT);
         widgets.open.corner_radius = egui::CornerRadius::same(4);
