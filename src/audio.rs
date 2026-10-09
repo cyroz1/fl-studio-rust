@@ -29,7 +29,7 @@ const TEST_TONE_LEVEL: f32 = 0.12;
 #[inline]
 pub(crate) fn enable_denormal_protection() {
     #[cfg(target_arch = "x86_64")]
-    unsafe {
+    {
         const FTZ_AND_DAZ: u32 = (1 << 15) | (1 << 6);
         write_mxcsr(read_mxcsr() | FTZ_AND_DAZ);
     }
