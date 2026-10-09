@@ -77,10 +77,47 @@ pub struct AudioClipRenderSummary {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WavSampleFormat {
+    Pcm16,
+    Pcm24,
+    Float32,
+}
+
+impl WavSampleFormat {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Pcm16 => "16-bit integer PCM",
+            Self::Pcm24 => "24-bit integer PCM",
+            Self::Float32 => "32-bit float",
+        }
+    }
+
+    const fn bits_per_sample(self) -> u16 {
+        match self {
+            Self::Pcm16 => 16,
+            Self::Pcm24 => 24,
+            Self::Float32 => 32,
+        }
+    }
+
+    const fn bytes_per_sample(self) -> u16 {
+        self.bits_per_sample() / 8
+    }
+
+    const fn format_code(self) -> u16 {
+        match self {
+            Self::Float32 => 3,
+            Self::Pcm16 | Self::Pcm24 => 1,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PlaylistRenderOptions {
     pub arrangement_id: u16,
     pub sample_rate: u32,
     pub sampler_voice_limit: usize,
+    pub wav_sample_format: WavSampleFormat,
 }
 
 impl Default for PlaylistRenderOptions {
@@ -89,6 +126,7 @@ impl Default for PlaylistRenderOptions {
             arrangement_id: 0,
             sample_rate: DEFAULT_SAMPLE_RATE,
             sampler_voice_limit: DEFAULT_SAMPLER_VOICE_LIMIT,
+            wav_sample_format: WavSampleFormat::Float32,
         }
     }
 }
@@ -289,9 +327,9 @@ pub fn stream_playlist_with_vst3_to_device(
 }
 
 /// Render enabled Playlist audio clips, Sampler Pattern Clips, and mapped VST3 instruments to a
-/// stereo 32-bit-float WAV. Audio is mixed in bounded blocks and written to a temporary file, so
-/// song length does not determine the in-memory mix size. Mixer effects, routing, tempo
-/// automation, and plugin delay compensation are not applied.
+/// stereo WAV. Audio is mixed in bounded blocks and written to a temporary file, so song length
+/// does not determine the in-memory mix size. Mixer effects, routing, tempo automation, and plugin
+/// delay compensation are not applied.
 pub fn render_playlist_with_vst3_to_wav_cancellable(
     document: &FlpDocument,
     project_path: impl AsRef<Path>,
@@ -345,8 +383,9 @@ pub fn render_playlist_with_vst3_to_wav_cancellable(
     }
     let frames_u32 =
         u32::try_from(frames).map_err(|_| "render is too long for a RIFF/WAVE file".to_owned())?;
+    let block_align = options.wav_sample_format.bytes_per_sample() * 2;
     let data_bytes = frames_u32
-        .checked_mul(8)
+        .checked_mul(u32::from(block_align))
         .filter(|bytes| *bytes <= u32::MAX - 36)
         .ok_or_else(|| "rendered WAV size exceeds the RIFF/WAVE limit".to_owned())?;
     let mut source_paths: std::collections::BTreeSet<PathBuf> =
@@ -378,8 +417,16 @@ pub fn render_playlist_with_vst3_to_wav_cancellable(
     let mut temporary = TemporaryWav::create(output_path)?;
     {
         let file = temporary.file.as_mut().expect("temporary WAV is open");
-        write_float_stereo_wav_header(file, options.sample_rate, frames_u32, data_bytes)?;
-        let mut bytes = Vec::with_capacity(STREAM_BLOCK_FRAMES * 2 * 4);
+        write_stereo_wav_header(
+            file,
+            options.sample_rate,
+            frames_u32,
+            data_bytes,
+            options.wav_sample_format,
+        )?;
+        let mut bytes = Vec::with_capacity(
+            STREAM_BLOCK_FRAMES * 2 * usize::from(options.wav_sample_format.bytes_per_sample()),
+        );
         summary.voices_stolen = stream_prepared_playlist_render(
             PreparedPlaylistBlockMix {
                 audio: &audio,
@@ -393,7 +440,7 @@ pub fn render_playlist_with_vst3_to_wav_cancellable(
             |block| {
                 bytes.clear();
                 for sample in block {
-                    bytes.extend_from_slice(&sample.to_le_bytes());
+                    append_wav_sample(*sample, options.wav_sample_format, &mut bytes);
                 }
                 file.write_all(&bytes)
                     .map_err(|error| format!("could not write rendered WAV data: {error}"))
@@ -404,25 +451,27 @@ pub fn render_playlist_with_vst3_to_wav_cancellable(
     Ok(summary)
 }
 
-fn write_float_stereo_wav_header(
+fn write_stereo_wav_header(
     file: &mut File,
     sample_rate: u32,
     frames: u32,
     data_bytes: u32,
+    sample_format: WavSampleFormat,
 ) -> Result<(), String> {
+    let block_align = sample_format.bytes_per_sample() * 2;
     let byte_rate = sample_rate
-        .checked_mul(8)
+        .checked_mul(u32::from(block_align))
         .ok_or_else(|| "rendered WAV byte rate overflow".to_owned())?;
     file.write_all(b"RIFF")
         .and_then(|()| file.write_all(&(36 + data_bytes).to_le_bytes()))
         .and_then(|()| file.write_all(b"WAVEfmt "))
         .and_then(|()| file.write_all(&16u32.to_le_bytes()))
-        .and_then(|()| file.write_all(&3u16.to_le_bytes()))
+        .and_then(|()| file.write_all(&sample_format.format_code().to_le_bytes()))
         .and_then(|()| file.write_all(&2u16.to_le_bytes()))
         .and_then(|()| file.write_all(&sample_rate.to_le_bytes()))
         .and_then(|()| file.write_all(&byte_rate.to_le_bytes()))
-        .and_then(|()| file.write_all(&8u16.to_le_bytes()))
-        .and_then(|()| file.write_all(&32u16.to_le_bytes()))
+        .and_then(|()| file.write_all(&block_align.to_le_bytes()))
+        .and_then(|()| file.write_all(&sample_format.bits_per_sample().to_le_bytes()))
         .and_then(|()| file.write_all(b"data"))
         .and_then(|()| file.write_all(&data_bytes.to_le_bytes()))
         .map_err(|error| format!("could not write rendered WAV header: {error}"))?;
@@ -430,6 +479,35 @@ fn write_float_stereo_wav_header(
         return Err("rendered WAV contains no frames".to_owned());
     }
     Ok(())
+}
+
+fn append_wav_sample(sample: f32, format: WavSampleFormat, output: &mut Vec<u8>) {
+    match format {
+        WavSampleFormat::Float32 => output.extend_from_slice(&sample.to_le_bytes()),
+        WavSampleFormat::Pcm16 => {
+            let quantized = quantize_signed_pcm(sample, 32_768.0, 32_767.0) as i16;
+            output.extend_from_slice(&quantized.to_le_bytes());
+        }
+        WavSampleFormat::Pcm24 => {
+            let quantized = quantize_signed_pcm(sample, 8_388_608.0, 8_388_607.0) as i32;
+            let packed = quantized as u32;
+            output.extend_from_slice(&packed.to_le_bytes()[..3]);
+        }
+    }
+}
+
+fn quantize_signed_pcm(sample: f32, negative_scale: f64, positive_scale: f64) -> i64 {
+    let sample = if sample.is_nan() {
+        0.0
+    } else {
+        f64::from(sample).clamp(-1.0, 1.0)
+    };
+    let scale = if sample < 0.0 {
+        negative_scale
+    } else {
+        positive_scale
+    };
+    (sample * scale).round() as i64
 }
 
 struct PreparedPlaylistBlockMix<'a> {
@@ -2151,6 +2229,7 @@ mod tests {
                     arrangement_id: 0,
                     sample_rate: 4,
                     sampler_voice_limit: 4,
+                    wav_sample_format: WavSampleFormat::Float32,
                 },
                 frames: 2,
                 vst3_processor: None,
@@ -2516,6 +2595,99 @@ mod tests {
         assert_eq!(u32::from_le_bytes(bytes[40..44].try_into().unwrap()), 8);
         assert_eq!(f32::from_le_bytes(bytes[44..48].try_into().unwrap()), 0.25);
         assert_eq!(f32::from_le_bytes(bytes[48..52].try_into().unwrap()), -0.5);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn writes_playlist_wav_formats_with_correct_headers_and_sample_data() {
+        let root = std::env::temp_dir().join(format!(
+            "flp-pcm-render-test-{}-{}",
+            std::process::id(),
+            NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+
+        let cases: [(WavSampleFormat, u16, u16, u16, &[u8]); 3] = [
+            (
+                WavSampleFormat::Pcm16,
+                1,
+                16,
+                4,
+                &[0x00, 0x80, 0xff, 0x7f, 0x00, 0x40, 0x00, 0xc0],
+            ),
+            (
+                WavSampleFormat::Pcm24,
+                1,
+                24,
+                6,
+                &[
+                    0x00, 0x00, 0x80, 0xff, 0xff, 0x7f, 0x00, 0x00, 0x40, 0x00, 0x00, 0xc0,
+                ],
+            ),
+            (
+                WavSampleFormat::Float32,
+                3,
+                32,
+                8,
+                &[
+                    0x00, 0x00, 0x80, 0xbf, 0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x3f, 0x00,
+                    0x00, 0x00, 0xbf,
+                ],
+            ),
+        ];
+
+        for (index, (format, format_code, bits_per_sample, block_align, expected_samples)) in
+            cases.into_iter().enumerate()
+        {
+            let output = root.join(format!("pcm-{index}.wav"));
+            let mut file = File::create(&output).unwrap();
+            let mut samples = Vec::new();
+            for sample in [-1.0, 1.0, 0.5, -0.5] {
+                append_wav_sample(sample, format, &mut samples);
+            }
+            write_stereo_wav_header(&mut file, 48_000, 2, samples.len() as u32, format).unwrap();
+            file.write_all(&samples).unwrap();
+            drop(file);
+
+            let bytes = fs::read(&output).unwrap();
+            assert_eq!(
+                u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+                bytes.len() as u32 - 8
+            );
+            assert_eq!(
+                u16::from_le_bytes(bytes[20..22].try_into().unwrap()),
+                format_code
+            );
+            assert_eq!(u16::from_le_bytes(bytes[22..24].try_into().unwrap()), 2);
+            assert_eq!(
+                u32::from_le_bytes(bytes[28..32].try_into().unwrap()),
+                48_000 * u32::from(block_align)
+            );
+            assert_eq!(
+                u16::from_le_bytes(bytes[32..34].try_into().unwrap()),
+                block_align
+            );
+            assert_eq!(
+                u16::from_le_bytes(bytes[34..36].try_into().unwrap()),
+                bits_per_sample
+            );
+            assert_eq!(
+                u32::from_le_bytes(bytes[40..44].try_into().unwrap()),
+                samples.len() as u32
+            );
+            assert_eq!(&bytes[44..], expected_samples);
+        }
+
+        assert_eq!(
+            quantize_signed_pcm(f32::NEG_INFINITY, 32_768.0, 32_767.0),
+            -32_768
+        );
+        assert_eq!(
+            quantize_signed_pcm(f32::INFINITY, 32_768.0, 32_767.0),
+            32_767
+        );
+        assert_eq!(quantize_signed_pcm(f32::NAN, 32_768.0, 32_767.0), 0);
 
         fs::remove_dir_all(root).unwrap();
     }

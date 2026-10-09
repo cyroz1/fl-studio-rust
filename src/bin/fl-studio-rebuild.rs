@@ -20,9 +20,9 @@ use flp_rebuild::plugins::{PluginCandidate, PluginFormat, scan_installed_plugins
 use flp_rebuild::project_package::ProjectPackageWorkspace;
 use flp_rebuild::sample_render::{
     AudioClipRenderOptions, PlaylistRenderOptions, PlaylistRenderSummary,
-    SamplerPatternRenderOptions, SamplerPatternRenderSummary, render_audio_clips_to_wav,
-    render_playlist_with_vst3_to_wav_cancellable, stream_playlist_with_vst3_to_device,
-    stream_sampler_pattern_to_device,
+    SamplerPatternRenderOptions, SamplerPatternRenderSummary, WavSampleFormat,
+    render_audio_clips_to_wav, render_playlist_with_vst3_to_wav_cancellable,
+    stream_playlist_with_vst3_to_device, stream_sampler_pattern_to_device,
 };
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions, Vst3PatternStreamHandle};
 use flp_rebuild::{
@@ -1295,6 +1295,8 @@ struct DawUi {
     project_settings_open: bool,
     project_settings_play_truncated: bool,
     project_settings_fast_declick: bool,
+    playlist_render_options_open: bool,
+    playlist_render_format: WavSampleFormat,
 }
 
 struct PendingAudioRender {
@@ -1555,6 +1557,8 @@ impl DawUi {
             project_settings_open: false,
             project_settings_play_truncated: false,
             project_settings_fast_declick: false,
+            playlist_render_options_open: false,
+            playlist_render_format: WavSampleFormat::Float32,
         };
         if let Some((autosave_minutes, autosave_before_risky, backup_retention)) =
             load_autosave_settings()
@@ -2477,6 +2481,58 @@ impl DawUi {
         }
     }
 
+    fn playlist_render_options_dialog(&mut self, context: &egui::Context) {
+        if !self.playlist_render_options_open {
+            return;
+        }
+        let mut open = self.playlist_render_options_open;
+        let mut start_render = false;
+        let mut cancel = false;
+        egui::Window::new("Render Playlist mix")
+            .id(Id::new("playlist-render-options-dialog"))
+            .open(&mut open)
+            .resizable(false)
+            .default_width(360.0)
+            .show(context, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("WAV format");
+                    egui::ComboBox::from_id_salt("playlist-render-wav-format")
+                        .selected_text(self.playlist_render_format.label())
+                        .show_ui(ui, |ui| {
+                            for format in [
+                                WavSampleFormat::Pcm16,
+                                WavSampleFormat::Pcm24,
+                                WavSampleFormat::Float32,
+                            ] {
+                                ui.selectable_value(
+                                    &mut self.playlist_render_format,
+                                    format,
+                                    format.label(),
+                                );
+                            }
+                        });
+                });
+                ui.label(match self.playlist_render_format {
+                    WavSampleFormat::Pcm16 | WavSampleFormat::Pcm24 => {
+                        "Integer PCM clips samples to the [-1, 1] range."
+                    }
+                    WavSampleFormat::Float32 => "Float WAV preserves levels outside [-1, 1].",
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Render…").clicked() {
+                        start_render = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        self.playlist_render_options_open = open && !start_render && !cancel;
+        if start_render {
+            self.render_playlist_dialog();
+        }
+    }
+
     fn clear_history(&mut self) {
         self.undo_history.clear();
         self.redo_history.clear();
@@ -3382,7 +3438,7 @@ impl DawUi {
                 )
                 .clicked()
             {
-                self.render_playlist_dialog();
+                self.playlist_render_options_open = true;
             }
             if ui
                 .add_enabled(
@@ -10048,7 +10104,7 @@ impl DawUi {
         let Some(output_path) = rfd::FileDialog::new()
             .set_title("Render Playlist mix")
             .set_file_name(format!("{project_stem}.wav"))
-            .add_filter("32-bit float WAV audio", &["wav"])
+            .add_filter("WAV audio", &["wav"])
             .save_file()
         else {
             return;
@@ -10057,6 +10113,7 @@ impl DawUi {
         let options = PlaylistRenderOptions {
             arrangement_id: self.selected_arrangement.unwrap_or_default(),
             sample_rate: self.audio_settings.sample_rate,
+            wav_sample_format: self.playlist_render_format,
             ..PlaylistRenderOptions::default()
         };
         let vst3_processor = self
@@ -12429,6 +12486,7 @@ impl eframe::App for DawUi {
         });
         self.project_info_dialog(ui.ctx());
         self.project_settings_dialog(ui.ctx());
+        self.playlist_render_options_dialog(ui.ctx());
         self.browser_tag_editor_dialog(ui.ctx());
         self.browser_search_save_dialog(ui.ctx());
         self.browser_tab_customize_dialog(ui.ctx());

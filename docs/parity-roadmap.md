@@ -297,7 +297,7 @@ export surface:
   audio clips, Sampler Pattern Clips, and mapped installed VST3 instruments in
   bounded blocks to a 32-bit float WAV. Automation, Mixer routing/effects, PDC,
   native level comparison, and export options remain incomplete.
-- `[todo]` Formats: WAV (16/24/32-bit), MP3, OGG, FLAC
+- `[partial]` Formats: the desktop Playlist renderer writes stereo WAV as 16/24-bit integer PCM or 32-bit float, matching the depths in [Image-Line's export format documentation](https://www.image-line.com/fl-studio-learning/fl-studio-online-manual/html/fformats_save_export.htm); MP3, OGG, and FLAC export remain todo
 - `[todo]` Render options: quality (resampling), dithering, normalize, tail length
 - `[todo]` Stem export: split mixer tracks, "split channel tracks"
 - `[todo]` Playlist selection render, pattern render
