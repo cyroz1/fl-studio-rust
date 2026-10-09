@@ -547,7 +547,7 @@ fn append_wav_block_samples(
     if !stereo_block.len().is_multiple_of(2) {
         return Err("render block must contain interleaved stereo frames".to_owned());
     }
-    for frame in stereo_block.chunks_exact(2) {
+    for frame in stereo_block.as_chunks::<2>().0 {
         match channel_mode {
             WavChannelMode::Stereo => {
                 append_wav_sample(frame[0], sample_format, output);
@@ -2846,8 +2846,10 @@ mod tests {
                 samples.len() as u32
             );
             let decoded = bytes[44..]
-                .chunks_exact(4)
-                .map(|sample| f32::from_le_bytes(sample.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|sample| f32::from_le_bytes(*sample))
                 .collect::<Vec<_>>();
             assert_eq!(decoded, expected_samples);
         }
