@@ -374,6 +374,7 @@ pub struct ChannelSummary {
     zipped: bool,
     color: Option<u32>,
     mixer_track: Option<i8>,
+    group_number: Option<i32>,
     volume: Option<u32>,
     pan: Option<i32>,
     levels_editable: bool,
@@ -386,6 +387,25 @@ pub struct ChannelSummary {
     layer_flags: Option<u32>,
     first_event_index: usize,
     end_event_index: usize,
+}
+
+/// A named Channel Rack display filter from the project-level `0xE7` events.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChannelGroupSummary {
+    index: i32,
+    name: Option<String>,
+}
+
+impl ChannelGroupSummary {
+    /// Zero-based group index referenced by channel `0x91` events.
+    pub fn index(&self) -> i32 {
+        self.index
+    }
+
+    /// Group name, if its text event could be decoded.
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -550,6 +570,12 @@ impl ChannelSummary {
     /// Raw signed Mixer track assignment from the channel's one-byte `0x16` event.
     pub fn mixer_track(&self) -> Option<i8> {
         self.mixer_track
+    }
+
+    /// Zero-based Channel Rack display group from the signed `0x91` event.
+    /// Missing or negative values represent an unassigned channel.
+    pub fn group_number(&self) -> Option<i32> {
+        self.group_number
     }
 
     /// Raw FL channel volume value, in the project's 0..=12800 control range.
@@ -1431,6 +1457,16 @@ impl FlpDocument {
                 0x16 if event.encoding == PayloadEncoding::Byte && event.payload.len() == 1 => {
                     channel.mixer_track = Some(event.payload[0] as i8);
                 }
+                0x91 if event.encoding == PayloadEncoding::Dword
+                    && event.payload.len() == 4
+                    && channel.group_number.is_none() =>
+                {
+                    channel.group_number = Some(i32::from_le_bytes(
+                        event.payload[..4]
+                            .try_into()
+                            .expect("a dword event has four payload bytes"),
+                    ));
+                }
                 0x15 if event.payload.len() == 1 => channel.kind = Some(event.payload[0]),
                 0x5E if event.payload.len() == 2 => {
                     channel
@@ -1521,6 +1557,29 @@ impl FlpDocument {
             channels.push(channel);
         }
         channels
+    }
+
+    /// Returns Channel Rack display groups declared before the first channel marker.
+    /// The same `0xE7` opcode is also used elsewhere in the project stream, so only the
+    /// project header section is treated as display-group metadata.
+    pub fn channel_groups(&self) -> Vec<ChannelGroupSummary> {
+        let first_channel = self
+            .events
+            .iter()
+            .position(|event| event.opcode == 0x40)
+            .unwrap_or(self.events.len());
+        self.events[..first_channel]
+            .iter()
+            .filter(|event| {
+                event.opcode == 0xE7 && matches!(event.encoding, PayloadEncoding::Data { .. })
+            })
+            .enumerate()
+            .map(|(index, event)| ChannelGroupSummary {
+                index: i32::try_from(index).unwrap_or(i32::MAX),
+                name: decode_project_string(&event.payload, self.project_version.as_deref())
+                    .filter(|name| !name.is_empty()),
+            })
+            .collect()
     }
 
     /// Returns the points found in each type-5 automation channel's `0xEA` blob.
@@ -6558,10 +6617,10 @@ fn decode_vst_text(bytes: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChannelNoteRouter, ChannelSortOrder, ChannelSummary, FlpDocument, FlpError, FstPreset,
-        FstPresetKind, MixerParameterKind, PATTERN_NOTE_SLIDE_FLAG, PatternNote, PatternNoteEdit,
-        PayloadEncoding, ProjectInfoEdit, ProjectSettingsEdit, TimeMarkerEdit,
-        midi::MidiChannelMapping, midi::MidiFile, parse_vst_plugin_state_metadata,
+        ChannelGroupSummary, ChannelNoteRouter, ChannelSortOrder, ChannelSummary, FlpDocument,
+        FlpError, FstPreset, FstPresetKind, MixerParameterKind, PATTERN_NOTE_SLIDE_FLAG,
+        PatternNote, PatternNoteEdit, PayloadEncoding, ProjectInfoEdit, ProjectSettingsEdit,
+        TimeMarkerEdit, midi::MidiChannelMapping, midi::MidiFile, parse_vst_plugin_state_metadata,
     };
 
     fn flp_fixture(event_stream: &[u8], header_extension: &[u8], trailing: &[u8]) -> Vec<u8> {
@@ -7842,6 +7901,44 @@ mod tests {
                 .map(|event| event.wire_bytes.clone())
                 .collect::<Vec<_>>(),
             expected_events
+        );
+    }
+
+    #[test]
+    fn reads_channel_display_groups_and_signed_group_assignments() {
+        let mut event_stream = Vec::new();
+        append_project_info_string(&mut event_stream, 0xE7, "Drums");
+        append_project_info_string(&mut event_stream, 0xE7, "Synths");
+        event_stream.extend_from_slice(&[
+            0x40, 7, 0, 0x15, 0, 0x91, 0, 0, 0, 0, 0x40, 8, 0, 0x15, 0, 0x91, 1, 0, 0, 0, 0x40, 9,
+            0, 0x15, 0, 0x91, 0xFF, 0xFF, 0xFF, 0xFF, 0x62, 0, 0,
+        ]);
+        append_project_info_string(&mut event_stream, 0xE7, "Not a display group");
+        let input = flp_fixture(&event_stream, &[], &[]);
+        let document = FlpDocument::parse(&input).expect("fixture should parse");
+
+        let groups = document.channel_groups();
+        assert_eq!(
+            groups
+                .iter()
+                .map(ChannelGroupSummary::index)
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
+        assert_eq!(
+            groups
+                .iter()
+                .map(ChannelGroupSummary::name)
+                .collect::<Vec<_>>(),
+            [Some("Drums"), Some("Synths")]
+        );
+        assert_eq!(
+            document
+                .channels()
+                .iter()
+                .map(ChannelSummary::group_number)
+                .collect::<Vec<_>>(),
+            [Some(0), Some(1), Some(-1)]
         );
     }
 

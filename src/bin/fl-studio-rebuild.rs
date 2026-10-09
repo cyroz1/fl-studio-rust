@@ -27,9 +27,10 @@ use flp_rebuild::sample_render::{
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions, Vst3PatternStreamHandle};
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, AutomationChannel, AutomationPoint, AutomationPointEdit,
-    ChannelSortOrder, ChannelSummary, FlpDocument, FstPreset, FstPresetKind, Pattern, PatternNote,
-    PatternNoteEdit, PlaylistClip, PlaylistClipEdit, PlaylistTrack, ProjectInfoEdit,
-    ProjectSettingsEdit, RandomizerOptions, TimeMarker, TimeMarkerEdit, VstPluginStateMetadata,
+    ChannelGroupSummary, ChannelSortOrder, ChannelSummary, FlpDocument, FstPreset, FstPresetKind,
+    Pattern, PatternNote, PatternNoteEdit, PlaylistClip, PlaylistClipEdit, PlaylistTrack,
+    ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions, TimeMarker, TimeMarkerEdit,
+    VstPluginStateMetadata,
 };
 
 const APP_BACKGROUND: Color32 = Color32::from_rgb(27, 27, 27);
@@ -259,6 +260,39 @@ enum MainView {
     Plugins,
     Audio,
     Automation,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ChannelDisplayFilter {
+    #[default]
+    All,
+    Unsorted,
+    Group(i32),
+}
+
+impl ChannelDisplayFilter {
+    fn label(self, groups: &[ChannelGroupSummary]) -> String {
+        match self {
+            Self::All => "All".to_owned(),
+            Self::Unsorted => "Unsorted".to_owned(),
+            Self::Group(index) => groups
+                .iter()
+                .find(|group| group.index() == index)
+                .and_then(ChannelGroupSummary::name)
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("Group {}", index.saturating_add(1))),
+        }
+    }
+
+    fn shows(self, group_number: Option<i32>, known_groups: &BTreeSet<i32>) -> bool {
+        match self {
+            Self::All => true,
+            Self::Unsorted => {
+                group_number.is_none_or(|index| index < 0 || !known_groups.contains(&index))
+            }
+            Self::Group(index) => group_number == Some(index),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1197,6 +1231,7 @@ struct DawUi {
     playlist_playback_loaded: bool,
     tempo_bpm: f64,
     selected_pattern: Option<u16>,
+    channel_display_filter: ChannelDisplayFilter,
     selected_note_channel: Option<u16>,
     selected_note: Option<(u16, u16, usize)>,
     selected_piano_notes: BTreeSet<(u16, u16, usize)>,
@@ -1465,6 +1500,7 @@ impl DawUi {
             playlist_playback_loaded: false,
             tempo_bpm: 140.0,
             selected_pattern: None,
+            channel_display_filter: ChannelDisplayFilter::All,
             selected_note_channel: None,
             selected_note: None,
             selected_piano_notes: BTreeSet::new(),
@@ -6621,6 +6657,16 @@ impl DawUi {
             return;
         };
         let channels = document.channels();
+        let channel_groups = document.channel_groups();
+        let known_group_indices = channel_groups
+            .iter()
+            .map(ChannelGroupSummary::index)
+            .collect::<BTreeSet<_>>();
+        if let ChannelDisplayFilter::Group(index) = self.channel_display_filter
+            && !known_group_indices.contains(&index)
+        {
+            self.channel_display_filter = ChannelDisplayFilter::All;
+        }
         let channel_ids = channels.iter().map(ChannelSummary::id).collect::<Vec<_>>();
         let plugin_states = document.channel_plugin_states();
         let patterns = document.patterns().unwrap_or_default();
@@ -6724,6 +6770,31 @@ impl DawUi {
                         );
                     }
                 });
+            ui.label("Display");
+            egui::ComboBox::from_id_salt("channel-rack-display-filter")
+                .selected_text(self.channel_display_filter.label(&channel_groups))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.channel_display_filter,
+                        ChannelDisplayFilter::All,
+                        "All",
+                    );
+                    ui.selectable_value(
+                        &mut self.channel_display_filter,
+                        ChannelDisplayFilter::Unsorted,
+                        "Unsorted",
+                    );
+                    for group in &channel_groups {
+                        let label = group.name().map(str::to_owned).unwrap_or_else(|| {
+                            format!("Group {}", group.index().saturating_add(1))
+                        });
+                        ui.selectable_value(
+                            &mut self.channel_display_filter,
+                            ChannelDisplayFilter::Group(group.index()),
+                            label,
+                        );
+                    }
+                });
             if ui.small_button("◀").clicked() {
                 self.step_sequencer_bar = self.step_sequencer_bar.saturating_sub(1);
             }
@@ -6804,9 +6875,22 @@ impl DawUi {
             .selected_pattern
             .and_then(|pattern_id| patterns.iter().find(|pattern| pattern.id == pattern_id))
             .cloned();
+        let visible_channel_indices = channels
+            .iter()
+            .enumerate()
+            .filter_map(|(index, channel)| {
+                self.channel_display_filter
+                    .shows(channel.group_number(), &known_group_indices)
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
         ui.separator();
         egui::ScrollArea::vertical().show(ui, |ui| {
-            for (channel_index, channel) in channels.iter().enumerate() {
+            if visible_channel_indices.is_empty() {
+                ui.weak("No channels in this display filter");
+            }
+            for channel_index in visible_channel_indices {
+                let channel = &channels[channel_index];
                 let mut volume = channel.volume().unwrap_or(10_000);
                 let mut pan = channel.pan().unwrap_or(6_400);
                 let zipped = channel.zipped();
@@ -14182,8 +14266,8 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::{
-        PianoRollGrid, PianoRollSnap, note_from_grid_position, snap_note_tick,
-        update_channel_rack_selection, update_layer_child_selection,
+        ChannelDisplayFilter, PianoRollGrid, PianoRollSnap, note_from_grid_position,
+        snap_note_tick, update_channel_rack_selection, update_layer_child_selection,
     };
 
     fn test_grid() -> PianoRollGrid {
@@ -14210,6 +14294,20 @@ mod tests {
         assert_eq!(PianoRollSnap::Beat.ticks(96, None), 96);
         assert_eq!(PianoRollSnap::TwoBeats.ticks(96, None), 192);
         assert_eq!(PianoRollSnap::Bar.ticks(96, Some((3, 4))), 288);
+    }
+
+    #[test]
+    fn channel_display_filter_matches_named_and_unsorted_channels() {
+        let known_groups = BTreeSet::from([0, 1]);
+        assert!(ChannelDisplayFilter::All.shows(None, &known_groups));
+        assert!(ChannelDisplayFilter::All.shows(Some(1), &known_groups));
+        assert!(ChannelDisplayFilter::Unsorted.shows(None, &known_groups));
+        assert!(ChannelDisplayFilter::Unsorted.shows(Some(-1), &known_groups));
+        assert!(ChannelDisplayFilter::Unsorted.shows(Some(4), &known_groups));
+        assert!(!ChannelDisplayFilter::Unsorted.shows(Some(0), &known_groups));
+        assert!(ChannelDisplayFilter::Group(1).shows(Some(1), &known_groups));
+        assert!(!ChannelDisplayFilter::Group(1).shows(Some(0), &known_groups));
+        assert!(!ChannelDisplayFilter::Group(1).shows(None, &known_groups));
     }
 
     #[test]
