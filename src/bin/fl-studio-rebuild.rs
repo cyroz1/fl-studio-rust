@@ -6666,9 +6666,17 @@ impl DawUi {
         let mut open_editor = None;
         let mut channel_enabled_edits = Vec::new();
         let mut channel_zipped_edits = Vec::new();
-        if ui.memory(|memory| memory.focused().is_none())
-            && ui.input_mut(|input| input.consume_key(egui::Modifiers::ALT, egui::Key::Z))
-        {
+        let (zip_selected, unzip_all) = if ui.memory(|memory| memory.focused().is_none()) {
+            ui.input_mut(|input| {
+                (
+                    input.consume_key(egui::Modifiers::ALT, egui::Key::Z),
+                    input.consume_key(egui::Modifiers::ALT, egui::Key::U),
+                )
+            })
+        } else {
+            (false, false)
+        };
+        if zip_selected {
             channel_zipped_edits.extend(
                 self.selected_rack_channels
                     .iter()
@@ -6679,6 +6687,14 @@ impl DawUi {
                             .any(|channel| channel.id() == *id && !channel.zipped())
                     })
                     .map(|id| (id, true)),
+            );
+        }
+        if unzip_all {
+            channel_zipped_edits.extend(
+                channels
+                    .iter()
+                    .filter(|channel| channel.zipped())
+                    .map(|channel| (channel.id(), false)),
             );
         }
         let mut channel_color_edits = Vec::new();
