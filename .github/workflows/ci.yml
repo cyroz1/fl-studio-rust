@@ -43,16 +43,116 @@ jobs:
       - name: Run tests
         run: cargo test --all-targets
 
+      - name: Prepare macOS signing and notarization
+        id: macos-signing
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
+        run: |
+          secret_names=(
+            APPLE_CERTIFICATE
+            APPLE_CERTIFICATE_PASSWORD
+            APPLE_SIGNING_IDENTITY
+            APPLE_API_KEY
+            APPLE_API_ISSUER
+            APPLE_API_KEY_CONTENT
+          )
+          present=0
+          for name in "${secret_names[@]}"; do
+            if [[ -n "${!name}" ]]; then
+              present=$((present + 1))
+            fi
+          done
+
+          if [[ "$present" -eq 0 ]]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Skipping macOS packaging because Developer ID signing and notarization secrets are not configured."
+            {
+              echo "### macOS package skipped"
+              echo
+              echo "The macOS tests ran, but no installer was published because signing and notarization credentials are not configured. See [macOS CI packaging](docs/macos-ci-packaging.md) for the required repository secrets."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [[ "$present" -ne "${#secret_names[@]}" ]]; then
+            echo "::error::macOS signing configuration is incomplete. Configure all six secrets listed in docs/macos-ci-packaging.md."
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          config = Path("Packager.toml").read_text(encoding="utf-8")
+          config += "\n[macos]\nsigning-identity = "
+          config += json.dumps(os.environ["APPLE_SIGNING_IDENTITY"])
+          config += "\n"
+          Path("Packager.signed.toml").write_text(config, encoding="utf-8")
+          PY
+
+          api_key_path="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
+          umask 077
+          printf '%s' "$APPLE_API_KEY_CONTENT" > "$api_key_path"
+          echo "APPLE_API_KEY_PATH=$api_key_path" >> "$GITHUB_ENV"
+          echo "configured=true" >> "$GITHUB_OUTPUT"
+
       - name: Install Cargo Packager
+        if: runner.os != 'macOS' || steps.macos-signing.outputs.configured == 'true'
         run: cargo install cargo-packager --locked
 
-      - name: Build desktop installers
+      - name: Build desktop installers (Linux and Windows)
+        if: runner.os != 'macOS'
         run: cargo packager --release
 
-      - name: Upload installers
+      - name: Build signed and notarized macOS installer
+        if: runner.os == 'macOS' && steps.macos-signing.outputs.configured == 'true'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: cargo packager --release --config Packager.signed.toml
+
+      - name: Verify macOS signature and notarization
+        if: runner.os == 'macOS' && steps.macos-signing.outputs.configured == 'true'
+        shell: bash
+        run: |
+          app_path="$(find dist -maxdepth 1 -type d -name '*.app' -print -quit)"
+          if [[ -z "$app_path" ]]; then
+            echo "::error::Cargo Packager did not produce a macOS app bundle."
+            exit 1
+          fi
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+          xcrun stapler validate "$app_path"
+          spctl --assess --type execute --verbose=4 "$app_path"
+
+      - name: Upload Linux and Windows installers
+        if: runner.os != 'macOS'
         uses: actions/upload-artifact@v4
         with:
           name: installers-${{ matrix.os }}
           path: dist/*
           if-no-files-found: error
           retention-days: 14
+
+      - name: Upload signed macOS disk image
+        if: runner.os == 'macOS' && steps.macos-signing.outputs.configured == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: installers-${{ matrix.os }}
+          path: dist/*.dmg
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Remove temporary macOS signing files
+        if: always() && runner.os == 'macOS'
+        shell: bash
+        run: rm -f Packager.signed.toml "${APPLE_API_KEY_PATH:-}"

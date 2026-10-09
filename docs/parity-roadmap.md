@@ -337,7 +337,7 @@ automation, Mixer routing/effects, or PDC. Full export surface:
 | Item | Status | Notes |
 |---|---|---|
 | Windows installer (NSIS/WiX) | `[partial]` | CI builds installers; verify signed + working |
-| macOS app bundle, notarization | `[partial]` | CI builds; AU hosting + CoreAudio pending |
+| macOS app bundle, notarization | `[partial]` | CI runs macOS checks and skips installer publication until Developer ID signing and Apple notarization secrets are configured; signed builds are checked with Apple's signature, stapler, and Gatekeeper tools. AU hosting + CoreAudio remain pending. |
 | Linux builds (AppImage/deb) | `[partial]` | CI builds; XCB headers handled |
 | Windows: ASIO support | `[todo]` | Pro-audio requirement on Windows |
 | macOS: native menu bar, file associations | `[todo]` | |
