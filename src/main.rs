@@ -36,6 +36,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
         [command, path] if command == "project-settings" => {
             show_project_settings(Path::new(path))
         }
+        [command, path] if command == "global-swing" => show_global_swing(Path::new(path)),
         [command, path] if command == "channels" => list_channels(Path::new(path)),
         [command, path] if command == "mixer" => list_mixer(Path::new(path)),
         [command, path] if command == "automation" => list_automation(Path::new(path)),
@@ -266,6 +267,13 @@ fn run(args: Vec<String>) -> Result<(), String> {
                     )?,
                 },
             )
+        }
+        [command, input, output, percent] if command == "set-global-swing" => {
+            let percent = parse_u32(percent, "global swing mix percentage")?;
+            if percent > 100 {
+                return Err("global swing mix must be between 0 and 100 percent".to_owned());
+            }
+            write_global_swing(Path::new(input), Path::new(output), percent as u8)
         }
         [command, input, output, channel_id, name] if command == "rename-channel" => {
             let channel_id = channel_id
@@ -688,6 +696,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild preset-info <file.fst>\n",
             "  flp-rebuild project-info <file.flp>\n",
             "  flp-rebuild project-settings <file.flp>\n",
+            "  flp-rebuild global-swing <file.flp>\n",
             "  flp-rebuild midi-info <file.mid>\n",
             "  flp-rebuild export-midi-pattern <project.flp> <output.mid> <pattern-id> [stored|channels]\n",
             "  flp-rebuild export-midi-song <project.flp> <output.mid> <arrangement-id> [stored|channels]\n",
@@ -715,6 +724,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild create-pattern <input.flp> <output.flp>\n",
             "  flp-rebuild set-project-info <input.flp> <output.flp> <title|-> <author|-> <genre|-> <comments|-> <web-link|->\n",
             "  flp-rebuild set-project-settings <input.flp> <output.flp> <play-truncated:0|1|-> <fast-declick:0|1|->\n",
+            "  flp-rebuild set-global-swing <input.flp> <output.flp> <percent-0..100>\n",
             "  flp-rebuild rename-channel <input.flp> <output.flp> <channel-id> <name>\n",
             "  flp-rebuild set-channel-color <input.flp> <output.flp> <channel-id> <RRGGBB>\n",
             "  flp-rebuild set-channel-levels <input.flp> <output.flp> <channel-id> <volume-0..12800> <pan-0..12800>\n",
@@ -1164,6 +1174,23 @@ fn show_project_settings(path: &Path) -> Result<(), String> {
         "fast declick for cut groups: {}",
         settings.fast_declick_for_cut_groups
     );
+    Ok(())
+}
+
+fn show_global_swing(path: &Path) -> Result<(), String> {
+    let (_, document) = load_document(path)?;
+    let metadata = document.metadata();
+    match metadata.global_swing_mix_raw() {
+        Some(raw) => {
+            if raw <= 128 {
+                let percent = (u32::from(raw) * 100 + 64) / 128;
+                println!("global swing mix: {percent}% (raw {raw})");
+            } else {
+                println!("global swing mix: invalid raw {raw} (expected 0–128)");
+            }
+        }
+        None => println!("global swing mix: 0% (event absent; defaults to 0)"),
+    }
     Ok(())
 }
 
@@ -2027,6 +2054,24 @@ fn write_project_settings(
     fs::write(output, bytes)
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!("wrote updated Project settings to {}", output.display());
+    Ok(())
+}
+
+fn write_global_swing(input: &Path, output: &Path, percent: u8) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let raw = ((u32::from(percent) * 128 + 50) / 100) as u8;
+    document
+        .set_global_swing_mix(raw)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "set global swing mix to {percent}% (raw {raw}) in {}",
+        output.display()
+    );
     Ok(())
 }
 

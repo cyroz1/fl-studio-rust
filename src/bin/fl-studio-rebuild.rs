@@ -7194,6 +7194,9 @@ impl DawUi {
         let channel_ids = channels.iter().map(ChannelSummary::id).collect::<Vec<_>>();
         let plugin_states = document.channel_plugin_states();
         let patterns = document.patterns().unwrap_or_default();
+        let global_swing_raw = document.metadata().global_swing_mix();
+        let global_swing_percent = (u32::from(global_swing_raw.min(128)) * 100 + 64) / 128;
+        let global_swing_is_valid = global_swing_raw <= 128;
         if self
             .selected_graph_channel
             .is_none_or(|id| !channels.iter().any(|channel| channel.id() == id))
@@ -7286,6 +7289,7 @@ impl DawUi {
         let mut channel_order_edits = Vec::new();
         let mut channel_sort = None;
         let mut level_edits = Vec::new();
+        let mut global_swing_edit = None;
         let mut channel_swing_edits = Vec::new();
         let mut layer_edits = Vec::new();
         let mut layer_flag_edits = Vec::new();
@@ -7358,6 +7362,51 @@ impl DawUi {
                         }
                     }
                 });
+            ui.menu_button(
+                if global_swing_is_valid {
+                    format!("Swing {global_swing_percent}%")
+                } else {
+                    "Swing invalid".to_owned()
+                },
+                |ui| {
+                    ui.small("Global Channel Rack swing");
+                    if !global_swing_is_valid {
+                        ui.colored_label(
+                            ORANGE,
+                            "Stored value is outside the supported 0–128 range",
+                        );
+                    }
+                    ui.separator();
+                    for percent in [0_u32, 25, 50, 75, 100] {
+                        if ui
+                            .selectable_label(
+                                global_swing_is_valid && global_swing_percent == percent,
+                                format!("{percent}%"),
+                            )
+                            .clicked()
+                        {
+                            global_swing_edit = Some(percent as u8);
+                            ui.close();
+                        }
+                    }
+                    ui.separator();
+                    let mut custom_percent = global_swing_percent;
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut custom_percent, 0..=100)
+                                .text("Custom")
+                                .suffix("%"),
+                        )
+                        .changed()
+                    {
+                        global_swing_edit = Some(custom_percent as u8);
+                    }
+                },
+            )
+            .response
+            .on_hover_text(
+                "Set project-wide swing mix. Playback scheduling does not apply swing yet.",
+            );
             if ui.small_button("◀").clicked() {
                 self.step_sequencer_bar = self.step_sequencer_bar.saturating_sub(1);
             }
@@ -8114,6 +8163,25 @@ impl DawUi {
                 }
                 Some(Err(error)) => {
                     self.status = format!("Could not change channel compact state: {error}");
+                }
+                None => {}
+            }
+        }
+        if let Some(percent) = global_swing_edit {
+            let swing_mix = ((u32::from(percent) * 128 + 50) / 100) as u8;
+            let result = self
+                .document
+                .as_mut()
+                .map(|document| document.set_global_swing_mix(swing_mix));
+            match result {
+                Some(Ok(())) => {
+                    self.dirty = true;
+                    self.status = format!(
+                        "Global swing mix set to {percent}%; playback scheduling is not implemented"
+                    );
+                }
+                Some(Err(error)) => {
+                    self.status = format!("Could not change global swing mix: {error}");
                 }
                 None => {}
             }

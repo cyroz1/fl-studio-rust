@@ -46,6 +46,12 @@ Controlled toggles in FL Studio 26.1.6 Project settings > Project > Advanced map
 
 The Rust model, CLI, and desktop dialog only edit this recognized event block, preserve unrelated events, and reject files where the block is missing or ambiguous. These mappings were verified against one FL Studio 26.1.6 project; other project settings, older-version layouts, and behavior across a broader project corpus remain to be mapped.
 
+## Channel Rack swing observations
+
+Image-Line documents global swing as a 0–100% Channel Rack amount, with each channel's swing setting acting as a multiplier of the global value; both amounts must be above zero for swing to take effect ([Channel Rack manual](https://www.image-line.com/fl-studio-learning-content/fl-studio-online-manual/html/channelrack.htm)). PyFLP identifies global swing as project-level event `0x0B`, stored in one byte with a 0–128 range and a default of 0 ([PyFLP Channel Rack model](https://pyflp.readthedocs.io/en/v2.1.0/_modules/pyflp/channel.html)).
+
+The Rust model reads and edits the project event, inserts it before the first channel marker when needed, and preserves unrelated events. `global-swing`, `set-global-swing`, and the Channel Rack header menu expose this value. Channel swing remains separately stored as the per-channel `0x61` word multiplier. Playback scheduling does not apply either setting yet; the event mapping has not been validated against a new native FL Studio save in this workspace.
+
 ## Pattern creation observations
 
 The pattern model recognizes word-sized `0x41` pattern IDs and treats an immediately following `0xD0` or `0xE0` data event as that pattern's 24-byte note records. Empty-pattern creation locates score sections by those adjacent marker/note-event pairs, reuses their unique note-event opcode, and chooses the next ID after the highest marker in those sections. This avoids confusing repeated `0x41` markers in later Playlist track records with score patterns. The new marker and zero-length note event are inserted at the end of the last recognized score section. A Rust-created pattern 15 in the installed `Electric Loop - The Ogun Dream.flp` demo project re-parsed as an empty pattern, and synthetic round-trip fixtures preserve unrelated events. The modified project has not yet been opened in FL Studio, so the insertion strategy still needs native validation.

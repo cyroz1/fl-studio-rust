@@ -305,6 +305,7 @@ impl FstPreset {
 pub struct ProjectMetadata {
     tempo_milli_bpm: Option<u32>,
     time_signature: Option<(u8, u8)>,
+    global_swing_mix: Option<u8>,
     build_number: Option<u32>,
     title: Option<String>,
     author: Option<String>,
@@ -1316,6 +1317,16 @@ impl ProjectMetadata {
 
     pub fn time_signature(&self) -> Option<(u8, u8)> {
         self.time_signature
+    }
+
+    /// Raw global Channel Rack swing mix from the project-level `0x0B` byte event.
+    pub fn global_swing_mix_raw(&self) -> Option<u8> {
+        self.global_swing_mix
+    }
+
+    /// Global Channel Rack swing mix in FL's 0..=128 range; missing events default to zero.
+    pub fn global_swing_mix(&self) -> u8 {
+        self.global_swing_mix.unwrap_or(0)
     }
 
     pub fn build_number(&self) -> Option<u32> {
@@ -4894,6 +4905,67 @@ impl FlpDocument {
         Ok(())
     }
 
+    /// Sets the global Channel Rack swing mix in FL's 0..=128 range.
+    /// The project-level `0x0B` byte event defaults to zero when absent.
+    pub fn set_global_swing_mix(&mut self, swing_mix: u8) -> Result<(), FlpError> {
+        if swing_mix > 128 {
+            return Err(FlpError::UnsupportedEdit(
+                "global swing mix must be in the 0..=128 range",
+            ));
+        }
+
+        let channel_start = self
+            .events
+            .iter()
+            .position(|event| event.opcode == 0x40)
+            .unwrap_or(self.events.len());
+        let mut swing_events = self
+            .events
+            .iter()
+            .enumerate()
+            .filter(|(index, event)| *index < channel_start && event.opcode == 0x0B)
+            .map(|(index, _)| index);
+        let existing_event = swing_events.next();
+        if swing_events.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the project has multiple 0x0B global swing events",
+            ));
+        }
+
+        let Some(event_index) = existing_event else {
+            if swing_mix == 0 {
+                return Ok(());
+            }
+            let mut candidate = self.clone();
+            candidate
+                .events
+                .insert(channel_start, FlpEvent::new_byte(0x0B, swing_mix));
+            candidate.refresh_event_offsets()?;
+            candidate.metadata =
+                read_project_metadata(&candidate.events, candidate.project_version.as_deref());
+            *self = candidate;
+            return Ok(());
+        };
+
+        let event = &self.events[event_index];
+        if event.encoding != PayloadEncoding::Byte || event.payload.len() != 1 {
+            return Err(FlpError::UnsupportedEdit(
+                "the project's 0x0B global swing event is not a one-byte value",
+            ));
+        }
+        if event.payload[0] == swing_mix {
+            return Ok(());
+        }
+
+        let mut candidate = self.clone();
+        candidate.events[event_index].replace_byte_payload(swing_mix)?;
+        candidate.refresh_event_offsets()?;
+        candidate.metadata =
+            read_project_metadata(&candidate.events, candidate.project_version.as_deref());
+        *self = candidate;
+        Ok(())
+    }
+
     /// Updates selected FL Studio Project Info fields while retaining each field's
     /// project-version string encoding, terminator convention, and trailing payload bytes.
     pub fn set_project_info(&mut self, edit: ProjectInfoEdit) -> Result<(), FlpError> {
@@ -6792,6 +6864,7 @@ fn read_project_metadata(events: &[FlpEvent], project_version: Option<&str>) -> 
     let mut legacy_fine_tempo = 0u32;
     let mut numerator = None;
     let mut denominator = None;
+    let mut global_swing_mix = None;
     let mut build_number = None;
     let mut title = None;
     let mut author = None;
@@ -6807,6 +6880,13 @@ fn read_project_metadata(events: &[FlpEvent], project_version: Option<&str>) -> 
         match event.opcode {
             0x11 if event.payload.len() == 1 => numerator = Some(event.payload[0]),
             0x12 if event.payload.len() == 1 => denominator = Some(event.payload[0]),
+            0x0B if event_index < channel_start
+                && event.encoding == PayloadEncoding::Byte
+                && event.payload.len() == 1
+                && global_swing_mix.is_none() =>
+            {
+                global_swing_mix = Some(event.payload[0]);
+            }
             0x42 if event.payload.len() == 2 => {
                 legacy_coarse_tempo = Some(u32::from(u16::from_le_bytes([
                     event.payload[0],
@@ -6864,6 +6944,7 @@ fn read_project_metadata(events: &[FlpEvent], project_version: Option<&str>) -> 
     ProjectMetadata {
         tempo_milli_bpm,
         time_signature,
+        global_swing_mix,
         build_number,
         title,
         author,
@@ -7338,6 +7419,95 @@ mod tests {
                 .is_err()
         );
         assert_eq!(document.encode_lossless().unwrap(), original);
+    }
+
+    #[test]
+    fn reads_and_sets_global_swing_mix_losslessly() {
+        let tail = [0xD1, 0xD2];
+        for (initial_mix, requested_mix, expected_mix, inserted) in [
+            (None, 32u8, Some(32u8), true),
+            (Some(40u8), 77, Some(77u8), false),
+            (None, 0, None, false),
+        ] {
+            let mut event_stream = vec![0x22, 0x99];
+            if let Some(initial_mix) = initial_mix {
+                event_stream.extend_from_slice(&[0x0B, initial_mix]);
+            }
+            event_stream.extend_from_slice(&[0x40, 7, 0, 0x15, 0, 0x62, 0, 0]);
+            let input = flp_fixture(&event_stream, &[], &tail);
+            let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+            assert_eq!(document.metadata().global_swing_mix_raw(), initial_mix);
+            assert_eq!(
+                document.metadata().global_swing_mix(),
+                initial_mix.unwrap_or(0)
+            );
+            assert_eq!(document.encode_lossless().unwrap(), input);
+
+            document
+                .set_global_swing_mix(requested_mix)
+                .expect("global swing mix should update");
+
+            assert_eq!(document.metadata().global_swing_mix_raw(), expected_mix);
+            assert_eq!(
+                document.metadata().global_swing_mix(),
+                expected_mix.unwrap_or(0)
+            );
+            let swing_events = document
+                .events()
+                .iter()
+                .filter(|event| event.opcode() == 0x0B)
+                .collect::<Vec<_>>();
+            if let Some(expected_mix) = expected_mix {
+                assert_eq!(swing_events.len(), 1);
+                assert_eq!(swing_events[0].payload(), &[expected_mix]);
+            } else {
+                assert!(swing_events.is_empty());
+            }
+            if inserted {
+                assert_eq!(document.events()[1].wire_bytes(), &[0x0B, 32]);
+                assert_eq!(document.events()[2].opcode(), 0x40);
+            }
+
+            let encoded = document.encode_lossless().expect("document should encode");
+            assert!(encoded.ends_with(&tail));
+            let round_trip = FlpDocument::parse(&encoded).expect("edited project should parse");
+            assert_eq!(round_trip.metadata().global_swing_mix_raw(), expected_mix);
+        }
+    }
+
+    #[test]
+    fn global_swing_ignores_channel_scoped_and_duplicate_events() {
+        let mut channel_scoped = FlpDocument::parse(&flp_fixture(
+            &[0x40, 7, 0, 0x15, 0, 0x0B, 16, 0x62, 0, 0],
+            &[],
+            &[],
+        ))
+        .expect("fixture should parse");
+        assert_eq!(channel_scoped.metadata().global_swing_mix_raw(), None);
+        channel_scoped
+            .set_global_swing_mix(64)
+            .expect("global swing should insert before channel data");
+        assert_eq!(channel_scoped.metadata().global_swing_mix_raw(), Some(64));
+        assert_eq!(
+            channel_scoped
+                .events()
+                .iter()
+                .filter(|event| event.opcode() == 0x0B)
+                .count(),
+            2
+        );
+
+        let mut duplicate = FlpDocument::parse(&flp_fixture(
+            &[0x0B, 0, 0x0B, 64, 0x40, 7, 0, 0x15, 0, 0x62, 0, 0],
+            &[],
+            &[],
+        ))
+        .expect("fixture should parse");
+        let original = duplicate.encode_lossless().unwrap();
+        assert!(duplicate.set_global_swing_mix(96).is_err());
+        assert_eq!(duplicate.encode_lossless().unwrap(), original);
+
+        assert!(duplicate.set_global_swing_mix(129).is_err());
     }
 
     #[test]
