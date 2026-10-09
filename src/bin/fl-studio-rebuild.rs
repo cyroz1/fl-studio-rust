@@ -13644,9 +13644,8 @@ impl eframe::App for DawUi {
                 (full_height - MENU_BAR_HEIGHT - TRANSPORT_BAR_HEIGHT - STATUS_BAR_HEIGHT - 8.0)
                     .max(100.0);
             ui.horizontal(|ui| {
-                let browser_max_width = (width - 700.0)
-                    .max(MIN_BROWSER_COLUMN_WIDTH)
-                    .min(MAX_BROWSER_COLUMN_WIDTH);
+                let browser_max_width =
+                    (width - 700.0).clamp(MIN_BROWSER_COLUMN_WIDTH, MAX_BROWSER_COLUMN_WIDTH);
                 self.browser_column_width = self
                     .browser_column_width
                     .clamp(MIN_BROWSER_COLUMN_WIDTH, browser_max_width);
