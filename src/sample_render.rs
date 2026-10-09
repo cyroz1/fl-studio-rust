@@ -118,6 +118,7 @@ pub struct PlaylistRenderOptions {
     pub sample_rate: u32,
     pub sampler_voice_limit: usize,
     pub wav_sample_format: WavSampleFormat,
+    pub tail_seconds: u8,
 }
 
 impl Default for PlaylistRenderOptions {
@@ -127,6 +128,7 @@ impl Default for PlaylistRenderOptions {
             sample_rate: DEFAULT_SAMPLE_RATE,
             sampler_voice_limit: DEFAULT_SAMPLER_VOICE_LIMIT,
             wav_sample_format: WavSampleFormat::Float32,
+            tail_seconds: 0,
         }
     }
 }
@@ -376,9 +378,12 @@ pub fn render_playlist_with_vst3_to_wav_cancellable(
         );
     }
 
-    let mut frames = audio.summary.frames.max(sampler.summary.frames);
+    let mut content_frames = audio.summary.frames.max(sampler.summary.frames);
     if let Some(processor) = vst3_processor.as_mut() {
-        frames = frames.max(processor.summary().frames);
+        content_frames = content_frames.max(processor.summary().frames);
+    }
+    let frames = add_render_tail_frames(content_frames, options.sample_rate, options.tail_seconds)?;
+    if let Some(processor) = vst3_processor.as_mut() {
         processor.extend_to_output_frames(frames)?;
     }
     let frames_u32 =
@@ -508,6 +513,19 @@ fn quantize_signed_pcm(sample: f32, negative_scale: f64, positive_scale: f64) ->
         positive_scale
     };
     (sample * scale).round() as i64
+}
+
+fn add_render_tail_frames(
+    content_frames: u64,
+    sample_rate: u32,
+    tail_seconds: u8,
+) -> Result<u64, String> {
+    let tail_frames = u64::from(sample_rate)
+        .checked_mul(u64::from(tail_seconds))
+        .ok_or_else(|| "render tail length overflow".to_owned())?;
+    content_frames
+        .checked_add(tail_frames)
+        .ok_or_else(|| "render length overflow".to_owned())
 }
 
 struct PreparedPlaylistBlockMix<'a> {
@@ -2090,6 +2108,16 @@ mod tests {
     }
 
     #[test]
+    fn adds_render_tail_frames_with_overflow_checks() {
+        assert_eq!(add_render_tail_frames(12_000, 48_000, 0).unwrap(), 12_000);
+        assert_eq!(add_render_tail_frames(12_000, 48_000, 2).unwrap(), 108_000);
+        assert_eq!(
+            add_render_tail_frames(u64::MAX, 48_000, 1),
+            Err("render length overflow".to_owned())
+        );
+    }
+
+    #[test]
     fn playlist_pattern_clips_place_repeat_and_clip_sampler_notes() {
         let pattern = Pattern {
             id: 5,
@@ -2230,6 +2258,7 @@ mod tests {
                     sample_rate: 4,
                     sampler_voice_limit: 4,
                     wav_sample_format: WavSampleFormat::Float32,
+                    tail_seconds: 0,
                 },
                 frames: 2,
                 vst3_processor: None,

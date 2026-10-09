@@ -287,18 +287,21 @@ implementation).
 ## 13. Render / export
 
 Current: experimental offline renders include audio clips, Sampler Pattern
-Clips, and mapped VST3 instruments in one bounded Playlist mix → stereo float
-WAV. This first combined renderer uses base tempo and provisional channel
-volume/pan; it does not apply automation, Mixer routing/effects, or PDC. Full
-export surface:
+Clips, and mapped VST3 instruments in one bounded Playlist mix → stereo WAV.
+The desktop dialog can choose 16/24-bit integer PCM or 32-bit float output and
+append up to five seconds after the final scheduled clip. This first combined
+renderer uses base tempo and provisional channel volume/pan; it does not apply
+automation, Mixer routing/effects, or PDC. Full export surface:
 
 - `[partial]` Full-song render through the complete mixer graph (instruments +
   samples + automation + FX + PDC): the desktop can render enabled Playlist
   audio clips, Sampler Pattern Clips, and mapped installed VST3 instruments in
-  bounded blocks to a 32-bit float WAV. Automation, Mixer routing/effects, PDC,
-  native level comparison, and export options remain incomplete.
+  bounded blocks to stereo WAV with 16/24-bit integer PCM or 32-bit float
+  output. The dialog also has 0/1/2/5-second tail presets. Automation, Mixer
+  routing/effects, PDC, native level comparison, and other export options
+  remain incomplete.
 - `[partial]` Formats: the desktop Playlist renderer writes stereo WAV as 16/24-bit integer PCM or 32-bit float, matching the depths in [Image-Line's export format documentation](https://www.image-line.com/fl-studio-learning/fl-studio-online-manual/html/fformats_save_export.htm); MP3, OGG, and FLAC export remain todo
-- `[todo]` Render options: quality (resampling), dithering, normalize, tail length
+- `[partial]` Render options: the Playlist mix dialog offers 0/1/2/5-second output tails for VST instrument releases; quality (resampling), dithering, normalize, and effect-based tail detection remain todo
 - `[todo]` Stem export: split mixer tracks, "split channel tracks"
 - `[todo]` Playlist selection render, pattern render
 - `[todo]` Burn to CD-era options: skip (obsolete)

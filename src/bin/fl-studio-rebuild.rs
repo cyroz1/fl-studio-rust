@@ -1297,6 +1297,7 @@ struct DawUi {
     project_settings_fast_declick: bool,
     playlist_render_options_open: bool,
     playlist_render_format: WavSampleFormat,
+    playlist_render_tail_seconds: u8,
 }
 
 struct PendingAudioRender {
@@ -1559,6 +1560,7 @@ impl DawUi {
             project_settings_fast_declick: false,
             playlist_render_options_open: false,
             playlist_render_format: WavSampleFormat::Float32,
+            playlist_render_tail_seconds: 0,
         };
         if let Some((autosave_minutes, autosave_before_risky, backup_retention)) =
             load_autosave_settings()
@@ -2512,6 +2514,21 @@ impl DawUi {
                             }
                         });
                 });
+                ui.horizontal(|ui| {
+                    ui.label("Tail length");
+                    egui::ComboBox::from_id_salt("playlist-render-tail-length")
+                        .selected_text(format!("{} seconds", self.playlist_render_tail_seconds))
+                        .show_ui(ui, |ui| {
+                            for seconds in [0, 1, 2, 5] {
+                                ui.selectable_value(
+                                    &mut self.playlist_render_tail_seconds,
+                                    seconds,
+                                    format!("{seconds} seconds"),
+                                );
+                            }
+                        });
+                });
+                ui.label("Adds time after the last clip for instrument release tails.");
                 ui.label(match self.playlist_render_format {
                     WavSampleFormat::Pcm16 | WavSampleFormat::Pcm24 => {
                         "Integer PCM clips samples to the [-1, 1] range."
@@ -10114,6 +10131,7 @@ impl DawUi {
             arrangement_id: self.selected_arrangement.unwrap_or_default(),
             sample_rate: self.audio_settings.sample_rate,
             wav_sample_format: self.playlist_render_format,
+            tail_seconds: self.playlist_render_tail_seconds,
             ..PlaylistRenderOptions::default()
         };
         let vst3_processor = self
