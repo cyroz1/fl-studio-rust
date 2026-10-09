@@ -82,6 +82,20 @@ const MIDI_CHANNEL_COLORS: [Color32; 16] = [
     Color32::from_rgb(172, 128, 105),
 ];
 
+fn install_ui_fonts(context: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "Inter".to_owned(),
+        egui::FontData::from_static(include_bytes!("../../assets/fonts/InterVariable.ttf")).into(),
+    );
+    fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        .insert(0, "Inter".to_owned());
+    context.set_fonts(fonts);
+}
+
 fn project_hash(document: &FlpDocument) -> Option<u64> {
     let bytes = document.encode_lossless().ok()?;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -1352,6 +1366,7 @@ struct PendingWaveformLoad {
 
 impl DawUi {
     fn new(creation: &eframe::CreationContext<'_>, initial_project: Option<PathBuf>) -> Self {
+        install_ui_fonts(&creation.egui_ctx);
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = APP_BACKGROUND;
         visuals.window_fill = PANEL;
