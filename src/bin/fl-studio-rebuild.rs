@@ -4159,9 +4159,6 @@ impl DawUi {
                 self.toggle_project_playback();
             }
             ui.separator();
-            ui.label("PAT");
-            ui.label("SONG");
-            ui.separator();
             ui.label("Tempo");
             let mut bpm = self.tempo_bpm;
             if ui
@@ -5540,7 +5537,6 @@ impl DawUi {
 
         ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
             ui.separator();
-            ui.small("Local files · project data stays lossless");
             self.browser_preview_player(ui);
         });
     }
@@ -6389,7 +6385,7 @@ impl DawUi {
 
     fn playlist(&mut self, ui: &mut egui::Ui) {
         let Some(document) = &self.document else {
-            empty_view(ui, "Open an FL Studio project to see its Playlist");
+            self.empty_project_view(ui);
             return;
         };
         let arrangements = document.arrangements().unwrap_or_default();
@@ -9077,6 +9073,101 @@ impl DawUi {
             }
             PianoRollSelectionCommand::Clear => "Note selection cleared".to_owned(),
         };
+    }
+
+    fn empty_project_view(&mut self, ui: &mut egui::Ui) {
+        let recent_projects = self.browser_recent_projects.clone();
+        let mut open_dialog = false;
+        let mut open_recent = None;
+        let mut browse_projects = false;
+
+        let recent_count = recent_projects.len().min(4);
+        let content_height = 216.0
+            + if recent_count == 0 {
+                0.0
+            } else {
+                26.0 + recent_count as f32 * 33.0
+            };
+        ui.add_space(((ui.available_height() - content_height) * 0.5).max(0.0));
+        ui.vertical_centered(|ui| {
+            ui.set_max_width(520.0);
+            let (logo_rect, _) = ui.allocate_exact_size(Vec2::splat(48.0), Sense::hover());
+            ui.painter()
+                .rect_filled(logo_rect, egui::CornerRadius::same(10), BLUE_SELECTION);
+            ui.painter().text(
+                logo_rect.center(),
+                Align2::CENTER_CENTER,
+                "FL",
+                FontId::proportional(20.0),
+                BLUE,
+            );
+            ui.add_space(18.0);
+            ui.label(
+                egui::RichText::new("Start with a project")
+                    .size(24.0)
+                    .strong(),
+            );
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(
+                    "Open an FL Studio project to view its arrangement and start editing.",
+                )
+                .size(14.0)
+                .color(MUTED),
+            );
+            ui.add_space(18.0);
+            if ui
+                .add_sized(
+                    Vec2::new(176.0, 36.0),
+                    egui::Button::new(egui::RichText::new("Open project…").color(Color32::WHITE))
+                        .fill(BLUE)
+                        .stroke(Stroke::NONE),
+                )
+                .clicked()
+            {
+                open_dialog = true;
+            }
+            if !recent_projects.is_empty() {
+                ui.add_space(22.0);
+                ui.label(
+                    egui::RichText::new("RECENT PROJECTS")
+                        .size(11.0)
+                        .strong()
+                        .color(MUTED),
+                );
+                ui.add_space(4.0);
+                for path in recent_projects.iter().take(4) {
+                    let name = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string());
+                    if ui
+                        .add_sized(
+                            Vec2::new(360.0, 28.0),
+                            egui::Button::new(name).fill(PANEL_LIGHT),
+                        )
+                        .on_hover_text(path.display().to_string())
+                        .clicked()
+                    {
+                        open_recent = Some(path.clone());
+                    }
+                }
+            }
+            ui.add_space(10.0);
+            if ui.link("Browse project files").clicked() {
+                browse_projects = true;
+            }
+        });
+
+        if open_dialog {
+            self.open_dialog();
+        } else if let Some(path) = open_recent {
+            self.open_project(&path);
+        } else if browse_projects {
+            self.browser_tab = BrowserTab::Files;
+            self.browser_active_saved_search = None;
+            self.browser_filter = BrowserFilter::Projects;
+        }
     }
 
     fn piano_roll(&mut self, ui: &mut egui::Ui) {
@@ -13594,10 +13685,18 @@ impl eframe::App for DawUi {
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
-                                        ui.label(
-                                            egui::RichText::new("FLP compatibility foundation")
-                                                .color(MUTED),
-                                        );
+                                        if let Some(path) = &self.current_path {
+                                            let name = path
+                                                .file_name()
+                                                .map(|name| name.to_string_lossy())
+                                                .unwrap_or_else(|| {
+                                                    path.as_os_str().to_string_lossy()
+                                                });
+                                            ui.label(
+                                                egui::RichText::new(name.as_ref()).color(MUTED),
+                                            )
+                                            .on_hover_text(path.display().to_string());
+                                        }
                                     },
                                 );
                             });
