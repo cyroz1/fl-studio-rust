@@ -4117,6 +4117,11 @@ impl DawUi {
     }
 
     fn transport_bar(&mut self, ui: &mut egui::Ui) {
+        let patterns = self
+            .document
+            .as_ref()
+            .and_then(|document| document.patterns().ok())
+            .unwrap_or_default();
         ui.horizontal_centered(|ui| {
             ui.add_space(4.0);
             if ui
@@ -4174,6 +4179,48 @@ impl DawUi {
             }
             ui.separator();
             ui.monospace(self.song_position_label());
+            if self.document.is_some() {
+                ui.separator();
+                ui.label("Pattern");
+                let selected_pattern_text = patterns
+                    .iter()
+                    .find(|pattern| Some(pattern.id) == self.selected_pattern)
+                    .map(|pattern| {
+                        pattern
+                            .name
+                            .as_deref()
+                            .filter(|name| !name.trim().is_empty())
+                            .map_or_else(|| format!("Pattern {}", pattern.id), str::to_owned)
+                    })
+                    .unwrap_or_else(|| "No patterns".to_owned());
+                egui::ComboBox::from_id_salt("transport-pattern-picker")
+                    .selected_text(selected_pattern_text)
+                    .width(132.0)
+                    .show_ui(ui, |ui| {
+                        if patterns.is_empty() {
+                            ui.weak("No patterns");
+                        }
+                        for pattern in &patterns {
+                            let label = pattern
+                                .name
+                                .as_deref()
+                                .filter(|name| !name.trim().is_empty())
+                                .map_or_else(|| format!("Pattern {}", pattern.id), str::to_owned);
+                            ui.selectable_value(
+                                &mut self.selected_pattern,
+                                Some(pattern.id),
+                                label,
+                            );
+                        }
+                    });
+                if ui
+                    .small_button("+")
+                    .on_hover_text("Create a new pattern")
+                    .clicked()
+                {
+                    self.create_pattern();
+                }
+            }
         });
     }
 
