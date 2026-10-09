@@ -6377,6 +6377,7 @@ impl DawUi {
             .clamp(1, 64) as usize;
         let mut open_editor = None;
         let mut channel_enabled_edits = Vec::new();
+        let mut channel_order_edits = Vec::new();
         let mut level_edits = Vec::new();
         let mut layer_edits = Vec::new();
         let mut layer_flag_edits = Vec::new();
@@ -6421,7 +6422,7 @@ impl DawUi {
             .cloned();
         ui.separator();
         egui::ScrollArea::vertical().show(ui, |ui| {
-            for channel in &channels {
+            for (channel_index, channel) in channels.iter().enumerate() {
                 let mut volume = channel.volume().unwrap_or(10_000);
                 let mut pan = channel.pan().unwrap_or(6_400);
                 let levels_editable = channel.levels_editable();
@@ -6467,6 +6468,69 @@ impl DawUi {
                                 .clicked()
                             {
                                 channel_enabled_edits.push((channel.id(), !is_enabled));
+                            }
+                            let move_up_enabled = channel_index > 0;
+                            let move_up_response = ui
+                                .add_enabled(move_up_enabled, egui::Button::new(""))
+                                .on_hover_text("Move channel up");
+                            let move_up_center = move_up_response.rect.center();
+                            let move_up_color = if move_up_enabled { TEXT } else { MUTED };
+                            let move_up_stroke = Stroke::new(1.5, move_up_color);
+                            ui.painter().line_segment(
+                                [
+                                    move_up_center + Vec2::new(0.0, 3.0),
+                                    move_up_center + Vec2::new(0.0, -3.0),
+                                ],
+                                move_up_stroke,
+                            );
+                            ui.painter().line_segment(
+                                [
+                                    move_up_center + Vec2::new(-3.0, 0.0),
+                                    move_up_center + Vec2::new(0.0, -3.0),
+                                ],
+                                move_up_stroke,
+                            );
+                            ui.painter().line_segment(
+                                [
+                                    move_up_center + Vec2::new(3.0, 0.0),
+                                    move_up_center + Vec2::new(0.0, -3.0),
+                                ],
+                                move_up_stroke,
+                            );
+                            if move_up_response.clicked() {
+                                channel_order_edits
+                                    .push((channel.id(), channel_index.saturating_sub(1)));
+                            }
+                            let move_down_enabled = channel_index + 1 < channels.len();
+                            let move_down_response = ui
+                                .add_enabled(move_down_enabled, egui::Button::new(""))
+                                .on_hover_text("Move channel down");
+                            let move_down_center = move_down_response.rect.center();
+                            let move_down_color = if move_down_enabled { TEXT } else { MUTED };
+                            let move_down_stroke = Stroke::new(1.5, move_down_color);
+                            ui.painter().line_segment(
+                                [
+                                    move_down_center + Vec2::new(0.0, -3.0),
+                                    move_down_center + Vec2::new(0.0, 3.0),
+                                ],
+                                move_down_stroke,
+                            );
+                            ui.painter().line_segment(
+                                [
+                                    move_down_center + Vec2::new(-3.0, 0.0),
+                                    move_down_center + Vec2::new(0.0, 3.0),
+                                ],
+                                move_down_stroke,
+                            );
+                            ui.painter().line_segment(
+                                [
+                                    move_down_center + Vec2::new(3.0, 0.0),
+                                    move_down_center + Vec2::new(0.0, 3.0),
+                                ],
+                                move_down_stroke,
+                            );
+                            if move_down_response.clicked() {
+                                channel_order_edits.push((channel.id(), channel_index + 1));
                             }
                             let plugin_state = plugin_states
                                 .iter()
@@ -6746,6 +6810,26 @@ impl DawUi {
                 }
                 Some(Err(error)) => {
                     self.status = format!("Could not change channel mute state: {error}");
+                }
+                None => {}
+            }
+        }
+        for (channel_id, target_index) in channel_order_edits {
+            let result = self
+                .document
+                .as_mut()
+                .map(|document| document.move_channel(channel_id, target_index));
+            match result {
+                Some(Ok(())) => {
+                    self.stop_project_playback();
+                    self.dirty = true;
+                    self.status = format!(
+                        "Moved channel {channel_id} to position {}",
+                        target_index + 1
+                    );
+                }
+                Some(Err(error)) => {
+                    self.status = format!("Could not reorder Channel Rack row: {error}");
                 }
                 None => {}
             }

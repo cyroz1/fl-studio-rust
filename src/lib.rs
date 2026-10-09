@@ -5063,6 +5063,55 @@ impl FlpDocument {
         Ok(())
     }
 
+    /// Moves a channel to `target_index` in Channel Rack order without changing its ID or event
+    /// bytes. The complete event range for the channel is moved as one block.
+    pub fn move_channel(&mut self, channel_id: u16, target_index: usize) -> Result<(), FlpError> {
+        let channels = self.channels();
+        let mut matching = channels
+            .iter()
+            .enumerate()
+            .filter(|(_, channel)| channel.id == channel_id);
+        let Some((source_index, channel)) = matching.next() else {
+            return Err(FlpError::ChannelNotFound(channel_id));
+        };
+        if matching.next().is_some() {
+            return Err(FlpError::AmbiguousChannelId(channel_id));
+        }
+        if target_index >= channels.len() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested Channel Rack position does not exist",
+            ));
+        }
+        if source_index == target_index {
+            return Ok(());
+        }
+
+        let source_range = channel.event_range();
+        let insertion_index = if target_index < source_index {
+            channels[target_index].event_range().start
+        } else {
+            channels[target_index]
+                .event_range()
+                .end
+                .checked_sub(source_range.len())
+                .ok_or(FlpError::UnsupportedEdit(
+                    "the requested channel order has inconsistent event ranges",
+                ))?
+        };
+
+        let mut candidate = self.clone();
+        let moved_events = candidate
+            .events
+            .drain(source_range)
+            .collect::<Vec<FlpEvent>>();
+        candidate
+            .events
+            .splice(insertion_index..insertion_index, moved_events);
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
     /// Adds a Sampler channel with the given source path and display name.
     ///
     /// The channel uses the project's recognized string encoding, gets the next available
@@ -7189,6 +7238,102 @@ mod tests {
             let round_trip = FlpDocument::parse(&encoded).expect("muted project should parse");
             assert_eq!(round_trip.channels()[0].enabled(), Some(false));
         }
+    }
+
+    #[test]
+    fn moves_channel_event_blocks_without_changing_channel_data() {
+        let mut event_stream = vec![0x40, 7, 0, 0x15, 0, 0x48, 0x11, 0];
+        append_project_info_string(&mut event_stream, 0xCB, "Kick");
+        event_stream.extend_from_slice(&[0x40, 8, 0, 0x15, 0, 0x48, 0x22, 0]);
+        append_project_info_string(&mut event_stream, 0xCB, "Snare");
+        event_stream.extend_from_slice(&[0x40, 9, 0, 0x15, 0, 0x48, 0x33, 0]);
+        append_project_info_string(&mut event_stream, 0xCB, "Hat");
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        let tail = [0xA5, 0x5A];
+        let input = flp_fixture(&event_stream, &[], &tail);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+        let original_blocks = document
+            .channels()
+            .iter()
+            .map(|channel| {
+                channel
+                    .event_range()
+                    .map(|index| document.events()[index].wire_bytes.clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let mut expected_events = original_blocks[0].clone();
+        expected_events.extend(original_blocks[2].clone());
+        expected_events.extend(original_blocks[1].clone());
+        expected_events.extend_from_slice(&[vec![0x62, 0, 0]]);
+
+        document
+            .move_channel(8, 2)
+            .expect("channel should move down one slot");
+
+        let channels = document.channels();
+        assert_eq!(
+            channels
+                .iter()
+                .map(|channel| channel.id())
+                .collect::<Vec<_>>(),
+            [7, 9, 8]
+        );
+        assert_eq!(
+            channels
+                .iter()
+                .map(|channel| channel.display_name())
+                .collect::<Vec<_>>(),
+            [Some("Kick"), Some("Hat"), Some("Snare")]
+        );
+        assert_eq!(
+            channels
+                .iter()
+                .map(|channel| channel.volume())
+                .collect::<Vec<_>>(),
+            [Some(0x11), Some(0x33), Some(0x22)]
+        );
+        let actual_events = document
+            .events()
+            .iter()
+            .map(|event| event.wire_bytes.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(actual_events, expected_events);
+        let encoded = document.encode_lossless().expect("document should encode");
+        assert!(encoded.ends_with(&tail));
+        let round_trip = FlpDocument::parse(&encoded).expect("reordered project should parse");
+        assert_eq!(
+            round_trip
+                .channels()
+                .iter()
+                .map(|channel| channel.id())
+                .collect::<Vec<_>>(),
+            [7, 9, 8]
+        );
+
+        document
+            .move_channel(9, 0)
+            .expect("channel should move to the first position");
+        assert_eq!(
+            document
+                .channels()
+                .iter()
+                .map(|channel| channel.id())
+                .collect::<Vec<_>>(),
+            [9, 7, 8]
+        );
+        let mut expected_up_events = original_blocks[2].clone();
+        expected_up_events.extend(original_blocks[0].clone());
+        expected_up_events.extend(original_blocks[1].clone());
+        expected_up_events.push(vec![0x62, 0, 0]);
+        assert_eq!(
+            document
+                .events()
+                .iter()
+                .map(|event| event.wire_bytes.clone())
+                .collect::<Vec<_>>(),
+            expected_up_events
+        );
     }
 
     #[test]
