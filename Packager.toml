@@ -7,6 +7,6 @@ out-dir = "dist"
 binaries-dir = "target/release"
 formats = ["default"]
 icons = ["assets/icon.png"]
-resources = ["assets/fonts/SourceSans3-OFL.txt"]
+resources = ["assets/fonts/Inter-OFL.txt"]
 binaries = [{ path = "fl-studio-rebuild", main = true }]
 before-packaging-command = "cargo build --release --bin fl-studio-rebuild"

@@ -40,7 +40,7 @@ const PANEL_LIGHT: Color32 = Color32::from_rgb(44, 44, 44);
 const GRID: Color32 = Color32::from_rgb(57, 57, 57);
 const BORDER: Color32 = Color32::from_rgb(68, 68, 68);
 const TEXT: Color32 = Color32::from_rgb(242, 242, 242);
-const MUTED: Color32 = Color32::from_rgb(175, 175, 175);
+const MUTED: Color32 = Color32::from_rgb(196, 196, 196);
 const GREEN: Color32 = Color32::from_rgb(14, 175, 98);
 const BLUE: Color32 = Color32::from_rgb(86, 129, 255);
 const BLUE_SELECTION: Color32 = Color32::from_rgb(15, 28, 82);
@@ -86,15 +86,14 @@ const MIDI_CHANNEL_COLORS: [Color32; 16] = [
 fn install_ui_fonts(context: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
-        "Source Sans 3".to_owned(),
-        egui::FontData::from_static(include_bytes!("../../assets/fonts/SourceSans3Variable.ttf"))
-            .into(),
+        "Inter".to_owned(),
+        egui::FontData::from_static(include_bytes!("../../assets/fonts/InterVariable.ttf")).into(),
     );
     fonts
         .families
         .entry(egui::FontFamily::Proportional)
         .or_default()
-        .insert(0, "Source Sans 3".to_owned());
+        .insert(0, "Inter".to_owned());
     context.set_fonts(fonts);
 }
 
@@ -1436,6 +1435,7 @@ struct PendingWaveformLoad {
 impl DawUi {
     fn new(creation: &eframe::CreationContext<'_>, initial_project: Option<PathBuf>) -> Self {
         install_ui_fonts(&creation.egui_ctx);
+        creation.egui_ctx.set_theme(egui::Theme::Dark);
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = APP_BACKGROUND;
         visuals.window_fill = PANEL;
@@ -1453,6 +1453,7 @@ impl DawUi {
         visuals.window_shadow = egui::Shadow::NONE;
         visuals.popup_shadow = egui::Shadow::NONE;
         visuals.window_stroke = Stroke::new(1.0, BORDER);
+        visuals.disabled_alpha = 0.72;
         visuals.button_frame = true;
         visuals.striped = true;
 
@@ -4014,25 +4015,6 @@ impl DawUi {
             ui.separator();
             ui.monospace(self.song_position_label());
             ui.separator();
-            for label in [
-                "Playlist",
-                "Channel Rack",
-                "Piano roll",
-                "Mixer",
-                "Audio",
-                "Automation",
-            ] {
-                if ui.small_button(label).clicked() {
-                    self.view = match label {
-                        "Channel Rack" => MainView::ChannelRack,
-                        "Piano roll" => MainView::PianoRoll,
-                        "Mixer" => MainView::Mixer,
-                        "Audio" => MainView::Audio,
-                        "Automation" => MainView::Automation,
-                        _ => MainView::Playlist,
-                    };
-                }
-            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label("00:00:00");
                 ui.label("CPU --%  voices --");
@@ -13333,7 +13315,7 @@ impl Drop for DawUi {
 
 fn empty_view(ui: &mut egui::Ui, message: &str) {
     ui.centered_and_justified(|ui| {
-        ui.label(egui::RichText::new(message).color(MUTED));
+        ui.label(egui::RichText::new(message).size(18.0).color(MUTED));
     });
 }
 
