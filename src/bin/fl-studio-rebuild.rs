@@ -247,6 +247,21 @@ enum MainView {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlaylistWaveformMode {
+    Combined,
+    Stereo,
+}
+
+impl PlaylistWaveformMode {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Combined => "Combined",
+            Self::Stereo => "Stereo",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PianoRollSnap {
     None,
     QuarterBeat,
@@ -1241,6 +1256,7 @@ struct DawUi {
     automation_visible_beats: f64,
     last_plugin_action: Option<String>,
     timeline_zoom: f32,
+    playlist_waveform_mode: PlaylistWaveformMode,
     plugin_candidates: Vec<PluginCandidate>,
     vst3_host: Option<Vst3HostRuntime>,
     channel_vst3_instances: BTreeMap<u16, u64>,
@@ -1507,6 +1523,7 @@ impl DawUi {
             automation_visible_beats: 16.0,
             last_plugin_action: None,
             timeline_zoom: 0.10,
+            playlist_waveform_mode: PlaylistWaveformMode::Combined,
             plugin_candidates,
             vst3_host: None,
             channel_vst3_instances: BTreeMap::new(),
@@ -5926,6 +5943,15 @@ impl DawUi {
             ui.label(format!("{} clips", arrangement.clips.len()));
             ui.separator();
             ui.label(format!("{} PPQ", ppq));
+            ui.separator();
+            ui.label("Waveform");
+            egui::ComboBox::from_id_salt("playlist-waveform-mode")
+                .selected_text(self.playlist_waveform_mode.label())
+                .show_ui(ui, |ui| {
+                    for mode in [PlaylistWaveformMode::Combined, PlaylistWaveformMode::Stereo] {
+                        ui.selectable_value(&mut self.playlist_waveform_mode, mode, mode.label());
+                    }
+                });
         });
         self.time_marker_editor(ui, arrangement.id, &arrangement.time_markers);
 
@@ -6137,7 +6163,13 @@ impl DawUi {
                                 && let Some(path) = self.audio_waveform_paths.get(&id)
                             {
                                 if let Some(waveform) = self.audio_waveforms.get(path).cloned() {
-                                    draw_audio_clip_waveform(&painter, clip_rect, clip, &waveform);
+                                    draw_audio_clip_waveform(
+                                        &painter,
+                                        clip_rect,
+                                        clip,
+                                        &waveform,
+                                        self.playlist_waveform_mode,
+                                    );
                                 } else if self.waveform_loads.contains_key(path) {
                                     painter.text(
                                         clip_rect.center(),
@@ -6151,8 +6183,8 @@ impl DawUi {
                             if width > 50.0 {
                                 let name = clip_name(clip, &tracks);
                                 painter.text(
-                                    egui::pos2(clip_rect.left() + 5.0, clip_rect.center().y),
-                                    Align2::LEFT_CENTER,
+                                    egui::pos2(clip_rect.left() + 5.0, clip_rect.top() + 1.0),
+                                    Align2::LEFT_TOP,
                                     name,
                                     FontId::proportional(10.0),
                                     Color32::WHITE,
@@ -13686,6 +13718,7 @@ fn draw_audio_clip_waveform(
     clip_rect: egui::Rect,
     clip: &PlaylistClip,
     waveform: &AudioWaveform,
+    mode: PlaylistWaveformMode,
 ) {
     if waveform.peaks.is_empty() || waveform.frame_count == 0 || waveform.sample_rate == 0 {
         return;
@@ -13708,37 +13741,78 @@ fn draw_audio_clip_waveform(
         return;
     };
     let columns = clip_rect.width().ceil().clamp(1.0, 1024.0) as usize;
-    let peak_count = waveform.peaks.len() as u128;
     let frame_count = u128::from(full_frame_count);
-    let amplitude = (clip_rect.height() * 0.42).max(1.0);
-    let center_y = clip_rect.center().y;
-    let color = Color32::from_rgba_unmultiplied(238, 243, 248, 132);
-    for column in 0..columns {
-        let frame_start = u128::from(source_start)
-            + u128::from(source_end - source_start) * column as u128 / columns as u128;
-        let frame_end = u128::from(source_start)
-            + u128::from(source_end - source_start) * (column + 1) as u128 / columns as u128;
-        let first_peak = (frame_start * peak_count / frame_count) as usize;
-        let last_peak = ((frame_end * peak_count / frame_count) as usize)
-            .max(first_peak + 1)
-            .min(waveform.peaks.len());
-        let mut minimum = f32::INFINITY;
-        let mut maximum = f32::NEG_INFINITY;
-        for peak in &waveform.peaks[first_peak.min(waveform.peaks.len() - 1)..last_peak] {
-            minimum = minimum.min(peak.minimum);
-            maximum = maximum.max(peak.maximum);
-        }
-        if !minimum.is_finite() || !maximum.is_finite() {
-            continue;
-        }
-        let x = clip_rect.left() + (column as f32 + 0.5) * clip_rect.width() / columns as f32;
+    let stereo = mode == PlaylistWaveformMode::Stereo && waveform.channel_peaks.len() >= 2;
+    let display_channels = if stereo { 2 } else { 1 };
+    if stereo {
+        let center_y = clip_rect.center().y;
         painter.line_segment(
             [
-                egui::pos2(x, center_y - maximum * amplitude),
-                egui::pos2(x, center_y - minimum * amplitude),
+                egui::pos2(clip_rect.left(), center_y),
+                egui::pos2(clip_rect.right(), center_y),
             ],
-            Stroke::new(1.0, color),
+            Stroke::new(0.5, Color32::from_rgba_unmultiplied(20, 20, 20, 115)),
         );
+    }
+    for display_channel in 0..display_channels {
+        let peaks = if stereo {
+            &waveform.channel_peaks[display_channel]
+        } else {
+            &waveform.peaks
+        };
+        if peaks.is_empty() {
+            continue;
+        }
+        let peak_count = peaks.len() as u128;
+        let lane = if stereo {
+            let lane_height = clip_rect.height() * 0.5;
+            egui::Rect::from_min_max(
+                egui::pos2(
+                    clip_rect.left(),
+                    clip_rect.top() + display_channel as f32 * lane_height,
+                ),
+                egui::pos2(
+                    clip_rect.right(),
+                    clip_rect.top() + (display_channel + 1) as f32 * lane_height,
+                ),
+            )
+        } else {
+            clip_rect
+        };
+        let amplitude = (lane.height() * 0.42).max(1.0);
+        let center_y = lane.center().y;
+        let color = if stereo && display_channel == 1 {
+            Color32::from_rgba_unmultiplied(222, 212, 255, 155)
+        } else {
+            Color32::from_rgba_unmultiplied(201, 220, 255, 155)
+        };
+        for column in 0..columns {
+            let frame_start = u128::from(source_start)
+                + u128::from(source_end - source_start) * column as u128 / columns as u128;
+            let frame_end = u128::from(source_start)
+                + u128::from(source_end - source_start) * (column + 1) as u128 / columns as u128;
+            let first_peak = (frame_start * peak_count / frame_count) as usize;
+            let last_peak = ((frame_end * peak_count / frame_count) as usize)
+                .max(first_peak + 1)
+                .min(peaks.len());
+            let mut minimum = f32::INFINITY;
+            let mut maximum = f32::NEG_INFINITY;
+            for peak in &peaks[first_peak.min(peaks.len() - 1)..last_peak] {
+                minimum = minimum.min(peak.minimum);
+                maximum = maximum.max(peak.maximum);
+            }
+            if !minimum.is_finite() || !maximum.is_finite() {
+                continue;
+            }
+            let x = clip_rect.left() + (column as f32 + 0.5) * clip_rect.width() / columns as f32;
+            painter.line_segment(
+                [
+                    egui::pos2(x, center_y - maximum * amplitude),
+                    egui::pos2(x, center_y - minimum * amplitude),
+                ],
+                Stroke::new(1.0, color),
+            );
+        }
     }
 }
 

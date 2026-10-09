@@ -35,6 +35,8 @@ pub struct AudioWaveform {
     pub frame_count: u64,
     /// Per-bucket extrema combined across channels, ordered from the sample start.
     pub peaks: Vec<WaveformPeak>,
+    /// Per-channel extrema for separate stereo displays, ordered from the sample start.
+    pub channel_peaks: Vec<Vec<WaveformPeak>>,
 }
 
 /// FL Studio factory samples can wrap an Ogg stream in a RIFF/WAVE header with a private codec
@@ -363,12 +365,22 @@ pub fn decode_audio_waveform(
 ) -> Result<AudioWaveform, String> {
     let path = path.as_ref();
     let audio = decode_audio_file(path)?;
-    let frame_count = audio.frame_count();
-    if frame_count == 0 {
+    if audio.frame_count() == 0 {
         return Err(format!(
             "sample {} contains no audio frames",
             path.display()
         ));
+    }
+    summarize_audio_waveform(&audio, maximum_buckets)
+}
+
+fn summarize_audio_waveform(
+    audio: &DecodedAudio,
+    maximum_buckets: usize,
+) -> Result<AudioWaveform, String> {
+    let frame_count = audio.frame_count();
+    if frame_count == 0 {
+        return Err("sample contains no audio frames".to_owned());
     }
     let maximum_buckets = maximum_buckets.max(1);
     let bucket_count = frame_count.min(maximum_buckets);
@@ -376,12 +388,25 @@ pub fn decode_audio_waveform(
     peaks
         .try_reserve_exact(bucket_count)
         .map_err(|error| format!("could not allocate waveform preview: {error}"))?;
+    let mut channel_peaks = Vec::new();
+    channel_peaks
+        .try_reserve_exact(audio.channels.len())
+        .map_err(|error| format!("could not allocate waveform channels: {error}"))?;
+    for _ in &audio.channels {
+        let mut channel = Vec::new();
+        channel
+            .try_reserve_exact(bucket_count)
+            .map_err(|error| format!("could not allocate waveform preview: {error}"))?;
+        channel_peaks.push(channel);
+    }
     for bucket_index in 0..bucket_count {
         let start = bucket_index * frame_count / bucket_count;
         let end = ((bucket_index + 1) * frame_count / bucket_count).max(start + 1);
-        let mut minimum = f32::INFINITY;
-        let mut maximum = f32::NEG_INFINITY;
-        for channel in &audio.channels {
+        let mut combined_minimum = f32::INFINITY;
+        let mut combined_maximum = f32::NEG_INFINITY;
+        for (channel_index, channel) in audio.channels.iter().enumerate() {
+            let mut minimum = f32::INFINITY;
+            let mut maximum = f32::NEG_INFINITY;
             for sample in &channel[start..end] {
                 let sample = if sample.is_finite() {
                     sample.clamp(-1.0, 1.0)
@@ -391,13 +416,20 @@ pub fn decode_audio_waveform(
                 minimum = minimum.min(sample);
                 maximum = maximum.max(sample);
             }
+            channel_peaks[channel_index].push(WaveformPeak { minimum, maximum });
+            combined_minimum = combined_minimum.min(minimum);
+            combined_maximum = combined_maximum.max(maximum);
         }
-        peaks.push(WaveformPeak { minimum, maximum });
+        peaks.push(WaveformPeak {
+            minimum: combined_minimum,
+            maximum: combined_maximum,
+        });
     }
     Ok(AudioWaveform {
         sample_rate: audio.sample_rate,
         frame_count: frame_count as u64,
         peaks,
+        channel_peaks,
     })
 }
 
@@ -828,6 +860,37 @@ mod tests {
         bytes.extend_from_slice(&(samples.len() as u32).to_le_bytes());
         bytes.extend_from_slice(&samples);
         bytes
+    }
+
+    #[test]
+    fn waveform_summary_keeps_stereo_channels_separate_and_combined() {
+        let audio = DecodedAudio {
+            sample_rate: 44_100,
+            channels: vec![vec![0.25, -0.25], vec![0.75, -0.75]],
+        };
+
+        let waveform = summarize_audio_waveform(&audio, 1).unwrap();
+
+        assert_eq!(
+            waveform.peaks,
+            vec![WaveformPeak {
+                minimum: -0.75,
+                maximum: 0.75
+            }]
+        );
+        assert_eq!(
+            waveform.channel_peaks,
+            vec![
+                vec![WaveformPeak {
+                    minimum: -0.25,
+                    maximum: 0.25
+                }],
+                vec![WaveformPeak {
+                    minimum: -0.75,
+                    maximum: 0.75
+                }]
+            ]
+        );
     }
 
     fn private_ogg_wave_fixture() -> Vec<u8> {
