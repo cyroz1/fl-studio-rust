@@ -5008,6 +5008,79 @@ impl FlpDocument {
         Ok(())
     }
 
+    /// Adds a Sampler channel with the given source path and display name.
+    ///
+    /// The channel uses the project's recognized string encoding, gets the next available
+    /// channel ID, and is inserted before the channel-list terminator so existing event bytes
+    /// remain in order. Projects whose string encoding cannot be inferred are rejected.
+    pub fn create_sampler_channel(&mut self, path: &str, name: &str) -> Result<u16, FlpError> {
+        if path.is_empty() || path.contains('\0') {
+            return Err(FlpError::UnsupportedEdit(
+                "a new Sampler channel requires a non-empty path without embedded NUL characters",
+            ));
+        }
+        if name.contains('\0') {
+            return Err(FlpError::UnsupportedEdit(
+                "channel names cannot contain an embedded NUL character",
+            ));
+        }
+
+        let channels = self.channels();
+        let used_ids = channels
+            .iter()
+            .map(ChannelSummary::id)
+            .collect::<HashSet<_>>();
+        let next_id = used_ids
+            .iter()
+            .max()
+            .copied()
+            .and_then(|value| value.checked_add(1))
+            .filter(|candidate| !used_ids.contains(candidate))
+            .or_else(|| (0..=u16::MAX).find(|candidate| !used_ids.contains(candidate)))
+            .ok_or(FlpError::UnsupportedEdit(
+                "the project has no unused channel IDs",
+            ))?;
+
+        let uses_utf16 = project_string_version(self.project_version.as_deref())
+            .map(|(major, minor)| major > 11 || (major == 11 && minor >= 5))
+            .or_else(|| {
+                self.events.iter().find_map(|event| {
+                    (matches!(event.opcode, 0xC2 | 0xC3 | 0xC4 | 0xC5 | 0xCB | 0xCE | 0xCF)
+                        && matches!(event.encoding, PayloadEncoding::Data { .. }))
+                    .then(|| project_string_is_utf16(&event.payload, None))
+                })
+            })
+            .ok_or(FlpError::UnsupportedEdit(
+                "the project's string encoding cannot be inferred for a new channel",
+            ))?;
+        let sample_path = encode_project_string(path, uses_utf16)?;
+        let display_name = encode_project_string(name, uses_utf16)?;
+        let new_events = vec![
+            FlpEvent::new_word(0x40, next_id),
+            FlpEvent::new_byte(0x15, 0),
+            FlpEvent::new_byte(0x00, 1),
+            FlpEvent::new_data(0xC4, sample_path)?,
+            FlpEvent::new_data(0xCB, display_name)?,
+        ];
+        let insertion_index = channels
+            .last()
+            .map(|channel| channel.event_range().end)
+            .or_else(|| self.events.iter().position(|event| event.opcode == 0x62))
+            .unwrap_or(self.events.len());
+        let channel_count = u16::try_from(channels.len().saturating_add(1)).map_err(|_| {
+            FlpError::UnsupportedEdit("the project has too many channels to add another")
+        })?;
+
+        let mut candidate = self.clone();
+        candidate
+            .events
+            .splice(insertion_index..insertion_index, new_events);
+        candidate.header.legacy_channel_count = channel_count;
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(next_id)
+    }
+
     /// Renames a channel through its verified UTF-16LE `0xCB` display-name event.
     /// Unedited event bytes are retained; the edited event is resized if needed.
     pub fn set_channel_name(&mut self, channel_id: u16, name: &str) -> Result<(), FlpError> {
@@ -7007,6 +7080,44 @@ mod tests {
             assert_eq!(channels[0].sample_path(), Some(path));
             assert_eq!(document.encode_lossless().unwrap(), input);
         }
+    }
+
+    #[test]
+    fn creates_sampler_channel_before_channel_terminator() {
+        let mut event_stream = vec![0x40, 7, 0, 0x15, 0];
+        append_data_event(
+            &mut event_stream,
+            0xC4,
+            &utf16_project_string("/samples/kick.wav"),
+        );
+        append_project_info_string(&mut event_stream, 0xCB, "Kick");
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        let mut input = flp_fixture(&event_stream, &[], &[0xA5, 0x5A]);
+        input[10..12].copy_from_slice(&1u16.to_le_bytes());
+
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+        let channel_id = document
+            .create_sampler_channel("/samples/snare.wav", "Snare")
+            .expect("Sampler channel should be created");
+
+        assert_eq!(channel_id, 8);
+        assert_eq!(document.header().legacy_channel_count(), 2);
+        let channels = document.channels();
+        assert_eq!(channels.len(), 2);
+        assert_eq!(channels[0].display_name(), Some("Kick"));
+        assert_eq!(channels[1].id(), channel_id);
+        assert_eq!(channels[1].kind(), Some(0));
+        assert_eq!(channels[1].enabled(), Some(true));
+        assert_eq!(channels[1].display_name(), Some("Snare"));
+        assert_eq!(channels[1].sample_path(), Some("/samples/snare.wav"));
+        let encoded = document.encode_lossless().expect("document should encode");
+        assert!(encoded.ends_with(&[0xA5, 0x5A]));
+        let round_trip = FlpDocument::parse(&encoded).expect("created channel should parse");
+        assert_eq!(round_trip.channels().len(), 2);
+        assert_eq!(
+            round_trip.channels()[1].sample_path(),
+            Some("/samples/snare.wav")
+        );
     }
 
     #[test]

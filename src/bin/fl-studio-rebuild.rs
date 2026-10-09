@@ -3910,6 +3910,35 @@ impl DawUi {
         }
     }
 
+    fn create_browser_sampler_channel(&mut self, path: &Path) {
+        let path_string = path.to_string_lossy().into_owned();
+        let name = path
+            .file_stem()
+            .map(|name| name.to_string_lossy().into_owned())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "Sampler".to_owned());
+        let result = self
+            .document
+            .as_mut()
+            .ok_or_else(|| "no project is open".to_owned())
+            .and_then(|document| {
+                document
+                    .create_sampler_channel(&path_string, &name)
+                    .map_err(|error| error.to_string())
+            });
+        match result {
+            Ok(channel_id) => {
+                self.stop_project_playback();
+                self.dirty = true;
+                self.selected_graph_channel = Some(channel_id);
+                self.selected_note_channel = Some(channel_id);
+                self.status = format!("Created Sampler channel {name} from {}", path.display());
+                self.refresh_audio_waveform_paths();
+            }
+            Err(error) => self.status = format!("Could not create Sampler channel: {error}"),
+        }
+    }
+
     fn browser_fst_details_dialog(&mut self, context: &egui::Context) {
         let Some(details) = self.browser_fst_details.clone() else {
             return;
@@ -6352,6 +6381,7 @@ impl DawUi {
         let mut layer_flag_edits = Vec::new();
         let mut step_toggles = Vec::new();
         let mut dropped_samples = Vec::new();
+        let mut new_sampler_sample = None;
         ui.horizontal(|ui| {
             ui.strong("Channel Rack");
             ui.separator();
@@ -6632,6 +6662,19 @@ impl DawUi {
                 }
                 ui.add_space(2.0);
             }
+            let (_, dropped_sample) = ui.dnd_drop_zone::<BrowserSampleDrag, _>(
+                egui::Frame::new().inner_margin(4.0),
+                |ui| {
+                    ui.add_sized(
+                        [ui.available_width(), 36.0],
+                        egui::Label::new(
+                            egui::RichText::new("Drop an audio file here to create a Sampler")
+                                .color(MUTED),
+                        ),
+                    );
+                },
+            );
+            new_sampler_sample = dropped_sample.map(|sample| sample.0.clone());
             ui.separator();
             ui.label(
                 egui::RichText::new(
@@ -6656,6 +6699,9 @@ impl DawUi {
         });
         for (channel_id, path) in dropped_samples {
             self.load_browser_sample_into_channel(channel_id, &path);
+        }
+        if let Some(path) = new_sampler_sample {
+            self.create_browser_sampler_channel(&path);
         }
         if let Some(pattern_id) = self.selected_pattern
             && !step_toggles.is_empty()
