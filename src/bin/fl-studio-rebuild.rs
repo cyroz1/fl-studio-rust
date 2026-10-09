@@ -45,6 +45,11 @@ const BLUE: Color32 = Color32::from_rgb(86, 129, 255);
 const BLUE_SELECTION: Color32 = Color32::from_rgb(15, 28, 82);
 const PURPLE: Color32 = Color32::from_rgb(150, 93, 181);
 const ORANGE: Color32 = Color32::from_rgb(195, 129, 61);
+const RED: Color32 = Color32::from_rgb(252, 67, 46);
+const MENU_BAR_HEIGHT: f32 = 32.0;
+const TRANSPORT_BAR_HEIGHT: f32 = 46.0;
+const STATUS_BAR_HEIGHT: f32 = 27.0;
+const BROWSER_COLUMN_WIDTH: f32 = 232.0;
 const HISTORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 const AUDIO_WAVEFORM_BUCKETS: usize = 4096;
 const MAX_WAVEFORM_WORKERS: usize = 1;
@@ -1338,7 +1343,7 @@ impl DawUi {
         visuals.weak_text_color = Some(MUTED);
         visuals.hyperlink_color = BLUE;
         visuals.selection.bg_fill = BLUE_SELECTION;
-        visuals.selection.stroke = Stroke::new(1.0, TEXT);
+        visuals.selection.stroke = Stroke::new(1.0, BLUE);
         visuals.window_corner_radius = egui::CornerRadius::same(4);
         visuals.menu_corner_radius = egui::CornerRadius::same(3);
         visuals.window_shadow = egui::Shadow::NONE;
@@ -1354,36 +1359,36 @@ impl DawUi {
         widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT);
         widgets.noninteractive.corner_radius = egui::CornerRadius::same(3);
 
-        widgets.inactive.bg_fill = PANEL_LIGHT;
-        widgets.inactive.weak_bg_fill = PANEL_LIGHT;
-        widgets.inactive.bg_stroke = Stroke::new(1.0, GRID);
+        widgets.inactive.bg_fill = PANEL;
+        widgets.inactive.weak_bg_fill = PANEL;
+        widgets.inactive.bg_stroke = Stroke::NONE;
         widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT);
-        widgets.inactive.corner_radius = egui::CornerRadius::same(3);
+        widgets.inactive.corner_radius = egui::CornerRadius::same(4);
 
-        widgets.hovered.bg_fill = GRID;
-        widgets.hovered.weak_bg_fill = GRID;
-        widgets.hovered.bg_stroke = Stroke::new(1.0, BLUE);
+        widgets.hovered.bg_fill = PANEL_LIGHT;
+        widgets.hovered.weak_bg_fill = PANEL_LIGHT;
+        widgets.hovered.bg_stroke = Stroke::new(1.0, BORDER);
         widgets.hovered.fg_stroke = Stroke::new(1.0, TEXT);
-        widgets.hovered.corner_radius = egui::CornerRadius::same(3);
+        widgets.hovered.corner_radius = egui::CornerRadius::same(4);
 
         widgets.active.bg_fill = BLUE_SELECTION;
         widgets.active.weak_bg_fill = BLUE_SELECTION;
         widgets.active.bg_stroke = Stroke::new(1.0, BLUE);
         widgets.active.fg_stroke = Stroke::new(1.0, TEXT);
-        widgets.active.corner_radius = egui::CornerRadius::same(3);
+        widgets.active.corner_radius = egui::CornerRadius::same(4);
 
         widgets.open.bg_fill = BLUE_SELECTION;
         widgets.open.weak_bg_fill = BLUE_SELECTION;
         widgets.open.bg_stroke = Stroke::new(1.0, BLUE);
         widgets.open.fg_stroke = Stroke::new(1.0, TEXT);
-        widgets.open.corner_radius = egui::CornerRadius::same(3);
+        widgets.open.corner_radius = egui::CornerRadius::same(4);
 
         creation.egui_ctx.set_visuals(visuals);
         creation.egui_ctx.all_styles_mut(|style| {
-            style.spacing.item_spacing = Vec2::new(5.0, 4.0);
-            style.spacing.button_padding = Vec2::new(8.0, 4.0);
-            style.spacing.window_margin = egui::Margin::same(12);
-            style.spacing.menu_margin = egui::Margin::same(6);
+            style.spacing.item_spacing = Vec2::new(7.0, 5.0);
+            style.spacing.button_padding = Vec2::new(9.0, 5.0);
+            style.spacing.window_margin = egui::Margin::same(14);
+            style.spacing.menu_margin = egui::Margin::same(8);
             style.spacing.slider_rail_height = 4.0;
         });
         let plugin_candidates = scan_installed_plugins().candidates;
@@ -3556,7 +3561,11 @@ impl DawUi {
     fn transport_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_centered(|ui| {
             ui.add_space(4.0);
-            if ui.button("●").on_hover_text("Record").clicked() {
+            if ui
+                .button(egui::RichText::new("●").color(RED))
+                .on_hover_text("Record")
+                .clicked()
+            {
                 self.status = "Recording is not implemented yet".to_owned();
             }
             if ui.button("■").on_hover_text("Stop").clicked() {
@@ -3583,7 +3592,16 @@ impl DawUi {
             } else {
                 "Play"
             };
-            if ui.button(play_label).on_hover_text(play_hint).clicked() {
+            let play_fill = if self.playing { GREEN } else { BLUE };
+            if ui
+                .add(
+                    egui::Button::new(egui::RichText::new(play_label).color(Color32::WHITE))
+                        .fill(play_fill)
+                        .stroke(Stroke::NONE),
+                )
+                .on_hover_text(play_hint)
+                .clicked()
+            {
                 self.toggle_project_playback();
             }
             ui.separator();
@@ -12447,7 +12465,7 @@ impl eframe::App for DawUi {
         let full_height = ui.available_height();
         ui.vertical(|ui| {
             ui.allocate_ui_with_layout(
-                Vec2::new(width, 29.0),
+                Vec2::new(width, MENU_BAR_HEIGHT),
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| {
                     egui::Frame::new()
@@ -12457,7 +12475,7 @@ impl eframe::App for DawUi {
                 },
             );
             ui.allocate_ui_with_layout(
-                Vec2::new(width, 43.0),
+                Vec2::new(width, TRANSPORT_BAR_HEIGHT),
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| {
                     egui::Frame::new()
@@ -12467,10 +12485,12 @@ impl eframe::App for DawUi {
                 },
             );
             ui.separator();
-            let content_height = (full_height - 29.0 - 43.0 - 23.0 - 8.0).max(100.0);
+            let content_height =
+                (full_height - MENU_BAR_HEIGHT - TRANSPORT_BAR_HEIGHT - STATUS_BAR_HEIGHT - 8.0)
+                    .max(100.0);
             ui.horizontal(|ui| {
                 ui.allocate_ui_with_layout(
-                    Vec2::new(218.0, content_height),
+                    Vec2::new(BROWSER_COLUMN_WIDTH, content_height),
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
                         egui::Frame::new()
@@ -12500,7 +12520,7 @@ impl eframe::App for DawUi {
             });
             ui.separator();
             ui.allocate_ui_with_layout(
-                Vec2::new(width, 23.0),
+                Vec2::new(width, STATUS_BAR_HEIGHT),
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| {
                     egui::Frame::new()
