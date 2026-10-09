@@ -12,7 +12,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::audio::StreamingAudioWriter;
 use crate::media::{DecodedAudio, SamplePathResolver, decode_audio_file};
 use crate::vst3::Vst3PlaylistStreamProcessor;
-use crate::{Arrangement, FlpDocument, Pattern, PatternNote, PlaylistClip, PlaylistClipTarget};
+use crate::{
+    Arrangement, ChannelNoteRouter, FlpDocument, Pattern, PatternNote, PlaylistClip,
+    PlaylistClipTarget,
+};
 
 const DEFAULT_SAMPLE_RATE: u32 = 44_100;
 const MAX_MIX_BYTES: usize = 512 * 1024 * 1024;
@@ -1142,6 +1145,7 @@ const MAX_SCHEDULED_PLAYLIST_NOTES: usize = 2_000_000;
 
 pub(crate) struct PlaylistPatternNote<'a> {
     pub(crate) note: &'a PatternNote,
+    pub(crate) target_channel_id: u16,
     pub(crate) start_tick: u64,
     pub(crate) clipped_stop_tick: Option<u64>,
     pub(crate) clip_index: usize,
@@ -1155,7 +1159,7 @@ pub(crate) struct PlaylistPatternSchedule<'a> {
 pub(crate) fn schedule_playlist_pattern_notes<'a>(
     patterns: &'a [Pattern],
     arrangement: &Arrangement,
-    is_enabled_sampler: impl Fn(u16) -> bool,
+    mut resolve_targets: impl FnMut(u16, u64) -> Vec<u16>,
 ) -> Result<PlaylistPatternSchedule<'a>, String> {
     let patterns_by_id: HashMap<_, _> = patterns
         .iter()
@@ -1214,20 +1218,12 @@ pub(crate) fn schedule_playlist_pattern_notes<'a>(
             let repeat_start = repetition
                 .checked_mul(loop_length)
                 .ok_or_else(|| "pattern repeat position overflow".to_owned())?;
-            for note in &pattern.notes {
-                if !is_enabled_sampler(note.channel_id) {
-                    continue;
-                }
+            for (note_index, note) in pattern.notes.iter().enumerate() {
                 let relative_start = repeat_start
                     .checked_add(u64::from(note.position))
                     .ok_or_else(|| "repeated pattern note position overflow".to_owned())?;
                 if relative_start >= clip_length {
                     continue;
-                }
-                if schedule.notes.len() >= MAX_SCHEDULED_PLAYLIST_NOTES {
-                    return Err(format!(
-                        "Playlist expands to more than {MAX_SCHEDULED_PLAYLIST_NOTES} pattern note events"
-                    ));
                 }
                 let start_tick = u64::from(clip.position_ticks)
                     .checked_add(relative_start)
@@ -1244,12 +1240,24 @@ pub(crate) fn schedule_playlist_pattern_notes<'a>(
                             .min(clip_end),
                     )
                 };
-                schedule.notes.push(PlaylistPatternNote {
-                    note,
-                    start_tick,
-                    clipped_stop_tick,
-                    clip_index,
-                });
+                let note_seed = (clip_index as u64).rotate_left(32)
+                    ^ repetition.rotate_left(17)
+                    ^ (note_index as u64).rotate_left(3)
+                    ^ start_tick.rotate_left(47);
+                for target_channel_id in resolve_targets(note.channel_id, note_seed) {
+                    if schedule.notes.len() >= MAX_SCHEDULED_PLAYLIST_NOTES {
+                        return Err(format!(
+                            "Playlist expands to more than {MAX_SCHEDULED_PLAYLIST_NOTES} pattern note events"
+                        ));
+                    }
+                    schedule.notes.push(PlaylistPatternNote {
+                        note,
+                        target_channel_id,
+                        start_tick,
+                        clipped_stop_tick,
+                        clip_index,
+                    });
+                }
             }
         }
     }
@@ -1298,15 +1306,24 @@ fn prepare_sampler_arrangement(
         .find(|arrangement| arrangement.id == options.arrangement_id)
         .ok_or_else(|| format!("arrangement {} was not found", options.arrangement_id))?;
     let patterns = document.patterns().map_err(|error| error.to_string())?;
-    let channels_by_id: HashMap<_, _> = document
-        .channels()
-        .into_iter()
+    let channels = document.channels();
+    let channels_by_id: HashMap<_, _> = channels
+        .iter()
         .map(|channel| (channel.id(), channel))
         .collect();
-    let schedule = schedule_playlist_pattern_notes(&patterns, &arrangement, |channel_id| {
-        channels_by_id
-            .get(&channel_id)
-            .is_some_and(|channel| channel.kind() == Some(0) && channel.enabled() != Some(false))
+    let channel_router = ChannelNoteRouter::new(channels.clone());
+    let schedule = schedule_playlist_pattern_notes(&patterns, &arrangement, |channel_id, seed| {
+        channel_router
+            .targets(channel_id, seed)
+            .into_iter()
+            .filter(|target_channel_id| {
+                channels_by_id
+                    .get(target_channel_id)
+                    .is_some_and(|channel| {
+                        channel.kind() == Some(0) && channel.enabled() != Some(false)
+                    })
+            })
+            .collect()
     })?;
     let sampler_note_count = schedule.notes.len();
     if sampler_note_count == 0 {
@@ -1345,24 +1362,24 @@ fn prepare_sampler_arrangement(
     for placed in &schedule.notes {
         check_cancelled(cancelled)?;
         let note = placed.note;
-        let Some(channel) = channels_by_id.get(&note.channel_id) else {
+        let Some(channel) = channels_by_id.get(&placed.target_channel_id) else {
             continue;
         };
         if channel.kind() != Some(0) || channel.enabled() == Some(false) {
             continue;
         }
         if let std::collections::hash_map::Entry::Vacant(source_entry) =
-            sources_by_channel.entry(note.channel_id)
+            sources_by_channel.entry(placed.target_channel_id)
         {
             let Some(sample_path) = channel.sample_path() else {
-                unresolved_sample_channels.insert(note.channel_id);
+                unresolved_sample_channels.insert(placed.target_channel_id);
                 skipped_unresolved += 1;
                 continue;
             };
             let resolved_path = match resolver.resolve(sample_path) {
                 Ok(path) => path,
                 Err(_) => {
-                    unresolved_sample_channels.insert(note.channel_id);
+                    unresolved_sample_channels.insert(placed.target_channel_id);
                     skipped_unresolved += 1;
                     continue;
                 }
@@ -1373,14 +1390,14 @@ fn prepare_sampler_arrangement(
                 let audio = decode_audio_file(&resolved_path).map_err(|error| {
                     format!(
                         "could not decode sample for Sampler channel {} at {}: {error}",
-                        note.channel_id,
+                        placed.target_channel_id,
                         resolved_path.display()
                     )
                 })?;
                 if !(1..=2).contains(&audio.channels.len()) {
                     return Err(format!(
                         "Sampler channel {} uses a {}-channel sample; only mono and stereo are supported by this renderer",
-                        note.channel_id,
+                        placed.target_channel_id,
                         audio.channels.len()
                     ));
                 }
@@ -1401,13 +1418,13 @@ fn prepare_sampler_arrangement(
             let (gain, pan) = channel_gain_pan(channel.volume(), channel.pan());
             source_entry.insert(SamplerVoiceSource { audio, gain, pan });
         }
-        let Some(source) = sources_by_channel.get(&note.channel_id) else {
+        let Some(source) = sources_by_channel.get(&placed.target_channel_id) else {
             continue;
         };
         if source.audio.frame_count() == 0 {
             return Err(format!(
                 "Sampler channel {} references an empty sample",
-                note.channel_id
+                placed.target_channel_id
             ));
         }
         let start_frame = ticks_to_frames(placed.start_tick, ppq, tempo_bpm, options.sample_rate)?;
@@ -1447,7 +1464,7 @@ fn prepare_sampler_arrangement(
         notes.push(ScheduledSamplerNote {
             start_frame,
             stop_frame,
-            channel_id: note.channel_id,
+            channel_id: placed.target_channel_id,
             key: note.key,
             velocity: note.velocity,
         });
@@ -1524,20 +1541,31 @@ fn prepare_sampler_pattern(
         .into_iter()
         .find(|pattern| pattern.id == options.pattern_id)
         .ok_or_else(|| format!("pattern {} was not found", options.pattern_id))?;
-    let channels_by_id: HashMap<_, _> = document
-        .channels()
-        .into_iter()
+    let channels = document.channels();
+    let channels_by_id: HashMap<_, _> = channels
+        .iter()
         .map(|channel| (channel.id(), channel))
         .collect();
-    let sampler_note_count = pattern
+    let channel_router = ChannelNoteRouter::new(channels.clone());
+    let sampler_notes = pattern
         .notes
         .iter()
-        .filter(|note| {
-            channels_by_id.get(&note.channel_id).is_some_and(|channel| {
-                channel.kind() == Some(0) && channel.enabled() != Some(false)
-            })
+        .enumerate()
+        .flat_map(|(note_index, note)| {
+            channel_router
+                .targets(note.channel_id, note_index as u64)
+                .into_iter()
+                .filter(|target_channel_id| {
+                    channels_by_id
+                        .get(target_channel_id)
+                        .is_some_and(|channel| {
+                            channel.kind() == Some(0) && channel.enabled() != Some(false)
+                        })
+                })
+                .map(move |target_channel_id| (note, target_channel_id))
         })
-        .count();
+        .collect::<Vec<_>>();
+    let sampler_note_count = sampler_notes.len();
     if sampler_note_count == 0 {
         return Err(format!(
             "pattern {} contains no notes on enabled Sampler channels",
@@ -1557,26 +1585,26 @@ fn prepare_sampler_pattern(
         .round()
         .max(1.0) as u64;
 
-    for note in &pattern.notes {
+    for (note, target_channel_id) in sampler_notes {
         check_cancelled(cancelled)?;
-        let Some(channel) = channels_by_id.get(&note.channel_id) else {
+        let Some(channel) = channels_by_id.get(&target_channel_id) else {
             continue;
         };
         if channel.kind() != Some(0) || channel.enabled() == Some(false) {
             continue;
         }
         if let std::collections::hash_map::Entry::Vacant(source_entry) =
-            sources_by_channel.entry(note.channel_id)
+            sources_by_channel.entry(target_channel_id)
         {
             let Some(sample_path) = channel.sample_path() else {
-                unresolved_sample_channels.insert(note.channel_id);
+                unresolved_sample_channels.insert(target_channel_id);
                 skipped_unresolved += 1;
                 continue;
             };
             let resolved_path = match resolver.resolve(sample_path) {
                 Ok(path) => path,
                 Err(_) => {
-                    unresolved_sample_channels.insert(note.channel_id);
+                    unresolved_sample_channels.insert(target_channel_id);
                     skipped_unresolved += 1;
                     continue;
                 }
@@ -1587,14 +1615,14 @@ fn prepare_sampler_pattern(
                 let audio = decode_audio_file(&resolved_path).map_err(|error| {
                     format!(
                         "could not decode sample for Sampler channel {} at {}: {error}",
-                        note.channel_id,
+                        target_channel_id,
                         resolved_path.display()
                     )
                 })?;
                 if !(1..=2).contains(&audio.channels.len()) {
                     return Err(format!(
                         "Sampler channel {} uses a {}-channel sample; only mono and stereo are supported by this renderer",
-                        note.channel_id,
+                        target_channel_id,
                         audio.channels.len()
                     ));
                 }
@@ -1615,7 +1643,7 @@ fn prepare_sampler_pattern(
             let (gain, pan) = channel_gain_pan(channel.volume(), channel.pan());
             source_entry.insert(SamplerVoiceSource { audio, gain, pan });
         }
-        let Some(source) = sources_by_channel.get(&note.channel_id) else {
+        let Some(source) = sources_by_channel.get(&target_channel_id) else {
             continue;
         };
         let start_frame = ticks_to_frames(
@@ -1628,7 +1656,7 @@ fn prepare_sampler_pattern(
         if source.audio.frame_count() == 0 {
             return Err(format!(
                 "Sampler channel {} references an empty sample",
-                note.channel_id
+                target_channel_id
             ));
         }
         let stop_frame = if note.length == 0 {
@@ -1670,7 +1698,7 @@ fn prepare_sampler_pattern(
         notes.push(ScheduledSamplerNote {
             start_frame,
             stop_frame,
-            channel_id: note.channel_id,
+            channel_id: target_channel_id,
             key: note.key,
             velocity: note.velocity,
         });
@@ -2453,7 +2481,10 @@ mod tests {
         };
 
         let patterns = [pattern];
-        let schedule = schedule_playlist_pattern_notes(&patterns, &arrangement, |_| true).unwrap();
+        let schedule = schedule_playlist_pattern_notes(&patterns, &arrangement, |channel_id, _| {
+            vec![channel_id]
+        })
+        .unwrap();
         assert_eq!(
             schedule
                 .notes
@@ -2466,6 +2497,43 @@ mod tests {
                 (288, Some(384)),
                 (432, Some(480)),
             ]
+        );
+    }
+
+    #[test]
+    fn playlist_pattern_notes_expand_to_ordered_layer_targets() {
+        let pattern = Pattern {
+            id: 8,
+            length_ticks: Some(96),
+            notes: vec![PatternNote {
+                position: 24,
+                length: 48,
+                channel_id: 7,
+                ..PatternNote::default()
+            }],
+            ..Pattern::default()
+        };
+        let arrangement = Arrangement {
+            clips: vec![test_pattern_clip(8, 96, 192)],
+            ..Arrangement::default()
+        };
+
+        let patterns = [pattern];
+        let schedule = schedule_playlist_pattern_notes(&patterns, &arrangement, |channel_id, _| {
+            if channel_id == 7 {
+                vec![2, 5]
+            } else {
+                vec![channel_id]
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            schedule
+                .notes
+                .iter()
+                .map(|placed| (placed.target_channel_id, placed.start_tick))
+                .collect::<Vec<_>>(),
+            vec![(2, 120), (5, 120), (2, 216), (5, 216)]
         );
     }
 
@@ -2487,7 +2555,10 @@ mod tests {
         };
 
         let patterns = [pattern];
-        let schedule = schedule_playlist_pattern_notes(&patterns, &arrangement, |_| true).unwrap();
+        let schedule = schedule_playlist_pattern_notes(&patterns, &arrangement, |channel_id, _| {
+            vec![channel_id]
+        })
+        .unwrap();
         assert_eq!(schedule.notes.len(), 1);
         assert_eq!(schedule.notes[0].start_tick, 12);
         assert_eq!(schedule.notes[0].clipped_stop_tick, None);

@@ -593,6 +593,66 @@ impl ChannelSummary {
     }
 }
 
+/// Resolves note channels to the enabled channels that should receive their MIDI.
+///
+/// Layer Random uses a stable per-note pseudo-random choice in this runtime so
+/// Sampler and VST3 render paths agree on the selected child. FL Studio's native
+/// random sequence is not known, so rendered choices may differ from FL Studio.
+pub(crate) struct ChannelNoteRouter {
+    channels_by_id: HashMap<u16, ChannelSummary>,
+}
+
+impl ChannelNoteRouter {
+    pub(crate) fn new(channels: impl IntoIterator<Item = ChannelSummary>) -> Self {
+        Self {
+            channels_by_id: channels
+                .into_iter()
+                .map(|channel| (channel.id(), channel))
+                .collect(),
+        }
+    }
+
+    /// Returns targets in Layer child order. `note_seed` distinguishes notes and
+    /// Playlist repetitions when Random is enabled.
+    pub(crate) fn targets(&self, source_channel_id: u16, note_seed: u64) -> Vec<u16> {
+        let Some(source) = self.channels_by_id.get(&source_channel_id) else {
+            return Vec::new();
+        };
+        if source.enabled == Some(false) {
+            return Vec::new();
+        }
+        if source.channel_type() != Some(ChannelType::Layer) {
+            return vec![source_channel_id];
+        }
+
+        let mut seen = HashSet::new();
+        let children = source
+            .layer_children
+            .iter()
+            .copied()
+            .filter(|child_id| seen.insert(*child_id))
+            .filter(|child_id| {
+                self.channels_by_id.get(child_id).is_some_and(|child| {
+                    child.enabled != Some(false) && child.channel_type() != Some(ChannelType::Layer)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        if children.is_empty() {
+            return children;
+        }
+        if source.layer_random_enabled() != Some(true) {
+            return children;
+        }
+
+        let mut random = note_seed ^ (u64::from(source_channel_id) << 32) ^ 0x9E37_79B9_7F4A_7C15;
+        random = (random ^ (random >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        random = (random ^ (random >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        random ^= random >> 31;
+        vec![children[(random as usize) % children.len()]]
+    }
+}
+
 /// One point from the `0xEA` payload of a kind-5 automation channel.
 ///
 /// Positions are cumulative beats from the start of the automation clip. The
@@ -6386,9 +6446,10 @@ fn decode_vst_text(bytes: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChannelSortOrder, ChannelSummary, FlpDocument, FlpError, FstPreset, FstPresetKind,
-        MixerParameterKind, PatternNote, PayloadEncoding, ProjectInfoEdit, ProjectSettingsEdit,
-        TimeMarkerEdit, midi::MidiChannelMapping, midi::MidiFile, parse_vst_plugin_state_metadata,
+        ChannelNoteRouter, ChannelSortOrder, ChannelSummary, FlpDocument, FlpError, FstPreset,
+        FstPresetKind, MixerParameterKind, PatternNote, PayloadEncoding, ProjectInfoEdit,
+        ProjectSettingsEdit, TimeMarkerEdit, midi::MidiChannelMapping, midi::MidiFile,
+        parse_vst_plugin_state_metadata,
     };
 
     fn flp_fixture(event_stream: &[u8], header_extension: &[u8], trailing: &[u8]) -> Vec<u8> {
@@ -8464,6 +8525,43 @@ mod tests {
             Some(super::ChannelType::Instrument)
         );
         assert_eq!(document.encode_lossless().unwrap(), original);
+    }
+
+    #[test]
+    fn layer_note_router_fans_out_and_uses_repeatable_random_child_choices() {
+        let all_children = FlpDocument::parse(&layer_channel_fixture(0, &[1, 2]))
+            .expect("Layer fixture should parse");
+        let router = ChannelNoteRouter::new(all_children.channels());
+        assert_eq!(router.targets(0, 23), vec![1, 2]);
+        assert!(router.targets(99, 23).is_empty());
+
+        let random_layer = FlpDocument::parse(&layer_channel_fixture(1, &[1, 2]))
+            .expect("random Layer fixture should parse");
+        let router = ChannelNoteRouter::new(random_layer.channels());
+        let first_choice = router.targets(0, 23);
+        assert_eq!(first_choice.len(), 1);
+        assert_eq!(router.targets(0, 23), first_choice);
+        let choices = (0..64)
+            .flat_map(|seed| router.targets(0, seed))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(choices, [1, 2].into_iter().collect());
+    }
+
+    #[test]
+    fn layer_note_router_skips_missing_disabled_and_nested_layer_children() {
+        let mut event_stream = vec![0x40, 0, 0, 0x15, 3, 0x90];
+        event_stream.extend_from_slice(&0u32.to_le_bytes());
+        for child in [1u16, 2, 3, 99] {
+            event_stream.push(0x5E);
+            event_stream.extend_from_slice(&child.to_le_bytes());
+        }
+        event_stream.extend_from_slice(&[0x40, 1, 0, 0x00, 0, 0x15, 2]);
+        event_stream.extend_from_slice(&[0x40, 2, 0, 0x15, 3]);
+        event_stream.extend_from_slice(&[0x40, 3, 0, 0x15, 4, 0x62, 0, 0]);
+        let document = FlpDocument::parse(&flp_fixture(&event_stream, &[], &[]))
+            .expect("Layer fixture should parse");
+        let router = ChannelNoteRouter::new(document.channels());
+        assert_eq!(router.targets(0, 0), vec![3]);
     }
 
     #[test]

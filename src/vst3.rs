@@ -14,7 +14,7 @@ use std::thread;
 
 use crate::audio::StreamingAudioWriter;
 use crate::sample_render::{channel_gain_pan, schedule_playlist_pattern_notes};
-use crate::{ChannelPluginState, FlpDocument};
+use crate::{ChannelNoteRouter, ChannelPluginState, FlpDocument};
 use vst3_host::audio::AudioBuffers;
 use vst3_host::midi::{MidiChannel, MidiEvent};
 use vst3_host::{Plugin, PluginInfo, PluginWindow, Vst3Host};
@@ -809,6 +809,7 @@ impl Vst3HostRuntime {
             .iter()
             .map(|channel| (channel.id(), channel))
             .collect();
+        let channel_router = ChannelNoteRouter::new(channels.clone());
         let mut plugin_channels: BTreeSet<_> = document
             .channel_plugin_states()
             .into_iter()
@@ -822,12 +823,14 @@ impl Vst3HostRuntime {
                 })
                 .map(|channel| channel.id()),
         );
-        let schedule = schedule_playlist_pattern_notes(&patterns, &arrangement, |channel_id| {
-            plugin_channels.contains(&channel_id)
-                && channels_by_id
-                    .get(&channel_id)
-                    .is_none_or(|channel| channel.enabled() != Some(false))
-        })?;
+        let schedule =
+            schedule_playlist_pattern_notes(&patterns, &arrangement, |channel_id, seed| {
+                channel_router
+                    .targets(channel_id, seed)
+                    .into_iter()
+                    .filter(|target_channel_id| plugin_channels.contains(target_channel_id))
+                    .collect()
+            })?;
 
         let mut notes_by_channel = BTreeMap::<u16, Vec<PlaylistMidiNote>>::new();
         for placed in &schedule.notes {
@@ -840,7 +843,7 @@ impl Vst3HostRuntime {
                     .ok_or_else(|| "zero-length VST3 note end overflow".to_owned())?,
             };
             notes_by_channel
-                .entry(note.channel_id)
+                .entry(placed.target_channel_id)
                 .or_default()
                 .push(PlaylistMidiNote {
                     start_tick: placed.start_tick,
