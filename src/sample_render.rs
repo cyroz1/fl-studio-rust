@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::audio::StreamingAudioWriter;
 use crate::media::{DecodedAudio, SamplePathResolver, decode_audio_file};
@@ -113,6 +114,21 @@ impl WavSampleFormat {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WavDitherMode {
+    Off,
+    Tpdf,
+}
+
+impl WavDitherMode {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Tpdf => "TPDF dither",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WavChannelMode {
     Stereo,
     MonoMerged,
@@ -144,6 +160,7 @@ pub struct PlaylistRenderOptions {
     pub sample_rate: u32,
     pub sampler_voice_limit: usize,
     pub wav_sample_format: WavSampleFormat,
+    pub wav_dither_mode: WavDitherMode,
     pub wav_channel_mode: WavChannelMode,
     pub tail_seconds: u8,
 }
@@ -155,6 +172,7 @@ impl Default for PlaylistRenderOptions {
             sample_rate: DEFAULT_SAMPLE_RATE,
             sampler_voice_limit: DEFAULT_SAMPLER_VOICE_LIMIT,
             wav_sample_format: WavSampleFormat::Float32,
+            wav_dither_mode: WavDitherMode::Off,
             wav_channel_mode: WavChannelMode::Stereo,
             tail_seconds: 0,
         }
@@ -464,6 +482,9 @@ pub fn render_playlist_with_vst3_to_wav_cancellable(
                 * usize::from(options.wav_channel_mode.channel_count())
                 * usize::from(options.wav_sample_format.bytes_per_sample()),
         );
+        let mut dither_state = (options.wav_dither_mode == WavDitherMode::Tpdf
+            && options.wav_sample_format == WavSampleFormat::Pcm16)
+            .then(TpdfDither::new);
         summary.voices_stolen = stream_prepared_playlist_render(
             PreparedPlaylistBlockMix {
                 audio: &audio,
@@ -476,10 +497,11 @@ pub fn render_playlist_with_vst3_to_wav_cancellable(
             || false,
             |block| {
                 bytes.clear();
-                append_wav_block_samples(
+                append_wav_block_samples_with_dither(
                     block,
                     options.wav_sample_format,
                     options.wav_channel_mode,
+                    dither_state.as_mut(),
                     &mut bytes,
                 )?;
                 file.write_all(&bytes)
@@ -523,11 +545,22 @@ fn write_wav_header(
     Ok(())
 }
 
+#[cfg(test)]
 fn append_wav_sample(sample: f32, format: WavSampleFormat, output: &mut Vec<u8>) {
+    append_wav_sample_with_dither(sample, format, 0.0, output);
+}
+
+fn append_wav_sample_with_dither(
+    sample: f32,
+    format: WavSampleFormat,
+    dither_noise_lsb: f64,
+    output: &mut Vec<u8>,
+) {
     match format {
         WavSampleFormat::Float32 => output.extend_from_slice(&sample.to_le_bytes()),
         WavSampleFormat::Pcm16 => {
-            let quantized = quantize_signed_pcm(sample, 32_768.0, 32_767.0) as i16;
+            let dithered_sample = sample + (dither_noise_lsb / 32_768.0) as f32;
+            let quantized = quantize_signed_pcm(dithered_sample, 32_768.0, 32_767.0) as i16;
             output.extend_from_slice(&quantized.to_le_bytes());
         }
         WavSampleFormat::Pcm24 => {
@@ -538,30 +571,88 @@ fn append_wav_sample(sample: f32, format: WavSampleFormat, output: &mut Vec<u8>)
     }
 }
 
+#[cfg(test)]
 fn append_wav_block_samples(
     stereo_block: &[f32],
     sample_format: WavSampleFormat,
     channel_mode: WavChannelMode,
     output: &mut Vec<u8>,
 ) -> Result<(), String> {
+    append_wav_block_samples_with_dither(stereo_block, sample_format, channel_mode, None, output)
+}
+
+fn append_wav_block_samples_with_dither(
+    stereo_block: &[f32],
+    sample_format: WavSampleFormat,
+    channel_mode: WavChannelMode,
+    mut dither_state: Option<&mut TpdfDither>,
+    output: &mut Vec<u8>,
+) -> Result<(), String> {
     if !stereo_block.len().is_multiple_of(2) {
         return Err("render block must contain interleaved stereo frames".to_owned());
     }
+    let mut append_sample = |sample| {
+        let noise = if sample_format == WavSampleFormat::Pcm16 {
+            dither_state
+                .as_deref_mut()
+                .map_or(0.0, TpdfDither::next_lsb_noise)
+        } else {
+            0.0
+        };
+        append_wav_sample_with_dither(sample, sample_format, noise, output);
+    };
     for frame in stereo_block.as_chunks::<2>().0 {
         match channel_mode {
             WavChannelMode::Stereo => {
-                append_wav_sample(frame[0], sample_format, output);
-                append_wav_sample(frame[1], sample_format, output);
+                append_sample(frame[0]);
+                append_sample(frame[1]);
             }
             WavChannelMode::MonoMerged => {
                 let merged = frame[0] * 0.5 + frame[1] * 0.5;
-                append_wav_sample(merged, sample_format, output);
+                append_sample(merged);
             }
-            WavChannelMode::MonoLeft => append_wav_sample(frame[0], sample_format, output),
-            WavChannelMode::MonoRight => append_wav_sample(frame[1], sample_format, output),
+            WavChannelMode::MonoLeft => append_sample(frame[0]),
+            WavChannelMode::MonoRight => append_sample(frame[1]),
         }
     }
     Ok(())
+}
+
+struct TpdfDither {
+    state: u64,
+}
+
+impl TpdfDither {
+    fn new() -> Self {
+        let time_seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos() as u64);
+        let counter = NEXT_TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
+        let process_seed = u64::from(std::process::id()).rotate_left(17);
+        Self::from_seed(time_seed ^ process_seed ^ counter.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+    }
+
+    fn from_seed(seed: u64) -> Self {
+        Self {
+            state: if seed == 0 {
+                0xA076_1D64_78BD_642F
+            } else {
+                seed
+            },
+        }
+    }
+
+    fn next_lsb_noise(&mut self) -> f64 {
+        self.next_unit() + self.next_unit() - 1.0
+    }
+
+    fn next_unit(&mut self) -> f64 {
+        self.state ^= self.state >> 12;
+        self.state ^= self.state << 25;
+        self.state ^= self.state >> 27;
+        (self.state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64
+            * (1.0 / 9_007_199_254_740_992.0)
+    }
 }
 
 fn quantize_signed_pcm(sample: f32, negative_scale: f64, positive_scale: f64) -> i64 {
@@ -2321,6 +2412,7 @@ mod tests {
                     sample_rate: 4,
                     sampler_voice_limit: 4,
                     wav_sample_format: WavSampleFormat::Float32,
+                    wav_dither_mode: WavDitherMode::Off,
                     wav_channel_mode: WavChannelMode::Stereo,
                     tail_seconds: 0,
                 },
@@ -2791,6 +2883,39 @@ mod tests {
         assert_eq!(quantize_signed_pcm(f32::NAN, 32_768.0, 32_767.0), 0);
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tpdf_dither_is_reproducible_and_limited_to_one_lsb_peak() {
+        let mut first = TpdfDither::from_seed(0x1234_5678_9ABC_DEF0);
+        let mut second = TpdfDither::from_seed(0x1234_5678_9ABC_DEF0);
+        for _ in 0..1024 {
+            let noise = first.next_lsb_noise();
+            assert!((-1.0..=1.0).contains(&noise));
+            assert_eq!(noise, second.next_lsb_noise());
+        }
+    }
+
+    #[test]
+    fn wav_dither_only_changes_sixteen_bit_pcm() {
+        let mut undithered_pcm16 = Vec::new();
+        let mut dithered_pcm16 = Vec::new();
+        append_wav_sample(0.0, WavSampleFormat::Pcm16, &mut undithered_pcm16);
+        append_wav_sample_with_dither(0.0, WavSampleFormat::Pcm16, 0.75, &mut dithered_pcm16);
+        assert_eq!(undithered_pcm16, [0, 0]);
+        assert_eq!(dithered_pcm16, [1, 0]);
+
+        let mut undithered_pcm24 = Vec::new();
+        let mut dithered_pcm24 = Vec::new();
+        append_wav_sample(0.0, WavSampleFormat::Pcm24, &mut undithered_pcm24);
+        append_wav_sample_with_dither(0.0, WavSampleFormat::Pcm24, 0.75, &mut dithered_pcm24);
+        assert_eq!(dithered_pcm24, undithered_pcm24);
+
+        let mut undithered_float = Vec::new();
+        let mut dithered_float = Vec::new();
+        append_wav_sample(0.0, WavSampleFormat::Float32, &mut undithered_float);
+        append_wav_sample_with_dither(0.0, WavSampleFormat::Float32, 0.75, &mut dithered_float);
+        assert_eq!(dithered_float, undithered_float);
     }
 
     #[test]

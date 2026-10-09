@@ -20,8 +20,8 @@ use flp_rebuild::plugins::{PluginCandidate, PluginFormat, scan_installed_plugins
 use flp_rebuild::project_package::ProjectPackageWorkspace;
 use flp_rebuild::sample_render::{
     AudioClipRenderOptions, PlaylistRenderOptions, PlaylistRenderSummary,
-    SamplerPatternRenderOptions, SamplerPatternRenderSummary, WavChannelMode, WavSampleFormat,
-    render_audio_clips_to_wav, render_playlist_with_vst3_to_wav_cancellable,
+    SamplerPatternRenderOptions, SamplerPatternRenderSummary, WavChannelMode, WavDitherMode,
+    WavSampleFormat, render_audio_clips_to_wav, render_playlist_with_vst3_to_wav_cancellable,
     stream_playlist_with_vst3_to_device, stream_sampler_pattern_to_device,
 };
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions, Vst3PatternStreamHandle};
@@ -1302,6 +1302,7 @@ struct DawUi {
     project_settings_fast_declick: bool,
     playlist_render_options_open: bool,
     playlist_render_format: WavSampleFormat,
+    playlist_render_dither: bool,
     playlist_render_channel_mode: WavChannelMode,
     playlist_render_tail_seconds: u8,
 }
@@ -1566,6 +1567,7 @@ impl DawUi {
             project_settings_fast_declick: false,
             playlist_render_options_open: false,
             playlist_render_format: WavSampleFormat::Float32,
+            playlist_render_dither: false,
             playlist_render_channel_mode: WavChannelMode::Stereo,
             playlist_render_tail_seconds: 0,
         };
@@ -2521,6 +2523,11 @@ impl DawUi {
                             }
                         });
                 });
+                let dither_enabled = self.playlist_render_format == WavSampleFormat::Pcm16;
+                ui.add_enabled_ui(dither_enabled, |ui| {
+                    ui.checkbox(&mut self.playlist_render_dither, "TPDF dither");
+                });
+                ui.label("Adds triangular dither during 16-bit output only.");
                 ui.horizontal(|ui| {
                     ui.label("Channels");
                     egui::ComboBox::from_id_salt("playlist-render-channel-mode")
@@ -10171,6 +10178,11 @@ impl DawUi {
             arrangement_id: self.selected_arrangement.unwrap_or_default(),
             sample_rate: self.audio_settings.sample_rate,
             wav_sample_format: self.playlist_render_format,
+            wav_dither_mode: if self.playlist_render_dither {
+                WavDitherMode::Tpdf
+            } else {
+                WavDitherMode::Off
+            },
             wav_channel_mode: self.playlist_render_channel_mode,
             tail_seconds: self.playlist_render_tail_seconds,
             ..PlaylistRenderOptions::default()

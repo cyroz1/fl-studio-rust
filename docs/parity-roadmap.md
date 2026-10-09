@@ -289,8 +289,8 @@ implementation).
 Current: experimental offline renders include audio clips, Sampler Pattern
 Clips, and mapped VST3 instruments in one bounded Playlist mix → WAV. The
 desktop dialog can choose 16/24-bit integer PCM or 32-bit float output, stereo
-or mono channel modes, and append up to five seconds after the final scheduled
-clip. This first combined
+or mono channel modes, append up to five seconds after the final scheduled
+clip, and optionally apply TPDF dither to 16-bit PCM. This first combined
 renderer uses base tempo and provisional channel volume/pan; it does not apply
 automation, Mixer routing/effects, or PDC. Full export surface:
 
@@ -303,7 +303,7 @@ automation, Mixer routing/effects, or PDC. Full export surface:
   routing/effects, PDC, native level comparison, and other export options
   remain incomplete.
 - `[partial]` Formats: the desktop Playlist renderer writes 16/24-bit integer PCM or 32-bit float WAV, with stereo, merged mono, left-only, or right-only channels as documented by [Image-Line](https://www.image-line.com/fl-studio-learning/fl-studio-online-manual/html/fformats_save_export.htm); MP3, OGG, and FLAC export remain todo
-- `[partial]` Render options: the Playlist mix dialog offers channel modes and 0/1/2/5-second output tails for VST instrument releases; quality (resampling), dithering, normalize, and effect-based tail detection remain todo
+- `[partial]` Render options: the Playlist mix dialog offers channel modes, 0/1/2/5-second output tails for VST instrument releases, and optional unshaped TPDF dither for 16-bit PCM. Image-Line documents high-frequency shaped dither, so matching its noise-shaping profile remains todo; quality (resampling), normalize, and effect-based tail detection are also incomplete.
 - `[todo]` Stem export: split mixer tracks, "split channel tracks"
 - `[todo]` Playlist selection render, pattern render
 - `[todo]` Burn to CD-era options: skip (obsolete)
