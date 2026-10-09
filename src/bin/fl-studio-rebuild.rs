@@ -295,6 +295,12 @@ impl ChannelDisplayFilter {
     }
 }
 
+#[derive(Clone)]
+struct ChannelGroupDialog {
+    channel_ids: Vec<u16>,
+    name: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PlaylistWaveformMode {
     Combined,
@@ -1232,6 +1238,7 @@ struct DawUi {
     tempo_bpm: f64,
     selected_pattern: Option<u16>,
     channel_display_filter: ChannelDisplayFilter,
+    channel_group_dialog: Option<ChannelGroupDialog>,
     selected_note_channel: Option<u16>,
     selected_note: Option<(u16, u16, usize)>,
     selected_piano_notes: BTreeSet<(u16, u16, usize)>,
@@ -1501,6 +1508,7 @@ impl DawUi {
             tempo_bpm: 140.0,
             selected_pattern: None,
             channel_display_filter: ChannelDisplayFilter::All,
+            channel_group_dialog: None,
             selected_note_channel: None,
             selected_note: None,
             selected_piano_notes: BTreeSet::new(),
@@ -1668,6 +1676,117 @@ impl DawUi {
             .pick_file()
         {
             self.open_project(&path);
+        }
+    }
+
+    fn open_channel_group_dialog(&mut self) {
+        let Some(document) = &self.document else {
+            self.status = "Open a project before grouping channels".to_owned();
+            return;
+        };
+        let channels = document.channels();
+        let channel_ids = channels
+            .iter()
+            .filter(|channel| self.selected_rack_channels.contains(&channel.id()))
+            .map(ChannelSummary::id)
+            .collect::<Vec<_>>();
+        if channel_ids.is_empty() {
+            self.status = "Select one or more channels to group".to_owned();
+            return;
+        }
+        let selected_group = channels
+            .iter()
+            .filter(|channel| self.selected_rack_channels.contains(&channel.id()))
+            .map(ChannelSummary::group_number)
+            .reduce(|left, right| (left == right).then_some(left).flatten())
+            .flatten();
+        let groups = document.channel_groups();
+        let name = selected_group
+            .and_then(|index| {
+                groups
+                    .iter()
+                    .find(|group| group.index() == index)
+                    .and_then(ChannelGroupSummary::name)
+            })
+            .unwrap_or_default()
+            .to_owned();
+        self.channel_group_dialog = Some(ChannelGroupDialog { channel_ids, name });
+    }
+
+    fn apply_channel_group_dialog(&mut self, dialog: ChannelGroupDialog) {
+        let before = self
+            .document
+            .as_ref()
+            .and_then(|document| document.encode_lossless().ok());
+        let result = self
+            .document
+            .as_mut()
+            .map(|document| document.group_channels(&dialog.channel_ids, &dialog.name));
+        match result {
+            Some(Ok(group_index)) => {
+                let changed = self
+                    .document
+                    .as_ref()
+                    .and_then(|document| document.encode_lossless().ok())
+                    .zip(before)
+                    .is_some_and(|(after, before)| after != before);
+                if changed {
+                    self.stop_project_playback();
+                    self.dirty = true;
+                    self.status = format!(
+                        "Grouped {} channel(s) in {}",
+                        dialog.channel_ids.len(),
+                        dialog.name
+                    );
+                } else {
+                    self.status = format!("Channels already belong to {}", dialog.name);
+                }
+                self.channel_display_filter = ChannelDisplayFilter::Group(group_index);
+            }
+            Some(Err(error)) => {
+                self.status = format!("Could not group selected channels: {error}");
+                self.channel_group_dialog = Some(dialog);
+            }
+            None => self.status = "Open a project before grouping channels".to_owned(),
+        }
+    }
+
+    fn channel_group_dialog(&mut self, context: &egui::Context) {
+        let Some(mut dialog) = self.channel_group_dialog.take() else {
+            return;
+        };
+        let mut open = true;
+        let mut apply = false;
+        let mut cancel = false;
+        egui::Window::new("Group selected channels")
+            .id(Id::new("channel-group-dialog"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(340.0)
+            .show(context, |ui| {
+                ui.label("Enter a group name. An existing name moves channels into that group.");
+                ui.label("Group name");
+                ui.text_edit_singleline(&mut dialog.name);
+                ui.horizontal(|ui| {
+                    if ui.button("Assign selected").clicked() {
+                        apply = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+                if ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                    apply = true;
+                }
+                if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                    cancel = true;
+                }
+            });
+        if apply {
+            self.apply_channel_group_dialog(dialog);
+        } else if open && !cancel {
+            self.channel_group_dialog = Some(dialog);
         }
     }
 
@@ -6710,18 +6829,22 @@ impl DawUi {
             .unwrap_or(1)
             .clamp(1, 64) as usize;
         let mut open_editor = None;
+        let mut open_group_dialog = false;
         let mut channel_enabled_edits = Vec::new();
         let mut channel_zipped_edits = Vec::new();
-        let (zip_selected, unzip_all) = if ui.memory(|memory| memory.focused().is_none()) {
-            ui.input_mut(|input| {
-                (
-                    input.consume_key(egui::Modifiers::ALT, egui::Key::Z),
-                    input.consume_key(egui::Modifiers::ALT, egui::Key::U),
-                )
-            })
-        } else {
-            (false, false)
-        };
+        let (zip_selected, unzip_all, group_selected) =
+            if ui.memory(|memory| memory.focused().is_none()) {
+                ui.input_mut(|input| {
+                    (
+                        input.consume_key(egui::Modifiers::ALT, egui::Key::Z),
+                        input.consume_key(egui::Modifiers::ALT, egui::Key::U),
+                        input.consume_key(egui::Modifiers::ALT, egui::Key::G),
+                    )
+                })
+            } else {
+                (false, false, false)
+            };
+        open_group_dialog |= group_selected;
         if zip_selected {
             channel_zipped_edits.extend(
                 self.selected_rack_channels
@@ -6867,6 +6990,16 @@ impl DawUi {
                             .filter(|channel| channel.zipped())
                             .map(|channel| (channel.id(), false)),
                     );
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        !selected_ids.is_empty(),
+                        egui::Button::new("Group selected…"),
+                    )
+                    .clicked()
+                {
+                    open_group_dialog = true;
                     ui.close();
                 }
             });
@@ -7645,6 +7778,9 @@ impl DawUi {
                 Ok(()) => self.status = "VST3 editor opened from Channel Rack".to_owned(),
                 Err(error) => self.status = format!("Could not open VST3 editor: {error}"),
             }
+        }
+        if open_group_dialog {
+            self.open_channel_group_dialog();
         }
     }
 
@@ -12938,6 +13074,7 @@ impl eframe::App for DawUi {
         });
         self.project_info_dialog(ui.ctx());
         self.project_settings_dialog(ui.ctx());
+        self.channel_group_dialog(ui.ctx());
         self.playlist_render_options_dialog(ui.ctx());
         self.browser_tag_editor_dialog(ui.ctx());
         self.browser_search_save_dialog(ui.ctx());

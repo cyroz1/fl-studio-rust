@@ -1582,6 +1582,153 @@ impl FlpDocument {
             .collect()
     }
 
+    fn project_string_encoding(&self) -> Option<bool> {
+        let utf16_from_version = project_string_version(self.project_version.as_deref())
+            .map(|(major, minor)| major > 11 || (major == 11 && minor >= 5));
+        utf16_from_version.or_else(|| {
+            let first_channel = self
+                .events
+                .iter()
+                .position(|event| event.opcode == 0x40)
+                .unwrap_or(self.events.len());
+            self.events.iter().enumerate().find_map(|(index, event)| {
+                let is_project_string =
+                    matches!(event.opcode, 0xC2 | 0xC3 | 0xC4 | 0xC5 | 0xCB | 0xCE | 0xCF)
+                        || (event.opcode == 0xE7 && index < first_channel);
+                (is_project_string && matches!(event.encoding, PayloadEncoding::Data { .. }))
+                    .then(|| project_string_is_utf16(&event.payload, None))
+            })
+        })
+    }
+
+    /// Creates a Channel Rack display group when `name` is new and assigns every listed channel
+    /// to it. Existing groups are matched by exact name. All edits are applied atomically while
+    /// preserving unrelated event bytes.
+    pub fn group_channels(&mut self, channel_ids: &[u16], name: &str) -> Result<i32, FlpError> {
+        if name.trim().is_empty() || name.contains('\0') {
+            return Err(FlpError::UnsupportedEdit(
+                "a Channel Rack group needs a non-empty name without embedded NUL characters",
+            ));
+        }
+        if channel_ids.is_empty() {
+            return Err(FlpError::UnsupportedEdit(
+                "at least one Channel Rack channel must be selected",
+            ));
+        }
+
+        let mut selected_ids = BTreeSet::new();
+        let channels = self.channels();
+        for channel_id in channel_ids {
+            if !selected_ids.insert(*channel_id) {
+                return Err(FlpError::UnsupportedEdit(
+                    "a Channel Rack channel was selected more than once",
+                ));
+            }
+            let mut matching = channels
+                .iter()
+                .filter(|channel| channel.id() == *channel_id);
+            if matching.next().is_none() {
+                return Err(FlpError::ChannelNotFound(*channel_id));
+            }
+            if matching.next().is_some() {
+                return Err(FlpError::AmbiguousChannelId(*channel_id));
+            }
+        }
+
+        let groups = self.channel_groups();
+        let matching_groups = groups
+            .iter()
+            .filter(|group| group.name() == Some(name))
+            .map(ChannelGroupSummary::index)
+            .collect::<Vec<_>>();
+        if matching_groups.len() > 1 {
+            return Err(FlpError::UnsupportedEdit(
+                "multiple Channel Rack groups have the requested name",
+            ));
+        }
+        let (group_index, create_group) = if let Some(index) = matching_groups.first() {
+            (*index, false)
+        } else {
+            (
+                i32::try_from(groups.len()).map_err(|_| {
+                    FlpError::UnsupportedEdit("the project has too many Channel Rack groups")
+                })?,
+                true,
+            )
+        };
+
+        let mut candidate = self.clone();
+        if create_group {
+            let utf16 = self
+                .project_string_encoding()
+                .ok_or(FlpError::UnsupportedEdit(
+                    "the project's string encoding cannot be inferred for a new Channel Rack group",
+                ))?;
+            let name_payload = encode_project_string(name, utf16)?;
+            let group_event = FlpEvent::new_data(0xE7, name_payload)?;
+            let first_channel = candidate
+                .events
+                .iter()
+                .position(|event| event.opcode == 0x40)
+                .unwrap_or(candidate.events.len());
+            let insertion_index = candidate.events[..first_channel]
+                .iter()
+                .rposition(|event| {
+                    event.opcode == 0xE7 && matches!(event.encoding, PayloadEncoding::Data { .. })
+                })
+                .map_or(first_channel, |index| index + 1);
+            candidate.events.insert(insertion_index, group_event);
+        }
+
+        let mut selected_channels = candidate
+            .channels()
+            .into_iter()
+            .filter(|channel| selected_ids.contains(&channel.id()))
+            .collect::<Vec<_>>();
+        selected_channels.sort_by_key(|channel| std::cmp::Reverse(channel.first_event_index));
+        let mut changed = create_group;
+        let group_number_payload = u32::from_le_bytes(group_index.to_le_bytes());
+        for channel in selected_channels {
+            let mut group_events = channel
+                .event_range()
+                .filter(|index| candidate.events[*index].opcode == 0x91);
+            let existing_index = group_events.next();
+            if group_events.next().is_some() {
+                return Err(FlpError::UnsupportedEdit(
+                    "a selected channel has multiple display-group events",
+                ));
+            }
+            if let Some(event_index) = existing_index {
+                let event = &candidate.events[event_index];
+                if event.encoding != PayloadEncoding::Dword || event.payload.len() != 4 {
+                    return Err(FlpError::UnsupportedEdit(
+                        "a selected channel's display-group event is not a dword",
+                    ));
+                }
+                let current_index = i32::from_le_bytes(
+                    event.payload[..4]
+                        .try_into()
+                        .expect("a dword event has four payload bytes"),
+                );
+                if current_index != group_index {
+                    candidate.events[event_index].replace_dword_payload(group_number_payload)?;
+                    changed = true;
+                }
+            } else {
+                candidate.events.insert(
+                    channel.event_range().end,
+                    FlpEvent::new_dword(0x91, group_number_payload),
+                );
+                changed = true;
+            }
+        }
+        if changed {
+            candidate.refresh_event_offsets()?;
+            *self = candidate;
+        }
+        Ok(group_index)
+    }
+
     /// Returns the points found in each type-5 automation channel's `0xEA` blob.
     /// The full event remains byte-exact in `events()`; the 17-byte header,
     /// per-point trailing bytes, and any era-specific trailer are not discarded.
@@ -5555,15 +5702,8 @@ impl FlpDocument {
                 "the project has no unused channel IDs",
             ))?;
 
-        let uses_utf16 = project_string_version(self.project_version.as_deref())
-            .map(|(major, minor)| major > 11 || (major == 11 && minor >= 5))
-            .or_else(|| {
-                self.events.iter().find_map(|event| {
-                    (matches!(event.opcode, 0xC2 | 0xC3 | 0xC4 | 0xC5 | 0xCB | 0xCE | 0xCF)
-                        && matches!(event.encoding, PayloadEncoding::Data { .. }))
-                    .then(|| project_string_is_utf16(&event.payload, None))
-                })
-            })
+        let uses_utf16 = self
+            .project_string_encoding()
             .ok_or(FlpError::UnsupportedEdit(
                 "the project's string encoding cannot be inferred for a new channel",
             ))?;
@@ -6618,7 +6758,7 @@ fn decode_vst_text(bytes: &[u8]) -> Option<String> {
 mod tests {
     use super::{
         ChannelGroupSummary, ChannelNoteRouter, ChannelSortOrder, ChannelSummary, FlpDocument,
-        FlpError, FstPreset, FstPresetKind, MixerParameterKind, PATTERN_NOTE_SLIDE_FLAG,
+        FlpError, FlpEvent, FstPreset, FstPresetKind, MixerParameterKind, PATTERN_NOTE_SLIDE_FLAG,
         PatternNote, PatternNoteEdit, PayloadEncoding, ProjectInfoEdit, ProjectSettingsEdit,
         TimeMarkerEdit, midi::MidiChannelMapping, midi::MidiFile, parse_vst_plugin_state_metadata,
     };
@@ -7939,6 +8079,113 @@ mod tests {
                 .map(ChannelSummary::group_number)
                 .collect::<Vec<_>>(),
             [Some(0), Some(1), Some(-1)]
+        );
+    }
+
+    #[test]
+    fn assigns_channels_to_an_existing_group_and_preserves_other_events() {
+        let mut event_stream = Vec::new();
+        append_project_info_string(&mut event_stream, 0xE7, "Drums");
+        append_project_info_string(&mut event_stream, 0xE7, "Synths");
+        event_stream.extend_from_slice(&[
+            0x40, 7, 0, 0x15, 0, 0x91, 0, 0, 0, 0, 0x90, 0x78, 0x56, 0x34, 0x12, 0x40, 8, 0, 0x15,
+            0, 0x48, 0x34, 0x12, 0x62, 0, 0,
+        ]);
+        let input = flp_fixture(&event_stream, &[], &[0xA5, 0x5A]);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+
+        assert_eq!(
+            document
+                .group_channels(&[7, 8], "Synths")
+                .expect("selected channels should be grouped"),
+            1
+        );
+        assert_eq!(
+            document
+                .channels()
+                .iter()
+                .map(ChannelSummary::group_number)
+                .collect::<Vec<_>>(),
+            [Some(1), Some(1)]
+        );
+        assert_eq!(
+            document
+                .events()
+                .iter()
+                .filter(|event| event.opcode() == 0x90)
+                .map(FlpEvent::wire_bytes)
+                .collect::<Vec<_>>(),
+            [&[0x90, 0x78, 0x56, 0x34, 0x12][..]]
+        );
+        assert!(
+            document.events().iter().any(|event| {
+                event.opcode() == 0x48 && event.wire_bytes() == [0x48, 0x34, 0x12]
+            })
+        );
+        let encoded = document.encode_lossless().expect("edited project encodes");
+        assert_eq!(
+            FlpDocument::parse(&encoded)
+                .expect("edited project parses")
+                .encode_lossless()
+                .expect("roundtrip encodes"),
+            encoded
+        );
+    }
+
+    #[test]
+    fn creates_new_channel_group_and_reuses_it_on_repeat() {
+        let mut event_stream = Vec::new();
+        append_project_info_string(&mut event_stream, 0xE7, "Drums");
+        event_stream.extend_from_slice(&[
+            0x40, 7, 0, 0x15, 0, 0x90, 0x78, 0x56, 0x34, 0x12, 0x40, 8, 0, 0x15, 0, 0x91, 0, 0, 0,
+            0, 0x62, 0, 0,
+        ]);
+        let input = flp_fixture(&event_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+
+        assert_eq!(
+            document
+                .group_channels(&[7], "Strings")
+                .expect("a new group should be created"),
+            1
+        );
+        let after_create = document
+            .encode_lossless()
+            .expect("grouped project should encode");
+        assert_eq!(
+            document
+                .channel_groups()
+                .iter()
+                .map(ChannelGroupSummary::name)
+                .collect::<Vec<_>>(),
+            [Some("Drums"), Some("Strings")]
+        );
+        assert_eq!(
+            document
+                .channels()
+                .iter()
+                .map(ChannelSummary::group_number)
+                .collect::<Vec<_>>(),
+            [Some(1), Some(0)]
+        );
+        assert_eq!(
+            document
+                .group_channels(&[7], "Strings")
+                .expect("the created group should be reused"),
+            1
+        );
+        assert_eq!(
+            document
+                .encode_lossless()
+                .expect("reused group should encode"),
+            after_create
+        );
+        assert_eq!(
+            FlpDocument::parse(&after_create)
+                .expect("grouped project should parse")
+                .encode_lossless()
+                .expect("grouped project should roundtrip"),
+            after_create
         );
     }
 
