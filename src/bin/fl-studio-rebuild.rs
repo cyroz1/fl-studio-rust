@@ -4049,6 +4049,7 @@ impl DawUi {
                     ("F6", "Channel Rack"),
                     ("F7", "Piano roll"),
                     ("F9", "Mixer"),
+                    ("Space", "Play / pause"),
                     ("Ctrl/Cmd+S", "Save project"),
                     ("Ctrl/Cmd+Z", "Undo"),
                     ("Ctrl/Cmd+Shift+Z", "Redo"),
@@ -13374,6 +13375,11 @@ impl eframe::App for DawUi {
         self.guard_window_close(ui.ctx());
         ui.painter()
             .rect_filled(ui.max_rect(), egui::CornerRadius::ZERO, APP_BACKGROUND);
+        let play_pause_requested = !ui.ctx().egui_wants_keyboard_input()
+            && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Space));
+        if play_pause_requested {
+            self.toggle_project_playback();
+        }
         let recent_project_index = ui.input_mut(|input| {
             if !input.modifiers.alt
                 || input.modifiers.ctrl

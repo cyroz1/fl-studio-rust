@@ -328,7 +328,7 @@ automation, Mixer routing/effects, or PDC. Full export surface:
 - `[todo]` Browser panel, toolbar, hint bar, project picker
 - `[todo]` Touch support
 - `[partial]` Themes / UI scaling: the Options menu can scale the interface from 80% to 140% and saves the choice locally; additional themes and per-platform HiDPI verification remain.
-- `[todo]` Full keyboard shortcut map parity
+- `[partial]` Keyboard shortcuts cover the main editors (F5, F6, F7, F9), Space play/pause, recent projects (Alt/Option+1–0), save/undo/redo, and several Browser, Channel Rack, and Piano roll actions; the full FL Studio shortcut map remains incomplete.
 - `[partial]` Undo/redo restores lossless FLP document snapshots across editors with a 64 MiB history cap; plug-in-host state and non-project UI state remain outside history
 - `[partial]` Autosave and recovery: configurable 5/10/15-minute autosaves (or off) pause during playback; Frequent mode saves every five minutes during playback and before plug-in loading, while Very frequent mode saves every minute and before plug-in loading. Manual saves retain the prior project, a shared retention limit prunes old backups, startup/open offers recovery from a newer autosave, and File provides Backup now, Revert to last autosave, and numbered Save new version (Ctrl/Cmd+N). Opening another project or using File > Exit or the window close button with unsaved edits prompts to Save, Don't Save, or Cancel. Untitled projects cannot autosave, and backup location/controls do not yet match FL Studio exactly.
 
