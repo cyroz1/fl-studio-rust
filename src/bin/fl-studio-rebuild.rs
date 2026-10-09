@@ -1178,6 +1178,8 @@ struct DawUi {
     piano_roll_grid_scroll_offset: Vec2,
     step_sequencer_bar: u32,
     selected_graph_channel: Option<u16>,
+    selected_rack_channels: BTreeSet<u16>,
+    rack_selection_anchor: Option<u16>,
     step_graph_mode: StepGraphMode,
     step_graph_editor_open: bool,
     step_graph_ramp: Option<StepGraphRamp>,
@@ -1436,6 +1438,8 @@ impl DawUi {
             piano_roll_grid_scroll_offset: Vec2::ZERO,
             step_sequencer_bar: 0,
             selected_graph_channel: None,
+            selected_rack_channels: BTreeSet::new(),
+            rack_selection_anchor: None,
             step_graph_mode: StepGraphMode::Velocity,
             step_graph_editor_open: false,
             step_graph_ramp: None,
@@ -1665,6 +1669,11 @@ impl DawUi {
                     document.channels().first().map(|channel| channel.id());
                 self.selected_graph_channel =
                     document.channels().first().map(|channel| channel.id());
+                self.selected_rack_channels.clear();
+                if let Some(channel_id) = self.selected_graph_channel {
+                    self.selected_rack_channels.insert(channel_id);
+                }
+                self.rack_selection_anchor = self.selected_graph_channel;
                 self.selected_clip = None;
                 self.selected_time_marker = None;
                 self.selected_note = None;
@@ -6418,6 +6427,7 @@ impl DawUi {
             return;
         };
         let channels = document.channels();
+        let channel_ids = channels.iter().map(ChannelSummary::id).collect::<Vec<_>>();
         let plugin_states = document.channel_plugin_states();
         let patterns = document.patterns().unwrap_or_default();
         if self
@@ -6425,6 +6435,19 @@ impl DawUi {
             .is_none_or(|id| !channels.iter().any(|channel| channel.id() == id))
         {
             self.selected_graph_channel = channels.first().map(|channel| channel.id());
+        }
+        self.selected_rack_channels
+            .retain(|id| channel_ids.contains(id));
+        if self.selected_rack_channels.is_empty()
+            && let Some(channel_id) = self.selected_graph_channel
+        {
+            self.selected_rack_channels.insert(channel_id);
+        }
+        if self
+            .rack_selection_anchor
+            .is_none_or(|id| !channels.iter().any(|channel| channel.id() == id))
+        {
+            self.rack_selection_anchor = self.selected_graph_channel;
         }
         if self
             .selected_pattern
@@ -6617,13 +6640,20 @@ impl DawUi {
                             let plugin_state = plugin_states
                                 .iter()
                                 .find(|state| state.channel_id() == channel.id());
-                            let selected = self.selected_graph_channel == Some(channel.id());
+                            let selected = self.selected_rack_channels.contains(&channel.id());
+                            let active = self.selected_graph_channel == Some(channel.id());
                             let channel_button = ui.add_sized(
                                 [190.0, 24.0],
                                 egui::Button::new(
                                     channel.display_name().unwrap_or("(unnamed channel)"),
                                 )
-                                .fill(if selected { BLUE } else { PANEL_LIGHT }),
+                                .fill(if active {
+                                    BLUE
+                                } else if selected {
+                                    BLUE_SELECTION
+                                } else {
+                                    PANEL_LIGHT
+                                }),
                             );
                             let accepts_sample_drop =
                                 matches!(channel.kind(), Some(0 | 4)) && channel.sample_path().is_some();
@@ -6646,11 +6676,74 @@ impl DawUi {
                                 }
                             }
                             if channel_button.clicked() {
+                                let modifiers = ui.input(|input| input.modifiers);
+                                update_channel_rack_selection(
+                                    &channel_ids,
+                                    &mut self.selected_rack_channels,
+                                    &mut self.rack_selection_anchor,
+                                    channel.id(),
+                                    modifiers.command || modifiers.ctrl,
+                                    modifiers.shift,
+                                );
                                 self.selected_graph_channel = Some(channel.id());
                                 self.selected_note_channel = Some(channel.id());
                             }
                             channel_button.context_menu(|ui| {
+                                let channel_selected =
+                                    self.selected_rack_channels.contains(&channel.id());
+                                let toggle_label = if channel_selected {
+                                    "Remove from selection"
+                                } else {
+                                    "Add to selection"
+                                };
+                                if ui
+                                    .add_enabled(
+                                        !channel_selected || self.selected_rack_channels.len() > 1,
+                                        egui::Button::new(toggle_label),
+                                    )
+                                    .clicked()
+                                {
+                                    if channel_selected {
+                                        self.selected_rack_channels.remove(&channel.id());
+                                    } else {
+                                        self.selected_rack_channels.insert(channel.id());
+                                    }
+                                    self.rack_selection_anchor = Some(channel.id());
+                                    self.selected_graph_channel = Some(channel.id());
+                                    self.selected_note_channel = Some(channel.id());
+                                    ui.close();
+                                }
+                                if ui.button("Select only this channel").clicked() {
+                                    self.selected_rack_channels.clear();
+                                    self.selected_rack_channels.insert(channel.id());
+                                    self.rack_selection_anchor = Some(channel.id());
+                                    self.selected_graph_channel = Some(channel.id());
+                                    self.selected_note_channel = Some(channel.id());
+                                    ui.close();
+                                }
+                                ui.separator();
+                                let selected_ids = if self.selected_rack_channels.is_empty() {
+                                    vec![channel.id()]
+                                } else {
+                                    self.selected_rack_channels.iter().copied().collect()
+                                };
+                                if ui.button("Mute selected channels").clicked() {
+                                    channel_enabled_edits.extend(
+                                        selected_ids.iter().copied().map(|id| (id, false)),
+                                    );
+                                    ui.close();
+                                }
+                                if ui.button("Unmute selected channels").clicked() {
+                                    channel_enabled_edits.extend(
+                                        selected_ids.iter().copied().map(|id| (id, true)),
+                                    );
+                                    ui.close();
+                                }
+                                ui.separator();
                                 if ui.button("Piano roll").clicked() {
+                                    self.selected_rack_channels.clear();
+                                    self.selected_rack_channels.insert(channel.id());
+                                    self.rack_selection_anchor = Some(channel.id());
                                     self.selected_graph_channel = Some(channel.id());
                                     self.selected_note_channel = Some(channel.id());
                                     self.view = MainView::PianoRoll;
@@ -12399,6 +12492,50 @@ fn update_layer_child_selection(child_ids: &mut Vec<u16>, child_id: u16, selecte
     }
 }
 
+fn update_channel_rack_selection(
+    channel_ids: &[u16],
+    selected: &mut BTreeSet<u16>,
+    anchor: &mut Option<u16>,
+    channel_id: u16,
+    additive: bool,
+    extend_range: bool,
+) {
+    let Some(channel_index) = channel_ids.iter().position(|id| *id == channel_id) else {
+        return;
+    };
+    if extend_range {
+        let anchor_index = anchor
+            .and_then(|anchor_id| channel_ids.iter().position(|id| *id == anchor_id))
+            .unwrap_or(channel_index);
+        if !additive {
+            selected.clear();
+        }
+        selected.extend(
+            channel_ids
+                .iter()
+                .take(anchor_index.max(channel_index) + 1)
+                .skip(anchor_index.min(channel_index))
+                .copied(),
+        );
+        if anchor.is_none() {
+            *anchor = Some(channel_id);
+        }
+    } else if additive {
+        if selected.contains(&channel_id) {
+            if selected.len() > 1 {
+                selected.remove(&channel_id);
+            }
+        } else {
+            selected.insert(channel_id);
+        }
+        *anchor = Some(channel_id);
+    } else {
+        selected.clear();
+        selected.insert(channel_id);
+        *anchor = Some(channel_id);
+    }
+}
+
 fn automation_point_screen_position(
     point: &AutomationPoint,
     plot_rect: egui::Rect,
@@ -13490,9 +13627,11 @@ fn note_from_grid_position(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::{
         PianoRollGrid, PianoRollSnap, note_from_grid_position, snap_note_tick,
-        update_layer_child_selection,
+        update_channel_rack_selection, update_layer_child_selection,
     };
 
     fn test_grid() -> PianoRollGrid {
@@ -13530,6 +13669,26 @@ mod tests {
         assert_eq!(child_ids, [4, 3]);
         update_layer_child_selection(&mut child_ids, 3, true);
         assert_eq!(child_ids, [4, 3]);
+    }
+
+    #[test]
+    fn channel_rack_selection_toggles_and_extends_ranges_by_channel_id() {
+        let channel_ids = [1, 3, 2];
+        let mut selected = BTreeSet::from([1]);
+        let mut anchor = Some(1);
+
+        update_channel_rack_selection(&channel_ids, &mut selected, &mut anchor, 3, true, false);
+        assert_eq!(selected, BTreeSet::from([1, 3]));
+        assert_eq!(anchor, Some(3));
+
+        update_channel_rack_selection(&channel_ids, &mut selected, &mut anchor, 2, false, true);
+        assert_eq!(selected, BTreeSet::from([2, 3]));
+        assert_eq!(anchor, Some(3));
+
+        update_channel_rack_selection(&channel_ids, &mut selected, &mut anchor, 3, true, false);
+        assert_eq!(selected, BTreeSet::from([2]));
+        update_channel_rack_selection(&channel_ids, &mut selected, &mut anchor, 2, true, false);
+        assert_eq!(selected, BTreeSet::from([2]));
     }
 
     #[test]
