@@ -337,6 +337,7 @@ pub enum ChannelType {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChannelSortOrder {
     Color,
+    MixerTrack,
     Name,
     Type,
 }
@@ -372,6 +373,7 @@ pub struct ChannelSummary {
     enabled: Option<bool>,
     zipped: bool,
     color: Option<u32>,
+    mixer_track: Option<i8>,
     volume: Option<u32>,
     pan: Option<i32>,
     levels_editable: bool,
@@ -543,6 +545,11 @@ impl ChannelSummary {
     /// Raw four-byte channel color value, in little-endian RGBA byte order.
     pub fn color(&self) -> Option<[u8; 4]> {
         self.color.map(u32::to_le_bytes)
+    }
+
+    /// Raw signed Mixer track assignment from the channel's one-byte `0x16` event.
+    pub fn mixer_track(&self) -> Option<i8> {
+        self.mixer_track
     }
 
     /// Raw FL channel volume value, in the project's 0..=12800 control range.
@@ -1420,6 +1427,9 @@ impl FlpDocument {
                 }
                 0x0F if event.payload.len() == 1 => {
                     channel.zipped = event.payload[0] != 0;
+                }
+                0x16 if event.encoding == PayloadEncoding::Byte && event.payload.len() == 1 => {
+                    channel.mixer_track = Some(event.payload[0] as i8);
                 }
                 0x15 if event.payload.len() == 1 => channel.kind = Some(event.payload[0]),
                 0x5E if event.payload.len() == 2 => {
@@ -5344,12 +5354,30 @@ impl FlpDocument {
     /// Reorders every channel using a stable Channel Rack sort while preserving each channel's
     /// complete event block and ID. Name sorting is case-insensitive; color sorting follows hue
     /// from red through violet, then achromatic and uncolored channels; type sorting follows the
-    /// documented Layer, generator, Sampler, audio-channel, and automation grouping.
+    /// documented Layer, generator, Sampler, audio-channel, and automation grouping. Mixer-track
+    /// sorting keeps generators and Layer channels at the top, then sorts known assignments by
+    /// track number while leaving missing or negative assignments at the end.
     pub fn sort_channels(&mut self, order: ChannelSortOrder) -> Result<(), FlpError> {
         let mut channels = self.channels();
         match order {
             ChannelSortOrder::Color => {
                 channels.sort_by_key(|channel| channel_color_sort_key(channel.color()));
+            }
+            ChannelSortOrder::MixerTrack => {
+                channels.sort_by_key(|channel| {
+                    let is_generator = channel.sample_path().is_none()
+                        && matches!(
+                            channel.channel_type(),
+                            Some(ChannelType::Native | ChannelType::Instrument)
+                        );
+                    let is_layer = channel.channel_type() == Some(ChannelType::Layer);
+                    let rank = if is_generator || is_layer { 0 } else { 1 };
+                    let track = channel
+                        .mixer_track()
+                        .filter(|track| *track >= 0)
+                        .map_or(i16::MAX, i16::from);
+                    (rank, track)
+                });
             }
             ChannelSortOrder::Name => {
                 channels.sort_by_key(|channel| {
@@ -7748,6 +7776,72 @@ mod tests {
                 Some([70, 70, 70, 0]),
                 None,
             ]
+        );
+    }
+
+    #[test]
+    fn sorts_channels_by_mixer_track_with_generators_and_layers_first() {
+        let mut event_stream = Vec::new();
+        for (id, kind, track) in [
+            (10, 0, Some(3)),
+            (11, 2, Some(2)),
+            (12, 3, None),
+            (13, 5, Some(1)),
+            (14, 0, Some(0)),
+            (15, 0, None),
+        ] {
+            event_stream.extend_from_slice(&[0x40, id, 0, 0x15, kind]);
+            if let Some(track) = track {
+                event_stream.extend_from_slice(&[0x16, track]);
+            }
+        }
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        let input = flp_fixture(&event_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+        let original_blocks = document
+            .channels()
+            .iter()
+            .map(|channel| {
+                channel
+                    .event_range()
+                    .map(|index| document.events()[index].wire_bytes.clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            document
+                .channels()
+                .iter()
+                .map(ChannelSummary::mixer_track)
+                .collect::<Vec<_>>(),
+            [Some(3), Some(2), None, Some(1), Some(0), None]
+        );
+
+        document
+            .sort_channels(ChannelSortOrder::MixerTrack)
+            .expect("Mixer-track sort should succeed");
+
+        assert_eq!(
+            document
+                .channels()
+                .iter()
+                .map(ChannelSummary::id)
+                .collect::<Vec<_>>(),
+            [11, 12, 14, 13, 10, 15]
+        );
+        let mut expected_events = Vec::new();
+        for index in [1, 2, 4, 3, 0, 5] {
+            expected_events.extend(original_blocks[index].clone());
+        }
+        expected_events.extend([vec![0x62, 0, 0]]);
+        assert_eq!(
+            document
+                .events()
+                .iter()
+                .map(|event| event.wire_bytes.clone())
+                .collect::<Vec<_>>(),
+            expected_events
         );
     }
 

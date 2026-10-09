@@ -6742,6 +6742,10 @@ impl DawUi {
                     channel_sort = Some(ChannelSortOrder::Color);
                     ui.close();
                 }
+                if ui.button("Mixer track").clicked() {
+                    channel_sort = Some(ChannelSortOrder::MixerTrack);
+                    ui.close();
+                }
                 if ui.button("Name").clicked() {
                     channel_sort = Some(ChannelSortOrder::Name);
                     ui.close();
@@ -7439,6 +7443,7 @@ impl DawUi {
                     });
                     let sort_name = match order {
                         ChannelSortOrder::Color => "color",
+                        ChannelSortOrder::MixerTrack => "Mixer track",
                         ChannelSortOrder::Name => "name",
                         ChannelSortOrder::Type => "type",
                     };
