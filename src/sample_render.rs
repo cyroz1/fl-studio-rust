@@ -1,6 +1,6 @@
 //! Offline rendering for Playlist clips that reference FLP audio channels.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -1063,6 +1063,12 @@ fn prepare_audio_clip_render(
         .into_iter()
         .find(|arrangement| arrangement.id == options.arrangement_id)
         .ok_or_else(|| format!("arrangement {} was not found", options.arrangement_id))?;
+    let disabled_track_ids = document
+        .playlist_tracks()
+        .into_iter()
+        .filter(|track| track.enabled == Some(false))
+        .map(|track| track.id)
+        .collect::<BTreeSet<_>>();
     let channels = document.channels();
     let resolver = SamplePathResolver::new(project_path);
 
@@ -1091,6 +1097,12 @@ fn prepare_audio_clip_render(
         let relative_position =
             audio_clip_render_start_tick(clip.position_ticks, selection_start_tick)?;
         max_tick = max_tick.max(relative_position + u64::from(clip.length_ticks));
+        if clip
+            .playlist_track_id()
+            .is_some_and(|track_id| disabled_track_ids.contains(&track_id))
+        {
+            continue;
+        }
         let PlaylistClipTarget::Channel { id } = clip.target() else {
             continue;
         };
@@ -1265,6 +1277,7 @@ pub(crate) struct PlaylistPatternSchedule<'a> {
 pub(crate) fn schedule_playlist_pattern_notes<'a>(
     patterns: &'a [Pattern],
     arrangement: &Arrangement,
+    disabled_track_ids: &BTreeSet<u32>,
     ppq: u16,
     global_swing_mix_raw: u8,
     mut channel_swing_mix_raw: impl FnMut(u16) -> u16,
@@ -1280,6 +1293,12 @@ pub(crate) fn schedule_playlist_pattern_notes<'a>(
     };
 
     for (clip_index, clip) in arrangement.clips.iter().enumerate() {
+        if clip
+            .playlist_track_id()
+            .is_some_and(|track_id| disabled_track_ids.contains(&track_id))
+        {
+            continue;
+        }
         let PlaylistClipTarget::Pattern { id } = clip.target() else {
             continue;
         };
@@ -1428,6 +1447,12 @@ fn prepare_sampler_arrangement(
         .into_iter()
         .find(|arrangement| arrangement.id == options.arrangement_id)
         .ok_or_else(|| format!("arrangement {} was not found", options.arrangement_id))?;
+    let disabled_track_ids = document
+        .playlist_tracks()
+        .into_iter()
+        .filter(|track| track.enabled == Some(false))
+        .map(|track| track.id)
+        .collect::<BTreeSet<_>>();
     let patterns = document.patterns().map_err(|error| error.to_string())?;
     let channels = document.channels();
     let channels_by_id: HashMap<_, _> = channels
@@ -1438,6 +1463,7 @@ fn prepare_sampler_arrangement(
     let schedule = schedule_playlist_pattern_notes(
         &patterns,
         &arrangement,
+        &disabled_track_ids,
         ppq,
         document.metadata().global_swing_mix(),
         |channel_id| {
@@ -2675,6 +2701,7 @@ mod tests {
         let schedule = schedule_playlist_pattern_notes(
             &patterns,
             &arrangement,
+            &BTreeSet::new(),
             96,
             0,
             |_| 128,
@@ -2694,6 +2721,36 @@ mod tests {
                 (432, Some(480)),
             ]
         );
+    }
+
+    #[test]
+    fn disabled_playlist_tracks_do_not_schedule_pattern_notes() {
+        let pattern = Pattern {
+            id: 2,
+            length_ticks: Some(96),
+            notes: vec![PatternNote {
+                length: 48,
+                channel_id: 1,
+                ..PatternNote::default()
+            }],
+            ..Pattern::default()
+        };
+        let arrangement = Arrangement {
+            clips: vec![test_pattern_clip(2, 0, 96)],
+            ..Arrangement::default()
+        };
+        let schedule = schedule_playlist_pattern_notes(
+            &[pattern],
+            &arrangement,
+            &BTreeSet::from([1]),
+            96,
+            0,
+            |_| 128,
+            |channel_id, _| vec![channel_id],
+        )
+        .unwrap();
+
+        assert!(schedule.notes.is_empty());
     }
 
     #[test]
@@ -2718,6 +2775,7 @@ mod tests {
         let schedule = schedule_playlist_pattern_notes(
             &patterns,
             &arrangement,
+            &BTreeSet::new(),
             96,
             0,
             |_| 128,
@@ -2761,6 +2819,7 @@ mod tests {
         let schedule = schedule_playlist_pattern_notes(
             &patterns,
             &arrangement,
+            &BTreeSet::new(),
             96,
             0,
             |_| 128,
@@ -2794,6 +2853,7 @@ mod tests {
         let schedule = schedule_playlist_pattern_notes(
             &patterns,
             &arrangement,
+            &BTreeSet::new(),
             96,
             128,
             |channel_id| if channel_id == 7 { 128 } else { 0 },

@@ -14,8 +14,8 @@ use flp_rebuild::sample_render::{
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions};
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, AutomationPointEdit, FlpDocument, FstPreset, PatternNote,
-    PatternNoteEdit, PlaylistClipEdit, ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions,
-    TimeMarkerEdit,
+    PatternNoteEdit, PlaylistClipEdit, PlaylistTrackEdit, ProjectInfoEdit, ProjectSettingsEdit,
+    RandomizerOptions, TimeMarkerEdit,
 };
 
 fn main() -> ExitCode {
@@ -659,6 +659,17 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u32(length, "clip length")?,
             )
         }
+        [command, input, output, track_id, enabled, grouped] if command == "edit-playlist-track" => {
+            edit_playlist_track(
+                Path::new(input),
+                Path::new(output),
+                parse_u32(track_id, "Playlist track id")?,
+                PlaylistTrackEdit {
+                    enabled: parse_optional_bool(enabled, "Playlist track enabled state")?,
+                    grouped: parse_optional_bool(grouped, "Playlist track grouping state")?,
+                },
+            )
+        }
         [command, input, output, arrangement_id, clip_index, item_index, raw_track_index, group, item_flags, start_offset, end_offset, scale]
             if command == "edit-clip-properties" =>
         {
@@ -869,6 +880,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild delete-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index>\n",
             "  flp-rebuild import-midi <input.flp> <input.mid> <output.flp> <track> <pattern-id> <channel-id>\n",
             "  flp-rebuild edit-clip <input.flp> <output.flp> <arrangement-id> <clip-index> <position> <length>\n",
+            "  flp-rebuild edit-playlist-track <input.flp> <output.flp> <track-id> <enabled:0|1|-> <grouped:0|1|->\n",
             "  flp-rebuild edit-clip-properties <input.flp> <output.flp> <arrangement-id> <clip-index> <item-index-raw|-> <track-index-raw|-> <group-raw|-> <flags-raw|-> <start-offset|-> <end-offset|-> <scale|->\n",
             "  flp-rebuild duplicate-clip <input.flp> <output.flp> <arrangement-id> <clip-index> <position|-> <track-index-raw|->\n",
             "  flp-rebuild split-audio-clip <input.flp> <output.flp> <arrangement-id> <clip-index> <split-position-ticks> <source-length-ms|->\n",
@@ -2902,6 +2914,25 @@ fn edit_clip_properties(
         "updated arrangement {arrangement_id} clip {clip_index} properties in {}",
         output.display()
     );
+    Ok(())
+}
+
+fn edit_playlist_track(
+    input: &Path,
+    output: &Path,
+    track_id: u32,
+    edit: PlaylistTrackEdit,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .edit_playlist_track(track_id, edit)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!("updated Playlist track {track_id} in {}", output.display());
     Ok(())
 }
 

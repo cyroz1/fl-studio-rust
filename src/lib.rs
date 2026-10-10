@@ -1384,8 +1384,19 @@ pub struct PlaylistTrack {
     /// The adjacent `0x2B` byte is retained without assigning it a meaning.
     pub state_byte: Option<u8>,
     pub name: Option<String>,
+    /// Track enabled state from byte 12 of the `0xEE` state record. Disabled tracks are muted.
+    pub enabled: Option<bool>,
+    /// Whether this track is grouped with the Playlist track directly above it.
+    pub grouped: Option<bool>,
     /// Raw 70-byte `0xEE` state payload.
     pub state_bytes: Vec<u8>,
+}
+
+/// Fields that can be changed on an existing Playlist track without rewriting its other state.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PlaylistTrackEdit {
+    pub enabled: Option<bool>,
+    pub grouped: Option<bool>,
 }
 
 /// Read-only Mixer insert fields recognized from the observed `0x9A`, `0x93`,
@@ -3541,10 +3552,73 @@ impl FlpDocument {
                 id,
                 state_byte,
                 name,
+                enabled: match event.payload[12] {
+                    0 => Some(false),
+                    1 => Some(true),
+                    _ => None,
+                },
+                grouped: match event.payload[46] {
+                    0 => Some(false),
+                    1 => Some(true),
+                    _ => None,
+                },
                 state_bytes: event.payload.clone(),
             });
         }
         tracks
+    }
+
+    /// Edits the observed mute and grouping fields of an existing Playlist track in place.
+    /// All other track and project event bytes are preserved.
+    pub fn edit_playlist_track(
+        &mut self,
+        track_id: u32,
+        edit: PlaylistTrackEdit,
+    ) -> Result<(), FlpError> {
+        if track_id == 0 || track_id > 500 {
+            return Err(FlpError::UnsupportedEdit(
+                "Playlist track id must be between 1 and 500",
+            ));
+        }
+        if edit.grouped == Some(true) && track_id == 1 {
+            return Err(FlpError::UnsupportedEdit(
+                "the first Playlist track cannot be grouped with a track above it",
+            ));
+        }
+        if edit.enabled.is_none() && edit.grouped.is_none() {
+            return Ok(());
+        }
+
+        let mut matching_events = self.events.iter().enumerate().filter_map(|(index, event)| {
+            if event.opcode != 0xEE || event.payload.len() != 70 {
+                return None;
+            }
+            let id = u32::from_le_bytes([
+                event.payload[0],
+                event.payload[1],
+                event.payload[2],
+                event.payload[3],
+            ]);
+            (id == track_id).then_some(index)
+        });
+        let Some(event_index) = matching_events.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested Playlist track does not exist",
+            ));
+        };
+        if matching_events.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested Playlist track id is ambiguous",
+            ));
+        }
+
+        if let Some(enabled) = edit.enabled {
+            write_event_payload_bytes(&mut self.events[event_index], 12, &[u8::from(enabled)])?;
+        }
+        if let Some(grouped) = edit.grouped {
+            write_event_payload_bytes(&mut self.events[event_index], 46, &[u8::from(grouped)])?;
+        }
+        Ok(())
     }
 
     /// Returns Mixer insert summaries for the observed adjacent `0x9A`, `0x93`, `0x95`
@@ -10709,9 +10783,10 @@ mod tests {
         ChannelSummary, ClawMachineOptions, FlpDocument, FlpError, FlpEvent, FstPreset,
         FstPresetKind, LimitNoteOptions, LimitSnapDirection, MixerParameterKind,
         PATTERN_NOTE_SLIDE_FLAG, PatternNote, PatternNoteEdit, PayloadEncoding, PlaylistClipEdit,
-        PlaylistClipTarget, ProjectInfoEdit, ProjectSettingsEdit, RiffMachineOptions,
-        RiffMachineQuantizeMode, ScaleLevelsOptions, TimeMarkerEdit, midi::MidiChannelMapping,
-        midi::MidiFile, parse_vst_plugin_state_metadata, riff_machine_groove_note_timing,
+        PlaylistClipTarget, PlaylistTrackEdit, ProjectInfoEdit, ProjectSettingsEdit,
+        RiffMachineOptions, RiffMachineQuantizeMode, ScaleLevelsOptions, TimeMarkerEdit,
+        midi::MidiChannelMapping, midi::MidiFile, parse_vst_plugin_state_metadata,
+        riff_machine_groove_note_timing,
     };
 
     fn articulate_options(
@@ -10775,6 +10850,72 @@ mod tests {
         event_stream.push(opcode);
         event_stream.extend_from_slice(&super::encode_leb128(payload.len() as u32));
         event_stream.extend_from_slice(payload);
+    }
+
+    #[test]
+    fn playlist_track_mute_and_group_edits_preserve_other_state_bytes() {
+        let mut event_stream = Vec::new();
+        let mut original_tracks = Vec::new();
+        for track_id in 1..=2 {
+            let mut state = vec![0; 70];
+            state[..4].copy_from_slice(&track_id.to_le_bytes());
+            state[12] = 1;
+            state[13] = 0xA5;
+            state[46] = 0;
+            state[47] = 0x5A;
+            state[69] = 0xC3;
+            append_data_event(&mut event_stream, 0xEE, &state);
+            original_tracks.push(state);
+        }
+
+        let input = flp_fixture(&event_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+        let tracks = document.playlist_tracks();
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[1].enabled, Some(true));
+        assert_eq!(tracks[1].grouped, Some(false));
+        assert_eq!(tracks[1].state_bytes, original_tracks[1]);
+
+        document
+            .edit_playlist_track(
+                2,
+                PlaylistTrackEdit {
+                    enabled: Some(false),
+                    grouped: Some(true),
+                },
+            )
+            .expect("mute and group fields should be editable");
+        let tracks = document.playlist_tracks();
+        assert_eq!(tracks[0].state_bytes, original_tracks[0]);
+        assert_eq!(tracks[1].enabled, Some(false));
+        assert_eq!(tracks[1].grouped, Some(true));
+        let mut expected_state = original_tracks[1].clone();
+        expected_state[12] = 0;
+        expected_state[46] = 1;
+        assert_eq!(tracks[1].state_bytes, expected_state);
+
+        let before_invalid_edit = document
+            .encode_lossless()
+            .expect("edited project should encode");
+        assert!(
+            document
+                .edit_playlist_track(
+                    1,
+                    PlaylistTrackEdit {
+                        grouped: Some(true),
+                        ..PlaylistTrackEdit::default()
+                    },
+                )
+                .is_err()
+        );
+        assert_eq!(
+            document.encode_lossless().unwrap(),
+            before_invalid_edit,
+            "invalid grouping should leave the project unchanged"
+        );
+        let reparsed = FlpDocument::parse(&before_invalid_edit)
+            .expect("edited Playlist tracks should round-trip");
+        assert_eq!(reparsed.playlist_tracks(), document.playlist_tracks());
     }
 
     fn utf16_project_string(value: &str) -> Vec<u8> {

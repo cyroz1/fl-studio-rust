@@ -821,6 +821,12 @@ impl Vst3HostRuntime {
             .into_iter()
             .map(|state| state.channel_id())
             .collect();
+        let disabled_track_ids = document
+            .playlist_tracks()
+            .into_iter()
+            .filter(|track| track.enabled == Some(false))
+            .map(|track| track.id)
+            .collect::<BTreeSet<_>>();
         plugin_channels.extend(
             channels
                 .iter()
@@ -832,6 +838,7 @@ impl Vst3HostRuntime {
         let schedule = schedule_playlist_pattern_notes(
             &patterns,
             &arrangement,
+            &disabled_track_ids,
             ppq,
             document.metadata().global_swing_mix(),
             |channel_id| {

@@ -31,9 +31,9 @@ use flp_rebuild::{
     AutomationPointEdit, ChannelGroupSummary, ChannelSortOrder, ChannelSummary, ClawMachineOptions,
     FlpDocument, FstPreset, FstPresetKind, LimitNoteOptions, LimitSnapDirection, Pattern,
     PatternNote, PatternNoteEdit, PlaylistClip, PlaylistClipClipboard, PlaylistClipEdit,
-    PlaylistClipTarget, PlaylistTrack, ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions,
-    RiffMachineOptions, RiffMachineQuantizeMode, ScaleLevelsOptions, TimeMarker, TimeMarkerEdit,
-    VstPluginStateMetadata,
+    PlaylistClipTarget, PlaylistTrack, PlaylistTrackEdit, ProjectInfoEdit, ProjectSettingsEdit,
+    RandomizerOptions, RiffMachineOptions, RiffMachineQuantizeMode, ScaleLevelsOptions, TimeMarker,
+    TimeMarkerEdit, VstPluginStateMetadata,
 };
 
 const APP_BACKGROUND: Color32 = Color32::from_rgb(29, 29, 29);
@@ -331,6 +331,7 @@ fn main() -> eframe::Result {
         renderer: eframe::Renderer::Wgpu,
         viewport: egui::ViewportBuilder::default()
             .with_title("FL Studio Rebuild")
+            .with_theme(Some(egui::Theme::Dark))
             .with_inner_size([1440.0, 900.0])
             .with_min_inner_size([
                 MIN_WINDOW_INNER_WIDTH / ui_scale,
@@ -7009,6 +7010,7 @@ impl DawUi {
         self.poll_audio_waveforms(ui.ctx());
 
         let mut create_pattern_clip_requested = false;
+        let mut playlist_track_edits_requested = Vec::new();
         let mut delete_clip_requested = None;
         let mut copy_clip_requested = None;
         let mut cut_clip_requested = None;
@@ -7202,6 +7204,9 @@ impl DawUi {
 
                 for row in 0..=last_track {
                     let track_id = u32::from(row) + 1;
+                    let track_state = tracks.iter().find(|track| track.id == track_id);
+                    let track_muted = track_state.is_some_and(|track| track.enabled == Some(false));
+                    let track_grouped = track_state.is_some_and(|track| track.grouped == Some(true));
                     let track_name = tracks
                         .iter()
                         .find(|track| track.id == track_id)
@@ -7212,20 +7217,96 @@ impl DawUi {
                             Vec2::new(label_width, row_height),
                             Sense::hover(),
                         );
-                        ui.painter().rect_filled(label_rect, 0, PANEL_LIGHT);
+                        ui.painter().rect_filled(
+                            label_rect,
+                            0,
+                            if track_muted { PANEL_DARK } else { PANEL_LIGHT },
+                        );
                         ui.painter().rect_stroke(
                             label_rect,
                             0,
                             Stroke::new(1.0, PANEL_DARK),
                             egui::StrokeKind::Inside,
                         );
-                        ui.painter().text(
-                            egui::pos2(label_rect.left() + 7.0, label_rect.center().y),
-                            Align2::LEFT_CENTER,
-                            format!("{:02}  {}", row + 1, track_name),
-                            FontId::proportional(11.0),
-                            TEXT,
+                        let mute_rect = egui::Rect::from_min_size(
+                            label_rect.left_top() + Vec2::new(5.0, 3.0),
+                            Vec2::new(22.0, row_height - 6.0),
                         );
+                        if track_state.is_some() {
+                            let mute_color = if track_muted { ORANGE } else { PANEL_DARK };
+                            let mute_response = ui.put(
+                                mute_rect,
+                                egui::Button::new(
+                                    egui::RichText::new("M")
+                                        .size(10.0)
+                                        .strong()
+                                        .color(if track_muted { Color32::WHITE } else { MUTED }),
+                                )
+                                .fill(mute_color)
+                                .stroke(Stroke::NONE),
+                            );
+                            if mute_response.clicked() {
+                                playlist_track_edits_requested.push((
+                                    track_id,
+                                    PlaylistTrackEdit {
+                                        enabled: Some(track_muted),
+                                        ..PlaylistTrackEdit::default()
+                                    },
+                                ));
+                            }
+                            mute_response.on_hover_text(if track_muted {
+                                "Unmute this Playlist track"
+                            } else {
+                                "Mute this Playlist track"
+                            });
+                        }
+                        let group_mark = if track_grouped { "↳" } else { "" };
+                        let name_x = label_rect.left() + 33.0 + if track_grouped { 9.0 } else { 0.0 };
+                        ui.painter().text(
+                            egui::pos2(name_x, label_rect.center().y),
+                            Align2::LEFT_CENTER,
+                            format!("{:02}  {group_mark}{track_name}", row + 1),
+                            FontId::proportional(11.0),
+                            if track_muted { MUTED } else { TEXT },
+                        );
+                        let context_rect = egui::Rect::from_min_max(
+                            egui::pos2(mute_rect.right() + 2.0, label_rect.top()),
+                            label_rect.right_bottom(),
+                        );
+                        let context_response = ui.interact(
+                            context_rect,
+                            Id::new(("playlist-track-context", track_id)),
+                            Sense::click(),
+                        );
+                        let context_response = context_response
+                            .on_hover_text("Right-click for track grouping options");
+                        context_response.context_menu(|ui| {
+                            ui.label(track_name);
+                            ui.separator();
+                            if let Some(track) = track_state {
+                                let mut grouped = track.grouped == Some(true);
+                                if ui
+                                    .add_enabled(
+                                        track_id > 1,
+                                        egui::Checkbox::new(&mut grouped, "Group with above"),
+                                    )
+                                    .changed()
+                                {
+                                    playlist_track_edits_requested.push((
+                                        track_id,
+                                        PlaylistTrackEdit {
+                                            grouped: Some(grouped),
+                                            ..PlaylistTrackEdit::default()
+                                        },
+                                    ));
+                                }
+                                if track_id == 1 {
+                                    ui.weak("The first track has no track above it");
+                                }
+                            } else {
+                                ui.weak("Track state is unavailable in this project");
+                            }
+                            });
 
                         let (grid_rect, _) = ui
                             .allocate_exact_size(Vec2::new(grid_width, row_height), Sense::hover());
@@ -7273,11 +7354,15 @@ impl DawUi {
                                     }
                                 }
                             };
+                            let mut clip_painter = painter.clone();
+                            if track_muted {
+                                clip_painter.multiply_opacity(0.4);
+                            }
                             let selected = self.selected_arrangement == Some(arrangement.id)
                                 && (self.selected_playlist_clips.contains(&clip_index)
                                     || (self.selected_playlist_clips.is_empty()
                                         && self.selected_clip == Some(clip_index)));
-                            painter.rect_filled(
+                            clip_painter.rect_filled(
                                 clip_rect,
                                 egui::CornerRadius::same(3),
                                 if selected {
@@ -7286,7 +7371,7 @@ impl DawUi {
                                     color
                                 },
                             );
-                            painter.rect_stroke(
+                            clip_painter.rect_stroke(
                                 clip_rect,
                                 egui::CornerRadius::same(3),
                                 Stroke::new(1.0, color.gamma_multiply(0.65)),
@@ -7297,14 +7382,14 @@ impl DawUi {
                             {
                                 if let Some(waveform) = self.audio_waveforms.get(path).cloned() {
                                     draw_audio_clip_waveform(
-                                        &painter,
+                                        &clip_painter,
                                         clip_rect,
                                         clip,
                                         &waveform,
                                         self.playlist_waveform_mode,
                                     );
                                 } else if self.waveform_loads.contains_key(path) {
-                                    painter.text(
+                                    clip_painter.text(
                                         clip_rect.center(),
                                         Align2::CENTER_CENTER,
                                         "…",
@@ -7315,7 +7400,7 @@ impl DawUi {
                             }
                             if width > 50.0 {
                                 let name = clip_name(clip, &tracks);
-                                painter.text(
+                                clip_painter.text(
                                     egui::pos2(clip_rect.left() + 5.0, clip_rect.top() + 1.0),
                                     Align2::LEFT_TOP,
                                     name,
@@ -7338,7 +7423,7 @@ impl DawUi {
                                 response
                             };
                             if selected || response.hovered() {
-                                painter.line_segment(
+                                clip_painter.line_segment(
                                     [
                                         egui::pos2(clip_rect.right() - 2.0, clip_rect.top() + 5.0),
                                         egui::pos2(
@@ -7802,6 +7887,41 @@ impl DawUi {
                     });
                 }
             });
+
+        for (track_id, edit) in playlist_track_edits_requested {
+            let result = self
+                .document
+                .as_mut()
+                .map(|document| document.edit_playlist_track(track_id, edit));
+            match result {
+                Some(Ok(())) => {
+                    if edit.enabled.is_some() {
+                        self.stop_project_playback();
+                    }
+                    self.dirty = true;
+                    ui.ctx().request_repaint();
+                    self.status = if let Some(enabled) = edit.enabled {
+                        if enabled {
+                            format!("Unmuted Playlist track {track_id}")
+                        } else {
+                            format!("Muted Playlist track {track_id}")
+                        }
+                    } else if let Some(grouped) = edit.grouped {
+                        if grouped {
+                            format!("Grouped Playlist track {track_id} with the track above")
+                        } else {
+                            format!("Ungrouped Playlist track {track_id}")
+                        }
+                    } else {
+                        "Updated Playlist track".to_owned()
+                    };
+                }
+                Some(Err(error)) => {
+                    self.status = format!("Could not edit Playlist track {track_id}: {error}");
+                }
+                None => self.status = "Open a project to edit Playlist tracks".to_owned(),
+            }
+        }
 
         let mut playlist_clip_list_changed = false;
         if let Some(clip_index) = delete_clip_requested {
@@ -16816,10 +16936,11 @@ impl DawUi {
 
 impl eframe::App for DawUi {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // The root Ui can be created before a native backend reports its
-        // system theme. Pin this frame to the same dark palette as all menus
-        // and popups so light controls never appear over the graphite shell.
-        *ui.visuals_mut() = app_visuals();
+        // Reassert the app theme before building child Uis. Some native
+        // window backends report a system appearance after startup.
+        ui.ctx().set_theme(egui::Theme::Dark);
+        let dark_style = ui.ctx().global_style();
+        ui.set_style(dark_style);
         self.guard_window_close(ui.ctx());
         if self.view != MainView::Playlist {
             self.active_playlist_clip_drag = None;

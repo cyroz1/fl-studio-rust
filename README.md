@@ -163,7 +163,7 @@ The Piano roll's **Ghost channels** toggle shows every channel in the current pa
 
 Enable **Color by MIDI channel** to assign each note's stored low four MIDI-channel bits a distinct display color. Native color groups and color-based selection remain undecoded.
 
-`edit-clip-properties` edits a clip's raw item/track/group/flags fields, source offsets, and scale when that field is present. Use `-` to leave a value unchanged; scale edits are rejected for layouts without the established scale field.
+`edit-clip-properties` edits a clip's raw item/track/group/flags fields, source offsets, and scale when that field is present. Use `-` to leave a value unchanged; scale edits are rejected for layouts without the established scale field. `edit-playlist-track <input.flp> <output.flp> <track-id> <enabled:0|1|-> <grouped:0|1|->` updates the observed mute/group fields on an existing Playlist track while preserving its other event bytes.
 
 `duplicate-clip` copies a clip's complete record and inserts it after the source. Its default position is the source clip's end; an optional position and raw track index can be supplied.
 
