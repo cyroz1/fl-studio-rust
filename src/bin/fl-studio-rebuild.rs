@@ -331,7 +331,6 @@ fn main() -> eframe::Result {
         renderer: eframe::Renderer::Wgpu,
         viewport: egui::ViewportBuilder::default()
             .with_title("FL Studio Rebuild")
-            .with_theme(Some(egui::Theme::Dark))
             .with_inner_size([1440.0, 900.0])
             .with_min_inner_size([
                 MIN_WINDOW_INNER_WIDTH / ui_scale,

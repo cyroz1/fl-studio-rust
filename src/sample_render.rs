@@ -2739,8 +2739,9 @@ mod tests {
             clips: vec![test_pattern_clip(2, 0, 96)],
             ..Arrangement::default()
         };
+        let patterns = [pattern];
         let schedule = schedule_playlist_pattern_notes(
-            &[pattern],
+            &patterns,
             &arrangement,
             &BTreeSet::from([1]),
             96,

@@ -10856,7 +10856,7 @@ mod tests {
     fn playlist_track_mute_and_group_edits_preserve_other_state_bytes() {
         let mut event_stream = Vec::new();
         let mut original_tracks = Vec::new();
-        for track_id in 1..=2 {
+        for track_id in 1_u32..=2 {
             let mut state = vec![0; 70];
             state[..4].copy_from_slice(&track_id.to_le_bytes());
             state[12] = 1;
