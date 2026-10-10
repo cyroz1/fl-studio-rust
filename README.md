@@ -105,6 +105,8 @@ The Browser now navigates local folders, filters samples/projects/presets/MIDI, 
 
 The Piano roll's **Selection** menu provides Select all, Invert selection, and Deselect commands, with Ctrl/Cmd+A, Shift+I, and Ctrl/Cmd+D shortcuts. These operate on the current pattern and channel.
 
+Shift+G groups selected notes and Alt/Option+G ungroups them. Clicking, box-selecting, moving, resizing, or deleting a grouped note applies to its group.
+
 The Piano roll's **Events** panel displays per-note velocity, pan, release, fine pitch, Mod X, or Mod Y as draggable stems. Select a target from the toolbar menu or press Shift+F to cycle through them. Pattern-scoped controller automation and event interpolation are not implemented yet.
 
 The selected-note inspector can toggle a **Slide** note flag and shows a small marker at the start of the note. The flag is preserved in the FLP, but native-instrument glide playback and portamento remain unsupported.

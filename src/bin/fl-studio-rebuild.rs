@@ -10919,6 +10919,82 @@ impl DawUi {
         };
     }
 
+    fn set_selected_piano_roll_note_group(&mut self, grouped: bool) {
+        let Some(pattern_id) = self.selected_pattern else {
+            self.status = "Select a Pattern before grouping notes".to_owned();
+            return;
+        };
+        let mut selected_by_channel = BTreeMap::<u16, BTreeSet<usize>>::new();
+        for (selected_pattern, channel_id, note_index) in &self.selected_piano_notes {
+            if *selected_pattern == pattern_id {
+                selected_by_channel
+                    .entry(*channel_id)
+                    .or_default()
+                    .insert(*note_index);
+            }
+        }
+        let selected_count = selected_by_channel
+            .values()
+            .map(BTreeSet::len)
+            .sum::<usize>();
+        if selected_count == 0 {
+            self.status = "Select notes before grouping them".to_owned();
+            return;
+        }
+        let Some(document) = self.document.as_ref() else {
+            self.status = "Open a project before grouping notes".to_owned();
+            return;
+        };
+        let pattern = match document.patterns().map(|patterns| {
+            patterns
+                .into_iter()
+                .find(|pattern| pattern.id == pattern_id)
+        }) {
+            Ok(Some(pattern)) => pattern,
+            Ok(None) => {
+                self.status = format!("Pattern {pattern_id} does not exist");
+                return;
+            }
+            Err(error) => {
+                self.status = format!("Could not read Pattern notes: {error}");
+                return;
+            }
+        };
+        let mut updated = document.clone();
+        for (channel_id, note_indices) in selected_by_channel {
+            let group = if grouped {
+                let Some(group) = next_piano_roll_note_group(&pattern, channel_id) else {
+                    self.status = format!("No free note group ID remains for channel {channel_id}");
+                    return;
+                };
+                group
+            } else {
+                0
+            };
+            for note_index in note_indices {
+                if let Err(error) = updated.edit_pattern_note(
+                    pattern_id,
+                    channel_id,
+                    note_index,
+                    PatternNoteEdit {
+                        group: Some(group),
+                        ..PatternNoteEdit::default()
+                    },
+                ) {
+                    self.status = format!("Could not update note group: {error}");
+                    return;
+                }
+            }
+        }
+        self.document = Some(updated);
+        self.dirty = true;
+        self.status = if grouped {
+            format!("Grouped {selected_count} selected notes")
+        } else {
+            format!("Ungrouped {selected_count} selected notes")
+        };
+    }
+
     fn empty_project_view(&mut self, ui: &mut egui::Ui) {
         let recent_projects = self.browser_recent_projects.clone();
         let mut open_dialog = false;
@@ -11108,6 +11184,8 @@ impl DawUi {
         let mut slice_requested = false;
         let mut delete_selection_requested = false;
         let mut duplicate_notes_requested = false;
+        let mut group_selected_notes_requested = false;
+        let mut ungroup_selected_notes_requested = false;
         let mut quantize_selected_requested = false;
         let mut open_pattern_time_signature_dialog = false;
         if ui.memory(|memory| memory.focused().is_none()) {
@@ -11125,6 +11203,10 @@ impl DawUi {
                 ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::D));
             duplicate_notes_requested =
                 ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::B));
+            group_selected_notes_requested =
+                ui.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::G));
+            ungroup_selected_notes_requested =
+                ui.input_mut(|input| input.consume_key(egui::Modifiers::ALT, egui::Key::G));
             let select_draw =
                 ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::P));
             let select_paint =
@@ -11200,6 +11282,15 @@ impl DawUi {
                 .collect::<Vec<_>>(),
             _ => Vec::new(),
         };
+        let selected_note_count = self
+            .selected_pattern
+            .map(|pattern_id| {
+                self.selected_piano_notes
+                    .iter()
+                    .filter(|(selected_pattern, _, _)| *selected_pattern == pattern_id)
+                    .count()
+            })
+            .unwrap_or(0);
         ui.horizontal_wrapped(|ui| {
             egui::ComboBox::from_id_salt("pattern-picker")
                 .selected_text(format!("Pattern {}", self.selected_pattern.unwrap_or(0)))
@@ -11360,6 +11451,27 @@ impl DawUi {
                     duplicate_notes_requested = true;
                     ui.close();
                 }
+                ui.separator();
+                if ui
+                    .add_enabled(
+                        selected_note_count > 0,
+                        egui::Button::new("Group selected notes (Shift+G)"),
+                    )
+                    .clicked()
+                {
+                    group_selected_notes_requested = true;
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        selected_note_count > 0,
+                        egui::Button::new("Ungroup selected notes (Alt/Option+G)"),
+                    )
+                    .clicked()
+                {
+                    ungroup_selected_notes_requested = true;
+                    ui.close();
+                }
             });
             if ui
                 .selectable_label(self.piano_roll_event_editor_open, "Events")
@@ -11404,15 +11516,6 @@ impl DawUi {
             && self.selected_note_channel.is_some()
             && (self.piano_roll_edit_scope != PianoRollEditScope::Selection
                 || !selected_quantize_indices.is_empty());
-        let selected_note_count = self
-            .selected_pattern
-            .map(|pattern_id| {
-                self.selected_piano_notes
-                    .iter()
-                    .filter(|(selected_pattern, _, _)| *selected_pattern == pattern_id)
-                    .count()
-            })
-            .unwrap_or(0);
         let has_loaded_instrument = self
             .selected_note_channel
             .is_some_and(|channel_id| self.channel_vst3_instances.contains_key(&channel_id));
@@ -11736,6 +11839,13 @@ impl DawUi {
             limit_requested = false;
             arpeggiate_requested = false;
             slice_requested = false;
+            group_selected_notes_requested = false;
+            ungroup_selected_notes_requested = false;
+        }
+        if group_selected_notes_requested {
+            self.set_selected_piano_roll_note_group(true);
+        } else if ungroup_selected_notes_requested {
+            self.set_selected_piano_roll_note_group(false);
         }
 
         let edit_selection_only = self.piano_roll_edit_scope == PianoRollEditScope::Selection
@@ -14107,7 +14217,20 @@ impl DawUi {
                     {
                         self.selected_piano_notes.clear();
                     }
-                    if additive && self.selected_piano_notes.remove(&note_id) {
+                    let group_members = piano_roll_note_group_members(
+                        pattern,
+                        pattern.id,
+                        note.channel_id,
+                        *channel_index,
+                    );
+                    if additive
+                        && group_members
+                            .iter()
+                            .all(|member| self.selected_piano_notes.contains(member))
+                    {
+                        for member in group_members {
+                            self.selected_piano_notes.remove(&member);
+                        }
                         self.selected_note = self
                             .selected_piano_notes
                             .iter()
@@ -14115,7 +14238,7 @@ impl DawUi {
                             .find(|(selected_pattern, _, _)| *selected_pattern == pattern.id)
                             .copied();
                     } else {
-                        self.selected_piano_notes.insert(note_id);
+                        self.selected_piano_notes.extend(group_members);
                         self.selected_note = Some(note_id);
                     }
                     self.selected_note_channel = Some(note.channel_id);
@@ -14148,8 +14271,14 @@ impl DawUi {
                     {
                         self.selected_piano_notes
                             .retain(|(selected_pattern, _, _)| *selected_pattern != pattern.id);
-                        self.selected_piano_notes.insert(note_id);
                     }
+                    self.selected_piano_notes
+                        .extend(piano_roll_note_group_members(
+                            pattern,
+                            pattern.id,
+                            note.channel_id,
+                            *channel_index,
+                        ));
                     let mut selected_note_indices = BTreeMap::<u16, usize>::new();
                     let mut targets = Vec::new();
                     for selected_note in &pattern.notes {
@@ -14406,22 +14535,22 @@ impl DawUi {
                     egui::StrokeKind::Inside,
                 );
                 if grid_response.drag_stopped_by(PointerButton::Primary) {
-                    let enclosed = note_selection_rects
+                    let enclosed_note_indices = note_selection_rects
                         .iter()
                         .filter(|(channel_id, _, note_rect)| {
                             *channel_id == selection.channel_id
                                 && note_rect.intersects(selection_rect)
                         })
-                        .map(|(channel_id, channel_note_index, _)| {
-                            (pattern.id, *channel_id, *channel_note_index)
-                        })
+                        .map(|(_, channel_note_index, _)| *channel_note_index)
                         .collect::<Vec<_>>();
-                    for note_id in enclosed {
-                        if selection.additive && self.selected_piano_notes.remove(&note_id) {
-                            continue;
-                        }
-                        self.selected_piano_notes.insert(note_id);
-                    }
+                    update_piano_roll_box_selection(
+                        pattern,
+                        pattern.id,
+                        selection.channel_id,
+                        &enclosed_note_indices,
+                        selection.additive,
+                        &mut self.selected_piano_notes,
+                    );
                     self.selected_note = self
                         .selected_piano_notes
                         .iter()
@@ -14883,13 +15012,29 @@ impl DawUi {
                 self.status = "Piano roll note updated".to_owned();
             }
         }
-        if delete_requested && let Some(document) = &mut self.document {
-            match document.delete_pattern_note(pattern_id, channel_id, channel_note_index) {
+        if delete_requested && let Some(document) = self.document.as_ref() {
+            let mut grouped_indices =
+                piano_roll_note_group_members(pattern, pattern_id, channel_id, channel_note_index)
+                    .into_iter()
+                    .map(|(_, _, note_index)| note_index)
+                    .collect::<Vec<_>>();
+            grouped_indices.sort_unstable_by(|left, right| right.cmp(left));
+            let deleted_count = grouped_indices.len();
+            let mut updated = document.clone();
+            let result = grouped_indices.into_iter().try_for_each(|note_index| {
+                updated.delete_pattern_note(pattern_id, channel_id, note_index)
+            });
+            match result {
                 Ok(()) => {
+                    self.document = Some(updated);
                     self.selected_note = None;
                     self.selected_piano_notes.clear();
                     self.dirty = true;
-                    self.status = format!("Deleted note from pattern {pattern_id}");
+                    self.status = if deleted_count == 1 {
+                        format!("Deleted note from pattern {pattern_id}")
+                    } else {
+                        format!("Deleted {deleted_count} grouped notes from pattern {pattern_id}")
+                    };
                 }
                 Err(error) => self.status = error.to_string(),
             }
@@ -16314,6 +16459,90 @@ fn update_channel_rack_selection(
         selected.insert(channel_id);
         *anchor = Some(channel_id);
     }
+}
+
+fn piano_roll_note_group_members(
+    pattern: &Pattern,
+    pattern_id: u16,
+    channel_id: u16,
+    channel_note_index: usize,
+) -> Vec<(u16, u16, usize)> {
+    let Some(note) = pattern
+        .notes
+        .iter()
+        .filter(|note| note.channel_id == channel_id)
+        .nth(channel_note_index)
+    else {
+        return Vec::new();
+    };
+    if note.group == 0 {
+        return vec![(pattern_id, channel_id, channel_note_index)];
+    }
+    let group = note.group;
+    pattern
+        .notes
+        .iter()
+        .filter(|note| note.channel_id == channel_id)
+        .enumerate()
+        .filter(|(_, note)| note.group == group)
+        .map(|(index, _)| (pattern_id, channel_id, index))
+        .collect()
+}
+
+fn toggle_piano_roll_note_group_selection(
+    selected: &mut BTreeSet<(u16, u16, usize)>,
+    members: &[(u16, u16, usize)],
+    additive: bool,
+) -> bool {
+    let remove =
+        additive && !members.is_empty() && members.iter().all(|member| selected.contains(member));
+    if remove {
+        for member in members {
+            selected.remove(member);
+        }
+    } else {
+        selected.extend(members.iter().copied());
+    }
+    !remove
+}
+
+fn update_piano_roll_box_selection(
+    pattern: &Pattern,
+    pattern_id: u16,
+    channel_id: u16,
+    enclosed_note_indices: &[usize],
+    additive: bool,
+    selected: &mut BTreeSet<(u16, u16, usize)>,
+) {
+    let mut processed_groups = BTreeSet::new();
+    for note_index in enclosed_note_indices {
+        let group = pattern
+            .notes
+            .iter()
+            .filter(|note| note.channel_id == channel_id)
+            .nth(*note_index)
+            .map_or(0, |note| note.group);
+        let key = if group == 0 {
+            (group, *note_index)
+        } else {
+            (group, 0)
+        };
+        if !processed_groups.insert(key) {
+            continue;
+        }
+        let members = piano_roll_note_group_members(pattern, pattern_id, channel_id, *note_index);
+        toggle_piano_roll_note_group_selection(selected, &members, additive);
+    }
+}
+
+fn next_piano_roll_note_group(pattern: &Pattern, channel_id: u16) -> Option<u16> {
+    let used_groups = pattern
+        .notes
+        .iter()
+        .filter(|note| note.channel_id == channel_id && note.group != 0)
+        .map(|note| note.group)
+        .collect::<BTreeSet<_>>();
+    (1..=u16::MAX).find(|group| !used_groups.contains(group))
 }
 
 fn automation_point_screen_position(
@@ -18018,10 +18247,12 @@ mod tests {
 
     use super::{
         ActivePlaylistClipDrag, ChannelDisplayFilter, FlpDocument, Pattern, PatternNote,
-        PianoRollGrid, PianoRollSnap, PlaylistClip, PlaylistClipDragKind, note_from_grid_position,
+        PianoRollGrid, PianoRollSnap, PlaylistClip, PlaylistClipDragKind,
+        next_piano_roll_note_group, note_from_grid_position, piano_roll_note_group_members,
         playlist_audio_clip_join_candidates, playlist_clip_drag_edit, playlist_clip_split_position,
-        playlist_pattern_clip_join_candidates, snap_note_tick, update_channel_rack_selection,
-        update_layer_child_selection,
+        playlist_pattern_clip_join_candidates, snap_note_tick,
+        toggle_piano_roll_note_group_selection, update_channel_rack_selection,
+        update_layer_child_selection, update_piano_roll_box_selection,
     };
 
     fn test_grid() -> PianoRollGrid {
@@ -18349,7 +18580,7 @@ mod tests {
                 length: 0,
                 ..PatternNote::default()
             }],
-            ..pattern
+            ..pattern.clone()
         };
         assert_eq!(
             playlist_pattern_clip_join_candidates(
@@ -18449,6 +18680,73 @@ mod tests {
         assert_eq!(snap_note_tick(36, 24, 0), 48);
         assert_eq!(snap_note_tick(0, 24, 1), 1);
         assert_eq!(snap_note_tick(i64::from(u32::MAX), 1, 0), u32::MAX);
+    }
+
+    #[test]
+    fn piano_roll_note_groups_select_toggle_and_allocate_per_channel() {
+        let pattern = Pattern {
+            id: 7,
+            notes: vec![
+                PatternNote {
+                    channel_id: 2,
+                    group: 9,
+                    ..PatternNote::default()
+                },
+                PatternNote {
+                    channel_id: 3,
+                    group: 9,
+                    ..PatternNote::default()
+                },
+                PatternNote {
+                    channel_id: 2,
+                    group: 9,
+                    ..PatternNote::default()
+                },
+                PatternNote {
+                    channel_id: 2,
+                    group: 0,
+                    ..PatternNote::default()
+                },
+            ],
+            ..Pattern::default()
+        };
+        let members = piano_roll_note_group_members(&pattern, pattern.id, 2, 0);
+        assert_eq!(members, vec![(7, 2, 0), (7, 2, 1)]);
+
+        let mut selected = BTreeSet::new();
+        assert!(toggle_piano_roll_note_group_selection(
+            &mut selected,
+            &members,
+            true
+        ));
+        assert_eq!(selected, BTreeSet::from([(7, 2, 0), (7, 2, 1)]));
+        assert!(!toggle_piano_roll_note_group_selection(
+            &mut selected,
+            &members,
+            true
+        ));
+        assert!(selected.is_empty());
+
+        let mut selected_by_box = BTreeSet::new();
+        update_piano_roll_box_selection(&pattern, 7, 2, &[0, 2], true, &mut selected_by_box);
+        assert_eq!(
+            selected_by_box,
+            BTreeSet::from([(7, 2, 0), (7, 2, 1), (7, 2, 2)])
+        );
+        update_piano_roll_box_selection(&pattern, 7, 2, &[0, 2], true, &mut selected_by_box);
+        assert!(selected_by_box.is_empty());
+
+        assert_eq!(next_piano_roll_note_group(&pattern, 2), Some(1));
+        let occupied = Pattern {
+            notes: vec![PatternNote {
+                channel_id: 2,
+                group: 1,
+                ..PatternNote::default()
+            }],
+            ..pattern.clone()
+        };
+        assert_eq!(next_piano_roll_note_group(&occupied, 2), Some(2));
+        assert_eq!(next_piano_roll_note_group(&pattern, 3), Some(1));
     }
 
     #[test]
