@@ -27,6 +27,21 @@ const SAMPLER_ROOT_KEY: u16 = 60;
 const SAMPLER_BLOCK_FRAMES: usize = 1_024;
 static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum PanLaw {
+    #[default]
+    Circular,
+    Triangular,
+}
+
+/// Unknown stored modes fall back to FL Studio's documented default, Circular.
+pub(crate) fn project_pan_law(document: &FlpDocument) -> PanLaw {
+    match document.metadata().pan_law_raw() {
+        Some(2) => PanLaw::Triangular,
+        _ => PanLaw::Circular,
+    }
+}
+
 fn resolve_sampler_root_key(
     saved_root_key: Option<u16>,
     sample_root_key: Option<u16>,
@@ -1014,13 +1029,14 @@ fn stream_prepared_playlist_render(
     let release_frames = (f64::from(options.sample_rate) * SAMPLER_RELEASE_SECONDS)
         .round()
         .max(1.0) as usize;
-    let mut sampler_engine = SamplerVoiceEngine::with_resampling_quality(
+    let mut sampler_engine = SamplerVoiceEngine::with_resampling_quality_and_pan_law(
         &render.sampler.sources_by_channel,
         &render.sampler.notes,
         options.sampler_voice_limit,
         release_frames,
         options.sample_rate,
         options.resampling_quality,
+        render.sampler.pan_law,
     );
     sampler_engine.mixer_transforms_by_channel = Some(&render.sampler.mixer_transforms_by_channel);
     if let Some(processor) = render.vst3_processor.as_deref_mut() {
@@ -1174,13 +1190,14 @@ fn stream_prepared_sampler_pattern(
     let release_frames = (f64::from(render.summary.sample_rate) * SAMPLER_RELEASE_SECONDS)
         .round()
         .max(1.0) as usize;
-    let mut engine = SamplerVoiceEngine::with_resampling_quality(
+    let mut engine = SamplerVoiceEngine::with_resampling_quality_and_pan_law(
         &render.sources_by_channel,
         &render.notes,
         render.voice_limit,
         release_frames,
         render.summary.sample_rate,
         render.resampling_quality,
+        render.pan_law,
     );
     engine.mixer_transforms_by_channel = Some(&render.mixer_transforms_by_channel);
     let mut block = vec![0.0f32; SAMPLER_BLOCK_FRAMES * 2];
@@ -1352,6 +1369,7 @@ fn prepare_audio_clip_render(
     if !tempo_bpm.is_finite() || tempo_bpm <= 0.0 {
         return Err("project tempo must be finite and positive".to_owned());
     }
+    let pan_law = project_pan_law(document);
     let arrangement = document
         .arrangements()
         .map_err(|error| error.to_string())?
@@ -1519,6 +1537,7 @@ fn prepare_audio_clip_render(
             duration_frames,
             gain: *gain,
             pan: *pan,
+            pan_law,
             mixer_transform: *mixer_transform,
         });
     }
@@ -1753,6 +1772,7 @@ pub(crate) fn schedule_playlist_pattern_notes<'a>(
 
 struct PreparedSamplerArrangement {
     summary: SamplerPatternRenderSummary,
+    pan_law: PanLaw,
     notes: Vec<ScheduledSamplerNote>,
     sources_by_channel: HashMap<u16, SamplerVoiceSource>,
     mixer_transforms_by_channel: HashMap<u16, MixerInsertSignalTransform>,
@@ -1784,6 +1804,7 @@ fn prepare_sampler_arrangement(
     if !tempo_bpm.is_finite() || tempo_bpm <= 0.0 {
         return Err("project tempo must be finite and positive".to_owned());
     }
+    let pan_law = project_pan_law(document);
     let arrangement = document
         .arrangements()
         .map_err(|error| error.to_string())?
@@ -1848,6 +1869,7 @@ fn prepare_sampler_arrangement(
                 notes_skipped_unresolved_sample: 0,
                 unresolved_sample_channels: Vec::new(),
             },
+            pan_law,
             notes: Vec::new(),
             sources_by_channel: HashMap::new(),
             mixer_transforms_by_channel: HashMap::new(),
@@ -2022,6 +2044,7 @@ fn prepare_sampler_arrangement(
             notes_skipped_unresolved_sample: skipped_unresolved,
             unresolved_sample_channels: unresolved_sample_channels.into_iter().collect(),
         },
+        pan_law,
         notes,
         sources_by_channel,
         mixer_transforms_by_channel,
@@ -2033,6 +2056,7 @@ fn prepare_sampler_arrangement(
 
 struct PreparedSamplerPattern {
     summary: SamplerPatternRenderSummary,
+    pan_law: PanLaw,
     notes: Vec<ScheduledSamplerNote>,
     sources_by_channel: HashMap<u16, SamplerVoiceSource>,
     mixer_transforms_by_channel: HashMap<u16, MixerInsertSignalTransform>,
@@ -2099,6 +2123,7 @@ fn prepare_sampler_pattern(
         .into_iter()
         .find(|pattern| pattern.id == options.pattern_id)
         .ok_or_else(|| format!("pattern {} was not found", options.pattern_id))?;
+    let pan_law = project_pan_law(document);
     let global_swing_mix_raw = document.metadata().global_swing_mix();
     let channels = document.channels();
     let mixer_route_audibility = MixerRouteAudibility::from_inserts(document.mixer_inserts());
@@ -2326,6 +2351,7 @@ fn prepare_sampler_pattern(
             notes_skipped_unresolved_sample: skipped_unresolved,
             unresolved_sample_channels: unresolved_sample_channels.into_iter().collect(),
         },
+        pan_law,
         notes,
         sources_by_channel,
         mixer_transforms_by_channel,
@@ -2339,6 +2365,7 @@ struct SamplerVoiceEngine<'a> {
     sources_by_channel: &'a HashMap<u16, SamplerVoiceSource>,
     notes: &'a [ScheduledSamplerNote],
     mixer_transforms_by_channel: Option<&'a HashMap<u16, MixerInsertSignalTransform>>,
+    pan_law: PanLaw,
     next_note: usize,
     voices: Vec<Option<SamplerVoice>>,
     release_frames: usize,
@@ -2389,10 +2416,31 @@ impl<'a> SamplerVoiceEngine<'a> {
         output_sample_rate: u32,
         resampling_quality: ResamplingQuality,
     ) -> Self {
+        Self::with_resampling_quality_and_pan_law(
+            sources_by_channel,
+            notes,
+            voice_limit,
+            release_frames,
+            output_sample_rate,
+            resampling_quality,
+            PanLaw::Circular,
+        )
+    }
+
+    fn with_resampling_quality_and_pan_law(
+        sources_by_channel: &'a HashMap<u16, SamplerVoiceSource>,
+        notes: &'a [ScheduledSamplerNote],
+        voice_limit: usize,
+        release_frames: usize,
+        output_sample_rate: u32,
+        resampling_quality: ResamplingQuality,
+        pan_law: PanLaw,
+    ) -> Self {
         Self {
             sources_by_channel,
             notes,
             mixer_transforms_by_channel: None,
+            pan_law,
             next_note: 0,
             voices: std::iter::repeat_with(|| None).take(voice_limit).collect(),
             release_frames,
@@ -2517,7 +2565,7 @@ impl<'a> SamplerVoiceEngine<'a> {
             source_step
         };
         let (left_gain, right_gain) =
-            sampler_pan_gains(source.pan, source.audio.channels.len() == 1);
+            channel_pan_gains(source.pan, source.audio.channels.len() == 1, self.pan_law);
         let velocity_gain = f32::from(note.velocity.min(127)) / 127.0;
         let mixer_transform = self
             .mixer_transforms_by_channel
@@ -2599,11 +2647,17 @@ fn advance_sampler_voice_position(voice: &mut SamplerVoice) {
     }
 }
 
-fn sampler_pan_gains(pan: f32, mono: bool) -> (f32, f32) {
+/// Apply the project pan law to mono sources; stereo sources retain linear balance panning.
+pub(crate) fn channel_pan_gains(pan: f32, mono: bool, pan_law: PanLaw) -> (f32, f32) {
     let pan = pan.clamp(-1.0, 1.0);
     if mono {
-        let angle = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
-        (angle.cos(), angle.sin())
+        match pan_law {
+            PanLaw::Circular => {
+                let angle = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
+                (angle.cos(), angle.sin())
+            }
+            PanLaw::Triangular => ((1.0 - pan) * 0.5, (1.0 + pan) * 0.5),
+        }
     } else if pan < 0.0 {
         (1.0, 1.0 + pan)
     } else {
@@ -2758,6 +2812,7 @@ struct PreparedClip {
     duration_frames: u64,
     gain: f32,
     pan: f32,
+    pan_law: PanLaw,
     mixer_transform: MixerInsertSignalTransform,
 }
 
@@ -2938,9 +2993,8 @@ fn mix_clip_window_into_stereo_with_quality(
     if overlap_start >= overlap_end {
         return Ok(());
     }
-    let pan = clip.pan.clamp(-1.0, 1.0);
-    let left_gain = (1.0 - pan.max(0.0)) * clip.gain;
-    let right_gain = (1.0 + pan.min(0.0)) * clip.gain;
+    let (left_pan_gain, right_pan_gain) =
+        channel_pan_gains(clip.pan, source.channels.len() == 1, clip.pan_law);
     let source_frames_per_output = f64::from(source.sample_rate) / f64::from(output_rate);
     for output_frame in overlap_start..overlap_end {
         let output_offset = output_frame - clip.start_frame;
@@ -2970,7 +3024,10 @@ fn mix_clip_window_into_stereo_with_quality(
         let output_index = usize::try_from(output_frame - mix_start_frame)
             .map_err(|_| "audio output frame index exceeds this platform".to_owned())?
             * 2;
-        let mut frame = [left * left_gain, right * right_gain];
+        let mut frame = [
+            left * clip.gain * left_pan_gain,
+            right * clip.gain * right_pan_gain,
+        ];
         clip.mixer_transform.apply_frame(&mut frame);
         mix[output_index] += frame[0];
         mix[output_index + 1] += frame[1];
@@ -3639,6 +3696,7 @@ mod tests {
                 duration_frames: 2,
                 gain: 0.5,
                 pan: 0.0,
+                pan_law: PanLaw::Circular,
                 mixer_transform: MixerInsertSignalTransform::default(),
             }],
         };
@@ -3653,6 +3711,7 @@ mod tests {
                 notes_skipped_unresolved_sample: 0,
                 unresolved_sample_channels: Vec::new(),
             },
+            pan_law: PanLaw::Circular,
             notes: vec![ScheduledSamplerNote {
                 start_frame: 0,
                 stop_frame: None,
@@ -3764,11 +3823,25 @@ mod tests {
             duration_frames: 4,
             gain: 1.0,
             pan: 0.0,
+            pan_law: PanLaw::Circular,
             mixer_transform: MixerInsertSignalTransform::default(),
         };
         let mut mix = vec![0.0; 8];
         mix_clip_into_stereo(&mut mix, &source, &clip, 4, None).unwrap();
-        assert_eq!(mix, vec![0.0, 0.0, 0.5, 0.5, 1.0, 1.0, 1.0, 1.0]);
+        let center_gain = std::f32::consts::FRAC_1_SQRT_2;
+        let expected = [
+            0.0,
+            0.0,
+            0.5 * center_gain,
+            0.5 * center_gain,
+            center_gain,
+            center_gain,
+            center_gain,
+            center_gain,
+        ];
+        for (actual, expected) in mix.iter().zip(expected) {
+            assert!((actual - expected).abs() < 1.0e-6);
+        }
     }
 
     #[test]
@@ -3786,6 +3859,7 @@ mod tests {
             duration_frames: 1,
             gain: 1.0,
             pan: 0.0,
+            pan_law: PanLaw::Circular,
             mixer_transform: MixerInsertSignalTransform::new(true, true),
         };
         let mut mix = vec![0.0; 2];
@@ -3814,6 +3888,7 @@ mod tests {
             duration_frames: 5,
             gain: 0.5,
             pan: 0.5,
+            pan_law: PanLaw::Circular,
             mixer_transform: MixerInsertSignalTransform::default(),
         };
         let render = PreparedAudioClipRender {
@@ -3861,6 +3936,30 @@ mod tests {
         assert_eq!(channel_gain_pan(Some(5_000), Some(0)), (0.5, -1.0));
         assert_eq!(channel_gain_pan(Some(12_800), Some(12_800)), (1.28, 1.0));
         assert_eq!(channel_gain_pan(None, None), (1.0, 0.0));
+    }
+
+    #[test]
+    fn mono_pan_gain_curves_match_circular_and_triangular_project_laws() {
+        let circular_center = channel_pan_gains(0.0, true, PanLaw::Circular);
+        let equal_power = std::f32::consts::FRAC_1_SQRT_2;
+        assert!((circular_center.0 - equal_power).abs() < 1.0e-6);
+        assert!((circular_center.1 - equal_power).abs() < 1.0e-6);
+
+        assert_eq!(channel_pan_gains(0.0, true, PanLaw::Triangular), (0.5, 0.5));
+        assert_eq!(
+            channel_pan_gains(-1.0, true, PanLaw::Triangular),
+            (1.0, 0.0)
+        );
+        assert_eq!(channel_pan_gains(1.0, true, PanLaw::Triangular), (0.0, 1.0));
+    }
+
+    #[test]
+    fn stereo_balance_curve_is_independent_of_mono_pan_law() {
+        assert_eq!(channel_pan_gains(-0.5, false, PanLaw::Circular), (1.0, 0.5));
+        assert_eq!(
+            channel_pan_gains(-0.5, false, PanLaw::Triangular),
+            (1.0, 0.5)
+        );
     }
 
     #[test]

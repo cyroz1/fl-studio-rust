@@ -14,8 +14,8 @@ use std::thread;
 
 use crate::audio::StreamingAudioWriter;
 use crate::sample_render::{
-    PlaylistRenderOptions, PlaylistTrackFilter, channel_gain_pan, schedule_playlist_pattern_notes,
-    swing_note_start_tick,
+    PlaylistRenderOptions, PlaylistTrackFilter, channel_gain_pan, channel_pan_gains,
+    project_pan_law, schedule_playlist_pattern_notes, swing_note_start_tick,
 };
 use crate::{
     ChannelNoteRouter, ChannelPluginState, FlpDocument, MixerInsertSignalTransform,
@@ -1095,6 +1095,7 @@ impl Vst3HostRuntime {
         if !tempo_bpm.is_finite() || tempo_bpm <= 0.0 {
             return Err("project tempo must be finite and positive".to_owned());
         }
+        let pan_law = project_pan_law(document);
         let arrangement = document
             .arrangements()
             .map_err(|error| error.to_string())?
@@ -1246,7 +1247,7 @@ impl Vst3HostRuntime {
                 )?
             };
             let (left_pan_gain, right_pan_gain) =
-                playlist_plugin_pan_gains(pan, render.output_channels == 1);
+                channel_pan_gains(pan, render.output_channels == 1, pan_law);
             let resampler = StereoStreamResampler::new(render.sample_rate_u32, output_sample_rate)?;
             notes_scheduled += render.note_count;
             streams.push(PlaylistPluginStream {
@@ -1455,18 +1456,6 @@ fn scheduled_playlist_midi_events(
     }
     events.sort_by_key(|event| (event.frame, event.priority));
     Ok((events, note_count))
-}
-
-fn playlist_plugin_pan_gains(pan: f32, mono: bool) -> (f32, f32) {
-    let pan = pan.clamp(-1.0, 1.0);
-    if mono {
-        let angle = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
-        (angle.cos(), angle.sin())
-    } else if pan < 0.0 {
-        (1.0, 1.0 + pan)
-    } else {
-        (1.0 - pan, 1.0)
-    }
 }
 
 fn prepare_pattern_render_with_automation(
