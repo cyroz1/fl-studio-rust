@@ -32,7 +32,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --yes ffmpeg libasound2-dev libxcb1-dev mesa-vulkan-drivers xvfb
+          sudo apt-get install --yes ffmpeg libasound2-dev libxcb1-dev libxkbcommon-x11-0 mesa-vulkan-drivers xvfb
 
       - name: Check formatting
         run: cargo fmt --all -- --check
