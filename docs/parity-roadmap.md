@@ -296,9 +296,10 @@ implementation).
 
 Current: experimental offline renders include audio clips, Sampler Pattern
 Clips, and mapped VST3 instruments in one bounded Playlist mix to WAV, FLAC,
-or OGG. The desktop dialog can choose 16/24-bit integer PCM or 32-bit float
-WAV, 16/24-bit integer FLAC, or Ogg Vorbis at a target average bitrate; all
-three support stereo or mono channel modes. Renders can append up to five
+OGG, or MP3. The desktop dialog can choose 16/24-bit integer PCM or 32-bit
+float WAV, 16/24-bit integer FLAC, Ogg Vorbis at a target average bitrate, or
+MP3 at a constant bitrate from 32 to 320 kbps. All four formats support stereo
+or mono channel modes; MP3 output is limited to 32, 44.1, or 48 kHz. Renders can append up to five
 seconds after the final scheduled clip, and 16-bit PCM WAV can apply TPDF
 dither. This first combined renderer uses base tempo and provisional channel
 volume/pan; it does not apply automation, full Mixer routing/effects, or PDC.
@@ -309,14 +310,15 @@ are applied where the Mixer rows below describe. Full export surface:
   samples + automation + FX + PDC): the desktop can render enabled Playlist
   audio clips, Sampler Pattern Clips, and mapped installed VST3 instruments in
   bounded blocks to WAV with 16/24-bit integer PCM or 32-bit float output,
-  16/24-bit FLAC, or Ogg Vorbis with a 64–450 kbps target average bitrate, and
-  stereo, merged mono, left-only, or right-only channels. The dialog also has
+  16/24-bit FLAC, Ogg Vorbis with a 64–450 kbps target average bitrate, or MP3
+  with a 32–320 kbps constant bitrate at 32, 44.1, or 48 kHz, and stereo,
+  merged mono, left-only, or right-only channels. The dialog also has
   0/1/2/5-second minimum tail presets and an optional finite VST3 tail extension
   capped at 60 seconds. Automation, full Mixer routing/effects, PDC, native
   level comparison, and other export options remain incomplete; recognized
   Mixer mute/solo/phase/swap flags are applied to supported sources as noted
   above.
-- `[partial]` Formats: the desktop full-song Playlist renderer supports WAV at 16/24-bit integer PCM or 32-bit float, FLAC at 16/24-bit integer, and streamed Ogg Vorbis at a 64–450 kbps target average bitrate; all support stereo, merged mono, left-only, or right-only channels. WAV and compressed formats are written from bounded render blocks; FLAC records STREAMINFO length and PCM MD5, while OGG uses average-bitrate Vorbis encoding. Lossy OGG is not bit-identical to WAV/FLAC and does not apply PCM dither. Audio-clip, selected Audio Clip, and Sampler-pattern renderers remain WAV-only with shared TPDF dither for 16-bit PCM. MP3 export remains todo ([Image-Line export manual](https://www.image-line.com/fl-studio-learning/fl-studio-online-manual/html/fformats_save_export.htm)).
+- `[partial]` Formats: the desktop full-song Playlist renderer supports WAV at 16/24-bit integer PCM or 32-bit float, FLAC at 16/24-bit integer, streamed Ogg Vorbis at a 64–450 kbps target average bitrate, and constant-bitrate MP3 at discrete rates from 32 to 320 kbps. All support stereo, merged mono, left-only, or right-only channels; MP3 output is limited to 32, 44.1, or 48 kHz. WAV and compressed formats are written from bounded render blocks; FLAC records STREAMINFO length and PCM MD5, while OGG and MP3 use Vorbis ABR and LAME CBR encoding. Lossy OGG and MP3 are not bit-identical to WAV/FLAC and do not apply PCM dither. Audio-clip, selected Audio Clip, and Sampler-pattern renderers remain WAV-only with shared TPDF dither for 16-bit PCM ([Image-Line export manual](https://www.image-line.com/fl-studio-learning/fl-studio-online-manual/html/fformats_save_export.htm)).
 - `[partial]` Render options: the Playlist mix dialog offers channel modes, 0/1/2/5-second base tails, optional finite VST3 instrument tail extension capped at 60 seconds (infinite reports use the selected base tail), optional unshaped TPDF dither for 16-bit PCM, and Linear, 6-point Hermite, or 16/24/32/64/128/256/512-point windowed-sinc resampling, defaulting to 32-point sinc and retaining the selected quality between launches. Live playback offers Linear, 6-point Hermite, and 24/64/128/256/512-point sinc, defaulting to 24-point sinc as documented by Image-Line. High-frequency shaped dither, automatic “Leave remainder” tail rendering, exact interpolation coefficients, and Mixer effect tail detection remain todo. Hermite remains a local six-sample quintic curve; sinc modes share a local variable-width Blackman-windowed kernel. These are not claims of bit-identical FL Studio output ([Image-Line export manual](https://www.image-line.com/fl-studio-learning/fl-studio-online-manual/html/fformats_save_export.htm), [Audio settings manual](https://www.image-line.com/fl-studio-learning/fl-studio-online-manual/html/envsettings_audio.htm), [Image-Line export quality discussion](https://forum.image-line.com/viewtopic.php?p=1886536)).
 - `[todo]` Stem export: split mixer tracks, "split channel tracks"
 - `[partial]` Selected Playlist clip render: File > Export can write one

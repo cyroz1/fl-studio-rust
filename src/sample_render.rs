@@ -14,6 +14,10 @@ use flacenc::component::{BitRepr, Frame, FrameOffset, Stream};
 use flacenc::error::Verify;
 use flacenc::source::{Fill, FrameBuf};
 use md5::{Digest, Md5};
+use mp3lame_encoder::{
+    Bitrate as Mp3Bitrate, Builder as Mp3EncoderBuilder, Encoder as Mp3Encoder, FlushNoGap,
+    InterleavedPcm, Mode as Mp3Mode, MonoPcm, Quality as Mp3Quality,
+};
 #[cfg(test)]
 use vorbis_rs::VorbisDecoder;
 use vorbis_rs::{VorbisBitrateManagementStrategy, VorbisEncoder, VorbisEncoderBuilder};
@@ -38,6 +42,9 @@ const FLAC_BLOCK_FRAMES: usize = 4_096;
 const FLAC_MAX_SAMPLE_FRAMES: u64 = (1_u64 << 36) - 1;
 const OGG_MIN_BITRATE_KBPS: u16 = 64;
 const OGG_MAX_BITRATE_KBPS: u16 = 450;
+pub const MP3_BITRATES_KBPS: [u16; 13] =
+    [32, 40, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320];
+const MP3_SAMPLE_RATES: [u32; 3] = [32_000, 44_100, 48_000];
 static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -761,11 +768,33 @@ pub fn render_playlist_with_vst3_to_ogg_cancellable(
     )
 }
 
+/// Render a full Playlist arrangement to an MP3 at the requested constant bitrate.
+pub fn render_playlist_with_vst3_to_mp3_cancellable(
+    document: &FlpDocument,
+    project_path: impl AsRef<Path>,
+    options: PlaylistRenderOptions,
+    output_path: impl AsRef<Path>,
+    bitrate_kbps: u16,
+    vst3_processor: Option<Vst3PlaylistStreamProcessor>,
+    cancelled: &AtomicBool,
+) -> Result<PlaylistRenderSummary, String> {
+    render_playlist_with_vst3_cancellable(
+        document,
+        project_path,
+        options,
+        output_path,
+        PlaylistRenderOutput::Mp3 { bitrate_kbps },
+        vst3_processor,
+        cancelled,
+    )
+}
+
 #[derive(Clone, Copy)]
 enum PlaylistRenderOutput {
     Wav,
     Flac { bits_per_sample: u8 },
     Ogg { bitrate_kbps: u16 },
+    Mp3 { bitrate_kbps: u16 },
 }
 
 fn render_playlist_with_vst3_cancellable(
@@ -793,6 +822,17 @@ fn render_playlist_with_vst3_cancellable(
                 return Err(format!(
                     "OGG output bitrate must be between {OGG_MIN_BITRATE_KBPS} and {OGG_MAX_BITRATE_KBPS} kbps"
                 ));
+            }
+        }
+        PlaylistRenderOutput::Mp3 { bitrate_kbps } => {
+            validate_mp3_output_path(project_path, output_path)?;
+            if !MP3_BITRATES_KBPS.contains(&bitrate_kbps) {
+                return Err(format!("unsupported MP3 bitrate: {bitrate_kbps} kbps"));
+            }
+            if !MP3_SAMPLE_RATES.contains(&options.sample_rate) {
+                return Err(
+                    "MP3 output supports sample rates of 32000, 44100, or 48000 Hz".to_owned(),
+                );
             }
         }
     }
@@ -976,6 +1016,28 @@ fn render_playlist_with_vst3_cancellable(
             )?;
             encoder.finalize()?;
         }
+        PlaylistRenderOutput::Mp3 { bitrate_kbps } => {
+            let mut encoder = StreamingMp3Writer::new(
+                file,
+                options.sample_rate,
+                options.wav_channel_mode,
+                bitrate_kbps,
+            )?;
+            summary.voices_stolen = stream_prepared_playlist_render(
+                PreparedPlaylistBlockMix {
+                    audio: &audio,
+                    sampler: &sampler,
+                    options,
+                    frames,
+                    master_output,
+                    vst3_processor: vst3_processor.as_mut(),
+                },
+                cancelled,
+                || false,
+                |block| encoder.write_stereo_block(block),
+            )?;
+            encoder.finalize()?;
+        }
     }
     temporary.commit(output_path)?;
     Ok(summary)
@@ -1057,6 +1119,133 @@ impl<'a> StreamingOggWriter<'a> {
             .map(|_| ())
             .map_err(|error| format!("could not finalize OGG stream: {error}"))
     }
+}
+
+struct StreamingMp3Writer<'a> {
+    file: &'a mut File,
+    encoder: Mp3Encoder,
+    channel_mode: WavChannelMode,
+    channel_buffers: Vec<Vec<f32>>,
+    encoded_buffer: Vec<u8>,
+}
+
+impl<'a> StreamingMp3Writer<'a> {
+    fn new(
+        file: &'a mut File,
+        sample_rate: u32,
+        channel_mode: WavChannelMode,
+        bitrate_kbps: u16,
+    ) -> Result<Self, String> {
+        let channels = channel_mode.channel_count() as u8;
+        let bitrate = mp3_bitrate(bitrate_kbps)
+            .ok_or_else(|| format!("unsupported MP3 bitrate: {bitrate_kbps} kbps"))?;
+        let mut builder =
+            Mp3EncoderBuilder::new().ok_or_else(|| "could not allocate MP3 encoder".to_owned())?;
+        builder
+            .set_num_channels(channels)
+            .map_err(|error| format!("could not configure MP3 channel count: {error:?}"))?;
+        builder
+            .set_sample_rate(sample_rate)
+            .map_err(|error| format!("could not configure MP3 sample rate: {error:?}"))?;
+        builder
+            .set_output_sample_rate(std::num::NonZeroU32::new(sample_rate))
+            .map_err(|error| format!("could not configure MP3 output rate: {error:?}"))?;
+        builder
+            .set_brate(bitrate)
+            .map_err(|error| format!("could not configure MP3 bitrate: {error:?}"))?;
+        builder
+            .set_quality(Mp3Quality::Best)
+            .map_err(|error| format!("could not configure MP3 quality: {error:?}"))?;
+        builder
+            .set_mode(if channels == 1 {
+                Mp3Mode::Mono
+            } else {
+                Mp3Mode::JointStereo
+            })
+            .map_err(|error| format!("could not configure MP3 channel mode: {error:?}"))?;
+        let encoder = builder
+            .build()
+            .map_err(|error| format!("could not initialize MP3 encoder: {error:?}"))?;
+        let capacity = mp3lame_encoder::max_required_buffer_size(STREAM_BLOCK_FRAMES);
+
+        Ok(Self {
+            file,
+            encoder,
+            channel_mode,
+            channel_buffers: (0..usize::from(channels))
+                .map(|_| Vec::with_capacity(STREAM_BLOCK_FRAMES))
+                .collect(),
+            encoded_buffer: Vec::with_capacity(capacity),
+        })
+    }
+}
+
+impl StreamingMp3Writer<'_> {
+    fn write_stereo_block(&mut self, stereo_block: &[f32]) -> Result<(), String> {
+        if !stereo_block.len().is_multiple_of(2) {
+            return Err("render block must contain interleaved stereo frames".to_owned());
+        }
+        let frame_count = stereo_block.len() / 2;
+        for channel in &mut self.channel_buffers {
+            channel.clear();
+        }
+        if self.channel_mode != WavChannelMode::Stereo {
+            for frame in stereo_block.as_chunks::<2>().0 {
+                let sample = match self.channel_mode {
+                    WavChannelMode::Stereo => unreachable!(),
+                    WavChannelMode::MonoMerged => frame[0] * 0.5 + frame[1] * 0.5,
+                    WavChannelMode::MonoLeft => frame[0],
+                    WavChannelMode::MonoRight => frame[1],
+                };
+                self.channel_buffers[0].push(sample);
+            }
+        }
+        self.encoded_buffer.clear();
+        self.encoded_buffer
+            .reserve(mp3lame_encoder::max_required_buffer_size(frame_count));
+        let result = if self.channel_mode == WavChannelMode::Stereo {
+            self.encoder
+                .encode_to_vec(InterleavedPcm(stereo_block), &mut self.encoded_buffer)
+        } else {
+            self.encoder
+                .encode_to_vec(MonoPcm(&self.channel_buffers[0]), &mut self.encoded_buffer)
+        };
+        result.map_err(|error| format!("could not encode MP3 audio block: {error:?}"))?;
+        self.file
+            .write_all(&self.encoded_buffer)
+            .map_err(|error| format!("could not write rendered MP3 data: {error}"))
+    }
+
+    fn finalize(mut self) -> Result<(), String> {
+        self.encoded_buffer.clear();
+        self.encoded_buffer
+            .reserve(mp3lame_encoder::max_required_buffer_size(0));
+        self.encoder
+            .flush_to_vec::<FlushNoGap>(&mut self.encoded_buffer)
+            .map_err(|error| format!("could not finalize MP3 stream: {error:?}"))?;
+        self.file
+            .write_all(&self.encoded_buffer)
+            .map_err(|error| format!("could not write MP3 trailer: {error}"))
+    }
+}
+
+fn mp3_bitrate(bitrate_kbps: u16) -> Option<Mp3Bitrate> {
+    Some(match bitrate_kbps {
+        32 => Mp3Bitrate::Kbps32,
+        40 => Mp3Bitrate::Kbps40,
+        48 => Mp3Bitrate::Kbps48,
+        64 => Mp3Bitrate::Kbps64,
+        80 => Mp3Bitrate::Kbps80,
+        96 => Mp3Bitrate::Kbps96,
+        112 => Mp3Bitrate::Kbps112,
+        128 => Mp3Bitrate::Kbps128,
+        160 => Mp3Bitrate::Kbps160,
+        192 => Mp3Bitrate::Kbps192,
+        224 => Mp3Bitrate::Kbps224,
+        256 => Mp3Bitrate::Kbps256,
+        320 => Mp3Bitrate::Kbps320,
+        _ => return None,
+    })
 }
 
 struct StreamingFlacWriter<'a> {
@@ -3514,6 +3703,10 @@ fn validate_ogg_output_path(project_path: &Path, output_path: &Path) -> Result<(
     validate_output_path_with_extension(project_path, output_path, "ogg")
 }
 
+fn validate_mp3_output_path(project_path: &Path, output_path: &Path) -> Result<(), String> {
+    validate_output_path_with_extension(project_path, output_path, "mp3")
+}
+
 fn validate_output_path_with_extension(
     project_path: &Path,
     output_path: &Path,
@@ -5161,6 +5354,55 @@ mod tests {
             }
             assert!(decoded_frames > 0);
             assert!(contains_audio);
+        }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn streams_decodable_mp3_blocks_for_each_channel_mode() {
+        let root = std::env::temp_dir().join(format!(
+            "flp-mp3-render-test-{}-{}",
+            std::process::id(),
+            NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+
+        for (index, (channel_mode, expected_channels)) in [
+            (WavChannelMode::Stereo, 2),
+            (WavChannelMode::MonoMerged, 1),
+            (WavChannelMode::MonoLeft, 1),
+            (WavChannelMode::MonoRight, 1),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let output = root.join(format!("stream-{index}.mp3"));
+            let mut file = File::create(&output).unwrap();
+            let mut writer = StreamingMp3Writer::new(&mut file, 48_000, channel_mode, 192).unwrap();
+            for block_index in 0..48 {
+                let mut stereo_block = Vec::with_capacity(STREAM_BLOCK_FRAMES * 2);
+                for frame_index in 0..STREAM_BLOCK_FRAMES {
+                    let sample_index = block_index * STREAM_BLOCK_FRAMES + frame_index;
+                    let phase = std::f32::consts::TAU * sample_index as f32 / 96.0;
+                    stereo_block.extend_from_slice(&[phase.sin() * 0.25, phase.cos() * 0.25]);
+                }
+                writer.write_stereo_block(&stereo_block).unwrap();
+            }
+            writer.finalize().unwrap();
+            drop(file);
+
+            let decoded = decode_audio_file(&output).unwrap();
+            assert_eq!(decoded.sample_rate, 48_000);
+            assert_eq!(decoded.channels.len(), expected_channels);
+            assert!(decoded.channels[0].len() > 0);
+            assert!(
+                decoded
+                    .channels
+                    .iter()
+                    .flatten()
+                    .any(|sample| sample.abs() > 0.01)
+            );
         }
 
         fs::remove_dir_all(root).unwrap();

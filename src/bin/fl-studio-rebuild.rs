@@ -19,13 +19,14 @@ use flp_rebuild::midi::{MidiChannelMapping, MidiFile};
 use flp_rebuild::plugins::{PluginCandidate, PluginFormat, scan_installed_plugins};
 use flp_rebuild::project_package::ProjectPackageWorkspace;
 use flp_rebuild::sample_render::{
-    AudioClipRenderOptions, AudioClipRenderSummary, AudioRecordingSummary, PlaylistRenderOptions,
-    PlaylistRenderSummary, ResamplingQuality, SamplerPatternRenderOptions,
+    AudioClipRenderOptions, AudioClipRenderSummary, AudioRecordingSummary, MP3_BITRATES_KBPS,
+    PlaylistRenderOptions, PlaylistRenderSummary, ResamplingQuality, SamplerPatternRenderOptions,
     SamplerPatternRenderSummary, WavChannelMode, WavDitherMode, WavSampleFormat,
     render_audio_clips_to_wav, render_playlist_with_vst3_to_flac_cancellable,
-    render_playlist_with_vst3_to_ogg_cancellable, render_playlist_with_vst3_to_wav_cancellable,
-    render_sampler_pattern_to_wav, stream_playlist_with_vst3_to_device_from_frame,
-    stream_sampler_pattern_to_device, write_input_recording_to_wav,
+    render_playlist_with_vst3_to_mp3_cancellable, render_playlist_with_vst3_to_ogg_cancellable,
+    render_playlist_with_vst3_to_wav_cancellable, render_sampler_pattern_to_wav,
+    stream_playlist_with_vst3_to_device_from_frame, stream_sampler_pattern_to_device,
+    write_input_recording_to_wav,
 };
 use flp_rebuild::vst3::{
     MAX_REPORTED_TAIL_SECONDS, Vst3HostRuntime, Vst3PatternRenderOptions, Vst3PatternStreamHandle,
@@ -98,6 +99,7 @@ enum PlaylistSongOutputFormat {
     Wav,
     Flac,
     Ogg,
+    Mp3,
 }
 
 impl PlaylistSongOutputFormat {
@@ -106,6 +108,7 @@ impl PlaylistSongOutputFormat {
             Self::Wav => "WAV",
             Self::Flac => "FLAC",
             Self::Ogg => "OGG",
+            Self::Mp3 => "MP3",
         }
     }
 
@@ -114,6 +117,7 @@ impl PlaylistSongOutputFormat {
             Self::Wav => "wav",
             Self::Flac => "flac",
             Self::Ogg => "ogg",
+            Self::Mp3 => "mp3",
         }
     }
 }
@@ -1827,6 +1831,7 @@ struct DawUi {
     playlist_render_format: WavSampleFormat,
     playlist_render_flac_bits_per_sample: u8,
     playlist_render_ogg_bitrate_kbps: u16,
+    playlist_render_mp3_bitrate_kbps: u16,
     playlist_render_dither: bool,
     playlist_render_quality: ResamplingQuality,
     playlist_render_channel_mode: WavChannelMode,
@@ -2193,6 +2198,7 @@ impl DawUi {
             playlist_render_format: WavSampleFormat::Float32,
             playlist_render_flac_bits_per_sample: 24,
             playlist_render_ogg_bitrate_kbps: 192,
+            playlist_render_mp3_bitrate_kbps: 192,
             playlist_render_dither: false,
             playlist_render_quality,
             playlist_render_channel_mode: WavChannelMode::Stereo,
@@ -3579,6 +3585,11 @@ impl DawUi {
                                 PlaylistSongOutputFormat::Ogg,
                                 "OGG",
                             );
+                            ui.selectable_value(
+                                &mut self.playlist_song_output_format,
+                                PlaylistSongOutputFormat::Mp3,
+                                "MP3",
+                            );
                         });
                 });
                 match self.playlist_song_output_format {
@@ -3648,6 +3659,26 @@ impl DawUi {
                             );
                         });
                         ui.label("Ogg Vorbis is lossy. This sets the target average bit rate.");
+                    }
+                    PlaylistSongOutputFormat::Mp3 => {
+                        ui.horizontal(|ui| {
+                            ui.label("MP3 bit rate");
+                            egui::ComboBox::from_id_salt("playlist-render-mp3-bitrate")
+                                .selected_text(format!(
+                                    "{} kbps",
+                                    self.playlist_render_mp3_bitrate_kbps
+                                ))
+                                .show_ui(ui, |ui| {
+                                    for bitrate in MP3_BITRATES_KBPS {
+                                        ui.selectable_value(
+                                            &mut self.playlist_render_mp3_bitrate_kbps,
+                                            bitrate,
+                                            format!("{bitrate} kbps"),
+                                        );
+                                    }
+                                });
+                        });
+                        ui.label("MP3 is lossy; supported render rates are 32, 44.1, and 48 kHz.");
                     }
                 }
                 let mut render_quality_changed = false;
@@ -4709,6 +4740,11 @@ impl DawUi {
                                 PlaylistSongOutputFormat::Ogg,
                                 "OGG",
                             );
+                            ui.selectable_value(
+                                &mut self.playlist_song_output_format,
+                                PlaylistSongOutputFormat::Mp3,
+                                "MP3",
+                            );
                             if self.playlist_song_output_format == PlaylistSongOutputFormat::Flac {
                                 ui.separator();
                                 ui.label("FLAC bit depth");
@@ -4730,6 +4766,23 @@ impl DawUi {
                                         for bitrate in [64, 96, 128, 160, 192, 224, 256, 320, 450] {
                                             ui.selectable_value(
                                                 &mut self.playlist_render_ogg_bitrate_kbps,
+                                                bitrate,
+                                                format!("{bitrate} kbps"),
+                                            );
+                                        }
+                                    },
+                                );
+                            }
+                            if self.playlist_song_output_format == PlaylistSongOutputFormat::Mp3 {
+                                ui.menu_button(
+                                    format!(
+                                        "MP3 target: {} kbps",
+                                        self.playlist_render_mp3_bitrate_kbps
+                                    ),
+                                    |ui| {
+                                        for bitrate in MP3_BITRATES_KBPS {
+                                            ui.selectable_value(
+                                                &mut self.playlist_render_mp3_bitrate_kbps,
                                                 bitrate,
                                                 format!("{bitrate} kbps"),
                                             );
@@ -15449,12 +15502,14 @@ impl DawUi {
             PlaylistSongOutputFormat::Wav => file_dialog.add_filter("WAV audio", &["wav"]),
             PlaylistSongOutputFormat::Flac => file_dialog.add_filter("FLAC audio", &["flac"]),
             PlaylistSongOutputFormat::Ogg => file_dialog.add_filter("Ogg Vorbis audio", &["ogg"]),
+            PlaylistSongOutputFormat::Mp3 => file_dialog.add_filter("MP3 audio", &["mp3"]),
         };
         let Some(output_path) = file_dialog.save_file() else {
             return;
         };
         let flac_bits_per_sample = self.playlist_render_flac_bits_per_sample;
         let ogg_bitrate_kbps = self.playlist_render_ogg_bitrate_kbps;
+        let mp3_bitrate_kbps = self.playlist_render_mp3_bitrate_kbps;
 
         let options = PlaylistRenderOptions {
             arrangement_id: self.selected_arrangement.unwrap_or_default(),
@@ -15529,6 +15584,15 @@ impl DawUi {
                         options,
                         &output_path_for_worker,
                         ogg_bitrate_kbps,
+                        vst3_processor,
+                        &worker_cancelled,
+                    ),
+                    PlaylistSongOutputFormat::Mp3 => render_playlist_with_vst3_to_mp3_cancellable(
+                        &document,
+                        &project_path,
+                        options,
+                        &output_path_for_worker,
+                        mp3_bitrate_kbps,
                         vst3_processor,
                         &worker_cancelled,
                     ),
