@@ -17100,14 +17100,14 @@ impl DawUi {
                                             ui.set_max_width(104.0);
                                             ui.set_min_height((available_height - 42.0).max(180.0));
                                             ui.vertical(|ui| {
-                                                ui.small(format!(
-                                                    "{}",
-                                                    if insert.ordinal() == 0 {
-                                                        "MASTER".to_owned()
-                                                    } else {
-                                                        format!("INSERT {:02}", insert.ordinal())
-                                                    }
-                                                ));
+                                                if insert.ordinal() == 0 {
+                                                    ui.small("MASTER");
+                                                } else {
+                                                    ui.small(format!(
+                                                        "INSERT {:02}",
+                                                        insert.ordinal()
+                                                    ));
+                                                }
                                                 let display_name = insert
                                                     .name()
                                                     .filter(|name| !name.is_empty())

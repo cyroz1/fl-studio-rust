@@ -11576,7 +11576,7 @@ mod tests {
     use super::{
         ArticulateOptions, ChannelGroupSummary, ChannelNoteRouter, ChannelSortOrder,
         ChannelSummary, ClawMachineOptions, FlpDocument, FlpError, FlpEvent, FstPreset,
-        FstPresetKind, LimitNoteOptions, LimitSnapDirection, MixerParameterKind,
+        FstPresetKind, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerParameterKind,
         PATTERN_NOTE_SLIDE_FLAG, PatternControllerEdit, PatternNote, PatternNoteEdit,
         PayloadEncoding, PlaylistClipEdit, PlaylistClipTarget, PlaylistTrackEdit, ProjectInfoEdit,
         ProjectSettingsEdit, RiffMachineOptions, RiffMachineQuantizeMode, ScaleLevelsOptions,
