@@ -1698,6 +1698,7 @@ struct DawUi {
     channel_vst3_instances: BTreeMap<u16, u64>,
     audio_catalog: AudioDeviceCatalog,
     audio_settings: AudioSettings,
+    read_sample_root_note: bool,
     audio_engine: Option<AudioEngine>,
     audio_recording: Option<AudioRecordingSession>,
     audio_record_start_requested: bool,
@@ -1884,6 +1885,7 @@ impl DawUi {
         if let Some(rate) = audio_catalog.default_sample_rate {
             audio_settings.sample_rate = rate;
         }
+        let read_sample_root_note = load_read_sample_root_note();
         let browser_path = initial_project
             .as_deref()
             .and_then(Path::parent)
@@ -2056,6 +2058,7 @@ impl DawUi {
             channel_vst3_instances: BTreeMap::new(),
             audio_catalog,
             audio_settings,
+            read_sample_root_note,
             audio_engine: None,
             audio_recording: None,
             audio_record_start_requested: false,
@@ -4085,6 +4088,7 @@ impl DawUi {
             sample_rate,
             tail_seconds: 2,
             soloed_playlist_track_range: self.soloed_playlist_track_range,
+            read_sample_root_note: self.read_sample_root_note,
             ..PlaylistRenderOptions::default()
         };
         let vst3_processor = self
@@ -14666,6 +14670,7 @@ impl DawUi {
         };
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
+        let read_sample_root_note = self.read_sample_root_note;
         let (sender, receiver) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
             .name("sampler-note-preview".to_owned())
@@ -14679,6 +14684,7 @@ impl DawUi {
                             SamplerPatternRenderOptions {
                                 pattern_id,
                                 sample_rate: device_rate,
+                                read_sample_root_note,
                                 ..SamplerPatternRenderOptions::default()
                             },
                             &writer,
@@ -14901,6 +14907,7 @@ impl DawUi {
         };
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
+        let read_sample_root_note = self.read_sample_root_note;
         let (sender, receiver) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
             .name("sampler-pattern-stream".to_owned())
@@ -14914,6 +14921,7 @@ impl DawUi {
                             SamplerPatternRenderOptions {
                                 pattern_id,
                                 sample_rate: device_rate,
+                                read_sample_root_note,
                                 ..SamplerPatternRenderOptions::default()
                             },
                             &writer,
@@ -15173,6 +15181,7 @@ impl DawUi {
             arrangement_id: self.selected_arrangement.unwrap_or_default(),
             sample_rate: self.audio_settings.sample_rate,
             soloed_playlist_track_range: self.soloed_playlist_track_range,
+            read_sample_root_note: self.read_sample_root_note,
             wav_sample_format: self.playlist_render_format,
             wav_dither_mode: if self.playlist_render_dither {
                 WavDitherMode::Tpdf
@@ -15310,6 +15319,7 @@ impl DawUi {
         let options = SamplerPatternRenderOptions {
             pattern_id,
             sample_rate: self.audio_settings.sample_rate,
+            read_sample_root_note: self.read_sample_root_note,
             ..SamplerPatternRenderOptions::default()
         };
         let document = document.clone();
@@ -18638,6 +18648,17 @@ impl DawUi {
             ui.checkbox(&mut self.audio_settings.enable_input, "Enable input");
             ui.checkbox(&mut self.audio_settings.enable_output, "Enable output");
         });
+        let root_note_preference_changed = ui
+            .checkbox(&mut self.read_sample_root_note, "Read sample root note")
+            .on_hover_text(
+                "Use embedded WAV root-note metadata when a Sampler channel has no valid saved root note.",
+            )
+            .changed();
+        if root_note_preference_changed
+            && let Err(error) = save_read_sample_root_note(self.read_sample_root_note)
+        {
+            self.status = format!("Could not save sample root-note preference: {error}");
+        }
 
         let input_name = self
             .audio_settings
@@ -20391,6 +20412,31 @@ fn browser_visibility_settings_file() -> Option<PathBuf> {
     browser_favorites_file()?
         .parent()
         .map(|directory| directory.join("browser-visible.txt"))
+}
+
+fn read_sample_root_note_settings_file() -> Option<PathBuf> {
+    browser_favorites_file()?
+        .parent()
+        .map(|directory| directory.join("read-sample-root-note.txt"))
+}
+
+fn load_read_sample_root_note() -> bool {
+    read_sample_root_note_settings_file()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|contents| contents.trim().parse::<bool>().ok())
+        .unwrap_or(true)
+}
+
+fn save_read_sample_root_note(enabled: bool) -> Result<(), String> {
+    let path = read_sample_root_note_settings_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the sample root-note preference path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(&path, format!("{enabled}\n"))
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
 }
 
 fn load_browser_visibility() -> bool {

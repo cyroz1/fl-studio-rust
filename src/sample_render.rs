@@ -27,9 +27,13 @@ const SAMPLER_ROOT_KEY: u16 = 60;
 const SAMPLER_BLOCK_FRAMES: usize = 1_024;
 static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(1);
 
-fn resolve_sampler_root_key(saved_root_key: Option<u16>, sample_root_key: Option<u16>) -> u16 {
+fn resolve_sampler_root_key(
+    saved_root_key: Option<u16>,
+    sample_root_key: Option<u16>,
+    read_sample_root_note: bool,
+) -> u16 {
     saved_root_key
-        .or(sample_root_key)
+        .or(read_sample_root_note.then_some(sample_root_key).flatten())
         .unwrap_or(SAMPLER_ROOT_KEY)
 }
 
@@ -62,6 +66,7 @@ pub struct SamplerPatternRenderOptions {
     pub pattern_id: u16,
     pub sample_rate: u32,
     pub voice_limit: usize,
+    pub read_sample_root_note: bool,
 }
 
 impl Default for SamplerPatternRenderOptions {
@@ -70,6 +75,7 @@ impl Default for SamplerPatternRenderOptions {
             pattern_id: 0,
             sample_rate: DEFAULT_SAMPLE_RATE,
             voice_limit: DEFAULT_SAMPLER_VOICE_LIMIT,
+            read_sample_root_note: true,
         }
     }
 }
@@ -206,6 +212,7 @@ pub struct PlaylistRenderOptions {
     pub tail_seconds: u8,
     /// Render only this inclusive one-based Playlist track range when soloing.
     pub soloed_playlist_track_range: Option<(u32, u32)>,
+    pub read_sample_root_note: bool,
 }
 
 impl Default for PlaylistRenderOptions {
@@ -220,6 +227,7 @@ impl Default for PlaylistRenderOptions {
             wav_channel_mode: WavChannelMode::Stereo,
             tail_seconds: 0,
             soloed_playlist_track_range: None,
+            read_sample_root_note: true,
         }
     }
 }
@@ -1752,6 +1760,7 @@ fn prepare_sampler_arrangement(
                 root_key: resolve_sampler_root_key(
                     channel.sampler_root_key(),
                     wave_metadata.root_key,
+                    options.read_sample_root_note,
                 ),
                 loop_bounds,
                 ping_pong_loop: channel.sampler_ping_pong_loop_enabled(),
@@ -2012,6 +2021,7 @@ fn prepare_sampler_pattern(
                 root_key: resolve_sampler_root_key(
                     channel.sampler_root_key(),
                     wave_metadata.root_key,
+                    options.read_sample_root_note,
                 ),
                 loop_bounds,
                 ping_pong_loop: channel.sampler_ping_pong_loop_enabled(),
@@ -3305,6 +3315,7 @@ mod tests {
                     wav_channel_mode: WavChannelMode::Stereo,
                     tail_seconds: 0,
                     soloed_playlist_track_range: None,
+                    read_sample_root_note: true,
                 },
                 frames: 2,
                 vst3_processor: None,
@@ -3657,9 +3668,13 @@ mod tests {
 
     #[test]
     fn sampler_root_key_prefers_saved_channel_value_then_wave_metadata_then_c5() {
-        assert_eq!(resolve_sampler_root_key(Some(48), Some(72)), 48);
-        assert_eq!(resolve_sampler_root_key(None, Some(72)), 72);
-        assert_eq!(resolve_sampler_root_key(None, None), SAMPLER_ROOT_KEY);
+        assert_eq!(resolve_sampler_root_key(Some(48), Some(72), true), 48);
+        assert_eq!(resolve_sampler_root_key(None, Some(72), true), 72);
+        assert_eq!(
+            resolve_sampler_root_key(None, Some(72), false),
+            SAMPLER_ROOT_KEY
+        );
+        assert_eq!(resolve_sampler_root_key(None, None, true), SAMPLER_ROOT_KEY);
     }
 
     #[test]
