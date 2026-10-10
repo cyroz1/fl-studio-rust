@@ -1733,6 +1733,9 @@ impl DawUi {
         creation.egui_ctx.set_zoom_factor(ui_scale);
         creation
             .egui_ctx
+            .send_viewport_cmd(egui::ViewportCommand::SetTheme(egui::SystemTheme::Dark));
+        creation
+            .egui_ctx
             .send_viewport_cmd(egui::ViewportCommand::MinInnerSize(Vec2::new(
                 MIN_WINDOW_INNER_WIDTH / ui_scale,
                 MIN_WINDOW_INNER_HEIGHT / ui_scale,
