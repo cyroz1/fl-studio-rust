@@ -19,11 +19,11 @@ use flp_rebuild::midi::{MidiChannelMapping, MidiFile};
 use flp_rebuild::plugins::{PluginCandidate, PluginFormat, scan_installed_plugins};
 use flp_rebuild::project_package::ProjectPackageWorkspace;
 use flp_rebuild::sample_render::{
-    AudioClipRenderOptions, PlaylistRenderOptions, PlaylistRenderSummary, ResamplingQuality,
-    SamplerPatternRenderOptions, SamplerPatternRenderSummary, WavChannelMode, WavDitherMode,
-    WavSampleFormat, render_audio_clips_to_wav, render_playlist_with_vst3_to_wav_cancellable,
-    render_sampler_pattern_to_wav, stream_playlist_with_vst3_to_device,
-    stream_sampler_pattern_to_device,
+    AudioClipRenderOptions, AudioClipRenderSummary, PlaylistRenderOptions, PlaylistRenderSummary,
+    ResamplingQuality, SamplerPatternRenderOptions, SamplerPatternRenderSummary, WavChannelMode,
+    WavDitherMode, WavSampleFormat, render_audio_clips_to_wav,
+    render_playlist_with_vst3_to_wav_cancellable, render_sampler_pattern_to_wav,
+    stream_playlist_with_vst3_to_device, stream_sampler_pattern_to_device,
 };
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions, Vst3PatternStreamHandle};
 use flp_rebuild::{
@@ -1406,6 +1406,7 @@ struct DawUi {
     audio_catalog: AudioDeviceCatalog,
     audio_settings: AudioSettings,
     audio_engine: Option<AudioEngine>,
+    pending_audio_clip_export: Option<PendingAudioClipExport>,
     pending_audio_render: Option<PendingAudioRender>,
     audio_render_workers: Vec<PendingAudioRender>,
     pending_song_render: Option<PendingSongRender>,
@@ -1474,6 +1475,13 @@ struct PendingAudioRender {
     receiver: Receiver<Result<PlaylistRenderSummary, String>>,
     cancelled: Arc<AtomicBool>,
     worker: thread::JoinHandle<()>,
+}
+
+struct PendingAudioClipExport {
+    receiver: Receiver<Result<AudioClipRenderSummary, String>>,
+    worker: thread::JoinHandle<()>,
+    output_path: PathBuf,
+    selected_clip_index: Option<usize>,
 }
 
 struct PendingSongRender {
@@ -1699,6 +1707,7 @@ impl DawUi {
             audio_catalog,
             audio_settings,
             audio_engine: None,
+            pending_audio_clip_export: None,
             pending_audio_render: None,
             audio_render_workers: Vec::new(),
             pending_song_render: None,
@@ -2200,6 +2209,28 @@ impl DawUi {
             .as_ref()
             .map(|workspace| workspace.sample_project_path().to_path_buf())
             .or_else(|| self.current_path.clone())
+    }
+
+    fn selected_playlist_audio_clip(&self) -> Option<(u16, usize)> {
+        let arrangement_id = self.selected_arrangement.unwrap_or_default();
+        let clip_index = self.selected_clip?;
+        let document = self.document.as_ref()?;
+        let arrangement = document
+            .arrangements()
+            .ok()?
+            .into_iter()
+            .find(|arrangement| arrangement.id == arrangement_id)?;
+        let clip = arrangement.clips.get(clip_index)?;
+        let flp_rebuild::PlaylistClipTarget::Channel { id } = clip.target() else {
+            return None;
+        };
+        document
+            .channels()
+            .iter()
+            .any(|channel| {
+                channel.id() == id && channel.kind() == Some(4) && channel.enabled() != Some(false)
+            })
+            .then_some((arrangement_id, clip_index))
     }
 
     fn request_audio_waveform(&mut self, path: &Path) {
@@ -3926,12 +3957,26 @@ impl DawUi {
                     }
                     if ui
                         .add_enabled(
-                            self.document.is_some() && self.current_path.is_some(),
+                            self.document.is_some()
+                                && self.current_path.is_some()
+                                && self.pending_audio_clip_export.is_none(),
                             egui::Button::new("Render audio clips…"),
                         )
                         .clicked()
                     {
                         self.render_audio_clips_dialog();
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.selected_playlist_audio_clip().is_some()
+                                && self.sample_project_path().is_some()
+                                && self.pending_audio_clip_export.is_none(),
+                            egui::Button::new("Render selected Audio Clip…"),
+                        )
+                        .clicked()
+                    {
+                        self.render_selected_audio_clip_dialog();
                         ui.close();
                     }
                     if ui
@@ -11505,12 +11550,18 @@ impl DawUi {
     }
 
     fn render_audio_clips_dialog(&mut self) {
-        let (Some(project_path), Some(document)) =
-            (self.current_path.as_deref(), self.document.as_ref())
-        else {
+        let Some(project_path) = self.current_path.as_deref() else {
             self.status = "Open a project before rendering audio clips".to_owned();
             return;
         };
+        if self.document.is_none() {
+            self.status = "Open a project before rendering audio clips".to_owned();
+            return;
+        }
+        if self.pending_audio_clip_export.is_some() {
+            self.status = "An audio clip render is already running".to_owned();
+            return;
+        }
         let project_stem = project_path
             .file_stem()
             .map(|stem| stem.to_string_lossy().into_owned())
@@ -11525,21 +11576,142 @@ impl DawUi {
         };
         let options = AudioClipRenderOptions {
             arrangement_id: self.selected_arrangement.unwrap_or_default(),
+            sample_rate: self.audio_settings.sample_rate,
             ..AudioClipRenderOptions::default()
         };
-        let sample_project_path = self
-            .sample_project_path()
-            .unwrap_or_else(|| project_path.to_path_buf());
-        match render_audio_clips_to_wav(document, &sample_project_path, options, &output_path) {
-            Ok(summary) => {
-                self.status = format!(
-                    "Rendered {} audio clips to {} ({} skipped for non-default scale)",
-                    summary.clips_rendered,
-                    output_path.display(),
-                    summary.clips_skipped_unsupported_scale
+        self.start_audio_clip_export(options, output_path);
+    }
+
+    fn render_selected_audio_clip_dialog(&mut self) {
+        let Some((arrangement_id, clip_index)) = self.selected_playlist_audio_clip() else {
+            self.status = "Select an enabled audio-channel clip in the Playlist first".to_owned();
+            return;
+        };
+        if self.pending_audio_clip_export.is_some() {
+            self.status = "An audio clip render is already running".to_owned();
+            return;
+        }
+        let Some(project_path) = self.current_path.as_deref() else {
+            self.status = "Open a project before rendering its selected audio clip".to_owned();
+            return;
+        };
+        let project_stem = project_path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "FL_Studio_Project".to_owned());
+        let Some(output_path) = rfd::FileDialog::new()
+            .set_title("Render selected Playlist audio clip")
+            .set_file_name(format!("{project_stem}_clip_{}.wav", clip_index + 1))
+            .add_filter("WAV audio", &["wav"])
+            .save_file()
+        else {
+            return;
+        };
+        let options = AudioClipRenderOptions {
+            arrangement_id,
+            sample_rate: self.audio_settings.sample_rate,
+            clip_index: Some(clip_index),
+        };
+        self.start_audio_clip_export(options, output_path);
+    }
+
+    fn start_audio_clip_export(&mut self, options: AudioClipRenderOptions, output_path: PathBuf) {
+        let Some(project_path) = self.sample_project_path() else {
+            self.status = "Save the project before rendering its audio clips".to_owned();
+            return;
+        };
+        let Some(document) = self.document.as_ref() else {
+            self.status = "Open a project before rendering its audio clips".to_owned();
+            return;
+        };
+        if self.pending_audio_clip_export.is_some() {
+            self.status = "An audio clip render is already running".to_owned();
+            return;
+        }
+        let document = document.clone();
+        let package_workspace = self.package_workspace.clone();
+        let output_path_for_worker = output_path.clone();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name("playlist-audio-clip-wav-render".to_owned())
+            .spawn(move || {
+                let _package_workspace = package_workspace;
+                let result = render_audio_clips_to_wav(
+                    &document,
+                    &project_path,
+                    options,
+                    &output_path_for_worker,
                 );
+                let _ = sender.send(result);
+            });
+        match worker {
+            Ok(worker) => {
+                let selected_clip_index = options.clip_index;
+                self.pending_audio_clip_export = Some(PendingAudioClipExport {
+                    receiver,
+                    worker,
+                    output_path: output_path.clone(),
+                    selected_clip_index,
+                });
+                self.status = match selected_clip_index {
+                    Some(clip_index) => format!(
+                        "Rendering selected Playlist audio clip {} to {}…",
+                        clip_index + 1,
+                        output_path.display()
+                    ),
+                    None => format!(
+                        "Rendering Playlist audio clips to {}…",
+                        output_path.display()
+                    ),
+                };
             }
-            Err(error) => self.status = format!("Could not render Playlist audio clips: {error}"),
+            Err(error) => {
+                self.status = format!("Could not start Playlist audio clip render: {error}");
+            }
+        }
+    }
+
+    fn poll_audio_clip_export(&mut self) {
+        let completed = self.pending_audio_clip_export.as_ref().and_then(|pending| {
+            match pending.receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Disconnected) => Some(Err(
+                    "Playlist audio clip render worker stopped unexpectedly".to_owned(),
+                )),
+                Err(TryRecvError::Empty) => None,
+            }
+        });
+        let Some(result) = completed else {
+            return;
+        };
+        let Some(pending) = self.pending_audio_clip_export.take() else {
+            return;
+        };
+        if pending.worker.join().is_err() {
+            self.status = "Playlist audio clip render worker panicked".to_owned();
+            return;
+        }
+        match result {
+            Ok(summary) => {
+                self.status = match pending.selected_clip_index {
+                    Some(clip_index) => format!(
+                        "Rendered selected Playlist audio clip {} to {} at {} Hz",
+                        clip_index + 1,
+                        pending.output_path.display(),
+                        summary.sample_rate,
+                    ),
+                    None => format!(
+                        "Rendered {} Playlist audio clips to {} at {} Hz ({} skipped for non-default scale)",
+                        summary.clips_rendered,
+                        pending.output_path.display(),
+                        summary.sample_rate,
+                        summary.clips_skipped_unsupported_scale,
+                    ),
+                };
+            }
+            Err(error) => {
+                self.status = format!("Could not render Playlist audio clips: {error}");
+            }
         }
     }
 
@@ -13985,6 +14157,7 @@ impl eframe::App for DawUi {
         } else {
             None
         };
+        self.poll_audio_clip_export();
         self.poll_project_audio_render();
         self.poll_song_render();
         self.poll_sampler_pattern_render();

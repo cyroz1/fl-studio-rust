@@ -31,6 +31,8 @@ static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(1);
 pub struct AudioClipRenderOptions {
     pub arrangement_id: u16,
     pub sample_rate: u32,
+    /// Render only this zero-based arrangement clip, rebased to output time zero.
+    pub clip_index: Option<usize>,
 }
 
 impl Default for AudioClipRenderOptions {
@@ -38,6 +40,7 @@ impl Default for AudioClipRenderOptions {
         Self {
             arrangement_id: 0,
             sample_rate: DEFAULT_SAMPLE_RATE,
+            clip_index: None,
         }
     }
 }
@@ -319,6 +322,7 @@ pub fn stream_playlist_with_vst3_to_device(
         AudioClipRenderOptions {
             arrangement_id: options.arrangement_id,
             sample_rate: options.sample_rate,
+            clip_index: None,
         },
         Some(cancelled),
     )?;
@@ -415,6 +419,7 @@ pub fn render_playlist_with_vst3_to_wav_cancellable(
         AudioClipRenderOptions {
             arrangement_id: options.arrangement_id,
             sample_rate: options.sample_rate,
+            clip_index: None,
         },
         Some(cancelled),
     )?;
@@ -1003,6 +1008,20 @@ fn render_audio_clips_to_stereo_buffer_inner(
     Ok((mix, render.summary))
 }
 
+fn audio_clip_matches_selection(selected_clip_index: Option<usize>, clip_index: usize) -> bool {
+    selected_clip_index.is_none_or(|selected_index| selected_index == clip_index)
+}
+
+fn audio_clip_render_start_tick(
+    clip_position_ticks: u32,
+    selection_start_tick: u32,
+) -> Result<u64, String> {
+    clip_position_ticks
+        .checked_sub(selection_start_tick)
+        .map(u64::from)
+        .ok_or_else(|| "selected clip position precedes its selection start".to_owned())
+}
+
 fn prepare_audio_clip_render(
     document: &FlpDocument,
     project_path: &Path,
@@ -1030,12 +1049,28 @@ fn prepare_audio_clip_render(
     let channels = document.channels();
     let resolver = SamplePathResolver::new(project_path);
 
+    let selected_clip = options
+        .clip_index
+        .map(|clip_index| {
+            arrangement
+                .clips
+                .get(clip_index)
+                .ok_or_else(|| format!("Playlist clip {clip_index} does not exist"))
+        })
+        .transpose()?;
+    let selection_start_tick = selected_clip.map_or(0, |clip| clip.position_ticks);
+
     let mut max_tick = 0u64;
     let mut clips_skipped_unsupported_scale = 0usize;
     let mut candidate_clips = Vec::<(usize, &PlaylistClip, u16, PathBuf, f32, f32)>::new();
     for (clip_index, clip) in arrangement.clips.iter().enumerate() {
         check_cancelled(cancelled)?;
-        max_tick = max_tick.max(u64::from(clip.position_ticks) + u64::from(clip.length_ticks));
+        if !audio_clip_matches_selection(options.clip_index, clip_index) {
+            continue;
+        }
+        let relative_position =
+            audio_clip_render_start_tick(clip.position_ticks, selection_start_tick)?;
+        max_tick = max_tick.max(relative_position + u64::from(clip.length_ticks));
         let PlaylistClipTarget::Channel { id } = clip.target() else {
             continue;
         };
@@ -1050,6 +1085,11 @@ fn prepare_audio_clip_render(
             .is_some_and(|scale| !scale.is_finite() || (scale - 1.0).abs() > 1e-9)
         {
             clips_skipped_unsupported_scale += 1;
+            if options.clip_index == Some(clip_index) {
+                return Err(format!(
+                    "selected Playlist clip {clip_index} uses a stretch scale unsupported by this renderer"
+                ));
+            }
             continue;
         }
         let sample_path = channel.sample_path().ok_or_else(|| {
@@ -1060,6 +1100,13 @@ fn prepare_audio_clip_render(
         })?;
         let (gain, pan) = channel_gain_pan(channel.volume(), channel.pan());
         candidate_clips.push((clip_index, clip, id, resolved_path, gain, pan));
+    }
+    if let Some(clip_index) = options.clip_index
+        && candidate_clips.is_empty()
+    {
+        return Err(format!(
+            "selected Playlist clip {clip_index} does not target an enabled audio channel"
+        ));
     }
     let timeline_frames = ticks_to_frames(max_tick, ppq, tempo_bpm, options.sample_rate)?;
     let mut decoded_by_path = HashMap::<PathBuf, DecodedAudio>::new();
@@ -1097,12 +1144,8 @@ fn prepare_audio_clip_render(
             ));
         }
         let source_bounds = sample_source_bounds(clip, audio, *clip_index)?;
-        let start_frame = ticks_to_frames(
-            u64::from(clip.position_ticks),
-            ppq,
-            tempo_bpm,
-            options.sample_rate,
-        )?;
+        let start_tick = audio_clip_render_start_tick(clip.position_ticks, selection_start_tick)?;
+        let start_frame = ticks_to_frames(start_tick, ppq, tempo_bpm, options.sample_rate)?;
         let duration_frames = source_duration_to_frames(
             source_bounds.end - source_bounds.start,
             audio.sample_rate,
@@ -2489,6 +2532,16 @@ mod tests {
             resample_sample(&samples, 1.5, 1.0, ResamplingQuality::Linear),
             0.0
         );
+    }
+
+    #[test]
+    fn selected_audio_clip_is_filtered_and_rebased_to_time_zero() {
+        assert!(audio_clip_matches_selection(None, 0));
+        assert!(audio_clip_matches_selection(Some(2), 2));
+        assert!(!audio_clip_matches_selection(Some(2), 1));
+        assert_eq!(audio_clip_render_start_tick(384, 384).unwrap(), 0);
+        assert_eq!(audio_clip_render_start_tick(384, 0).unwrap(), 384);
+        assert!(audio_clip_render_start_tick(96, 192).is_err());
     }
 
     #[test]

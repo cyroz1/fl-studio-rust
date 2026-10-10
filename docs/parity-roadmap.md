@@ -306,8 +306,13 @@ automation, Mixer routing/effects, or PDC. Full export surface:
 - `[partial]` Formats: the desktop Playlist renderer writes 16/24-bit integer PCM or 32-bit float WAV, with stereo, merged mono, left-only, or right-only channels as documented by [Image-Line](https://www.image-line.com/fl-studio-learning/fl-studio-online-manual/html/fformats_save_export.htm); MP3, OGG, and FLAC export remain todo
 - `[partial]` Render options: the Playlist mix dialog offers channel modes, 0/1/2/5-second output tails for VST instrument releases, optional unshaped TPDF dither for 16-bit PCM, and Linear or 64-point windowed-sinc resampling. Image-Line documents high-frequency shaped dither and Linear, 6-point Hermite, and selectable sinc quality settings, so matching its noise-shaping profile, interpolation kernels, and full quality range remains todo; normalize and effect-based tail detection are also incomplete. The sinc choice is a local 64-tap Blackman-windowed kernel, not a claim of bit-identical FL Studio output ([Image-Line export manual](https://www.image-line.com/fl-studio-learning/fl-studio-online-manual/html/fformats_save_export.htm)).
 - `[todo]` Stem export: split mixer tracks, "split channel tracks"
-- `[todo]` Selected Playlist clip consolidation, including selection-start or
-  song-start placement and muting the source clips ([Image-Line Playlist
+- `[partial]` Selected Playlist clip render: File > Export can write one
+  selected enabled audio-channel clip's supported sample source to float stereo
+  WAV, starting at the clip's position. Clip-length and stretch fidelity,
+  Pattern Clip rendering, multiple selection, song-start placement,
+  automatic Audio Clip insertion, source muting, automation, and Mixer effects
+  remain incomplete. FL Studio's consolidation also accepts Pattern Clips and
+  supports song-start placement with source muting ([Image-Line Playlist
   manual](https://www.image-line.com/fl-studio-learning-content/fl-studio-online-manual/html/playlist.htm)).
 - `[partial]` Pattern render: the Piano roll can render enabled Sampler notes
   from the selected pattern to float stereo WAV, and a mapped VST3 channel can
