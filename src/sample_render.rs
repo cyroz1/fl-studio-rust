@@ -327,7 +327,7 @@ pub fn write_input_recording_to_wav(
     let data_bytes = u32::try_from(frames * 8)
         .map_err(|_| "audio recording exceeds the RIFF/WAVE size limit".to_owned())?;
     file.seek(SeekFrom::Start(4))
-        .and_then(|()| file.write_all(&(36_u32 + data_bytes).to_le_bytes()))
+        .and_then(|_| file.write_all(&(36_u32 + data_bytes).to_le_bytes()))
         .and_then(|()| file.seek(SeekFrom::Start(40)).map(|_| ()))
         .and_then(|()| file.write_all(&data_bytes.to_le_bytes()))
         .map_err(|error| format!("could not finalize recorded WAV header: {error}"))?;
