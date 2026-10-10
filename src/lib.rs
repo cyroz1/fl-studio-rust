@@ -4034,6 +4034,185 @@ impl FlpDocument {
         })
     }
 
+    /// Slips the source window inside one Playlist Audio Clip while keeping its timeline bounds.
+    /// The requested offset is in milliseconds; `source_length_ms` bounds the window to the file.
+    /// Clips under Playlist tempo automation or with non-default scale are rejected.
+    pub fn slip_playlist_audio_clip(
+        &mut self,
+        arrangement_id: u16,
+        clip_index: usize,
+        delta_ms: f64,
+        source_length_ms: f32,
+    ) -> Result<(), FlpError> {
+        if !delta_ms.is_finite() {
+            return Err(FlpError::UnsupportedEdit(
+                "Audio Clip slip distance must be finite",
+            ));
+        }
+        if !source_length_ms.is_finite() || source_length_ms <= 0.0 {
+            return Err(FlpError::UnsupportedEdit(
+                "the sample length must be a positive number of milliseconds",
+            ));
+        }
+        let arrangements = self.arrangements()?;
+        let mut matching_arrangements = arrangements
+            .iter()
+            .filter(|arrangement| arrangement.id == arrangement_id);
+        let Some(arrangement) = matching_arrangements.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested arrangement does not exist",
+            ));
+        };
+        if matching_arrangements.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested arrangement id is ambiguous",
+            ));
+        }
+        let Some(clip) = arrangement.clips.get(clip_index) else {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested Playlist Audio Clip does not exist",
+            ));
+        };
+        let PlaylistClipTarget::Channel { id: channel_id } = clip.target() else {
+            return Err(FlpError::UnsupportedEdit(
+                "only Playlist Audio Clips can be slip-edited",
+            ));
+        };
+        let channels = self.channels();
+        let mut matching_channels = channels.iter().filter(|channel| channel.id() == channel_id);
+        let Some(channel) = matching_channels.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the Playlist Audio Clip channel does not exist",
+            ));
+        };
+        if matching_channels.next().is_some() || channel.kind() != Some(4) {
+            return Err(FlpError::UnsupportedEdit(
+                "the Playlist clip does not target one unambiguous Audio Clip channel",
+            ));
+        }
+        if clip
+            .scale
+            .is_some_and(|scale| !scale.is_finite() || scale <= 0.0 || (scale - 1.0).abs() > 1e-9)
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "Playlist Audio Clips with a non-default or invalid scale cannot be slip-edited",
+            ));
+        }
+        let (source_start_ms, source_end_ms) =
+            if clip.start_offset == -1.0 && clip.end_offset == -1.0 {
+                (0.0, source_length_ms)
+            } else if clip.start_offset.is_finite()
+                && clip.end_offset.is_finite()
+                && clip.start_offset >= 0.0
+                && clip.end_offset > clip.start_offset
+            {
+                (clip.start_offset, clip.end_offset)
+            } else {
+                return Err(FlpError::UnsupportedEdit(
+                    "the Audio Clip has an unsupported sample window",
+                ));
+            };
+        if source_end_ms > source_length_ms {
+            return Err(FlpError::UnsupportedEdit(
+                "the Audio Clip sample window extends beyond the sample",
+            ));
+        }
+        let clip_end_ticks = clip
+            .position_ticks
+            .checked_add(clip.length_ticks)
+            .ok_or(FlpError::LengthOverflow)?;
+        let tempo_channel_ids = channels
+            .iter()
+            .filter(|candidate| {
+                candidate.kind() == Some(5)
+                    && candidate
+                        .display_name()
+                        .is_some_and(|name| name.eq_ignore_ascii_case("TEMPO"))
+            })
+            .map(ChannelSummary::id)
+            .collect::<HashSet<_>>();
+        if arrangement.clips.iter().any(|candidate| {
+            let PlaylistClipTarget::Channel { id } = candidate.target() else {
+                return false;
+            };
+            tempo_channel_ids.contains(&id)
+                && candidate.position_ticks < clip_end_ticks
+                && candidate
+                    .position_ticks
+                    .saturating_add(candidate.length_ticks)
+                    > clip.position_ticks
+        }) {
+            return Err(FlpError::UnsupportedEdit(
+                "slip-editing an Audio Clip across Playlist tempo automation is unsupported",
+            ));
+        }
+        if delta_ms == 0.0 {
+            return Ok(());
+        }
+
+        let window_length_ms = f64::from(source_end_ms) - f64::from(source_start_ms);
+        let next_start_ms = f64::from(source_start_ms) + delta_ms;
+        let next_end_ms = next_start_ms + window_length_ms;
+        if next_start_ms < 0.0 || next_end_ms > f64::from(source_length_ms) {
+            return Err(FlpError::UnsupportedEdit(
+                "the slipped sample window must remain within the source audio",
+            ));
+        }
+        let next_start_ms = next_start_ms as f32;
+        let next_end_ms = next_end_ms as f32;
+        if !next_start_ms.is_finite()
+            || !next_end_ms.is_finite()
+            || next_start_ms < 0.0
+            || next_end_ms > source_length_ms
+            || next_end_ms <= next_start_ms
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "the slipped sample window is not representable in the project",
+            ));
+        }
+
+        let record_size = clip.record_size;
+        let record_start = clip
+            .source_record_index
+            .checked_mul(record_size)
+            .ok_or(FlpError::LengthOverflow)?;
+        let record_end = record_start
+            .checked_add(record_size)
+            .ok_or(FlpError::LengthOverflow)?;
+        let event_index = clip.source_event_index;
+        let event = self
+            .events
+            .get(event_index)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the Playlist Audio Clip event no longer exists",
+            ))?;
+        if event.opcode != 0xE9
+            || !matches!(event.encoding, PayloadEncoding::Data { .. })
+            || record_size < 32
+            || record_end > event.payload.len()
+            || !event.payload.len().is_multiple_of(record_size)
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "the Playlist Audio Clip record does not fit its event payload",
+            ));
+        }
+
+        let mut candidate = self.clone();
+        write_event_payload_bytes(
+            &mut candidate.events[event_index],
+            record_start + 24,
+            &next_start_ms.to_le_bytes(),
+        )?;
+        write_event_payload_bytes(
+            &mut candidate.events[event_index],
+            record_start + 28,
+            &next_end_ms.to_le_bytes(),
+        )?;
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
     /// Edits selected fields of one existing note without changing the event's wire length.
     /// `note_index` is zero-based within the selected channel's notes in that pattern.
     pub fn edit_pattern_note(
@@ -9010,6 +9189,91 @@ mod tests {
     }
 
     #[test]
+    fn slips_playlist_audio_clip_source_without_moving_its_timeline_bounds() {
+        let mut clip = [0xA5; 80];
+        clip[0..4].copy_from_slice(&120u32.to_le_bytes());
+        clip[4..6].copy_from_slice(&0x5000u16.to_le_bytes());
+        clip[6..8].copy_from_slice(&9u16.to_le_bytes());
+        clip[8..12].copy_from_slice(&384u32.to_le_bytes());
+        clip[12..14].copy_from_slice(&499u16.to_le_bytes());
+        clip[20..24].copy_from_slice(&[0x40, 0x64, 0x80, 0x80]);
+        clip[24..28].copy_from_slice(&100.0f32.to_le_bytes());
+        clip[28..32].copy_from_slice(&900.0f32.to_le_bytes());
+        clip[64..72].copy_from_slice(&1.0f64.to_le_bytes());
+        let mut event_stream = vec![0x40, 9, 0, 0x15, 4, 0x48, 9, 0, 0x62, 0, 0, 0x63, 3, 0];
+        append_data_event(&mut event_stream, 0xE9, &clip);
+        let input = flp_fixture(&event_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&input).expect("the project fixture should parse");
+
+        document
+            .slip_playlist_audio_clip(3, 0, -100.0, 1_000.0)
+            .expect("the window should slip to the sample start");
+        document
+            .slip_playlist_audio_clip(3, 0, 200.0, 1_000.0)
+            .expect("the window should slip right while staying in the sample");
+
+        let clips = &document.arrangements().unwrap()[0].clips;
+        assert_eq!(clips.len(), 1);
+        assert_eq!(clips[0].position_ticks, 120);
+        assert_eq!(clips[0].length_ticks, 384);
+        assert_eq!(clips[0].start_offset, 200.0);
+        assert_eq!(clips[0].end_offset, 1_000.0);
+        let mut expected_clip = clip;
+        expected_clip[24..28].copy_from_slice(&200.0f32.to_le_bytes());
+        expected_clip[28..32].copy_from_slice(&1_000.0f32.to_le_bytes());
+        let clip_event = document
+            .events()
+            .iter()
+            .find(|event| event.opcode() == 0xE9)
+            .expect("the Playlist event should remain present");
+        assert_eq!(clip_event.payload(), expected_clip);
+
+        let before_rejected_slip = document
+            .encode_lossless()
+            .expect("the slipped project should encode");
+        assert!(
+            document
+                .slip_playlist_audio_clip(3, 0, 1.0, 1_000.0)
+                .is_err()
+        );
+        assert_eq!(
+            document
+                .encode_lossless()
+                .expect("the project should encode after a rejected slip"),
+            before_rejected_slip
+        );
+        let encoded = document
+            .encode_lossless()
+            .expect("the slipped project should encode");
+        FlpDocument::parse(&encoded).expect("the slipped project should parse again");
+    }
+
+    #[test]
+    fn playlist_audio_clip_slip_rejects_full_source_without_room_atomically() {
+        let mut clip = [0xA5; 80];
+        clip[0..4].copy_from_slice(&0u32.to_le_bytes());
+        clip[4..6].copy_from_slice(&0x5000u16.to_le_bytes());
+        clip[6..8].copy_from_slice(&9u16.to_le_bytes());
+        clip[8..12].copy_from_slice(&384u32.to_le_bytes());
+        clip[12..14].copy_from_slice(&499u16.to_le_bytes());
+        clip[20..24].copy_from_slice(&[0x40, 0x64, 0x80, 0x80]);
+        clip[24..28].copy_from_slice(&(-1.0f32).to_le_bytes());
+        clip[28..32].copy_from_slice(&(-1.0f32).to_le_bytes());
+        clip[64..72].copy_from_slice(&1.0f64.to_le_bytes());
+        let mut event_stream = vec![0x40, 9, 0, 0x15, 4, 0x48, 9, 0, 0x62, 0, 0, 0x63, 3, 0];
+        append_data_event(&mut event_stream, 0xE9, &clip);
+        let input = flp_fixture(&event_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&input).expect("the project fixture should parse");
+
+        assert!(
+            document
+                .slip_playlist_audio_clip(3, 0, 1.0, 1_000.0)
+                .is_err()
+        );
+        assert_eq!(document.encode_lossless().unwrap(), input);
+    }
+
+    #[test]
     fn playlist_audio_clip_split_rejects_unsupported_edits_atomically() {
         let mut clip = [0xA5; 80];
         clip[0..4].copy_from_slice(&0u32.to_le_bytes());
@@ -9066,6 +9330,12 @@ mod tests {
                 .is_err()
         );
         assert_eq!(scaled_document.encode_lossless().unwrap(), scaled_input);
+        assert!(
+            scaled_document
+                .slip_playlist_audio_clip(3, 0, 1.0, 1_000.0)
+                .is_err()
+        );
+        assert_eq!(scaled_document.encode_lossless().unwrap(), scaled_input);
     }
 
     #[test]
@@ -9100,6 +9370,12 @@ mod tests {
         let mut document = FlpDocument::parse(&input).expect("the project fixture should parse");
 
         assert!(document.split_playlist_audio_clip(3, 0, 96, None).is_err());
+        assert_eq!(document.encode_lossless().unwrap(), input);
+        assert!(
+            document
+                .slip_playlist_audio_clip(3, 0, 1.0, 1_000.0)
+                .is_err()
+        );
         assert_eq!(document.encode_lossless().unwrap(), input);
     }
 
