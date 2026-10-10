@@ -5395,7 +5395,7 @@ mod tests {
             let decoded = decode_audio_file(&output).unwrap();
             assert_eq!(decoded.sample_rate, 48_000);
             assert_eq!(decoded.channels.len(), expected_channels);
-            assert!(decoded.channels[0].len() > 0);
+            assert!(!decoded.channels[0].is_empty());
             assert!(
                 decoded
                     .channels
