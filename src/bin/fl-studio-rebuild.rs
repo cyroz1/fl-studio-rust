@@ -32,7 +32,7 @@ use flp_rebuild::{
     FlpDocument, FstPreset, FstPresetKind, LimitNoteOptions, LimitSnapDirection, Pattern,
     PatternNote, PatternNoteEdit, PlaylistClip, PlaylistClipClipboard, PlaylistClipEdit,
     PlaylistClipTarget, PlaylistTrack, ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions,
-    ScaleLevelsOptions, TimeMarker, TimeMarkerEdit, VstPluginStateMetadata,
+    RiffMachineOptions, ScaleLevelsOptions, TimeMarker, TimeMarkerEdit, VstPluginStateMetadata,
 };
 
 const APP_BACKGROUND: Color32 = Color32::from_rgb(29, 29, 29);
@@ -1530,6 +1530,9 @@ struct DawUi {
     arpeggiator_range_octaves: u8,
     arpeggiator_gate_percent: u8,
     arpeggiator_direction: ArpeggioDirection,
+    riff_seed: u64,
+    riff_velocity_variation_percent: u8,
+    riff_length_multiplier_percent: u8,
     claw_period_ticks: u32,
     claw_trash_every: u8,
     claw_time_distortion_percent: i16,
@@ -1807,6 +1810,9 @@ impl DawUi {
             arpeggiator_range_octaves: 1,
             arpeggiator_gate_percent: 80,
             arpeggiator_direction: ArpeggioDirection::Up,
+            riff_seed: 1,
+            riff_velocity_variation_percent: 10,
+            riff_length_multiplier_percent: 100,
             claw_period_ticks: 384,
             claw_trash_every: 4,
             claw_time_distortion_percent: 0,
@@ -11265,6 +11271,7 @@ impl DawUi {
         let mut humanize_requested = false;
         let mut limit_requested = false;
         let mut arpeggiate_requested = false;
+        let mut riff_machine_requested = false;
         let mut claw_requested = false;
         let mut slice_requested = false;
         let mut delete_selection_requested = false;
@@ -11842,6 +11849,128 @@ impl DawUi {
                                 .clicked()
                             {
                                 articulate_requested = true;
+                                ui.close();
+                            }
+                        });
+                    });
+                    ui.menu_button("Riff machine", |ui| {
+                        ui.small(
+                            "Use the targeted notes as chord roots, then create a fitted arpeggio.",
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut self.arpeggiator_step_ticks, 1..=384)
+                                .text("Arpeggio step (ticks)"),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut self.arpeggiator_range_octaves, 1..=4)
+                                .text("Octave range"),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut self.arpeggiator_gate_percent, 1..=100)
+                                .text("Gate (%)"),
+                        );
+                        egui::ComboBox::from_id_salt("piano-roll-riff-direction")
+                            .selected_text(match self.arpeggiator_direction {
+                                ArpeggioDirection::Up => "Direction: Up",
+                                ArpeggioDirection::Down => "Direction: Down",
+                                ArpeggioDirection::UpDown => "Direction: Up / Down",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.arpeggiator_direction,
+                                    ArpeggioDirection::Up,
+                                    "Up",
+                                );
+                                ui.selectable_value(
+                                    &mut self.arpeggiator_direction,
+                                    ArpeggioDirection::Down,
+                                    "Down",
+                                );
+                                ui.selectable_value(
+                                    &mut self.arpeggiator_direction,
+                                    ArpeggioDirection::UpDown,
+                                    "Up / Down",
+                                );
+                            });
+                        ui.add(
+                            egui::Slider::new(&mut self.note_limit_minimum_key, 0..=127)
+                                .text("Lowest key"),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut self.note_limit_maximum_key, 0..=127)
+                                .text("Highest key"),
+                        );
+                        ui.checkbox(&mut self.note_limit_wrap_to_bottom, "Wrap to lowest octave");
+                        egui::ComboBox::from_id_salt("piano-roll-riff-scale-snap")
+                            .selected_text(match self.note_limit_snap_direction {
+                                LimitSnapDirection::Up => "Scale snap: Up",
+                                LimitSnapDirection::Down => "Scale snap: Down",
+                                LimitSnapDirection::Alternate => "Scale snap: Alternate",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.note_limit_snap_direction,
+                                    LimitSnapDirection::Up,
+                                    "Up",
+                                );
+                                ui.selectable_value(
+                                    &mut self.note_limit_snap_direction,
+                                    LimitSnapDirection::Down,
+                                    "Down",
+                                );
+                                ui.selectable_value(
+                                    &mut self.note_limit_snap_direction,
+                                    LimitSnapDirection::Alternate,
+                                    "Alternate",
+                                );
+                            });
+                        ui.add(
+                            egui::Slider::new(&mut self.riff_length_multiplier_percent, 10..=100)
+                                .text("Note length (%)"),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut self.riff_velocity_variation_percent, 0..=100)
+                                .text("Velocity variation (%)"),
+                        );
+                        if self.riff_velocity_variation_percent > 0 {
+                            ui.add(egui::DragValue::new(&mut self.riff_seed).prefix("Seed "));
+                        }
+                        ui.small(format!(
+                            "Key and scale: {} {}",
+                            PITCH_CLASSES[usize::from(self.piano_roll_scale_root)],
+                            self.piano_roll_scale.label()
+                        ));
+                        ui.horizontal(|ui| {
+                            if ui.button("Reset").clicked() {
+                                let defaults = RiffMachineOptions::default();
+                                self.arpeggiator_step_ticks = defaults.step_ticks;
+                                self.arpeggiator_range_octaves = defaults.range_octaves;
+                                self.arpeggiator_gate_percent = defaults.gate_percent;
+                                self.arpeggiator_direction = defaults.direction;
+                                self.note_limit_minimum_key = defaults.minimum_key as u8;
+                                self.note_limit_maximum_key = defaults.maximum_key as u8;
+                                self.note_limit_wrap_to_bottom = defaults.wrap_to_bottom;
+                                self.note_limit_snap_direction = defaults.snap_direction;
+                                self.riff_seed = defaults.seed;
+                                self.riff_velocity_variation_percent =
+                                    defaults.velocity_variation_percent;
+                                self.riff_length_multiplier_percent =
+                                    defaults.length_multiplier_percent;
+                            }
+                            if self.riff_velocity_variation_percent > 0
+                                && ui.button("New seed").clicked()
+                            {
+                                self.riff_seed = self.riff_seed.saturating_add(1);
+                            }
+                            if ui
+                                .add_enabled(
+                                    edit_scope_available
+                                        && self.piano_roll_scale != PianoRollScale::None,
+                                    egui::Button::new(format!("Generate for {edit_target}")),
+                                )
+                                .clicked()
+                            {
+                                riff_machine_requested = true;
                                 ui.close();
                             }
                         });
@@ -12951,6 +13080,60 @@ impl DawUi {
                     );
                 }
                 Err(error) => self.status = format!("Could not arpeggiate notes: {error}"),
+            }
+        }
+        if riff_machine_requested
+            && let (Some(pattern_id), Some(channel_id)) =
+                (self.selected_pattern, self.selected_note_channel)
+        {
+            let scale_intervals = self.piano_roll_scale.intervals();
+            let options = RiffMachineOptions {
+                scale_root: self.piano_roll_scale_root,
+                scale_intervals,
+                minimum_key: u16::from(self.note_limit_minimum_key),
+                maximum_key: u16::from(self.note_limit_maximum_key),
+                wrap_to_bottom: self.note_limit_wrap_to_bottom,
+                snap_direction: self.note_limit_snap_direction,
+                step_ticks: self.arpeggiator_step_ticks,
+                range_octaves: self.arpeggiator_range_octaves,
+                gate_percent: self.arpeggiator_gate_percent,
+                direction: self.arpeggiator_direction,
+                length_multiplier_percent: self.riff_length_multiplier_percent,
+                velocity_variation_percent: self.riff_velocity_variation_percent,
+                seed: self.riff_seed,
+            };
+            let result = self
+                .document
+                .as_mut()
+                .ok_or_else(|| "no project is open".to_owned())
+                .and_then(|document| {
+                    let result = if edit_selection_only {
+                        document.riff_machine_pattern_note_selection(
+                            pattern_id,
+                            channel_id,
+                            &selected_quantize_indices,
+                            options,
+                        )
+                    } else {
+                        document.riff_machine_pattern_notes(pattern_id, channel_id, options)
+                    };
+                    result.map_err(|error| error.to_string())
+                });
+            match result {
+                Ok(created) => {
+                    if created > 0 {
+                        self.stop_project_playback();
+                        self.dirty = true;
+                        self.selected_piano_notes.clear();
+                        self.selected_note = None;
+                        self.active_note_drag = None;
+                        self.riff_seed = self.riff_seed.saturating_add(1);
+                    }
+                    self.status = format!(
+                        "Generated {created} Riff Machine notes in pattern {pattern_id}, {edit_scope_description}"
+                    );
+                }
+                Err(error) => self.status = format!("Could not generate a riff: {error}"),
             }
         }
         if claw_requested

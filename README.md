@@ -149,6 +149,8 @@ The Piano roll's **Edit** target selector applies note-transform buttons to eith
 
 **Arpeggiate channel/selected** and `arp-notes` replace targeted simultaneous chord groups with repeated up, down, or up/down note runs across a configurable octave range. Step time and gate length are configurable. Custom `.fsc` arp patterns, alternate patterns, and native sync modes are not implemented.
 
+**Riff machine channel/selected** uses the targeted notes as a progression, builds diatonic triads in the current Piano roll scale, arpeggiates them, and applies seeded velocity variation, note-length scaling, and key-range fitting. It does not yet provide native progression presets, mirror and groove stages, custom patterns, or staged preview ([FL Studio Riff Machine manual](https://www.image-line.com/fl-studio-learning/fl-studio-online-manual/html/pianoroll_riff.htm)).
+
 **Claw machine channel/selected** gates notes on a repeating period, slews their timing toward the period start or end, can remove notes shorter than one period slice, and can stretch notes across gaps left by removed notes. Its 16-slice gate and timing curve are local interpretations; native note-splitting and exact distortion behavior remain unverified ([FL Studio Claw Machine manual](https://www.image-line.com/fl-studio-learning/fl-studio-online-manual/html/pianoroll_claw.htm)).
 
 **Slice channel/selected** splits targeted notes that cross the configured tick, retaining their note properties. The drag-based directional Slice tool remains incomplete.
