@@ -5546,7 +5546,7 @@ mod tests {
         ));
         fs::create_dir_all(&root).unwrap();
 
-        let frames = STREAM_BLOCK_FRAMES * 2 + 137;
+        let frames = FLAC_BLOCK_FRAMES * 2 + 137;
         let mut samples = Vec::with_capacity(frames * 2);
         for frame in 0..frames {
             let phase = std::f32::consts::TAU * frame as f32 / 96.0;
@@ -5580,11 +5580,27 @@ mod tests {
             )
             .unwrap();
 
-            let decoded = decode_audio_file(&output).unwrap();
-            assert_eq!(decoded.sample_rate, 48_000);
-            assert_eq!(decoded.channels.len(), 1);
-            assert!(!decoded.channels[0].is_empty());
-            assert!(decoded.channels[0].iter().any(|sample| sample.abs() > 0.01));
+            if matches!(output_format, AudioClipRenderOutput::Ogg { .. }) {
+                let mut source = File::open(&output).unwrap();
+                let mut decoder = VorbisDecoder::new(&mut source).unwrap();
+                assert_eq!(decoder.sampling_frequency().get(), 48_000);
+                assert_eq!(decoder.channels().get(), 1);
+                let mut decoded_frames = 0;
+                let mut contains_audio = false;
+                while let Some(block) = decoder.decode_audio_block().unwrap() {
+                    assert_eq!(block.samples().len(), 1);
+                    decoded_frames += block.samples()[0].len();
+                    contains_audio |= block.samples()[0].iter().any(|sample| sample.abs() > 0.01);
+                }
+                assert!(decoded_frames > 0);
+                assert!(contains_audio);
+            } else {
+                let decoded = decode_audio_file(&output).unwrap();
+                assert_eq!(decoded.sample_rate, 48_000);
+                assert_eq!(decoded.channels.len(), 1);
+                assert!(!decoded.channels[0].is_empty());
+                assert!(decoded.channels[0].iter().any(|sample| sample.abs() > 0.01));
+            }
         }
 
         fs::remove_dir_all(root).unwrap();
