@@ -882,6 +882,15 @@ pub struct ArpeggioOptions {
     pub direction: ArpeggioDirection,
 }
 
+/// Timing mode for the Riff Machine's Groove stage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RiffMachineQuantizeMode {
+    LeaveDuration,
+    LeaveEnd,
+    QuantizeDuration,
+    QuantizeEnd,
+}
+
 /// Settings for a seeded, scale-based Riff Machine pass over an existing note progression.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RiffMachineOptions<'a> {
@@ -901,6 +910,15 @@ pub struct RiffMachineOptions<'a> {
     pub preserve_start_times: bool,
     /// Reflect generated pitches around the midpoint of their current pitch range.
     pub mirror_vertical: bool,
+    /// Optional Piano roll snap grid for the Groove stage; `None` means snap is disabled.
+    pub groove_snap_ticks: Option<u32>,
+    /// Mix from original starts toward quantized starts, from 0 through 100 percent.
+    pub groove_start_percent: u8,
+    /// Quantize only features within this fraction of half a snap step, from 0 through 100.
+    pub groove_sensitivity_percent: u8,
+    /// Mix note durations or end positions toward their quantized values.
+    pub groove_duration_percent: u8,
+    pub groove_quantize_mode: RiffMachineQuantizeMode,
     pub length_multiplier_percent: u8,
     pub velocity_variation_percent: u8,
     pub seed: u64,
@@ -922,11 +940,83 @@ impl<'a> Default for RiffMachineOptions<'a> {
             mirror_horizontal: false,
             preserve_start_times: false,
             mirror_vertical: false,
+            groove_snap_ticks: Some(24),
+            groove_start_percent: 0,
+            groove_sensitivity_percent: 50,
+            groove_duration_percent: 0,
+            groove_quantize_mode: RiffMachineQuantizeMode::LeaveDuration,
             length_multiplier_percent: 100,
             velocity_variation_percent: 10,
             seed: 1,
         }
     }
+}
+
+fn riff_machine_groove_note_timing(
+    note: &PatternNote,
+    snap_ticks: u32,
+    options: RiffMachineOptions<'_>,
+) -> Result<(u32, u32), FlpError> {
+    if snap_ticks == 0 {
+        return Err(FlpError::UnsupportedEdit(
+            "Riff Machine Groove needs an enabled Piano roll snap grid",
+        ));
+    }
+    let grid = u64::from(snap_ticks);
+    let original_start = u64::from(note.position);
+    let original_length = u64::from(note.length);
+    let original_end = original_start
+        .checked_add(original_length)
+        .ok_or(FlpError::LengthOverflow)?;
+
+    let quantize = |tick: u64| (tick.saturating_add(grid / 2) / grid).saturating_mul(grid);
+    let near_grid = |tick: u64, snapped: u64| {
+        tick.abs_diff(snapped).saturating_mul(200)
+            <= grid.saturating_mul(u64::from(options.groove_sensitivity_percent))
+    };
+    let mix = |original: u64, target: u64, amount: u8| {
+        let delta = target as i64 - original as i64;
+        (original as i64 + delta * i64::from(amount) / 100).max(0) as u64
+    };
+
+    let snapped_start = quantize(original_start);
+    let target_start = if near_grid(original_start, snapped_start) {
+        snapped_start
+    } else {
+        original_start
+    };
+    let mut start = mix(original_start, target_start, options.groove_start_percent);
+    let snapped_end = quantize(original_end);
+    let target_end = if near_grid(original_end, snapped_end) {
+        snapped_end
+    } else {
+        original_end
+    };
+    let length = match options.groove_quantize_mode {
+        RiffMachineQuantizeMode::LeaveDuration => original_length,
+        RiffMachineQuantizeMode::LeaveEnd => {
+            start = start.min(original_end.saturating_sub(1));
+            original_end.saturating_sub(start)
+        }
+        RiffMachineQuantizeMode::QuantizeDuration => {
+            let target_length = target_end.saturating_sub(target_start).max(1);
+            mix(
+                original_length,
+                target_length,
+                options.groove_duration_percent,
+            )
+            .max(1)
+        }
+        RiffMachineQuantizeMode::QuantizeEnd => {
+            let end = mix(original_end, target_end, options.groove_duration_percent);
+            start = start.min(end.saturating_sub(1));
+            end.saturating_sub(start)
+        }
+    };
+    let start = u32::try_from(start).map_err(|_| FlpError::LengthOverflow)?;
+    let length =
+        u32::try_from(length.min(u64::from(u32::MAX))).map_err(|_| FlpError::LengthOverflow)?;
+    Ok((start, length.max(1)))
 }
 
 /// Parameters for seeded note velocity, pan, and pitch randomization.
@@ -6506,6 +6596,21 @@ impl FlpDocument {
                 "Riff Machine velocity variation must be between 0 and 100 percent",
             ));
         }
+        if options.groove_start_percent > 100
+            || options.groove_sensitivity_percent > 100
+            || options.groove_duration_percent > 100
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "Riff Machine Groove percentages must be between 0 and 100",
+            ));
+        }
+        let groove_enabled =
+            options.groove_start_percent > 0 || options.groove_duration_percent > 0;
+        if groove_enabled && options.groove_snap_ticks.is_none_or(|ticks| ticks == 0) {
+            return Err(FlpError::UnsupportedEdit(
+                "Riff Machine Groove needs an enabled Piano roll snap grid",
+            ));
+        }
 
         let minimum = i32::from(options.minimum_key);
         let maximum = i32::from(options.maximum_key);
@@ -6736,6 +6841,14 @@ impl FlpDocument {
             },
             false,
         )?;
+        if groove_enabled {
+            updated.apply_riff_machine_groove(
+                pattern_id,
+                channel_id,
+                &generated_indices,
+                options,
+            )?;
+        }
         updated.limit_pattern_note_selection_range_with_options(
             pattern_id,
             channel_id,
@@ -6751,6 +6864,47 @@ impl FlpDocument {
         )?;
         *self = updated;
         Ok(arpeggiated)
+    }
+
+    fn apply_riff_machine_groove(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: &[usize],
+        options: RiffMachineOptions<'_>,
+    ) -> Result<(), FlpError> {
+        let snap_ticks = options.groove_snap_ticks.filter(|ticks| *ticks > 0).ok_or(
+            FlpError::UnsupportedEdit("Riff Machine Groove needs an enabled Piano roll snap grid"),
+        )?;
+        let selected_indices = note_indices.iter().copied().collect::<HashSet<_>>();
+        let patterns = self.patterns()?;
+        let pattern = patterns
+            .iter()
+            .find(|pattern| pattern.id == pattern_id)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested pattern does not exist",
+            ))?;
+        let mut edits = HashMap::new();
+        for (note_index, note) in pattern
+            .notes
+            .iter()
+            .filter(|note| note.channel_id == channel_id)
+            .enumerate()
+            .filter(|(note_index, _)| selected_indices.contains(note_index))
+        {
+            let (position, length) = riff_machine_groove_note_timing(note, snap_ticks, options)?;
+            if position != note.position || length != note.length {
+                edits.insert(
+                    note_index,
+                    PatternNoteEdit {
+                        position: Some(position),
+                        length: Some(length),
+                        ..PatternNoteEdit::default()
+                    },
+                );
+            }
+        }
+        self.edit_pattern_notes_batch(pattern_id, channel_id, &edits)
     }
 
     /// Adds a short, same-pitch stroke before or after every note in a channel.
@@ -14002,6 +14156,181 @@ mod tests {
         );
         assert_eq!(notes[0].channel_id, 1);
         assert_eq!(notes[0].key, 48);
+    }
+
+    #[test]
+    fn riff_machine_groove_moves_starts_by_strength_and_sensitivity() {
+        let input = pattern_fixture(
+            &[
+                note_record(0, 0, 96, 60, 100),
+                note_record(96, 0, 96, 62, 90),
+            ],
+            &[0xFF, 0],
+        );
+        let mut softened = FlpDocument::parse(&input).expect("fixture should parse");
+        softened
+            .riff_machine_pattern_notes(
+                7,
+                0,
+                RiffMachineOptions {
+                    velocity_variation_percent: 0,
+                    groove_snap_ticks: Some(36),
+                    groove_start_percent: 50,
+                    groove_sensitivity_percent: 100,
+                    ..RiffMachineOptions::default()
+                },
+            )
+            .expect("Riff Machine should mix starts toward the snap grid");
+        let notes = softened.patterns().unwrap().remove(0).notes;
+        let channel_notes = notes
+            .iter()
+            .filter(|note| note.channel_id == 0)
+            .collect::<Vec<_>>();
+        assert_eq!(channel_notes[0].position, 0);
+        assert_eq!(channel_notes[1].position, 30);
+        assert_eq!(channel_notes[2].position, 42);
+        assert_eq!(channel_notes[1].length, 19);
+
+        let mut sensitive = FlpDocument::parse(&input).expect("fixture should parse");
+        sensitive
+            .riff_machine_pattern_notes(
+                7,
+                0,
+                RiffMachineOptions {
+                    velocity_variation_percent: 0,
+                    groove_snap_ticks: Some(36),
+                    groove_start_percent: 100,
+                    groove_sensitivity_percent: 50,
+                    ..RiffMachineOptions::default()
+                },
+            )
+            .expect("Riff Machine should leave distant starts unchanged");
+        let notes = sensitive.patterns().unwrap().remove(0).notes;
+        let channel_notes = notes
+            .iter()
+            .filter(|note| note.channel_id == 0)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            channel_notes
+                .iter()
+                .map(|note| note.position)
+                .collect::<Vec<_>>(),
+            [0, 24, 48, 72, 96, 120, 144, 168]
+        );
+    }
+
+    #[test]
+    fn riff_machine_groove_quantizes_duration_and_can_leave_note_ends_fixed() {
+        let input = pattern_fixture(
+            &[
+                note_record(0, 0, 96, 60, 100),
+                note_record(96, 0, 96, 62, 90),
+            ],
+            &[0xFF, 0],
+        );
+        let mut quantized = FlpDocument::parse(&input).expect("fixture should parse");
+        quantized
+            .riff_machine_pattern_notes(
+                7,
+                0,
+                RiffMachineOptions {
+                    velocity_variation_percent: 0,
+                    groove_snap_ticks: Some(24),
+                    groove_duration_percent: 100,
+                    groove_sensitivity_percent: 100,
+                    groove_quantize_mode: RiffMachineQuantizeMode::QuantizeDuration,
+                    ..RiffMachineOptions::default()
+                },
+            )
+            .expect("Riff Machine should quantize note durations");
+        let notes = quantized.patterns().unwrap().remove(0).notes;
+        assert!(
+            notes
+                .iter()
+                .filter(|note| note.channel_id == 0)
+                .all(|note| note.length == 24)
+        );
+
+        let mut fixed_end = FlpDocument::parse(&input).expect("fixture should parse");
+        fixed_end
+            .riff_machine_pattern_notes(
+                7,
+                0,
+                RiffMachineOptions {
+                    velocity_variation_percent: 0,
+                    groove_snap_ticks: Some(36),
+                    groove_start_percent: 100,
+                    groove_sensitivity_percent: 100,
+                    groove_quantize_mode: RiffMachineQuantizeMode::LeaveEnd,
+                    ..RiffMachineOptions::default()
+                },
+            )
+            .expect("Riff Machine should preserve note ends");
+        let notes = fixed_end.patterns().unwrap().remove(0).notes;
+        let channel_notes = notes
+            .iter()
+            .filter(|note| note.channel_id == 0)
+            .collect::<Vec<_>>();
+        assert_eq!(channel_notes[1].position + channel_notes[1].length, 43);
+        assert_eq!(channel_notes[1].position, 36);
+        assert_eq!(channel_notes[1].length, 7);
+    }
+
+    #[test]
+    fn riff_machine_groove_distinguishes_quantized_duration_from_quantized_end() {
+        let note = PatternNote {
+            position: 30,
+            length: 24,
+            ..PatternNote::default()
+        };
+        let duration = riff_machine_groove_note_timing(
+            &note,
+            24,
+            RiffMachineOptions {
+                groove_start_percent: 25,
+                groove_sensitivity_percent: 100,
+                groove_duration_percent: 100,
+                groove_quantize_mode: RiffMachineQuantizeMode::QuantizeDuration,
+                ..RiffMachineOptions::default()
+            },
+        )
+        .expect("duration quantization should succeed");
+        let end = riff_machine_groove_note_timing(
+            &note,
+            24,
+            RiffMachineOptions {
+                groove_start_percent: 25,
+                groove_sensitivity_percent: 100,
+                groove_duration_percent: 100,
+                groove_quantize_mode: RiffMachineQuantizeMode::QuantizeEnd,
+                ..RiffMachineOptions::default()
+            },
+        )
+        .expect("end-time quantization should succeed");
+        assert_eq!(duration, (29, 24));
+        assert_eq!(end, (29, 19));
+    }
+
+    #[test]
+    fn riff_machine_groove_requires_snap_when_timing_is_enabled() {
+        let input = pattern_fixture(&[note_record(0, 0, 96, 60, 100)], &[0xFF, 0]);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+        let original = document.encode_lossless().unwrap();
+        assert!(
+            document
+                .riff_machine_pattern_notes(
+                    7,
+                    0,
+                    RiffMachineOptions {
+                        velocity_variation_percent: 0,
+                        groove_snap_ticks: None,
+                        groove_start_percent: 100,
+                        ..RiffMachineOptions::default()
+                    },
+                )
+                .is_err()
+        );
+        assert_eq!(document.encode_lossless().unwrap(), original);
     }
 
     #[test]

@@ -32,7 +32,8 @@ use flp_rebuild::{
     FlpDocument, FstPreset, FstPresetKind, LimitNoteOptions, LimitSnapDirection, Pattern,
     PatternNote, PatternNoteEdit, PlaylistClip, PlaylistClipClipboard, PlaylistClipEdit,
     PlaylistClipTarget, PlaylistTrack, ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions,
-    RiffMachineOptions, ScaleLevelsOptions, TimeMarker, TimeMarkerEdit, VstPluginStateMetadata,
+    RiffMachineOptions, RiffMachineQuantizeMode, ScaleLevelsOptions, TimeMarker, TimeMarkerEdit,
+    VstPluginStateMetadata,
 };
 
 const APP_BACKGROUND: Color32 = Color32::from_rgb(29, 29, 29);
@@ -1536,6 +1537,10 @@ struct DawUi {
     riff_mirror_horizontal: bool,
     riff_preserve_start_times: bool,
     riff_mirror_vertical: bool,
+    riff_groove_start_percent: u8,
+    riff_groove_sensitivity_percent: u8,
+    riff_groove_duration_percent: u8,
+    riff_groove_quantize_mode: RiffMachineQuantizeMode,
     claw_period_ticks: u32,
     claw_trash_every: u8,
     claw_time_distortion_percent: i16,
@@ -1819,6 +1824,10 @@ impl DawUi {
             riff_mirror_horizontal: false,
             riff_preserve_start_times: false,
             riff_mirror_vertical: false,
+            riff_groove_start_percent: 0,
+            riff_groove_sensitivity_percent: 50,
+            riff_groove_duration_percent: 0,
+            riff_groove_quantize_mode: RiffMachineQuantizeMode::LeaveDuration,
             claw_period_ticks: 384,
             claw_trash_every: 4,
             claw_time_distortion_percent: 0,
@@ -11906,6 +11915,65 @@ impl DawUi {
                             );
                         });
                         ui.checkbox(&mut self.riff_mirror_vertical, "Flip vertically");
+                        ui.separator();
+                        ui.strong("Groove");
+                        let groove_grid_available = self.piano_roll_snap != PianoRollSnap::None;
+                        ui.add_enabled_ui(groove_grid_available, |ui| {
+                            ui.add(
+                                egui::Slider::new(&mut self.riff_groove_start_percent, 0..=100)
+                                    .text("Start time (%)"),
+                            );
+                            ui.add(
+                                egui::Slider::new(
+                                    &mut self.riff_groove_sensitivity_percent,
+                                    0..=100,
+                                )
+                                .text("Sensitivity (%)"),
+                            );
+                            ui.add_enabled(
+                                matches!(
+                                    self.riff_groove_quantize_mode,
+                                    RiffMachineQuantizeMode::QuantizeDuration
+                                        | RiffMachineQuantizeMode::QuantizeEnd
+                                ),
+                                egui::Slider::new(&mut self.riff_groove_duration_percent, 0..=100)
+                                    .text("Duration (%)"),
+                            );
+                            egui::ComboBox::from_id_salt("piano-roll-riff-groove-mode")
+                                .selected_text(match self.riff_groove_quantize_mode {
+                                    RiffMachineQuantizeMode::LeaveDuration => "Leave duration",
+                                    RiffMachineQuantizeMode::LeaveEnd => "Leave end time",
+                                    RiffMachineQuantizeMode::QuantizeDuration => {
+                                        "Quantize duration"
+                                    }
+                                    RiffMachineQuantizeMode::QuantizeEnd => "Quantize end time",
+                                })
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut self.riff_groove_quantize_mode,
+                                        RiffMachineQuantizeMode::LeaveDuration,
+                                        "Leave duration",
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.riff_groove_quantize_mode,
+                                        RiffMachineQuantizeMode::LeaveEnd,
+                                        "Leave end time",
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.riff_groove_quantize_mode,
+                                        RiffMachineQuantizeMode::QuantizeDuration,
+                                        "Quantize duration",
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.riff_groove_quantize_mode,
+                                        RiffMachineQuantizeMode::QuantizeEnd,
+                                        "Quantize end time",
+                                    );
+                                });
+                        });
+                        if !groove_grid_available {
+                            ui.small("Choose a Piano roll snap grid to enable groove timing.");
+                        }
                         ui.add(
                             egui::Slider::new(&mut self.note_limit_minimum_key, 0..=127)
                                 .text("Lowest key"),
@@ -11973,6 +12041,12 @@ impl DawUi {
                                 self.riff_mirror_horizontal = defaults.mirror_horizontal;
                                 self.riff_preserve_start_times = defaults.preserve_start_times;
                                 self.riff_mirror_vertical = defaults.mirror_vertical;
+                                self.riff_groove_start_percent = defaults.groove_start_percent;
+                                self.riff_groove_sensitivity_percent =
+                                    defaults.groove_sensitivity_percent;
+                                self.riff_groove_duration_percent =
+                                    defaults.groove_duration_percent;
+                                self.riff_groove_quantize_mode = defaults.groove_quantize_mode;
                             }
                             if self.riff_velocity_variation_percent > 0
                                 && ui.button("New seed").clicked()
@@ -11982,7 +12056,10 @@ impl DawUi {
                             if ui
                                 .add_enabled(
                                     edit_scope_available
-                                        && self.piano_roll_scale != PianoRollScale::None,
+                                        && self.piano_roll_scale != PianoRollScale::None
+                                        && (groove_grid_available
+                                            || (self.riff_groove_start_percent == 0
+                                                && self.riff_groove_duration_percent == 0)),
                                     egui::Button::new(format!("Generate for {edit_target}")),
                                 )
                                 .clicked()
@@ -13118,6 +13195,12 @@ impl DawUi {
                 mirror_horizontal: self.riff_mirror_horizontal,
                 preserve_start_times: self.riff_preserve_start_times,
                 mirror_vertical: self.riff_mirror_vertical,
+                groove_snap_ticks: (self.piano_roll_snap != PianoRollSnap::None)
+                    .then(|| self.piano_roll_snap.ticks(ppq, time_signature)),
+                groove_start_percent: self.riff_groove_start_percent,
+                groove_sensitivity_percent: self.riff_groove_sensitivity_percent,
+                groove_duration_percent: self.riff_groove_duration_percent,
+                groove_quantize_mode: self.riff_groove_quantize_mode,
                 length_multiplier_percent: self.riff_length_multiplier_percent,
                 velocity_variation_percent: self.riff_velocity_variation_percent,
                 seed: self.riff_seed,
