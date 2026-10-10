@@ -1482,6 +1482,7 @@ struct PendingAudioClipExport {
     worker: thread::JoinHandle<()>,
     output_path: PathBuf,
     selected_clip_index: Option<usize>,
+    start_from_song_start: bool,
 }
 
 struct PendingSongRender {
@@ -3967,18 +3968,25 @@ impl DawUi {
                         self.render_audio_clips_dialog();
                         ui.close();
                     }
-                    if ui
-                        .add_enabled(
-                            self.selected_playlist_audio_clip().is_some()
-                                && self.sample_project_path().is_some()
-                                && self.pending_audio_clip_export.is_none(),
-                            egui::Button::new("Render selected Audio Clip…"),
-                        )
-                        .clicked()
-                    {
-                        self.render_selected_audio_clip_dialog();
-                        ui.close();
-                    }
+                    ui.menu_button("Render selected Audio Clip…", |ui| {
+                        let can_render = self.selected_playlist_audio_clip().is_some()
+                            && self.sample_project_path().is_some()
+                            && self.pending_audio_clip_export.is_none();
+                        if ui
+                            .add_enabled(can_render, egui::Button::new("From clip start…"))
+                            .clicked()
+                        {
+                            self.render_selected_audio_clip_dialog(false);
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(can_render, egui::Button::new("From song start…"))
+                            .clicked()
+                        {
+                            self.render_selected_audio_clip_dialog(true);
+                            ui.close();
+                        }
+                    });
                     if ui
                         .add_enabled(
                             self.document.is_some()
@@ -11582,7 +11590,7 @@ impl DawUi {
         self.start_audio_clip_export(options, output_path);
     }
 
-    fn render_selected_audio_clip_dialog(&mut self) {
+    fn render_selected_audio_clip_dialog(&mut self, start_from_song_start: bool) {
         let Some((arrangement_id, clip_index)) = self.selected_playlist_audio_clip() else {
             self.status = "Select an enabled audio-channel clip in the Playlist first".to_owned();
             return;
@@ -11600,8 +11608,20 @@ impl DawUi {
             .map(|stem| stem.to_string_lossy().into_owned())
             .unwrap_or_else(|| "FL_Studio_Project".to_owned());
         let Some(output_path) = rfd::FileDialog::new()
-            .set_title("Render selected Playlist audio clip")
-            .set_file_name(format!("{project_stem}_clip_{}.wav", clip_index + 1))
+            .set_title(if start_from_song_start {
+                "Render selected Playlist audio clip from song start"
+            } else {
+                "Render selected Playlist audio clip from clip start"
+            })
+            .set_file_name(format!(
+                "{project_stem}_clip_{}_{}.wav",
+                clip_index + 1,
+                if start_from_song_start {
+                    "song_start"
+                } else {
+                    "clip_start"
+                }
+            ))
             .add_filter("WAV audio", &["wav"])
             .save_file()
         else {
@@ -11611,6 +11631,7 @@ impl DawUi {
             arrangement_id,
             sample_rate: self.audio_settings.sample_rate,
             clip_index: Some(clip_index),
+            start_from_song_start,
         };
         self.start_audio_clip_export(options, output_path);
     }
@@ -11652,11 +11673,17 @@ impl DawUi {
                     worker,
                     output_path: output_path.clone(),
                     selected_clip_index,
+                    start_from_song_start: options.start_from_song_start,
                 });
                 self.status = match selected_clip_index {
                     Some(clip_index) => format!(
-                        "Rendering selected Playlist audio clip {} to {}…",
+                        "Rendering selected Playlist audio clip {} from {} to {}…",
                         clip_index + 1,
+                        if options.start_from_song_start {
+                            "song start"
+                        } else {
+                            "clip start"
+                        },
                         output_path.display()
                     ),
                     None => format!(
@@ -11695,8 +11722,13 @@ impl DawUi {
             Ok(summary) => {
                 self.status = match pending.selected_clip_index {
                     Some(clip_index) => format!(
-                        "Rendered selected Playlist audio clip {} to {} at {} Hz",
+                        "Rendered selected Playlist audio clip {} from {} to {} at {} Hz",
                         clip_index + 1,
+                        if pending.start_from_song_start {
+                            "song start"
+                        } else {
+                            "clip start"
+                        },
                         pending.output_path.display(),
                         summary.sample_rate,
                     ),

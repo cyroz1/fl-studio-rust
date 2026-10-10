@@ -33,6 +33,8 @@ pub struct AudioClipRenderOptions {
     pub sample_rate: u32,
     /// Render only this zero-based arrangement clip, rebased to output time zero.
     pub clip_index: Option<usize>,
+    /// Keep the selected clip at its original arrangement position in the output.
+    pub start_from_song_start: bool,
 }
 
 impl Default for AudioClipRenderOptions {
@@ -41,6 +43,7 @@ impl Default for AudioClipRenderOptions {
             arrangement_id: 0,
             sample_rate: DEFAULT_SAMPLE_RATE,
             clip_index: None,
+            start_from_song_start: false,
         }
     }
 }
@@ -323,6 +326,7 @@ pub fn stream_playlist_with_vst3_to_device(
             arrangement_id: options.arrangement_id,
             sample_rate: options.sample_rate,
             clip_index: None,
+            start_from_song_start: false,
         },
         Some(cancelled),
     )?;
@@ -420,6 +424,7 @@ pub fn render_playlist_with_vst3_to_wav_cancellable(
             arrangement_id: options.arrangement_id,
             sample_rate: options.sample_rate,
             clip_index: None,
+            start_from_song_start: false,
         },
         Some(cancelled),
     )?;
@@ -1012,6 +1017,18 @@ fn audio_clip_matches_selection(selected_clip_index: Option<usize>, clip_index: 
     selected_clip_index.is_none_or(|selected_index| selected_index == clip_index)
 }
 
+fn audio_clip_selection_start_tick(
+    selected_clip_position_ticks: Option<u32>,
+    start_from_song_start: bool,
+) -> u32 {
+    selected_clip_position_ticks.map_or(
+        0,
+        |position| {
+            if start_from_song_start { 0 } else { position }
+        },
+    )
+}
+
 fn audio_clip_render_start_tick(
     clip_position_ticks: u32,
     selection_start_tick: u32,
@@ -1058,7 +1075,10 @@ fn prepare_audio_clip_render(
                 .ok_or_else(|| format!("Playlist clip {clip_index} does not exist"))
         })
         .transpose()?;
-    let selection_start_tick = selected_clip.map_or(0, |clip| clip.position_ticks);
+    let selection_start_tick = audio_clip_selection_start_tick(
+        selected_clip.map(|clip| clip.position_ticks),
+        options.start_from_song_start,
+    );
 
     let mut max_tick = 0u64;
     let mut clips_skipped_unsupported_scale = 0usize;
@@ -2539,6 +2559,9 @@ mod tests {
         assert!(audio_clip_matches_selection(None, 0));
         assert!(audio_clip_matches_selection(Some(2), 2));
         assert!(!audio_clip_matches_selection(Some(2), 1));
+        assert_eq!(audio_clip_selection_start_tick(Some(384), false), 384);
+        assert_eq!(audio_clip_selection_start_tick(Some(384), true), 0);
+        assert_eq!(audio_clip_selection_start_tick(None, true), 0);
         assert_eq!(audio_clip_render_start_tick(384, 384).unwrap(), 0);
         assert_eq!(audio_clip_render_start_tick(384, 0).unwrap(), 384);
         assert!(audio_clip_render_start_tick(96, 192).is_err());
