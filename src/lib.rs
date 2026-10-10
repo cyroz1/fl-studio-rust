@@ -854,6 +854,14 @@ pub enum ArpeggioDirection {
     UpDown,
 }
 
+/// Direction used when a limited pitch needs to move onto a selected scale.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LimitSnapDirection {
+    Up,
+    Down,
+    Alternate,
+}
+
 /// Parameters for replacing simultaneous notes with a gated arpeggio sequence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArpeggioOptions {
@@ -1034,6 +1042,34 @@ fn randomizer_offset(state: &mut u64, range: i32, negative: bool, bipolar: bool)
 
 fn note_index_in_scope(note_index: usize, selected_indices: Option<&HashSet<usize>>) -> bool {
     selected_indices.is_none_or(|indices| indices.contains(&note_index))
+}
+
+fn note_pitch_in_scale(key: i32, scale_root: u8, scale_intervals: &[u8]) -> bool {
+    let pitch_class = (key.rem_euclid(12) - i32::from(scale_root)).rem_euclid(12) as u8;
+    scale_intervals.contains(&pitch_class)
+}
+
+fn snap_note_pitch_to_scale(
+    key: i32,
+    minimum: i32,
+    maximum: i32,
+    scale_root: u8,
+    scale_intervals: &[u8],
+    snap_up: bool,
+) -> i32 {
+    let in_scale = |candidate| note_pitch_in_scale(candidate, scale_root, scale_intervals);
+    if snap_up {
+        (key..=maximum)
+            .find(|candidate| in_scale(*candidate))
+            .or_else(|| (minimum..key).rev().find(|candidate| in_scale(*candidate)))
+            .expect("the validated key range contains at least one scale pitch")
+    } else {
+        (minimum..=key)
+            .rev()
+            .find(|candidate| in_scale(*candidate))
+            .or_else(|| (key..=maximum).find(|candidate| in_scale(*candidate)))
+            .expect("the validated key range contains at least one scale pitch")
+    }
 }
 
 fn scale_note_level(level: u8, options: ScaleLevelsOptions) -> u8 {
@@ -6626,6 +6662,28 @@ impl FlpDocument {
             None,
             minimum_key,
             maximum_key,
+            None,
+        )
+    }
+
+    /// Limits channel note pitches and snaps out-of-scale notes using the given scale intervals.
+    pub fn limit_pattern_note_range_with_scale(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        minimum_key: u16,
+        maximum_key: u16,
+        scale_root: u8,
+        scale_intervals: &[u8],
+        snap_direction: LimitSnapDirection,
+    ) -> Result<usize, FlpError> {
+        self.limit_pattern_note_range_in_scope(
+            pattern_id,
+            channel_id,
+            None,
+            minimum_key,
+            maximum_key,
+            Some((scale_root, scale_intervals, snap_direction)),
         )
     }
 
@@ -6644,6 +6702,29 @@ impl FlpDocument {
             Some(note_indices),
             minimum_key,
             maximum_key,
+            None,
+        )
+    }
+
+    /// Limits selected channel note pitches and snaps out-of-scale notes.
+    pub fn limit_pattern_note_selection_range_with_scale(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: &[usize],
+        minimum_key: u16,
+        maximum_key: u16,
+        scale_root: u8,
+        scale_intervals: &[u8],
+        snap_direction: LimitSnapDirection,
+    ) -> Result<usize, FlpError> {
+        self.limit_pattern_note_range_in_scope(
+            pattern_id,
+            channel_id,
+            Some(note_indices),
+            minimum_key,
+            maximum_key,
+            Some((scale_root, scale_intervals, snap_direction)),
         )
     }
 
@@ -6654,11 +6735,30 @@ impl FlpDocument {
         note_indices: Option<&[usize]>,
         minimum_key: u16,
         maximum_key: u16,
+        scale_snap: Option<(u8, &[u8], LimitSnapDirection)>,
     ) -> Result<usize, FlpError> {
         if minimum_key > maximum_key || maximum_key > 127 {
             return Err(FlpError::UnsupportedEdit(
                 "note range must be ordered and remain within keys 0 through 127",
             ));
+        }
+        if let Some((scale_root, scale_intervals, _)) = scale_snap {
+            if scale_root > 11
+                || scale_intervals.is_empty()
+                || scale_intervals.iter().any(|interval| *interval > 11)
+            {
+                return Err(FlpError::UnsupportedEdit(
+                    "scale root and intervals must describe pitch classes 0 through 11",
+                ));
+            }
+            let minimum = i32::from(minimum_key);
+            let maximum = i32::from(maximum_key);
+            if !(minimum..=maximum).any(|key| note_pitch_in_scale(key, scale_root, scale_intervals))
+            {
+                return Err(FlpError::UnsupportedEdit(
+                    "the requested key range contains no notes from the selected scale",
+                ));
+            }
         }
         let patterns = self.patterns()?;
         let pattern = patterns
@@ -6670,6 +6770,7 @@ impl FlpDocument {
         let selected_indices =
             note_indices.map(|indices| indices.iter().copied().collect::<HashSet<_>>());
         let mut edits = Vec::new();
+        let mut snap_up_next = true;
         for (note_index, note) in pattern
             .notes
             .iter()
@@ -6692,6 +6793,27 @@ impl FlpDocument {
                 } else {
                     maximum
                 };
+            }
+            if let Some((scale_root, scale_intervals, snap_direction)) = scale_snap
+                && !note_pitch_in_scale(key, scale_root, scale_intervals)
+            {
+                let snap_up = match snap_direction {
+                    LimitSnapDirection::Up => true,
+                    LimitSnapDirection::Down => false,
+                    LimitSnapDirection::Alternate => {
+                        let snap_up = snap_up_next;
+                        snap_up_next = !snap_up_next;
+                        snap_up
+                    }
+                };
+                key = snap_note_pitch_to_scale(
+                    key,
+                    minimum,
+                    maximum,
+                    scale_root,
+                    scale_intervals,
+                    snap_up,
+                );
             }
             let key = u16::try_from(key).map_err(|_| FlpError::LengthOverflow)?;
             if key != note.key {
@@ -9535,10 +9657,10 @@ mod tests {
     use super::{
         ArticulateOptions, ChannelGroupSummary, ChannelNoteRouter, ChannelSortOrder,
         ChannelSummary, FlpDocument, FlpError, FlpEvent, FstPreset, FstPresetKind,
-        MixerParameterKind, PATTERN_NOTE_SLIDE_FLAG, PatternNote, PatternNoteEdit, PayloadEncoding,
-        PlaylistClipEdit, PlaylistClipTarget, ProjectInfoEdit, ProjectSettingsEdit,
-        ScaleLevelsOptions, TimeMarkerEdit, midi::MidiChannelMapping, midi::MidiFile,
-        parse_vst_plugin_state_metadata,
+        LimitSnapDirection, MixerParameterKind, PATTERN_NOTE_SLIDE_FLAG, PatternNote,
+        PatternNoteEdit, PayloadEncoding, PlaylistClipEdit, PlaylistClipTarget, ProjectInfoEdit,
+        ProjectSettingsEdit, ScaleLevelsOptions, TimeMarkerEdit, midi::MidiChannelMapping,
+        midi::MidiFile, parse_vst_plugin_state_metadata,
     };
 
     fn articulate_options(
@@ -12879,6 +13001,88 @@ mod tests {
             )
             .expect("centered multiply should scale around its pivot");
         assert_eq!(centered.patterns().unwrap()[0].notes[0].velocity, 65);
+    }
+
+    #[test]
+    fn limit_notes_snaps_to_scale_in_requested_direction_and_scope() {
+        const MAJOR_INTERVALS: &[u8] = &[0, 2, 4, 5, 7, 9, 11];
+        let input = pattern_fixture(
+            &[
+                note_record(0, 0, 61, 60, 100),
+                note_record(24, 0, 63, 60, 90),
+                note_record(48, 0, 65, 60, 80),
+                note_record(72, 1, 61, 60, 70),
+            ],
+            &[0xFF, 1, 0xA7],
+        );
+
+        let mut snap_up = FlpDocument::parse(&input).expect("fixture should parse");
+        snap_up
+            .limit_pattern_note_range_with_scale(
+                7,
+                0,
+                60,
+                66,
+                0,
+                MAJOR_INTERVALS,
+                LimitSnapDirection::Up,
+            )
+            .expect("notes should snap upward into C major");
+        let notes = snap_up.patterns().unwrap().remove(0).notes;
+        assert_eq!(notes[0].key, 62);
+        assert_eq!(notes[1].key, 64);
+        assert_eq!(notes[2].key, 65);
+        assert_eq!(notes[3].key, 61);
+
+        let mut snap_down = FlpDocument::parse(&input).expect("fixture should parse");
+        snap_down
+            .limit_pattern_note_range_with_scale(
+                7,
+                0,
+                60,
+                66,
+                0,
+                MAJOR_INTERVALS,
+                LimitSnapDirection::Down,
+            )
+            .expect("notes should snap downward into C major");
+        let notes = snap_down.patterns().unwrap().remove(0).notes;
+        assert_eq!(notes[0].key, 60);
+        assert_eq!(notes[1].key, 62);
+
+        let mut alternating = FlpDocument::parse(&input).expect("fixture should parse");
+        alternating
+            .limit_pattern_note_selection_range_with_scale(
+                7,
+                0,
+                &[0, 1],
+                60,
+                66,
+                0,
+                MAJOR_INTERVALS,
+                LimitSnapDirection::Alternate,
+            )
+            .expect("selected notes should alternate their snap direction");
+        let notes = alternating.patterns().unwrap().remove(0).notes;
+        assert_eq!(notes[0].key, 62);
+        assert_eq!(notes[1].key, 62);
+        assert_eq!(notes[2].key, 65);
+        assert_eq!(notes[3].key, 61);
+
+        let mut no_in_scale_key = FlpDocument::parse(&input).expect("fixture should parse");
+        assert!(
+            no_in_scale_key
+                .limit_pattern_note_range_with_scale(
+                    7,
+                    0,
+                    61,
+                    61,
+                    0,
+                    MAJOR_INTERVALS,
+                    LimitSnapDirection::Up,
+                )
+                .is_err()
+        );
     }
 
     #[test]

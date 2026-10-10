@@ -145,7 +145,7 @@ The Piano roll's **Edit** target selector applies note-transform buttons to eith
 
 **Humanize channel/selected** and `humanize-notes` apply seeded onset shifts within a symmetric tick range and velocity variation within a symmetric percentage range. Note lengths and other properties are retained. Tempo-relative timing remains incomplete.
 
-**Limit channel/selected** and `limit-notes` fold targeted note pitches by octaves into the chosen key range, then clamp notes whose pitch classes cannot fit. Key and scale snapping is not implemented.
+**Limit channel/selected** and `limit-notes` fold targeted note pitches by octaves into the chosen key range, then clamp notes whose pitch classes cannot fit. The Piano roll can also snap out-of-scale pitches to the currently selected key and scale, upward, downward, or alternating. The CLI remains range-only; native wrap-to-top/bottom behavior is not implemented.
 
 **Arpeggiate channel/selected** and `arp-notes` replace targeted simultaneous chord groups with repeated up, down, or up/down note runs across a configurable octave range. Step time and gate length are configurable. Custom `.fsc` arp patterns, alternate patterns, and native sync modes are not implemented.
 

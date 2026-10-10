@@ -29,10 +29,10 @@ use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions, Vst3PatternSt
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, ArticulateOptions, AutomationChannel, AutomationPoint,
     AutomationPointEdit, ChannelGroupSummary, ChannelSortOrder, ChannelSummary, FlpDocument,
-    FstPreset, FstPresetKind, Pattern, PatternNote, PatternNoteEdit, PlaylistClip,
-    PlaylistClipClipboard, PlaylistClipEdit, PlaylistClipTarget, PlaylistTrack, ProjectInfoEdit,
-    ProjectSettingsEdit, RandomizerOptions, ScaleLevelsOptions, TimeMarker, TimeMarkerEdit,
-    VstPluginStateMetadata,
+    FstPreset, FstPresetKind, LimitSnapDirection, Pattern, PatternNote, PatternNoteEdit,
+    PlaylistClip, PlaylistClipClipboard, PlaylistClipEdit, PlaylistClipTarget, PlaylistTrack,
+    ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions, ScaleLevelsOptions, TimeMarker,
+    TimeMarkerEdit, VstPluginStateMetadata,
 };
 
 const APP_BACKGROUND: Color32 = Color32::from_rgb(29, 29, 29);
@@ -1523,6 +1523,8 @@ struct DawUi {
     humanize_velocity_variation_percent: u8,
     note_limit_minimum_key: u8,
     note_limit_maximum_key: u8,
+    note_limit_snap_to_scale: bool,
+    note_limit_snap_direction: LimitSnapDirection,
     arpeggiator_step_ticks: u32,
     arpeggiator_range_octaves: u8,
     arpeggiator_gate_percent: u8,
@@ -1792,6 +1794,8 @@ impl DawUi {
             humanize_velocity_variation_percent: 10,
             note_limit_minimum_key: 36,
             note_limit_maximum_key: 83,
+            note_limit_snap_to_scale: false,
+            note_limit_snap_direction: LimitSnapDirection::Up,
             arpeggiator_step_ticks: 24,
             arpeggiator_range_octaves: 1,
             arpeggiator_gate_percent: 80,
@@ -12317,6 +12321,44 @@ impl DawUi {
                     egui::Slider::new(&mut self.note_limit_maximum_key, 0..=127)
                         .text("Limit highest key"),
                 );
+                ui.add_enabled_ui(self.piano_roll_scale != PianoRollScale::None, |ui| {
+                    ui.checkbox(&mut self.note_limit_snap_to_scale, "Limit: snap to current scale");
+                });
+                if self.note_limit_snap_to_scale && self.piano_roll_scale != PianoRollScale::None {
+                    ui.small(format!(
+                        "Using {} {}",
+                        PITCH_CLASSES[usize::from(self.piano_roll_scale_root)],
+                        self.piano_roll_scale.label()
+                    ));
+                }
+                ui.add_enabled_ui(
+                    self.note_limit_snap_to_scale && self.piano_roll_scale != PianoRollScale::None,
+                    |ui| {
+                        egui::ComboBox::from_id_salt("piano-roll-limit-snap-direction")
+                            .selected_text(match self.note_limit_snap_direction {
+                                LimitSnapDirection::Up => "Scale snap: Up",
+                                LimitSnapDirection::Down => "Scale snap: Down",
+                                LimitSnapDirection::Alternate => "Scale snap: Alternate",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.note_limit_snap_direction,
+                                    LimitSnapDirection::Up,
+                                    "Up",
+                                );
+                                ui.selectable_value(
+                                    &mut self.note_limit_snap_direction,
+                                    LimitSnapDirection::Down,
+                                    "Down",
+                                );
+                                ui.selectable_value(
+                                    &mut self.note_limit_snap_direction,
+                                    LimitSnapDirection::Alternate,
+                                    "Alternate",
+                                );
+                            });
+                    },
+                );
                 ui.add(
                     egui::Slider::new(&mut self.arpeggiator_step_ticks, 1..=384)
                         .text("Arpeggiator step (ticks)"),
@@ -12756,12 +12798,40 @@ impl DawUi {
         {
             let minimum_key = u16::from(self.note_limit_minimum_key);
             let maximum_key = u16::from(self.note_limit_maximum_key);
+            let scale_root = self.piano_roll_scale_root;
+            let scale_intervals = (self.note_limit_snap_to_scale
+                && self.piano_roll_scale != PianoRollScale::None)
+                .then(|| self.piano_roll_scale.intervals());
+            let snap_direction = self.note_limit_snap_direction;
             let result = self
                 .document
                 .as_mut()
                 .ok_or_else(|| "no project is open".to_owned())
                 .and_then(|document| {
-                    let result = if edit_selection_only {
+                    let result = if let Some(scale_intervals) = scale_intervals {
+                        if edit_selection_only {
+                            document.limit_pattern_note_selection_range_with_scale(
+                                pattern_id,
+                                channel_id,
+                                &selected_quantize_indices,
+                                minimum_key,
+                                maximum_key,
+                                scale_root,
+                                scale_intervals,
+                                snap_direction,
+                            )
+                        } else {
+                            document.limit_pattern_note_range_with_scale(
+                                pattern_id,
+                                channel_id,
+                                minimum_key,
+                                maximum_key,
+                                scale_root,
+                                scale_intervals,
+                                snap_direction,
+                            )
+                        }
+                    } else if edit_selection_only {
                         document.limit_pattern_note_selection_range(
                             pattern_id,
                             channel_id,
