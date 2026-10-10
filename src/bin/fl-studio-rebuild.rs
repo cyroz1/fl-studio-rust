@@ -104,6 +104,81 @@ fn install_ui_fonts(context: &egui::Context) {
     context.set_fonts(fonts);
 }
 
+fn app_visuals() -> egui::Visuals {
+    let mut visuals = egui::Visuals::dark();
+    visuals.panel_fill = APP_BACKGROUND;
+    visuals.window_fill = PANEL;
+    visuals.extreme_bg_color = PANEL_DARK;
+    visuals.text_edit_bg_color = Some(PANEL_DARK);
+    visuals.faint_bg_color = PANEL_LIGHT;
+    visuals.code_bg_color = PANEL_DARK;
+    visuals.override_text_color = Some(TEXT);
+    visuals.weak_text_color = Some(MUTED);
+    visuals.hyperlink_color = BLUE;
+    visuals.selection.bg_fill = BLUE_SELECTION;
+    visuals.selection.stroke = Stroke::new(1.0, BLUE);
+    visuals.window_corner_radius = egui::CornerRadius::same(4);
+    visuals.menu_corner_radius = egui::CornerRadius::same(3);
+    visuals.window_shadow = egui::Shadow::NONE;
+    visuals.popup_shadow = egui::Shadow::NONE;
+    visuals.window_stroke = Stroke::new(1.0, BORDER);
+    visuals.disabled_alpha = 0.84;
+    visuals.button_frame = true;
+    visuals.striped = true;
+
+    let widgets = &mut visuals.widgets;
+    widgets.noninteractive.bg_fill = APP_BACKGROUND;
+    widgets.noninteractive.weak_bg_fill = PANEL;
+    widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
+    widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT);
+    widgets.noninteractive.corner_radius = egui::CornerRadius::same(3);
+
+    widgets.inactive.bg_fill = PANEL;
+    widgets.inactive.weak_bg_fill = PANEL;
+    widgets.inactive.bg_stroke = Stroke::NONE;
+    widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT);
+    widgets.inactive.corner_radius = egui::CornerRadius::same(4);
+
+    widgets.hovered.bg_fill = PANEL_LIGHT;
+    widgets.hovered.weak_bg_fill = PANEL_LIGHT;
+    widgets.hovered.bg_stroke = Stroke::new(1.0, BORDER);
+    widgets.hovered.fg_stroke = Stroke::new(1.0, TEXT);
+    widgets.hovered.corner_radius = egui::CornerRadius::same(4);
+
+    widgets.active.bg_fill = BLUE_SELECTION;
+    widgets.active.weak_bg_fill = BLUE_SELECTION;
+    widgets.active.bg_stroke = Stroke::new(1.0, BLUE);
+    widgets.active.fg_stroke = Stroke::new(1.0, TEXT);
+    widgets.active.corner_radius = egui::CornerRadius::same(4);
+
+    widgets.open.bg_fill = BLUE_SELECTION;
+    widgets.open.weak_bg_fill = PANEL_LIGHT;
+    widgets.open.bg_stroke = Stroke::new(1.0, BLUE);
+    widgets.open.fg_stroke = Stroke::new(1.0, TEXT);
+    widgets.open.corner_radius = egui::CornerRadius::same(4);
+
+    visuals
+}
+
+fn install_ui_visuals(context: &egui::Context) {
+    context.set_theme(egui::Theme::Dark);
+    let visuals = app_visuals();
+
+    // Some native backends initialize the root app Ui before applying the
+    // user's theme. Keep both context variants on this palette for menus and
+    // popups; the root Ui also reapplies it each frame below.
+    context.set_visuals_of(egui::Theme::Dark, visuals.clone());
+    context.set_visuals_of(egui::Theme::Light, visuals.clone());
+    context.set_visuals(visuals);
+    context.all_styles_mut(|style| {
+        style.spacing.item_spacing = Vec2::new(7.0, 5.0);
+        style.spacing.button_padding = Vec2::new(9.0, 5.0);
+        style.spacing.window_margin = egui::Margin::same(14);
+        style.spacing.menu_margin = egui::Margin::same(8);
+        style.spacing.slider_rail_height = 4.0;
+    });
+}
+
 fn project_hash(document: &FlpDocument) -> Option<u64> {
     let bytes = document.encode_lossless().ok()?;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -1558,7 +1633,7 @@ struct PendingWaveformLoad {
 impl DawUi {
     fn new(creation: &eframe::CreationContext<'_>, initial_project: Option<PathBuf>) -> Self {
         install_ui_fonts(&creation.egui_ctx);
-        creation.egui_ctx.set_theme(egui::Theme::Dark);
+        install_ui_visuals(&creation.egui_ctx);
         let ui_scale = load_ui_scale();
         creation.egui_ctx.set_zoom_factor(ui_scale);
         creation
@@ -1567,75 +1642,6 @@ impl DawUi {
                 MIN_WINDOW_INNER_WIDTH / ui_scale,
                 MIN_WINDOW_INNER_HEIGHT / ui_scale,
             )));
-        let mut visuals = egui::Visuals::dark();
-        visuals.panel_fill = APP_BACKGROUND;
-        visuals.window_fill = PANEL;
-        visuals.extreme_bg_color = PANEL_DARK;
-        visuals.text_edit_bg_color = Some(PANEL_DARK);
-        visuals.faint_bg_color = PANEL_LIGHT;
-        visuals.code_bg_color = PANEL_DARK;
-        visuals.override_text_color = Some(TEXT);
-        visuals.weak_text_color = Some(MUTED);
-        visuals.hyperlink_color = BLUE;
-        visuals.selection.bg_fill = BLUE_SELECTION;
-        visuals.selection.stroke = Stroke::new(1.0, BLUE);
-        visuals.window_corner_radius = egui::CornerRadius::same(4);
-        visuals.menu_corner_radius = egui::CornerRadius::same(3);
-        visuals.window_shadow = egui::Shadow::NONE;
-        visuals.popup_shadow = egui::Shadow::NONE;
-        visuals.window_stroke = Stroke::new(1.0, BORDER);
-        visuals.disabled_alpha = 0.84;
-        visuals.button_frame = true;
-        visuals.striped = true;
-
-        let widgets = &mut visuals.widgets;
-        widgets.noninteractive.bg_fill = APP_BACKGROUND;
-        widgets.noninteractive.weak_bg_fill = PANEL;
-        widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
-        widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT);
-        widgets.noninteractive.corner_radius = egui::CornerRadius::same(3);
-
-        widgets.inactive.bg_fill = PANEL;
-        widgets.inactive.weak_bg_fill = PANEL;
-        widgets.inactive.bg_stroke = Stroke::NONE;
-        widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT);
-        widgets.inactive.corner_radius = egui::CornerRadius::same(4);
-
-        widgets.hovered.bg_fill = PANEL_LIGHT;
-        widgets.hovered.weak_bg_fill = PANEL_LIGHT;
-        widgets.hovered.bg_stroke = Stroke::new(1.0, BORDER);
-        widgets.hovered.fg_stroke = Stroke::new(1.0, TEXT);
-        widgets.hovered.corner_radius = egui::CornerRadius::same(4);
-
-        widgets.active.bg_fill = BLUE_SELECTION;
-        widgets.active.weak_bg_fill = BLUE_SELECTION;
-        widgets.active.bg_stroke = Stroke::new(1.0, BLUE);
-        widgets.active.fg_stroke = Stroke::new(1.0, TEXT);
-        widgets.active.corner_radius = egui::CornerRadius::same(4);
-
-        widgets.open.bg_fill = BLUE_SELECTION;
-        widgets.open.weak_bg_fill = PANEL_LIGHT;
-        widgets.open.bg_stroke = Stroke::new(1.0, BLUE);
-        widgets.open.fg_stroke = Stroke::new(1.0, TEXT);
-        widgets.open.corner_radius = egui::CornerRadius::same(4);
-
-        // Set both variants and the active style explicitly. Native backends
-        // can report the system appearance after app creation; applying the
-        // active visuals too keeps widgets aligned with the painted workspace.
-        creation
-            .egui_ctx
-            .set_visuals_of(egui::Theme::Dark, visuals.clone());
-        creation
-            .egui_ctx
-            .set_visuals_of(egui::Theme::Light, visuals.clone());
-        creation.egui_ctx.set_visuals(visuals);
-        creation.egui_ctx.all_styles_mut(|style| {
-            style.spacing.item_spacing = Vec2::new(7.0, 5.0);
-            style.spacing.button_padding = Vec2::new(9.0, 5.0);
-            style.spacing.window_margin = egui::Margin::same(14);
-            style.spacing.menu_margin = egui::Margin::same(8);
-            style.spacing.slider_rail_height = 4.0;
-        });
         let plugin_candidates = scan_installed_plugins().candidates;
         let audio_catalog = enumerate_devices();
         let mut audio_settings = AudioSettings::default();
@@ -16150,6 +16156,10 @@ impl DawUi {
 
 impl eframe::App for DawUi {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // The root Ui can be created before a native backend reports its
+        // system theme. Pin this frame to the same dark palette as all menus
+        // and popups so light controls never appear over the graphite shell.
+        *ui.visuals_mut() = app_visuals();
         self.guard_window_close(ui.ctx());
         if self.view != MainView::Playlist {
             self.active_playlist_clip_drag = None;
