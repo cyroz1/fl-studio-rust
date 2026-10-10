@@ -252,6 +252,8 @@ jobs:
             cat "$RUNNER_TEMP/controller-preview.log"
             exit 1
           fi
+          xdotool mousemove 600 820 click 1
+          sleep 0.5
           ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
             -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/controller-events.png"
           if [[ "$(stat -c%s "$GITHUB_WORKSPACE/dist/gui-preview/controller-events.png")" -lt 10000 ]]; then

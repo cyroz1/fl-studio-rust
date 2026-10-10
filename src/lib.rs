@@ -829,6 +829,26 @@ impl PatternController {
     pub fn value(&self) -> f32 {
         f32::from_bits(self.value_bits)
     }
+
+    fn decode(record: &[u8; FLP_PATTERN_CONTROLLER_RECORD_SIZE]) -> Self {
+        Self {
+            position: u32::from_le_bytes(record[..4].try_into().expect("four-byte position")),
+            reserved: [record[4], record[5]],
+            channel: record[6],
+            flags: record[7],
+            value_bits: u32::from_le_bytes(record[8..12].try_into().expect("four-byte value")),
+        }
+    }
+
+    fn encode(self) -> [u8; FLP_PATTERN_CONTROLLER_RECORD_SIZE] {
+        let mut record = [0; FLP_PATTERN_CONTROLLER_RECORD_SIZE];
+        record[..4].copy_from_slice(&self.position.to_le_bytes());
+        record[4..6].copy_from_slice(&self.reserved);
+        record[6] = self.channel;
+        record[7] = self.flags;
+        record[8..12].copy_from_slice(&self.value_bits.to_le_bytes());
+        record
+    }
 }
 
 /// Fields that can be changed on an existing Pattern controller point.
@@ -2695,46 +2715,8 @@ impl FlpDocument {
             return Ok(());
         }
 
-        let mut current_pattern = None;
-        let mut next_controller_index = 0usize;
-        let mut target = None;
-        for (event_index, event) in self.events.iter().enumerate() {
-            match event.opcode {
-                0x41 if event.payload.len() == 2 => {
-                    current_pattern =
-                        Some(u16::from_le_bytes([event.payload[0], event.payload[1]]));
-                }
-                0x40 | 0x62 | 0x63 => current_pattern = None,
-                0xDF if current_pattern == Some(pattern_id) => {
-                    if !event
-                        .payload
-                        .len()
-                        .is_multiple_of(FLP_PATTERN_CONTROLLER_RECORD_SIZE)
-                    {
-                        return Err(FlpError::InvalidEvent {
-                            offset: event.file_offset,
-                            detail: "pattern controller payload is not a whole number of 12-byte records",
-                        });
-                    }
-                    let count = event.payload.len() / FLP_PATTERN_CONTROLLER_RECORD_SIZE;
-                    if controller_index < next_controller_index.saturating_add(count) {
-                        let record_index = controller_index - next_controller_index;
-                        target = Some((
-                            event_index,
-                            record_index * FLP_PATTERN_CONTROLLER_RECORD_SIZE,
-                        ));
-                        break;
-                    }
-                    next_controller_index += count;
-                }
-                _ => {}
-            }
-        }
-        let Some((event_index, record_offset)) = target else {
-            return Err(FlpError::UnsupportedEdit(
-                "the requested Pattern or controller index does not exist",
-            ));
-        };
+        let (event_index, record_offset, _) =
+            self.pattern_controller_record_location(pattern_id, controller_index)?;
 
         let mut candidate = self.clone();
         if let Some(position) = edit.position {
@@ -2754,6 +2736,124 @@ impl FlpDocument {
         candidate.refresh_event_offsets()?;
         *self = candidate;
         Ok(())
+    }
+
+    /// Adds a raw Pattern controller point by copying an existing point's uninterpreted fields.
+    /// Reserved, channel, and flags bytes are copied exactly; only position and value change.
+    pub fn duplicate_pattern_controller(
+        &mut self,
+        pattern_id: u16,
+        template_controller_index: usize,
+        position: u32,
+        value: f32,
+    ) -> Result<usize, FlpError> {
+        if !value.is_finite() {
+            return Err(FlpError::UnsupportedEdit(
+                "Pattern controller values must be finite",
+            ));
+        }
+        let (event_index, _, mut controller) =
+            self.pattern_controller_record_location(pattern_id, template_controller_index)?;
+        let new_index = self
+            .patterns()?
+            .into_iter()
+            .find(|pattern| pattern.id == pattern_id)
+            .map(|pattern| pattern.controllers.len())
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested Pattern does not exist",
+            ))?;
+        controller.position = position;
+        controller.value_bits = value.to_bits();
+
+        let mut candidate = self.clone();
+        let mut payload = candidate.events[event_index].payload.clone();
+        payload
+            .len()
+            .checked_add(FLP_PATTERN_CONTROLLER_RECORD_SIZE)
+            .ok_or(FlpError::LengthOverflow)?;
+        payload.extend_from_slice(&controller.encode());
+        candidate.events[event_index].replace_data_payload(payload)?;
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(new_index)
+    }
+
+    /// Removes one raw Pattern controller point by its zero-based Pattern index.
+    pub fn delete_pattern_controller(
+        &mut self,
+        pattern_id: u16,
+        controller_index: usize,
+    ) -> Result<(), FlpError> {
+        let (event_index, record_offset, _) =
+            self.pattern_controller_record_location(pattern_id, controller_index)?;
+        let mut candidate = self.clone();
+        let mut payload = candidate.events[event_index].payload.clone();
+        payload.drain(record_offset..record_offset + FLP_PATTERN_CONTROLLER_RECORD_SIZE);
+        if payload.is_empty() {
+            candidate.events.remove(event_index);
+        } else {
+            candidate.events[event_index].replace_data_payload(payload)?;
+        }
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    fn pattern_controller_record_location(
+        &self,
+        pattern_id: u16,
+        controller_index: usize,
+    ) -> Result<(usize, usize, PatternController), FlpError> {
+        let mut current_pattern = None;
+        let mut matching_pattern_markers = 0usize;
+        let mut next_controller_index = 0usize;
+        let mut target = None;
+        for (event_index, event) in self.events.iter().enumerate() {
+            match event.opcode {
+                0x41 if event.payload.len() == 2 => {
+                    current_pattern =
+                        Some(u16::from_le_bytes([event.payload[0], event.payload[1]]));
+                    if current_pattern == Some(pattern_id) {
+                        matching_pattern_markers += 1;
+                    }
+                }
+                0x40 | 0x62 | 0x63 => current_pattern = None,
+                0xDF if current_pattern == Some(pattern_id) => {
+                    let (records, remainder) = event
+                        .payload
+                        .as_chunks::<FLP_PATTERN_CONTROLLER_RECORD_SIZE>();
+                    if !remainder.is_empty() {
+                        return Err(FlpError::InvalidEvent {
+                            offset: event.file_offset,
+                            detail: "pattern controller payload is not a whole number of 12-byte records",
+                        });
+                    }
+                    if controller_index < next_controller_index.saturating_add(records.len()) {
+                        let record_index = controller_index - next_controller_index;
+                        target = Some((
+                            event_index,
+                            record_index * FLP_PATTERN_CONTROLLER_RECORD_SIZE,
+                            PatternController::decode(&records[record_index]),
+                        ));
+                    }
+                    next_controller_index = next_controller_index.saturating_add(records.len());
+                }
+                _ => {}
+            }
+        }
+        if matching_pattern_markers == 0 {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested Pattern does not exist",
+            ));
+        }
+        if matching_pattern_markers > 1 {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested Pattern ID is ambiguous",
+            ));
+        }
+        target.ok_or(FlpError::UnsupportedEdit(
+            "the requested Pattern or controller index does not exist",
+        ))
     }
 
     /// Sets or creates a time-signature marker within one Pattern.
@@ -14381,6 +14481,93 @@ mod tests {
                 .is_err()
         );
         assert_eq!(document.encode_lossless().unwrap(), input);
+    }
+
+    #[test]
+    fn duplicate_pattern_controller_copies_unknown_fields_and_roundtrips() {
+        let first = pattern_controller_record(120, [0xA5, 0x5A], 3, 0x91, 0.25f32.to_bits());
+        let template = pattern_controller_record(480, [0xD3, 0x4C], 7, 0x2A, 0.5f32.to_bits());
+        let unknown_event = [0xFE, 0x02, 0xAA, 0xBB];
+        let mut controller_payload = first.to_vec();
+        controller_payload.extend_from_slice(&template);
+        let mut controller_event = Vec::new();
+        append_data_event(&mut controller_event, 0xDF, &controller_payload);
+        controller_event.extend_from_slice(&unknown_event);
+        let input = pattern_fixture(&[], &controller_event);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+
+        let new_index = document
+            .duplicate_pattern_controller(7, 1, 777, 0.75)
+            .expect("an existing point should provide an exact record template");
+        assert_eq!(new_index, 2);
+        let controllers = &document.patterns().unwrap()[0].controllers;
+        assert_eq!(controllers.len(), 3);
+        assert_eq!(controllers[0].position, 120);
+        assert_eq!(controllers[0].reserved, [0xA5, 0x5A]);
+        assert_eq!(controllers[1].value(), 0.5);
+        assert_eq!(controllers[2].position, 777);
+        assert_eq!(controllers[2].reserved, [0xD3, 0x4C]);
+        assert_eq!(controllers[2].channel, 7);
+        assert_eq!(controllers[2].flags, 0x2A);
+        assert_eq!(controllers[2].value(), 0.75);
+
+        let encoded = document.encode_lossless().unwrap();
+        let reparsed = FlpDocument::parse(&encoded).expect("duplicated file should parse");
+        assert_eq!(reparsed.patterns().unwrap(), document.patterns().unwrap());
+        assert_eq!(
+            reparsed
+                .events()
+                .iter()
+                .find(|event| event.opcode() == 0xFE)
+                .expect("unknown event should remain")
+                .wire_bytes(),
+            &unknown_event
+        );
+    }
+
+    #[test]
+    fn delete_pattern_controller_removes_only_the_requested_records() {
+        let first = pattern_controller_record(120, [0xA5, 0x5A], 3, 0x91, 0.25f32.to_bits());
+        let second = pattern_controller_record(480, [0xD3, 0x4C], 7, 0x2A, 0.5f32.to_bits());
+        let unknown_event = [0xFE, 0x02, 0xAA, 0xBB];
+        let mut controller_payload = first.to_vec();
+        controller_payload.extend_from_slice(&second);
+        let mut controller_event = Vec::new();
+        append_data_event(&mut controller_event, 0xDF, &controller_payload);
+        controller_event.extend_from_slice(&unknown_event);
+        let input = pattern_fixture(&[], &controller_event);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+
+        document
+            .delete_pattern_controller(7, 1)
+            .expect("the selected point should be deleted");
+        assert_eq!(document.patterns().unwrap()[0].controllers.len(), 1);
+        assert_eq!(
+            document
+                .events()
+                .iter()
+                .find(|event| event.opcode() == 0xDF)
+                .expect("the remaining point should keep the event")
+                .payload(),
+            &first
+        );
+
+        document
+            .delete_pattern_controller(7, 0)
+            .expect("the final point should be deleted");
+        assert!(document.events().iter().all(|event| event.opcode() != 0xDF));
+        let encoded = document.encode_lossless().unwrap();
+        let reparsed = FlpDocument::parse(&encoded).expect("deleted file should parse");
+        assert!(reparsed.patterns().unwrap()[0].controllers.is_empty());
+        assert_eq!(
+            reparsed
+                .events()
+                .iter()
+                .find(|event| event.opcode() == 0xFE)
+                .expect("unknown event should remain")
+                .wire_bytes(),
+            &unknown_event
+        );
     }
 
     #[test]

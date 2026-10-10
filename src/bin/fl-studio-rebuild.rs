@@ -16103,7 +16103,9 @@ impl DawUi {
                         }
                     });
             }
-            ui.weak("Drag points to edit · channel and flags are uninterpreted fields");
+            ui.weak(
+                "Drag to edit · click empty space to duplicate · right-click a point to delete",
+            );
         });
 
         let size = Vec2::new(ui.available_width().max(1.0), 116.0);
@@ -16148,7 +16150,7 @@ impl DawUi {
             painter.text(
                 plot_rect.center(),
                 Align2::CENTER_CENTER,
-                "No Pattern controller points (0xDF) in this Pattern",
+                "No Pattern controller points (0xDF)\nAdding needs an existing point to copy",
                 FontId::proportional(13.0),
                 MUTED,
             );
@@ -16198,6 +16200,12 @@ impl DawUi {
             }
         }
 
+        let plot_response = ui.interact(
+            plot_rect,
+            Id::new(("piano-controller-event-plot", pattern.id)),
+            Sense::click(),
+        );
+        let mut hovered_point = false;
         let mut same_position_count = BTreeMap::<(u32, u8, u8), u8>::new();
         for (controller_index, controller) in points {
             let count = same_position_count
@@ -16251,7 +16259,29 @@ impl DawUi {
                     controller.value_bits,
                 ));
             if response.hovered() {
+                hovered_point = true;
                 painter.circle_stroke(point, 5.5, Stroke::new(1.0, TEXT));
+            }
+            let mut delete_requested = false;
+            response.clone().context_menu(|ui| {
+                if ui.button("Delete raw point").clicked() {
+                    delete_requested = true;
+                    ui.close();
+                }
+            });
+            if delete_requested {
+                if let Some(document) = &mut self.document {
+                    match document.delete_pattern_controller(pattern.id, controller_index) {
+                        Ok(()) => {
+                            self.dirty = true;
+                            self.status = "Deleted raw Pattern controller point".to_owned();
+                        }
+                        Err(error) => {
+                            self.status = format!("Could not delete Pattern controller: {error}");
+                        }
+                    }
+                }
+                return;
             }
             if response.dragged()
                 && let Some(pointer) = response.interact_pointer_pos()
@@ -16286,6 +16316,61 @@ impl DawUi {
                         Err(error) => {
                             self.status = format!("Could not update Pattern controller: {error}");
                         }
+                    }
+                }
+            }
+        }
+
+        if plot_response.clicked()
+            && !hovered_point
+            && !self.piano_roll_select_mode
+            && !self.piano_roll_zoom_mode
+            && !self.piano_roll_playback_mode
+        {
+            let stream = self.piano_roll_controller_stream.or_else(|| {
+                (streams.len() == 1)
+                    .then(|| streams.first().copied())
+                    .flatten()
+            });
+            let Some(stream) = stream else {
+                self.status = "Choose a raw controller stream before adding a point".to_owned();
+                return;
+            };
+            let Some(template_index) = pattern.controllers.iter().position(|controller| {
+                controller.channel == stream.0 && controller.flags == stream.1
+            }) else {
+                self.status = "The selected raw controller stream has no point to copy".to_owned();
+                return;
+            };
+            let Some(pointer) = plot_response.interact_pointer_pos() else {
+                return;
+            };
+            let timeline_x = (pointer.x.clamp(plot_rect.left(), plot_rect.right())
+                - plot_rect.left()
+                + geometry.horizontal_scroll)
+                / geometry.tick_scale.max(0.001);
+            let position = snap_note_tick(
+                timeline_x.round().clamp(0.0, u32::MAX as f32) as i64,
+                geometry.snap_ticks,
+                0,
+            );
+            let normalized =
+                ((plot_rect.bottom() - pointer.y) / plot_rect.height()).clamp(0.0, 1.0);
+            let value = piano_roll_controller_value_at(normalized, minimum, maximum);
+            if let Some(document) = &mut self.document {
+                match document.duplicate_pattern_controller(
+                    pattern.id,
+                    template_index,
+                    position,
+                    value,
+                ) {
+                    Ok(_) => {
+                        self.piano_roll_controller_stream = Some(stream);
+                        self.dirty = true;
+                        self.status = "Added raw Pattern controller point".to_owned();
+                    }
+                    Err(error) => {
+                        self.status = format!("Could not add Pattern controller: {error}");
                     }
                 }
             }

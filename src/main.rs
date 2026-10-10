@@ -151,6 +151,28 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 },
             )
         }
+        [command, input, output, pattern_id, template_index, position, value]
+            if command == "duplicate-pattern-controller" =>
+        {
+            duplicate_pattern_controller(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_usize(template_index, "Pattern controller template index")?,
+                parse_u32(position, "controller position")?,
+                parse_f32(value, "controller value")?,
+            )
+        }
+        [command, input, output, pattern_id, controller_index]
+            if command == "delete-pattern-controller" =>
+        {
+            delete_pattern_controller(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_usize(controller_index, "Pattern controller index")?,
+            )
+        }
         [command, path] if command == "playlist" => list_playlist(Path::new(path), 0, 16),
         [command, path, start] if command == "playlist" => {
             list_playlist(Path::new(path), parse_usize(start, "clip start")?, 16)
@@ -859,6 +881,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild patterns <file.flp>\n",
             "  flp-rebuild pattern-controllers <file.flp> <pattern-id>\n",
             "  flp-rebuild edit-pattern-controller <input.flp> <output.flp> <pattern-id> <controller-index> <position-ticks|-> <value|->\n",
+            "  flp-rebuild duplicate-pattern-controller <input.flp> <output.flp> <pattern-id> <template-index> <position-ticks> <value>\n",
+            "  flp-rebuild delete-pattern-controller <input.flp> <output.flp> <pattern-id> <controller-index>\n",
             "  flp-rebuild playlist <file.flp> [start] [count]\n",
             "  flp-rebuild notes <file.flp> <pattern-id> [start] [count]\n",
             "  flp-rebuild events <file.flp> [start] [count]\n",
@@ -2558,6 +2582,52 @@ fn edit_pattern_controller(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "edited controller {controller_index} in pattern {pattern_id} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn duplicate_pattern_controller(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    template_controller_index: usize,
+    position: u32,
+    value: f32,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let controller_index = document
+        .duplicate_pattern_controller(pattern_id, template_controller_index, position, value)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "duplicated controller point {template_controller_index} as point {controller_index} in pattern {pattern_id} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn delete_pattern_controller(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    controller_index: usize,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .delete_pattern_controller(pattern_id, controller_index)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "deleted controller point {controller_index} from pattern {pattern_id} in {}",
         output.display()
     );
     Ok(())
