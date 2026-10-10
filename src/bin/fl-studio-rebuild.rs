@@ -546,6 +546,45 @@ impl PianoRollEditScope {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ArticulatePreset {
+    Legato,
+    Portato,
+    Staccato,
+    SmallGap,
+    ChopChords,
+}
+
+impl ArticulatePreset {
+    const ALL: [Self; 5] = [
+        Self::Legato,
+        Self::Portato,
+        Self::Staccato,
+        Self::SmallGap,
+        Self::ChopChords,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Legato => "Legato",
+            Self::Portato => "Portato",
+            Self::Staccato => "Staccato",
+            Self::SmallGap => "Ensure small gap between notes",
+            Self::ChopChords => "Just chop chords",
+        }
+    }
+
+    fn settings(self) -> (u8, bool, bool) {
+        match self {
+            Self::Legato => (100, false, false),
+            Self::Portato => (90, false, false),
+            Self::Staccato => (50, true, false),
+            Self::SmallGap => (98, false, false),
+            Self::ChopChords => (100, true, true),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PianoRollSelectionCommand {
     All,
     Invert,
@@ -1476,6 +1515,7 @@ struct DawUi {
     articulate_seed: u64,
     articulate_use_original_lengths: bool,
     articulate_only_with_selection: bool,
+    articulate_chop_chords: bool,
     humanize_timing_range_ticks: u32,
     humanize_velocity_variation_percent: u8,
     note_limit_minimum_key: u8,
@@ -1742,6 +1782,7 @@ impl DawUi {
             articulate_seed: 1,
             articulate_use_original_lengths: true,
             articulate_only_with_selection: false,
+            articulate_chop_chords: false,
             humanize_timing_range_ticks: 12,
             humanize_velocity_variation_percent: 10,
             note_limit_minimum_key: 36,
@@ -11703,6 +11744,20 @@ impl DawUi {
                         });
                     });
                     ui.menu_button("Articulate", |ui| {
+                        ui.menu_button("Options", |ui| {
+                            for preset in ArticulatePreset::ALL {
+                                if ui.button(preset.label()).clicked() {
+                                    let (multiplier, use_original_lengths, chop_chords) =
+                                        preset.settings();
+                                    self.articulate_multiplier_percent = multiplier;
+                                    self.articulate_variation_percent = 0;
+                                    self.articulate_use_original_lengths = use_original_lengths;
+                                    self.articulate_only_with_selection = false;
+                                    self.articulate_chop_chords = chop_chords;
+                                    ui.close();
+                                }
+                            }
+                        });
                         ui.add(
                             egui::Slider::new(&mut self.articulate_multiplier_percent, 10..=100)
                                 .text("Multiply %"),
@@ -11722,6 +11777,7 @@ impl DawUi {
                             );
                         }
                         ui.checkbox(&mut self.articulate_use_original_lengths, "Use lengths");
+                        ui.checkbox(&mut self.articulate_chop_chords, "Chop chords");
                         if !self.articulate_use_original_lengths && edit_selection_only {
                             ui.checkbox(
                                 &mut self.articulate_only_with_selection,
@@ -11738,6 +11794,7 @@ impl DawUi {
                                 self.articulate_seed = 1;
                                 self.articulate_use_original_lengths = true;
                                 self.articulate_only_with_selection = false;
+                                self.articulate_chop_chords = false;
                             }
                             if self.articulate_variation_percent > 0
                                 && ui.button("New seed").clicked()
@@ -12030,6 +12087,7 @@ impl DawUi {
                                 variation_percent,
                                 seed,
                                 use_original_lengths,
+                                chop_chords: self.articulate_chop_chords,
                             },
                             only_with_selection,
                         )
@@ -12042,6 +12100,7 @@ impl DawUi {
                                 variation_percent,
                                 seed,
                                 use_original_lengths,
+                                chop_chords: self.articulate_chop_chords,
                             },
                         )
                     };

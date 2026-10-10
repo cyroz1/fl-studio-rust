@@ -881,6 +881,7 @@ pub struct ArticulateOptions {
     pub variation_percent: u8,
     pub seed: u64,
     pub use_original_lengths: bool,
+    pub chop_chords: bool,
 }
 
 impl Default for ArticulateOptions {
@@ -890,6 +891,7 @@ impl Default for ArticulateOptions {
             variation_percent: 0,
             seed: 1,
             use_original_lengths: true,
+            chop_chords: false,
         }
     }
 }
@@ -5423,6 +5425,7 @@ impl FlpDocument {
             variation_percent,
             seed,
             use_original_lengths,
+            chop_chords,
         } = options;
         if !(10..=100).contains(&multiplier_percent) {
             return Err(FlpError::UnsupportedEdit(
@@ -5474,16 +5477,15 @@ impl FlpDocument {
             .enumerate()
             .filter(|(note_index, _)| note_index_in_scope(*note_index, selected_indices.as_ref()))
             .filter_map(|(note_index, note)| {
+                let next_onset =
+                    onset_positions.partition_point(|position| *position <= note.position);
+                let next_onset_length = onset_positions
+                    .get(next_onset)
+                    .map(|position| position.saturating_sub(note.position));
                 let base_length = if use_original_lengths {
                     note.length
                 } else {
-                    let next_onset =
-                        onset_positions.partition_point(|position| *position <= note.position);
-                    onset_positions
-                        .get(next_onset)
-                        .map_or(note.length, |position| {
-                            position.saturating_sub(note.position)
-                        })
+                    next_onset_length.unwrap_or(note.length)
                 };
                 let scaled_length = if base_length == 0 {
                     0
@@ -5492,7 +5494,7 @@ impl FlpDocument {
                         .round()
                         .clamp(1.0, f64::from(u32::MAX)) as u32
                 };
-                let length = if scaled_length == 0 || variation_percent == 0 {
+                let varied_length = if scaled_length == 0 || variation_percent == 0 {
                     scaled_length
                 } else {
                     let range = ((u64::from(scaled_length) * u64::from(variation_percent) + 50)
@@ -5501,6 +5503,11 @@ impl FlpDocument {
                     let offset = randomizer_offset(&mut state, range, false, true);
                     (i64::from(scaled_length) + i64::from(offset)).clamp(1, i64::from(u32::MAX))
                         as u32
+                };
+                let length = if chop_chords {
+                    next_onset_length.map_or(varied_length, |boundary| varied_length.min(boundary))
+                } else {
+                    varied_length
                 };
                 (length != note.length).then_some((note_index, length))
             })
@@ -9473,6 +9480,7 @@ mod tests {
             variation_percent,
             seed,
             use_original_lengths,
+            chop_chords: false,
         }
     }
 
@@ -12804,6 +12812,58 @@ mod tests {
         assert_eq!(repeated_notes, first_notes);
         assert_eq!(
             FlpDocument::parse(&varied_first.encode_lossless().unwrap())
+                .unwrap()
+                .events()
+                .last()
+                .unwrap()
+                .wire_bytes(),
+            &[0xFF, 1, 0x5A]
+        );
+    }
+
+    #[test]
+    fn articulate_chop_chords_trims_only_notes_overlapping_the_next_onset() {
+        let short_first = note_record(0, 0, 24, 60, 100);
+        let long_first = note_record(0, 0, 96, 64, 90);
+        let long_second = note_record(48, 0, 96, 67, 85);
+        let short_second = note_record(48, 0, 24, 72, 80);
+        let final_note = note_record(96, 0, 24, 70, 75);
+        let other_channel = note_record(24, 1, 48, 48, 70);
+        let input = pattern_fixture(
+            &[
+                short_first,
+                long_first,
+                long_second,
+                short_second,
+                final_note,
+                other_channel,
+            ],
+            &[0xFF, 1, 0x5A],
+        );
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+        let changed = document
+            .articulate_pattern_notes(
+                7,
+                0,
+                ArticulateOptions {
+                    chop_chords: true,
+                    ..ArticulateOptions::default()
+                },
+            )
+            .expect("chord chopping should succeed");
+
+        assert_eq!(changed, 2);
+        let notes = document.patterns().unwrap()[0].notes.clone();
+        assert_eq!(notes[0].length, 24);
+        assert_eq!(notes[1].length, 48);
+        assert_eq!(notes[2].length, 48);
+        assert_eq!(notes[3].length, 24);
+        assert_eq!(notes[4].length, 24);
+        assert_eq!(notes[5].length, 48);
+        assert_eq!(notes[1].key, 64);
+        assert_eq!(notes[1].velocity, 90);
+        assert_eq!(
+            FlpDocument::parse(&document.encode_lossless().unwrap())
                 .unwrap()
                 .events()
                 .last()
