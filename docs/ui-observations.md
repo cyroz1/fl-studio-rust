@@ -56,6 +56,7 @@ These observations come from the installed FL Studio 2026 desktop application an
 - The Playlist has a timeline ruler, a track-name column, colored clips, and vertical and horizontal scrolling.
 - Pattern, audio, automation, and tempo content appear on separate tracks. Track names and clip names can differ.
 - The arrangement selector and Playlist tools live in the view toolbar above the timeline.
+- The Playlist's **New Pattern Clip** action places the selected pattern after the last clip on the existing arrangement and selects it. It uses the pattern's explicit length, its last note end, or one measure, and preserves the unknown fields from a recognized clip record. It is disabled when the arrangement has no clip record to use as a template.
 - The observed project used colored track groups and displayed a long arrangement across more than one hundred bars.
 - FL Studio displays audio samples as waveforms inside Playlist clips and offers stereo, combined, and spectral preview modes; its clip view also reflects audio fades and gain previews ([Image-Line Audio Clips manual](https://www.image-line.com/fl-studio-learning-content/fl-studio-online-manual/html/playlist_audioclip.htm)). The rewrite offers combined or separate-channel min/max waveforms and a coarse log-frequency spectral preview for resolved audio clips, crops to source offsets, and scales visible detail with Playlist zoom. Its spectral coloring/analysis and fade/gain previews do not match FL Studio yet.
 

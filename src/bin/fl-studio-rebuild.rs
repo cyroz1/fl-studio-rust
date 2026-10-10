@@ -6600,6 +6600,29 @@ impl DawUi {
             .map(|channel| (channel.id(), channel.kind()))
             .collect();
         let ppq = document.header().ppq().max(1);
+        let patterns = document.patterns().unwrap_or_default();
+        let selected_pattern_id = self
+            .selected_pattern
+            .filter(|pattern_id| patterns.iter().any(|pattern| pattern.id == *pattern_id))
+            .or_else(|| patterns.first().map(|pattern| pattern.id));
+        let measure_length_ticks = u32::from(ppq).saturating_mul(4).max(1);
+        let new_pattern_clip_length = selected_pattern_id
+            .and_then(|pattern_id| patterns.iter().find(|pattern| pattern.id == pattern_id))
+            .map(|pattern| {
+                pattern
+                    .length_ticks
+                    .filter(|length| *length > 0)
+                    .or_else(|| {
+                        pattern
+                            .notes
+                            .iter()
+                            .map(|note| note.position.saturating_add(note.length))
+                            .max()
+                            .filter(|length| *length > 0)
+                    })
+                    .unwrap_or(measure_length_ticks)
+            })
+            .unwrap_or(measure_length_ticks);
         let Some(arrangement) = arrangements
             .iter()
             .find(|arrangement| Some(arrangement.id) == self.selected_arrangement)
@@ -6625,7 +6648,8 @@ impl DawUi {
         }
         self.poll_audio_waveforms(ui.ctx());
 
-        ui.horizontal(|ui| {
+        let mut create_pattern_clip_requested = false;
+        ui.horizontal_wrapped(|ui| {
             ui.label("Arrangement");
             ui.strong(arrangement.name.as_deref().unwrap_or("Arrangement"));
             ui.separator();
@@ -6645,6 +6669,21 @@ impl DawUi {
                         ui.selectable_value(&mut self.playlist_waveform_mode, mode, mode.label());
                     }
                 });
+            let can_create_pattern_clip =
+                selected_pattern_id.is_some() && !arrangement.clips.is_empty();
+            create_pattern_clip_requested = ui
+                .add_enabled(
+                    can_create_pattern_clip,
+                    egui::Button::new("New Pattern Clip"),
+                )
+                .on_hover_text(if selected_pattern_id.is_none() {
+                    "Create a pattern before adding it to the Playlist"
+                } else if arrangement.clips.is_empty() {
+                    "This arrangement needs an existing clip to establish its clip format"
+                } else {
+                    "Add the selected pattern at the end of the arrangement"
+                })
+                .clicked();
         });
         self.time_marker_editor(ui, arrangement.id, &arrangement.time_markers);
 
@@ -6661,6 +6700,24 @@ impl DawUi {
             .max()
             .unwrap_or(ppq as u32 * 64)
             .max(ppq as u32 * 16);
+        let new_pattern_clip_position = arrangement
+            .clips
+            .iter()
+            .map(|clip| clip.position_ticks.saturating_add(clip.length_ticks))
+            .max()
+            .unwrap_or(0);
+        let new_pattern_clip_track = arrangement
+            .clips
+            .iter()
+            .find(|clip| {
+                matches!(
+                    clip.target(),
+                    flp_rebuild::PlaylistClipTarget::Pattern { .. }
+                )
+            })
+            .or_else(|| arrangement.clips.first())
+            .and_then(|clip| clip.track_index)
+            .unwrap_or(0);
         let grid_width = ((max_tick as f32 * self.timeline_zoom) + 240.0).clamp(1800.0, 50000.0);
         let last_track = arrangement
             .clips
@@ -6937,7 +6994,35 @@ impl DawUi {
                 }
             });
 
-        self.selected_clip_editor(ui, arrangement.id, &arrangement.clips);
+        let mut created_pattern_clip = false;
+        if create_pattern_clip_requested
+            && let Some(pattern_id) = selected_pattern_id
+            && let Some(document) = self.document.as_mut()
+        {
+            match document.create_playlist_pattern_clip(
+                arrangement.id,
+                pattern_id,
+                new_pattern_clip_position,
+                new_pattern_clip_length,
+                new_pattern_clip_track,
+            ) {
+                Ok(clip_index) => {
+                    self.stop_project_playback();
+                    self.selected_pattern = Some(pattern_id);
+                    self.selected_arrangement = Some(arrangement.id);
+                    self.selected_clip = Some(clip_index);
+                    self.dirty = true;
+                    self.status = format!("Added Pattern {pattern_id} to the Playlist");
+                    created_pattern_clip = true;
+                }
+                Err(error) => {
+                    self.status = format!("Could not add a Pattern Clip: {error}");
+                }
+            }
+        }
+        if !created_pattern_clip {
+            self.selected_clip_editor(ui, arrangement.id, &arrangement.clips);
+        }
     }
 
     fn selected_clip_editor(
