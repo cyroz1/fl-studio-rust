@@ -15921,7 +15921,10 @@ impl DawUi {
         pattern: &Pattern,
         geometry: PianoRollEventEditorGeometry,
     ) {
-        if self.piano_roll_event_target == PianoRollEventTarget::RawControllers {
+        // Capture before drawing the selector: changing its value during this frame must not
+        // send the note lane through RawControllers' separate value scale.
+        let target = self.piano_roll_event_target;
+        if target == PianoRollEventTarget::RawControllers {
             self.draw_piano_roll_controller_event_editor(ui, pattern, geometry);
             return;
         }
@@ -15957,7 +15960,7 @@ impl DawUi {
             FontId::proportional(10.0),
             TEXT,
         );
-        let maximum = self.piano_roll_event_target.maximum();
+        let maximum = target.maximum();
         let baseline = plot_rect.bottom() - 1.0;
         painter.line_segment(
             [
@@ -15986,7 +15989,6 @@ impl DawUi {
             return;
         };
         let mut same_onset_count = BTreeMap::<u32, u32>::new();
-        let target = self.piano_roll_event_target;
         for (note_index, note) in pattern
             .notes
             .iter()
