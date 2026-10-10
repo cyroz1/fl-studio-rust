@@ -598,6 +598,16 @@ impl PianoRollEventTarget {
     }
 }
 
+fn piano_roll_event_target_selector(ui: &mut egui::Ui, target: &mut PianoRollEventTarget) {
+    egui::ComboBox::from_id_salt("piano-roll-event-target")
+        .selected_text(format!("Target: {}", target.label()))
+        .show_ui(ui, |ui| {
+            for option in PianoRollEventTarget::ALL {
+                ui.selectable_value(target, option, option.label());
+            }
+        });
+}
+
 #[derive(Clone, Copy, Debug)]
 struct PianoRollEventEditorGeometry {
     ppq: u16,
@@ -12669,19 +12679,6 @@ impl DawUi {
                     &mut self.piano_roll_color_by_midi_channel,
                     "Color by MIDI channel",
                 );
-                if self.piano_roll_event_editor_open {
-                    egui::ComboBox::from_id_salt("piano-roll-event-target")
-                        .selected_text(self.piano_roll_event_target.label())
-                        .show_ui(ui, |ui| {
-                            for target in PianoRollEventTarget::ALL {
-                                ui.selectable_value(
-                                    &mut self.piano_roll_event_target,
-                                    target,
-                                    target.label(),
-                                );
-                            }
-                        });
-                }
             });
             ui.menu_button("MIDI", |ui| {
                 egui::ComboBox::from_id_salt("midi-channel-mapping")
@@ -15929,8 +15926,9 @@ impl DawUi {
             return;
         }
 
-        ui.horizontal(|ui| {
-            ui.strong(format!("{} events", self.piano_roll_event_target.label()));
+        ui.horizontal_wrapped(|ui| {
+            ui.strong("Events");
+            piano_roll_event_target_selector(ui, &mut self.piano_roll_event_target);
             ui.label("Drag stems to change note properties · Shift+F cycles targets");
         });
         let size = Vec2::new(ui.available_width().max(1.0), 102.0);
@@ -16080,6 +16078,7 @@ impl DawUi {
 
         ui.horizontal_wrapped(|ui| {
             ui.strong("Pattern controller data");
+            piano_roll_event_target_selector(ui, &mut self.piano_roll_event_target);
             if !streams.is_empty() {
                 let selected_text = self.piano_roll_controller_stream.map_or_else(
                     || "All raw points".to_owned(),
