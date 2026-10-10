@@ -13818,9 +13818,9 @@ mod tests {
     #[test]
     fn decodes_sampler_reverse_flag_and_preserves_other_flag_bits() {
         for (kind, fx_flags, expected) in [
-            (0, 0xA505_u16, true),
+            (0, 0xA507_u16, true),
             (0, 0xA504, false),
-            (4, 0xA505, false),
+            (4, 0xA507, false),
         ] {
             let mut event_stream = vec![0x40, 7, 0, 0x15, kind, 0x46];
             event_stream.extend_from_slice(&fx_flags.to_le_bytes());
