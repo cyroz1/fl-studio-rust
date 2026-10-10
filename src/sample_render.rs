@@ -2,14 +2,14 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::audio::StreamingAudioWriter;
+use crate::audio::{AudioInputRecording, StreamingAudioWriter};
 use crate::media::{DecodedAudio, SamplePathResolver, decode_audio_file};
 use crate::vst3::Vst3PlaylistStreamProcessor;
 use crate::{
@@ -87,6 +87,13 @@ pub struct AudioClipRenderSummary {
     pub clips_rendered: usize,
     pub clips_skipped_unsupported_scale: usize,
     pub source_files: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AudioRecordingSummary {
+    pub frames: u64,
+    pub sample_rate: u32,
+    pub overflow_frames: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -246,6 +253,91 @@ pub fn render_audio_clips_to_wav(
     validate_output_path(project_path, output_path)?;
     let (mix, summary) = render_audio_clips_to_stereo_buffer(document, project_path, options)?;
     write_float_stereo_wav(output_path, &mix, options.sample_rate, summary.frames)?;
+    Ok(summary)
+}
+
+/// Drain a stopped or active input capture to a stereo 32-bit-float WAV on a worker thread.
+///
+/// The capture queue is bounded, so callers should start this writer promptly and keep it
+/// running until [`AudioInputRecording::is_finished`] becomes true. Any input frames lost to
+/// queue overflow are reported in the returned summary.
+pub fn write_input_recording_to_wav(
+    recording: &AudioInputRecording,
+    output_path: impl AsRef<Path>,
+) -> Result<AudioRecordingSummary, String> {
+    let output_path = output_path.as_ref();
+    if !output_path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("wav"))
+    {
+        return Err("audio recording output must use the .wav extension".to_owned());
+    }
+    let sample_rate = recording.sample_rate();
+    if !(8_000..=384_000).contains(&sample_rate) {
+        return Err("audio recording sample rate must be between 8,000 and 384,000 Hz".to_owned());
+    }
+
+    let mut temporary = TemporaryWav::create(output_path)?;
+    let file = temporary.file.as_mut().expect("temporary WAV is open");
+    // Reserve a stereo float header; the frame and data sizes are patched after capture ends.
+    write_wav_header(
+        file,
+        sample_rate,
+        1,
+        8,
+        WavSampleFormat::Float32,
+        WavChannelMode::Stereo,
+    )?;
+
+    let mut frames = 0_u64;
+    let mut frame_block = vec![[0.0_f32; 2]; STREAM_BLOCK_FRAMES];
+    let mut bytes = Vec::with_capacity(STREAM_BLOCK_FRAMES * 8);
+    loop {
+        let count = recording.read_frames(&mut frame_block);
+        if count == 0 {
+            if recording.is_finished() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            continue;
+        }
+
+        let next_frames = frames
+            .checked_add(count as u64)
+            .ok_or_else(|| "audio recording frame count overflow".to_owned())?;
+        if next_frames
+            .checked_mul(8)
+            .is_none_or(|bytes| bytes > u64::from(u32::MAX - 36))
+        {
+            return Err("audio recording exceeds the RIFF/WAVE size limit".to_owned());
+        }
+        bytes.clear();
+        for [left, right] in &frame_block[..count] {
+            bytes.extend_from_slice(&left.to_le_bytes());
+            bytes.extend_from_slice(&right.to_le_bytes());
+        }
+        file.write_all(&bytes)
+            .map_err(|error| format!("could not write recorded WAV data: {error}"))?;
+        frames = next_frames;
+    }
+
+    if frames == 0 {
+        return Err("audio recording contains no frames".to_owned());
+    }
+    let data_bytes = u32::try_from(frames * 8)
+        .map_err(|_| "audio recording exceeds the RIFF/WAVE size limit".to_owned())?;
+    file.seek(SeekFrom::Start(4))
+        .and_then(|()| file.write_all(&(36_u32 + data_bytes).to_le_bytes()))
+        .and_then(|()| file.seek(SeekFrom::Start(40)).map(|_| ()))
+        .and_then(|()| file.write_all(&data_bytes.to_le_bytes()))
+        .map_err(|error| format!("could not finalize recorded WAV header: {error}"))?;
+
+    let summary = AudioRecordingSummary {
+        frames,
+        sample_rate,
+        overflow_frames: recording.overflow_frames(),
+    };
+    temporary.commit(output_path)?;
     Ok(summary)
 }
 
@@ -3433,6 +3525,34 @@ mod tests {
         assert_eq!(u32::from_le_bytes(bytes[40..44].try_into().unwrap()), 8);
         assert_eq!(f32::from_le_bytes(bytes[44..48].try_into().unwrap()), 0.25);
         assert_eq!(f32::from_le_bytes(bytes[48..52].try_into().unwrap()), -0.5);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn writes_captured_input_to_float_stereo_wav() {
+        let root = std::env::temp_dir().join(format!(
+            "flp-input-recording-test-{}-{}",
+            std::process::id(),
+            NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let output = root.join("take.wav");
+        let recording = AudioInputRecording::from_test_frames(48_000, &[[0.25, -0.5], [-1.0, 1.0]]);
+
+        let summary = write_input_recording_to_wav(&recording, &output).unwrap();
+        let bytes = fs::read(&output).unwrap();
+        assert_eq!(summary.frames, 2);
+        assert_eq!(summary.sample_rate, 48_000);
+        assert_eq!(summary.overflow_frames, 0);
+        assert_eq!(bytes.len(), 60);
+        assert_eq!(&bytes[..4], b"RIFF");
+        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 52);
+        assert_eq!(u32::from_le_bytes(bytes[40..44].try_into().unwrap()), 16);
+        assert_eq!(f32::from_le_bytes(bytes[44..48].try_into().unwrap()), 0.25);
+        assert_eq!(f32::from_le_bytes(bytes[48..52].try_into().unwrap()), -0.5);
+        assert_eq!(f32::from_le_bytes(bytes[52..56].try_into().unwrap()), -1.0);
+        assert_eq!(f32::from_le_bytes(bytes[56..60].try_into().unwrap()), 1.0);
 
         fs::remove_dir_all(root).unwrap();
     }

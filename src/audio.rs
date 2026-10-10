@@ -312,6 +312,20 @@ pub struct AudioInputRecording {
 }
 
 impl AudioInputRecording {
+    #[cfg(test)]
+    pub(crate) fn from_test_frames(sample_rate: u32, frames: &[[f32; 2]]) -> Self {
+        let recording = Arc::new(InputRecordingState::new(sample_rate, frames.len().max(1)));
+        let callback = recording
+            .begin_callback()
+            .expect("a test recording starts active");
+        for &[left, right] in frames {
+            callback.push_frame(left, right);
+        }
+        drop(callback);
+        recording.stop();
+        Self { recording }
+    }
+
     pub fn sample_rate(&self) -> u32 {
         self.recording.sample_rate
     }
