@@ -331,7 +331,7 @@ automation, Mixer routing/effects, or PDC. Full export surface:
 
 ## 14. MIDI hardware & scripting
 
-- `[todo]` MIDI input: keyboards, controllers, MMC transport
+- `[partial]` MIDI input: the Audio settings view can list, refresh, connect, and disconnect hardware inputs. The transport Record button captures note-on/off events (including velocity and MIDI channel) into the selected Pattern/channel; held notes close at stop, and the whole capture is one undoable project edit. Captured notes start at Pattern tick zero when recording is armed; they are not yet aligned to the Playlist playhead or quantized. MIDI Start/Continue/Stop and MMC Play/Stop/Record commands operate the Playlist transport/recorder. Clock, song position, controller, pressure, program, and pitch-bend messages are parsed for activity display; controller mapping/automation, live instrument audition, input filters, device persistence, and MIDI scripting remain incomplete ([Image-Line MIDI settings](https://www.image-line.com/fl-studio-learning/fl-studio-online-manual/html/envsettings_midi.htm), [Note/MIDI recording](https://www.image-line.com/fl-studio-learning/fl-studio-online-manual/html/recording_scores.htm)).
 - `[todo]` MIDI output to external hardware
 - `[todo]` MIDI scripting API (FL uses Python `midi` module — device scripts)
 - `[todo]` Controller templates for popular hardware

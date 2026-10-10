@@ -9,6 +9,7 @@ license = "MIT"
 arc-swap = "1.7.1"
 cpal = "0.18.2"
 eframe = { version = "0.36.2", default-features = false, features = ["accesskit", "default_fonts", "links", "wayland", "wgpu", "x11"] }
+midir = "0.11.0"
 rfd = "0.17.2"
 symphonia = { version = "0.6.1", default-features = false, features = ["aac", "aiff", "alac", "flac", "isomp4", "mp3", "ogg", "pcm", "vorbis", "wav"] }
 wavicle = { version = "0.1.0", default-features = false, features = ["decode"] }

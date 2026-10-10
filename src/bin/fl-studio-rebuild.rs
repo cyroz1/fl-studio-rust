@@ -3,8 +3,8 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -36,6 +36,13 @@ use flp_rebuild::{
     PlaylistClipTarget, PlaylistTrack, PlaylistTrackEdit, ProjectInfoEdit, ProjectSettingsEdit,
     RandomizerOptions, RiffMachineOptions, RiffMachineQuantizeMode, ScaleLevelsOptions, TimeMarker,
     TimeMarkerEdit, VstPluginStateMetadata,
+};
+
+mod midi_input;
+
+use midi_input::{
+    ConnectedMidiInput, MidiInputDevice, MidiInputEvent, MidiPatternRecorder, MidiTransportCommand,
+    ReceivedMidiMessage, connect_input_device, describe_event, enumerate_input_devices,
 };
 
 const APP_BACKGROUND: Color32 = Color32::from_rgb(29, 29, 29);
@@ -1476,6 +1483,7 @@ struct DawUi {
     close_approved: bool,
     history_reset_during_frame: bool,
     history_navigation_during_frame: bool,
+    history_snapshot_available_this_frame: bool,
     playing: bool,
     project_playback_loaded: bool,
     playlist_playback_loaded: bool,
@@ -1615,6 +1623,19 @@ struct DawUi {
     audio_catalog: AudioDeviceCatalog,
     audio_settings: AudioSettings,
     audio_engine: Option<AudioEngine>,
+    midi_input_devices: Vec<MidiInputDevice>,
+    midi_selected_input_id: Option<String>,
+    midi_input_error: Option<String>,
+    midi_input_connection: Option<ConnectedMidiInput>,
+    midi_message_sender: SyncSender<ReceivedMidiMessage>,
+    midi_message_receiver: Receiver<ReceivedMidiMessage>,
+    midi_dropped_messages: Arc<AtomicU64>,
+    midi_reported_dropped_messages: u64,
+    midi_activity: Option<(String, Instant)>,
+    midi_recording: Option<MidiPatternRecorder>,
+    midi_record_toggle_requested: bool,
+    midi_input_refresh_requested: bool,
+    midi_input_toggle_requested: bool,
     pending_audio_clip_export: Option<PendingAudioClipExport>,
     pending_audio_render: Option<PendingAudioRender>,
     audio_render_workers: Vec<PendingAudioRender>,
@@ -1742,6 +1763,12 @@ impl DawUi {
             )));
         let plugin_candidates = scan_installed_plugins().candidates;
         let audio_catalog = enumerate_devices();
+        let (midi_message_sender, midi_message_receiver) =
+            mpsc::sync_channel(midi_input::MIDI_INPUT_QUEUE_CAPACITY);
+        let (midi_input_devices, midi_input_error) = match enumerate_input_devices() {
+            Ok(devices) => (devices, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
         let mut audio_settings = AudioSettings::default();
         if let Some(rate) = audio_catalog.default_sample_rate {
             audio_settings.sample_rate = rate;
@@ -1774,6 +1801,7 @@ impl DawUi {
             close_approved: false,
             history_reset_during_frame: false,
             history_navigation_during_frame: false,
+            history_snapshot_available_this_frame: false,
             playing: false,
             project_playback_loaded: false,
             playlist_playback_loaded: false,
@@ -1913,6 +1941,19 @@ impl DawUi {
             audio_catalog,
             audio_settings,
             audio_engine: None,
+            midi_input_devices,
+            midi_selected_input_id: None,
+            midi_input_error,
+            midi_input_connection: None,
+            midi_message_sender,
+            midi_message_receiver,
+            midi_dropped_messages: Arc::new(AtomicU64::new(0)),
+            midi_reported_dropped_messages: 0,
+            midi_activity: None,
+            midi_recording: None,
+            midi_record_toggle_requested: false,
+            midi_input_refresh_requested: false,
+            midi_input_toggle_requested: false,
             pending_audio_clip_export: None,
             pending_audio_render: None,
             audio_render_workers: Vec::new(),
@@ -2239,6 +2280,7 @@ impl DawUi {
     }
 
     fn open_project(&mut self, path: &Path) {
+        self.finish_active_midi_recording();
         if self.dirty {
             self.recovery_prompt = None;
             self.pending_project_change = Some(PendingProjectChange::Open(path.to_path_buf()));
@@ -2610,6 +2652,7 @@ impl DawUi {
     }
 
     fn save(&mut self) {
+        self.finish_active_midi_recording();
         if let Some(path) = self.current_path.clone() {
             self.write_project(&path);
         } else {
@@ -2636,6 +2679,7 @@ impl DawUi {
     }
 
     fn backup_now(&mut self) {
+        self.finish_active_midi_recording();
         if self.pending_backup_write.is_some() {
             self.status = "A backup is already being written".to_owned();
             return;
@@ -2915,6 +2959,7 @@ impl DawUi {
             self.close_approved = false;
             return;
         }
+        self.finish_active_midi_recording();
         if self.pending_project_change.is_some() || self.dirty {
             context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
@@ -3663,6 +3708,7 @@ impl DawUi {
     }
 
     fn write_project(&mut self, path: &Path) {
+        self.finish_active_midi_recording();
         let Some(mut document) = self.document.as_ref().cloned() else {
             self.status = "Open a project before saving".to_owned();
             return;
@@ -4429,6 +4475,7 @@ impl DawUi {
                 });
                 ui.separator();
                 if ui.button("Exit").clicked() {
+                    self.finish_active_midi_recording();
                     if self.dirty {
                         self.recovery_prompt = None;
                         self.pending_project_change = Some(PendingProjectChange::Exit);
@@ -4715,17 +4762,33 @@ impl DawUi {
             .unwrap_or_default();
         ui.horizontal_centered(|ui| {
             ui.add_space(4.0);
+            let recording_midi = self.midi_recording.is_some();
+            let can_record_midi =
+                recording_midi || (self.midi_input_connection.is_some() && self.document.is_some());
+            let record_button = egui::Button::new(
+                egui::RichText::new(if recording_midi { "■" } else { "●" })
+                    .color(if recording_midi { Color32::WHITE } else { RED }),
+            )
+            .fill(if recording_midi { RED } else { PANEL })
+            .stroke(Stroke::NONE);
             if ui
-                .button(egui::RichText::new("●").color(RED))
-                .on_hover_text("Record")
+                .add_enabled(can_record_midi, record_button)
+                .on_hover_text(if recording_midi {
+                    "Finish MIDI note recording"
+                } else {
+                    "Record MIDI notes into the selected pattern and channel"
+                })
                 .clicked()
             {
-                self.status = "Recording is not implemented yet".to_owned();
+                self.midi_record_toggle_requested = true;
             }
             if ui.button("■").on_hover_text("Stop").clicked() {
                 let was_preparing =
                     self.pending_audio_render.is_some() || self.pending_song_render.is_some();
                 self.stop_project_playback();
+                if self.midi_recording.is_some() {
+                    self.midi_record_toggle_requested = true;
+                }
                 self.status = if was_preparing {
                     "Audio preparation or render cancelled".to_owned()
                 } else {
@@ -16340,6 +16403,343 @@ impl DawUi {
         }
     }
 
+    fn refresh_midi_input_devices(&mut self) {
+        match enumerate_input_devices() {
+            Ok(devices) => {
+                let connected_device_missing =
+                    self.midi_input_connection
+                        .as_ref()
+                        .is_some_and(|connection| {
+                            !devices
+                                .iter()
+                                .any(|device| device.id == connection.device_id)
+                        });
+                self.midi_input_devices = devices;
+                self.midi_input_error = None;
+                if connected_device_missing {
+                    self.finish_active_midi_recording();
+                    self.midi_input_connection = None;
+                    self.status = "MIDI input disconnected; device list refreshed".to_owned();
+                }
+                if self.midi_input_connection.is_none()
+                    && self
+                        .midi_selected_input_id
+                        .as_ref()
+                        .is_some_and(|selected_id| {
+                            !self
+                                .midi_input_devices
+                                .iter()
+                                .any(|device| &device.id == selected_id)
+                        })
+                {
+                    self.midi_selected_input_id = None;
+                }
+            }
+            Err(error) => self.midi_input_error = Some(error),
+        }
+    }
+
+    fn connect_selected_midi_input(&mut self) {
+        let Some(device_id) = self.midi_selected_input_id.clone() else {
+            self.status = "Select a MIDI input device first".to_owned();
+            return;
+        };
+        let Some(device) = self
+            .midi_input_devices
+            .iter()
+            .find(|device| device.id == device_id)
+            .cloned()
+        else {
+            self.status =
+                "The selected MIDI input is no longer available; refresh devices".to_owned();
+            return;
+        };
+        let previous_connection = self.midi_input_connection.take();
+        drop(previous_connection);
+        if self.midi_recording.is_some() {
+            self.finish_active_midi_recording();
+        }
+        match connect_input_device(
+            &device_id,
+            self.midi_message_sender.clone(),
+            Arc::clone(&self.midi_dropped_messages),
+        ) {
+            Ok(connection) => {
+                self.midi_input_connection = Some(connection);
+                self.midi_selected_input_id = Some(device_id);
+                self.midi_input_error = None;
+                self.status = format!("Connected MIDI input: {}", device.name);
+            }
+            Err(error) => {
+                self.midi_input_error = Some(error.clone());
+                self.status = format!("Could not connect MIDI input: {error}");
+            }
+        }
+    }
+
+    fn disconnect_midi_input(&mut self) {
+        let Some(connection) = self.midi_input_connection.take() else {
+            return;
+        };
+        let device_name = connection.device_name.clone();
+        drop(connection);
+        if self.midi_recording.is_some() {
+            self.finish_active_midi_recording();
+        }
+        self.status = format!("Disconnected MIDI input: {device_name}");
+    }
+
+    fn toggle_midi_input_connection(&mut self) {
+        let selected_is_connected = self
+            .midi_input_connection
+            .as_ref()
+            .is_some_and(|connection| {
+                self.midi_selected_input_id.as_deref() == Some(connection.device_id.as_str())
+            });
+        if selected_is_connected {
+            self.disconnect_midi_input();
+        } else {
+            self.connect_selected_midi_input();
+        }
+    }
+
+    fn start_midi_recording(&mut self) {
+        if self.midi_input_connection.is_none() {
+            self.status = "Connect a MIDI input before recording notes".to_owned();
+            return;
+        }
+        let Some(document) = &self.document else {
+            self.status = "Open a project before recording MIDI notes".to_owned();
+            return;
+        };
+        let patterns = match document.patterns() {
+            Ok(patterns) => patterns,
+            Err(error) => {
+                self.status = format!("Could not read project patterns: {error}");
+                return;
+            }
+        };
+        let Some(pattern_id) = self
+            .selected_pattern
+            .filter(|pattern_id| patterns.iter().any(|pattern| pattern.id == *pattern_id))
+            .or_else(|| patterns.first().map(|pattern| pattern.id))
+        else {
+            self.status = "Create or select a pattern before recording MIDI notes".to_owned();
+            return;
+        };
+        let channels = document.channels();
+        let selected_channel = self
+            .selected_note_channel
+            .filter(|channel_id| channels.iter().any(|channel| channel.id() == *channel_id))
+            .or_else(|| {
+                self.selected_rack_channels
+                    .iter()
+                    .copied()
+                    .find(|channel_id| channels.iter().any(|channel| channel.id() == *channel_id))
+            })
+            .or_else(|| channels.first().map(ChannelSummary::id));
+        let Some(channel_id) = selected_channel else {
+            self.status = "Add a channel before recording MIDI notes".to_owned();
+            return;
+        };
+        match MidiPatternRecorder::new(
+            pattern_id,
+            channel_id,
+            self.current_path.clone(),
+            document.header().ppq(),
+            self.tempo_bpm,
+            Instant::now(),
+        ) {
+            Ok(recorder) => {
+                self.midi_recording = Some(recorder);
+                let channel_name = channels
+                    .iter()
+                    .find(|channel| channel.id() == channel_id)
+                    .and_then(ChannelSummary::display_name)
+                    .unwrap_or("Channel");
+                self.status = format!(
+                    "Recording MIDI to Pattern {pattern_id} · {channel_name}; press Record to finish"
+                );
+            }
+            Err(error) => self.status = error.to_owned(),
+        }
+    }
+
+    fn stop_midi_recording(
+        &mut self,
+        stop_timestamp_micros: Option<u64>,
+        finished_at: Instant,
+        history_snapshot_available: bool,
+    ) {
+        let Some(recorder) = self.midi_recording.take() else {
+            return;
+        };
+        let result = recorder.finish(stop_timestamp_micros, finished_at);
+        if result.notes.is_empty() {
+            self.status = if result.overflowed {
+                "MIDI recording reached its note limit before any note was completed".to_owned()
+            } else {
+                "MIDI recording ended without complete notes".to_owned()
+            };
+            return;
+        }
+        if self.current_path != result.project_path {
+            self.status = format!(
+                "Discarded {} MIDI note(s) because the active project changed during recording",
+                result.notes.len()
+            );
+            return;
+        }
+        let Some(document) = &self.document else {
+            self.status = "MIDI recording ended after the project was closed".to_owned();
+            return;
+        };
+        let undo_snapshot = if history_snapshot_available {
+            None
+        } else {
+            match document.encode_lossless() {
+                Ok(snapshot) => Some(snapshot),
+                Err(error) => {
+                    self.status =
+                        format!("Could not capture undo state for MIDI recording: {error}");
+                    return;
+                }
+            }
+        };
+        let mut updated = document.clone();
+        match updated.add_pattern_notes(result.pattern_id, &result.notes) {
+            Ok(()) => {
+                self.document = Some(updated);
+                if let Some(snapshot) = undo_snapshot {
+                    self.remember_undo_snapshot(snapshot);
+                }
+                self.selected_pattern = Some(result.pattern_id);
+                self.selected_note_channel = Some(result.channel_id);
+                self.dirty = true;
+                self.status = if result.overflowed {
+                    format!(
+                        "Recorded {} MIDI note(s); the capture limit was reached and later notes were ignored",
+                        result.notes.len()
+                    )
+                } else {
+                    format!(
+                        "Recorded {} MIDI note(s) into Pattern {}",
+                        result.notes.len(),
+                        result.pattern_id
+                    )
+                };
+            }
+            Err(error) => {
+                self.status = format!("Could not add recorded MIDI notes: {error}");
+            }
+        }
+    }
+
+    fn toggle_midi_recording(&mut self, history_snapshot_available: bool) {
+        if self.midi_recording.is_some() {
+            self.stop_midi_recording(None, Instant::now(), history_snapshot_available);
+        } else {
+            self.start_midi_recording();
+        }
+    }
+
+    fn finish_active_midi_recording(&mut self) {
+        if self.midi_recording.is_none() {
+            return;
+        }
+        for _ in 0..midi_input::MIDI_INPUT_QUEUE_CAPACITY {
+            let message = match self.midi_message_receiver.try_recv() {
+                Ok(message) => message,
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            };
+            self.midi_activity = Some((describe_event(message.event), message.received_at));
+            if !matches!(message.event, MidiInputEvent::Transport(_))
+                && let Some(recorder) = self.midi_recording.as_mut()
+            {
+                recorder.record(message);
+            }
+        }
+        self.stop_midi_recording(
+            None,
+            Instant::now(),
+            self.history_snapshot_available_this_frame,
+        );
+    }
+
+    fn handle_midi_transport(
+        &mut self,
+        command: MidiTransportCommand,
+        message: ReceivedMidiMessage,
+        history_snapshot_available: bool,
+    ) {
+        match command {
+            MidiTransportCommand::Start => {
+                self.stop_project_playback();
+                self.start_project_playback();
+            }
+            MidiTransportCommand::Continue => {
+                if !self.playing {
+                    self.toggle_project_playback();
+                }
+            }
+            MidiTransportCommand::Stop => {
+                let stopped_recording = self.midi_recording.is_some();
+                if stopped_recording {
+                    self.stop_midi_recording(
+                        Some(message.timestamp_micros),
+                        message.received_at,
+                        history_snapshot_available,
+                    );
+                }
+                self.stop_project_playback();
+                if !stopped_recording {
+                    self.status = "MIDI Stop received".to_owned();
+                }
+            }
+            MidiTransportCommand::Pause => {
+                if self.playing {
+                    self.toggle_project_playback();
+                }
+            }
+            MidiTransportCommand::RecordStart => {
+                if self.midi_recording.is_none() {
+                    self.start_midi_recording();
+                }
+            }
+            MidiTransportCommand::RecordStop => {
+                if self.midi_recording.is_some() {
+                    self.stop_midi_recording(
+                        Some(message.timestamp_micros),
+                        message.received_at,
+                        history_snapshot_available,
+                    );
+                }
+            }
+        }
+    }
+
+    fn poll_midi_input(&mut self, history_snapshot_available: bool) {
+        for _ in 0..midi_input::MIDI_INPUT_QUEUE_CAPACITY {
+            let message = match self.midi_message_receiver.try_recv() {
+                Ok(message) => message,
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            };
+            self.midi_activity = Some((describe_event(message.event), message.received_at));
+            if let MidiInputEvent::Transport(command) = message.event {
+                self.handle_midi_transport(command, message, history_snapshot_available);
+            } else if let Some(recorder) = self.midi_recording.as_mut() {
+                recorder.record(message);
+            }
+        }
+        let dropped = self.midi_dropped_messages.load(Ordering::Relaxed);
+        if dropped > self.midi_reported_dropped_messages {
+            let new_drops = dropped - self.midi_reported_dropped_messages;
+            self.midi_reported_dropped_messages = dropped;
+            self.status =
+                format!("MIDI input queue dropped {new_drops} message(s) ({dropped} total)");
+        }
+    }
+
     fn audio_settings_view(&mut self, ui: &mut egui::Ui) {
         let mut start_requested = false;
         let mut stop_requested = false;
@@ -16351,6 +16751,106 @@ impl DawUi {
                 self.audio_catalog = enumerate_devices();
             }
         });
+        ui.separator();
+        ui.strong("MIDI input");
+        ui.label(
+            egui::RichText::new(
+                "Connect a keyboard or controller to record notes into the selected pattern and channel.",
+            )
+            .color(MUTED),
+        );
+        ui.horizontal(|ui| {
+            ui.label("Input device");
+            let selected_name = self
+                .midi_selected_input_id
+                .as_ref()
+                .and_then(|id| {
+                    self.midi_input_devices
+                        .iter()
+                        .find(|device| &device.id == id)
+                })
+                .map(|device| device.name.as_str())
+                .unwrap_or("Select a MIDI input");
+            egui::ComboBox::from_id_salt("midi_input_device")
+                .selected_text(selected_name)
+                .width(280.0)
+                .show_ui(ui, |ui| {
+                    if self.midi_input_devices.is_empty() {
+                        ui.weak("No MIDI input devices found");
+                    }
+                    for device in &self.midi_input_devices {
+                        ui.selectable_value(
+                            &mut self.midi_selected_input_id,
+                            Some(device.id.clone()),
+                            &device.name,
+                        );
+                    }
+                });
+            if ui.button("Refresh MIDI inputs").clicked() {
+                self.midi_input_refresh_requested = true;
+            }
+            let selected_is_connected =
+                self.midi_input_connection
+                    .as_ref()
+                    .is_some_and(|connection| {
+                        self.midi_selected_input_id.as_deref()
+                            == Some(connection.device_id.as_str())
+                    });
+            let connection_label = if selected_is_connected {
+                "Disconnect"
+            } else if self.midi_input_connection.is_some() {
+                "Connect selected"
+            } else {
+                "Connect"
+            };
+            let can_toggle =
+                self.midi_selected_input_id.is_some() || self.midi_input_connection.is_some();
+            if ui
+                .add_enabled(can_toggle, egui::Button::new(connection_label))
+                .clicked()
+            {
+                self.midi_input_toggle_requested = true;
+            }
+        });
+        if let Some(connection) = &self.midi_input_connection {
+            ui.label(
+                egui::RichText::new(format!("● Connected · {}", connection.device_name))
+                    .color(GREEN),
+            );
+        } else if self.midi_input_devices.is_empty() && self.midi_input_error.is_none() {
+            ui.label(egui::RichText::new("No MIDI inputs are currently available").color(MUTED));
+        }
+        if let Some(error) = &self.midi_input_error {
+            ui.label(egui::RichText::new(format!("MIDI input: {error}")).color(ORANGE));
+        }
+        if let Some((activity, received_at)) = &self.midi_activity {
+            let active = received_at.elapsed() < Duration::from_secs(2);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("●").color(if active { GREEN } else { MUTED }));
+                ui.label(if active {
+                    format!("MIDI activity · {activity}")
+                } else {
+                    format!("Last MIDI event · {activity}")
+                });
+            });
+        }
+        let dropped = self.midi_dropped_messages.load(Ordering::Relaxed);
+        if dropped > 0 {
+            ui.label(
+                egui::RichText::new(format!("Dropped MIDI messages: {dropped}")).color(ORANGE),
+            );
+        }
+        if let Some(recorder) = &self.midi_recording {
+            ui.label(
+                egui::RichText::new(format!(
+                    "● Recording to Pattern {} · Channel {} · press Record again to finish",
+                    recorder.pattern_id(),
+                    recorder.channel_id()
+                ))
+                .color(RED),
+            );
+        }
+        ui.separator();
         ui.label(
             egui::RichText::new(
                 "Select separate input and output devices. The input meter checks capture; monitor input to hear it through the selected output.",
@@ -17059,6 +17559,12 @@ impl eframe::App for DawUi {
         // system theme. Keep its widget visuals on the app palette as well.
         *ui.visuals_mut() = app_visuals();
         self.guard_window_close(ui.ctx());
+        let history_navigation_requested = ui.input(|input| {
+            input.modifiers.command
+                && (input.key_pressed(egui::Key::Z) || input.key_pressed(egui::Key::Y))
+        });
+        self.history_snapshot_available_this_frame =
+            !history_navigation_requested && self.pending_history_snapshot.is_some();
         if self.view != MainView::Playlist {
             self.active_playlist_clip_drag = None;
         }
@@ -17185,6 +17691,9 @@ impl eframe::App for DawUi {
         } else {
             None
         };
+        self.history_snapshot_available_this_frame =
+            frame_snapshot.is_some() || self.pending_history_snapshot.is_some();
+        self.poll_midi_input(self.history_snapshot_available_this_frame);
         let playlist_clip_shortcuts_enabled =
             self.view == MainView::Playlist && !ui.ctx().egui_wants_keyboard_input();
         let (
@@ -17289,7 +17798,7 @@ impl eframe::App for DawUi {
             self.playlist_playback_loaded = false;
             self.status = "Project playback reached the end".to_owned();
         }
-        if self.audio_engine.is_some() {
+        if self.audio_engine.is_some() || self.midi_input_connection.is_some() {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(33));
         }
@@ -17434,6 +17943,18 @@ impl eframe::App for DawUi {
                 },
             );
         });
+        let history_snapshot_available = self.history_snapshot_available_this_frame
+            || frame_snapshot.is_some()
+            || self.pending_history_snapshot.is_some();
+        if std::mem::take(&mut self.midi_input_refresh_requested) {
+            self.refresh_midi_input_devices();
+        }
+        if std::mem::take(&mut self.midi_input_toggle_requested) {
+            self.toggle_midi_input_connection();
+        }
+        if std::mem::take(&mut self.midi_record_toggle_requested) {
+            self.toggle_midi_recording(history_snapshot_available);
+        }
         self.project_info_dialog(ui.ctx());
         self.project_settings_dialog(ui.ctx());
         self.channel_group_dialog(ui.ctx());
@@ -17445,6 +17966,7 @@ impl eframe::App for DawUi {
         self.recovery_prompt_dialog(ui.ctx());
         self.unsaved_changes_dialog(ui.ctx());
         self.finish_history_frame(frame_snapshot.take(), pointer_down, history_navigation);
+        self.history_snapshot_available_this_frame = false;
     }
 }
 
