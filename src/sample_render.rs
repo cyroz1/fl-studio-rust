@@ -505,7 +505,8 @@ pub fn stream_audio_clips_to_device(
 ///
 /// Pattern clips are expanded on the worker thread into sample-offset note events. Audio-device
 /// callbacks continue to consume only complete stereo frames from the bounded streaming queue.
-/// Plugin instruments, automation, time stretching, and Mixer processing are not included yet.
+/// The recognized Master mute, polarity, and stereo-swap flags are applied to the final mix.
+/// Insert routing and processing, automation, and time stretching are not included yet.
 pub fn stream_playlist_to_device(
     document: &FlpDocument,
     project_path: impl AsRef<Path>,
@@ -548,6 +549,7 @@ pub fn stream_playlist_with_vst3_to_device_from_frame(
     start_frame: u64,
 ) -> Result<PlaylistRenderSummary, String> {
     let project_path = project_path.as_ref();
+    let master_output = MixerMasterOutput::from_document(document);
     let audio = prepare_audio_clip_render(
         document,
         project_path,
@@ -625,6 +627,7 @@ pub fn stream_playlist_with_vst3_to_device_from_frame(
             sampler: &sampler,
             options,
             frames,
+            master_output,
             vst3_processor: vst3_processor.as_mut(),
         },
         cancelled,
@@ -640,8 +643,9 @@ pub fn stream_playlist_with_vst3_to_device_from_frame(
 
 /// Render enabled Playlist audio clips, Sampler Pattern Clips, and mapped VST3 instruments to a
 /// stereo WAV. Audio is mixed in bounded blocks and written to a temporary file, so song length
-/// does not determine the in-memory mix size. Mixer effects, routing, tempo automation, and plugin
-/// delay compensation are not applied.
+/// does not determine the in-memory mix size. The recognized Master mute, polarity, and stereo-swap
+/// flags are applied to the final mix. Insert routing, effects, tempo automation, and plugin delay
+/// compensation are not applied.
 pub fn render_playlist_with_vst3_to_wav_cancellable(
     document: &FlpDocument,
     project_path: impl AsRef<Path>,
@@ -653,6 +657,7 @@ pub fn render_playlist_with_vst3_to_wav_cancellable(
     let project_path = project_path.as_ref();
     let output_path = output_path.as_ref();
     validate_output_path(project_path, output_path)?;
+    let master_output = MixerMasterOutput::from_document(document);
     let audio = prepare_audio_clip_render(
         document,
         project_path,
@@ -759,6 +764,7 @@ pub fn render_playlist_with_vst3_to_wav_cancellable(
                 sampler: &sampler,
                 options,
                 frames,
+                master_output,
                 vst3_processor: vst3_processor.as_mut(),
             },
             cancelled,
@@ -955,7 +961,44 @@ struct PreparedPlaylistBlockMix<'a> {
     sampler: &'a PreparedSamplerArrangement,
     options: PlaylistRenderOptions,
     frames: u64,
+    master_output: MixerMasterOutput,
     vst3_processor: Option<&'a mut Vst3PlaylistStreamProcessor>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct MixerMasterOutput {
+    enabled: Option<bool>,
+    polarity_reversed: Option<bool>,
+    swap_left_right: Option<bool>,
+}
+
+impl MixerMasterOutput {
+    fn from_document(document: &FlpDocument) -> Self {
+        let Some(master) = document.mixer_inserts().into_iter().next() else {
+            return Self::default();
+        };
+        Self {
+            enabled: master.enabled(),
+            polarity_reversed: master.polarity_reversed(),
+            swap_left_right: master.swap_left_right(),
+        }
+    }
+
+    fn apply(self, stereo_samples: &mut [f32]) {
+        if self.enabled == Some(false) {
+            stereo_samples.fill(0.0);
+            return;
+        }
+        for frame in stereo_samples.chunks_exact_mut(2) {
+            if self.swap_left_right == Some(true) {
+                frame.swap(0, 1);
+            }
+            if self.polarity_reversed == Some(true) {
+                frame[0] = -frame[0];
+                frame[1] = -frame[1];
+            }
+        }
+    }
 }
 
 fn stream_prepared_playlist_render(
@@ -1024,6 +1067,7 @@ fn stream_prepared_playlist_render(
             if let Some(processor) = render.vst3_processor.as_deref_mut() {
                 processor.mix_next_block(block)?;
             }
+            render.master_output.apply(block);
             write_block(block)?;
             block_start += frame_count as u64;
         }
@@ -3041,6 +3085,36 @@ mod tests {
 
     static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(1);
 
+    #[test]
+    fn mixer_master_mute_silences_the_playlist_mix() {
+        let mut output = [0.25, -0.5, 0.75, -1.0];
+        MixerMasterOutput {
+            enabled: Some(false),
+            ..MixerMasterOutput::default()
+        }
+        .apply(&mut output);
+        assert_eq!(output, [0.0; 4]);
+    }
+
+    #[test]
+    fn mixer_master_polarity_and_stereo_swap_transform_the_final_bus() {
+        let mut output = [0.25, -0.5, 0.75, -1.0];
+        MixerMasterOutput {
+            enabled: Some(true),
+            polarity_reversed: Some(true),
+            swap_left_right: Some(true),
+        }
+        .apply(&mut output);
+        assert_eq!(output, [0.5, -0.25, 1.0, -0.75]);
+    }
+
+    #[test]
+    fn unknown_mixer_master_flags_leave_the_playlist_mix_unchanged() {
+        let mut output = [0.25, -0.5];
+        MixerMasterOutput::default().apply(&mut output);
+        assert_eq!(output, [0.25, -0.5]);
+    }
+
     fn test_pattern_clip(pattern_id: u16, position_ticks: u32, length_ticks: u32) -> PlaylistClip {
         PlaylistClip {
             position_ticks,
@@ -3560,6 +3634,7 @@ mod tests {
                     read_sample_root_note: true,
                 },
                 frames: 2,
+                master_output: MixerMasterOutput::default(),
                 vst3_processor: None,
             },
             &AtomicBool::new(false),
