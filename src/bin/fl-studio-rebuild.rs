@@ -7238,24 +7238,6 @@ impl DawUi {
             .selected_pattern
             .filter(|pattern_id| patterns.iter().any(|pattern| pattern.id == *pattern_id))
             .or_else(|| patterns.first().map(|pattern| pattern.id));
-        let measure_length_ticks = u32::from(ppq).saturating_mul(4).max(1);
-        let new_pattern_clip_length = selected_pattern_id
-            .and_then(|pattern_id| patterns.iter().find(|pattern| pattern.id == pattern_id))
-            .map(|pattern| {
-                pattern
-                    .length_ticks
-                    .filter(|length| *length > 0)
-                    .or_else(|| {
-                        pattern
-                            .notes
-                            .iter()
-                            .map(|note| note.position.saturating_add(note.length))
-                            .max()
-                            .filter(|length| *length > 0)
-                    })
-                    .unwrap_or(measure_length_ticks)
-            })
-            .unwrap_or(measure_length_ticks);
         let Some(arrangement) = arrangements
             .iter()
             .find(|arrangement| Some(arrangement.id) == self.selected_arrangement)
@@ -7265,6 +7247,18 @@ impl DawUi {
             empty_view(ui, "This project has no decoded Playlist arrangement");
             return;
         };
+        let signature_changes = arrangement
+            .time_markers
+            .iter()
+            .filter(|marker| marker.is_signature())
+            .filter_map(|marker| {
+                Some((
+                    marker.position_ticks(),
+                    marker.numerator()?.max(1),
+                    marker.denominator()?.max(1),
+                ))
+            })
+            .collect::<Vec<_>>();
 
         let waveform_paths = arrangement
             .clips
@@ -7361,6 +7355,32 @@ impl DawUi {
             .map(|clip| clip.position_ticks.saturating_add(clip.length_ticks))
             .max()
             .unwrap_or(0);
+        let measure_length_ticks = playlist_bar_ticks(
+            ppq,
+            playlist_signature_at_tick(
+                document.metadata().time_signature(),
+                &signature_changes,
+                new_pattern_clip_position,
+            ),
+        )
+        .min(u64::from(u32::MAX)) as u32;
+        let new_pattern_clip_length = selected_pattern_id
+            .and_then(|pattern_id| patterns.iter().find(|pattern| pattern.id == pattern_id))
+            .map(|pattern| {
+                pattern
+                    .length_ticks
+                    .filter(|length| *length > 0)
+                    .or_else(|| {
+                        pattern
+                            .notes
+                            .iter()
+                            .map(|note| note.position.saturating_add(note.length))
+                            .max()
+                            .filter(|length| *length > 0)
+                    })
+                    .unwrap_or(measure_length_ticks)
+            })
+            .unwrap_or(measure_length_ticks);
         let new_pattern_clip_track = arrangement
             .clips
             .iter()
@@ -7385,8 +7405,15 @@ impl DawUi {
         let row_height = 27.0;
         let tick_scale = self.timeline_zoom;
         let playhead_tick = self.current_playhead_tick();
-        let bars_per_measure = 4u32;
-        let measure_ticks = ppq as u32 * bars_per_measure;
+        let measure_tick_limit = (grid_width / tick_scale.max(0.001))
+            .ceil()
+            .clamp(0.0, u32::MAX as f32) as u32;
+        let measure_boundaries = playlist_measure_boundaries(
+            ppq,
+            document.metadata().time_signature(),
+            &signature_changes,
+            measure_tick_limit,
+        );
 
         egui::ScrollArea::both()
             .auto_shrink([false, false])
@@ -7406,26 +7433,22 @@ impl DawUi {
                         ui.allocate_exact_size(Vec2::new(grid_width, 24.0), Sense::hover());
                     let painter = ui.painter_at(ruler_rect);
                     painter.rect_filled(ruler_rect, 0, PANEL_DARK);
-                    let measure_width = measure_ticks as f32 * tick_scale;
-                    if measure_width > 0.0 {
-                        let measures = (grid_width / measure_width).ceil() as u32;
-                        for measure in 0..=measures {
-                            let x = ruler_rect.left() + measure as f32 * measure_width;
-                            painter.line_segment(
-                                [
-                                    egui::pos2(x, ruler_rect.top()),
-                                    egui::pos2(x, ruler_rect.bottom()),
-                                ],
-                                Stroke::new(1.0, GRID),
-                            );
-                            painter.text(
-                                egui::pos2(x + 4.0, ruler_rect.center().y),
-                                Align2::LEFT_CENTER,
-                                (measure + 1).to_string(),
-                                FontId::proportional(10.0),
-                                MUTED,
-                            );
-                        }
+                    for (measure_tick, measure_number) in &measure_boundaries {
+                        let x = ruler_rect.left() + *measure_tick as f32 * tick_scale;
+                        painter.line_segment(
+                            [
+                                egui::pos2(x, ruler_rect.top()),
+                                egui::pos2(x, ruler_rect.bottom()),
+                            ],
+                            Stroke::new(1.0, GRID),
+                        );
+                        painter.text(
+                            egui::pos2(x + 4.0, ruler_rect.center().y),
+                            Align2::LEFT_CENTER,
+                            measure_number.to_string(),
+                            FontId::proportional(10.0),
+                            MUTED,
+                        );
                     }
                     for (marker_index, marker) in arrangement.time_markers.iter().enumerate() {
                         let x = ruler_rect.left() + marker.position_ticks() as f32 * tick_scale;
@@ -7588,19 +7611,15 @@ impl DawUi {
                             [grid_rect.left_bottom(), grid_rect.right_bottom()],
                             Stroke::new(1.0, GRID),
                         );
-                        let measure_width = measure_ticks as f32 * tick_scale;
-                        if measure_width > 0.0 {
-                            let measures = (grid_width / measure_width).ceil() as u32;
-                            for measure in 0..=measures {
-                                let x = grid_rect.left() + measure as f32 * measure_width;
-                                painter.line_segment(
-                                    [
-                                        egui::pos2(x, grid_rect.top()),
-                                        egui::pos2(x, grid_rect.bottom()),
-                                    ],
-                                    Stroke::new(1.0, GRID),
-                                );
-                            }
+                        for (measure_tick, _) in &measure_boundaries {
+                            let x = grid_rect.left() + *measure_tick as f32 * tick_scale;
+                            painter.line_segment(
+                                [
+                                    egui::pos2(x, grid_rect.top()),
+                                    egui::pos2(x, grid_rect.bottom()),
+                                ],
+                                Stroke::new(1.0, GRID),
+                            );
                         }
 
                         for (clip_index, clip) in arrangement.clips.iter().enumerate() {
@@ -21001,6 +21020,120 @@ fn playlist_clip_split_position(
         .then_some(position_ticks)
 }
 
+fn playlist_measure_boundaries(
+    ppq: u16,
+    initial_time_signature: Option<(u8, u8)>,
+    signature_changes: &[(u32, u8, u8)],
+    max_tick: u32,
+) -> Vec<(u32, u64)> {
+    let mut changes = signature_changes.to_vec();
+    changes.sort_by_key(|(position, _, _)| *position);
+    let mut signature = initial_time_signature.unwrap_or((4, 4));
+    signature.0 = signature.0.max(1);
+    signature.1 = signature.1.max(1);
+    let mut boundaries = vec![(0, 1)];
+    let mut segment_start = 0u32;
+    let mut measure_number = 1u64;
+    let mut change_index = 0usize;
+
+    while changes
+        .get(change_index)
+        .is_some_and(|(position, _, _)| *position == 0)
+    {
+        let (_, numerator, denominator) = changes[change_index];
+        signature = (numerator.max(1), denominator.max(1));
+        change_index += 1;
+    }
+
+    while let Some((position, _, _)) = changes.get(change_index).copied() {
+        if position > max_tick {
+            break;
+        }
+        if position > segment_start {
+            let bar_ticks = playlist_bar_ticks(ppq, signature);
+            append_playlist_measures(
+                &mut boundaries,
+                &mut measure_number,
+                segment_start,
+                position,
+                bar_ticks,
+            );
+            if boundaries.last().is_none_or(|(tick, _)| *tick < position) {
+                measure_number = measure_number.saturating_add(1);
+                boundaries.push((position, measure_number));
+            }
+            segment_start = position;
+        }
+        while changes
+            .get(change_index)
+            .is_some_and(|(change_position, _, _)| *change_position == position)
+        {
+            let (_, numerator, denominator) = changes[change_index];
+            signature = (numerator.max(1), denominator.max(1));
+            change_index += 1;
+        }
+    }
+
+    if segment_start < max_tick {
+        append_playlist_measures(
+            &mut boundaries,
+            &mut measure_number,
+            segment_start,
+            max_tick,
+            playlist_bar_ticks(ppq, signature),
+        );
+    }
+    boundaries
+}
+
+fn playlist_bar_ticks(ppq: u16, time_signature: (u8, u8)) -> u64 {
+    (u64::from(ppq.max(1)) * u64::from(time_signature.0.max(1)) * 4
+        / u64::from(time_signature.1.max(1)))
+    .max(1)
+}
+
+fn playlist_signature_at_tick(
+    initial_time_signature: Option<(u8, u8)>,
+    signature_changes: &[(u32, u8, u8)],
+    tick: u32,
+) -> (u8, u8) {
+    let mut signature = initial_time_signature.unwrap_or((4, 4));
+    signature.0 = signature.0.max(1);
+    signature.1 = signature.1.max(1);
+    let mut changes = signature_changes.to_vec();
+    changes.sort_by_key(|(position, _, _)| *position);
+    for (position, numerator, denominator) in changes {
+        if position > tick {
+            break;
+        }
+        signature = (numerator.max(1), denominator.max(1));
+    }
+    signature
+}
+
+fn append_playlist_measures(
+    boundaries: &mut Vec<(u32, u64)>,
+    measure_number: &mut u64,
+    segment_start: u32,
+    segment_end: u32,
+    bar_ticks: u64,
+) {
+    let mut tick = u64::from(segment_start).saturating_add(bar_ticks.max(1));
+    while tick <= u64::from(segment_end) {
+        if boundaries
+            .last()
+            .is_none_or(|(last_tick, _)| *last_tick < tick as u32)
+        {
+            *measure_number = (*measure_number).saturating_add(1);
+            boundaries.push((tick as u32, *measure_number));
+        }
+        tick = tick.saturating_add(bar_ticks.max(1));
+        if tick == u64::MAX {
+            break;
+        }
+    }
+}
+
 fn playlist_clip_drag_edit(
     drag: ActivePlaylistClipDrag,
     pointer: egui::Pos2,
@@ -21157,11 +21290,12 @@ mod tests {
         encode_midi_device_selections, next_piano_roll_note_group, note_from_grid_position,
         parse_midi_device_selections, piano_roll_controller_value_at,
         piano_roll_controller_value_range, piano_roll_note_group_members,
-        playlist_audio_clip_join_candidates, playlist_clip_drag_edit,
+        playlist_audio_clip_join_candidates, playlist_bar_ticks, playlist_clip_drag_edit,
         playlist_clip_local_recording_offset, playlist_clip_split_position,
-        playlist_pattern_clip_join_candidates, snap_note_tick,
-        toggle_piano_roll_note_group_selection, update_channel_rack_selection,
-        update_layer_child_selection, update_piano_roll_box_selection,
+        playlist_measure_boundaries, playlist_pattern_clip_join_candidates,
+        playlist_signature_at_tick, snap_note_tick, toggle_piano_roll_note_group_selection,
+        update_channel_rack_selection, update_layer_child_selection,
+        update_piano_roll_box_selection,
     };
 
     fn mixer_parameter_fixture(records: &[(u8, u16, i32)]) -> FlpDocument {
@@ -21529,6 +21663,46 @@ mod tests {
                 true,
             ),
             None
+        );
+    }
+
+    #[test]
+    fn playlist_bar_boundaries_follow_project_and_marker_signatures() {
+        assert_eq!(
+            playlist_measure_boundaries(96, Some((4, 4)), &[], 1_536),
+            vec![(0, 1), (384, 2), (768, 3), (1_152, 4), (1_536, 5)]
+        );
+        assert_eq!(
+            playlist_measure_boundaries(96, Some((3, 8)), &[], 432),
+            vec![(0, 1), (144, 2), (288, 3), (432, 4)]
+        );
+        assert_eq!(
+            playlist_measure_boundaries(96, Some((4, 4)), &[(768, 3, 4)], 1_344),
+            vec![(0, 1), (384, 2), (768, 3), (1_056, 4), (1_344, 5)]
+        );
+    }
+
+    #[test]
+    fn playlist_midbar_signature_starts_a_new_measure_at_its_marker() {
+        assert_eq!(
+            playlist_measure_boundaries(96, Some((4, 4)), &[(576, 3, 4)], 1_152),
+            vec![(0, 1), (384, 2), (576, 3), (864, 4), (1_152, 5)]
+        );
+    }
+
+    #[test]
+    fn playlist_bar_length_uses_the_active_meter() {
+        assert_eq!(playlist_bar_ticks(96, (4, 4)), 384);
+        assert_eq!(playlist_bar_ticks(96, (5, 8)), 240);
+        assert_eq!(playlist_bar_ticks(96, (7, 16)), 168);
+        assert_eq!(playlist_bar_ticks(0, (0, 0)), 1);
+        assert_eq!(
+            playlist_signature_at_tick(Some((4, 4)), &[(384, 3, 4), (768, 5, 8)], 700),
+            (3, 4)
+        );
+        assert_eq!(
+            playlist_signature_at_tick(Some((4, 4)), &[(384, 3, 4), (768, 5, 8)], 768),
+            (5, 8)
         );
     }
 

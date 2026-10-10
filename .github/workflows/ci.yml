@@ -163,6 +163,15 @@ jobs:
           def dword_event(opcode, value):
               return bytes([opcode]) + struct.pack("<i", value)
 
+          arrangement_meter_markers = (
+              bytes([0x63, 0, 0])
+              + dword_event(0x94, 0x08000000)
+              + bytes([0x21, 3, 0x22, 4])
+              + dword_event(0x94, 0x08000000 | 576)
+              + bytes([0x21, 5, 0x22, 8])
+              + bytes([0x62, 0, 0])
+          )
+
           target = 64 << 6
           parameters = (
               bytes([0xAA, 0xBB, 0xCC, 0xDD, 192, 0])
@@ -173,7 +182,8 @@ jobs:
               + struct.pack("<i", 0)
           )
           event_stream = (
-              dword_event(0x9A, -1)
+              arrangement_meter_markers
+              + dword_event(0x9A, -1)
               + dword_event(0x93, 0)
               + dword_event(0x95, 0x006A8DCE)
               + data_event(0xCC, b"Drum Bus\0")
@@ -217,6 +227,8 @@ jobs:
             fi
             sleep 1
           done
+          ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
+            -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/playlist-meter.png"
           xdotool mousemove 625 111 click 1
           sleep 2
           ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
