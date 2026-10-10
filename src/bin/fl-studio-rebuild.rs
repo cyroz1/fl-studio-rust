@@ -7426,7 +7426,7 @@ impl DawUi {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let (label_rect, _) =
-                        ui.allocate_exact_size(Vec2::new(label_width, 24.0), Sense::hover());
+                        ui.allocate_exact_size(Vec2::new(label_width, 34.0), Sense::hover());
                     ui.painter().rect_filled(label_rect, 0, PANEL_DARK);
                     ui.painter().text(
                         label_rect.center(),
@@ -7436,7 +7436,7 @@ impl DawUi {
                         MUTED,
                     );
                     let (ruler_rect, _) =
-                        ui.allocate_exact_size(Vec2::new(grid_width, 24.0), Sense::hover());
+                        ui.allocate_exact_size(Vec2::new(grid_width, 34.0), Sense::hover());
                     let painter = ui.painter_at(ruler_rect);
                     painter.rect_filled(ruler_rect, 0, PANEL_DARK);
                     for (measure_tick, measure_number) in &measure_boundaries {
@@ -7449,10 +7449,10 @@ impl DawUi {
                             Stroke::new(1.0, GRID),
                         );
                         painter.text(
-                            egui::pos2(x + 4.0, ruler_rect.center().y),
-                            Align2::LEFT_CENTER,
+                            egui::pos2(x + 4.0, ruler_rect.top() + 2.0),
+                            Align2::LEFT_TOP,
                             measure_number.to_string(),
-                            FontId::proportional(10.0),
+                            FontId::proportional(9.0),
                             MUTED,
                         );
                     }
@@ -7482,8 +7482,8 @@ impl DawUi {
                             }
                         });
                         painter.text(
-                            egui::pos2(x + 3.0, ruler_rect.top() + 2.0),
-                            Align2::LEFT_TOP,
+                            egui::pos2(x + 3.0, ruler_rect.bottom() - 2.0),
+                            Align2::LEFT_BOTTOM,
                             label,
                             FontId::proportional(9.0),
                             color,
