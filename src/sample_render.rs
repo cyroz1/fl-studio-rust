@@ -1732,7 +1732,12 @@ fn prepare_sampler_arrangement(
                 audio
             };
             let (gain, pan) = channel_gain_pan(channel.volume(), channel.pan());
-            source_entry.insert(SamplerVoiceSource { audio, gain, pan });
+            source_entry.insert(SamplerVoiceSource {
+                audio,
+                gain,
+                pan,
+                reverse: channel.sample_reversed(),
+            });
         }
         let Some(source) = sources_by_channel.get(&placed.target_channel_id) else {
             continue;
@@ -1817,6 +1822,7 @@ struct SamplerVoiceSource {
     audio: Arc<DecodedAudio>,
     gain: f32,
     pan: f32,
+    reverse: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1958,7 +1964,12 @@ fn prepare_sampler_pattern(
                 audio
             };
             let (gain, pan) = channel_gain_pan(channel.volume(), channel.pan());
-            source_entry.insert(SamplerVoiceSource { audio, gain, pan });
+            source_entry.insert(SamplerVoiceSource {
+                audio,
+                gain,
+                pan,
+                reverse: channel.sample_reversed(),
+            });
         }
         let Some(source) = sources_by_channel.get(&target_channel_id) else {
             continue;
@@ -2152,8 +2163,7 @@ impl<'a> SamplerVoiceEngine<'a> {
                     None => 1.0,
                 };
                 let source_frames = voice.source.frame_count();
-                let source_index = voice.source_position.floor() as usize;
-                if source_index >= source_frames {
+                if voice.source_position < 0.0 || voice.source_position >= source_frames as f64 {
                     *voice_slot = None;
                     continue;
                 }
@@ -2179,10 +2189,15 @@ impl<'a> SamplerVoiceEngine<'a> {
                 voice.source_position += voice.source_step;
                 if let Some(remaining) = voice.release_remaining.as_mut() {
                     *remaining = remaining.saturating_sub(1);
-                    if *remaining == 0 || voice.source_position >= source_frames as f64 {
+                    if *remaining == 0
+                        || voice.source_position < 0.0
+                        || voice.source_position >= source_frames as f64
+                    {
                         *voice_slot = None;
                     }
-                } else if voice.source_position >= source_frames as f64 {
+                } else if voice.source_position < 0.0
+                    || voice.source_position >= source_frames as f64
+                {
                     *voice_slot = None;
                 }
             }
@@ -2213,12 +2228,21 @@ impl<'a> SamplerVoiceEngine<'a> {
         }
         let source_step =
             sampler_source_step(source.audio.sample_rate, self.output_sample_rate, note.key);
+        let source_step = if source.reverse {
+            -source_step
+        } else {
+            source_step
+        };
         let (left_gain, right_gain) =
             sampler_pan_gains(source.pan, source.audio.channels.len() == 1);
         let velocity_gain = f32::from(note.velocity.min(127)) / 127.0;
         self.voices[slot_index] = Some(SamplerVoice {
             source: Arc::clone(&source.audio),
-            source_position: 0.0,
+            source_position: if source.reverse {
+                source.audio.frame_count().saturating_sub(1) as f64
+            } else {
+                0.0
+            },
             source_step,
             stop_frame: note.stop_frame,
             started_frame: note.start_frame,
@@ -2279,6 +2303,7 @@ fn windowed_sinc64_sample(channel: &[f32], position: f64, source_step: f64) -> f
     const LEFT_TAPS: isize = 31;
     let center = position.floor() as isize;
     let last_index = (channel.len() - 1) as isize;
+    let source_step = source_step.abs();
     let cutoff = if source_step.is_finite() && source_step > 1.0 {
         (1.0 / source_step).clamp(1.0e-6, 1.0)
     } else {
@@ -3138,6 +3163,7 @@ mod tests {
                     }),
                     gain: 1.0,
                     pan: -1.0,
+                    reverse: false,
                 },
             )]),
             pattern_clips_rendered: 1,
@@ -3309,6 +3335,7 @@ mod tests {
                 audio: source,
                 gain: 1.0,
                 pan: 0.0,
+                reverse: false,
             },
         )]);
         let notes = [ScheduledSamplerNote {
@@ -3336,6 +3363,35 @@ mod tests {
     }
 
     #[test]
+    fn sampler_voice_plays_reversed_sample_from_end_to_start() {
+        let source = Arc::new(DecodedAudio {
+            sample_rate: 4,
+            channels: vec![vec![1.0, 2.0, 3.0, 4.0]],
+        });
+        let sources = HashMap::from([(
+            7,
+            SamplerVoiceSource {
+                audio: source,
+                gain: 1.0,
+                pan: -1.0,
+                reverse: true,
+            },
+        )]);
+        let notes = [ScheduledSamplerNote {
+            start_frame: 0,
+            stop_frame: None,
+            channel_id: 7,
+            key: SAMPLER_ROOT_KEY,
+            velocity: 127,
+        }];
+        let mut engine = SamplerVoiceEngine::new(&sources, &notes, 1, 4, 4);
+        let mut output = vec![0.0; 8];
+        engine.render_block(0, 4, &mut output);
+
+        assert_eq!(output, vec![4.0, 0.0, 3.0, 0.0, 2.0, 0.0, 1.0, 0.0]);
+    }
+
+    #[test]
     fn sampler_voice_resamples_at_output_rate_and_transposes_by_note_key() {
         let source = Arc::new(DecodedAudio {
             sample_rate: 8,
@@ -3347,6 +3403,7 @@ mod tests {
                 audio: source,
                 gain: 1.0,
                 pan: -1.0,
+                reverse: false,
             },
         )]);
         let notes = [ScheduledSamplerNote {
@@ -3377,6 +3434,7 @@ mod tests {
                 audio: source,
                 gain: 1.0,
                 pan: -1.0,
+                reverse: false,
             },
         )]);
         let notes = [ScheduledSamplerNote {
@@ -3414,6 +3472,7 @@ mod tests {
                     audio: source_a,
                     gain: 1.0,
                     pan: -1.0,
+                    reverse: false,
                 },
             ),
             (
@@ -3422,6 +3481,7 @@ mod tests {
                     audio: source_b,
                     gain: 1.0,
                     pan: -1.0,
+                    reverse: false,
                 },
             ),
         ]);

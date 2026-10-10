@@ -401,6 +401,7 @@ pub struct ChannelSummary {
     zipped: bool,
     color: Option<u32>,
     mixer_track: Option<i8>,
+    sampler_fx_flags: Option<u16>,
     swing_mix: Option<u16>,
     group_number: Option<i32>,
     volume: Option<u32>,
@@ -588,6 +589,17 @@ impl ChannelSummary {
     /// A missing `0x0F` event defaults to false.
     pub fn zipped(&self) -> bool {
         self.zipped
+    }
+
+    /// Whether a kind-0 Sampler's saved Reverse option is enabled.
+    ///
+    /// The Reverse bit is bit 1 of the channel's `0x46` FX flags word. Unknown
+    /// flag bits remain untouched in the original event stream.
+    pub fn sample_reversed(&self) -> bool {
+        self.kind == Some(0)
+            && self
+                .sampler_fx_flags
+                .is_some_and(|flags| flags & (1 << 1) != 0)
     }
 
     /// Raw four-byte channel color value, in little-endian RGBA byte order.
@@ -1966,6 +1978,13 @@ impl FlpDocument {
                 }
                 0x0F if event.payload.len() == 1 => {
                     channel.zipped = event.payload[0] != 0;
+                }
+                0x46 if event.encoding == PayloadEncoding::Word
+                    && event.payload.len() == 2
+                    && channel.sampler_fx_flags.is_none() =>
+                {
+                    channel.sampler_fx_flags =
+                        Some(u16::from_le_bytes([event.payload[0], event.payload[1]]));
                 }
                 0x16 if event.encoding == PayloadEncoding::Byte && event.payload.len() == 1 => {
                     channel.mixer_track = Some(event.payload[0] as i8);
@@ -13792,6 +13811,24 @@ mod tests {
 
             assert_eq!(channels.len(), 1);
             assert_eq!(channels[0].sample_path(), Some(path));
+            assert_eq!(document.encode_lossless().unwrap(), input);
+        }
+    }
+
+    #[test]
+    fn decodes_sampler_reverse_flag_and_preserves_other_flag_bits() {
+        for (kind, fx_flags, expected) in [
+            (0, 0xA505_u16, true),
+            (0, 0xA504, false),
+            (4, 0xA505, false),
+        ] {
+            let mut event_stream = vec![0x40, 7, 0, 0x15, kind, 0x46];
+            event_stream.extend_from_slice(&fx_flags.to_le_bytes());
+            event_stream.extend_from_slice(&[0x62, 0, 0]);
+            let input = flp_fixture(&event_stream, &[], &[]);
+            let document = FlpDocument::parse(&input).expect("fixture should parse");
+
+            assert_eq!(document.channels()[0].sample_reversed(), expected);
             assert_eq!(document.encode_lossless().unwrap(), input);
         }
     }
