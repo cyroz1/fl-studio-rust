@@ -6784,22 +6784,24 @@ impl DawUi {
         if search_all_requested {
             self.start_browser_roots_index();
         }
-        ui.collapsing(search_options_label, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                if ui.small_button("Save search").clicked() {
-                    self.open_browser_search_save_dialog();
-                }
-                if ui
-                    .add_enabled(
-                        !scan_running && !current_indexed,
-                        egui::Button::new("Recursive search"),
-                    )
-                    .on_hover_text("Search supported files in this folder and its subfolders")
-                    .clicked()
-                {
-                    self.start_browser_index();
-                }
-                if ui
+        egui::CollapsingHeader::new(search_options_label)
+            .id_salt("browser-search-options")
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    if ui.small_button("Save search").clicked() {
+                        self.open_browser_search_save_dialog();
+                    }
+                    if ui
+                        .add_enabled(
+                            !scan_running && !current_indexed,
+                            egui::Button::new("Recursive search"),
+                        )
+                        .on_hover_text("Search supported files in this folder and its subfolders")
+                        .clicked()
+                    {
+                        self.start_browser_index();
+                    }
+                    if ui
                     .add_enabled(
                         !scan_running
                             && !all_roots_indexed
@@ -6813,18 +6815,22 @@ impl DawUi {
                 {
                     self.start_browser_roots_index();
                 }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    egui::ComboBox::from_id_salt("browser-file-filter")
+                        .selected_text(self.browser_filter.label())
+                        .show_ui(ui, |ui| {
+                            for filter in BrowserFilter::ALL {
+                                ui.selectable_value(
+                                    &mut self.browser_filter,
+                                    filter,
+                                    filter.label(),
+                                );
+                            }
+                        });
+                    self.browser_tag_search_controls(ui);
+                });
             });
-            ui.horizontal_wrapped(|ui| {
-                egui::ComboBox::from_id_salt("browser-file-filter")
-                    .selected_text(self.browser_filter.label())
-                    .show_ui(ui, |ui| {
-                        for filter in BrowserFilter::ALL {
-                            ui.selectable_value(&mut self.browser_filter, filter, filter.label());
-                        }
-                    });
-                self.browser_tag_search_controls(ui);
-            });
-        });
         if let Some(pending) = self.pending_browser_index.as_ref() {
             if self.browser_index_request_is_active(pending) && pending.all_roots {
                 ui.horizontal(|ui| {
