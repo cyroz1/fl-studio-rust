@@ -1406,6 +1406,8 @@ struct DawUi {
     midi_channel_mapping: MidiChannelMapping,
     selected_arrangement: Option<u16>,
     selected_clip: Option<usize>,
+    selected_playlist_clips: BTreeSet<usize>,
+    playlist_selection_anchor: Option<usize>,
     playlist_clip_context_split: Option<(u16, usize, u32)>,
     playlist_clip_clipboard: Option<PlaylistClipClipboard>,
     playlist_slip_tool_active: bool,
@@ -1720,6 +1722,8 @@ impl DawUi {
             midi_channel_mapping: MidiChannelMapping::PreserveNoteChannels,
             selected_arrangement: None,
             selected_clip: None,
+            selected_playlist_clips: BTreeSet::new(),
+            playlist_selection_anchor: None,
             playlist_clip_context_split: None,
             playlist_clip_clipboard: None,
             playlist_slip_tool_active: false,
@@ -2157,6 +2161,8 @@ impl DawUi {
                 }
                 self.rack_selection_anchor = self.selected_graph_channel;
                 self.selected_clip = None;
+                self.selected_playlist_clips.clear();
+                self.playlist_selection_anchor = None;
                 self.playlist_clip_context_split = None;
                 self.playlist_clip_clipboard = None;
                 self.active_playlist_clip_drag = None;
@@ -3292,6 +3298,8 @@ impl DawUi {
         }
         self.selected_note = None;
         self.selected_clip = None;
+        self.selected_playlist_clips.clear();
+        self.playlist_selection_anchor = None;
         self.active_playlist_clip_drag = None;
         self.selected_time_marker = None;
         self.selected_automation_point = None;
@@ -4137,6 +4145,21 @@ impl DawUi {
                     self.paste_selected_playlist_clip();
                     ui.close();
                 }
+                let can_merge_pattern_clips = self.view == MainView::Playlist
+                    && self
+                        .selected_arrangement
+                        .and_then(|id| self.selected_playlist_pattern_clip_indices(id))
+                        .is_some();
+                if ui
+                    .add_enabled(
+                        can_merge_pattern_clips,
+                        egui::Button::new("Merge selected Pattern Clips  Ctrl/Cmd+G"),
+                    )
+                    .clicked()
+                {
+                    self.merge_selected_playlist_pattern_clips();
+                    ui.close();
+                }
             });
             ui.menu_button("Add", |ui| {
                 if ui
@@ -4271,6 +4294,7 @@ impl DawUi {
                     ("Ctrl/Cmd+C", "Copy selected Playlist clip"),
                     ("Ctrl/Cmd+X", "Cut selected Playlist clip"),
                     ("Ctrl/Cmd+V", "Paste Playlist clip after selection"),
+                    ("Ctrl/Cmd+G", "Merge selected Pattern Clips"),
                     ("Ctrl/Cmd+Z", "Undo"),
                     ("Ctrl/Cmd+Shift+Z", "Redo"),
                 ] {
@@ -6739,6 +6763,7 @@ impl DawUi {
         let mut split_clip_requested = None;
         let mut join_clip_requested = None;
         let mut join_pattern_clip_requested = None;
+        let mut merge_pattern_clips_requested = None;
         ui.horizontal_wrapped(|ui| {
             ui.label("Arrangement");
             ui.strong(arrangement.name.as_deref().unwrap_or("Arrangement"));
@@ -6995,8 +7020,10 @@ impl DawUi {
                                     }
                                 }
                             };
-                            let selected = self.selected_clip == Some(clip_index)
-                                && self.selected_arrangement == Some(arrangement.id);
+                            let selected = self.selected_arrangement == Some(arrangement.id)
+                                && (self.selected_playlist_clips.contains(&clip_index)
+                                    || (self.selected_playlist_clips.is_empty()
+                                        && self.selected_clip == Some(clip_index)));
                             painter.rect_filled(
                                 clip_rect,
                                 egui::CornerRadius::same(3),
@@ -7073,8 +7100,18 @@ impl DawUi {
                                 let (pointer, snap) = ui.input(|input| {
                                     (input.pointer.interact_pos(), !input.modifiers.alt)
                                 });
-                                self.selected_arrangement = Some(arrangement.id);
-                                self.selected_clip = Some(clip_index);
+                                if self.selected_arrangement != Some(arrangement.id)
+                                    || !self.selected_playlist_clips.contains(&clip_index)
+                                {
+                                    self.selected_arrangement = Some(arrangement.id);
+                                    self.selected_clip = Some(clip_index);
+                                    self.selected_playlist_clips.clear();
+                                    self.selected_playlist_clips.insert(clip_index);
+                                    self.playlist_selection_anchor = Some(clip_index);
+                                } else {
+                                    self.selected_arrangement = Some(arrangement.id);
+                                    self.selected_clip = Some(clip_index);
+                                }
                                 self.playlist_clip_context_split = pointer
                                     .and_then(|pointer| {
                                         playlist_clip_split_position(
@@ -7289,6 +7326,18 @@ impl DawUi {
                                         ui.close();
                                     }
                                 } else if is_pattern_clip {
+                                    if let Some(selected_indices) = self
+                                        .selected_playlist_pattern_clip_indices(arrangement.id)
+                                        && ui
+                                            .button(
+                                                "Merge selected Pattern Clips  Ctrl/Cmd+G",
+                                            )
+                                            .clicked()
+                                    {
+                                        merge_pattern_clips_requested =
+                                            Some(selected_indices);
+                                        ui.close();
+                                    }
                                     let (join_previous_clip, join_next_clip) =
                                         playlist_pattern_clip_join_candidates(
                                             &arrangement.clips,
@@ -7330,6 +7379,9 @@ impl DawUi {
                                     && pointer.x >= clip_rect.right() - 8.0;
                                 self.selected_arrangement = Some(arrangement.id);
                                 self.selected_clip = Some(clip_index);
+                                self.selected_playlist_clips.clear();
+                                self.selected_playlist_clips.insert(clip_index);
+                                self.playlist_selection_anchor = Some(clip_index);
                                 let slip_requested =
                                     self.playlist_slip_tool_active && is_audio_clip && !resize;
                                 if slip_requested && !can_slip_clip {
@@ -7449,9 +7501,19 @@ impl DawUi {
                                 self.active_playlist_clip_drag = None;
                             }
                             if response.clicked() {
-                                self.selected_arrangement = Some(arrangement.id);
-                                self.selected_clip = Some(clip_index);
-                                self.status = format!("Selected Playlist clip {}", clip_index + 1);
+                                let modifiers = ui.input(|input| input.modifiers);
+                                self.set_playlist_clip_selection(
+                                    arrangement.id,
+                                    clip_index,
+                                    arrangement.clips.len(),
+                                    modifiers,
+                                );
+                                let selected_count = self.selected_playlist_clips.len();
+                                self.status = if selected_count > 1 {
+                                    format!("Selected {selected_count} Playlist clips")
+                                } else {
+                                    format!("Selected Playlist clip {}", clip_index + 1)
+                                };
                             }
                         }
                         for (marker_index, marker) in arrangement.time_markers.iter().enumerate() {
@@ -7613,6 +7675,11 @@ impl DawUi {
             }
         }
 
+        if let Some(clip_indices) = merge_pattern_clips_requested {
+            playlist_clip_list_changed |=
+                self.merge_playlist_pattern_clips(arrangement.id, &clip_indices);
+        }
+
         if create_pattern_clip_requested
             && let Some(pattern_id) = selected_pattern_id
             && let Some(document) = self.document.as_mut()
@@ -7629,6 +7696,9 @@ impl DawUi {
                     self.selected_pattern = Some(pattern_id);
                     self.selected_arrangement = Some(arrangement.id);
                     self.selected_clip = Some(clip_index);
+                    self.selected_playlist_clips.clear();
+                    self.selected_playlist_clips.insert(clip_index);
+                    self.playlist_selection_anchor = Some(clip_index);
                     self.dirty = true;
                     self.status = format!("Added Pattern {pattern_id} to the Playlist");
                     playlist_clip_list_changed = true;
@@ -7638,8 +7708,170 @@ impl DawUi {
                 }
             }
         }
+        if playlist_clip_list_changed {
+            let selected_clip = self.selected_clip.filter(|index| {
+                self.document
+                    .as_ref()
+                    .and_then(|document| document.arrangements().ok())
+                    .and_then(|arrangements| {
+                        arrangements
+                            .into_iter()
+                            .find(|item| item.id == arrangement.id)
+                    })
+                    .is_some_and(|item| *index < item.clips.len())
+            });
+            self.selected_clip = selected_clip;
+            self.selected_playlist_clips.clear();
+            if let Some(index) = selected_clip {
+                self.selected_playlist_clips.insert(index);
+                self.playlist_selection_anchor = Some(index);
+            } else {
+                self.playlist_selection_anchor = None;
+            }
+        }
         if !playlist_clip_list_changed {
             self.selected_clip_editor(ui, arrangement.id, &arrangement.clips);
+        }
+    }
+
+    fn selected_playlist_pattern_clip_indices(&self, arrangement_id: u16) -> Option<Vec<usize>> {
+        if self.selected_arrangement != Some(arrangement_id)
+            || self.selected_playlist_clips.len() < 2
+        {
+            return None;
+        }
+        let document = self.document.as_ref()?;
+        let arrangement = document
+            .arrangements()
+            .ok()?
+            .into_iter()
+            .find(|arrangement| arrangement.id == arrangement_id)?;
+        self.selected_playlist_clips
+            .iter()
+            .copied()
+            .all(|index| {
+                arrangement
+                    .clips
+                    .get(index)
+                    .is_some_and(|clip| matches!(clip.target(), PlaylistClipTarget::Pattern { .. }))
+            })
+            .then(|| self.selected_playlist_clips.iter().copied().collect())
+    }
+
+    fn set_playlist_clip_selection(
+        &mut self,
+        arrangement_id: u16,
+        clip_index: usize,
+        clip_count: usize,
+        modifiers: egui::Modifiers,
+    ) {
+        if self.selected_arrangement != Some(arrangement_id) {
+            self.selected_playlist_clips.clear();
+            self.selected_clip = None;
+            self.playlist_selection_anchor = None;
+        }
+        self.selected_arrangement = Some(arrangement_id);
+
+        let command_or_control = modifiers.command || modifiers.ctrl;
+        if modifiers.shift {
+            let last_index = clip_count.saturating_sub(1);
+            let anchor = self
+                .playlist_selection_anchor
+                .or(self.selected_clip)
+                .unwrap_or(clip_index)
+                .min(last_index);
+            let target = clip_index.min(last_index);
+            self.selected_playlist_clips.clear();
+            for index in anchor.min(target)..=anchor.max(target) {
+                self.selected_playlist_clips.insert(index);
+            }
+            self.playlist_selection_anchor = Some(anchor);
+            self.selected_clip = Some(target);
+        } else if command_or_control {
+            if !self.selected_playlist_clips.remove(&clip_index) {
+                self.selected_playlist_clips.insert(clip_index);
+            }
+            self.selected_clip = if self.selected_playlist_clips.contains(&clip_index) {
+                Some(clip_index)
+            } else {
+                self.selected_playlist_clips.iter().next_back().copied()
+            };
+            if self.playlist_selection_anchor.is_none() {
+                self.playlist_selection_anchor = Some(clip_index);
+            }
+        } else {
+            self.selected_playlist_clips.clear();
+            self.selected_playlist_clips.insert(clip_index);
+            self.selected_clip = Some(clip_index);
+            self.playlist_selection_anchor = Some(clip_index);
+        }
+    }
+
+    fn merge_selected_playlist_pattern_clips(&mut self) -> bool {
+        let Some(arrangement_id) = self.selected_arrangement else {
+            self.status = "Select Pattern Clips in the Playlist before merging".to_owned();
+            return false;
+        };
+        let Some(clip_indices) = self.selected_playlist_pattern_clip_indices(arrangement_id) else {
+            self.status = "Select at least two Pattern Clips to merge".to_owned();
+            return false;
+        };
+        self.merge_playlist_pattern_clips(arrangement_id, &clip_indices)
+    }
+
+    fn merge_playlist_pattern_clips(
+        &mut self,
+        arrangement_id: u16,
+        clip_indices: &[usize],
+    ) -> bool {
+        let result = self
+            .document
+            .as_mut()
+            .map(|document| document.merge_playlist_pattern_clips(arrangement_id, clip_indices));
+        match result {
+            Some(Ok(merged_clip_index)) => {
+                let merged_pattern_id = self
+                    .document
+                    .as_ref()
+                    .and_then(|document| document.arrangements().ok())
+                    .and_then(|arrangements| {
+                        arrangements
+                            .into_iter()
+                            .find(|arrangement| arrangement.id == arrangement_id)
+                    })
+                    .and_then(|arrangement| arrangement.clips.get(merged_clip_index).cloned())
+                    .and_then(|clip| match clip.target() {
+                        PlaylistClipTarget::Pattern { id } => Some(id),
+                        PlaylistClipTarget::Channel { .. } => None,
+                    });
+                self.stop_project_playback();
+                self.selected_arrangement = Some(arrangement_id);
+                self.selected_clip = Some(merged_clip_index);
+                self.selected_playlist_clips.clear();
+                self.selected_playlist_clips.insert(merged_clip_index);
+                self.playlist_selection_anchor = Some(merged_clip_index);
+                if let Some(pattern_id) = merged_pattern_id {
+                    self.selected_pattern = Some(pattern_id);
+                    self.status = format!(
+                        "Merged {} Pattern Clips into Pattern {pattern_id}",
+                        clip_indices.len()
+                    );
+                } else {
+                    self.status = "Merged selected Pattern Clips".to_owned();
+                }
+                self.playlist_clip_context_split = None;
+                self.active_playlist_clip_drag = None;
+                self.dirty = true;
+                true
+            }
+            Some(Err(error)) => {
+                self.status = format!("Could not merge Pattern Clips: {error}");
+                false
+            }
+            None => {
+                self.status = "Open a project to merge Playlist Pattern Clips".to_owned();
+                false
+            }
         }
     }
 
@@ -7667,6 +7899,8 @@ impl DawUi {
             Some(Ok(())) => {
                 self.stop_project_playback();
                 self.selected_clip = None;
+                self.selected_playlist_clips.clear();
+                self.playlist_selection_anchor = None;
                 self.active_playlist_clip_drag = None;
                 self.dirty = true;
                 self.status = format!("Deleted Playlist clip {}", clip_index + 1);
@@ -7734,6 +7968,8 @@ impl DawUi {
                 self.stop_project_playback();
                 self.selected_arrangement = Some(arrangement_id);
                 self.selected_clip = None;
+                self.selected_playlist_clips.clear();
+                self.playlist_selection_anchor = None;
                 self.active_playlist_clip_drag = None;
                 self.dirty = true;
                 self.status = format!("Cut Playlist clip {}", clip_index + 1);
@@ -7827,6 +8063,9 @@ impl DawUi {
                 self.document = Some(updated);
                 self.selected_arrangement = Some(arrangement_id);
                 self.selected_clip = Some(clip_index);
+                self.selected_playlist_clips.clear();
+                self.selected_playlist_clips.insert(clip_index);
+                self.playlist_selection_anchor = Some(clip_index);
                 self.active_playlist_clip_drag = None;
                 self.dirty = true;
                 self.status = format!("Pasted Playlist clip {}", clip_index + 1);
@@ -8010,6 +8249,9 @@ impl DawUi {
                     Ok(duplicate_index) => {
                         self.stop_project_playback();
                         self.selected_clip = Some(duplicate_index);
+                        self.selected_playlist_clips.clear();
+                        self.selected_playlist_clips.insert(duplicate_index);
+                        self.playlist_selection_anchor = Some(duplicate_index);
                         self.dirty = true;
                         self.status = format!("Duplicated Playlist clip {}", index + 1);
                     }
@@ -15161,16 +15403,18 @@ impl eframe::App for DawUi {
             copy_playlist_clip_requested,
             cut_playlist_clip_requested,
             paste_playlist_clip_requested,
+            merge_playlist_pattern_clips_requested,
         ) = if playlist_clip_shortcuts_enabled {
             ui.input_mut(|input| {
                 (
                     input.consume_key(egui::Modifiers::COMMAND, egui::Key::C),
                     input.consume_key(egui::Modifiers::COMMAND, egui::Key::X),
                     input.consume_key(egui::Modifiers::COMMAND, egui::Key::V),
+                    input.consume_key(egui::Modifiers::COMMAND, egui::Key::G),
                 )
             })
         } else {
-            (false, false, false)
+            (false, false, false, false)
         };
         if copy_playlist_clip_requested {
             self.copy_selected_playlist_clip();
@@ -15178,6 +15422,9 @@ impl eframe::App for DawUi {
             self.cut_selected_playlist_clip();
         } else if paste_playlist_clip_requested {
             self.paste_selected_playlist_clip();
+        }
+        if merge_playlist_pattern_clips_requested {
+            self.merge_selected_playlist_pattern_clips();
         }
         let delete_playlist_clip_requested = self.view == MainView::Playlist
             && self.selected_clip.is_some()

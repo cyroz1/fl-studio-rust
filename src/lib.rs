@@ -14,6 +14,7 @@ const FLDT: &[u8; 4] = b"FLdt";
 const MIN_HEADER_CONTENT_LENGTH: usize = 6;
 const FLP_NOTE_RECORD_SIZE: usize = 24;
 const FLP_PLAYLIST_RECORD_SIZES: [usize; 3] = [80, 60, 32];
+const MAX_MERGED_PATTERN_NOTES: usize = 2_000_000;
 const FLP_AUTOMATION_COUNT_OFFSET: usize = 17;
 const FLP_AUTOMATION_POINTS_OFFSET: usize = 21;
 const FLP_AUTOMATION_POINT_SIZE: usize = 24;
@@ -4267,6 +4268,365 @@ impl FlpDocument {
         } else {
             left_clip_index
         })
+    }
+
+    fn pattern_score_for_playlist_merge(
+        &self,
+        pattern_id: u16,
+    ) -> Result<(Vec<PatternNote>, Option<u8>), FlpError> {
+        let mut matching_markers = self.events.iter().enumerate().filter(|(_, event)| {
+            event.opcode == 0x41
+                && event.encoding == PayloadEncoding::Word
+                && event.payload.len() == 2
+                && event.payload.as_slice() == pattern_id.to_le_bytes()
+        });
+        let Some((marker_index, _)) = matching_markers.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "a selected Pattern Clip references a missing pattern",
+            ));
+        };
+        if matching_markers.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "a selected Pattern Clip references an ambiguous pattern",
+            ));
+        }
+
+        let region_start = marker_index + 1;
+        let region_end = self.events[region_start..]
+            .iter()
+            .position(|event| {
+                (event.opcode == 0x41 && event.payload.len() == 2)
+                    || matches!(event.opcode, 0x40 | 0x62 | 0x63)
+            })
+            .map_or(self.events.len(), |offset| region_start + offset);
+        let note_event_index = self
+            .events
+            .get(region_start)
+            .filter(|event| Self::is_pattern_note_event(event))
+            .map(|_| region_start);
+        let mut notes = Vec::new();
+        let mut note_opcode = None;
+        let mut length_event_count = 0usize;
+
+        for event_index in region_start..region_end {
+            let event = &self.events[event_index];
+            if Some(event_index) == note_event_index {
+                if !matches!(event.encoding, PayloadEncoding::Data { .. })
+                    || !event.payload.len().is_multiple_of(FLP_NOTE_RECORD_SIZE)
+                {
+                    return Err(FlpError::UnsupportedEdit(
+                        "a selected pattern has an unsupported score event layout",
+                    ));
+                }
+                note_opcode = Some(event.opcode);
+                notes.extend(
+                    event
+                        .payload
+                        .as_chunks::<FLP_NOTE_RECORD_SIZE>()
+                        .0
+                        .iter()
+                        .map(|record| PatternNote::decode(record)),
+                );
+                continue;
+            }
+
+            match event.opcode {
+                0xC1 if matches!(event.encoding, PayloadEncoding::Data { .. }) => {}
+                0xA4 if event.encoding == PayloadEncoding::Dword && event.payload.len() == 4 => {
+                    length_event_count += 1;
+                }
+                _ => {
+                    return Err(FlpError::UnsupportedEdit(
+                        "selected patterns containing event automation or unknown pattern data cannot be merged",
+                    ));
+                }
+            }
+        }
+
+        if length_event_count > 1 {
+            return Err(FlpError::UnsupportedEdit(
+                "a selected pattern has multiple explicit length events",
+            ));
+        }
+
+        Ok((notes, note_opcode))
+    }
+
+    /// Merges selected Pattern Clip scores into a new pattern assigned to the uppermost clip.
+    /// The output clip spans the selected timeline range; repeated source scores are expanded
+    /// into that range and clipped at each source clip's endpoint. Original patterns remain
+    /// unchanged. Pattern event automation, unknown per-pattern data, and scaled clips are
+    /// rejected because their score timing or payload is not yet modeled.
+    pub fn merge_playlist_pattern_clips(
+        &mut self,
+        arrangement_id: u16,
+        clip_indices: &[usize],
+    ) -> Result<usize, FlpError> {
+        let mut selected_indices = BTreeSet::new();
+        for &clip_index in clip_indices {
+            if !selected_indices.insert(clip_index) {
+                return Err(FlpError::UnsupportedEdit(
+                    "selected Playlist clip indexes must be unique",
+                ));
+            }
+        }
+        if selected_indices.len() < 2 {
+            return Err(FlpError::UnsupportedEdit(
+                "merging requires at least two Playlist Pattern Clips",
+            ));
+        }
+
+        let arrangements = self.arrangements()?;
+        let mut matching_arrangements = arrangements
+            .iter()
+            .filter(|arrangement| arrangement.id == arrangement_id);
+        let Some(arrangement) = matching_arrangements.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested arrangement does not exist",
+            ));
+        };
+        if matching_arrangements.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested arrangement id is ambiguous",
+            ));
+        }
+
+        let selected_indices = selected_indices.into_iter().collect::<Vec<_>>();
+        let mut selected_clips = Vec::with_capacity(selected_indices.len());
+        let mut merged_start = u64::MAX;
+        let mut merged_end = 0u64;
+        for &clip_index in &selected_indices {
+            let Some(clip) = arrangement.clips.get(clip_index) else {
+                return Err(FlpError::UnsupportedEdit(
+                    "a selected Playlist clip does not exist",
+                ));
+            };
+            if !matches!(clip.target(), PlaylistClipTarget::Pattern { .. }) {
+                return Err(FlpError::UnsupportedEdit(
+                    "only Playlist Pattern Clips can be merged",
+                ));
+            }
+            if clip.track_index.is_none() {
+                return Err(FlpError::UnsupportedEdit(
+                    "a selected Pattern Clip has an unsupported Playlist track index",
+                ));
+            }
+            if clip
+                .scale
+                .is_some_and(|scale| !scale.is_finite() || (scale - 1.0).abs() > 1e-9)
+            {
+                return Err(FlpError::UnsupportedEdit(
+                    "Pattern Clips with a non-default or invalid scale cannot be merged",
+                ));
+            }
+            if clip.length_ticks == 0 {
+                return Err(FlpError::UnsupportedEdit(
+                    "selected Pattern Clips must have nonzero timeline lengths",
+                ));
+            }
+            let clip_start = u64::from(clip.position_ticks);
+            let clip_end = clip_start
+                .checked_add(u64::from(clip.length_ticks))
+                .ok_or(FlpError::LengthOverflow)?;
+            merged_start = merged_start.min(clip_start);
+            merged_end = merged_end.max(clip_end);
+            selected_clips.push((clip_index, clip.clone()));
+        }
+        let merged_length_ticks = u32::try_from(
+            merged_end
+                .checked_sub(merged_start)
+                .ok_or(FlpError::LengthOverflow)?,
+        )
+        .map_err(|_| FlpError::UnsupportedEdit("the merged Playlist range is too long"))?;
+        if merged_length_ticks == 0 {
+            return Err(FlpError::UnsupportedEdit(
+                "the merged Playlist range must be nonzero",
+            ));
+        }
+
+        let receiver_clip_index = selected_clips
+            .iter()
+            .min_by_key(|(clip_index, clip)| {
+                (
+                    clip.track_index.unwrap_or(u16::MAX),
+                    clip.position_ticks,
+                    *clip_index,
+                )
+            })
+            .map(|(clip_index, _)| *clip_index)
+            .expect("at least two selected clips were checked above");
+        let receiver_clip = selected_clips
+            .iter()
+            .find(|(clip_index, _)| *clip_index == receiver_clip_index)
+            .map(|(_, clip)| clip)
+            .expect("the receiver is one of the selected clips");
+        let PlaylistClipTarget::Pattern {
+            id: receiver_pattern_id,
+        } = receiver_clip.target()
+        else {
+            unreachable!("all selected clips were checked as Pattern Clips");
+        };
+
+        let patterns = self.patterns()?;
+        let mut scores_by_pattern = HashMap::<u16, (Vec<PatternNote>, Option<u8>)>::new();
+        for (_, clip) in &selected_clips {
+            let PlaylistClipTarget::Pattern { id } = clip.target() else {
+                unreachable!("all selected clips were checked as Pattern Clips");
+            };
+            if !patterns.iter().any(|pattern| pattern.id == id) {
+                return Err(FlpError::UnsupportedEdit(
+                    "a selected Pattern Clip references a missing pattern",
+                ));
+            }
+            if let std::collections::hash_map::Entry::Vacant(entry) = scores_by_pattern.entry(id) {
+                entry.insert(self.pattern_score_for_playlist_merge(id)?);
+            }
+        }
+
+        let receiver_pattern = patterns
+            .iter()
+            .find(|pattern| pattern.id == receiver_pattern_id)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the uppermost Pattern Clip references a missing pattern",
+            ))?;
+        let pattern_name = receiver_pattern
+            .name
+            .as_deref()
+            .unwrap_or("Merged")
+            .to_owned();
+        let mut merged_notes = Vec::<PatternNote>::new();
+
+        for (_, clip) in &selected_clips {
+            let PlaylistClipTarget::Pattern { id } = clip.target() else {
+                unreachable!("all selected clips were checked as Pattern Clips");
+            };
+            let pattern = patterns
+                .iter()
+                .find(|pattern| pattern.id == id)
+                .expect("selected pattern ids were checked above");
+            let (source_notes, _) = scores_by_pattern
+                .get(&id)
+                .expect("selected pattern score was decoded above");
+            let clip_length = u64::from(clip.length_ticks);
+            let inferred_length = source_notes
+                .iter()
+                .filter(|note| note.length > 0)
+                .try_fold(0u64, |end, note| {
+                    let note_end = u64::from(note.position)
+                        .checked_add(u64::from(note.length))
+                        .ok_or(FlpError::LengthOverflow)?;
+                    Ok::<_, FlpError>(end.max(note_end))
+                })?;
+            let repeat_length = pattern
+                .length_ticks
+                .map(u64::from)
+                .filter(|length| *length > 0)
+                .unwrap_or(if inferred_length > 0 {
+                    inferred_length
+                } else {
+                    clip_length
+                });
+            let repetitions = clip_length.div_ceil(repeat_length);
+            let clip_offset = u64::from(clip.position_ticks)
+                .checked_sub(merged_start)
+                .ok_or(FlpError::LengthOverflow)?;
+
+            for note in source_notes {
+                if u64::from(note.position) >= clip_length {
+                    continue;
+                }
+                for repetition in 0..repetitions {
+                    let source_position = repetition
+                        .checked_mul(repeat_length)
+                        .and_then(|start| start.checked_add(u64::from(note.position)))
+                        .ok_or(FlpError::LengthOverflow)?;
+                    if source_position >= clip_length {
+                        continue;
+                    }
+                    if merged_notes.len() >= MAX_MERGED_PATTERN_NOTES {
+                        return Err(FlpError::UnsupportedEdit(
+                            "merging would expand beyond 2,000,000 Pattern Clip notes",
+                        ));
+                    }
+                    let mut merged_note = note.clone();
+                    merged_note.position = u32::try_from(
+                        clip_offset
+                            .checked_add(source_position)
+                            .ok_or(FlpError::LengthOverflow)?,
+                    )
+                    .map_err(|_| FlpError::LengthOverflow)?;
+                    if merged_note.length > 0 {
+                        merged_note.length = u32::try_from(
+                            u64::from(merged_note.length).min(clip_length - source_position),
+                        )
+                        .map_err(|_| FlpError::LengthOverflow)?;
+                    }
+                    merged_notes.push(merged_note);
+                }
+            }
+        }
+
+        let receiver_pattern_base = receiver_clip.pattern_base;
+        let new_item_index = receiver_pattern_base;
+        let mut candidate = self.clone();
+        let merged_pattern_id = candidate.create_pattern()?;
+        let merged_item_index = new_item_index
+            .checked_add(merged_pattern_id)
+            .ok_or(FlpError::LengthOverflow)?;
+        candidate.add_pattern_notes(merged_pattern_id, &merged_notes)?;
+        let name_payload =
+            encode_project_string(&pattern_name, candidate.project_strings_use_utf16())?;
+        let name_event = FlpEvent::new_data(0xC1, name_payload)?;
+        let length_event = FlpEvent::new_dword(0xA4, merged_length_ticks);
+        let merged_marker_index = candidate
+            .events
+            .iter()
+            .position(|event| {
+                event.opcode == 0x41
+                    && event.encoding == PayloadEncoding::Word
+                    && event.payload.as_slice() == merged_pattern_id.to_le_bytes()
+            })
+            .ok_or(FlpError::UnsupportedEdit(
+                "the merged Pattern marker could not be found",
+            ))?;
+        let metadata_insert_index = merged_marker_index
+            .checked_add(2)
+            .filter(|index| *index <= candidate.events.len())
+            .ok_or(FlpError::LengthOverflow)?;
+        candidate.events.splice(
+            metadata_insert_index..metadata_insert_index,
+            [name_event, length_event],
+        );
+        candidate.refresh_event_offsets()?;
+
+        candidate.edit_playlist_clip(
+            arrangement_id,
+            receiver_clip_index,
+            PlaylistClipEdit {
+                position_ticks: Some(
+                    u32::try_from(merged_start).map_err(|_| FlpError::LengthOverflow)?,
+                ),
+                item_index: Some(merged_item_index),
+                length_ticks: Some(merged_length_ticks),
+                ..PlaylistClipEdit::default()
+            },
+        )?;
+        for clip_index in selected_indices
+            .iter()
+            .copied()
+            .filter(|clip_index| *clip_index != receiver_clip_index)
+            .rev()
+        {
+            candidate.delete_playlist_clip(arrangement_id, clip_index)?;
+        }
+
+        let clips_before_receiver = selected_indices
+            .iter()
+            .filter(|clip_index| **clip_index < receiver_clip_index)
+            .count();
+        let merged_clip_index = receiver_clip_index - clips_before_receiver;
+        *self = candidate;
+        Ok(merged_clip_index)
     }
 
     /// Slips the source window inside one Playlist Audio Clip while keeping its timeline bounds.
@@ -8584,6 +8944,110 @@ mod tests {
         append_data_event(&mut event_stream, 0xE9, &clip_payload);
         FlpDocument::parse(&flp_fixture(&event_stream, &[], &[]))
             .expect("Pattern Clip fixture should parse")
+    }
+
+    fn merge_pattern_clips_fixture(include_unsupported_pattern_event: bool) -> FlpDocument {
+        let mut event_stream = vec![0x40, 0, 0, 0x41, 7, 0];
+        let receiver_note = note_record(0, 7, 48, 60, 100);
+        append_data_event(&mut event_stream, 0xD0, &receiver_note);
+        event_stream.extend_from_slice(&[0xA4]);
+        event_stream.extend_from_slice(&96u32.to_le_bytes());
+
+        event_stream.extend_from_slice(&[0x41, 8, 0]);
+        let source_note = note_record(24, 7, 24, 64, 90);
+        append_data_event(&mut event_stream, 0xD0, &source_note);
+        if include_unsupported_pattern_event {
+            append_project_info_string(&mut event_stream, 0xC2, "automation");
+        }
+        event_stream.extend_from_slice(&[0xA4]);
+        event_stream.extend_from_slice(&48u32.to_le_bytes());
+
+        event_stream.extend_from_slice(&[0x40, 7, 0, 0x15, 4, 0x62, 0, 0]);
+        event_stream.extend_from_slice(&[0x40, 9, 0, 0x15, 4, 0x48, 9, 0, 0x62, 0, 0, 0x63, 3, 0]);
+
+        let mut source_clip = [0u8; 80];
+        source_clip[4..6].copy_from_slice(&0x5000u16.to_le_bytes());
+        source_clip[6..8].copy_from_slice(&0x5008u16.to_le_bytes());
+        source_clip[8..12].copy_from_slice(&96u32.to_le_bytes());
+        source_clip[12..14].copy_from_slice(&498u16.to_le_bytes());
+        source_clip[28..32].copy_from_slice(&1.0f32.to_le_bytes());
+        source_clip[64..72].copy_from_slice(&1.0f64.to_le_bytes());
+
+        let mut receiver_clip = source_clip;
+        receiver_clip[0..4].copy_from_slice(&96u32.to_le_bytes());
+        receiver_clip[6..8].copy_from_slice(&0x5007u16.to_le_bytes());
+        receiver_clip[12..14].copy_from_slice(&499u16.to_le_bytes());
+        let mut clip_payload = source_clip.to_vec();
+        clip_payload.extend_from_slice(&receiver_clip);
+        append_data_event(&mut event_stream, 0xE9, &clip_payload);
+
+        FlpDocument::parse(&flp_fixture(&event_stream, &[], &[]))
+            .expect("Pattern Clip merge fixture should parse")
+    }
+
+    #[test]
+    fn merges_selected_pattern_clips_into_the_uppermost_clip() {
+        let mut document = merge_pattern_clips_fixture(false);
+        let original_patterns = document.patterns().expect("source patterns should decode");
+
+        let merged_clip_index = document
+            .merge_playlist_pattern_clips(9, &[0, 1])
+            .expect("different Pattern Clip scores should merge");
+
+        assert_eq!(merged_clip_index, 0);
+        let arrangement = document
+            .arrangements()
+            .expect("the merged arrangement should decode")
+            .remove(0);
+        assert_eq!(arrangement.clips.len(), 1);
+        assert_eq!(arrangement.clips[0].position_ticks, 0);
+        assert_eq!(arrangement.clips[0].length_ticks, 192);
+        assert_eq!(arrangement.clips[0].track_index, Some(0));
+        assert_eq!(
+            arrangement.clips[0].target(),
+            PlaylistClipTarget::Pattern { id: 9 }
+        );
+
+        let patterns = document.patterns().expect("merged pattern should decode");
+        assert_eq!(patterns.len(), 3);
+        assert_eq!(&patterns[..2], original_patterns.as_slice());
+        let merged_pattern = patterns
+            .iter()
+            .find(|pattern| pattern.id == 9)
+            .expect("the merged Pattern should be created");
+        assert_eq!(merged_pattern.name.as_deref(), Some("Merged"));
+        assert_eq!(merged_pattern.length_ticks, Some(192));
+        assert_eq!(
+            merged_pattern
+                .notes
+                .iter()
+                .map(|note| (note.position, note.key, note.length))
+                .collect::<Vec<_>>(),
+            [(24, 64, 24), (72, 64, 24), (96, 60, 48)]
+        );
+
+        let encoded = document
+            .encode_lossless()
+            .expect("the merged project should encode");
+        let reparsed = FlpDocument::parse(&encoded).expect("the merged project should parse");
+        assert_eq!(reparsed.patterns().unwrap(), patterns);
+        assert_eq!(reparsed.arrangements().unwrap()[0].clips, arrangement.clips);
+    }
+
+    #[test]
+    fn pattern_clip_merge_rejects_unmodeled_pattern_data_atomically() {
+        let mut document = merge_pattern_clips_fixture(true);
+        let original = document
+            .encode_lossless()
+            .expect("the original project should encode");
+
+        assert!(document.merge_playlist_pattern_clips(9, &[0, 1]).is_err());
+        assert_eq!(
+            document
+                .encode_lossless()
+                .expect("the project should still encode after rejection"),
+            original
+        );
     }
 
     #[test]

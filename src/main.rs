@@ -667,6 +667,16 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_usize(right_clip_index, "right clip index")?,
             )
         }
+        [command, input, output, arrangement_id, clip_indices]
+            if command == "merge-pattern-clips" =>
+        {
+            merge_pattern_clips(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(arrangement_id, "arrangement id")?,
+                parse_clip_indices(clip_indices)?,
+            )
+        }
         [command, input, output, arrangement_id, clip_index, delta_ms, source_length_ms]
             if command == "slip-audio-clip" =>
         {
@@ -803,6 +813,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild split-audio-clip <input.flp> <output.flp> <arrangement-id> <clip-index> <split-position-ticks> <source-length-ms|->\n",
             "  flp-rebuild join-audio-clips <input.flp> <output.flp> <arrangement-id> <left-clip-index> <right-clip-index>\n",
             "  flp-rebuild join-pattern-clips <input.flp> <output.flp> <arrangement-id> <left-clip-index> <right-clip-index>\n",
+            "  flp-rebuild merge-pattern-clips <input.flp> <output.flp> <arrangement-id> <clip-index,clip-index,...>\n",
             "  flp-rebuild slip-audio-clip <input.flp> <output.flp> <arrangement-id> <clip-index> <delta-ms> <sample-length-ms>\n",
             "  flp-rebuild edit-time-marker <input.flp> <output.flp> <arrangement-id> <marker-index> <position-ticks|-> <signature:0|1|-> <numerator|-> <denominator|-> <name|->\n",
             "  flp-rebuild create-time-marker <input.flp> <output.flp> <arrangement-id> <position-ticks> <signature:0|1> <numerator|-> <denominator|-> <name|->\n",
@@ -816,6 +827,21 @@ fn parse_usize(value: &str, description: &str) -> Result<usize, String> {
     value
         .parse::<usize>()
         .map_err(|_| format!("{description} must be a non-negative integer"))
+}
+
+fn parse_clip_indices(value: &str) -> Result<Vec<usize>, String> {
+    let mut indices = Vec::new();
+    for part in value.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            return Err("clip indexes must be comma-separated non-negative integers".to_owned());
+        }
+        indices.push(parse_usize(part, "clip index")?);
+    }
+    if indices.len() < 2 {
+        return Err("merge-pattern-clips requires at least two clip indexes".to_owned());
+    }
+    Ok(indices)
 }
 
 fn parse_midi_channel_mapping(value: &str) -> Result<MidiChannelMapping, String> {
@@ -2891,6 +2917,44 @@ fn join_pattern_clips(
     Ok(())
 }
 
+fn merge_pattern_clips(
+    input: &Path,
+    output: &Path,
+    arrangement_id: u16,
+    clip_indices: Vec<usize>,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let merged_clip_index = document
+        .merge_playlist_pattern_clips(arrangement_id, &clip_indices)
+        .map_err(|error| error.to_string())?;
+    let merged_pattern_id = document
+        .arrangements()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|arrangement| arrangement.id == arrangement_id)
+        .and_then(|arrangement| arrangement.clips.get(merged_clip_index).cloned())
+        .and_then(|clip| match clip.target() {
+            flp_rebuild::PlaylistClipTarget::Pattern { id } => Some(id),
+            flp_rebuild::PlaylistClipTarget::Channel { .. } => None,
+        })
+        .ok_or_else(|| "the merged Playlist clip could not be found".to_owned())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    let indexes = clip_indices
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    println!(
+        "merged arrangement {arrangement_id} Pattern Clips {indexes} into clip {merged_clip_index} (Pattern {merged_pattern_id}) in {}",
+        output.display()
+    );
+    Ok(())
+}
+
 fn slip_audio_clip(
     input: &Path,
     output: &Path,
@@ -2984,7 +3048,7 @@ fn delete_time_marker(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_rgb_hex;
+    use super::{parse_clip_indices, parse_rgb_hex};
 
     #[test]
     fn parses_channel_rgb_in_hex_form_with_optional_prefix() {
@@ -2992,5 +3056,13 @@ mod tests {
         assert_eq!(parse_rgb_hex("#102030"), Ok([0x10, 0x20, 0x30]));
         assert!(parse_rgb_hex("#12345").is_err());
         assert!(parse_rgb_hex("xyzxyz").is_err());
+    }
+
+    #[test]
+    fn parses_comma_separated_playlist_clip_indexes() {
+        assert_eq!(parse_clip_indices("2, 0,7"), Ok(vec![2, 0, 7]));
+        assert!(parse_clip_indices("1").is_err());
+        assert!(parse_clip_indices("1,,2").is_err());
+        assert!(parse_clip_indices("one,2").is_err());
     }
 }
