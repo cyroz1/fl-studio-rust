@@ -17,7 +17,10 @@ use crate::sample_render::{
     PlaylistRenderOptions, PlaylistTrackFilter, channel_gain_pan, schedule_playlist_pattern_notes,
     swing_note_start_tick,
 };
-use crate::{ChannelNoteRouter, ChannelPluginState, FlpDocument, MixerRouteAudibility};
+use crate::{
+    ChannelNoteRouter, ChannelPluginState, FlpDocument, MixerInsertSignalTransform,
+    MixerRouteAudibility,
+};
 use vst3_host::audio::AudioBuffers;
 use vst3_host::midi::{MidiChannel, MidiEvent};
 use vst3_host::{Plugin, PluginWindow, Vst3Host};
@@ -192,6 +195,7 @@ struct PlaylistPluginStream {
     gain: f32,
     left_pan_gain: f32,
     right_pan_gain: f32,
+    mixer_transform: MixerInsertSignalTransform,
 }
 
 /// Prepared VST3 instrument channels for blockwise Playlist Song transport.
@@ -267,10 +271,13 @@ impl Vst3PlaylistStreamProcessor {
                 .map_err(|error| format!("could not allocate VST3 Playlist block: {error}"))?;
             stream.render_output_frames(frame_count, &mut plugin_output)?;
             for (frame_index, frame) in plugin_output.as_chunks::<2>().0.iter().enumerate() {
-                let left = frame[0] * stream.gain;
-                let right = frame[1] * stream.gain;
-                output[frame_index * 2] += left * stream.left_pan_gain;
-                output[frame_index * 2 + 1] += right * stream.right_pan_gain;
+                let mut routed_frame = [
+                    frame[0] * stream.gain * stream.left_pan_gain,
+                    frame[1] * stream.gain * stream.right_pan_gain,
+                ];
+                stream.mixer_transform.apply_frame(&mut routed_frame);
+                output[frame_index * 2] += routed_frame[0];
+                output[frame_index * 2 + 1] += routed_frame[1];
             }
         }
         Ok(())
@@ -1207,6 +1214,9 @@ impl Vst3HostRuntime {
                 channel.and_then(|channel| channel.volume()),
                 channel.and_then(|channel| channel.pan()),
             );
+            let mixer_transform = channel
+                .map(|channel| mixer_route_audibility.transform_for_channel(channel.mixer_track()))
+                .unwrap_or_default();
             let render = {
                 let plugin_guard = plugin
                     .lock()
@@ -1251,6 +1261,7 @@ impl Vst3HostRuntime {
                 gain,
                 left_pan_gain,
                 right_pan_gain,
+                mixer_transform,
             });
         }
         if streams.is_empty() {

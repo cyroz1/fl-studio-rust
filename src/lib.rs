@@ -1601,6 +1601,32 @@ pub(crate) struct MixerRouteAudibility {
     known_tracks: HashSet<i8>,
     disabled_tracks: HashSet<i8>,
     soloed_insert_tracks: HashSet<i8>,
+    source_transforms: HashMap<i8, MixerInsertSignalTransform>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct MixerInsertSignalTransform {
+    polarity_reversed: bool,
+    swap_left_right: bool,
+}
+
+impl MixerInsertSignalTransform {
+    pub(crate) const fn new(polarity_reversed: bool, swap_left_right: bool) -> Self {
+        Self {
+            polarity_reversed,
+            swap_left_right,
+        }
+    }
+
+    pub(crate) fn apply_frame(self, frame: &mut [f32; 2]) {
+        if self.swap_left_right {
+            frame.swap(0, 1);
+        }
+        if self.polarity_reversed {
+            frame[0] = -frame[0];
+            frame[1] = -frame[1];
+        }
+    }
 }
 
 impl MixerRouteAudibility {
@@ -1622,6 +1648,13 @@ impl MixerRouteAudibility {
             if insert.soloed() == Some(true) {
                 routing.soloed_insert_tracks.insert(track);
             }
+            let transform = MixerInsertSignalTransform::new(
+                insert.polarity_reversed() == Some(true),
+                insert.swap_left_right() == Some(true),
+            );
+            if transform != MixerInsertSignalTransform::default() {
+                routing.source_transforms.insert(track, transform);
+            }
         }
         routing
     }
@@ -1641,6 +1674,15 @@ impl MixerRouteAudibility {
             return false;
         }
         self.soloed_insert_tracks.is_empty() || self.soloed_insert_tracks.contains(&track)
+    }
+
+    /// Returns the supported insert phase/stereo transform for a known source route.
+    /// Master transforms are applied once to the final mix, and unknown routes are unchanged.
+    pub(crate) fn transform_for_channel(&self, route: Option<i8>) -> MixerInsertSignalTransform {
+        route
+            .filter(|track| *track > 0 && self.known_tracks.contains(track))
+            .and_then(|track| self.source_transforms.get(&track).copied())
+            .unwrap_or_default()
     }
 }
 
@@ -11626,12 +11668,13 @@ mod tests {
     use super::{
         ArticulateOptions, ChannelGroupSummary, ChannelNoteRouter, ChannelSortOrder,
         ChannelSummary, ClawMachineOptions, FlpDocument, FlpError, FlpEvent, FstPreset,
-        FstPresetKind, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerInsertSummary,
-        MixerParameterKind, MixerRouteAudibility, PATTERN_NOTE_SLIDE_FLAG, PatternControllerEdit,
-        PatternNote, PatternNoteEdit, PayloadEncoding, PlaylistClipEdit, PlaylistClipTarget,
-        PlaylistTrackEdit, ProjectInfoEdit, ProjectSettingsEdit, RiffMachineOptions,
-        RiffMachineQuantizeMode, ScaleLevelsOptions, TimeMarkerEdit, midi::MidiChannelMapping,
-        midi::MidiFile, parse_vst_plugin_state_metadata, riff_machine_groove_note_timing,
+        FstPresetKind, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit,
+        MixerInsertSignalTransform, MixerInsertSummary, MixerParameterKind, MixerRouteAudibility,
+        PATTERN_NOTE_SLIDE_FLAG, PatternControllerEdit, PatternNote, PatternNoteEdit,
+        PayloadEncoding, PlaylistClipEdit, PlaylistClipTarget, PlaylistTrackEdit, ProjectInfoEdit,
+        ProjectSettingsEdit, RiffMachineOptions, RiffMachineQuantizeMode, ScaleLevelsOptions,
+        TimeMarkerEdit, midi::MidiChannelMapping, midi::MidiFile, parse_vst_plugin_state_metadata,
+        riff_machine_groove_note_timing,
     };
 
     fn articulate_options(
@@ -13745,8 +13788,8 @@ mod tests {
             end_event_index: 0,
         };
         let routing = MixerRouteAudibility::from_inserts([
-            insert(0, (1 << 3) | (1 << 12)), // Master solo does not narrow its inputs.
-            insert(1, (1 << 3) | (1 << 12)),
+            insert(0, (1 << 3) | (1 << 12) | 1 | (1 << 1)),
+            insert(1, (1 << 3) | (1 << 12) | 1 | (1 << 1)),
             insert(2, 0), // Disabled insert.
         ]);
 
@@ -13755,6 +13798,16 @@ mod tests {
         assert!(!routing.allows_channel(Some(2)));
         assert!(routing.allows_channel(Some(-1)));
         assert!(routing.allows_channel(Some(7)));
+        let mut routed_frame = [0.25, -0.5];
+        routing
+            .transform_for_channel(Some(1))
+            .apply_frame(&mut routed_frame);
+        assert_eq!(routed_frame, [0.5, -0.25]);
+        let mut master_frame = [0.25, -0.5];
+        routing
+            .transform_for_channel(None)
+            .apply_frame(&mut master_frame);
+        assert_eq!(master_frame, [0.25, -0.5]);
 
         let master_solo = MixerRouteAudibility::from_inserts([
             insert(0, (1 << 3) | (1 << 12)),
