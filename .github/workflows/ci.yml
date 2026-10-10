@@ -32,7 +32,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --yes ffmpeg libasound2-dev libxcb1-dev libxkbcommon-x11-0 mesa-vulkan-drivers xvfb
+          sudo apt-get install --yes ffmpeg libasound2-dev libxcb1-dev libxkbcommon-x11-0 mesa-vulkan-drivers xvfb xdotool
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -132,8 +132,12 @@ jobs:
             fi
             sleep 1
           done
-          ffmpeg -y -loglevel error -f x11grab -video_size 1600x900 -framerate 1 \
+          ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
             -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/startup.png"
+          xdotool mousemove 382 111 click 1
+          sleep 1
+          ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
+            -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/channel-rack.png"
           BASH
           xvfb-run --auto-servernum --server-args="-screen 0 1600x900x24 +extension GLX" \
             bash "$RUNNER_TEMP/capture-ui.sh"
@@ -143,7 +147,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: linux-gui-preview
-          path: dist/gui-preview/startup.png
+          path: dist/gui-preview/*.png
           if-no-files-found: error
           retention-days: 14
 
