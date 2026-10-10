@@ -1512,8 +1512,8 @@ pub struct PlaylistTrackEdit {
     pub grouped: Option<bool>,
 }
 
-/// Read-only Mixer insert fields recognized from the observed `0x9A`, `0x93`,
-/// `0x95` sequence. The source events remain byte-exact in [`FlpDocument::events`].
+/// Mixer insert fields recognized from the observed `0x9A`, `0x93`, `0x95`
+/// sequence. The source events remain byte-exact in [`FlpDocument::events`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MixerInsertSummary {
     ordinal: usize,
@@ -1522,6 +1522,8 @@ pub struct MixerInsertSummary {
     color_raw: u32,
     icon_raw: Option<i16>,
     name: Option<String>,
+    flags: Option<u32>,
+    flags_event_index: Option<usize>,
     first_event_index: usize,
     end_event_index: usize,
 }
@@ -1554,6 +1556,36 @@ impl MixerInsertSummary {
 
     pub fn name(&self) -> Option<&str> {
         self.name.as_deref()
+    }
+
+    /// Raw insert flag bitmask from the version-specific Mixer state event.
+    pub fn flags(&self) -> Option<u32> {
+        self.flags
+    }
+
+    /// Whether this Mixer track is enabled. Disabled tracks are muted.
+    pub fn enabled(&self) -> Option<bool> {
+        self.flags.map(|flags| flags & (1 << 3) != 0)
+    }
+
+    /// Whether this Mixer track is soloed.
+    pub fn soloed(&self) -> Option<bool> {
+        self.flags.map(|flags| flags & (1 << 12) != 0)
+    }
+
+    /// Whether the track reverses signal polarity.
+    pub fn polarity_reversed(&self) -> Option<bool> {
+        self.flags.map(|flags| flags & 1 != 0)
+    }
+
+    /// Whether the track swaps its left and right channels.
+    pub fn swap_left_right(&self) -> Option<bool> {
+        self.flags.map(|flags| flags & (1 << 1) != 0)
+    }
+
+    /// Whether effects processing is enabled for this Mixer track.
+    pub fn effects_enabled(&self) -> Option<bool> {
+        self.flags.map(|flags| flags & (1 << 2) != 0)
     }
 
     /// Event range associated with this insert record, ending before the next recognized record.
@@ -1593,6 +1625,16 @@ pub struct MixerParameterRecord {
     reserved: u8,
     channel_data: u16,
     value: i32,
+}
+
+/// Fields that can be toggled in an existing Mixer insert flag record.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MixerInsertEdit {
+    pub enabled: Option<bool>,
+    pub soloed: Option<bool>,
+    pub polarity_reversed: Option<bool>,
+    pub swap_left_right: Option<bool>,
+    pub effects_enabled: Option<bool>,
 }
 
 impl MixerParameterRecord {
@@ -4045,6 +4087,16 @@ impl FlpDocument {
     /// record signature. This is intentionally read-only; the unparsed insert and effect data
     /// remains available byte-for-byte through `events()`.
     pub fn mixer_inserts(&self) -> Vec<MixerInsertSummary> {
+        let flag_opcodes: &[u8] = match self
+            .project_version
+            .as_deref()
+            .and_then(|version| version.split('.').next())
+            .and_then(|major| major.parse::<u32>().ok())
+        {
+            Some(major) if major >= 25 => &[0xEC],
+            Some(_) => &[0xDC],
+            None => &[0xEC, 0xDC],
+        };
         let starts = self
             .events
             .windows(3)
@@ -4092,6 +4144,25 @@ impl FlpDocument {
                         decode_project_string(&event.payload, self.project_version.as_deref())
                     })
                     .filter(|value| !value.is_empty());
+                let mut flags_records = insert_events
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, event)| {
+                        flag_opcodes.contains(&event.opcode) && event.payload.len() == 12
+                    })
+                    .map(|(offset, event)| {
+                        (
+                            start + offset,
+                            u32::from_le_bytes(
+                                event.payload[4..8]
+                                    .try_into()
+                                    .expect("Mixer insert flags have four bytes"),
+                            ),
+                        )
+                    });
+                let flags_record = flags_records
+                    .next()
+                    .filter(|_| flags_records.next().is_none());
 
                 MixerInsertSummary {
                     ordinal,
@@ -4100,11 +4171,65 @@ impl FlpDocument {
                     color_raw,
                     icon_raw,
                     name,
+                    flags: flags_record.map(|(_, flags)| flags),
+                    flags_event_index: flags_record.map(|(event_index, _)| event_index),
                     first_event_index: start,
                     end_event_index: end,
                 }
             })
             .collect()
+    }
+
+    /// Edits known bits in one existing Mixer insert flag event while preserving
+    /// unrecognized bits, reserved bytes, and all other source events.
+    pub fn edit_mixer_insert_flags(
+        &mut self,
+        insert_ordinal: usize,
+        edit: MixerInsertEdit,
+    ) -> Result<(), FlpError> {
+        let insert = self
+            .mixer_inserts()
+            .into_iter()
+            .find(|insert| insert.ordinal() == insert_ordinal)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested Mixer insert does not exist",
+            ))?;
+        let Some(mut flags) = insert.flags else {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested Mixer insert has no unique recognized flags event",
+            ));
+        };
+        let event_index = insert.flags_event_index.ok_or(FlpError::UnsupportedEdit(
+            "the requested Mixer insert has no unique recognized flags event",
+        ))?;
+        for (bit, value) in [
+            (3, edit.enabled),
+            (12, edit.soloed),
+            (0, edit.polarity_reversed),
+            (1, edit.swap_left_right),
+            (2, edit.effects_enabled),
+        ] {
+            if let Some(value) = value {
+                let mask = 1_u32 << bit;
+                if value {
+                    flags |= mask;
+                } else {
+                    flags &= !mask;
+                }
+            }
+        }
+        let event = self
+            .events
+            .get(event_index)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested Mixer insert flags event does not exist",
+            ))?;
+        if !matches!(event.encoding, PayloadEncoding::Data { .. }) || event.payload.len() != 12 {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested Mixer insert flags event has an unsupported layout",
+            ));
+        }
+        write_event_payload_bytes(&mut self.events[event_index], 4, &flags.to_le_bytes())
     }
 
     /// Renames a recognized Mixer insert through its existing `0xCC` name event.
@@ -13471,6 +13596,88 @@ mod tests {
                 .expect("lossless encoding should succeed"),
             original
         );
+    }
+
+    #[test]
+    fn mixer_insert_flags_decode_and_edit_known_bits_losslessly() {
+        let mut event_stream = vec![0x9A];
+        event_stream.extend_from_slice(&(-1_i32).to_le_bytes());
+        event_stream.push(0x93);
+        event_stream.extend_from_slice(&(-1_i32).to_le_bytes());
+        event_stream.push(0x95);
+        event_stream.extend_from_slice(&0_u32.to_le_bytes());
+        let flags = 0x8000_0005_u32;
+        let mut flags_payload = vec![0xAA, 0xBB, 0xCC, 0xDD];
+        flags_payload.extend_from_slice(&flags.to_le_bytes());
+        flags_payload.extend_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+        append_data_event(&mut event_stream, 0xEC, &flags_payload);
+
+        let original = flp_fixture(&event_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&original).expect("the fixture should parse");
+        let insert = &document.mixer_inserts()[0];
+        assert_eq!(insert.flags(), Some(flags));
+        assert_eq!(insert.enabled(), Some(false));
+        assert_eq!(insert.soloed(), Some(false));
+        assert_eq!(insert.polarity_reversed(), Some(true));
+        assert_eq!(insert.swap_left_right(), Some(false));
+        assert_eq!(insert.effects_enabled(), Some(true));
+
+        let flags_event_index = insert.flags_event_index.expect("flags event is recognized");
+        let original_events = document
+            .events()
+            .iter()
+            .map(|event| event.wire_bytes().to_vec())
+            .collect::<Vec<_>>();
+        document
+            .edit_mixer_insert_flags(
+                0,
+                MixerInsertEdit {
+                    enabled: Some(true),
+                    soloed: Some(true),
+                    polarity_reversed: Some(false),
+                    swap_left_right: Some(true),
+                    effects_enabled: None,
+                },
+            )
+            .expect("known Mixer flags should be editable");
+
+        let insert = &document.mixer_inserts()[0];
+        assert_eq!(insert.flags(), Some(0x8000_100E));
+        assert_eq!(insert.enabled(), Some(true));
+        assert_eq!(insert.soloed(), Some(true));
+        assert_eq!(insert.polarity_reversed(), Some(false));
+        assert_eq!(insert.swap_left_right(), Some(true));
+        assert_eq!(insert.effects_enabled(), Some(true));
+        let edited_payload = document.events()[flags_event_index].payload();
+        assert_eq!(&edited_payload[..4], &[0xAA, 0xBB, 0xCC, 0xDD]);
+        assert_eq!(&edited_payload[4..8], &0x8000_100E_u32.to_le_bytes());
+        assert_eq!(&edited_payload[8..], &[0x11, 0x22, 0x33, 0x44]);
+        for (index, event) in document.events().iter().enumerate() {
+            if index != flags_event_index {
+                assert_eq!(event.wire_bytes(), original_events[index]);
+            }
+        }
+
+        let encoded = document
+            .encode_lossless()
+            .expect("edited flags should encode losslessly");
+        let reparsed = FlpDocument::parse(&encoded).expect("edited project should parse");
+        assert_eq!(reparsed.mixer_inserts()[0].flags(), Some(0x8000_100E));
+
+        let mut legacy_stream = vec![0x9A];
+        legacy_stream.extend_from_slice(&(-1_i32).to_le_bytes());
+        legacy_stream.push(0x93);
+        legacy_stream.extend_from_slice(&(-1_i32).to_le_bytes());
+        legacy_stream.push(0x95);
+        legacy_stream.extend_from_slice(&0_u32.to_le_bytes());
+        let mut legacy_flags = vec![0; 4];
+        legacy_flags.extend_from_slice(&(1_u32 << 3).to_le_bytes());
+        legacy_flags.extend_from_slice(&[0; 4]);
+        append_data_event(&mut legacy_stream, 0xDC, &legacy_flags);
+        let mut legacy = FlpDocument::parse(&flp_fixture(&legacy_stream, &[], &[]))
+            .expect("the legacy fixture should parse");
+        legacy.project_version = Some("24.2.0".to_owned());
+        assert_eq!(legacy.mixer_inserts()[0].enabled(), Some(true));
     }
 
     #[test]

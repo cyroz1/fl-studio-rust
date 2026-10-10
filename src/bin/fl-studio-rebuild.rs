@@ -17101,15 +17101,23 @@ impl DawUi {
                                             ui.set_min_height((available_height - 42.0).max(180.0));
                                             ui.vertical(|ui| {
                                                 ui.small(format!(
-                                                    "INSERT {:02}",
-                                                    insert.ordinal() + 1
+                                                    "{}",
+                                                    if insert.ordinal() == 0 {
+                                                        "MASTER".to_owned()
+                                                    } else {
+                                                        format!("INSERT {:02}", insert.ordinal())
+                                                    }
                                                 ));
                                                 let display_name = insert
                                                     .name()
                                                     .filter(|name| !name.is_empty())
                                                     .map(str::to_owned)
                                                     .unwrap_or_else(|| {
-                                                        format!("Insert {}", insert.ordinal() + 1)
+                                                        if insert.ordinal() == 0 {
+                                                            "Master".to_owned()
+                                                        } else {
+                                                            format!("Insert {}", insert.ordinal())
+                                                        }
                                                     });
                                                 if ui
                                                     .add_sized(
@@ -17228,13 +17236,57 @@ impl DawUi {
                         .iter()
                         .find(|insert| Some(insert.ordinal()) == self.selected_mixer_insert)
                     {
-                        ui.label(format!("Insert {}", insert.ordinal() + 1));
+                        ui.label(if insert.ordinal() == 0 {
+                            "Master".to_owned()
+                        } else {
+                            format!("Insert {}", insert.ordinal())
+                        });
                         let mut name = insert.name().unwrap_or_default().to_owned();
                         if ui
                             .add(egui::TextEdit::singleline(&mut name).hint_text("Insert name"))
                             .changed()
                         {
                             rename_edits.push((insert.ordinal(), name));
+                        }
+                        ui.add_space(6.0);
+                        ui.label("Track state");
+                        if let Some(enabled) = insert.enabled() {
+                            ui.small(format!(
+                                "Output: {}",
+                                if enabled { "Enabled" } else { "Muted" }
+                            ));
+                            ui.small(format!(
+                                "Solo: {}",
+                                if insert.soloed().unwrap_or(false) {
+                                    "On"
+                                } else {
+                                    "Off"
+                                }
+                            ));
+                            ui.small(format!(
+                                "Effects: {} · Polarity: {} · L/R swap: {}",
+                                if insert.effects_enabled().unwrap_or(false) {
+                                    "On"
+                                } else {
+                                    "Off"
+                                },
+                                if insert.polarity_reversed().unwrap_or(false) {
+                                    "Reversed"
+                                } else {
+                                    "Normal"
+                                },
+                                if insert.swap_left_right().unwrap_or(false) {
+                                    "On"
+                                } else {
+                                    "Off"
+                                }
+                            ));
+                            ui.small(format!("Flags: 0x{:08X}", insert.flags().unwrap_or_default()));
+                        } else {
+                            ui.small(
+                                egui::RichText::new("Track state is not decoded for this FLP version")
+                                    .color(MUTED),
+                            );
                         }
                         ui.add_space(6.0);
                         ui.label("Routing fields");
@@ -17324,7 +17376,11 @@ impl DawUi {
                 match document.set_mixer_insert_name(insert_ordinal, &name) {
                     Ok(()) => {
                         self.dirty = true;
-                        self.status = format!("Renamed Mixer insert {}", insert_ordinal + 1);
+                        self.status = if insert_ordinal == 0 {
+                            "Renamed Mixer Master".to_owned()
+                        } else {
+                            format!("Renamed Mixer insert {insert_ordinal}")
+                        };
                     }
                     Err(error) => {
                         self.status = format!("Could not rename Mixer insert: {error}");
