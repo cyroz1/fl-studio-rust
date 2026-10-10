@@ -75,7 +75,7 @@ const TRANSPORT_BAR_HEIGHT: f32 = 46.0;
 const STATUS_BAR_HEIGHT: f32 = 27.0;
 const MIN_WINDOW_INNER_WIDTH: f32 = 960.0;
 const MIN_WINDOW_INNER_HEIGHT: f32 = 640.0;
-const DEFAULT_BROWSER_COLUMN_WIDTH: f32 = 232.0;
+const DEFAULT_BROWSER_COLUMN_WIDTH: f32 = 272.0;
 const MIN_BROWSER_COLUMN_WIDTH: f32 = 180.0;
 const MAX_BROWSER_COLUMN_WIDTH: f32 = 500.0;
 const HISTORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
@@ -6410,6 +6410,9 @@ impl DawUi {
         let mut rename_saved_search = None;
         let mut move_saved_search = None;
         let mut clone_saved_search = None;
+        let browser_tab_spacing = ui.spacing().clone();
+        ui.spacing_mut().button_padding = Vec2::new(5.0, 3.0);
+        ui.spacing_mut().item_spacing.x = 4.0;
         ui.horizontal_wrapped(|ui| {
             for tab in BrowserTab::ALL {
                 let selected =
@@ -6510,6 +6513,7 @@ impl DawUi {
                 });
             }
         });
+        *ui.spacing_mut() = browser_tab_spacing;
         if let Some(index) = remove_saved_search {
             self.remove_browser_search(index);
         } else if let Some(index) = hide_saved_search {
@@ -6733,10 +6737,6 @@ impl DawUi {
             self.refresh_browser_directory();
         }
 
-        if ui.small_button("Save search").clicked() {
-            self.open_browser_search_save_dialog();
-        }
-
         let current_indexed = self.browser_index.as_ref().is_some_and(|index| {
             !self.browser_search_all_active
                 && !index.all_roots
@@ -6749,9 +6749,25 @@ impl DawUi {
                 && index.roots == self.browser_search_roots
         });
         let scan_running = self.pending_browser_index.is_some();
+        let mut search_options_label = "Search options".to_owned();
+        if self.browser_filter != BrowserFilter::All {
+            search_options_label.push_str(" · ");
+            search_options_label.push_str(self.browser_filter.label());
+        }
+        if !self.browser_selected_tags.is_empty() {
+            search_options_label.push_str(&format!(
+                " · {} tag{}",
+                self.browser_selected_tags.len(),
+                if self.browser_selected_tags.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ));
+        }
         let search_all_requested =
             ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::F));
-        ui.horizontal_wrapped(|ui| {
+        ui.horizontal(|ui| {
             let search_field = ui.add(
                 egui::TextEdit::singleline(&mut self.browser_search)
                     .hint_text(if self.browser_search_all_active || search_all_requested {
@@ -6764,32 +6780,51 @@ impl DawUi {
             if search_all_requested {
                 search_field.request_focus();
             }
-            if ui
-                .add_enabled(
-                    !scan_running && !current_indexed,
-                    egui::Button::new("⌕ Recursive"),
-                )
-                .on_hover_text("Search supported files in this folder and its subfolders")
-                .clicked()
-            {
-                self.start_browser_index();
-            }
-            if ui
-                .add_enabled(
-                    !scan_running && !all_roots_indexed && !self.browser_search_roots.is_empty(),
-                    egui::Button::new("⌕ All folders"),
-                )
-                .on_hover_text(
-                    "Search supported files in every saved Browser folder and its subfolders",
-                )
-                .clicked()
-            {
-                self.start_browser_roots_index();
-            }
         });
         if search_all_requested {
             self.start_browser_roots_index();
         }
+        ui.collapsing(search_options_label, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                if ui.small_button("Save search").clicked() {
+                    self.open_browser_search_save_dialog();
+                }
+                if ui
+                    .add_enabled(
+                        !scan_running && !current_indexed,
+                        egui::Button::new("Recursive search"),
+                    )
+                    .on_hover_text("Search supported files in this folder and its subfolders")
+                    .clicked()
+                {
+                    self.start_browser_index();
+                }
+                if ui
+                    .add_enabled(
+                        !scan_running
+                            && !all_roots_indexed
+                            && !self.browser_search_roots.is_empty(),
+                        egui::Button::new("All folders"),
+                    )
+                    .on_hover_text(
+                        "Search supported files in every saved Browser folder and its subfolders",
+                    )
+                    .clicked()
+                {
+                    self.start_browser_roots_index();
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                egui::ComboBox::from_id_salt("browser-file-filter")
+                    .selected_text(self.browser_filter.label())
+                    .show_ui(ui, |ui| {
+                        for filter in BrowserFilter::ALL {
+                            ui.selectable_value(&mut self.browser_filter, filter, filter.label());
+                        }
+                    });
+                self.browser_tag_search_controls(ui);
+            });
+        });
         if let Some(pending) = self.pending_browser_index.as_ref() {
             if self.browser_index_request_is_active(pending) && pending.all_roots {
                 ui.horizontal(|ui| {
@@ -6837,16 +6872,6 @@ impl DawUi {
                 });
             }
         }
-        ui.horizontal_wrapped(|ui| {
-            egui::ComboBox::from_id_salt("browser-file-filter")
-                .selected_text(self.browser_filter.label())
-                .show_ui(ui, |ui| {
-                    for filter in BrowserFilter::ALL {
-                        ui.selectable_value(&mut self.browser_filter, filter, filter.label());
-                    }
-                });
-            self.browser_tag_search_controls(ui);
-        });
         if let Some(error) = &self.browser_error {
             ui.label(egui::RichText::new(error).color(ORANGE).small());
         }
