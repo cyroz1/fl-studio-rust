@@ -849,11 +849,13 @@ impl AudioEngine {
             let stream = build_input_stream(
                 &device,
                 settings,
-                Arc::clone(&ring),
-                Arc::clone(&input_peak),
-                Arc::clone(&source),
-                Arc::clone(&input_recording),
-                Arc::clone(&error),
+                InputStreamState {
+                    ring: Arc::clone(&ring),
+                    peak: Arc::clone(&input_peak),
+                    source: Arc::clone(&source),
+                    recording: Arc::clone(&input_recording),
+                    error: Arc::clone(&error),
+                },
             )?;
             stream
                 .play()
@@ -1254,44 +1256,32 @@ where
     Ok(stream)
 }
 
-fn build_input_stream(
-    device: &cpal::Device,
-    settings: &AudioSettings,
+#[derive(Clone)]
+struct InputStreamState {
     ring: Arc<AudioRingBuffer>,
     peak: Arc<AtomicU32>,
     source: Arc<AtomicU8>,
-    input_recording: Arc<ArcSwapOption<InputRecordingState>>,
+    recording: Arc<ArcSwapOption<InputRecordingState>>,
     error: Arc<AudioErrorState>,
+}
+
+fn build_input_stream(
+    device: &cpal::Device,
+    settings: &AudioSettings,
+    state: InputStreamState,
 ) -> Result<Stream, String> {
     let supported = select_config(device, true, settings.sample_rate)?;
     let format = supported.sample_format();
     let mut config = supported.config();
     config.buffer_size = cpal::BufferSize::Fixed(settings.buffer_frames);
-    match build_typed_input(
-        device,
-        config,
-        format,
-        Arc::clone(&ring),
-        Arc::clone(&peak),
-        Arc::clone(&source),
-        Arc::clone(&input_recording),
-        Arc::clone(&error),
-    ) {
+    match build_typed_input(device, config, format, state.clone()) {
         Ok(stream) => Ok(stream),
         Err(first_error) => {
             let mut default_config = supported.config();
             default_config.buffer_size = cpal::BufferSize::Default;
-            build_typed_input(
-                device,
-                default_config,
-                format,
-                ring,
-                peak,
-                source,
-                input_recording,
-                error,
-            )
-            .map_err(|error| format!("{error} (requested buffer was also rejected: {first_error})"))
+            build_typed_input(device, default_config, format, state).map_err(|error| {
+                format!("{error} (requested buffer was also rejected: {first_error})")
+            })
         }
     }
 }
@@ -1300,23 +1290,11 @@ fn build_typed_input(
     device: &cpal::Device,
     config: StreamConfig,
     format: SampleFormat,
-    ring: Arc<AudioRingBuffer>,
-    peak: Arc<AtomicU32>,
-    source: Arc<AtomicU8>,
-    input_recording: Arc<ArcSwapOption<InputRecordingState>>,
-    error: Arc<AudioErrorState>,
+    state: InputStreamState,
 ) -> Result<Stream, String> {
     macro_rules! build {
         ($sample:ty) => {
-            build_capture_stream::<$sample>(
-                device,
-                config,
-                ring,
-                peak,
-                source,
-                input_recording,
-                error,
-            )
+            build_capture_stream::<$sample>(device, config, state)
         };
     }
     match format {
@@ -1341,17 +1319,20 @@ fn build_typed_input(
 fn build_capture_stream<T>(
     device: &cpal::Device,
     config: StreamConfig,
-    ring: Arc<AudioRingBuffer>,
-    peak: Arc<AtomicU32>,
-    source: Arc<AtomicU8>,
-    input_recording: Arc<ArcSwapOption<InputRecordingState>>,
-    error: Arc<AudioErrorState>,
+    state: InputStreamState,
 ) -> Result<Stream, String>
 where
     T: cpal::SizedSample + Copy,
     f32: FromSample<T>,
 {
     let channels = usize::from(config.channels).max(1);
+    let InputStreamState {
+        ring,
+        peak,
+        source,
+        recording: input_recording,
+        error,
+    } = state;
     let stream = device
         .build_input_stream::<T, _, _>(
             config,
