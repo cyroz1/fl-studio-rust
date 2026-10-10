@@ -262,6 +262,7 @@ jobs:
             echo "::error::Cargo Packager did not produce a macOS app bundle."
             exit 1
           fi
+          app_path="$(cd "$(dirname "$app_path")" && pwd)/$(basename "$app_path")"
           app_executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app_path/Contents/Info.plist")"
           app_binary="$app_path/Contents/MacOS/$app_executable"
           if [[ ! -x "$app_binary" ]]; then
