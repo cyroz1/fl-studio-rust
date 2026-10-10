@@ -3550,6 +3550,7 @@ impl DawUi {
                         .show_ui(ui, |ui| {
                             for quality in [
                                 ResamplingQuality::Linear,
+                                ResamplingQuality::Hermite6,
                                 ResamplingQuality::Sinc64,
                             ] {
                                 ui.selectable_value(
@@ -3560,7 +3561,7 @@ impl DawUi {
                             }
                         });
                 });
-                ui.label("Sinc uses more CPU and reduces aliasing when samples are pitched or downsampled.");
+                ui.label("Hermite gives curved interpolation at low CPU cost; sinc reduces aliasing during pitch shifts and downsampling.");
                 ui.horizontal(|ui| {
                     ui.label("Channels");
                     egui::ComboBox::from_id_salt("playlist-render-channel-mode")

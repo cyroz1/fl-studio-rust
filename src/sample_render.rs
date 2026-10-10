@@ -153,6 +153,7 @@ pub enum WavDitherMode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResamplingQuality {
     Linear,
+    Hermite6,
     Sinc64,
 }
 
@@ -160,6 +161,7 @@ impl ResamplingQuality {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Linear => "Linear",
+            Self::Hermite6 => "6-point Hermite",
             Self::Sinc64 => "64-point sinc",
         }
     }
@@ -2431,8 +2433,42 @@ fn resample_sample(
             let second = finite_audio_sample(channel[second_index]);
             first + (second - first) * fraction
         }
+        ResamplingQuality::Hermite6 => hermite6_sample(channel, position),
         ResamplingQuality::Sinc64 => windowed_sinc64_sample(channel, position, source_step),
     }
+}
+
+fn hermite6_sample(channel: &[f32], position: f64) -> f32 {
+    let last_index = (channel.len() - 1) as isize;
+    let position = position.clamp(0.0, last_index as f64);
+    let center = position.floor() as isize;
+    let fraction = position - center as f64;
+    let sample = |offset: isize| {
+        finite_audio_sample(channel[(center + offset).clamp(0, last_index) as usize]) as f64
+    };
+
+    let p0 = sample(0);
+    let p1 = sample(1);
+    let derivative0 = (sample(-2) - 8.0 * sample(-1) + 8.0 * p1 - sample(2)) / 12.0;
+    let curvature0 = (-sample(-2) + 16.0 * sample(-1) - 30.0 * p0 + 16.0 * p1 - sample(2)) / 12.0;
+    let derivative1 = (sample(-1) - 8.0 * p0 + 8.0 * sample(2) - sample(3)) / 12.0;
+    let curvature1 = (-sample(-1) + 16.0 * p0 - 30.0 * p1 + 16.0 * sample(2) - sample(3)) / 12.0;
+
+    let remainder0 = p1 - p0 - derivative0 - curvature0 * 0.5;
+    let remainder1 = derivative1 - derivative0 - curvature0;
+    let remainder2 = curvature1 - curvature0;
+    let coefficient3 = 10.0 * remainder0 - 4.0 * remainder1 + 0.5 * remainder2;
+    let coefficient4 = -15.0 * remainder0 + 7.0 * remainder1 - remainder2;
+    let coefficient5 = 6.0 * remainder0 - 3.0 * remainder1 + 0.5 * remainder2;
+    let interpolated = (((((coefficient5 * fraction + coefficient4) * fraction + coefficient3)
+        * fraction
+        + curvature0 * 0.5)
+        * fraction
+        + derivative0)
+        * fraction)
+        + p0;
+
+    finite_audio_sample(interpolated as f32)
 }
 
 fn finite_audio_sample(sample: f32) -> f32 {
@@ -2919,6 +2955,28 @@ mod tests {
             resample_sample(&samples, 1.5, 1.0, ResamplingQuality::Linear),
             0.0
         );
+    }
+
+    #[test]
+    fn hermite6_resampling_preserves_dc_and_integer_samples() {
+        let constant = vec![0.375; 16];
+        assert!((hermite6_sample(&constant, 7.25) - 0.375).abs() < 1.0e-6);
+
+        let samples = [0.0, 0.5, -0.25, 0.75, -1.0, 0.25, 0.125, -0.5];
+        for (index, sample) in samples.iter().enumerate() {
+            assert_eq!(hermite6_sample(&samples, index as f64), *sample);
+        }
+    }
+
+    #[test]
+    fn hermite6_resampling_reconstructs_a_quadratic_curve() {
+        let samples = (0..12)
+            .map(|index| (index * index) as f32)
+            .collect::<Vec<_>>();
+        let position = 5.25;
+        let rendered = resample_sample(&samples, position, 1.0, ResamplingQuality::Hermite6);
+        let expected = (position * position) as f32;
+        assert!((rendered - expected).abs() < 1.0e-4);
     }
 
     #[test]
