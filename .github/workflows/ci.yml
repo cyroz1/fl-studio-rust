@@ -138,6 +138,10 @@ jobs:
           sleep 1
           ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
             -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/channel-rack.png"
+          xdotool mousemove 682 111 click 1
+          sleep 1
+          ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
+            -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/audio-settings.png"
           BASH
           xvfb-run --auto-servernum --server-args="-screen 0 1600x900x24 +extension GLX" \
             bash "$RUNNER_TEMP/capture-ui.sh"
