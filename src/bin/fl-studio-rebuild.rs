@@ -1401,6 +1401,7 @@ struct DawUi {
     midi_channel_mapping: MidiChannelMapping,
     selected_arrangement: Option<u16>,
     selected_clip: Option<usize>,
+    playlist_clip_context_split: Option<(u16, usize, u32)>,
     playlist_clip_clipboard: Option<PlaylistClipClipboard>,
     active_playlist_clip_drag: Option<ActivePlaylistClipDrag>,
     selected_time_marker: Option<usize>,
@@ -1713,6 +1714,7 @@ impl DawUi {
             midi_channel_mapping: MidiChannelMapping::PreserveNoteChannels,
             selected_arrangement: None,
             selected_clip: None,
+            playlist_clip_context_split: None,
             playlist_clip_clipboard: None,
             active_playlist_clip_drag: None,
             selected_time_marker: None,
@@ -2148,6 +2150,7 @@ impl DawUi {
                 }
                 self.rack_selection_anchor = self.selected_graph_channel;
                 self.selected_clip = None;
+                self.playlist_clip_context_split = None;
                 self.playlist_clip_clipboard = None;
                 self.active_playlist_clip_drag = None;
                 self.selected_time_marker = None;
@@ -6657,8 +6660,18 @@ impl DawUi {
         };
         let arrangements = document.arrangements().unwrap_or_default();
         let tracks = document.playlist_tracks();
-        let channel_kinds: BTreeMap<_, _> = document
-            .channels()
+        let channels = document.channels();
+        let tempo_channel_ids = channels
+            .iter()
+            .filter(|channel| {
+                channel.kind() == Some(5)
+                    && channel
+                        .display_name()
+                        .is_some_and(|name| name.eq_ignore_ascii_case("TEMPO"))
+            })
+            .map(ChannelSummary::id)
+            .collect::<BTreeSet<_>>();
+        let channel_kinds: BTreeMap<_, _> = channels
             .into_iter()
             .map(|channel| (channel.id(), channel.kind()))
             .collect();
@@ -6716,6 +6729,7 @@ impl DawUi {
         let mut copy_clip_requested = None;
         let mut cut_clip_requested = None;
         let mut paste_clip_after_requested = None;
+        let mut split_clip_requested = None;
         ui.horizontal_wrapped(|ui| {
             ui.label("Arrangement");
             ui.strong(arrangement.name.as_deref().unwrap_or("Arrangement"));
@@ -7036,6 +7050,96 @@ impl DawUi {
                             let response = response.on_hover_text(
                                 "Drag to move. Shift-drag the right edge to resize. Hold Alt to ignore the 1/16 grid.",
                             );
+                            if response.clicked_by(PointerButton::Secondary) {
+                                let (pointer, snap) = ui.input(|input| {
+                                    (input.pointer.interact_pos(), !input.modifiers.alt)
+                                });
+                                self.selected_arrangement = Some(arrangement.id);
+                                self.selected_clip = Some(clip_index);
+                                self.playlist_clip_context_split = pointer
+                                    .and_then(|pointer| {
+                                        playlist_clip_split_position(
+                                            pointer,
+                                            clip_rect,
+                                            clip.position_ticks,
+                                            clip.length_ticks,
+                                            tick_scale,
+                                            ppq,
+                                            snap,
+                                        )
+                                    })
+                                    .map(|position_ticks| {
+                                        (arrangement.id, clip_index, position_ticks)
+                                    });
+                            }
+                            let context_split_position = self
+                                .playlist_clip_context_split
+                                .filter(|(context_arrangement, context_clip, _)| {
+                                    *context_arrangement == arrangement.id
+                                        && *context_clip == clip_index
+                                })
+                                .map(|(_, _, position_ticks)| position_ticks);
+                            let is_audio_clip = match clip.target() {
+                                flp_rebuild::PlaylistClipTarget::Channel { id } => {
+                                    channel_kinds.get(&id).copied().flatten() == Some(4)
+                                }
+                                flp_rebuild::PlaylistClipTarget::Pattern { .. } => false,
+                            };
+                            let full_source_length_ms = if clip.start_offset == -1.0
+                                && clip.end_offset == -1.0
+                            {
+                                match clip.target() {
+                                    flp_rebuild::PlaylistClipTarget::Channel { id } => self
+                                        .audio_waveform_paths
+                                        .get(&id)
+                                        .and_then(|path| self.audio_waveforms.get(path))
+                                        .filter(|waveform| waveform.sample_rate > 0)
+                                        .map(|waveform| {
+                                            (waveform.frame_count as f64 * 1_000.0
+                                                / f64::from(waveform.sample_rate))
+                                                as f32
+                                        })
+                                        .filter(|length_ms| {
+                                            length_ms.is_finite() && *length_ms > 0.0
+                                        }),
+                                    flp_rebuild::PlaylistClipTarget::Pattern { .. } => None,
+                                }
+                            } else {
+                                None
+                            };
+                            let source_window_supported =
+                                if clip.start_offset == -1.0 && clip.end_offset == -1.0 {
+                                    full_source_length_ms.is_some()
+                                } else {
+                                    clip.start_offset.is_finite()
+                                        && clip.end_offset.is_finite()
+                                        && clip.start_offset >= 0.0
+                                        && clip.end_offset > clip.start_offset
+                                };
+                            let scale_supported = clip.scale.is_none_or(|scale| {
+                                scale.is_finite() && scale > 0.0 && (scale - 1.0).abs() <= 1e-9
+                            });
+                            let tempo_automation_overlaps = context_split_position
+                                .is_some_and(|split_position| {
+                                    arrangement.clips.iter().any(|candidate| {
+                                        let flp_rebuild::PlaylistClipTarget::Channel { id } =
+                                            candidate.target()
+                                        else {
+                                            return false;
+                                        };
+                                        tempo_channel_ids.contains(&id)
+                                            && candidate.position_ticks <= split_position
+                                            && candidate
+                                                .position_ticks
+                                                .saturating_add(candidate.length_ticks)
+                                                > clip.position_ticks
+                                    })
+                                });
+                            let can_split_clip = is_audio_clip
+                                && context_split_position.is_some()
+                                && source_window_supported
+                                && scale_supported
+                                && !tempo_automation_overlaps;
                             response.context_menu(|ui| {
                                 if ui.button("Copy clip").clicked() {
                                     copy_clip_requested = Some(clip_index);
@@ -7054,6 +7158,33 @@ impl DawUi {
                                 {
                                     paste_clip_after_requested = Some(clip_index);
                                     ui.close();
+                                }
+                                if is_audio_clip {
+                                    let split_button = ui.add_enabled(
+                                        can_split_clip,
+                                        egui::Button::new("Split audio at cursor"),
+                                    );
+                                    let split_hint = if context_split_position.is_none() {
+                                        "Right-click inside the clip, away from its edges"
+                                    } else if !source_window_supported {
+                                        "Wait for the waveform to load so the sample duration is known"
+                                    } else if !scale_supported {
+                                        "Splitting requires the default Audio Clip scale"
+                                    } else if tempo_automation_overlaps {
+                                        "Splitting across Playlist tempo automation is unsupported"
+                                    } else {
+                                        "Split at the right-click position; Alt disables 1/16 snapping"
+                                    };
+                                    if split_button.on_hover_text(split_hint).clicked()
+                                        && let Some(position_ticks) = context_split_position
+                                    {
+                                        split_clip_requested = Some((
+                                            clip_index,
+                                            position_ticks,
+                                            full_source_length_ms,
+                                        ));
+                                        ui.close();
+                                    }
                                 }
                                 ui.separator();
                                 if ui.button("Delete clip").clicked() {
@@ -7220,6 +7351,38 @@ impl DawUi {
             && self.paste_playlist_clip_into_arrangement(arrangement.id, Some(clip_index))
         {
             playlist_clip_list_changed = true;
+        }
+
+        if let Some((clip_index, split_position_ticks, full_source_length_ms)) =
+            split_clip_requested
+        {
+            if let Some(document) = self.document.as_mut() {
+                match document.split_playlist_audio_clip(
+                    arrangement.id,
+                    clip_index,
+                    split_position_ticks,
+                    full_source_length_ms,
+                ) {
+                    Ok(right_clip_index) => {
+                        self.stop_project_playback();
+                        self.selected_arrangement = Some(arrangement.id);
+                        self.selected_clip = Some(right_clip_index);
+                        self.playlist_clip_context_split = None;
+                        self.active_playlist_clip_drag = None;
+                        self.dirty = true;
+                        self.status = format!(
+                            "Split Audio Clip {} at tick {split_position_ticks}",
+                            clip_index + 1
+                        );
+                        playlist_clip_list_changed = true;
+                    }
+                    Err(error) => {
+                        self.status = format!("Could not split Audio Clip: {error}");
+                    }
+                }
+            } else {
+                self.status = "Open a project to split Playlist Audio Clips".to_owned();
+            }
         }
 
         if create_pattern_clip_requested
@@ -16375,6 +16538,31 @@ fn snap_note_tick(value: i64, quantum: u32, minimum: u32) -> u32 {
     snapped as u32
 }
 
+fn playlist_clip_split_position(
+    pointer: egui::Pos2,
+    clip_rect: egui::Rect,
+    clip_position_ticks: u32,
+    clip_length_ticks: u32,
+    tick_scale: f32,
+    ppq: u16,
+    snap: bool,
+) -> Option<u32> {
+    if !clip_rect.contains(pointer) || !tick_scale.is_finite() || tick_scale <= 0.0 {
+        return None;
+    }
+    let relative_ticks = ((pointer.x - clip_rect.left()) / tick_scale).round() as i64;
+    let position_ticks = i64::from(clip_position_ticks).saturating_add(relative_ticks);
+    let snap_ticks = if snap {
+        (u32::from(ppq.max(1)) / 4).max(1)
+    } else {
+        1
+    };
+    let position_ticks = snap_note_tick(position_ticks, snap_ticks, 0);
+    let clip_end_ticks = clip_position_ticks.saturating_add(clip_length_ticks);
+    (position_ticks > clip_position_ticks && position_ticks < clip_end_ticks)
+        .then_some(position_ticks)
+}
+
 fn playlist_clip_drag_edit(
     drag: ActivePlaylistClipDrag,
     pointer: egui::Pos2,
@@ -16460,8 +16648,9 @@ mod tests {
 
     use super::{
         ActivePlaylistClipDrag, ChannelDisplayFilter, PianoRollGrid, PianoRollSnap,
-        PlaylistClipDragKind, note_from_grid_position, playlist_clip_drag_edit, snap_note_tick,
-        update_channel_rack_selection, update_layer_child_selection,
+        PlaylistClipDragKind, note_from_grid_position, playlist_clip_drag_edit,
+        playlist_clip_split_position, snap_note_tick, update_channel_rack_selection,
+        update_layer_child_selection,
     };
 
     fn test_grid() -> PianoRollGrid {
@@ -16564,6 +16753,35 @@ mod tests {
             15,
         );
         assert_eq!(minimum.length_ticks, Some(1));
+    }
+
+    #[test]
+    fn playlist_clip_split_uses_cursor_and_respects_alt_snapping() {
+        let clip_rect = eframe::egui::Rect::from_min_max(
+            eframe::egui::pos2(100.0, 20.0),
+            eframe::egui::pos2(140.0, 40.0),
+        );
+        let pointer = eframe::egui::pos2(107.0, 30.0);
+        assert_eq!(
+            playlist_clip_split_position(pointer, clip_rect, 120, 384, 0.1, 96, true),
+            Some(192)
+        );
+        assert_eq!(
+            playlist_clip_split_position(pointer, clip_rect, 120, 384, 0.1, 96, false),
+            Some(190)
+        );
+        assert_eq!(
+            playlist_clip_split_position(
+                eframe::egui::pos2(101.0, 30.0),
+                clip_rect,
+                120,
+                384,
+                0.1,
+                96,
+                true,
+            ),
+            None
+        );
     }
 
     #[test]
