@@ -34,14 +34,14 @@ use flp_rebuild::{
     TimeMarker, TimeMarkerEdit, VstPluginStateMetadata,
 };
 
-const APP_BACKGROUND: Color32 = Color32::from_rgb(25, 25, 25);
-const PANEL: Color32 = Color32::from_rgb(37, 37, 37);
-const PANEL_DARK: Color32 = Color32::from_rgb(18, 18, 18);
-const PANEL_LIGHT: Color32 = Color32::from_rgb(50, 50, 50);
-const GRID: Color32 = Color32::from_rgb(58, 58, 58);
-const BORDER: Color32 = Color32::from_rgb(73, 73, 73);
+const APP_BACKGROUND: Color32 = Color32::from_rgb(29, 29, 29);
+const PANEL: Color32 = Color32::from_rgb(43, 43, 43);
+const PANEL_DARK: Color32 = Color32::from_rgb(35, 35, 35);
+const PANEL_LIGHT: Color32 = Color32::from_rgb(54, 54, 54);
+const GRID: Color32 = Color32::from_rgb(65, 65, 65);
+const BORDER: Color32 = Color32::from_rgb(76, 76, 76);
 const TEXT: Color32 = Color32::from_rgb(245, 245, 245);
-const MUTED: Color32 = Color32::from_rgb(186, 186, 186);
+const MUTED: Color32 = Color32::from_rgb(200, 200, 200);
 const GREEN: Color32 = Color32::from_rgb(14, 175, 98);
 const BLUE: Color32 = Color32::from_rgb(38, 128, 235);
 const BLUE_SELECTION: Color32 = Color32::from_rgb(24, 62, 104);
@@ -1633,7 +1633,7 @@ impl DawUi {
             package_workspace: None,
             view: MainView::Playlist,
             ui_scale,
-            status: "Open an FL Studio project to begin".to_owned(),
+            status: "Ready".to_owned(),
             dirty: false,
             undo_history: Vec::new(),
             redo_history: Vec::new(),
