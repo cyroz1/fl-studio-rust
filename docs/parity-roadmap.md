@@ -112,7 +112,7 @@ where real-time constraints punish sloppy code.
 - `[todo]` Per-track FX chains (10 slots each)
 - `[todo]` Sends and sidechain routing (arbitrary track-to-track routing)
 - `[todo]` Plugin delay compensation (PDC): per-plugin latency measurement, graph-wide delay alignment, manual + automatic modes
-- `[todo]` 32-bit float internal processing throughout
+- `[partial]` 32-bit float internal processing: decoded audio, Sampler/VST3 output, stereo mix buffers, and streamed device samples use `f32`; timeline calculations and some parameter/interpolation math use `f64`, and the Mixer graph and its effects are not implemented yet
 - `[todo]` Multi-threaded rendering: parallelize independent mixer tracks across cores
 
 ### 3.4 Sample playback
