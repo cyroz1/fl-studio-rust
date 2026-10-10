@@ -30,8 +30,8 @@ use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, AutomationChannel, AutomationPoint, AutomationPointEdit,
     ChannelGroupSummary, ChannelSortOrder, ChannelSummary, FlpDocument, FstPreset, FstPresetKind,
     Pattern, PatternNote, PatternNoteEdit, PlaylistClip, PlaylistClipClipboard, PlaylistClipEdit,
-    PlaylistTrack, ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions, TimeMarker,
-    TimeMarkerEdit, VstPluginStateMetadata,
+    PlaylistClipTarget, PlaylistTrack, ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions,
+    TimeMarker, TimeMarkerEdit, VstPluginStateMetadata,
 };
 
 const APP_BACKGROUND: Color32 = Color32::from_rgb(25, 25, 25);
@@ -6730,6 +6730,7 @@ impl DawUi {
         let mut cut_clip_requested = None;
         let mut paste_clip_after_requested = None;
         let mut split_clip_requested = None;
+        let mut join_clip_requested = None;
         ui.horizontal_wrapped(|ui| {
             ui.label("Arrangement");
             ui.strong(arrangement.name.as_deref().unwrap_or("Arrangement"));
@@ -7185,6 +7186,30 @@ impl DawUi {
                                         ));
                                         ui.close();
                                     }
+
+                                    let (join_previous_clip, join_next_clip) =
+                                        playlist_audio_clip_join_candidates(
+                                            &arrangement.clips,
+                                            clip_index,
+                                            &channel_kinds,
+                                            &tempo_channel_ids,
+                                        );
+                                    if join_previous_clip.is_some() || join_next_clip.is_some() {
+                                        ui.separator();
+                                    }
+                                    if let Some(previous_clip_index) = join_previous_clip
+                                        && ui.button("Join with previous Audio Clip").clicked()
+                                    {
+                                        join_clip_requested =
+                                            Some((previous_clip_index, clip_index));
+                                        ui.close();
+                                    }
+                                    if let Some(next_clip_index) = join_next_clip
+                                        && ui.button("Join with next Audio Clip").clicked()
+                                    {
+                                        join_clip_requested = Some((clip_index, next_clip_index));
+                                        ui.close();
+                                    }
                                 }
                                 ui.separator();
                                 if ui.button("Delete clip").clicked() {
@@ -7382,6 +7407,36 @@ impl DawUi {
                 }
             } else {
                 self.status = "Open a project to split Playlist Audio Clips".to_owned();
+            }
+        }
+
+        if let Some((left_clip_index, right_clip_index)) = join_clip_requested {
+            if let Some(document) = self.document.as_mut() {
+                match document.join_adjacent_playlist_audio_clips(
+                    arrangement.id,
+                    left_clip_index,
+                    right_clip_index,
+                ) {
+                    Ok(joined_clip_index) => {
+                        self.stop_project_playback();
+                        self.selected_arrangement = Some(arrangement.id);
+                        self.selected_clip = Some(joined_clip_index);
+                        self.playlist_clip_context_split = None;
+                        self.active_playlist_clip_drag = None;
+                        self.dirty = true;
+                        self.status = format!(
+                            "Joined Audio Clips {} and {}",
+                            left_clip_index + 1,
+                            right_clip_index + 1
+                        );
+                        playlist_clip_list_changed = true;
+                    }
+                    Err(error) => {
+                        self.status = format!("Could not join Audio Clips: {error}");
+                    }
+                }
+            } else {
+                self.status = "Open a project to join Playlist Audio Clips".to_owned();
             }
         }
 
@@ -16538,6 +16593,146 @@ fn snap_note_tick(value: i64, quantum: u32, minimum: u32) -> u32 {
     snapped as u32
 }
 
+fn playlist_audio_clip_joinable(
+    left: &PlaylistClip,
+    right: &PlaylistClip,
+    channel_kinds: &BTreeMap<u16, Option<u8>>,
+) -> bool {
+    let (
+        PlaylistClipTarget::Channel {
+            id: left_channel_id,
+        },
+        PlaylistClipTarget::Channel {
+            id: right_channel_id,
+        },
+    ) = (left.target(), right.target())
+    else {
+        return false;
+    };
+    if left_channel_id != right_channel_id
+        || channel_kinds.get(&left_channel_id).copied().flatten() != Some(4)
+        || left.raw_track_index != right.raw_track_index
+        || left.record_size != right.record_size
+        || left.pattern_base != right.pattern_base
+        || left.item_index != right.item_index
+        || left.track_index != right.track_index
+        || left.group != right.group
+        || left.unknown_word != right.unknown_word
+        || left.item_flags != right.item_flags
+        || left.header_bytes != right.header_bytes
+        || left.clip_id != right.clip_id
+        || left.reserved != right.reserved
+        || left.scale != right.scale
+        || left.trailing_bytes != right.trailing_bytes
+        || left.length_ticks == 0
+        || right.length_ticks == 0
+    {
+        return false;
+    }
+    if left
+        .scale
+        .is_some_and(|scale| !scale.is_finite() || (scale - 1.0).abs() > 1e-9)
+    {
+        return false;
+    }
+    let Some(left_end_ticks) = left.position_ticks.checked_add(left.length_ticks) else {
+        return false;
+    };
+    if left_end_ticks != right.position_ticks
+        || right
+            .position_ticks
+            .checked_add(right.length_ticks)
+            .is_none()
+        || !left.start_offset.is_finite()
+        || !left.end_offset.is_finite()
+        || !right.start_offset.is_finite()
+        || !right.end_offset.is_finite()
+        || left.start_offset < 0.0
+        || right.start_offset < 0.0
+        || left.end_offset <= left.start_offset
+        || right.end_offset <= right.start_offset
+        || left.end_offset.to_bits() != right.start_offset.to_bits()
+    {
+        return false;
+    }
+    true
+}
+
+fn playlist_audio_clip_join_candidates(
+    clips: &[PlaylistClip],
+    clip_index: usize,
+    channel_kinds: &BTreeMap<u16, Option<u8>>,
+    tempo_channel_ids: &BTreeSet<u16>,
+) -> (Option<usize>, Option<usize>) {
+    let Some(clip) = clips.get(clip_index) else {
+        return (None, None);
+    };
+    let mut previous = clips
+        .iter()
+        .enumerate()
+        .filter(|(candidate_index, candidate)| {
+            *candidate_index != clip_index
+                && playlist_audio_clip_joinable(candidate, clip, channel_kinds)
+                && !playlist_tempo_overlaps_range(
+                    clips,
+                    tempo_channel_ids,
+                    candidate.position_ticks,
+                    clip.position_ticks.saturating_add(clip.length_ticks),
+                )
+        })
+        .map(|(candidate_index, _)| candidate_index);
+    let previous_clip_index = previous.next();
+    let previous_clip_index = if previous.next().is_none() {
+        previous_clip_index
+    } else {
+        None
+    };
+
+    let mut next = clips
+        .iter()
+        .enumerate()
+        .filter(|(candidate_index, candidate)| {
+            *candidate_index != clip_index
+                && playlist_audio_clip_joinable(clip, candidate, channel_kinds)
+                && !playlist_tempo_overlaps_range(
+                    clips,
+                    tempo_channel_ids,
+                    clip.position_ticks,
+                    candidate
+                        .position_ticks
+                        .saturating_add(candidate.length_ticks),
+                )
+        })
+        .map(|(candidate_index, _)| candidate_index);
+    let next_clip_index = next.next();
+    let next_clip_index = if next.next().is_none() {
+        next_clip_index
+    } else {
+        None
+    };
+
+    (previous_clip_index, next_clip_index)
+}
+
+fn playlist_tempo_overlaps_range(
+    clips: &[PlaylistClip],
+    tempo_channel_ids: &BTreeSet<u16>,
+    start_ticks: u32,
+    end_ticks: u32,
+) -> bool {
+    clips.iter().any(|candidate| {
+        let PlaylistClipTarget::Channel { id } = candidate.target() else {
+            return false;
+        };
+        tempo_channel_ids.contains(&id)
+            && candidate.position_ticks < end_ticks
+            && candidate
+                .position_ticks
+                .saturating_add(candidate.length_ticks)
+                > start_ticks
+    })
+}
+
 fn playlist_clip_split_position(
     pointer: egui::Pos2,
     clip_rect: egui::Rect,
@@ -16644,13 +16839,13 @@ fn note_from_grid_position(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use super::{
-        ActivePlaylistClipDrag, ChannelDisplayFilter, PianoRollGrid, PianoRollSnap,
-        PlaylistClipDragKind, note_from_grid_position, playlist_clip_drag_edit,
-        playlist_clip_split_position, snap_note_tick, update_channel_rack_selection,
-        update_layer_child_selection,
+        ActivePlaylistClipDrag, ChannelDisplayFilter, FlpDocument, PianoRollGrid, PianoRollSnap,
+        PlaylistClip, PlaylistClipDragKind, note_from_grid_position,
+        playlist_audio_clip_join_candidates, playlist_clip_drag_edit, playlist_clip_split_position,
+        snap_note_tick, update_channel_rack_selection, update_layer_child_selection,
     };
 
     fn test_grid() -> PianoRollGrid {
@@ -16667,6 +16862,58 @@ mod tests {
             snap_ticks: 24,
             ppq: 96,
         }
+    }
+
+    fn playlist_audio_clip_fixture() -> (Vec<PlaylistClip>, BTreeMap<u16, Option<u8>>) {
+        let mut left = [0xA5; 80];
+        left[0..4].copy_from_slice(&0u32.to_le_bytes());
+        left[4..6].copy_from_slice(&0x5000u16.to_le_bytes());
+        left[6..8].copy_from_slice(&9u16.to_le_bytes());
+        left[8..12].copy_from_slice(&96u32.to_le_bytes());
+        left[12..14].copy_from_slice(&499u16.to_le_bytes());
+        left[20..24].copy_from_slice(&[0x40, 0x64, 0x80, 0x80]);
+        left[24..28].copy_from_slice(&0.0f32.to_le_bytes());
+        left[28..32].copy_from_slice(&480.0f32.to_le_bytes());
+        left[64..72].copy_from_slice(&1.0f64.to_le_bytes());
+        let mut right = left;
+        right[0..4].copy_from_slice(&96u32.to_le_bytes());
+        right[8..12].copy_from_slice(&144u32.to_le_bytes());
+        right[24..28].copy_from_slice(&480.0f32.to_le_bytes());
+        right[28..32].copy_from_slice(&1_200.0f32.to_le_bytes());
+
+        let mut event_stream = vec![0x40, 9, 0, 0x15, 4, 0x48, 9, 0, 0x62, 0, 0, 0x63, 3, 0];
+        event_stream.push(0xE9);
+        let mut payload_length = 160u32;
+        while payload_length >= 0x80 {
+            event_stream.push((payload_length as u8 & 0x7F) | 0x80);
+            payload_length >>= 7;
+        }
+        event_stream.push(payload_length as u8);
+        event_stream.extend_from_slice(&left);
+        event_stream.extend_from_slice(&right);
+
+        let mut project = Vec::new();
+        project.extend_from_slice(b"FLhd");
+        project.extend_from_slice(&6u32.to_le_bytes());
+        project.extend_from_slice(&0u16.to_le_bytes());
+        project.extend_from_slice(&0u16.to_le_bytes());
+        project.extend_from_slice(&96u16.to_le_bytes());
+        project.extend_from_slice(b"FLdt");
+        project.extend_from_slice(&(event_stream.len() as u32).to_le_bytes());
+        project.extend_from_slice(&event_stream);
+
+        let document = FlpDocument::parse(&project).expect("the Playlist fixture should parse");
+        let clips = document
+            .arrangements()
+            .expect("the arrangement should decode")
+            .remove(0)
+            .clips;
+        let channel_kinds = document
+            .channels()
+            .into_iter()
+            .map(|channel| (channel.id(), channel.kind()))
+            .collect();
+        (clips, channel_kinds)
     }
 
     #[test]
@@ -16781,6 +17028,28 @@ mod tests {
                 true,
             ),
             None
+        );
+    }
+
+    #[test]
+    fn playlist_join_menu_finds_only_unique_contiguous_audio_neighbors() {
+        let (clips, channel_kinds) = playlist_audio_clip_fixture();
+        assert_eq!(
+            playlist_audio_clip_join_candidates(&clips, 0, &channel_kinds, &BTreeSet::new()),
+            (None, Some(1))
+        );
+        assert_eq!(
+            playlist_audio_clip_join_candidates(&clips, 1, &channel_kinds, &BTreeSet::new()),
+            (Some(0), None)
+        );
+        assert_eq!(
+            playlist_audio_clip_join_candidates(
+                &clips,
+                clips.len(),
+                &channel_kinds,
+                &BTreeSet::new()
+            ),
+            (None, None)
         );
     }
 
