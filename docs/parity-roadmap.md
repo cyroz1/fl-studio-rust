@@ -308,8 +308,9 @@ automation, Mixer routing/effects, or PDC. Full export surface:
 - `[todo]` Stem export: split mixer tracks, "split channel tracks"
 - `[partial]` Selected Playlist clip render: File > Export can write one
   selected enabled audio-channel clip's supported sample source to float stereo
-  WAV from either the clip start or its original song position. Clip-length and
-  stretch fidelity, Pattern Clip rendering, multiple selection, automatic Audio
+  WAV from either the clip start or its original song position, clipped to the
+  Playlist endpoint. Looping or stretching clips beyond their source duration,
+  Pattern Clip rendering, multiple selection, automatic Audio
   Clip insertion, source muting, automation, and Mixer effects remain
   incomplete. FL Studio's consolidation also accepts Pattern Clips and supports
   song-start placement with source muting ([Image-Line Playlist

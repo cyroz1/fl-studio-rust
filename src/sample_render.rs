@@ -1166,9 +1166,16 @@ fn prepare_audio_clip_render(
         let source_bounds = sample_source_bounds(clip, audio, *clip_index)?;
         let start_tick = audio_clip_render_start_tick(clip.position_ticks, selection_start_tick)?;
         let start_frame = ticks_to_frames(start_tick, ppq, tempo_bpm, options.sample_rate)?;
-        let duration_frames = source_duration_to_frames(
+        let source_duration_frames = source_duration_to_frames(
             source_bounds.end - source_bounds.start,
             audio.sample_rate,
+            options.sample_rate,
+        )?;
+        let duration_frames = audio_clip_duration_frames(
+            source_duration_frames,
+            clip.length_ticks,
+            ppq,
+            tempo_bpm,
             options.sample_rate,
         )?;
         let end_frame = start_frame
@@ -2222,6 +2229,18 @@ fn source_duration_to_frames(
     Ok(duration.ceil() as u64)
 }
 
+fn audio_clip_duration_frames(
+    source_duration_frames: u64,
+    clip_length_ticks: u32,
+    ppq: u16,
+    tempo_bpm: f64,
+    sample_rate: u32,
+) -> Result<u64, String> {
+    let clip_duration_frames =
+        ticks_to_frames(u64::from(clip_length_ticks), ppq, tempo_bpm, sample_rate)?;
+    Ok(source_duration_frames.min(clip_duration_frames))
+}
+
 pub(crate) fn channel_gain_pan(volume: Option<u32>, pan: Option<i32>) -> (f32, f32) {
     let gain = volume.unwrap_or(10_000).min(12_800) as f32 / 10_000.0;
     let pan = pan
@@ -2589,6 +2608,18 @@ mod tests {
     #[test]
     fn converts_project_ticks_to_output_frames() {
         assert_eq!(ticks_to_frames(192, 96, 120.0, 48_000).unwrap(), 48_000);
+    }
+
+    #[test]
+    fn audio_clip_render_stops_at_the_playlist_clip_end() {
+        assert_eq!(
+            audio_clip_duration_frames(96_000, 192, 96, 120.0, 48_000).unwrap(),
+            48_000
+        );
+        assert_eq!(
+            audio_clip_duration_frames(48_000, 384, 96, 120.0, 48_000).unwrap(),
+            48_000
+        );
     }
 
     #[test]
