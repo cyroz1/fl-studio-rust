@@ -129,11 +129,19 @@ pub fn decode_audio_file(path: impl AsRef<Path>) -> Result<DecodedAudio, String>
     decode_audio_file_for_preview(path.as_ref(), None)
 }
 
-/// Read the first embedded WAVE sampler loop as a half-open source-frame range.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct WavSamplerMetadata {
+    /// Root key from `inst`, falling back to the `smpl` MIDI unity note.
+    pub(crate) root_key: Option<u16>,
+    /// First valid `smpl` loop as half-open source-frame bounds.
+    pub(crate) loop_points: Option<(usize, usize)>,
+}
+
+/// Read standard sampler metadata from a RIFF/WAVE file.
 ///
-/// WAVE stores the loop end inclusively; playback code uses an exclusive end. Invalid or absent
-/// metadata is ignored so a sample remains playable without loop points.
-pub(crate) fn wav_sampler_loop_points(path: &Path) -> Option<(usize, usize)> {
+/// The `inst` root key takes precedence over the `smpl` MIDI unity note. WAVE stores loop ends
+/// inclusively, while playback code uses an exclusive end. Invalid or absent metadata is ignored.
+pub(crate) fn wav_sampler_metadata(path: &Path) -> Option<WavSamplerMetadata> {
     let mut file = File::open(path).ok()?;
     let file_length = file.metadata().ok()?.len();
     if file_length < 12 {
@@ -151,6 +159,9 @@ pub(crate) fn wav_sampler_loop_points(path: &Path) -> Option<(usize, usize)> {
     }
 
     let mut cursor = 12u64;
+    let mut inst_root_key = None;
+    let mut smpl_root_key = None;
+    let mut loop_points = None;
     while cursor.checked_add(8)? <= riff_end {
         file.seek(SeekFrom::Start(cursor)).ok()?;
         let mut chunk_header = [0; 8];
@@ -162,27 +173,60 @@ pub(crate) fn wav_sampler_loop_points(path: &Path) -> Option<(usize, usize)> {
             return None;
         }
 
-        if &chunk_header[..4] == b"smpl" {
-            if chunk_size < 36 {
-                return None;
+        match &chunk_header[..4] {
+            b"inst" if chunk_size >= 7 && inst_root_key.is_none() => {
+                file.seek(SeekFrom::Start(body_start)).ok()?;
+                let mut instrument = [0; 7];
+                file.read_exact(&mut instrument).ok()?;
+                if instrument[0] <= 127 {
+                    inst_root_key = Some(u16::from(instrument[0]));
+                }
             }
-            file.seek(SeekFrom::Start(body_start.checked_add(28)?))
-                .ok()?;
-            let mut loop_count_bytes = [0; 4];
-            file.read_exact(&mut loop_count_bytes).ok()?;
-            let loop_count = u64::from(u32::from_le_bytes(loop_count_bytes));
-            if loop_count == 0 || 36u64.checked_add(loop_count.checked_mul(24)?)? > chunk_size {
-                return None;
-            }
+            b"smpl" if chunk_size >= 36 => {
+                file.seek(SeekFrom::Start(body_start)).ok()?;
+                let mut sampler_header = [0; 36];
+                file.read_exact(&mut sampler_header).ok()?;
+                let root_key = u32::from_le_bytes(
+                    sampler_header[12..16]
+                        .try_into()
+                        .expect("the MIDI unity note has four bytes"),
+                );
+                if smpl_root_key.is_none() && root_key <= 127 {
+                    smpl_root_key = Some(root_key as u16);
+                }
 
-            file.seek(SeekFrom::Start(body_start.checked_add(36)?))
-                .ok()?;
-            let mut first_loop = [0; 24];
-            file.read_exact(&mut first_loop).ok()?;
-            let start = u32::from_le_bytes(first_loop[8..12].try_into().ok()?);
-            let end_inclusive = u32::from_le_bytes(first_loop[12..16].try_into().ok()?);
-            let end = end_inclusive.checked_add(1)?;
-            return (start < end).then_some((start as usize, end as usize));
+                if loop_points.is_none() {
+                    let loop_count = u64::from(u32::from_le_bytes(
+                        sampler_header[28..32]
+                            .try_into()
+                            .expect("the WAVE loop count has four bytes"),
+                    ));
+                    if loop_count > 0
+                        && 36u64.checked_add(loop_count.checked_mul(24)?)? <= chunk_size
+                    {
+                        file.seek(SeekFrom::Start(body_start.checked_add(36)?))
+                            .ok()?;
+                        let mut first_loop = [0; 24];
+                        file.read_exact(&mut first_loop).ok()?;
+                        let start = u32::from_le_bytes(
+                            first_loop[8..12]
+                                .try_into()
+                                .expect("the WAVE loop start has four bytes"),
+                        );
+                        let end_inclusive = u32::from_le_bytes(
+                            first_loop[12..16]
+                                .try_into()
+                                .expect("the WAVE loop end has four bytes"),
+                        );
+                        if let Some(end) = end_inclusive.checked_add(1)
+                            && start < end
+                        {
+                            loop_points = Some((start as usize, end as usize));
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
 
         cursor = body_end.checked_add(chunk_size & 1)?;
@@ -190,7 +234,12 @@ pub(crate) fn wav_sampler_loop_points(path: &Path) -> Option<(usize, usize)> {
             return None;
         }
     }
-    None
+
+    let metadata = WavSamplerMetadata {
+        root_key: inst_root_key.or(smpl_root_key),
+        loop_points,
+    };
+    (metadata.root_key.is_some() || metadata.loop_points.is_some()).then_some(metadata)
 }
 
 /// Decode an audio file for the Browser and return interleaved stereo samples at the output rate.
@@ -1055,6 +1104,7 @@ mod tests {
 
     fn wav_with_sampler_loop_fixture() -> Vec<u8> {
         let mut sampler = vec![0u8; 60];
+        sampler[12..16].copy_from_slice(&60u32.to_le_bytes());
         sampler[28..32].copy_from_slice(&1u32.to_le_bytes());
         sampler[36 + 8..36 + 12].copy_from_slice(&2u32.to_le_bytes());
         sampler[36 + 12..36 + 16].copy_from_slice(&4u32.to_le_bytes());
@@ -1066,6 +1116,24 @@ mod tests {
         body.extend_from_slice(b"data");
         body.extend_from_slice(&10u32.to_le_bytes());
         body.extend_from_slice(&[0; 10]);
+
+        let mut bytes = b"RIFF".to_vec();
+        bytes.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&body);
+        bytes
+    }
+
+    fn wave_with_sampler_chunks(chunks: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut body = b"WAVE".to_vec();
+        for (id, payload) in chunks {
+            assert_eq!(id.len(), 4);
+            body.extend_from_slice(id.as_bytes());
+            body.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            body.extend_from_slice(payload);
+            if payload.len() % 2 != 0 {
+                body.push(0);
+            }
+        }
 
         let mut bytes = b"RIFF".to_vec();
         bytes.extend_from_slice(&(body.len() as u32).to_le_bytes());
@@ -1220,7 +1288,10 @@ mod tests {
         let path = root.join("loop.wav");
         std::fs::write(&path, wav_with_sampler_loop_fixture()).unwrap();
 
-        assert_eq!(wav_sampler_loop_points(&path), Some((2, 5)));
+        assert_eq!(
+            wav_sampler_metadata(&path).and_then(|metadata| metadata.loop_points),
+            Some((2, 5))
+        );
 
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -1231,12 +1302,70 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("plain.wav");
         std::fs::write(&path, pcm16_wav_fixture()).unwrap();
-        assert_eq!(wav_sampler_loop_points(&path), None);
+        assert_eq!(
+            wav_sampler_metadata(&path).and_then(|metadata| metadata.loop_points),
+            None
+        );
 
         let mut malformed = wav_with_sampler_loop_fixture();
         malformed[48..52].copy_from_slice(&2u32.to_le_bytes());
         std::fs::write(&path, malformed).unwrap();
-        assert_eq!(wav_sampler_loop_points(&path), None);
+        assert_eq!(
+            wav_sampler_metadata(&path).and_then(|metadata| metadata.loop_points),
+            None
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reads_wav_root_note_from_inst_before_smpl_in_either_chunk_order() {
+        let root = fixture_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("root-note.wav");
+        let instrument = [72, 0, 0, 0, 127, 0, 127];
+        let mut sampler = [0u8; 36];
+        sampler[12..16].copy_from_slice(&60u32.to_le_bytes());
+
+        for chunks in [
+            vec![
+                ("inst", instrument.as_slice()),
+                ("smpl", sampler.as_slice()),
+            ],
+            vec![
+                ("smpl", sampler.as_slice()),
+                ("inst", instrument.as_slice()),
+            ],
+        ] {
+            std::fs::write(&path, wave_with_sampler_chunks(&chunks)).unwrap();
+            let metadata = wav_sampler_metadata(&path).expect("WAVE root metadata should parse");
+            assert_eq!(metadata.root_key, Some(72));
+            assert_eq!(metadata.loop_points, None);
+        }
+
+        let invalid_instrument = [128, 0, 0, 0, 127, 0, 127];
+        std::fs::write(
+            &path,
+            wave_with_sampler_chunks(&[
+                ("inst", invalid_instrument.as_slice()),
+                ("smpl", sampler.as_slice()),
+            ]),
+        )
+        .unwrap();
+        let metadata = wav_sampler_metadata(&path).expect("valid smpl root should parse");
+        assert_eq!(metadata.root_key, Some(60));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ignores_truncated_wav_root_metadata() {
+        let root = fixture_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("truncated-root.wav");
+        std::fs::write(&path, wave_with_sampler_chunks(&[("inst", &[72, 0, 0])])).unwrap();
+
+        assert_eq!(wav_sampler_metadata(&path), None);
 
         std::fs::remove_dir_all(root).unwrap();
     }

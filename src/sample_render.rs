@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::audio::{AudioInputRecording, StreamingAudioWriter};
-use crate::media::{DecodedAudio, SamplePathResolver, decode_audio_file, wav_sampler_loop_points};
+use crate::media::{DecodedAudio, SamplePathResolver, decode_audio_file, wav_sampler_metadata};
 use crate::vst3::Vst3PlaylistStreamProcessor;
 use crate::{
     Arrangement, ChannelNoteRouter, FlpDocument, Pattern, PatternNote, PlaylistClip,
@@ -26,6 +26,12 @@ const SAMPLER_RELEASE_SECONDS: f64 = 0.005;
 const SAMPLER_ROOT_KEY: u16 = 60;
 const SAMPLER_BLOCK_FRAMES: usize = 1_024;
 static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn resolve_sampler_root_key(saved_root_key: Option<u16>, sample_root_key: Option<u16>) -> u16 {
+    saved_root_key
+        .or(sample_root_key)
+        .unwrap_or(SAMPLER_ROOT_KEY)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AudioClipRenderOptions {
@@ -1700,9 +1706,10 @@ fn prepare_sampler_arrangement(
                     continue;
                 }
             };
+            let wave_metadata = wav_sampler_metadata(&resolved_path).unwrap_or_default();
             let loop_points = channel
                 .sampler_uses_loop_points()
-                .then(|| wav_sampler_loop_points(&resolved_path))
+                .then_some(wave_metadata.loop_points)
                 .flatten();
             let audio = if let Some(audio) = decoded_by_path.get(&resolved_path) {
                 Arc::clone(audio)
@@ -1742,7 +1749,10 @@ fn prepare_sampler_arrangement(
                 gain,
                 pan,
                 reverse: channel.sample_reversed(),
-                root_key: channel.sampler_root_key().unwrap_or(SAMPLER_ROOT_KEY),
+                root_key: resolve_sampler_root_key(
+                    channel.sampler_root_key(),
+                    wave_metadata.root_key,
+                ),
                 loop_bounds,
                 ping_pong_loop: channel.sampler_ping_pong_loop_enabled(),
             });
@@ -1956,9 +1966,10 @@ fn prepare_sampler_pattern(
                     continue;
                 }
             };
+            let wave_metadata = wav_sampler_metadata(&resolved_path).unwrap_or_default();
             let loop_points = channel
                 .sampler_uses_loop_points()
-                .then(|| wav_sampler_loop_points(&resolved_path))
+                .then_some(wave_metadata.loop_points)
                 .flatten();
             let audio = if let Some(audio) = decoded_by_path.get(&resolved_path) {
                 Arc::clone(audio)
@@ -1998,7 +2009,10 @@ fn prepare_sampler_pattern(
                 gain,
                 pan,
                 reverse: channel.sample_reversed(),
-                root_key: channel.sampler_root_key().unwrap_or(SAMPLER_ROOT_KEY),
+                root_key: resolve_sampler_root_key(
+                    channel.sampler_root_key(),
+                    wave_metadata.root_key,
+                ),
                 loop_bounds,
                 ping_pong_loop: channel.sampler_ping_pong_loop_enabled(),
             });
@@ -3639,6 +3653,13 @@ mod tests {
         engine.render_block(0, 4, &mut output);
 
         assert_eq!(output, vec![0.0, 0.0, 2.0, 0.0, 4.0, 0.0, 6.0, 0.0]);
+    }
+
+    #[test]
+    fn sampler_root_key_prefers_saved_channel_value_then_wave_metadata_then_c5() {
+        assert_eq!(resolve_sampler_root_key(Some(48), Some(72)), 48);
+        assert_eq!(resolve_sampler_root_key(None, Some(72)), 72);
+        assert_eq!(resolve_sampler_root_key(None, None), SAMPLER_ROOT_KEY);
     }
 
     #[test]

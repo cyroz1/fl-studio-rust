@@ -1236,7 +1236,7 @@ fn render_pattern_samplers(
         );
     }
     println!(
-        "render uses the default C5 sample root; sampler envelopes, loop modes, Playlist arrangement, automation, Mixer routing, and effects are not applied"
+        "render uses saved channel roots or WAVE root metadata (default C5); sampler envelopes, Playlist arrangement, automation, Mixer routing, and effects are not applied"
     );
     Ok(())
 }
