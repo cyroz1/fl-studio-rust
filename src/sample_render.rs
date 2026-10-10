@@ -4648,7 +4648,7 @@ mod tests {
                 u32::from_le_bytes(bytes[40..44].try_into().unwrap()),
                 samples.len() as u32
             );
-            assert_eq!(&bytes[44..], expected_samples.as_slice());
+            assert_eq!(&bytes[44..], expected_samples);
         }
 
         assert_eq!(
