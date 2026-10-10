@@ -1539,7 +1539,7 @@ impl DawUi {
         visuals.window_shadow = egui::Shadow::NONE;
         visuals.popup_shadow = egui::Shadow::NONE;
         visuals.window_stroke = Stroke::new(1.0, BORDER);
-        visuals.disabled_alpha = 0.72;
+        visuals.disabled_alpha = 0.84;
         visuals.button_frame = true;
         visuals.striped = true;
 
@@ -1574,7 +1574,15 @@ impl DawUi {
         widgets.open.fg_stroke = Stroke::new(1.0, TEXT);
         widgets.open.corner_radius = egui::CornerRadius::same(4);
 
-        creation.egui_ctx.set_visuals(visuals);
+        // Set both variants explicitly. Some native backends can report a
+        // system theme after app creation; keeping both styles identical
+        // prevents light text fields from appearing inside the dark workspace.
+        creation
+            .egui_ctx
+            .set_visuals_of(egui::Theme::Dark, visuals.clone());
+        creation
+            .egui_ctx
+            .set_visuals_of(egui::Theme::Light, visuals);
         creation.egui_ctx.all_styles_mut(|style| {
             style.spacing.item_spacing = Vec2::new(7.0, 5.0);
             style.spacing.button_padding = Vec2::new(9.0, 5.0);
