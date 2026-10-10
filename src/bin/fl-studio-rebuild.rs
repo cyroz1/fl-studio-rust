@@ -6411,8 +6411,8 @@ impl DawUi {
         let mut move_saved_search = None;
         let mut clone_saved_search = None;
         let browser_tab_spacing = ui.spacing().clone();
-        ui.spacing_mut().button_padding = Vec2::new(5.0, 3.0);
-        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.spacing_mut().button_padding = Vec2::new(4.0, 3.0);
+        ui.spacing_mut().item_spacing.x = 3.0;
         ui.horizontal_wrapped(|ui| {
             for tab in BrowserTab::ALL {
                 let selected =
@@ -7382,6 +7382,7 @@ impl DawUi {
             .inner_margin(egui::Margin::symmetric(8, 0))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 5.0;
                     for view in MainView::ALL {
                         let selected = self.view == view;
                         let response = ui.selectable_label(selected, view.label());
@@ -7402,11 +7403,13 @@ impl DawUi {
                     if self.view == MainView::Playlist {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let zoom_percent = self.timeline_zoom / 0.10 * 100.0;
+                            let zoom_slider_width =
+                                (ui.available_width() - 100.0).clamp(64.0, 112.0);
                             ui.scope(|ui| {
                                 ui.visuals_mut().widgets.inactive.bg_fill = GRID;
                                 ui.visuals_mut().selection.bg_fill = BLUE;
                                 ui.add_sized(
-                                    Vec2::new(112.0, 22.0),
+                                    Vec2::new(zoom_slider_width, 22.0),
                                     egui::Slider::new(&mut self.timeline_zoom, 0.04..=0.24)
                                         .show_value(false)
                                         .trailing_fill(true)
@@ -7420,6 +7423,7 @@ impl DawUi {
                                     .color(MUTED),
                             );
                             ui.label(egui::RichText::new("Zoom").color(MUTED));
+                            ui.separator();
                         });
                     }
                 });
