@@ -3624,6 +3624,192 @@ impl FlpDocument {
         Ok(clip_index.saturating_add(1))
     }
 
+    /// Splits one un-stretched Audio Clip at a Playlist tick while preserving its source window.
+    /// The clip is split only when its source offsets can be mapped linearly to timeline time.
+    /// `full_source_length_ms` is needed only for clips whose two offsets are the `-1` sentinel.
+    /// The right-hand clip is inserted immediately after the source record.
+    pub fn split_playlist_audio_clip(
+        &mut self,
+        arrangement_id: u16,
+        clip_index: usize,
+        split_position_ticks: u32,
+        full_source_length_ms: Option<f32>,
+    ) -> Result<usize, FlpError> {
+        let arrangements = self.arrangements()?;
+        let mut matching_arrangements = arrangements
+            .iter()
+            .filter(|arrangement| arrangement.id == arrangement_id);
+        let Some(arrangement) = matching_arrangements.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested arrangement does not exist",
+            ));
+        };
+        if matching_arrangements.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested arrangement id is ambiguous",
+            ));
+        }
+        let Some(clip) = arrangement.clips.get(clip_index) else {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested playlist clip does not exist",
+            ));
+        };
+        let PlaylistClipTarget::Channel { id: channel_id } = clip.target() else {
+            return Err(FlpError::UnsupportedEdit(
+                "only Playlist Audio Clips can be split",
+            ));
+        };
+        let channel_summaries = self.channels();
+        let mut matching_channels = channel_summaries
+            .iter()
+            .filter(|channel| channel.id() == channel_id);
+        let Some(channel) = matching_channels.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the Playlist Audio Clip channel does not exist",
+            ));
+        };
+        if matching_channels.next().is_some() || channel.kind() != Some(4) {
+            return Err(FlpError::UnsupportedEdit(
+                "the Playlist clip does not target one unambiguous Audio Clip channel",
+            ));
+        }
+
+        let relative_split_ticks = split_position_ticks.checked_sub(clip.position_ticks);
+        let Some(relative_split_ticks) =
+            relative_split_ticks.filter(|ticks| *ticks > 0 && *ticks < clip.length_ticks)
+        else {
+            return Err(FlpError::UnsupportedEdit(
+                "the split point must fall inside the Playlist Audio Clip",
+            ));
+        };
+        let tempo_channel_ids = channel_summaries
+            .iter()
+            .filter(|channel| {
+                channel.kind() == Some(5)
+                    && channel
+                        .display_name()
+                        .is_some_and(|name| name.eq_ignore_ascii_case("TEMPO"))
+            })
+            .map(ChannelSummary::id)
+            .collect::<HashSet<_>>();
+        if arrangement.clips.iter().any(|candidate| {
+            let PlaylistClipTarget::Channel { id } = candidate.target() else {
+                return false;
+            };
+            tempo_channel_ids.contains(&id)
+                && candidate.position_ticks <= split_position_ticks
+                && candidate
+                    .position_ticks
+                    .saturating_add(candidate.length_ticks)
+                    > clip.position_ticks
+        }) {
+            return Err(FlpError::UnsupportedEdit(
+                "splitting an Audio Clip across Playlist tempo automation is unsupported",
+            ));
+        }
+        if clip
+            .scale
+            .is_some_and(|scale| !scale.is_finite() || scale <= 0.0 || (scale - 1.0).abs() > 1e-9)
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "Playlist Audio Clips with a non-default or invalid scale cannot be split",
+            ));
+        }
+
+        let (source_start_ms, source_end_ms) =
+            if clip.start_offset == -1.0 && clip.end_offset == -1.0 {
+                let Some(source_length_ms) = full_source_length_ms else {
+                    return Err(FlpError::UnsupportedEdit(
+                        "splitting a full-source Audio Clip requires its sample length",
+                    ));
+                };
+                if !source_length_ms.is_finite() || source_length_ms <= 0.0 {
+                    return Err(FlpError::UnsupportedEdit(
+                        "the full sample length must be a positive number of milliseconds",
+                    ));
+                }
+                (0.0, source_length_ms)
+            } else if clip.start_offset.is_finite()
+                && clip.end_offset.is_finite()
+                && clip.start_offset >= 0.0
+                && clip.end_offset > clip.start_offset
+            {
+                (clip.start_offset, clip.end_offset)
+            } else {
+                return Err(FlpError::UnsupportedEdit(
+                    "the Audio Clip has an unsupported source window",
+                ));
+            };
+
+        let ppq = f64::from(self.header.ppq);
+        let tempo_bpm = self.metadata.tempo_bpm().unwrap_or(140.0);
+        if ppq == 0.0 || !tempo_bpm.is_finite() || tempo_bpm <= 0.0 {
+            return Err(FlpError::UnsupportedEdit(
+                "splitting an Audio Clip requires a valid project tempo and PPQ",
+            ));
+        }
+        let elapsed_source_ms = f64::from(relative_split_ticks) * 60_000.0 / (ppq * tempo_bpm);
+        let split_source_ms = (f64::from(source_start_ms) + elapsed_source_ms) as f32;
+        if !split_source_ms.is_finite()
+            || split_source_ms <= source_start_ms
+            || split_source_ms >= source_end_ms
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "the split point must fall inside the Audio Clip's available source audio",
+            ));
+        }
+
+        let record_size = clip.record_size;
+        let record_start = clip
+            .source_record_index
+            .checked_mul(record_size)
+            .ok_or(FlpError::LengthOverflow)?;
+        let record_end = record_start
+            .checked_add(record_size)
+            .ok_or(FlpError::LengthOverflow)?;
+        let event_index = clip.source_event_index;
+        let event = self
+            .events
+            .get(event_index)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the Playlist Audio Clip event no longer exists",
+            ))?;
+        if event.opcode != 0xE9
+            || !matches!(event.encoding, PayloadEncoding::Data { .. })
+            || record_end > event.payload.len()
+            || !event.payload.len().is_multiple_of(record_size)
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "the Playlist Audio Clip record does not fit its event payload",
+            ));
+        }
+
+        let left_length = relative_split_ticks;
+        let right_position = split_position_ticks;
+        let right_length = clip.length_ticks - relative_split_ticks;
+        let mut left_record = event.payload[record_start..record_end].to_vec();
+        let mut right_record = left_record.clone();
+        left_record[8..12].copy_from_slice(&left_length.to_le_bytes());
+        left_record[24..28].copy_from_slice(&source_start_ms.to_le_bytes());
+        left_record[28..32].copy_from_slice(&split_source_ms.to_le_bytes());
+        right_record[0..4].copy_from_slice(&right_position.to_le_bytes());
+        right_record[8..12].copy_from_slice(&right_length.to_le_bytes());
+        right_record[24..28].copy_from_slice(&split_source_ms.to_le_bytes());
+        right_record[28..32].copy_from_slice(&source_end_ms.to_le_bytes());
+
+        let mut candidate = self.clone();
+        let mut payload = event.payload.clone();
+        payload.splice(record_start..record_end, left_record);
+        let right_record_start = record_start
+            .checked_add(record_size)
+            .ok_or(FlpError::LengthOverflow)?;
+        payload.splice(right_record_start..right_record_start, right_record);
+        candidate.events[event_index].replace_data_payload(payload)?;
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(clip_index.saturating_add(1))
+    }
+
     /// Edits selected fields of one existing note without changing the event's wire length.
     /// `note_index` is zero-based within the selected channel's notes in that pattern.
     pub fn edit_pattern_note(
@@ -8449,6 +8635,156 @@ mod tests {
             .encode_lossless()
             .expect("the empty Playlist should encode");
         FlpDocument::parse(&encoded).expect("the edited project should parse again");
+    }
+
+    #[test]
+    fn splits_unstretched_playlist_audio_clips_and_preserves_the_source_window() {
+        let mut clip = [0xA5; 80];
+        clip[0..4].copy_from_slice(&0u32.to_le_bytes());
+        clip[4..6].copy_from_slice(&0x5000u16.to_le_bytes());
+        clip[6..8].copy_from_slice(&9u16.to_le_bytes());
+        clip[8..12].copy_from_slice(&240u32.to_le_bytes());
+        clip[12..14].copy_from_slice(&499u16.to_le_bytes());
+        clip[20..24].copy_from_slice(&[0x40, 0x64, 0x80, 0x80]);
+        clip[24..28].copy_from_slice(&0.0f32.to_le_bytes());
+        clip[28..32].copy_from_slice(&1_000.0f32.to_le_bytes());
+        clip[64..72].copy_from_slice(&1.0f64.to_le_bytes());
+
+        let mut event_stream = vec![0x40, 9, 0, 0x15, 4, 0x48, 9, 0, 0x62, 0, 0, 0x63, 3, 0];
+        append_data_event(&mut event_stream, 0xE9, &clip);
+        let input = flp_fixture(&event_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&input).expect("the project fixture should parse");
+
+        let right_clip = document
+            .split_playlist_audio_clip(3, 0, 96, None)
+            .expect("a split inside the available source audio should succeed");
+        assert_eq!(right_clip, 1);
+
+        let clips = &document.arrangements().unwrap()[0].clips;
+        assert_eq!(clips.len(), 2);
+        assert_eq!(clips[0].position_ticks, 0);
+        assert_eq!(clips[0].length_ticks, 96);
+        assert_eq!(clips[1].position_ticks, 96);
+        assert_eq!(clips[1].length_ticks, 144);
+        assert_eq!(clips[0].start_offset, 0.0);
+        assert_eq!(clips[1].end_offset, 1_000.0);
+        assert!((clips[0].end_offset - 428.57144).abs() < 0.001);
+        assert_eq!(clips[1].start_offset, clips[0].end_offset);
+
+        let mut expected_left = clip;
+        expected_left[8..12].copy_from_slice(&96u32.to_le_bytes());
+        expected_left[28..32].copy_from_slice(&clips[0].end_offset.to_le_bytes());
+        let mut expected_right = clip;
+        expected_right[0..4].copy_from_slice(&96u32.to_le_bytes());
+        expected_right[8..12].copy_from_slice(&144u32.to_le_bytes());
+        expected_right[24..28].copy_from_slice(&clips[0].end_offset.to_le_bytes());
+        let clip_event = document
+            .events()
+            .iter()
+            .find(|event| event.opcode() == 0xE9)
+            .expect("the Playlist clip event should remain present");
+        let mut expected_payload = expected_left.to_vec();
+        expected_payload.extend_from_slice(&expected_right);
+        assert_eq!(clip_event.payload(), expected_payload);
+
+        let encoded = document
+            .encode_lossless()
+            .expect("the split project should encode");
+        FlpDocument::parse(&encoded).expect("the split project should parse again");
+    }
+
+    #[test]
+    fn playlist_audio_clip_split_rejects_unsupported_edits_atomically() {
+        let mut clip = [0xA5; 80];
+        clip[0..4].copy_from_slice(&0u32.to_le_bytes());
+        clip[4..6].copy_from_slice(&0x5000u16.to_le_bytes());
+        clip[6..8].copy_from_slice(&9u16.to_le_bytes());
+        clip[8..12].copy_from_slice(&240u32.to_le_bytes());
+        clip[12..14].copy_from_slice(&499u16.to_le_bytes());
+        clip[20..24].copy_from_slice(&[0x40, 0x64, 0x80, 0x80]);
+        clip[24..28].copy_from_slice(&(-1.0f32).to_le_bytes());
+        clip[28..32].copy_from_slice(&(-1.0f32).to_le_bytes());
+        clip[64..72].copy_from_slice(&1.0f64.to_le_bytes());
+        let mut event_stream = vec![0x40, 9, 0, 0x15, 4, 0x48, 9, 0, 0x62, 0, 0, 0x63, 3, 0];
+        append_data_event(&mut event_stream, 0xE9, &clip);
+        let input = flp_fixture(&event_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&input).expect("the project fixture should parse");
+
+        assert!(document.split_playlist_audio_clip(3, 0, 96, None).is_err());
+        assert_eq!(document.encode_lossless().unwrap(), input);
+        let mut full_source_document =
+            FlpDocument::parse(&input).expect("the full-source project fixture should parse");
+        full_source_document
+            .split_playlist_audio_clip(3, 0, 96, Some(1_000.0))
+            .expect("a split should succeed when the sample duration is supplied");
+        let full_source_clips = &full_source_document.arrangements().unwrap()[0].clips;
+        assert_eq!(full_source_clips[0].start_offset, 0.0);
+        assert!((full_source_clips[0].end_offset - 428.57144).abs() < 0.001);
+        assert_eq!(
+            full_source_clips[1].start_offset,
+            full_source_clips[0].end_offset
+        );
+        assert_eq!(full_source_clips[1].end_offset, 1_000.0);
+        assert!(
+            document
+                .split_playlist_audio_clip(3, 0, 96, Some(200.0))
+                .is_err()
+        );
+        assert_eq!(document.encode_lossless().unwrap(), input);
+        assert!(
+            document
+                .split_playlist_audio_clip(3, 0, 240, Some(1_000.0))
+                .is_err()
+        );
+        assert_eq!(document.encode_lossless().unwrap(), input);
+
+        clip[64..72].copy_from_slice(&0.5f64.to_le_bytes());
+        let mut event_stream = vec![0x40, 9, 0, 0x15, 4, 0x48, 9, 0, 0x62, 0, 0, 0x63, 3, 0];
+        append_data_event(&mut event_stream, 0xE9, &clip);
+        let scaled_input = flp_fixture(&event_stream, &[], &[]);
+        let mut scaled_document =
+            FlpDocument::parse(&scaled_input).expect("the scaled project fixture should parse");
+        assert!(
+            scaled_document
+                .split_playlist_audio_clip(3, 0, 96, Some(1_000.0))
+                .is_err()
+        );
+        assert_eq!(scaled_document.encode_lossless().unwrap(), scaled_input);
+    }
+
+    #[test]
+    fn playlist_audio_clip_split_rejects_tempo_automation_atomically() {
+        let mut audio_clip = [0xA5; 80];
+        audio_clip[4..6].copy_from_slice(&0x5000u16.to_le_bytes());
+        audio_clip[6..8].copy_from_slice(&9u16.to_le_bytes());
+        audio_clip[8..12].copy_from_slice(&240u32.to_le_bytes());
+        audio_clip[12..14].copy_from_slice(&499u16.to_le_bytes());
+        audio_clip[20..24].copy_from_slice(&[0x40, 0x64, 0x80, 0x80]);
+        audio_clip[24..28].copy_from_slice(&0.0f32.to_le_bytes());
+        audio_clip[28..32].copy_from_slice(&1_000.0f32.to_le_bytes());
+        audio_clip[64..72].copy_from_slice(&1.0f64.to_le_bytes());
+
+        let mut tempo_clip = [0xA5; 80];
+        tempo_clip[4..6].copy_from_slice(&0x5000u16.to_le_bytes());
+        tempo_clip[6..8].copy_from_slice(&10u16.to_le_bytes());
+        tempo_clip[8..12].copy_from_slice(&240u32.to_le_bytes());
+        tempo_clip[12..14].copy_from_slice(&498u16.to_le_bytes());
+        tempo_clip[20..24].copy_from_slice(&[0x40, 0x64, 0x80, 0x80]);
+        let mut clips_payload = audio_clip.to_vec();
+        clips_payload.extend_from_slice(&tempo_clip);
+
+        let mut event_stream = Vec::new();
+        append_data_event(&mut event_stream, 0xC7, b"26.0.0\0");
+        event_stream.extend_from_slice(&[0x40, 9, 0, 0x15, 4, 0x48, 9, 0]);
+        event_stream.extend_from_slice(&[0x40, 10, 0, 0x15, 5, 0x48, 10, 0]);
+        append_project_info_string(&mut event_stream, 0xCB, "TEMPO");
+        event_stream.extend_from_slice(&[0x62, 0, 0, 0x63, 3, 0]);
+        append_data_event(&mut event_stream, 0xE9, &clips_payload);
+        let input = flp_fixture(&event_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&input).expect("the project fixture should parse");
+
+        assert!(document.split_playlist_audio_clip(3, 0, 96, None).is_err());
+        assert_eq!(document.encode_lossless().unwrap(), input);
     }
 
     #[test]
