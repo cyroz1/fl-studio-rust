@@ -989,7 +989,8 @@ impl MixerMasterOutput {
             stereo_samples.fill(0.0);
             return;
         }
-        for frame in stereo_samples.chunks_exact_mut(2) {
+        let (frames, _) = stereo_samples.as_chunks_mut::<2>();
+        for frame in frames {
             if self.swap_left_right == Some(true) {
                 frame.swap(0, 1);
             }
