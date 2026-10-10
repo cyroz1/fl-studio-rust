@@ -16544,6 +16544,18 @@ impl DawUi {
             self.status = "Add a channel before recording MIDI notes".to_owned();
             return;
         };
+        let playback_arrangement_id = self.selected_arrangement.unwrap_or(0);
+        let recording_start_tick = self
+            .current_playhead_tick()
+            .and_then(|playhead_tick| {
+                let arrangements = document.arrangements().ok()?;
+                let arrangement = arrangements
+                    .iter()
+                    .find(|arrangement| arrangement.id == playback_arrangement_id)
+                    .or_else(|| arrangements.first())?;
+                playlist_pattern_recording_offset(playhead_tick, pattern_id, &arrangement.clips)
+            })
+            .unwrap_or(0);
         let snap_ticks = (self.midi_record_snap != PianoRollSnap::None).then(|| {
             self.midi_record_snap.ticks(
                 document.header().ppq(),
@@ -16556,6 +16568,7 @@ impl DawUi {
             self.current_path.clone(),
             document.header().ppq(),
             self.tempo_bpm,
+            recording_start_tick,
             snap_ticks,
             Instant::now(),
         ) {
@@ -16567,7 +16580,7 @@ impl DawUi {
                     .and_then(ChannelSummary::display_name)
                     .unwrap_or("Channel");
                 self.status = format!(
-                    "Recording MIDI to Pattern {pattern_id} · {channel_name}; press Record to finish"
+                    "Recording MIDI to Pattern {pattern_id} from tick {recording_start_tick} · {channel_name}; press Record to finish"
                 );
             }
             Err(error) => self.status = error.to_owned(),
@@ -19892,6 +19905,53 @@ fn note_from_grid_position(
     })
 }
 
+fn playlist_pattern_recording_offset(
+    playhead_tick: f64,
+    pattern_id: u16,
+    clips: &[PlaylistClip],
+) -> Option<u32> {
+    clips
+        .iter()
+        .filter_map(|clip| {
+            if clip.track_index.is_none()
+                || clip.length_ticks == 0
+                || clip
+                    .scale
+                    .is_some_and(|scale| !scale.is_finite() || (scale - 1.0).abs() > 1e-9)
+                || !matches!(clip.target(), PlaylistClipTarget::Pattern { id } if id == pattern_id)
+            {
+                return None;
+            }
+            let local_tick = playlist_clip_local_recording_offset(
+                playhead_tick,
+                clip.position_ticks,
+                clip.length_ticks,
+            )?;
+            Some((clip.position_ticks, local_tick))
+        })
+        .max_by_key(|(clip_start, _)| *clip_start)
+        .map(|(_, local_tick)| local_tick)
+}
+
+fn playlist_clip_local_recording_offset(
+    playhead_tick: f64,
+    clip_position_ticks: u32,
+    clip_length_ticks: u32,
+) -> Option<u32> {
+    if !playhead_tick.is_finite() || playhead_tick < 0.0 || clip_length_ticks == 0 {
+        return None;
+    }
+    let clip_start = f64::from(clip_position_ticks);
+    let clip_end = clip_start + f64::from(clip_length_ticks);
+    if playhead_tick < clip_start || playhead_tick >= clip_end {
+        return None;
+    }
+    let local_tick = (playhead_tick - clip_start)
+        .round()
+        .clamp(0.0, f64::from(clip_length_ticks.saturating_sub(1)));
+    Some(local_tick as u32)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
@@ -19902,7 +19962,8 @@ mod tests {
         PianoRollGrid, PianoRollSnap, PlaylistClip, PlaylistClipDragKind, PluginCandidate,
         PluginFormat, candidate_matches_vst_identity, next_piano_roll_note_group,
         note_from_grid_position, piano_roll_note_group_members,
-        playlist_audio_clip_join_candidates, playlist_clip_drag_edit, playlist_clip_split_position,
+        playlist_audio_clip_join_candidates, playlist_clip_drag_edit,
+        playlist_clip_local_recording_offset, playlist_clip_split_position,
         playlist_pattern_clip_join_candidates, snap_note_tick,
         toggle_piano_roll_note_group_selection, update_channel_rack_selection,
         update_layer_child_selection, update_piano_roll_box_selection,
@@ -19929,6 +19990,24 @@ mod tests {
             Some("/old/Example.vst3"),
             Some("Example"),
         ));
+    }
+
+    #[test]
+    fn playlist_recording_offset_is_local_to_an_active_pattern_clip() {
+        assert_eq!(
+            playlist_clip_local_recording_offset(148.4, 100, 200),
+            Some(48)
+        );
+        assert_eq!(
+            playlist_clip_local_recording_offset(299.6, 100, 200),
+            Some(199)
+        );
+        assert_eq!(playlist_clip_local_recording_offset(300.0, 100, 200), None);
+        assert_eq!(playlist_clip_local_recording_offset(99.0, 100, 200), None);
+        assert_eq!(
+            playlist_clip_local_recording_offset(f64::NAN, 100, 200),
+            None
+        );
     }
 
     #[test]

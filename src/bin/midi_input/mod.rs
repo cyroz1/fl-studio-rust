@@ -319,6 +319,7 @@ pub struct MidiPatternRecorder {
     project_path: Option<PathBuf>,
     ppq: u16,
     tempo_bpm: f64,
+    start_tick: u32,
     snap_ticks: Option<u32>,
     started_at: Instant,
     timestamp_origin_micros: Option<u64>,
@@ -336,6 +337,7 @@ impl MidiPatternRecorder {
         project_path: Option<PathBuf>,
         ppq: u16,
         tempo_bpm: f64,
+        start_tick: u32,
         snap_ticks: Option<u32>,
         started_at: Instant,
     ) -> Result<Self, &'static str> {
@@ -354,6 +356,7 @@ impl MidiPatternRecorder {
             project_path,
             ppq,
             tempo_bpm,
+            start_tick,
             snap_ticks,
             started_at,
             timestamp_origin_micros: None,
@@ -377,7 +380,10 @@ impl MidiPatternRecorder {
         if message.received_at < self.started_at {
             return;
         }
-        let tick = self.tick_for_message(message.timestamp_micros, message.received_at);
+        let tick = self
+            .tick_for_message(message.timestamp_micros, message.received_at)
+            .saturating_add(self.start_tick)
+            .min(MAX_NOTE_TICK);
         self.last_position_tick = self.last_position_tick.max(tick);
         match message.event {
             MidiInputEvent::NoteOn {
@@ -425,7 +431,9 @@ impl MidiPatternRecorder {
             .map(|timestamp| self.tick_for_message(timestamp, finished_at))
             .unwrap_or_else(|| {
                 self.tick_for_elapsed(finished_at.saturating_duration_since(self.started_at))
-            });
+            })
+            .saturating_add(self.start_tick)
+            .min(MAX_NOTE_TICK);
         let finish_tick = finish_tick.max(self.last_position_tick);
         for ((channel, key), active) in std::mem::take(&mut self.active_notes) {
             for (start_tick, velocity) in active {
@@ -574,6 +582,7 @@ mod tests {
             Some(PathBuf::from("song.flp")),
             96,
             120.0,
+            0,
             None,
             started_at,
         )
@@ -611,7 +620,7 @@ mod tests {
     #[test]
     fn closes_held_notes_when_recording_stops() {
         let started_at = Instant::now();
-        let mut recorder = MidiPatternRecorder::new(1, 2, None, 96, 120.0, None, started_at)
+        let mut recorder = MidiPatternRecorder::new(1, 2, None, 96, 120.0, 0, None, started_at)
             .expect("valid project timing should create a recorder");
         recorder.record(ReceivedMidiMessage {
             timestamp_micros: 110_000,
@@ -630,7 +639,7 @@ mod tests {
     #[test]
     fn quantizes_recorded_note_start_and_end_to_the_nearest_grid() {
         let started_at = Instant::now();
-        let mut recorder = MidiPatternRecorder::new(1, 2, None, 96, 120.0, Some(24), started_at)
+        let mut recorder = MidiPatternRecorder::new(1, 2, None, 96, 120.0, 0, Some(24), started_at)
             .expect("valid project timing and snap should create a recorder");
         recorder.record(ReceivedMidiMessage {
             timestamp_micros: 1_135_417,
@@ -660,8 +669,38 @@ mod tests {
     #[test]
     fn rejects_a_zero_length_recording_snap() {
         assert!(matches!(
-            MidiPatternRecorder::new(1, 2, None, 96, 120.0, Some(0), Instant::now()),
+            MidiPatternRecorder::new(1, 2, None, 96, 120.0, 0, Some(0), Instant::now()),
             Err("MIDI recording snap requires a non-zero tick value")
         ));
+    }
+
+    #[test]
+    fn offsets_recorded_notes_from_the_selected_pattern_playhead_position() {
+        let started_at = Instant::now();
+        let mut recorder = MidiPatternRecorder::new(1, 2, None, 96, 120.0, 192, None, started_at)
+            .expect("valid project timing and playhead should create a recorder");
+        recorder.record(ReceivedMidiMessage {
+            timestamp_micros: 1_200_000,
+            received_at: started_at + Duration::from_millis(200),
+            event: MidiInputEvent::NoteOn {
+                channel: 0,
+                key: 60,
+                velocity: 90,
+            },
+        });
+        recorder.record(ReceivedMidiMessage {
+            timestamp_micros: 1_500_000,
+            received_at: started_at + Duration::from_millis(500),
+            event: MidiInputEvent::NoteOff {
+                channel: 0,
+                key: 60,
+                velocity: 0,
+            },
+        });
+
+        let result = recorder.finish(None, started_at + Duration::from_millis(500));
+        assert_eq!(result.notes.len(), 1);
+        assert_eq!(result.notes[0].position, 230);
+        assert_eq!(result.notes[0].length, 58);
     }
 }
