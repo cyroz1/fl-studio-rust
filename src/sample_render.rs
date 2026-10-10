@@ -13,8 +13,8 @@ use crate::audio::{AudioInputRecording, StreamingAudioWriter};
 use crate::media::{DecodedAudio, SamplePathResolver, decode_audio_file, wav_sampler_loop_points};
 use crate::vst3::Vst3PlaylistStreamProcessor;
 use crate::{
-    Arrangement, ChannelNoteRouter, ChannelSummary, FlpDocument, Pattern, PatternNote,
-    PlaylistClip, PlaylistClipTarget,
+    Arrangement, ChannelNoteRouter, FlpDocument, Pattern, PatternNote, PlaylistClip,
+    PlaylistClipTarget,
 };
 
 const DEFAULT_SAMPLE_RATE: u32 = 44_100;
@@ -3507,13 +3507,12 @@ mod tests {
         let mut output = vec![0.0; 18];
         engine.render_block(0, 9, &mut output);
 
-        let rendered_left = output
-            .chunks_exact(2)
-            .map(|frame| frame[0])
-            .collect::<Vec<_>>();
         assert_eq!(
-            rendered_left,
-            vec![0.0, 1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0]
+            output,
+            vec![
+                0.0, 0.0, 1.0, 0.0, 2.0, 0.0, 3.0, 0.0, 1.0, 0.0, 2.0, 0.0, 3.0, 0.0, 1.0, 0.0,
+                2.0, 0.0,
+            ]
         );
     }
 
@@ -3544,13 +3543,12 @@ mod tests {
         let mut output = vec![0.0; 18];
         engine.render_block(0, 9, &mut output);
 
-        let rendered_left = output
-            .chunks_exact(2)
-            .map(|frame| frame[0])
-            .collect::<Vec<_>>();
         assert_eq!(
-            rendered_left,
-            vec![0.0, 1.0, 2.0, 3.0, 2.0, 1.0, 2.0, 3.0, 2.0]
+            output,
+            vec![
+                0.0, 0.0, 1.0, 0.0, 2.0, 0.0, 3.0, 0.0, 2.0, 0.0, 1.0, 0.0, 2.0, 0.0, 3.0, 0.0,
+                2.0, 0.0,
+            ]
         );
     }
 
