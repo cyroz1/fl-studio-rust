@@ -862,6 +862,16 @@ pub enum LimitSnapDirection {
     Alternate,
 }
 
+/// Pitch range and scale settings for the Piano roll Limit operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LimitNoteOptions<'a> {
+    pub minimum_key: u16,
+    pub maximum_key: u16,
+    pub scale_root: u8,
+    pub scale_intervals: &'a [u8],
+    pub snap_direction: LimitSnapDirection,
+}
+
 /// Parameters for replacing simultaneous notes with a gated arpeggio sequence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArpeggioOptions {
@@ -6671,19 +6681,19 @@ impl FlpDocument {
         &mut self,
         pattern_id: u16,
         channel_id: u16,
-        minimum_key: u16,
-        maximum_key: u16,
-        scale_root: u8,
-        scale_intervals: &[u8],
-        snap_direction: LimitSnapDirection,
+        options: LimitNoteOptions<'_>,
     ) -> Result<usize, FlpError> {
         self.limit_pattern_note_range_in_scope(
             pattern_id,
             channel_id,
             None,
-            minimum_key,
-            maximum_key,
-            Some((scale_root, scale_intervals, snap_direction)),
+            options.minimum_key,
+            options.maximum_key,
+            Some((
+                options.scale_root,
+                options.scale_intervals,
+                options.snap_direction,
+            )),
         )
     }
 
@@ -6712,19 +6722,19 @@ impl FlpDocument {
         pattern_id: u16,
         channel_id: u16,
         note_indices: &[usize],
-        minimum_key: u16,
-        maximum_key: u16,
-        scale_root: u8,
-        scale_intervals: &[u8],
-        snap_direction: LimitSnapDirection,
+        options: LimitNoteOptions<'_>,
     ) -> Result<usize, FlpError> {
         self.limit_pattern_note_range_in_scope(
             pattern_id,
             channel_id,
             Some(note_indices),
-            minimum_key,
-            maximum_key,
-            Some((scale_root, scale_intervals, snap_direction)),
+            options.minimum_key,
+            options.maximum_key,
+            Some((
+                options.scale_root,
+                options.scale_intervals,
+                options.snap_direction,
+            )),
         )
     }
 
@@ -9657,10 +9667,10 @@ mod tests {
     use super::{
         ArticulateOptions, ChannelGroupSummary, ChannelNoteRouter, ChannelSortOrder,
         ChannelSummary, FlpDocument, FlpError, FlpEvent, FstPreset, FstPresetKind,
-        LimitSnapDirection, MixerParameterKind, PATTERN_NOTE_SLIDE_FLAG, PatternNote,
-        PatternNoteEdit, PayloadEncoding, PlaylistClipEdit, PlaylistClipTarget, ProjectInfoEdit,
-        ProjectSettingsEdit, ScaleLevelsOptions, TimeMarkerEdit, midi::MidiChannelMapping,
-        midi::MidiFile, parse_vst_plugin_state_metadata,
+        LimitNoteOptions, LimitSnapDirection, MixerParameterKind, PATTERN_NOTE_SLIDE_FLAG,
+        PatternNote, PatternNoteEdit, PayloadEncoding, PlaylistClipEdit, PlaylistClipTarget,
+        ProjectInfoEdit, ProjectSettingsEdit, ScaleLevelsOptions, TimeMarkerEdit,
+        midi::MidiChannelMapping, midi::MidiFile, parse_vst_plugin_state_metadata,
     };
 
     fn articulate_options(
@@ -13021,11 +13031,13 @@ mod tests {
             .limit_pattern_note_range_with_scale(
                 7,
                 0,
-                60,
-                66,
-                0,
-                MAJOR_INTERVALS,
-                LimitSnapDirection::Up,
+                LimitNoteOptions {
+                    minimum_key: 60,
+                    maximum_key: 66,
+                    scale_root: 0,
+                    scale_intervals: MAJOR_INTERVALS,
+                    snap_direction: LimitSnapDirection::Up,
+                },
             )
             .expect("notes should snap upward into C major");
         let notes = snap_up.patterns().unwrap().remove(0).notes;
@@ -13039,11 +13051,13 @@ mod tests {
             .limit_pattern_note_range_with_scale(
                 7,
                 0,
-                60,
-                66,
-                0,
-                MAJOR_INTERVALS,
-                LimitSnapDirection::Down,
+                LimitNoteOptions {
+                    minimum_key: 60,
+                    maximum_key: 66,
+                    scale_root: 0,
+                    scale_intervals: MAJOR_INTERVALS,
+                    snap_direction: LimitSnapDirection::Down,
+                },
             )
             .expect("notes should snap downward into C major");
         let notes = snap_down.patterns().unwrap().remove(0).notes;
@@ -13056,11 +13070,13 @@ mod tests {
                 7,
                 0,
                 &[0, 1],
-                60,
-                66,
-                0,
-                MAJOR_INTERVALS,
-                LimitSnapDirection::Alternate,
+                LimitNoteOptions {
+                    minimum_key: 60,
+                    maximum_key: 66,
+                    scale_root: 0,
+                    scale_intervals: MAJOR_INTERVALS,
+                    snap_direction: LimitSnapDirection::Alternate,
+                },
             )
             .expect("selected notes should alternate their snap direction");
         let notes = alternating.patterns().unwrap().remove(0).notes;
@@ -13075,11 +13091,13 @@ mod tests {
                 .limit_pattern_note_range_with_scale(
                     7,
                     0,
-                    61,
-                    61,
-                    0,
-                    MAJOR_INTERVALS,
-                    LimitSnapDirection::Up,
+                    LimitNoteOptions {
+                        minimum_key: 61,
+                        maximum_key: 61,
+                        scale_root: 0,
+                        scale_intervals: MAJOR_INTERVALS,
+                        snap_direction: LimitSnapDirection::Up,
+                    },
                 )
                 .is_err()
         );

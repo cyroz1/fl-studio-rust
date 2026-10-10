@@ -29,10 +29,10 @@ use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions, Vst3PatternSt
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, ArticulateOptions, AutomationChannel, AutomationPoint,
     AutomationPointEdit, ChannelGroupSummary, ChannelSortOrder, ChannelSummary, FlpDocument,
-    FstPreset, FstPresetKind, LimitSnapDirection, Pattern, PatternNote, PatternNoteEdit,
-    PlaylistClip, PlaylistClipClipboard, PlaylistClipEdit, PlaylistClipTarget, PlaylistTrack,
-    ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions, ScaleLevelsOptions, TimeMarker,
-    TimeMarkerEdit, VstPluginStateMetadata,
+    FstPreset, FstPresetKind, LimitNoteOptions, LimitSnapDirection, Pattern, PatternNote,
+    PatternNoteEdit, PlaylistClip, PlaylistClipClipboard, PlaylistClipEdit, PlaylistClipTarget,
+    PlaylistTrack, ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions, ScaleLevelsOptions,
+    TimeMarker, TimeMarkerEdit, VstPluginStateMetadata,
 };
 
 const APP_BACKGROUND: Color32 = Color32::from_rgb(29, 29, 29);
@@ -12809,26 +12809,23 @@ impl DawUi {
                 .ok_or_else(|| "no project is open".to_owned())
                 .and_then(|document| {
                     let result = if let Some(scale_intervals) = scale_intervals {
+                        let options = LimitNoteOptions {
+                            minimum_key,
+                            maximum_key,
+                            scale_root,
+                            scale_intervals,
+                            snap_direction,
+                        };
                         if edit_selection_only {
                             document.limit_pattern_note_selection_range_with_scale(
                                 pattern_id,
                                 channel_id,
                                 &selected_quantize_indices,
-                                minimum_key,
-                                maximum_key,
-                                scale_root,
-                                scale_intervals,
-                                snap_direction,
+                                options,
                             )
                         } else {
                             document.limit_pattern_note_range_with_scale(
-                                pattern_id,
-                                channel_id,
-                                minimum_key,
-                                maximum_key,
-                                scale_root,
-                                scale_intervals,
-                                snap_direction,
+                                pattern_id, channel_id, options,
                             )
                         }
                     } else if edit_selection_only {
