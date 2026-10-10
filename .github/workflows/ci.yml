@@ -32,7 +32,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --yes libasound2-dev libxcb1-dev
+          sudo apt-get install --yes ffmpeg libasound2-dev libxcb1-dev mesa-vulkan-drivers xvfb
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -110,6 +110,42 @@ jobs:
       - name: Build desktop installers (Linux and Windows)
         if: runner.os != 'macOS'
         run: cargo packager --release
+
+      - name: Capture desktop UI on a virtual display
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          mkdir -p dist/gui-preview
+          cat > "$RUNNER_TEMP/capture-ui.sh" <<'BASH'
+          set -euo pipefail
+          target/release/fl-studio-rebuild > "$RUNNER_TEMP/gui-preview.log" 2>&1 &
+          app_pid=$!
+          cleanup() {
+            kill "$app_pid" 2>/dev/null || true
+            wait "$app_pid" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          for attempt in $(seq 1 20); do
+            if ! kill -0 "$app_pid" 2>/dev/null; then
+              cat "$RUNNER_TEMP/gui-preview.log"
+              exit 1
+            fi
+            sleep 1
+          done
+          ffmpeg -y -loglevel error -f x11grab -video_size 1600x900 -framerate 1 \
+            -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/startup.png"
+          BASH
+          xvfb-run --auto-servernum --server-args="-screen 0 1600x900x24 +extension GLX" \
+            bash "$RUNNER_TEMP/capture-ui.sh"
+
+      - name: Upload Linux GUI preview
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-gui-preview
+          path: dist/gui-preview/startup.png
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Build signed and notarized macOS installer
         if: runner.os == 'macOS' && steps.macos-signing.outputs.configured == 'true'
