@@ -1133,9 +1133,9 @@ impl Vst3HostRuntime {
                     .get(&channel_id)
                     .map_or(128, |channel| channel.swing_mix())
             },
-            |channel_id, seed| {
+            |channel_id, seed, key| {
                 channel_router
-                    .targets(channel_id, seed)
+                    .targets_for_note(channel_id, seed, key)
                     .into_iter()
                     .filter(|target_channel_id| plugin_channels.contains(target_channel_id))
                     .collect()

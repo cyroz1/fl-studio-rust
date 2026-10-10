@@ -404,6 +404,7 @@ pub struct ChannelSummary {
     sampler_fx_flags: Option<u16>,
     sampler_flags: Option<u32>,
     sampler_root_note: Option<u32>,
+    keyboard_key_region: Option<(u32, u32)>,
     ping_pong_loop: bool,
     swing_mix: Option<u16>,
     group_number: Option<i32>,
@@ -630,6 +631,13 @@ impl ChannelSummary {
             .map(|note| note as u16)
     }
 
+    /// Inclusive playable MIDI key range from the channel Parameters event.
+    /// Missing or invalid ranges are treated as unrestricted.
+    pub fn keyboard_key_region(&self) -> Option<(u16, u16)> {
+        let (low, high) = self.keyboard_key_region?;
+        (low <= high && high <= 127).then_some((low as u16, high as u16))
+    }
+
     /// Raw four-byte channel color value, in little-endian RGBA byte order.
     pub fn color(&self) -> Option<[u8; 4]> {
         self.color.map(u32::to_le_bytes)
@@ -734,10 +742,33 @@ impl ChannelNoteRouter {
     /// Returns targets in Layer child order. `note_seed` distinguishes notes and
     /// Playlist repetitions when Random is enabled.
     pub(crate) fn targets(&self, source_channel_id: u16, note_seed: u64) -> Vec<u16> {
+        self.targets_for_optional_key(source_channel_id, note_seed, None)
+    }
+
+    /// Returns targets for a note after applying the source and child key regions.
+    /// Layer Random chooses from the children that accept this note.
+    pub(crate) fn targets_for_note(
+        &self,
+        source_channel_id: u16,
+        note_seed: u64,
+        key: u16,
+    ) -> Vec<u16> {
+        self.targets_for_optional_key(source_channel_id, note_seed, Some(key))
+    }
+
+    fn targets_for_optional_key(
+        &self,
+        source_channel_id: u16,
+        note_seed: u64,
+        key: Option<u16>,
+    ) -> Vec<u16> {
         let Some(source) = self.channels_by_id.get(&source_channel_id) else {
             return Vec::new();
         };
         if source.enabled == Some(false) {
+            return Vec::new();
+        }
+        if key.is_some_and(|key| !channel_accepts_key(source, key)) {
             return Vec::new();
         }
         if source.channel_type() != Some(ChannelType::Layer) {
@@ -752,7 +783,9 @@ impl ChannelNoteRouter {
             .filter(|child_id| seen.insert(*child_id))
             .filter(|child_id| {
                 self.channels_by_id.get(child_id).is_some_and(|child| {
-                    child.enabled != Some(false) && child.channel_type() != Some(ChannelType::Layer)
+                    child.enabled != Some(false)
+                        && child.channel_type() != Some(ChannelType::Layer)
+                        && key.is_none_or(|key| channel_accepts_key(child, key))
                 })
             })
             .collect::<Vec<_>>();
@@ -770,6 +803,12 @@ impl ChannelNoteRouter {
         random ^= random >> 31;
         vec![children[(random as usize) % children.len()]]
     }
+}
+
+fn channel_accepts_key(channel: &ChannelSummary, key: u16) -> bool {
+    channel
+        .keyboard_key_region()
+        .is_none_or(|(low, high)| (low..=high).contains(&key))
 }
 
 /// One point from the `0xEA` payload of a kind-5 automation channel.
@@ -2036,6 +2075,22 @@ impl FlpDocument {
                             .try_into()
                             .expect("a dword event has four payload bytes"),
                     ));
+                }
+                0xC7 if matches!(event.encoding, PayloadEncoding::Data { .. })
+                    && event.payload.len() >= 76
+                    && channel.keyboard_key_region.is_none() =>
+                {
+                    let low = u32::from_le_bytes(
+                        event.payload[68..72]
+                            .try_into()
+                            .expect("the key-region low bound has four payload bytes"),
+                    );
+                    let high = u32::from_le_bytes(
+                        event.payload[72..76]
+                            .try_into()
+                            .expect("the key-region high bound has four payload bytes"),
+                    );
+                    channel.keyboard_key_region = Some((low, high));
                 }
                 0x16 if event.encoding == PayloadEncoding::Byte && event.payload.len() == 1 => {
                     channel.mixer_track = Some(event.payload[0] as i8);
@@ -11482,6 +11537,13 @@ mod tests {
         event_stream.extend_from_slice(payload);
     }
 
+    fn channel_key_region_parameters(low: u32, high: u32) -> Vec<u8> {
+        let mut parameters = vec![0; 76];
+        parameters[68..72].copy_from_slice(&low.to_le_bytes());
+        parameters[72..76].copy_from_slice(&high.to_le_bytes());
+        parameters
+    }
+
     #[test]
     fn playlist_track_mute_and_group_edits_preserve_other_state_bytes() {
         let mut event_stream = Vec::new();
@@ -13923,6 +13985,31 @@ mod tests {
             assert_eq!(document.channels()[0].sampler_root_key(), expected_root_key);
             assert_eq!(document.encode_lossless().unwrap(), input);
         }
+    }
+
+    #[test]
+    fn decodes_channel_key_region_from_parameters_and_preserves_event_bytes() {
+        for (low, high, expected) in [(36, 84, Some((36, 84))), (72, 60, None), (0, 128, None)] {
+            let mut event_stream = vec![0x40, 7, 0, 0x15, 4];
+            append_data_event(
+                &mut event_stream,
+                0xC7,
+                &channel_key_region_parameters(low, high),
+            );
+            event_stream.extend_from_slice(&[0x62, 0, 0]);
+            let input = flp_fixture(&event_stream, &[], &[]);
+            let document = FlpDocument::parse(&input).expect("fixture should parse");
+
+            assert_eq!(document.channels()[0].keyboard_key_region(), expected);
+            assert_eq!(document.encode_lossless().unwrap(), input);
+        }
+
+        let mut short_event_stream = vec![0x40, 7, 0, 0x15, 0];
+        append_data_event(&mut short_event_stream, 0xC7, &[0; 75]);
+        short_event_stream.extend_from_slice(&[0x62, 0, 0]);
+        let short_document = FlpDocument::parse(&flp_fixture(&short_event_stream, &[], &[]))
+            .expect("short parameters fixture should parse");
+        assert_eq!(short_document.channels()[0].keyboard_key_region(), None);
     }
 
     #[test]
@@ -17086,6 +17173,50 @@ mod tests {
             .expect("Layer fixture should parse");
         let router = ChannelNoteRouter::new(document.channels());
         assert_eq!(router.targets(0, 0), vec![3]);
+    }
+
+    #[test]
+    fn note_router_applies_source_and_child_key_regions_before_random_selection() {
+        let mut event_stream = vec![0x40, 0, 0, 0x15, 3, 0x90];
+        event_stream.extend_from_slice(&1u32.to_le_bytes());
+        event_stream.push(0x5E);
+        event_stream.extend_from_slice(&1u16.to_le_bytes());
+        event_stream.push(0x5E);
+        event_stream.extend_from_slice(&2u16.to_le_bytes());
+        append_data_event(
+            &mut event_stream,
+            0xC7,
+            &channel_key_region_parameters(48, 84),
+        );
+
+        for (channel_id, low, high) in [(1_u16, 48, 72), (2_u16, 60, 84)] {
+            event_stream.extend_from_slice(&[0x40, channel_id as u8, 0, 0x15, 0]);
+            append_data_event(
+                &mut event_stream,
+                0xC7,
+                &channel_key_region_parameters(low, high),
+            );
+        }
+        event_stream.extend_from_slice(&[0x40, 3, 0, 0x15, 0]);
+        append_data_event(
+            &mut event_stream,
+            0xC7,
+            &channel_key_region_parameters(60, 60),
+        );
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+
+        let document = FlpDocument::parse(&flp_fixture(&event_stream, &[], &[]))
+            .expect("Layer key-region fixture should parse");
+        let router = ChannelNoteRouter::new(document.channels());
+
+        assert_eq!(router.targets_for_note(0, 1, 47), Vec::<u16>::new());
+        assert_eq!(router.targets_for_note(0, 1, 48), vec![1]);
+        assert_eq!(router.targets_for_note(0, 2, 59), vec![1]);
+        assert_eq!(router.targets_for_note(0, 3, 73), vec![2]);
+        assert_eq!(router.targets_for_note(0, 4, 84), vec![2]);
+        assert_eq!(router.targets_for_note(0, 5, 85), Vec::<u16>::new());
+        assert_eq!(router.targets_for_note(3, 6, 59), Vec::<u16>::new());
+        assert_eq!(router.targets_for_note(3, 6, 60), vec![3]);
     }
 
     #[test]

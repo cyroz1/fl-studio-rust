@@ -1436,7 +1436,7 @@ pub(crate) fn schedule_playlist_pattern_notes<'a>(
     ppq: u16,
     global_swing_mix_raw: u8,
     mut channel_swing_mix_raw: impl FnMut(u16) -> u16,
-    mut resolve_targets: impl FnMut(u16, u64) -> Vec<u16>,
+    mut resolve_targets: impl FnMut(u16, u64, u16) -> Vec<u16>,
 ) -> Result<PlaylistPatternSchedule<'a>, String> {
     let patterns_by_id: HashMap<_, _> = patterns
         .iter()
@@ -1538,7 +1538,7 @@ pub(crate) fn schedule_playlist_pattern_notes<'a>(
                     ^ repetition.rotate_left(17)
                     ^ (note_index as u64).rotate_left(3)
                     ^ nominal_start_tick.rotate_left(47);
-                for target_channel_id in resolve_targets(note.channel_id, note_seed) {
+                for target_channel_id in resolve_targets(note.channel_id, note_seed, note.key) {
                     if schedule.notes.len() >= MAX_SCHEDULED_PLAYLIST_NOTES {
                         return Err(format!(
                             "Playlist expands to more than {MAX_SCHEDULED_PLAYLIST_NOTES} pattern note events"
@@ -1627,9 +1627,9 @@ fn prepare_sampler_arrangement(
                 .get(&channel_id)
                 .map_or(128, |channel| channel.swing_mix())
         },
-        |channel_id, seed| {
+        |channel_id, seed, key| {
             channel_router
-                .targets(channel_id, seed)
+                .targets_for_note(channel_id, seed, key)
                 .into_iter()
                 .filter(|target_channel_id| {
                     channels_by_id
@@ -1900,7 +1900,7 @@ fn prepare_sampler_pattern(
         .enumerate()
         .flat_map(|(note_index, note)| {
             channel_router
-                .targets(note.channel_id, note_index as u64)
+                .targets_for_note(note.channel_id, note_index as u64, note.key)
                 .into_iter()
                 .filter(|target_channel_id| {
                     channels_by_id
@@ -2986,7 +2986,7 @@ mod tests {
             96,
             0,
             |_| 128,
-            |channel_id, _| vec![channel_id],
+            |channel_id, _, _| vec![channel_id],
         )
         .unwrap();
         assert_eq!(
@@ -3028,7 +3028,7 @@ mod tests {
             96,
             0,
             |_| 128,
-            |channel_id, _| vec![channel_id],
+            |channel_id, _, _| vec![channel_id],
         )
         .unwrap();
 
@@ -3087,7 +3087,7 @@ mod tests {
             96,
             0,
             |_| 128,
-            |channel_id, _| vec![channel_id],
+            |channel_id, _, _| vec![channel_id],
         )
         .unwrap();
 
@@ -3104,6 +3104,7 @@ mod tests {
                 position: 24,
                 length: 48,
                 channel_id: 7,
+                key: 72,
                 ..PatternNote::default()
             }],
             ..Pattern::default()
@@ -3121,7 +3122,8 @@ mod tests {
             96,
             0,
             |_| 128,
-            |channel_id, _| {
+            |channel_id, _, key| {
+                assert_eq!(key, 72);
                 if channel_id == 7 {
                     vec![2, 5]
                 } else {
@@ -3165,7 +3167,7 @@ mod tests {
             96,
             0,
             |_| 128,
-            |channel_id, _| vec![channel_id],
+            |channel_id, _, _| vec![channel_id],
         )
         .unwrap();
         assert_eq!(schedule.notes.len(), 1);
@@ -3199,7 +3201,7 @@ mod tests {
             96,
             128,
             |channel_id| if channel_id == 7 { 128 } else { 0 },
-            |channel_id, _| vec![channel_id],
+            |channel_id, _, _| vec![channel_id],
         )
         .unwrap();
         assert_eq!(schedule.notes.len(), 1);
