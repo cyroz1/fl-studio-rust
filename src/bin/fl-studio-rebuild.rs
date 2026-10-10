@@ -6411,7 +6411,7 @@ impl DawUi {
         let mut move_saved_search = None;
         let mut clone_saved_search = None;
         let browser_tab_spacing = ui.spacing().clone();
-        ui.spacing_mut().button_padding = Vec2::new(4.0, 3.0);
+        ui.spacing_mut().button_padding = Vec2::new(2.0, 3.0);
         ui.spacing_mut().item_spacing.x = 3.0;
         ui.horizontal_wrapped(|ui| {
             for tab in BrowserTab::ALL {
