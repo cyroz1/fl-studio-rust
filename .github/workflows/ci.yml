@@ -146,7 +146,7 @@ jobs:
           kill "$app_pid" 2>/dev/null || true
           wait "$app_pid" 2>/dev/null || true
           app_pid=""
-          python3 - "$RUNNER_TEMP/mixer-preview.flp" <<'PY'
+          python3 - "$RUNNER_TEMP/mixer-preview.flp" "$RUNNER_TEMP/controller-preview.flp" <<'PY'
           import struct
           import sys
           from pathlib import Path
@@ -187,6 +187,24 @@ jobs:
               + event_stream
           )
           Path(sys.argv[1]).write_bytes(project)
+
+          controller_records = b"".join(
+              struct.pack("<I2sBBf", position, b"\xA5\x5A", 2, 0x24, value)
+              for position, value in [(0, 0.15), (192, 0.78), (384, 0.36), (576, 0.9)]
+          )
+          pattern_events = (
+              bytes([0x40, 0, 0, 0x41, 7, 0])
+              + data_event(0xD0, b"")
+              + data_event(0xDF, controller_records)
+          )
+          controller_project = (
+              b"FLhd"
+              + struct.pack("<IHHH", 6, 0, 0, 96)
+              + b"FLdt"
+              + struct.pack("<I", len(pattern_events))
+              + pattern_events
+          )
+          Path(sys.argv[2]).write_bytes(controller_project)
           PY
 
           target/release/fl-studio-rebuild "$RUNNER_TEMP/mixer-preview.flp" \
@@ -203,6 +221,33 @@ jobs:
           sleep 2
           ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
             -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/mixer.png"
+
+          kill "$app_pid" 2>/dev/null || true
+          wait "$app_pid" 2>/dev/null || true
+          app_pid=""
+          target/release/fl-studio-rebuild "$RUNNER_TEMP/controller-preview.flp" \
+            > "$RUNNER_TEMP/controller-preview.log" 2>&1 &
+          app_pid=$!
+          for attempt in $(seq 1 10); do
+            if ! kill -0 "$app_pid" 2>/dev/null; then
+              cat "$RUNNER_TEMP/controller-preview.log"
+              exit 1
+            fi
+            sleep 1
+          done
+          xdotool key F7
+          sleep 1
+          xdotool mousemove 414 16 click 1
+          sleep 0.5
+          xdotool mousemove 510 67 click 1
+          sleep 0.5
+          for cycle in $(seq 1 6); do
+            xdotool key Shift+F
+            sleep 0.15
+          done
+          sleep 1
+          ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
+            -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/controller-events.png"
           BASH
           xvfb-run --auto-servernum --server-args="-screen 0 1600x900x24 +extension GLX" \
             bash "$RUNNER_TEMP/capture-ui.sh"

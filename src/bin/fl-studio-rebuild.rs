@@ -32,11 +32,11 @@ use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, ArticulateOptions, AutomationChannel, AutomationPoint,
     AutomationPointEdit, ChannelGroupSummary, ChannelSortOrder, ChannelSummary, ClawMachineOptions,
     FlpDocument, FstPreset, FstPresetKind, LimitNoteOptions, LimitSnapDirection,
-    MixerParameterKind, MixerParameterRecord, Pattern, PatternNote, PatternNoteEdit, PlaylistClip,
-    PlaylistClipClipboard, PlaylistClipEdit, PlaylistClipTarget, PlaylistTrack, PlaylistTrackEdit,
-    ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions, RiffMachineOptions,
-    RiffMachineQuantizeMode, ScaleLevelsOptions, TimeMarker, TimeMarkerEdit,
-    VstPluginStateMetadata,
+    MixerParameterKind, MixerParameterRecord, Pattern, PatternController, PatternControllerEdit,
+    PatternNote, PatternNoteEdit, PlaylistClip, PlaylistClipClipboard, PlaylistClipEdit,
+    PlaylistClipTarget, PlaylistTrack, PlaylistTrackEdit, ProjectInfoEdit, ProjectSettingsEdit,
+    RandomizerOptions, RiffMachineOptions, RiffMachineQuantizeMode, ScaleLevelsOptions, TimeMarker,
+    TimeMarkerEdit, VstPluginStateMetadata,
 };
 
 mod midi_input;
@@ -519,16 +519,18 @@ enum PianoRollEventTarget {
     Pitch,
     ModX,
     ModY,
+    RawControllers,
 }
 
 impl PianoRollEventTarget {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::Velocity,
         Self::Pan,
         Self::Release,
         Self::Pitch,
         Self::ModX,
         Self::ModY,
+        Self::RawControllers,
     ];
 
     fn label(self) -> &'static str {
@@ -539,6 +541,7 @@ impl PianoRollEventTarget {
             Self::Pitch => "Fine pitch",
             Self::ModX => "Mod X",
             Self::ModY => "Mod Y",
+            Self::RawControllers => "Raw controllers",
         }
     }
 
@@ -547,6 +550,7 @@ impl PianoRollEventTarget {
             Self::Velocity | Self::Pan | Self::Release => 128,
             Self::Pitch => 240,
             Self::ModX | Self::ModY => 255,
+            Self::RawControllers => unreachable!("raw controllers use their own value scale"),
         }
     }
 
@@ -558,6 +562,7 @@ impl PianoRollEventTarget {
             Self::Pitch => u16::from(note.fine_pitch),
             Self::ModX => u16::from(note.mod_x),
             Self::ModY => u16::from(note.mod_y),
+            Self::RawControllers => unreachable!("raw controllers are not note properties"),
         }
     }
 
@@ -588,6 +593,7 @@ impl PianoRollEventTarget {
                 mod_y: Some(value),
                 ..PatternNoteEdit::default()
             },
+            Self::RawControllers => unreachable!("raw controllers use PatternControllerEdit"),
         }
     }
 }
@@ -1566,6 +1572,7 @@ struct DawUi {
     piano_roll_edit_scope: PianoRollEditScope,
     piano_roll_event_editor_open: bool,
     piano_roll_event_target: PianoRollEventTarget,
+    piano_roll_controller_stream: Option<(u8, u8)>,
     piano_roll_scale: PianoRollScale,
     piano_roll_scale_root: u8,
     piano_roll_ghost_channels: bool,
@@ -1904,6 +1911,7 @@ impl DawUi {
             piano_roll_edit_scope: PianoRollEditScope::Automatic,
             piano_roll_event_editor_open: false,
             piano_roll_event_target: PianoRollEventTarget::Velocity,
+            piano_roll_controller_stream: None,
             piano_roll_scale: PianoRollScale::Major,
             piano_roll_scale_root: 0,
             piano_roll_ghost_channels: true,
@@ -11961,7 +11969,9 @@ impl DawUi {
             });
             if ui
                 .selectable_label(self.piano_roll_event_editor_open, "Events")
-                .on_hover_text("Show note properties below the grid (Shift+F cycles target)")
+                .on_hover_text(
+                    "Show note properties or raw Pattern controllers below the grid (Shift+F cycles targets)",
+                )
                 .clicked()
             {
                 self.piano_roll_event_editor_open = !self.piano_roll_event_editor_open;
@@ -15135,6 +15145,12 @@ impl DawUi {
                     .filter(|marker| marker.is_signature())
                     .map(TimeMarker::position_ticks),
             )
+            .chain(
+                pattern
+                    .controllers
+                    .iter()
+                    .map(|controller| controller.position),
+            )
             .max()
             .unwrap_or(ppq as u32 * 16)
             .max(ppq as u32 * 16);
@@ -15841,6 +15857,7 @@ impl DawUi {
                 tick_scale,
                 keyboard_width,
                 scroll_output.state.offset.x,
+                snap_ticks,
             );
         }
         if !ui.input(|input| input.pointer.primary_down()) {
@@ -15898,7 +15915,21 @@ impl DawUi {
         tick_scale: f32,
         keyboard_width: f32,
         horizontal_scroll: f32,
+        snap_ticks: u32,
     ) {
+        if self.piano_roll_event_target == PianoRollEventTarget::RawControllers {
+            self.draw_piano_roll_controller_event_editor(
+                ui,
+                pattern,
+                ppq,
+                tick_scale,
+                keyboard_width,
+                horizontal_scroll,
+                snap_ticks,
+            );
+            return;
+        }
+
         ui.horizontal(|ui| {
             ui.strong(format!("{} events", self.piano_roll_event_target.label()));
             ui.label("Drag stems to change note properties · Shift+F cycles targets");
@@ -16021,6 +16052,240 @@ impl DawUi {
                         }
                         Err(error) => {
                             self.status = format!("Could not update note event: {error}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn draw_piano_roll_controller_event_editor(
+        &mut self,
+        ui: &mut egui::Ui,
+        pattern: &Pattern,
+        ppq: u16,
+        tick_scale: f32,
+        keyboard_width: f32,
+        horizontal_scroll: f32,
+        snap_ticks: u32,
+    ) {
+        let streams = pattern
+            .controllers
+            .iter()
+            .map(|controller| (controller.channel, controller.flags))
+            .collect::<BTreeSet<_>>();
+        if self
+            .piano_roll_controller_stream
+            .is_some_and(|stream| !streams.contains(&stream))
+        {
+            self.piano_roll_controller_stream = None;
+        }
+
+        ui.horizontal_wrapped(|ui| {
+            ui.strong("Pattern controller data");
+            if !streams.is_empty() {
+                let selected_text = self.piano_roll_controller_stream.map_or_else(
+                    || "All raw points".to_owned(),
+                    |(channel, flags)| format!("Channel {channel} · flags 0x{flags:02X}"),
+                );
+                egui::ComboBox::from_id_salt(("piano-roll-controller-stream", pattern.id))
+                    .selected_text(selected_text)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.piano_roll_controller_stream,
+                            None,
+                            "All raw points",
+                        );
+                        for (channel, flags) in &streams {
+                            ui.selectable_value(
+                                &mut self.piano_roll_controller_stream,
+                                Some((*channel, *flags)),
+                                format!("Channel {channel} · flags 0x{flags:02X}"),
+                            );
+                        }
+                    });
+            }
+            ui.weak("Drag points to edit · channel and flags are uninterpreted fields");
+        });
+
+        let size = Vec2::new(ui.available_width().max(1.0), 116.0);
+        let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+        let plot_rect = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + keyboard_width, rect.top() + 8.0),
+            egui::pos2(rect.right(), rect.bottom() - 8.0),
+        );
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 0, PANEL_DARK);
+        painter.rect_filled(
+            egui::Rect::from_min_max(rect.min, egui::pos2(plot_rect.left(), rect.bottom())),
+            0,
+            PANEL_LIGHT,
+        );
+        painter.rect_stroke(
+            rect,
+            egui::CornerRadius::ZERO,
+            Stroke::new(1.0, GRID),
+            egui::StrokeKind::Inside,
+        );
+        painter.text(
+            egui::pos2(rect.left() + 6.0, rect.top() + 10.0),
+            Align2::LEFT_TOP,
+            "Raw 0xDF",
+            FontId::proportional(10.0),
+            TEXT,
+        );
+
+        let selected_stream = self.piano_roll_controller_stream;
+        let points = pattern
+            .controllers
+            .iter()
+            .enumerate()
+            .filter(|(_, controller)| {
+                selected_stream.is_none_or(|(channel, flags)| {
+                    controller.channel == channel && controller.flags == flags
+                })
+            })
+            .collect::<Vec<_>>();
+        if points.is_empty() {
+            painter.text(
+                plot_rect.center(),
+                Align2::CENTER_CENTER,
+                "No Pattern controller points (0xDF) in this Pattern",
+                FontId::proportional(13.0),
+                MUTED,
+            );
+            return;
+        }
+
+        let (minimum, maximum) =
+            piano_roll_controller_value_range(&pattern.controllers, selected_stream);
+        let baseline = plot_rect.bottom() - 1.0;
+        for fraction in [0.0_f32, 0.5, 1.0] {
+            let y = egui::lerp(plot_rect.bottom()..=plot_rect.top(), fraction);
+            let value = minimum + f64::from(fraction) * (maximum - minimum);
+            painter.line_segment(
+                [
+                    egui::pos2(plot_rect.left(), y),
+                    egui::pos2(plot_rect.right(), y),
+                ],
+                Stroke::new(1.0, GRID),
+            );
+            let label = if value.abs() >= 10_000.0 || (value != 0.0 && value.abs() < 0.01) {
+                format!("{value:.2e}")
+            } else {
+                format!("{value:.2}")
+            };
+            painter.text(
+                egui::pos2(rect.left() + 5.0, y),
+                Align2::LEFT_CENTER,
+                label,
+                FontId::proportional(9.0),
+                MUTED,
+            );
+        }
+
+        let measure_ticks = u32::from(ppq).saturating_mul(4).max(1);
+        let measure_width = measure_ticks as f32 * tick_scale;
+        if measure_width > 0.0 {
+            let measure_count = (rect.width() / measure_width).ceil() as u32 + 2;
+            for measure in 0..measure_count {
+                let x = plot_rect.left() + measure as f32 * measure_width - horizontal_scroll;
+                if x >= plot_rect.left() && x <= plot_rect.right() {
+                    painter.line_segment(
+                        [egui::pos2(x, plot_rect.top()), egui::pos2(x, baseline)],
+                        Stroke::new(1.0, GRID),
+                    );
+                }
+            }
+        }
+
+        let mut same_position_count = BTreeMap::<(u32, u8, u8), u8>::new();
+        for (controller_index, controller) in points {
+            let count = same_position_count
+                .entry((controller.position, controller.channel, controller.flags))
+                .or_default();
+            let stagger = f32::from(*count).min(6.0) * 4.0;
+            *count = count.saturating_add(1);
+
+            let value = controller.value();
+            let normalized = if value.is_finite() {
+                ((f64::from(value) - minimum) / (maximum - minimum)).clamp(0.0, 1.0) as f32
+            } else {
+                0.5
+            };
+            let x = plot_rect.left() + controller.position as f32 * tick_scale - horizontal_scroll
+                + stagger;
+            if x < plot_rect.left() - 10.0 || x > plot_rect.right() + 10.0 {
+                continue;
+            }
+            let point = egui::pos2(
+                x,
+                egui::lerp(plot_rect.bottom()..=plot_rect.top(), normalized),
+            );
+            let color = if value.is_finite() {
+                MIDI_CHANNEL_COLORS[usize::from(controller.channel) % MIDI_CHANNEL_COLORS.len()]
+            } else {
+                ORANGE
+            };
+            painter.line_segment([egui::pos2(x, baseline), point], Stroke::new(1.5, color));
+            painter.circle_filled(point, 4.0, color);
+
+            let hit_rect = egui::Rect::from_min_max(
+                egui::pos2(x - 7.0, point.y.min(baseline) - 5.0),
+                egui::pos2(x + 7.0, point.y.max(baseline) + 5.0),
+            );
+            let response = ui
+                .interact(
+                    hit_rect,
+                    Id::new(("piano-controller-event", pattern.id, controller_index)),
+                    Sense::click_and_drag(),
+                )
+                .on_hover_text(format!(
+                    "0xDF point {controller_index}\nPosition: {} ticks\nRaw channel: {}\nRaw flags: 0x{:02X}\nReserved: {:02X} {:02X}\nValue: {:?} (0x{:08X})",
+                    controller.position,
+                    controller.channel,
+                    controller.flags,
+                    controller.reserved[0],
+                    controller.reserved[1],
+                    value,
+                    controller.value_bits,
+                ));
+            if response.hovered() {
+                painter.circle_stroke(point, 5.5, Stroke::new(1.0, TEXT));
+            }
+            if response.dragged()
+                && let Some(pointer) = response.interact_pointer_pos()
+            {
+                let timeline_x = (pointer.x.clamp(plot_rect.left(), plot_rect.right())
+                    - plot_rect.left()
+                    + horizontal_scroll
+                    - stagger)
+                    / tick_scale.max(0.001);
+                let position = snap_note_tick(
+                    timeline_x.round().clamp(0.0, u32::MAX as f32) as i64,
+                    snap_ticks,
+                    0,
+                );
+                let normalized = ((baseline - pointer.y) / plot_rect.height()).clamp(0.0, 1.0);
+                let value = piano_roll_controller_value_at(normalized, minimum, maximum);
+                if position != controller.position || value.to_bits() != controller.value_bits {
+                    if let Some(document) = &mut self.document {
+                        match document.edit_pattern_controller(
+                            pattern.id,
+                            controller_index,
+                            PatternControllerEdit {
+                                position: (position != controller.position).then_some(position),
+                                value: (value.to_bits() != controller.value_bits).then_some(value),
+                            },
+                        ) {
+                            Ok(()) => {
+                                self.dirty = true;
+                                self.status = "Updated raw Pattern controller point".to_owned();
+                            }
+                            Err(error) => {
+                                self.status =
+                                    format!("Could not update Pattern controller: {error}");
+                            }
                         }
                     }
                 }
@@ -20296,6 +20561,44 @@ fn snap_note_tick(value: i64, quantum: u32, minimum: u32) -> u32 {
     snapped as u32
 }
 
+fn piano_roll_controller_value_range(
+    controllers: &[PatternController],
+    stream: Option<(u8, u8)>,
+) -> (f64, f64) {
+    let mut minimum = f64::INFINITY;
+    let mut maximum = f64::NEG_INFINITY;
+    for controller in controllers.iter().filter(|controller| {
+        stream.is_none_or(|(channel, flags)| {
+            controller.channel == channel && controller.flags == flags
+        })
+    }) {
+        let value = f64::from(controller.value());
+        if value.is_finite() {
+            minimum = minimum.min(value);
+            maximum = maximum.max(value);
+        }
+    }
+
+    if !minimum.is_finite() || !maximum.is_finite() {
+        return (0.0, 1.0);
+    }
+    if minimum >= 0.0 && maximum <= 1.0 {
+        return (0.0, 1.0);
+    }
+
+    let padding = (maximum - minimum).max(1.0) * 0.08;
+    (
+        (minimum - padding).max(-f64::from(f32::MAX)),
+        (maximum + padding).min(f64::from(f32::MAX)),
+    )
+}
+
+fn piano_roll_controller_value_at(normalized: f32, minimum: f64, maximum: f64) -> f32 {
+    let normalized = f64::from(normalized.clamp(0.0, 1.0));
+    let value = minimum + normalized * (maximum - minimum);
+    value.clamp(-f64::from(f32::MAX), f64::from(f32::MAX)) as f32
+}
+
 fn snap_signed_tick_delta(value: i64, quantum: u32) -> i64 {
     let quantum = u64::from(quantum.max(1));
     let magnitude = value.unsigned_abs();
@@ -20764,11 +21067,12 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        ActivePlaylistClipDrag, ChannelDisplayFilter, FlpDocument, Pattern, PatternNote,
-        PianoRollGrid, PianoRollSnap, PlaylistClip, PlaylistClipDragKind, PluginCandidate,
-        PluginFormat, candidate_matches_vst_identity, candidate_mixer_controls,
+        ActivePlaylistClipDrag, ChannelDisplayFilter, FlpDocument, Pattern, PatternController,
+        PatternNote, PianoRollGrid, PianoRollSnap, PlaylistClip, PlaylistClipDragKind,
+        PluginCandidate, PluginFormat, candidate_matches_vst_identity, candidate_mixer_controls,
         encode_midi_device_selections, next_piano_roll_note_group, note_from_grid_position,
-        parse_midi_device_selections, piano_roll_note_group_members,
+        parse_midi_device_selections, piano_roll_controller_value_at,
+        piano_roll_controller_value_range, piano_roll_note_group_members,
         playlist_audio_clip_join_candidates, playlist_clip_drag_edit,
         playlist_clip_local_recording_offset, playlist_clip_split_position,
         playlist_pattern_clip_join_candidates, snap_note_tick,
@@ -21331,6 +21635,50 @@ mod tests {
         assert_eq!(snap_note_tick(36, 24, 0), 48);
         assert_eq!(snap_note_tick(0, 24, 1), 1);
         assert_eq!(snap_note_tick(i64::from(u32::MAX), 1, 0), u32::MAX);
+    }
+
+    #[test]
+    fn raw_controller_event_range_filters_streams_and_handles_unusual_values() {
+        let controllers = [
+            PatternController {
+                channel: 2,
+                flags: 0x24,
+                value_bits: 0.25_f32.to_bits(),
+                ..PatternController::default()
+            },
+            PatternController {
+                channel: 2,
+                flags: 0x24,
+                value_bits: 0.75_f32.to_bits(),
+                ..PatternController::default()
+            },
+            PatternController {
+                channel: 3,
+                flags: 0x10,
+                value_bits: 24.0_f32.to_bits(),
+                ..PatternController::default()
+            },
+            PatternController {
+                channel: 4,
+                flags: 0x80,
+                value_bits: f32::NAN.to_bits(),
+                ..PatternController::default()
+            },
+        ];
+
+        assert_eq!(
+            piano_roll_controller_value_range(&controllers, Some((2, 0x24))),
+            (0.0, 1.0)
+        );
+        let raw_range = piano_roll_controller_value_range(&controllers, Some((3, 0x10)));
+        assert!(raw_range.0 < 24.0 && raw_range.1 > 24.0);
+        assert_eq!(
+            piano_roll_controller_value_range(&controllers, Some((4, 0x80))),
+            (0.0, 1.0)
+        );
+        assert_eq!(piano_roll_controller_value_at(0.0, 0.0, 1.0), 0.0);
+        assert_eq!(piano_roll_controller_value_at(1.0, 0.0, 1.0), 1.0);
+        assert!(piano_roll_controller_value_at(0.5, raw_range.0, raw_range.1).is_finite());
     }
 
     #[test]
