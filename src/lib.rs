@@ -13050,7 +13050,6 @@ mod tests {
         let mut event_stream = vec![0x40, 7, 0, 0x15, 2];
         append_data_event(&mut event_stream, 0xD4, &[0xD4, 0xA5]);
         append_data_event(&mut event_stream, 0xD5, &payload);
-        event_stream.extend_from_slice(&[0x62, 0]);
         flp_fixture(&event_stream, &[], &[0xD1, 0xD2])
     }
 
@@ -13151,7 +13150,6 @@ mod tests {
         append_vst_field(&mut payload, 53, &[0x66]);
         let mut duplicate_stream = vec![0x40, 7, 0, 0x15, 2];
         append_data_event(&mut duplicate_stream, 0xD5, &payload);
-        duplicate_stream.extend_from_slice(&[0x62, 0]);
         input = flp_fixture(&duplicate_stream, &[], &[]);
         document = FlpDocument::parse(&input).expect("duplicate-field fixture should parse");
         let before = document.encode_lossless().expect("document should encode");
