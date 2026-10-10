@@ -10,11 +10,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::audio::{AudioInputRecording, StreamingAudioWriter};
-use crate::media::{DecodedAudio, SamplePathResolver, decode_audio_file};
+use crate::media::{DecodedAudio, SamplePathResolver, decode_audio_file, wav_sampler_loop_points};
 use crate::vst3::Vst3PlaylistStreamProcessor;
 use crate::{
-    Arrangement, ChannelNoteRouter, FlpDocument, Pattern, PatternNote, PlaylistClip,
-    PlaylistClipTarget,
+    Arrangement, ChannelNoteRouter, ChannelSummary, FlpDocument, Pattern, PatternNote,
+    PlaylistClip, PlaylistClipTarget,
 };
 
 const DEFAULT_SAMPLE_RATE: u32 = 44_100;
@@ -1700,6 +1700,10 @@ fn prepare_sampler_arrangement(
                     continue;
                 }
             };
+            let loop_points = channel
+                .sampler_uses_loop_points()
+                .then(|| wav_sampler_loop_points(&resolved_path))
+                .flatten();
             let audio = if let Some(audio) = decoded_by_path.get(&resolved_path) {
                 Arc::clone(audio)
             } else {
@@ -1731,12 +1735,15 @@ fn prepare_sampler_arrangement(
                 decoded_by_path.insert(resolved_path, Arc::clone(&audio));
                 audio
             };
+            let loop_bounds = validated_sampler_loop_bounds(loop_points, audio.frame_count());
             let (gain, pan) = channel_gain_pan(channel.volume(), channel.pan());
             source_entry.insert(SamplerVoiceSource {
                 audio,
                 gain,
                 pan,
                 reverse: channel.sample_reversed(),
+                loop_bounds,
+                ping_pong_loop: channel.sampler_ping_pong_loop_enabled(),
             });
         }
         let Some(source) = sources_by_channel.get(&placed.target_channel_id) else {
@@ -1823,6 +1830,16 @@ struct SamplerVoiceSource {
     gain: f32,
     pan: f32,
     reverse: bool,
+    loop_bounds: Option<SampleBounds>,
+    ping_pong_loop: bool,
+}
+
+fn validated_sampler_loop_bounds(
+    loop_points: Option<(usize, usize)>,
+    frame_count: usize,
+) -> Option<SampleBounds> {
+    let (start, end) = loop_points?;
+    (start < end && end <= frame_count).then_some(SampleBounds { start, end })
 }
 
 #[derive(Clone, Copy)]
@@ -1932,6 +1949,10 @@ fn prepare_sampler_pattern(
                     continue;
                 }
             };
+            let loop_points = channel
+                .sampler_uses_loop_points()
+                .then(|| wav_sampler_loop_points(&resolved_path))
+                .flatten();
             let audio = if let Some(audio) = decoded_by_path.get(&resolved_path) {
                 Arc::clone(audio)
             } else {
@@ -1963,12 +1984,15 @@ fn prepare_sampler_pattern(
                 decoded_by_path.insert(resolved_path, Arc::clone(&audio));
                 audio
             };
+            let loop_bounds = validated_sampler_loop_bounds(loop_points, audio.frame_count());
             let (gain, pan) = channel_gain_pan(channel.volume(), channel.pan());
             source_entry.insert(SamplerVoiceSource {
                 audio,
                 gain,
                 pan,
                 reverse: channel.sample_reversed(),
+                loop_bounds,
+                ping_pong_loop: channel.sampler_ping_pong_loop_enabled(),
             });
         }
         let Some(source) = sources_by_channel.get(&target_channel_id) else {
@@ -2083,6 +2107,8 @@ struct SamplerVoice {
     source: Arc<DecodedAudio>,
     source_position: f64,
     source_step: f64,
+    loop_bounds: Option<SampleBounds>,
+    ping_pong_loop: bool,
     stop_frame: Option<u64>,
     started_frame: u64,
     gain: f32,
@@ -2186,7 +2212,7 @@ impl<'a> SamplerVoiceEngine<'a> {
                 let gain = voice.gain * fade;
                 output_frame[0] += left * gain * voice.left_gain;
                 output_frame[1] += right * gain * voice.right_gain;
-                voice.source_position += voice.source_step;
+                advance_sampler_voice_position(voice);
                 if let Some(remaining) = voice.release_remaining.as_mut() {
                     *remaining = remaining.saturating_sub(1);
                     if *remaining == 0
@@ -2244,6 +2270,8 @@ impl<'a> SamplerVoiceEngine<'a> {
                 0.0
             },
             source_step,
+            loop_bounds: source.loop_bounds,
+            ping_pong_loop: source.ping_pong_loop,
             stop_frame: note.stop_frame,
             started_frame: note.start_frame,
             gain: source.gain * velocity_gain,
@@ -2251,6 +2279,61 @@ impl<'a> SamplerVoiceEngine<'a> {
             right_gain,
             release_remaining: None,
         });
+    }
+}
+
+fn advance_sampler_voice_position(voice: &mut SamplerVoice) {
+    let mut next_position = voice.source_position + voice.source_step;
+    let Some(bounds) = voice.loop_bounds else {
+        voice.source_position = next_position;
+        return;
+    };
+    if voice.stop_frame.is_none() || voice.release_remaining.is_some() {
+        voice.source_position = next_position;
+        return;
+    }
+
+    let start = bounds.start as f64;
+    let end = bounds.end as f64;
+    if !voice.ping_pong_loop {
+        let loop_length = end - start;
+        if (voice.source_step > 0.0 && next_position >= end)
+            || (voice.source_step < 0.0 && next_position < start)
+        {
+            next_position = start + (next_position - start).rem_euclid(loop_length);
+        }
+        voice.source_position = next_position;
+        return;
+    }
+
+    let low = start;
+    let high = end - 1.0;
+    let step_magnitude = voice.source_step.abs();
+    if (voice.source_step > 0.0 && next_position > high)
+        || (voice.source_step < 0.0 && next_position < low)
+    {
+        let span = high - low;
+        if span <= 0.0 {
+            voice.source_position = low;
+            voice.source_step = 0.0;
+            return;
+        }
+
+        let phase = (next_position - low).rem_euclid(span * 2.0);
+        if phase == 0.0 {
+            voice.source_position = low;
+            voice.source_step = step_magnitude;
+        } else if phase == span {
+            voice.source_position = high;
+            voice.source_step = -step_magnitude;
+        } else if phase < span {
+            voice.source_position = low + phase;
+        } else {
+            voice.source_position = high - (phase - span);
+            voice.source_step = -voice.source_step;
+        }
+    } else {
+        voice.source_position = next_position;
     }
 }
 
@@ -3164,6 +3247,8 @@ mod tests {
                     gain: 1.0,
                     pan: -1.0,
                     reverse: false,
+                    loop_bounds: None,
+                    ping_pong_loop: false,
                 },
             )]),
             pattern_clips_rendered: 1,
@@ -3336,6 +3421,8 @@ mod tests {
                 gain: 1.0,
                 pan: 0.0,
                 reverse: false,
+                loop_bounds: None,
+                ping_pong_loop: false,
             },
         )]);
         let notes = [ScheduledSamplerNote {
@@ -3375,6 +3462,8 @@ mod tests {
                 gain: 1.0,
                 pan: -1.0,
                 reverse: true,
+                loop_bounds: None,
+                ping_pong_loop: false,
             },
         )]);
         let notes = [ScheduledSamplerNote {
@@ -3392,6 +3481,80 @@ mod tests {
     }
 
     #[test]
+    fn held_sampler_voice_wraps_forward_at_wave_loop_points() {
+        let sources = HashMap::from([(
+            7,
+            SamplerVoiceSource {
+                audio: Arc::new(DecodedAudio {
+                    sample_rate: 4,
+                    channels: vec![vec![0.0, 1.0, 2.0, 3.0, 4.0]],
+                }),
+                gain: 1.0,
+                pan: -1.0,
+                reverse: false,
+                loop_bounds: Some(SampleBounds { start: 1, end: 4 }),
+                ping_pong_loop: false,
+            },
+        )]);
+        let notes = [ScheduledSamplerNote {
+            start_frame: 0,
+            stop_frame: Some(100),
+            channel_id: 7,
+            key: SAMPLER_ROOT_KEY,
+            velocity: 127,
+        }];
+        let mut engine = SamplerVoiceEngine::new(&sources, &notes, 1, 4, 4);
+        let mut output = vec![0.0; 18];
+        engine.render_block(0, 9, &mut output);
+
+        let rendered_left = output
+            .chunks_exact(2)
+            .map(|frame| frame[0])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rendered_left,
+            vec![0.0, 1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0]
+        );
+    }
+
+    #[test]
+    fn held_sampler_voice_bounces_between_wave_loop_points_in_ping_pong_mode() {
+        let sources = HashMap::from([(
+            7,
+            SamplerVoiceSource {
+                audio: Arc::new(DecodedAudio {
+                    sample_rate: 4,
+                    channels: vec![vec![0.0, 1.0, 2.0, 3.0, 4.0]],
+                }),
+                gain: 1.0,
+                pan: -1.0,
+                reverse: false,
+                loop_bounds: Some(SampleBounds { start: 1, end: 4 }),
+                ping_pong_loop: true,
+            },
+        )]);
+        let notes = [ScheduledSamplerNote {
+            start_frame: 0,
+            stop_frame: Some(100),
+            channel_id: 7,
+            key: SAMPLER_ROOT_KEY,
+            velocity: 127,
+        }];
+        let mut engine = SamplerVoiceEngine::new(&sources, &notes, 1, 4, 4);
+        let mut output = vec![0.0; 18];
+        engine.render_block(0, 9, &mut output);
+
+        let rendered_left = output
+            .chunks_exact(2)
+            .map(|frame| frame[0])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rendered_left,
+            vec![0.0, 1.0, 2.0, 3.0, 2.0, 1.0, 2.0, 3.0, 2.0]
+        );
+    }
+
+    #[test]
     fn sampler_voice_resamples_at_output_rate_and_transposes_by_note_key() {
         let source = Arc::new(DecodedAudio {
             sample_rate: 8,
@@ -3404,6 +3567,8 @@ mod tests {
                 gain: 1.0,
                 pan: -1.0,
                 reverse: false,
+                loop_bounds: None,
+                ping_pong_loop: false,
             },
         )]);
         let notes = [ScheduledSamplerNote {
@@ -3435,6 +3600,8 @@ mod tests {
                 gain: 1.0,
                 pan: -1.0,
                 reverse: false,
+                loop_bounds: None,
+                ping_pong_loop: false,
             },
         )]);
         let notes = [ScheduledSamplerNote {
@@ -3473,6 +3640,8 @@ mod tests {
                     gain: 1.0,
                     pan: -1.0,
                     reverse: false,
+                    loop_bounds: None,
+                    ping_pong_loop: false,
                 },
             ),
             (
@@ -3482,6 +3651,8 @@ mod tests {
                     gain: 1.0,
                     pan: -1.0,
                     reverse: false,
+                    loop_bounds: None,
+                    ping_pong_loop: false,
                 },
             ),
         ]);

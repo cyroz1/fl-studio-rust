@@ -402,6 +402,8 @@ pub struct ChannelSummary {
     color: Option<u32>,
     mixer_track: Option<i8>,
     sampler_fx_flags: Option<u16>,
+    sampler_flags: Option<u32>,
+    ping_pong_loop: bool,
     swing_mix: Option<u16>,
     group_number: Option<i32>,
     volume: Option<u32>,
@@ -600,6 +602,21 @@ impl ChannelSummary {
             && self
                 .sampler_fx_flags
                 .is_some_and(|flags| flags & (1 << 1) != 0)
+    }
+
+    /// Whether a kind-0 Sampler uses embedded sample loop points.
+    ///
+    /// The `UsesLoopPoints` option is bit 3 of the `0x8F` sampler-flags dword.
+    pub fn sampler_uses_loop_points(&self) -> bool {
+        self.kind == Some(0)
+            && self
+                .sampler_flags
+                .is_some_and(|flags| flags & (1 << 3) != 0)
+    }
+
+    /// Whether a kind-0 Sampler has its Ping-pong loop option enabled (`0x14`).
+    pub fn sampler_ping_pong_loop_enabled(&self) -> bool {
+        self.kind == Some(0) && self.ping_pong_loop
     }
 
     /// Raw four-byte channel color value, in little-endian RGBA byte order.
@@ -1979,12 +1996,25 @@ impl FlpDocument {
                 0x0F if event.payload.len() == 1 => {
                     channel.zipped = event.payload[0] != 0;
                 }
+                0x14 if event.payload.len() == 1 => {
+                    channel.ping_pong_loop = event.payload[0] != 0;
+                }
                 0x46 if event.encoding == PayloadEncoding::Word
                     && event.payload.len() == 2
                     && channel.sampler_fx_flags.is_none() =>
                 {
                     channel.sampler_fx_flags =
                         Some(u16::from_le_bytes([event.payload[0], event.payload[1]]));
+                }
+                0x8F if event.encoding == PayloadEncoding::Dword
+                    && event.payload.len() == 4
+                    && channel.sampler_flags.is_none() =>
+                {
+                    channel.sampler_flags = Some(u32::from_le_bytes(
+                        event.payload[..4]
+                            .try_into()
+                            .expect("a dword event has four payload bytes"),
+                    ));
                 }
                 0x16 if event.encoding == PayloadEncoding::Byte && event.payload.len() == 1 => {
                     channel.mixer_track = Some(event.payload[0] as i8);
@@ -13829,6 +13859,31 @@ mod tests {
             let document = FlpDocument::parse(&input).expect("fixture should parse");
 
             assert_eq!(document.channels()[0].sample_reversed(), expected);
+            assert_eq!(document.encode_lossless().unwrap(), input);
+        }
+    }
+
+    #[test]
+    fn decodes_sampler_loop_point_and_ping_pong_flags_losslessly() {
+        for (kind, flags, ping_pong, expected_loop_points, expected_ping_pong) in [
+            (0, 0x0000_0008_u32, true, true, true),
+            (0, 0x0000_0000, false, false, false),
+            (4, 0x0000_0008, true, false, false),
+        ] {
+            let mut event_stream = vec![0x40, 7, 0, 0x15, kind, 0x14, u8::from(ping_pong), 0x8F];
+            event_stream.extend_from_slice(&flags.to_le_bytes());
+            event_stream.extend_from_slice(&[0x62, 0, 0]);
+            let input = flp_fixture(&event_stream, &[], &[]);
+            let document = FlpDocument::parse(&input).expect("fixture should parse");
+
+            assert_eq!(
+                document.channels()[0].sampler_uses_loop_points(),
+                expected_loop_points
+            );
+            assert_eq!(
+                document.channels()[0].sampler_ping_pong_loop_enabled(),
+                expected_ping_pong
+            );
             assert_eq!(document.encode_lossless().unwrap(), input);
         }
     }

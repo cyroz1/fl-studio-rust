@@ -129,6 +129,70 @@ pub fn decode_audio_file(path: impl AsRef<Path>) -> Result<DecodedAudio, String>
     decode_audio_file_for_preview(path.as_ref(), None)
 }
 
+/// Read the first embedded WAVE sampler loop as a half-open source-frame range.
+///
+/// WAVE stores the loop end inclusively; playback code uses an exclusive end. Invalid or absent
+/// metadata is ignored so a sample remains playable without loop points.
+pub(crate) fn wav_sampler_loop_points(path: &Path) -> Option<(usize, usize)> {
+    let mut file = File::open(path).ok()?;
+    let file_length = file.metadata().ok()?.len();
+    if file_length < 12 {
+        return None;
+    }
+    let mut header = [0; 12];
+    file.read_exact(&mut header).ok()?;
+    if &header[..4] != b"RIFF" || &header[8..12] != b"WAVE" {
+        return None;
+    }
+    let riff_size = u64::from(u32::from_le_bytes(header[4..8].try_into().ok()?));
+    let riff_end = 8u64.checked_add(riff_size)?;
+    if riff_size < 4 || riff_end > file_length {
+        return None;
+    }
+
+    let mut cursor = 12u64;
+    while cursor.checked_add(8)? <= riff_end {
+        file.seek(SeekFrom::Start(cursor)).ok()?;
+        let mut chunk_header = [0; 8];
+        file.read_exact(&mut chunk_header).ok()?;
+        let chunk_size = u64::from(u32::from_le_bytes(chunk_header[4..8].try_into().ok()?));
+        let body_start = cursor.checked_add(8)?;
+        let body_end = body_start.checked_add(chunk_size)?;
+        if body_end > riff_end {
+            return None;
+        }
+
+        if &chunk_header[..4] == b"smpl" {
+            if chunk_size < 36 {
+                return None;
+            }
+            file.seek(SeekFrom::Start(body_start.checked_add(28)?))
+                .ok()?;
+            let mut loop_count_bytes = [0; 4];
+            file.read_exact(&mut loop_count_bytes).ok()?;
+            let loop_count = u64::from(u32::from_le_bytes(loop_count_bytes));
+            if loop_count == 0 || 36u64.checked_add(loop_count.checked_mul(24)?)? > chunk_size {
+                return None;
+            }
+
+            file.seek(SeekFrom::Start(body_start.checked_add(36)?))
+                .ok()?;
+            let mut first_loop = [0; 24];
+            file.read_exact(&mut first_loop).ok()?;
+            let start = u32::from_le_bytes(first_loop[8..12].try_into().ok()?);
+            let end_inclusive = u32::from_le_bytes(first_loop[12..16].try_into().ok()?);
+            let end = end_inclusive.checked_add(1)?;
+            return (start < end).then_some((start as usize, end as usize));
+        }
+
+        cursor = body_end.checked_add(chunk_size & 1)?;
+        if cursor > riff_end {
+            return None;
+        }
+    }
+    None
+}
+
 /// Decode an audio file for the Browser and return interleaved stereo samples at the output rate.
 /// A duration limit keeps the default short preview bounded; `None` returns the full sample.
 pub fn decode_audio_preview(
@@ -989,6 +1053,26 @@ mod tests {
         bytes
     }
 
+    fn wav_with_sampler_loop_fixture() -> Vec<u8> {
+        let mut sampler = vec![0u8; 60];
+        sampler[28..32].copy_from_slice(&1u32.to_le_bytes());
+        sampler[36 + 8..36 + 12].copy_from_slice(&2u32.to_le_bytes());
+        sampler[36 + 12..36 + 16].copy_from_slice(&4u32.to_le_bytes());
+
+        let mut body = b"WAVE".to_vec();
+        body.extend_from_slice(b"smpl");
+        body.extend_from_slice(&(sampler.len() as u32).to_le_bytes());
+        body.extend_from_slice(&sampler);
+        body.extend_from_slice(b"data");
+        body.extend_from_slice(&10u32.to_le_bytes());
+        body.extend_from_slice(&[0; 10]);
+
+        let mut bytes = b"RIFF".to_vec();
+        bytes.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&body);
+        bytes
+    }
+
     #[test]
     fn waveform_summary_keeps_stereo_channels_separate_and_combined() {
         let audio = DecodedAudio {
@@ -1125,6 +1209,34 @@ mod tests {
         assert_eq!(decoded.frame_count(), 2);
         assert_eq!(decoded.channels[0][0], -1.0);
         assert!((decoded.channels[0][1] - 0.999_969_5).abs() < 1e-6);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reads_first_wave_sampler_loop_as_half_open_frame_bounds() {
+        let root = fixture_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("loop.wav");
+        std::fs::write(&path, wav_with_sampler_loop_fixture()).unwrap();
+
+        assert_eq!(wav_sampler_loop_points(&path), Some((2, 5)));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ignores_missing_or_malformed_wave_sampler_loops() {
+        let root = fixture_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("plain.wav");
+        std::fs::write(&path, pcm16_wav_fixture()).unwrap();
+        assert_eq!(wav_sampler_loop_points(&path), None);
+
+        let mut malformed = wav_with_sampler_loop_fixture();
+        malformed[48..52].copy_from_slice(&2u32.to_le_bytes());
+        std::fs::write(&path, malformed).unwrap();
+        assert_eq!(wav_sampler_loop_points(&path), None);
 
         std::fs::remove_dir_all(root).unwrap();
     }
