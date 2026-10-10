@@ -1602,7 +1602,7 @@ pub(crate) struct PlaylistPatternNote<'a> {
     pub(crate) note: &'a PatternNote,
     pub(crate) target_channel_id: u16,
     pub(crate) start_tick: u64,
-    pub(crate) clipped_stop_tick: Option<u64>,
+    pub(crate) stop_tick: Option<u64>,
     pub(crate) clip_index: usize,
 }
 
@@ -1644,6 +1644,7 @@ pub(crate) fn schedule_playlist_pattern_notes<'a>(
     track_filter: PlaylistTrackFilter<'_>,
     ppq: u16,
     global_swing_mix_raw: u8,
+    play_truncated_notes_in_clips: bool,
     mut channel_swing_mix_raw: impl FnMut(u16) -> u16,
     mut resolve_targets: impl FnMut(u16, u64, u16) -> Vec<u16>,
 ) -> Result<PlaylistPatternSchedule<'a>, String> {
@@ -1730,18 +1731,18 @@ pub(crate) fn schedule_playlist_pattern_notes<'a>(
                 if start_tick >= clip_end {
                     continue;
                 }
-                let clipped_stop_tick = if note.length == 0 {
+                let stop_tick = if note.length == 0 {
                     None
                 } else {
-                    Some(
-                        nominal_start_tick
-                            .checked_add(u64::from(note.length))
-                            .and_then(|stop_tick| stop_tick.checked_add(swing_offset))
-                            .ok_or_else(|| {
-                                "Playlist pattern note end position overflow".to_owned()
-                            })?
-                            .min(clip_end),
-                    )
+                    let note_end_tick = nominal_start_tick
+                        .checked_add(u64::from(note.length))
+                        .and_then(|stop_tick| stop_tick.checked_add(swing_offset))
+                        .ok_or_else(|| "Playlist pattern note end position overflow".to_owned())?;
+                    Some(if play_truncated_notes_in_clips {
+                        note_end_tick
+                    } else {
+                        note_end_tick.min(clip_end)
+                    })
                 };
                 let note_seed = (clip_index as u64).rotate_left(32)
                     ^ repetition.rotate_left(17)
@@ -1757,7 +1758,7 @@ pub(crate) fn schedule_playlist_pattern_notes<'a>(
                         note,
                         target_channel_id,
                         start_tick,
-                        clipped_stop_tick,
+                        stop_tick,
                         clip_index,
                     });
                 }
@@ -1835,6 +1836,9 @@ fn prepare_sampler_arrangement(
         track_filter,
         ppq,
         document.metadata().global_swing_mix(),
+        document
+            .project_settings()
+            .is_none_or(|settings| settings.play_truncated_notes_in_clips),
         |channel_id| {
             channels_by_id
                 .get(&channel_id)
@@ -1986,7 +1990,7 @@ fn prepare_sampler_arrangement(
         }
         let start_frame = ticks_to_frames(placed.start_tick, ppq, tempo_bpm, options.sample_rate)?;
         let stop_frame = placed
-            .clipped_stop_tick
+            .stop_tick
             .map(|stop_tick| {
                 ticks_to_frames(stop_tick, ppq, tempo_bpm, options.sample_rate)
                     .map(|frame| frame.max(start_frame.saturating_add(1)))
@@ -3426,6 +3430,7 @@ mod tests {
             PlaylistTrackFilter::new(&BTreeSet::new(), None),
             96,
             0,
+            false,
             |_| 128,
             |channel_id, _, _| vec![channel_id],
         )
@@ -3434,7 +3439,7 @@ mod tests {
             schedule
                 .notes
                 .iter()
-                .map(|placed| (placed.start_tick, placed.clipped_stop_tick))
+                .map(|placed| (placed.start_tick, placed.stop_tick))
                 .collect::<Vec<_>>(),
             vec![
                 (96, Some(192)),
@@ -3468,6 +3473,7 @@ mod tests {
             PlaylistTrackFilter::new(&BTreeSet::from([1]), None),
             96,
             0,
+            false,
             |_| 128,
             |channel_id, _, _| vec![channel_id],
         )
@@ -3527,6 +3533,7 @@ mod tests {
             PlaylistTrackFilter::new(&BTreeSet::from([1]), Some((1, 1))),
             96,
             0,
+            false,
             |_| 128,
             |channel_id, _, _| vec![channel_id],
         )
@@ -3562,6 +3569,7 @@ mod tests {
             PlaylistTrackFilter::new(&BTreeSet::new(), None),
             96,
             0,
+            false,
             |_| 128,
             |channel_id, _, key| {
                 assert_eq!(key, 72);
@@ -3607,13 +3615,14 @@ mod tests {
             PlaylistTrackFilter::new(&BTreeSet::new(), None),
             96,
             0,
+            false,
             |_| 128,
             |channel_id, _, _| vec![channel_id],
         )
         .unwrap();
         assert_eq!(schedule.notes.len(), 1);
         assert_eq!(schedule.notes[0].start_tick, 12);
-        assert_eq!(schedule.notes[0].clipped_stop_tick, None);
+        assert_eq!(schedule.notes[0].stop_tick, None);
     }
 
     #[test]
@@ -3641,13 +3650,51 @@ mod tests {
             PlaylistTrackFilter::new(&BTreeSet::new(), None),
             96,
             128,
+            false,
             |channel_id| if channel_id == 7 { 128 } else { 0 },
             |channel_id, _, _| vec![channel_id],
         )
         .unwrap();
         assert_eq!(schedule.notes.len(), 1);
         assert_eq!(schedule.notes[0].start_tick, 44);
-        assert_eq!(schedule.notes[0].clipped_stop_tick, Some(68));
+        assert_eq!(schedule.notes[0].stop_tick, Some(68));
+    }
+
+    #[test]
+    fn play_truncated_notes_in_clips_controls_pattern_note_tail() {
+        let pattern = Pattern {
+            id: 9,
+            length_ticks: Some(96),
+            notes: vec![PatternNote {
+                position: 48,
+                length: 96,
+                channel_id: 1,
+                ..PatternNote::default()
+            }],
+            ..Pattern::default()
+        };
+        let arrangement = Arrangement {
+            clips: vec![test_pattern_clip(9, 0, 96)],
+            ..Arrangement::default()
+        };
+        let patterns = [pattern];
+
+        let schedule = |play_truncated_notes_in_clips| {
+            schedule_playlist_pattern_notes(
+                &patterns,
+                &arrangement,
+                PlaylistTrackFilter::new(&BTreeSet::new(), None),
+                96,
+                0,
+                play_truncated_notes_in_clips,
+                |_| 128,
+                |channel_id, _, _| vec![channel_id],
+            )
+            .unwrap()
+        };
+
+        assert_eq!(schedule(false).notes[0].stop_tick, Some(96));
+        assert_eq!(schedule(true).notes[0].stop_tick, Some(144));
     }
 
     #[test]

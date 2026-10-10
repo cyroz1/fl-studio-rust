@@ -1137,6 +1137,9 @@ impl Vst3HostRuntime {
             track_filter,
             ppq,
             document.metadata().global_swing_mix(),
+            document
+                .project_settings()
+                .is_none_or(|settings| settings.play_truncated_notes_in_clips),
             |channel_id| {
                 channels_by_id
                     .get(&channel_id)
@@ -1161,7 +1164,7 @@ impl Vst3HostRuntime {
         let mut notes_by_channel = BTreeMap::<u16, Vec<PlaylistMidiNote>>::new();
         for placed in &schedule.notes {
             let note = placed.note;
-            let stop_tick = match placed.clipped_stop_tick {
+            let stop_tick = match placed.stop_tick {
                 Some(stop_tick) => stop_tick,
                 None => placed
                     .start_tick
@@ -1181,9 +1184,16 @@ impl Vst3HostRuntime {
         }
 
         let ppq = u64::from(ppq);
-        let max_tick = arrangement.clips.iter().fold(0u64, |end, clip| {
+        let clip_end_tick = arrangement.clips.iter().fold(0u64, |end, clip| {
             end.max(u64::from(clip.position_ticks) + u64::from(clip.length_ticks))
         });
+        let scheduled_note_end_tick = notes_by_channel
+            .values()
+            .flatten()
+            .map(|note| note.stop_tick)
+            .max()
+            .unwrap_or(0);
+        let max_tick = clip_end_tick.max(scheduled_note_end_tick);
         let duration_seconds = max_tick as f64 * 60.0 / (ppq as f64 * tempo_bpm);
         let base_output_frames = duration_seconds * f64::from(output_sample_rate);
         let tail_output_frames = tail_seconds * f64::from(output_sample_rate);
