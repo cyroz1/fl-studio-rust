@@ -1602,15 +1602,16 @@ impl DawUi {
         widgets.open.fg_stroke = Stroke::new(1.0, TEXT);
         widgets.open.corner_radius = egui::CornerRadius::same(4);
 
-        // Set both variants explicitly. Some native backends can report a
-        // system theme after app creation; keeping both styles identical
-        // prevents light text fields from appearing inside the dark workspace.
+        // Set both variants and the active style explicitly. Native backends
+        // can report the system appearance after app creation; applying the
+        // active visuals too keeps widgets aligned with the painted workspace.
         creation
             .egui_ctx
             .set_visuals_of(egui::Theme::Dark, visuals.clone());
         creation
             .egui_ctx
-            .set_visuals_of(egui::Theme::Light, visuals);
+            .set_visuals_of(egui::Theme::Light, visuals.clone());
+        creation.egui_ctx.set_visuals(visuals);
         creation.egui_ctx.all_styles_mut(|style| {
             style.spacing.item_spacing = Vec2::new(7.0, 5.0);
             style.spacing.button_padding = Vec2::new(9.0, 5.0);
