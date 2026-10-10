@@ -739,12 +739,6 @@ impl ChannelNoteRouter {
         }
     }
 
-    /// Returns targets in Layer child order. `note_seed` distinguishes notes and
-    /// Playlist repetitions when Random is enabled.
-    pub(crate) fn targets(&self, source_channel_id: u16, note_seed: u64) -> Vec<u16> {
-        self.targets_for_optional_key(source_channel_id, note_seed, None)
-    }
-
     /// Returns targets for a note after applying the source and child key regions.
     /// Layer Random chooses from the children that accept this note.
     pub(crate) fn targets_for_note(
@@ -753,22 +747,13 @@ impl ChannelNoteRouter {
         note_seed: u64,
         key: u16,
     ) -> Vec<u16> {
-        self.targets_for_optional_key(source_channel_id, note_seed, Some(key))
-    }
-
-    fn targets_for_optional_key(
-        &self,
-        source_channel_id: u16,
-        note_seed: u64,
-        key: Option<u16>,
-    ) -> Vec<u16> {
         let Some(source) = self.channels_by_id.get(&source_channel_id) else {
             return Vec::new();
         };
         if source.enabled == Some(false) {
             return Vec::new();
         }
-        if key.is_some_and(|key| !channel_accepts_key(source, key)) {
+        if !channel_accepts_key(source, key) {
             return Vec::new();
         }
         if source.channel_type() != Some(ChannelType::Layer) {
@@ -785,7 +770,7 @@ impl ChannelNoteRouter {
                 self.channels_by_id.get(child_id).is_some_and(|child| {
                     child.enabled != Some(false)
                         && child.channel_type() != Some(ChannelType::Layer)
-                        && key.is_none_or(|key| channel_accepts_key(child, key))
+                        && channel_accepts_key(child, key)
                 })
             })
             .collect::<Vec<_>>();
@@ -17143,17 +17128,17 @@ mod tests {
         let all_children = FlpDocument::parse(&layer_channel_fixture(0, &[1, 2]))
             .expect("Layer fixture should parse");
         let router = ChannelNoteRouter::new(all_children.channels());
-        assert_eq!(router.targets(0, 23), vec![1, 2]);
-        assert!(router.targets(99, 23).is_empty());
+        assert_eq!(router.targets_for_note(0, 23, 60), vec![1, 2]);
+        assert!(router.targets_for_note(99, 23, 60).is_empty());
 
         let random_layer = FlpDocument::parse(&layer_channel_fixture(1, &[1, 2]))
             .expect("random Layer fixture should parse");
         let router = ChannelNoteRouter::new(random_layer.channels());
-        let first_choice = router.targets(0, 23);
+        let first_choice = router.targets_for_note(0, 23, 60);
         assert_eq!(first_choice.len(), 1);
-        assert_eq!(router.targets(0, 23), first_choice);
+        assert_eq!(router.targets_for_note(0, 23, 60), first_choice);
         let choices = (0..64)
-            .flat_map(|seed| router.targets(0, seed))
+            .flat_map(|seed| router.targets_for_note(0, seed, 60))
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(choices, [1, 2].into_iter().collect());
     }
@@ -17172,7 +17157,7 @@ mod tests {
         let document = FlpDocument::parse(&flp_fixture(&event_stream, &[], &[]))
             .expect("Layer fixture should parse");
         let router = ChannelNoteRouter::new(document.channels());
-        assert_eq!(router.targets(0, 0), vec![3]);
+        assert_eq!(router.targets_for_note(0, 0, 60), vec![3]);
     }
 
     #[test]
