@@ -4058,7 +4058,7 @@ impl DawUi {
                 return;
             }
         };
-        let start_frame = playlist_tick_to_frame(
+        let start_frame = playlist_seek_tick_to_frame(
             self.playlist_seek_tick,
             self.document
                 .as_ref()
@@ -21142,7 +21142,7 @@ fn playlist_bar_ticks(ppq: u16, time_signature: (u8, u8)) -> u64 {
     .max(1)
 }
 
-fn playlist_tick_to_frame(tick: u32, ppq: u16, tempo_bpm: f64, sample_rate: u32) -> u64 {
+fn playlist_seek_tick_to_frame(tick: u32, ppq: u16, tempo_bpm: f64, sample_rate: u32) -> u64 {
     if !tempo_bpm.is_finite() || tempo_bpm <= 0.0 || sample_rate == 0 {
         return 0;
     }
@@ -21356,9 +21356,9 @@ mod tests {
         playlist_audio_clip_join_candidates, playlist_bar_ticks, playlist_clip_drag_edit,
         playlist_clip_local_recording_offset, playlist_clip_split_position,
         playlist_measure_boundaries, playlist_pattern_clip_join_candidates,
-        playlist_signature_at_tick, snap_note_tick, toggle_piano_roll_note_group_selection,
-        update_channel_rack_selection, update_layer_child_selection,
-        update_piano_roll_box_selection,
+        playlist_seek_tick_to_frame, playlist_signature_at_tick, snap_note_tick,
+        toggle_piano_roll_note_group_selection, update_channel_rack_selection,
+        update_layer_child_selection, update_piano_roll_box_selection,
     };
 
     fn mixer_parameter_fixture(records: &[(u8, u16, i32)]) -> FlpDocument {
@@ -21771,11 +21771,11 @@ mod tests {
 
     #[test]
     fn playlist_seek_tick_converts_to_song_frames() {
-        assert_eq!(playlist_tick_to_frame(384, 96, 120.0, 48_000), 96_000);
-        assert_eq!(playlist_tick_to_frame(0, 96, 120.0, 48_000), 0);
-        assert_eq!(playlist_tick_to_frame(384, 0, 120.0, 48_000), 96_000);
-        assert_eq!(playlist_tick_to_frame(384, 96, 0.0, 48_000), 0);
-        assert_eq!(playlist_tick_to_frame(384, 96, 120.0, 0), 0);
+        assert_eq!(playlist_seek_tick_to_frame(384, 96, 120.0, 48_000), 96_000);
+        assert_eq!(playlist_seek_tick_to_frame(0, 96, 120.0, 48_000), 0);
+        assert_eq!(playlist_seek_tick_to_frame(384, 0, 120.0, 48_000), 96_000);
+        assert_eq!(playlist_seek_tick_to_frame(384, 96, 0.0, 48_000), 0);
+        assert_eq!(playlist_seek_tick_to_frame(384, 96, 120.0, 0), 0);
     }
 
     #[test]

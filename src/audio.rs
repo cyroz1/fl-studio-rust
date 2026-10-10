@@ -2043,7 +2043,7 @@ mod tests {
     #[test]
     fn streamed_output_waits_for_prefill_and_drains_before_stopping() {
         let playback = PlaybackState::new();
-        let writer = playback.start_streaming();
+        let writer = playback.start_streaming(0);
         let source = AtomicU8::new(AUDIO_SOURCE_STREAM);
         let ring = AudioRingBuffer::new(2);
         let mut phase = 0.0;
@@ -2109,7 +2109,7 @@ mod tests {
     #[test]
     fn streamed_output_pause_preserves_queued_frames_for_resume() {
         let playback = PlaybackState::new();
-        let writer = playback.start_streaming();
+        let writer = playback.start_streaming(0);
         writer.write_stereo_samples(&[0.25, -0.5]).unwrap();
         writer.finish();
         let stream = playback.streaming.load();
