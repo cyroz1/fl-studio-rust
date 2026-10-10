@@ -34,17 +34,17 @@ use flp_rebuild::{
     VstPluginStateMetadata,
 };
 
-const APP_BACKGROUND: Color32 = Color32::from_rgb(27, 27, 27);
-const PANEL: Color32 = Color32::from_rgb(34, 34, 34);
-const PANEL_DARK: Color32 = Color32::from_rgb(17, 17, 17);
-const PANEL_LIGHT: Color32 = Color32::from_rgb(44, 44, 44);
-const GRID: Color32 = Color32::from_rgb(57, 57, 57);
-const BORDER: Color32 = Color32::from_rgb(68, 68, 68);
-const TEXT: Color32 = Color32::from_rgb(242, 242, 242);
-const MUTED: Color32 = Color32::from_rgb(196, 196, 196);
+const APP_BACKGROUND: Color32 = Color32::from_rgb(25, 25, 25);
+const PANEL: Color32 = Color32::from_rgb(37, 37, 37);
+const PANEL_DARK: Color32 = Color32::from_rgb(18, 18, 18);
+const PANEL_LIGHT: Color32 = Color32::from_rgb(50, 50, 50);
+const GRID: Color32 = Color32::from_rgb(58, 58, 58);
+const BORDER: Color32 = Color32::from_rgb(73, 73, 73);
+const TEXT: Color32 = Color32::from_rgb(245, 245, 245);
+const MUTED: Color32 = Color32::from_rgb(186, 186, 186);
 const GREEN: Color32 = Color32::from_rgb(14, 175, 98);
-const BLUE: Color32 = Color32::from_rgb(86, 129, 255);
-const BLUE_SELECTION: Color32 = Color32::from_rgb(15, 28, 82);
+const BLUE: Color32 = Color32::from_rgb(38, 128, 235);
+const BLUE_SELECTION: Color32 = Color32::from_rgb(24, 62, 104);
 const PURPLE: Color32 = Color32::from_rgb(150, 93, 181);
 const ORANGE: Color32 = Color32::from_rgb(195, 129, 61);
 const RED: Color32 = Color32::from_rgb(252, 67, 46);
