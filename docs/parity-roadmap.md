@@ -201,7 +201,8 @@ FL Studio's piano roll is famously deep — the full toolset:
 - `[partial]` Randomize applies seeded velocity, pan, and pitch changes with directional or bipolar level offsets and optional default-level reset to the channel or selection; scale-aware note generation remains
 - `[partial]` Humanize applies seeded timing and velocity variation to the channel or selection; tempo-relative timing remains
 - `[partial]` Arpeggiator converts selected same-onset chords to gated up/down runs with configurable step time and octave range; custom score patterns and sync modes remain
-- `[todo]` Riff machine, Claw machine
+- `[todo]` Riff machine
+- `[partial]` Claw machine exposes Period, Trash every, Time distortion, Remove short notes, and Stretch to compensate for the channel or selection, using a local 16-slice gate and timing curve; native note splitting and exact slice, distortion, and short-note behavior remain unverified
 - `[partial]` Limit folds or clamps channel or selected note pitches into a key range, supports wrapping to the lowest octave, and can snap out-of-scale notes to the current Piano roll scale upward, downward, or alternately; exact alternate-snap edge behavior remains
 - `[partial]` Slice-at-tick splits notes crossing the chosen tick in the channel or selection; native directional cut gestures remain
 - `[partial]` Scale Levels applies Center, logarithmic Tension, Multiply, and Offset to selected notes or the target channel; Center and Tension use documented ranges with local formulas pending comparison against native FL Studio

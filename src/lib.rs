@@ -923,6 +923,28 @@ pub struct ArticulateOptions {
     pub chop_chords: bool,
 }
 
+/// Parameters for the Piano roll Claw Machine's periodic note gate and timing slew.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClawMachineOptions {
+    pub period_ticks: u32,
+    pub trash_every: u8,
+    pub time_distortion_percent: i16,
+    pub remove_short_notes: bool,
+    pub stretch_to_compensate: bool,
+}
+
+impl Default for ClawMachineOptions {
+    fn default() -> Self {
+        Self {
+            period_ticks: 384,
+            trash_every: 4,
+            time_distortion_percent: 0,
+            remove_short_notes: false,
+            stretch_to_compensate: false,
+        }
+    }
+}
+
 impl Default for ArticulateOptions {
     fn default() -> Self {
         Self {
@@ -1058,6 +1080,30 @@ fn note_index_in_scope(note_index: usize, selected_indices: Option<&HashSet<usiz
 fn note_pitch_in_scale(key: i32, scale_root: u8, scale_intervals: &[u8]) -> bool {
     let pitch_class = (key.rem_euclid(12) - i32::from(scale_root)).rem_euclid(12) as u8;
     scale_intervals.contains(&pitch_class)
+}
+
+fn claw_warp_position(
+    position: u64,
+    origin: u64,
+    period_ticks: u32,
+    distortion_percent: i16,
+) -> Result<u32, FlpError> {
+    let period = u64::from(period_ticks);
+    let relative = position.saturating_sub(origin);
+    let cycle_start = origin + (relative / period) * period;
+    let phase = relative % period;
+    let normalized = phase as f64 / period as f64;
+    let exponent = 1.0 + 2.0 * (f64::from(distortion_percent.abs()) / 100.0);
+    let warped = if distortion_percent >= 0 {
+        normalized.powf(exponent)
+    } else {
+        1.0 - (1.0 - normalized).powf(exponent)
+    };
+    let warped_phase = (warped * period as f64)
+        .round()
+        .clamp(0.0, (period - 1) as f64) as u64;
+    let warped_position = cycle_start + warped_phase;
+    u32::try_from(warped_position).map_err(|_| FlpError::LengthOverflow)
 }
 
 fn fold_note_pitch_to_limit(key: i32, minimum: i32, maximum: i32, wrap_to_bottom: bool) -> i32 {
@@ -6682,6 +6728,190 @@ impl FlpDocument {
         Ok(edits.len())
     }
 
+    /// Applies a periodic gate and timing slew to notes in one channel.
+    /// Each period is divided into 16 slices; every Nth slice is removed.
+    pub fn claw_pattern_notes(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        options: ClawMachineOptions,
+    ) -> Result<usize, FlpError> {
+        self.claw_pattern_notes_in_scope(pattern_id, channel_id, None, options)
+    }
+
+    /// Applies the periodic gate and timing slew only to selected channel-local notes.
+    pub fn claw_pattern_note_selection(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: &[usize],
+        options: ClawMachineOptions,
+    ) -> Result<usize, FlpError> {
+        self.claw_pattern_notes_in_scope(pattern_id, channel_id, Some(note_indices), options)
+    }
+
+    fn claw_pattern_notes_in_scope(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: Option<&[usize]>,
+        options: ClawMachineOptions,
+    ) -> Result<usize, FlpError> {
+        if options.period_ticks < 16 {
+            return Err(FlpError::UnsupportedEdit(
+                "Claw Machine period must be at least 16 ticks",
+            ));
+        }
+        if !(2..=16).contains(&options.trash_every) {
+            return Err(FlpError::UnsupportedEdit(
+                "Claw Machine Trash every must be between 2 and 16",
+            ));
+        }
+        if !(-100..=100).contains(&options.time_distortion_percent) {
+            return Err(FlpError::UnsupportedEdit(
+                "Claw Machine time distortion must be between -100 and 100 percent",
+            ));
+        }
+
+        const SLICES_PER_PERIOD: u64 = 16;
+        let patterns = self.patterns()?;
+        let pattern = patterns
+            .iter()
+            .find(|pattern| pattern.id == pattern_id)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested pattern does not exist",
+            ))?;
+        let selected_indices =
+            note_indices.map(|indices| indices.iter().copied().collect::<HashSet<_>>());
+        let targeted_notes = pattern
+            .notes
+            .iter()
+            .filter(|note| note.channel_id == channel_id)
+            .enumerate()
+            .filter(|(note_index, _)| note_index_in_scope(*note_index, selected_indices.as_ref()))
+            .map(|(note_index, note)| (note_index, note.clone()))
+            .collect::<Vec<_>>();
+        if targeted_notes.is_empty() {
+            return Ok(0);
+        }
+
+        let origin = targeted_notes
+            .iter()
+            .map(|(_, note)| u64::from(note.position))
+            .min()
+            .expect("targeted notes are not empty");
+        let scope_end = targeted_notes
+            .iter()
+            .map(|(_, note)| u64::from(note.position) + u64::from(note.length))
+            .max()
+            .expect("targeted notes are not empty");
+        let period = u64::from(options.period_ticks);
+        let short_note_threshold = options.period_ticks.div_ceil(16);
+        let mut kept_notes = Vec::new();
+        let mut removed_indices = Vec::new();
+        let mut removed_positions = Vec::new();
+
+        for (note_index, note) in targeted_notes {
+            let relative = u64::from(note.position) - origin;
+            let phase = relative % period;
+            let slice = phase * SLICES_PER_PERIOD / period;
+            let trashed = (slice + 1).is_multiple_of(u64::from(options.trash_every));
+            let too_short = options.remove_short_notes && note.length < short_note_threshold;
+            if trashed || too_short {
+                removed_indices.push(note_index);
+                removed_positions.push(note.position);
+                continue;
+            }
+
+            let position = claw_warp_position(
+                u64::from(note.position),
+                origin,
+                options.period_ticks,
+                options.time_distortion_percent,
+            )?;
+            let original_length = note.length;
+            kept_notes.push((note_index, note, position, original_length));
+        }
+
+        kept_notes.sort_unstable_by_key(|(note_index, note, _, _)| (note.position, *note_index));
+        if options.stretch_to_compensate && !removed_positions.is_empty() {
+            let mut kept_onsets = kept_notes
+                .iter()
+                .map(|(_, note, _, _)| note.position)
+                .collect::<Vec<_>>();
+            kept_onsets.sort_unstable();
+            kept_onsets.dedup();
+            for (_, note, position, _) in &mut kept_notes {
+                let next_onset_index = kept_onsets.partition_point(|onset| *onset <= note.position);
+                let next_original_onset = kept_onsets
+                    .get(next_onset_index)
+                    .copied()
+                    .map(u64::from)
+                    .unwrap_or(scope_end);
+                let has_removed_note_in_gap = removed_positions.iter().any(|removed_position| {
+                    u64::from(*removed_position) > u64::from(note.position)
+                        && u64::from(*removed_position) < next_original_onset
+                });
+                if !has_removed_note_in_gap {
+                    continue;
+                }
+
+                let compensated_end = if let Some(next_onset) = kept_onsets.get(next_onset_index) {
+                    claw_warp_position(
+                        u64::from(*next_onset),
+                        origin,
+                        options.period_ticks,
+                        options.time_distortion_percent,
+                    )?
+                } else {
+                    claw_warp_position(
+                        scope_end,
+                        origin,
+                        options.period_ticks,
+                        options.time_distortion_percent,
+                    )?
+                };
+                let compensated_length = compensated_end.saturating_sub(*position).max(note.length);
+                note.length = compensated_length;
+            }
+        }
+
+        let edits = kept_notes
+            .into_iter()
+            .filter_map(|(note_index, note, position, original_length)| {
+                (position != note.position || note.length != original_length).then_some((
+                    note_index,
+                    position,
+                    note.length,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let changed_count = edits.len() + removed_indices.len();
+        if changed_count == 0 {
+            return Ok(0);
+        }
+
+        let mut updated = self.clone();
+        for (note_index, position, length) in &edits {
+            updated.edit_pattern_note(
+                pattern_id,
+                channel_id,
+                *note_index,
+                PatternNoteEdit {
+                    position: Some(*position),
+                    length: Some(*length),
+                    ..PatternNoteEdit::default()
+                },
+            )?;
+        }
+        removed_indices.sort_unstable_by(|left, right| right.cmp(left));
+        for note_index in removed_indices {
+            updated.delete_pattern_note(pattern_id, channel_id, note_index)?;
+        }
+        *self = updated;
+        Ok(changed_count)
+    }
+
     /// Folds channel note pitches by octaves into a key range, then clamps any pitch that cannot fit.
     pub fn limit_pattern_note_range(
         &mut self,
@@ -9678,11 +9908,11 @@ fn decode_vst_text(bytes: &[u8]) -> Option<String> {
 mod tests {
     use super::{
         ArticulateOptions, ChannelGroupSummary, ChannelNoteRouter, ChannelSortOrder,
-        ChannelSummary, FlpDocument, FlpError, FlpEvent, FstPreset, FstPresetKind,
-        LimitNoteOptions, LimitSnapDirection, MixerParameterKind, PATTERN_NOTE_SLIDE_FLAG,
-        PatternNote, PatternNoteEdit, PayloadEncoding, PlaylistClipEdit, PlaylistClipTarget,
-        ProjectInfoEdit, ProjectSettingsEdit, ScaleLevelsOptions, TimeMarkerEdit,
-        midi::MidiChannelMapping, midi::MidiFile, parse_vst_plugin_state_metadata,
+        ChannelSummary, ClawMachineOptions, FlpDocument, FlpError, FlpEvent, FstPreset,
+        FstPresetKind, LimitNoteOptions, LimitSnapDirection, MixerParameterKind,
+        PATTERN_NOTE_SLIDE_FLAG, PatternNote, PatternNoteEdit, PayloadEncoding, PlaylistClipEdit,
+        PlaylistClipTarget, ProjectInfoEdit, ProjectSettingsEdit, ScaleLevelsOptions,
+        TimeMarkerEdit, midi::MidiChannelMapping, midi::MidiFile, parse_vst_plugin_state_metadata,
     };
 
     fn articulate_options(
@@ -13023,6 +13253,136 @@ mod tests {
             )
             .expect("centered multiply should scale around its pivot");
         assert_eq!(centered.patterns().unwrap()[0].notes[0].velocity, 65);
+    }
+
+    #[test]
+    fn claw_machine_trashes_periodic_slices_and_preserves_other_channels() {
+        let note_records = [
+            note_record(0, 0, 24, 60, 100),
+            note_record(24, 0, 24, 62, 95),
+            note_record(48, 0, 24, 64, 90),
+            note_record(72, 0, 24, 65, 85),
+            note_record(96, 0, 24, 67, 80),
+            note_record(120, 0, 24, 69, 75),
+            note_record(144, 0, 24, 71, 70),
+            note_record(168, 0, 24, 72, 65),
+            note_record(72, 1, 24, 48, 60),
+        ];
+        let unknown_event = [0xFF, 1, 0xA7];
+        let mut document = FlpDocument::parse(&pattern_fixture(&note_records, &unknown_event))
+            .expect("fixture should parse");
+
+        let changed = document
+            .claw_pattern_notes(
+                7,
+                0,
+                ClawMachineOptions {
+                    period_ticks: 384,
+                    trash_every: 4,
+                    ..ClawMachineOptions::default()
+                },
+            )
+            .expect("Claw Machine should process the channel");
+
+        assert_eq!(changed, 2);
+        let notes = document.patterns().unwrap().remove(0).notes;
+        assert_eq!(
+            notes
+                .iter()
+                .filter(|note| note.channel_id == 0)
+                .map(|note| note.position)
+                .collect::<Vec<_>>(),
+            [0, 24, 48, 96, 120, 144]
+        );
+        assert_eq!(notes.last().unwrap().position, 72);
+        assert_eq!(
+            document.events().last().unwrap().wire_bytes(),
+            &unknown_event
+        );
+
+        let encoded = document.encode_lossless().unwrap();
+        let reparsed = FlpDocument::parse(&encoded).expect("edited file should parse");
+        assert_eq!(reparsed.patterns().unwrap()[0].notes.len(), 7);
+    }
+
+    #[test]
+    fn claw_machine_stretches_removed_gaps_and_limits_selection_scope() {
+        let input = pattern_fixture(
+            &[
+                note_record(0, 0, 12, 60, 100),
+                note_record(24, 0, 12, 62, 90),
+                note_record(48, 0, 12, 64, 80),
+                note_record(72, 1, 12, 48, 70),
+            ],
+            &[0xFF, 0],
+        );
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+
+        let changed = document
+            .claw_pattern_note_selection(
+                7,
+                0,
+                &[0, 1],
+                ClawMachineOptions {
+                    period_ticks: 384,
+                    trash_every: 2,
+                    stretch_to_compensate: true,
+                    ..ClawMachineOptions::default()
+                },
+            )
+            .expect("Claw Machine should process the selection");
+
+        assert_eq!(changed, 2);
+        let notes = document.patterns().unwrap().remove(0).notes;
+        assert_eq!(notes[0].position, 0);
+        assert_eq!(notes[0].length, 36);
+        assert_eq!(notes[1].position, 48);
+        assert_eq!(notes[1].length, 12);
+        assert_eq!(notes[2].channel_id, 1);
+        assert_eq!(notes[2].position, 72);
+    }
+
+    #[test]
+    fn claw_machine_slews_note_timing_and_validates_options() {
+        let input = pattern_fixture(
+            &[
+                note_record(0, 0, 24, 60, 100),
+                note_record(96, 0, 24, 62, 90),
+                note_record(192, 0, 24, 64, 80),
+            ],
+            &[0xFF, 0],
+        );
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+        document
+            .claw_pattern_notes(
+                7,
+                0,
+                ClawMachineOptions {
+                    period_ticks: 384,
+                    trash_every: 16,
+                    time_distortion_percent: 100,
+                    ..ClawMachineOptions::default()
+                },
+            )
+            .expect("Claw Machine should slew note timing");
+        let notes = document.patterns().unwrap().remove(0).notes;
+        assert_eq!(notes[0].position, 0);
+        assert_eq!(notes[1].position, 6);
+        assert_eq!(notes[2].position, 48);
+
+        let mut invalid = FlpDocument::parse(&input).expect("fixture should parse");
+        assert!(
+            invalid
+                .claw_pattern_notes(
+                    7,
+                    0,
+                    ClawMachineOptions {
+                        period_ticks: 15,
+                        ..ClawMachineOptions::default()
+                    },
+                )
+                .is_err()
+        );
     }
 
     #[test]

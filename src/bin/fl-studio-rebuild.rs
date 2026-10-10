@@ -28,11 +28,11 @@ use flp_rebuild::sample_render::{
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions, Vst3PatternStreamHandle};
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, ArticulateOptions, AutomationChannel, AutomationPoint,
-    AutomationPointEdit, ChannelGroupSummary, ChannelSortOrder, ChannelSummary, FlpDocument,
-    FstPreset, FstPresetKind, LimitNoteOptions, LimitSnapDirection, Pattern, PatternNote,
-    PatternNoteEdit, PlaylistClip, PlaylistClipClipboard, PlaylistClipEdit, PlaylistClipTarget,
-    PlaylistTrack, ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions, ScaleLevelsOptions,
-    TimeMarker, TimeMarkerEdit, VstPluginStateMetadata,
+    AutomationPointEdit, ChannelGroupSummary, ChannelSortOrder, ChannelSummary, ClawMachineOptions,
+    FlpDocument, FstPreset, FstPresetKind, LimitNoteOptions, LimitSnapDirection, Pattern,
+    PatternNote, PatternNoteEdit, PlaylistClip, PlaylistClipClipboard, PlaylistClipEdit,
+    PlaylistClipTarget, PlaylistTrack, ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions,
+    ScaleLevelsOptions, TimeMarker, TimeMarkerEdit, VstPluginStateMetadata,
 };
 
 const APP_BACKGROUND: Color32 = Color32::from_rgb(29, 29, 29);
@@ -1530,6 +1530,11 @@ struct DawUi {
     arpeggiator_range_octaves: u8,
     arpeggiator_gate_percent: u8,
     arpeggiator_direction: ArpeggioDirection,
+    claw_period_ticks: u32,
+    claw_trash_every: u8,
+    claw_time_distortion_percent: i16,
+    claw_remove_short_notes: bool,
+    claw_stretch_to_compensate: bool,
     piano_roll_slice_position_ticks: u32,
     pending_midi_import: Option<PendingMidiImport>,
     midi_channel_mapping: MidiChannelMapping,
@@ -1802,6 +1807,11 @@ impl DawUi {
             arpeggiator_range_octaves: 1,
             arpeggiator_gate_percent: 80,
             arpeggiator_direction: ArpeggioDirection::Up,
+            claw_period_ticks: 384,
+            claw_trash_every: 4,
+            claw_time_distortion_percent: 0,
+            claw_remove_short_notes: false,
+            claw_stretch_to_compensate: false,
             piano_roll_slice_position_ticks: 0,
             pending_midi_import: None,
             midi_channel_mapping: MidiChannelMapping::PreserveNoteChannels,
@@ -11255,6 +11265,7 @@ impl DawUi {
         let mut humanize_requested = false;
         let mut limit_requested = false;
         let mut arpeggiate_requested = false;
+        let mut claw_requested = false;
         let mut slice_requested = false;
         let mut delete_selection_requested = false;
         let mut duplicate_notes_requested = false;
@@ -11831,6 +11842,47 @@ impl DawUi {
                                 .clicked()
                             {
                                 articulate_requested = true;
+                                ui.close();
+                            }
+                        });
+                    });
+                    ui.menu_button("Claw machine", |ui| {
+                        ui.add(
+                            egui::Slider::new(&mut self.claw_period_ticks, 16..=1536)
+                                .text("Period (ticks)"),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut self.claw_trash_every, 2..=16)
+                                .text("Trash every"),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut self.claw_time_distortion_percent, -100..=100)
+                                .text("Time distortion (%)"),
+                        );
+                        ui.checkbox(&mut self.claw_remove_short_notes, "Remove short notes");
+                        ui.checkbox(
+                            &mut self.claw_stretch_to_compensate,
+                            "Stretch to compensate",
+                        );
+                        ui.small("Positive pulls toward the start; negative pulls toward the end.");
+                        ui.horizontal(|ui| {
+                            if ui.button("Reset").clicked() {
+                                let defaults = ClawMachineOptions::default();
+                                self.claw_period_ticks = defaults.period_ticks;
+                                self.claw_trash_every = defaults.trash_every;
+                                self.claw_time_distortion_percent =
+                                    defaults.time_distortion_percent;
+                                self.claw_remove_short_notes = defaults.remove_short_notes;
+                                self.claw_stretch_to_compensate = defaults.stretch_to_compensate;
+                            }
+                            if ui
+                                .add_enabled(
+                                    edit_scope_available,
+                                    egui::Button::new(format!("Apply to {edit_target}")),
+                                )
+                                .clicked()
+                            {
+                                claw_requested = true;
                                 ui.close();
                             }
                         });
@@ -12899,6 +12951,50 @@ impl DawUi {
                     );
                 }
                 Err(error) => self.status = format!("Could not arpeggiate notes: {error}"),
+            }
+        }
+        if claw_requested
+            && let (Some(pattern_id), Some(channel_id)) =
+                (self.selected_pattern, self.selected_note_channel)
+        {
+            let options = ClawMachineOptions {
+                period_ticks: self.claw_period_ticks,
+                trash_every: self.claw_trash_every,
+                time_distortion_percent: self.claw_time_distortion_percent,
+                remove_short_notes: self.claw_remove_short_notes,
+                stretch_to_compensate: self.claw_stretch_to_compensate,
+            };
+            let result = self
+                .document
+                .as_mut()
+                .ok_or_else(|| "no project is open".to_owned())
+                .and_then(|document| {
+                    let result = if edit_selection_only {
+                        document.claw_pattern_note_selection(
+                            pattern_id,
+                            channel_id,
+                            &selected_quantize_indices,
+                            options,
+                        )
+                    } else {
+                        document.claw_pattern_notes(pattern_id, channel_id, options)
+                    };
+                    result.map_err(|error| error.to_string())
+                });
+            match result {
+                Ok(changed) => {
+                    if changed > 0 {
+                        self.stop_project_playback();
+                        self.dirty = true;
+                        self.selected_piano_notes.clear();
+                        self.selected_note = None;
+                        self.active_note_drag = None;
+                    }
+                    self.status = format!(
+                        "Processed {changed} notes with Claw Machine in pattern {pattern_id}, {edit_scope_description}"
+                    );
+                }
+                Err(error) => self.status = format!("Could not apply Claw Machine: {error}"),
             }
         }
         if slice_requested
