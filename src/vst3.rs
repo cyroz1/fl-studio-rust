@@ -30,6 +30,7 @@ const VST3_HOST_STATE_MAGIC: &[u8; 16] = b"VST3HOST_STATE\0\0";
 const VST3_HOST_STATE_VERSION: u32 = 1;
 const VST3_HOST_NO_CONTROLLER_STATE: u32 = u32::MAX;
 const MAX_VST3_STATE_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_REPORTED_TAIL_SECONDS: f64 = 60.0;
 const VST3_HOST_STATE_HEADER_SIZE: usize = 28;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -811,6 +812,7 @@ impl Vst3HostRuntime {
         channel_instances: &BTreeMap<u16, u64>,
         output_sample_rate: u32,
         tail_seconds: f64,
+        include_plugin_reported_tails: bool,
     ) -> Result<Vst3PlaylistStreamProcessor, String> {
         if !(8_000..=384_000).contains(&output_sample_rate) {
             return Err("Playlist audio rate must be between 8000 and 384000 Hz".to_owned());
@@ -920,6 +922,7 @@ impl Vst3HostRuntime {
         let mut streams = Vec::new();
         let mut unloaded_plugin_channels = BTreeSet::new();
         let mut notes_scheduled = 0usize;
+        let mut longest_plugin_tail_seconds = 0.0f64;
         for (channel_id, notes) in notes_by_channel {
             let Some(instance_id) = channel_instances.get(&channel_id).copied() else {
                 unloaded_plugin_channels.insert(channel_id);
@@ -938,6 +941,14 @@ impl Vst3HostRuntime {
                 let plugin_guard = plugin
                     .lock()
                     .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
+                if include_plugin_reported_tails {
+                    if let Some(tail_seconds) = reported_tail_seconds(
+                        plugin_guard.tail_samples(),
+                        plugin_guard.sample_rate(),
+                    ) {
+                        longest_plugin_tail_seconds = longest_plugin_tail_seconds.max(tail_seconds);
+                    }
+                }
                 let source_frames = (output_frames as f64 * plugin_guard.sample_rate()
                     / f64::from(output_sample_rate))
                 .ceil();
@@ -974,15 +985,25 @@ impl Vst3HostRuntime {
         }
         if streams.is_empty() {
             output_frames = 0;
+        } else if include_plugin_reported_tails {
+            let effective_tail_seconds = tail_seconds.max(longest_plugin_tail_seconds);
+            let total_output_frames =
+                base_output_frames + effective_tail_seconds * f64::from(output_sample_rate);
+            if !total_output_frames.is_finite() || total_output_frames > u64::MAX as f64 {
+                return Err("VST3 Playlist length is outside the renderable range".to_owned());
+            }
+            output_frames = (total_output_frames.ceil() as u64).max(1);
         }
-        Ok(Vst3PlaylistStreamProcessor {
+        let mut processor = Vst3PlaylistStreamProcessor {
             streams,
             output_sample_rate,
             output_frames,
             notes_scheduled,
             unloaded_plugin_channels: unloaded_plugin_channels.into_iter().collect(),
             started_count: 0,
-        })
+        };
+        processor.extend_to_output_frames(output_frames)?;
+        Ok(processor)
     }
 
     /// Service editor/UI requests and VST3 restart requests on the control thread.
@@ -1744,6 +1765,13 @@ fn hosted_info(id: u64, plugin: &Plugin) -> HostedPluginInfo {
     }
 }
 
+fn reported_tail_seconds(tail_samples: u32, sample_rate_hz: f64) -> Option<f64> {
+    if tail_samples == u32::MAX || !sample_rate_hz.is_finite() || sample_rate_hz <= 0.0 {
+        return None;
+    }
+    Some((f64::from(tail_samples) / sample_rate_hz).min(MAX_REPORTED_TAIL_SECONDS))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1785,6 +1813,19 @@ mod tests {
         assert_eq!(info.latency_milliseconds(), None);
         info.sample_rate_hz = f64::NAN;
         assert_eq!(info.latency_milliseconds(), None);
+    }
+
+    #[test]
+    fn finite_plugin_tail_uses_its_sample_rate_and_obeys_the_render_cap() {
+        assert_eq!(reported_tail_seconds(96_000, 48_000.0), Some(2.0));
+        assert_eq!(reported_tail_seconds(600_000_000, 48_000.0), Some(60.0));
+    }
+
+    #[test]
+    fn infinite_or_invalid_plugin_tails_do_not_extend_the_selected_tail() {
+        assert_eq!(reported_tail_seconds(u32::MAX, 48_000.0), None);
+        assert_eq!(reported_tail_seconds(48_000, 0.0), None);
+        assert_eq!(reported_tail_seconds(48_000, f64::NAN), None);
     }
 
     fn append_flp_vst3_state_record(payload: &mut Vec<u8>, id: u32, data: &[u8]) {

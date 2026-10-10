@@ -25,7 +25,9 @@ use flp_rebuild::sample_render::{
     render_playlist_with_vst3_to_wav_cancellable, render_sampler_pattern_to_wav,
     stream_playlist_with_vst3_to_device, stream_sampler_pattern_to_device,
 };
-use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions, Vst3PatternStreamHandle};
+use flp_rebuild::vst3::{
+    MAX_REPORTED_TAIL_SECONDS, Vst3HostRuntime, Vst3PatternRenderOptions, Vst3PatternStreamHandle,
+};
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, ArticulateOptions, AutomationChannel, AutomationPoint,
     AutomationPointEdit, ChannelGroupSummary, ChannelSortOrder, ChannelSummary, ClawMachineOptions,
@@ -1660,6 +1662,7 @@ struct DawUi {
     playlist_render_quality: ResamplingQuality,
     playlist_render_channel_mode: WavChannelMode,
     playlist_render_tail_seconds: u8,
+    playlist_render_include_plugin_tails: bool,
 }
 
 struct PendingAudioRender {
@@ -1954,6 +1957,7 @@ impl DawUi {
             playlist_render_quality: ResamplingQuality::Linear,
             playlist_render_channel_mode: WavChannelMode::Stereo,
             playlist_render_tail_seconds: 0,
+            playlist_render_include_plugin_tails: false,
         };
         if let Some((autosave_minutes, autosave_before_risky, backup_retention)) =
             load_autosave_settings()
@@ -3331,7 +3335,15 @@ impl DawUi {
                             }
                         });
                 });
-                ui.label("Adds time after the last clip for instrument release tails.");
+                ui.label("Adds this much time after the last clip for instrument releases.");
+                ui.checkbox(
+                    &mut self.playlist_render_include_plugin_tails,
+                    "Use VST3 instrument tail reports",
+                )
+                .on_hover_text(format!(
+                    "Extends to the longest finite VST3 instrument tail, up to {:.0} seconds. Infinite reports use the selected tail length.",
+                    MAX_REPORTED_TAIL_SECONDS
+                ));
                 ui.label(match self.playlist_render_format {
                     WavSampleFormat::Pcm16 | WavSampleFormat::Pcm24 => {
                         "Integer PCM clips samples to the [-1, 1] range."
@@ -3796,6 +3808,7 @@ impl DawUi {
                     &self.channel_vst3_instances,
                     sample_rate,
                     2.0,
+                    true,
                 )
             })
             .transpose();
@@ -14532,7 +14545,8 @@ impl DawUi {
                     options.arrangement_id,
                     &self.channel_vst3_instances,
                     options.sample_rate,
-                    2.0,
+                    f64::from(options.tail_seconds),
+                    self.playlist_render_include_plugin_tails,
                 )
             })
             .transpose();
