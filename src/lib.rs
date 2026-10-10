@@ -1594,6 +1594,56 @@ impl MixerInsertSummary {
     }
 }
 
+/// Conservative source-audibility rules for saved Mixer insert mute and solo state.
+/// Unknown and context-dependent routes are left untouched.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct MixerRouteAudibility {
+    known_tracks: HashSet<i8>,
+    disabled_tracks: HashSet<i8>,
+    soloed_insert_tracks: HashSet<i8>,
+}
+
+impl MixerRouteAudibility {
+    pub(crate) fn from_inserts(inserts: impl IntoIterator<Item = MixerInsertSummary>) -> Self {
+        let mut routing = Self::default();
+        for insert in inserts {
+            let Ok(track) = i8::try_from(insert.ordinal()) else {
+                continue;
+            };
+            routing.known_tracks.insert(track);
+            // Master is the final destination for every normally routed source. Its
+            // saved mute/phase flags are applied to the completed stereo mix instead.
+            if track == 0 {
+                continue;
+            }
+            if insert.enabled() == Some(false) {
+                routing.disabled_tracks.insert(track);
+            }
+            if insert.soloed() == Some(true) {
+                routing.soloed_insert_tracks.insert(track);
+            }
+        }
+        routing
+    }
+
+    /// `None` is FL Studio's default Master route; `-1` means context-dependent
+    /// Current insert, so it is kept audible until that context is understood.
+    pub(crate) fn allows_channel(&self, route: Option<i8>) -> bool {
+        let track = match route {
+            None => 0,
+            Some(track) if track < 0 => return true,
+            Some(track) => track,
+        };
+        if track != 0 && !self.known_tracks.contains(&track) {
+            return true;
+        }
+        if self.disabled_tracks.contains(&track) {
+            return false;
+        }
+        self.soloed_insert_tracks.is_empty() || self.soloed_insert_tracks.contains(&track)
+    }
+}
+
 /// Recognized parameter-ID interpretations for Mixer `0xE1` records.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MixerParameterKind {
@@ -11576,12 +11626,12 @@ mod tests {
     use super::{
         ArticulateOptions, ChannelGroupSummary, ChannelNoteRouter, ChannelSortOrder,
         ChannelSummary, ClawMachineOptions, FlpDocument, FlpError, FlpEvent, FstPreset,
-        FstPresetKind, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerParameterKind,
-        PATTERN_NOTE_SLIDE_FLAG, PatternControllerEdit, PatternNote, PatternNoteEdit,
-        PayloadEncoding, PlaylistClipEdit, PlaylistClipTarget, PlaylistTrackEdit, ProjectInfoEdit,
-        ProjectSettingsEdit, RiffMachineOptions, RiffMachineQuantizeMode, ScaleLevelsOptions,
-        TimeMarkerEdit, midi::MidiChannelMapping, midi::MidiFile, parse_vst_plugin_state_metadata,
-        riff_machine_groove_note_timing,
+        FstPresetKind, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerInsertSummary,
+        MixerParameterKind, MixerRouteAudibility, PATTERN_NOTE_SLIDE_FLAG, PatternControllerEdit,
+        PatternNote, PatternNoteEdit, PayloadEncoding, PlaylistClipEdit, PlaylistClipTarget,
+        PlaylistTrackEdit, ProjectInfoEdit, ProjectSettingsEdit, RiffMachineOptions,
+        RiffMachineQuantizeMode, ScaleLevelsOptions, TimeMarkerEdit, midi::MidiChannelMapping,
+        midi::MidiFile, parse_vst_plugin_state_metadata, riff_machine_groove_note_timing,
     };
 
     fn articulate_options(
@@ -13678,6 +13728,40 @@ mod tests {
             .expect("the legacy fixture should parse");
         legacy.project_version = Some("24.2.0".to_owned());
         assert_eq!(legacy.mixer_inserts()[0].enabled(), Some(true));
+    }
+
+    #[test]
+    fn mixer_route_audibility_applies_insert_mute_and_solo_conservatively() {
+        let insert = |ordinal, flags| MixerInsertSummary {
+            ordinal,
+            input_raw: 0,
+            output_raw: 0,
+            color_raw: 0,
+            icon_raw: None,
+            name: None,
+            flags: Some(flags),
+            flags_event_index: None,
+            first_event_index: 0,
+            end_event_index: 0,
+        };
+        let routing = MixerRouteAudibility::from_inserts([
+            insert(0, (1 << 3) | (1 << 12)), // Master solo does not narrow its inputs.
+            insert(1, (1 << 3) | (1 << 12)),
+            insert(2, 0), // Disabled insert.
+        ]);
+
+        assert!(!routing.allows_channel(None));
+        assert!(routing.allows_channel(Some(1)));
+        assert!(!routing.allows_channel(Some(2)));
+        assert!(routing.allows_channel(Some(-1)));
+        assert!(routing.allows_channel(Some(7)));
+
+        let master_solo = MixerRouteAudibility::from_inserts([
+            insert(0, (1 << 3) | (1 << 12)),
+            insert(1, 1 << 3),
+        ]);
+        assert!(master_solo.allows_channel(None));
+        assert!(master_solo.allows_channel(Some(1)));
     }
 
     #[test]

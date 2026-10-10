@@ -17,7 +17,7 @@ use crate::sample_render::{
     PlaylistRenderOptions, PlaylistTrackFilter, channel_gain_pan, schedule_playlist_pattern_notes,
     swing_note_start_tick,
 };
-use crate::{ChannelNoteRouter, ChannelPluginState, FlpDocument};
+use crate::{ChannelNoteRouter, ChannelPluginState, FlpDocument, MixerRouteAudibility};
 use vst3_host::audio::AudioBuffers;
 use vst3_host::midi::{MidiChannel, MidiEvent};
 use vst3_host::{Plugin, PluginWindow, Vst3Host};
@@ -1100,6 +1100,7 @@ impl Vst3HostRuntime {
             .iter()
             .map(|channel| (channel.id(), channel))
             .collect();
+        let mixer_route_audibility = MixerRouteAudibility::from_inserts(document.mixer_inserts());
         let channel_router = ChannelNoteRouter::new(channels.clone());
         let mut plugin_channels: BTreeSet<_> = document
             .channel_plugin_states()
@@ -1137,7 +1138,14 @@ impl Vst3HostRuntime {
                 channel_router
                     .targets_for_note(channel_id, seed, key)
                     .into_iter()
-                    .filter(|target_channel_id| plugin_channels.contains(target_channel_id))
+                    .filter(|target_channel_id| {
+                        plugin_channels.contains(target_channel_id)
+                            && channels_by_id
+                                .get(target_channel_id)
+                                .is_some_and(|channel| {
+                                    mixer_route_audibility.allows_channel(channel.mixer_track())
+                                })
+                    })
                     .collect()
             },
         )?;

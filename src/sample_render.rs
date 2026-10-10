@@ -13,8 +13,8 @@ use crate::audio::{AudioInputRecording, StreamingAudioWriter};
 use crate::media::{DecodedAudio, SamplePathResolver, decode_audio_file, wav_sampler_metadata};
 use crate::vst3::Vst3PlaylistStreamProcessor;
 use crate::{
-    Arrangement, ChannelNoteRouter, FlpDocument, Pattern, PatternNote, PlaylistClip,
-    PlaylistClipTarget,
+    Arrangement, ChannelNoteRouter, FlpDocument, MixerRouteAudibility, Pattern, PatternNote,
+    PlaylistClip, PlaylistClipTarget,
 };
 
 const DEFAULT_SAMPLE_RATE: u32 = 44_100;
@@ -1366,6 +1366,7 @@ fn prepare_audio_clip_render(
         soloed_track_range: options.soloed_playlist_track_range,
     };
     let channels = document.channels();
+    let mixer_route_audibility = MixerRouteAudibility::from_inserts(document.mixer_inserts());
     let resolver = SamplePathResolver::new(project_path);
 
     let selected_clip = options
@@ -1402,7 +1403,10 @@ fn prepare_audio_clip_render(
         let Some(channel) = channels.iter().find(|channel| channel.id() == id) else {
             continue;
         };
-        if channel.kind() != Some(4) || channel.enabled() == Some(false) {
+        if channel.kind() != Some(4)
+            || channel.enabled() == Some(false)
+            || !mixer_route_audibility.allows_channel(channel.mixer_track())
+        {
             continue;
         }
         if clip
@@ -1777,6 +1781,7 @@ fn prepare_sampler_arrangement(
     };
     let patterns = document.patterns().map_err(|error| error.to_string())?;
     let channels = document.channels();
+    let mixer_route_audibility = MixerRouteAudibility::from_inserts(document.mixer_inserts());
     let channels_by_id: HashMap<_, _> = channels
         .iter()
         .map(|channel| (channel.id(), channel))
@@ -1801,7 +1806,9 @@ fn prepare_sampler_arrangement(
                     channels_by_id
                         .get(target_channel_id)
                         .is_some_and(|channel| {
-                            channel.kind() == Some(0) && channel.enabled() != Some(false)
+                            channel.kind() == Some(0)
+                                && channel.enabled() != Some(false)
+                                && mixer_route_audibility.allows_channel(channel.mixer_track())
                         })
                 })
                 .collect()
