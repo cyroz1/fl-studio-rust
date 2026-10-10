@@ -243,11 +243,7 @@ jobs:
           sleep 0.5
           xdotool mousemove 455 741 click 1
           sleep 0.3
-          for cycle in $(seq 1 6); do
-            xdotool key Down
-            sleep 0.1
-          done
-          xdotool key Return
+          xdotool mousemove 440 720 click 1
           sleep 1
           ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
             -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/controller-events.png"
