@@ -13018,10 +13018,10 @@ mod tests {
         const MAJOR_INTERVALS: &[u8] = &[0, 2, 4, 5, 7, 9, 11];
         let input = pattern_fixture(
             &[
-                note_record(0, 0, 61, 60, 100),
-                note_record(24, 0, 63, 60, 90),
-                note_record(48, 0, 65, 60, 80),
-                note_record(72, 1, 61, 60, 70),
+                note_record(0, 0, 60, 61, 100),
+                note_record(24, 0, 60, 63, 90),
+                note_record(48, 0, 60, 65, 80),
+                note_record(72, 1, 60, 61, 70),
             ],
             &[0xFF, 1, 0xA7],
         );
