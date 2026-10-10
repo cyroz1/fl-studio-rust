@@ -129,10 +129,12 @@ pub fn decode_audio_file(path: impl AsRef<Path>) -> Result<DecodedAudio, String>
     decode_audio_file_for_preview(path.as_ref(), None)
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct WavSamplerMetadata {
     /// Root key from `inst`, falling back to the `smpl` MIDI unity note.
     pub(crate) root_key: Option<u16>,
+    /// Fine tuning in cents from WAVE `inst` or `smpl` pitch metadata.
+    pub(crate) fine_tune_cents: Option<f64>,
     /// First valid `smpl` loop as half-open source-frame bounds.
     pub(crate) loop_points: Option<(usize, usize)>,
 }
@@ -160,7 +162,9 @@ pub(crate) fn wav_sampler_metadata(path: &Path) -> Option<WavSamplerMetadata> {
 
     let mut cursor = 12u64;
     let mut inst_root_key = None;
+    let mut inst_fine_tune_cents = None;
     let mut smpl_root_key = None;
+    let mut smpl_fine_tune_cents = None;
     let mut loop_points = None;
     while cursor.checked_add(8)? <= riff_end {
         file.seek(SeekFrom::Start(cursor)).ok()?;
@@ -180,6 +184,10 @@ pub(crate) fn wav_sampler_metadata(path: &Path) -> Option<WavSamplerMetadata> {
                 file.read_exact(&mut instrument).ok()?;
                 if instrument[0] <= 127 {
                     inst_root_key = Some(u16::from(instrument[0]));
+                    let fine_tune_cents = i8::from_le_bytes([instrument[1]]);
+                    if (-50..=50).contains(&fine_tune_cents) {
+                        inst_fine_tune_cents = Some(f64::from(fine_tune_cents));
+                    }
                 }
             }
             b"smpl" if chunk_size >= 36 => {
@@ -193,6 +201,13 @@ pub(crate) fn wav_sampler_metadata(path: &Path) -> Option<WavSamplerMetadata> {
                 );
                 if smpl_root_key.is_none() && root_key <= 127 {
                     smpl_root_key = Some(root_key as u16);
+                    let pitch_fraction = u32::from_le_bytes(
+                        sampler_header[16..20]
+                            .try_into()
+                            .expect("the MIDI pitch fraction has four bytes"),
+                    );
+                    smpl_fine_tune_cents =
+                        Some(f64::from(pitch_fraction) / 4_294_967_296.0 * 100.0);
                 }
 
                 if loop_points.is_none() {
@@ -237,6 +252,7 @@ pub(crate) fn wav_sampler_metadata(path: &Path) -> Option<WavSamplerMetadata> {
 
     let metadata = WavSamplerMetadata {
         root_key: inst_root_key.or(smpl_root_key),
+        fine_tune_cents: inst_fine_tune_cents.or(smpl_fine_tune_cents),
         loop_points,
     };
     (metadata.root_key.is_some() || metadata.loop_points.is_some()).then_some(metadata)
@@ -1323,9 +1339,10 @@ mod tests {
         let root = fixture_root();
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("root-note.wav");
-        let instrument = [72, 0, 0, 0, 127, 0, 127];
+        let instrument = [72, (-23i8).to_le_bytes()[0], 0, 0, 127, 0, 127];
         let mut sampler = [0u8; 36];
         sampler[12..16].copy_from_slice(&60u32.to_le_bytes());
+        sampler[16..20].copy_from_slice(&0x8000_0000u32.to_le_bytes());
 
         for chunks in [
             vec![
@@ -1340,6 +1357,7 @@ mod tests {
             std::fs::write(&path, wave_with_sampler_chunks(&chunks)).unwrap();
             let metadata = wav_sampler_metadata(&path).expect("WAVE root metadata should parse");
             assert_eq!(metadata.root_key, Some(72));
+            assert_eq!(metadata.fine_tune_cents, Some(-23.0));
             assert_eq!(metadata.loop_points, None);
         }
 
@@ -1354,6 +1372,32 @@ mod tests {
         .unwrap();
         let metadata = wav_sampler_metadata(&path).expect("valid smpl root should parse");
         assert_eq!(metadata.root_key, Some(60));
+        assert_eq!(metadata.fine_tune_cents, Some(50.0));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reads_wav_smpl_pitch_fraction_as_cents_when_inst_root_is_invalid() {
+        let root = fixture_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("smpl-pitch-fraction.wav");
+        let invalid_instrument = [128, 17, 0, 0, 127, 0, 127];
+        let mut sampler = [0u8; 36];
+        sampler[12..16].copy_from_slice(&60u32.to_le_bytes());
+        sampler[16..20].copy_from_slice(&0x4000_0000u32.to_le_bytes());
+        std::fs::write(
+            &path,
+            wave_with_sampler_chunks(&[
+                ("inst", invalid_instrument.as_slice()),
+                ("smpl", sampler.as_slice()),
+            ]),
+        )
+        .unwrap();
+
+        let metadata = wav_sampler_metadata(&path).expect("valid smpl root should parse");
+        assert_eq!(metadata.root_key, Some(60));
+        assert_eq!(metadata.fine_tune_cents, Some(25.0));
 
         std::fs::remove_dir_all(root).unwrap();
     }

@@ -1762,6 +1762,7 @@ fn prepare_sampler_arrangement(
                     wave_metadata.root_key,
                     options.read_sample_root_note,
                 ),
+                fine_tune_cents: wave_metadata.fine_tune_cents.unwrap_or_default(),
                 loop_bounds,
                 ping_pong_loop: channel.sampler_ping_pong_loop_enabled(),
             });
@@ -1789,6 +1790,7 @@ fn prepare_sampler_arrangement(
                 options.sample_rate,
                 note.key,
                 source.root_key,
+                source.fine_tune_cents,
             ))
         .ceil();
         if !natural_duration.is_finite()
@@ -1856,6 +1858,7 @@ struct SamplerVoiceSource {
     pan: f32,
     reverse: bool,
     root_key: u16,
+    fine_tune_cents: f64,
     loop_bounds: Option<SampleBounds>,
     ping_pong_loop: bool,
 }
@@ -2023,6 +2026,7 @@ fn prepare_sampler_pattern(
                     wave_metadata.root_key,
                     options.read_sample_root_note,
                 ),
+                fine_tune_cents: wave_metadata.fine_tune_cents.unwrap_or_default(),
                 loop_bounds,
                 ping_pong_loop: channel.sampler_ping_pong_loop_enabled(),
             });
@@ -2067,6 +2071,7 @@ fn prepare_sampler_pattern(
                 options.sample_rate,
                 note.key,
                 source.root_key,
+                source.fine_tune_cents,
             ))
         .ceil();
         if !natural_duration.is_finite()
@@ -2294,6 +2299,7 @@ impl<'a> SamplerVoiceEngine<'a> {
             self.output_sample_rate,
             note.key,
             source.root_key,
+            source.fine_tune_cents,
         );
         let source_step = if source.reverse {
             -source_step
@@ -2390,10 +2396,17 @@ fn sampler_pan_gains(pan: f32, mono: bool) -> (f32, f32) {
     }
 }
 
-fn sampler_source_step(source_rate: u32, output_rate: u32, key: u16, root_key: u16) -> f64 {
+fn sampler_source_step(
+    source_rate: u32,
+    output_rate: u32,
+    key: u16,
+    root_key: u16,
+    fine_tune_cents: f64,
+) -> f64 {
     let semitones = (i32::from(key) - i32::from(root_key)).clamp(-48, 48);
     f64::from(source_rate) / f64::from(output_rate.max(1))
         * 2.0f64.powf(f64::from(semitones) / 12.0)
+        * 2.0f64.powf(fine_tune_cents / 1_200.0)
 }
 
 fn resample_sample(
@@ -3291,6 +3304,7 @@ mod tests {
                     pan: -1.0,
                     reverse: false,
                     root_key: SAMPLER_ROOT_KEY,
+                    fine_tune_cents: 0.0,
                     loop_bounds: None,
                     ping_pong_loop: false,
                 },
@@ -3467,6 +3481,7 @@ mod tests {
                 pan: 0.0,
                 reverse: false,
                 root_key: SAMPLER_ROOT_KEY,
+                fine_tune_cents: 0.0,
                 loop_bounds: None,
                 ping_pong_loop: false,
             },
@@ -3509,6 +3524,7 @@ mod tests {
                 pan: -1.0,
                 reverse: true,
                 root_key: SAMPLER_ROOT_KEY,
+                fine_tune_cents: 0.0,
                 loop_bounds: None,
                 ping_pong_loop: false,
             },
@@ -3540,6 +3556,7 @@ mod tests {
                 pan: -1.0,
                 reverse: false,
                 root_key: SAMPLER_ROOT_KEY,
+                fine_tune_cents: 0.0,
                 loop_bounds: Some(SampleBounds { start: 1, end: 4 }),
                 ping_pong_loop: false,
             },
@@ -3577,6 +3594,7 @@ mod tests {
                 pan: -1.0,
                 reverse: false,
                 root_key: SAMPLER_ROOT_KEY,
+                fine_tune_cents: 0.0,
                 loop_bounds: Some(SampleBounds { start: 1, end: 4 }),
                 ping_pong_loop: true,
             },
@@ -3615,6 +3633,7 @@ mod tests {
                 pan: -1.0,
                 reverse: false,
                 root_key: SAMPLER_ROOT_KEY,
+                fine_tune_cents: 0.0,
                 loop_bounds: None,
                 ping_pong_loop: false,
             },
@@ -3648,6 +3667,7 @@ mod tests {
                 pan: -1.0,
                 reverse: false,
                 root_key: 48,
+                fine_tune_cents: 0.0,
                 loop_bounds: None,
                 ping_pong_loop: false,
             },
@@ -3678,6 +3698,17 @@ mod tests {
     }
 
     #[test]
+    fn sampler_source_step_applies_wav_fine_tuning_cents() {
+        let untuned = sampler_source_step(48_000, 48_000, 60, 60, 0.0);
+        let half_semitone_up = sampler_source_step(48_000, 48_000, 60, 60, 50.0);
+        let half_semitone_down = sampler_source_step(48_000, 48_000, 60, 60, -50.0);
+
+        assert_eq!(untuned, 1.0);
+        assert!((half_semitone_up - 2.0f64.powf(0.5 / 12.0)).abs() < 1e-12);
+        assert!((half_semitone_down - 2.0f64.powf(-0.5 / 12.0)).abs() < 1e-12);
+    }
+
+    #[test]
     fn zero_length_sampler_note_plays_the_sample_to_its_end() {
         let source = Arc::new(DecodedAudio {
             sample_rate: 4,
@@ -3691,6 +3722,7 @@ mod tests {
                 pan: -1.0,
                 reverse: false,
                 root_key: SAMPLER_ROOT_KEY,
+                fine_tune_cents: 0.0,
                 loop_bounds: None,
                 ping_pong_loop: false,
             },
@@ -3732,6 +3764,7 @@ mod tests {
                     pan: -1.0,
                     reverse: false,
                     root_key: SAMPLER_ROOT_KEY,
+                    fine_tune_cents: 0.0,
                     loop_bounds: None,
                     ping_pong_loop: false,
                 },
@@ -3744,6 +3777,7 @@ mod tests {
                     pan: -1.0,
                     reverse: false,
                     root_key: SAMPLER_ROOT_KEY,
+                    fine_tune_cents: 0.0,
                     loop_bounds: None,
                     ping_pong_loop: false,
                 },
