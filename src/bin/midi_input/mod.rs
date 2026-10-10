@@ -319,6 +319,7 @@ pub struct MidiPatternRecorder {
     project_path: Option<PathBuf>,
     ppq: u16,
     tempo_bpm: f64,
+    snap_ticks: Option<u32>,
     started_at: Instant,
     timestamp_origin_micros: Option<u64>,
     active_notes: BTreeMap<(u8, u8), VecDeque<(u32, u8)>>,
@@ -335,6 +336,7 @@ impl MidiPatternRecorder {
         project_path: Option<PathBuf>,
         ppq: u16,
         tempo_bpm: f64,
+        snap_ticks: Option<u32>,
         started_at: Instant,
     ) -> Result<Self, &'static str> {
         if ppq == 0 {
@@ -343,12 +345,16 @@ impl MidiPatternRecorder {
         if !tempo_bpm.is_finite() || tempo_bpm <= 0.0 {
             return Err("MIDI recording requires a positive project tempo");
         }
+        if snap_ticks == Some(0) {
+            return Err("MIDI recording snap requires a non-zero tick value");
+        }
         Ok(Self {
             pattern_id,
             channel_id,
             project_path,
             ppq,
             tempo_bpm,
+            snap_ticks,
             started_at,
             timestamp_origin_micros: None,
             active_notes: BTreeMap::new(),
@@ -471,7 +477,8 @@ impl MidiPatternRecorder {
         key: u8,
         velocity: u8,
     ) -> PatternNote {
-        let position = start_tick.min(MAX_NOTE_TICK);
+        let position = quantize_recording_tick(start_tick, self.snap_ticks);
+        let end_tick = quantize_recording_tick(end_tick, self.snap_ticks);
         PatternNote {
             position,
             channel_id: self.channel_id,
@@ -482,6 +489,16 @@ impl MidiPatternRecorder {
             ..PatternNote::default()
         }
     }
+}
+
+fn quantize_recording_tick(tick: u32, snap_ticks: Option<u32>) -> u32 {
+    let tick = u64::from(tick.min(MAX_NOTE_TICK));
+    let Some(quantum) = snap_ticks.filter(|quantum| *quantum > 1) else {
+        return tick as u32;
+    };
+    let quantum = u64::from(quantum);
+    let rounded = tick.saturating_add(quantum / 2) / quantum * quantum;
+    rounded.min(u64::from(MAX_NOTE_TICK)) as u32
 }
 
 #[cfg(test)]
@@ -557,6 +574,7 @@ mod tests {
             Some(PathBuf::from("song.flp")),
             96,
             120.0,
+            None,
             started_at,
         )
         .expect("valid project timing should create a recorder");
@@ -593,7 +611,7 @@ mod tests {
     #[test]
     fn closes_held_notes_when_recording_stops() {
         let started_at = Instant::now();
-        let mut recorder = MidiPatternRecorder::new(1, 2, None, 96, 120.0, started_at)
+        let mut recorder = MidiPatternRecorder::new(1, 2, None, 96, 120.0, None, started_at)
             .expect("valid project timing should create a recorder");
         recorder.record(ReceivedMidiMessage {
             timestamp_micros: 110_000,
@@ -607,5 +625,43 @@ mod tests {
         let result = recorder.finish(None, started_at + Duration::from_millis(600));
         assert_eq!(result.notes.len(), 1);
         assert_eq!(result.notes[0].length, 96);
+    }
+
+    #[test]
+    fn quantizes_recorded_note_start_and_end_to_the_nearest_grid() {
+        let started_at = Instant::now();
+        let mut recorder = MidiPatternRecorder::new(1, 2, None, 96, 120.0, Some(24), started_at)
+            .expect("valid project timing and snap should create a recorder");
+        recorder.record(ReceivedMidiMessage {
+            timestamp_micros: 1_135_417,
+            received_at: started_at + Duration::from_micros(135_417),
+            event: MidiInputEvent::NoteOn {
+                channel: 0,
+                key: 60,
+                velocity: 90,
+            },
+        });
+        recorder.record(ReceivedMidiMessage {
+            timestamp_micros: 1_364_583,
+            received_at: started_at + Duration::from_micros(364_583),
+            event: MidiInputEvent::NoteOff {
+                channel: 0,
+                key: 60,
+                velocity: 0,
+            },
+        });
+
+        let result = recorder.finish(None, started_at + Duration::from_millis(500));
+        assert_eq!(result.notes.len(), 1);
+        assert_eq!(result.notes[0].position, 24);
+        assert_eq!(result.notes[0].length, 48);
+    }
+
+    #[test]
+    fn rejects_a_zero_length_recording_snap() {
+        assert!(matches!(
+            MidiPatternRecorder::new(1, 2, None, 96, 120.0, Some(0), Instant::now()),
+            Err("MIDI recording snap requires a non-zero tick value")
+        ));
     }
 }

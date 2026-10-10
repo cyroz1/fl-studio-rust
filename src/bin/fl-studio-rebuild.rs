@@ -1633,6 +1633,7 @@ struct DawUi {
     midi_reported_dropped_messages: u64,
     midi_activity: Option<(String, Instant)>,
     midi_recording: Option<MidiPatternRecorder>,
+    midi_record_snap: PianoRollSnap,
     midi_record_toggle_requested: bool,
     midi_input_refresh_requested: bool,
     midi_input_toggle_requested: bool,
@@ -1951,6 +1952,7 @@ impl DawUi {
             midi_reported_dropped_messages: 0,
             midi_activity: None,
             midi_recording: None,
+            midi_record_snap: PianoRollSnap::None,
             midi_record_toggle_requested: false,
             midi_input_refresh_requested: false,
             midi_input_toggle_requested: false,
@@ -16542,12 +16544,19 @@ impl DawUi {
             self.status = "Add a channel before recording MIDI notes".to_owned();
             return;
         };
+        let snap_ticks = (self.midi_record_snap != PianoRollSnap::None).then(|| {
+            self.midi_record_snap.ticks(
+                document.header().ppq(),
+                document.metadata().time_signature(),
+            )
+        });
         match MidiPatternRecorder::new(
             pattern_id,
             channel_id,
             self.current_path.clone(),
             document.header().ppq(),
             self.tempo_bpm,
+            snap_ticks,
             Instant::now(),
         ) {
             Ok(recorder) => {
@@ -16811,6 +16820,25 @@ impl DawUi {
             {
                 self.midi_input_toggle_requested = true;
             }
+        });
+        ui.horizontal(|ui| {
+            ui.add_enabled_ui(self.midi_recording.is_none(), |ui| {
+                ui.label("Input quantize");
+                egui::ComboBox::from_id_salt("midi_input_quantize")
+                    .selected_text(self.midi_record_snap.label())
+                    .width(140.0)
+                    .show_ui(ui, |ui| {
+                        for snap in PianoRollSnap::ALL {
+                            ui.selectable_value(&mut self.midi_record_snap, snap, snap.label());
+                        }
+                    });
+            });
+            ui.label(
+                egui::RichText::new(
+                    "Round note starts and ends to the nearest grid; None keeps timing as played.",
+                )
+                .color(MUTED),
+            );
         });
         if let Some(connection) = &self.midi_input_connection {
             ui.label(
