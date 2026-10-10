@@ -6649,6 +6649,7 @@ impl DawUi {
         self.poll_audio_waveforms(ui.ctx());
 
         let mut create_pattern_clip_requested = false;
+        let mut delete_clip_requested = None;
         ui.horizontal_wrapped(|ui| {
             ui.label("Arrangement");
             ui.strong(arrangement.name.as_deref().unwrap_or("Arrangement"));
@@ -6954,6 +6955,12 @@ impl DawUi {
                             } else {
                                 response
                             };
+                            response.context_menu(|ui| {
+                                if ui.button("Delete clip").clicked() {
+                                    delete_clip_requested = Some(clip_index);
+                                    ui.close();
+                                }
+                            });
                             if response.clicked() {
                                 self.selected_arrangement = Some(arrangement.id);
                                 self.selected_clip = Some(clip_index);
@@ -6994,7 +7001,24 @@ impl DawUi {
                 }
             });
 
-        let mut created_pattern_clip = false;
+        let mut playlist_clip_list_changed = false;
+        if let Some(clip_index) = delete_clip_requested {
+            let deleted = self.document.as_mut().is_some_and(|document| {
+                document
+                    .delete_playlist_clip(arrangement.id, clip_index)
+                    .is_ok()
+            });
+            if deleted {
+                self.stop_project_playback();
+                self.selected_clip = None;
+                self.dirty = true;
+                self.status = format!("Deleted Playlist clip {}", clip_index + 1);
+                playlist_clip_list_changed = true;
+            } else {
+                self.status = "Could not delete the selected Playlist clip".to_owned();
+            }
+        }
+
         if create_pattern_clip_requested
             && let Some(pattern_id) = selected_pattern_id
             && let Some(document) = self.document.as_mut()
@@ -7013,15 +7037,49 @@ impl DawUi {
                     self.selected_clip = Some(clip_index);
                     self.dirty = true;
                     self.status = format!("Added Pattern {pattern_id} to the Playlist");
-                    created_pattern_clip = true;
+                    playlist_clip_list_changed = true;
                 }
                 Err(error) => {
                     self.status = format!("Could not add a Pattern Clip: {error}");
                 }
             }
         }
-        if !created_pattern_clip {
+        if !playlist_clip_list_changed {
             self.selected_clip_editor(ui, arrangement.id, &arrangement.clips);
+        }
+    }
+
+    fn delete_selected_playlist_clip(&mut self) {
+        let Some(clip_index) = self.selected_clip else {
+            return;
+        };
+        let arrangement_id = self.selected_arrangement.or_else(|| {
+            self.document
+                .as_ref()?
+                .arrangements()
+                .ok()?
+                .first()
+                .map(|arrangement| arrangement.id)
+        });
+        let Some(arrangement_id) = arrangement_id else {
+            self.status = "No Playlist arrangement is selected".to_owned();
+            return;
+        };
+        let result = self
+            .document
+            .as_mut()
+            .map(|document| document.delete_playlist_clip(arrangement_id, clip_index));
+        match result {
+            Some(Ok(())) => {
+                self.stop_project_playback();
+                self.selected_clip = None;
+                self.dirty = true;
+                self.status = format!("Deleted Playlist clip {}", clip_index + 1);
+            }
+            Some(Err(error)) => {
+                self.status = format!("Could not delete Playlist clip: {error}");
+            }
+            None => self.status = "Open a project to delete a Playlist clip".to_owned(),
         }
     }
 
@@ -14311,6 +14369,16 @@ impl eframe::App for DawUi {
         } else {
             None
         };
+        let delete_playlist_clip_requested = self.view == MainView::Playlist
+            && self.selected_clip.is_some()
+            && !ui.ctx().egui_wants_keyboard_input()
+            && ui.input_mut(|input| {
+                input.consume_key(egui::Modifiers::NONE, egui::Key::Delete)
+                    || input.consume_key(egui::Modifiers::NONE, egui::Key::Backspace)
+            });
+        if delete_playlist_clip_requested {
+            self.delete_selected_playlist_clip();
+        }
         self.poll_audio_clip_export();
         self.poll_project_audio_render();
         self.poll_song_render();

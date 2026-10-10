@@ -3308,6 +3308,67 @@ impl FlpDocument {
         Ok(template_index.saturating_add(1))
     }
 
+    /// Removes one Playlist clip's complete stored record without rewriting its neighbors.
+    pub fn delete_playlist_clip(
+        &mut self,
+        arrangement_id: u16,
+        clip_index: usize,
+    ) -> Result<(), FlpError> {
+        let arrangements = self.arrangements()?;
+        let mut matching_arrangements = arrangements
+            .iter()
+            .filter(|arrangement| arrangement.id == arrangement_id);
+        let Some(arrangement) = matching_arrangements.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested arrangement does not exist",
+            ));
+        };
+        if matching_arrangements.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested arrangement id is ambiguous",
+            ));
+        }
+        let Some(clip) = arrangement.clips.get(clip_index) else {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested playlist clip does not exist",
+            ));
+        };
+
+        let record_size = clip.record_size;
+        let record_start = clip
+            .source_record_index
+            .checked_mul(record_size)
+            .ok_or(FlpError::LengthOverflow)?;
+        let record_end = record_start
+            .checked_add(record_size)
+            .ok_or(FlpError::LengthOverflow)?;
+        let event_index = clip.source_event_index;
+        let event = self
+            .events
+            .get(event_index)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the Playlist clip event no longer exists",
+            ))?;
+        if event.opcode != 0xE9 || !matches!(event.encoding, PayloadEncoding::Data { .. }) {
+            return Err(FlpError::UnsupportedEdit(
+                "the Playlist clip is not in a length-prefixed data event",
+            ));
+        }
+        if record_end > event.payload.len() || !event.payload.len().is_multiple_of(record_size) {
+            return Err(FlpError::UnsupportedEdit(
+                "the Playlist clip record does not fit its event payload",
+            ));
+        }
+
+        let mut candidate = self.clone();
+        let mut payload = event.payload.clone();
+        payload.drain(record_start..record_end);
+        candidate.events[event_index].replace_data_payload(payload)?;
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
     /// Duplicates one clip's complete stored record into the same Playlist event.
     /// The duplicate is inserted immediately after the source record.
     pub fn duplicate_playlist_clip(
@@ -8146,6 +8207,60 @@ mod tests {
                 .is_err()
         );
         assert_eq!(document.encode_lossless().unwrap(), input);
+    }
+
+    #[test]
+    fn deletes_playlist_clip_records_without_rewriting_their_neighbors() {
+        let mut first = [0xA5; 80];
+        first[4..6].copy_from_slice(&0x5000u16.to_le_bytes());
+        first[6..8].copy_from_slice(&0x5007u16.to_le_bytes());
+        first[8..12].copy_from_slice(&960u32.to_le_bytes());
+        first[12..14].copy_from_slice(&499u16.to_le_bytes());
+        first[20..24].copy_from_slice(&[0x40, 0x64, 0x80, 0x80]);
+        first[24..28].copy_from_slice(&0.0f32.to_le_bytes());
+        first[28..32].copy_from_slice(&1.0f32.to_le_bytes());
+        let mut second = first;
+        second[0..4].copy_from_slice(&1920u32.to_le_bytes());
+        second[6..8].copy_from_slice(&0x5008u16.to_le_bytes());
+
+        let mut clips_payload = first.to_vec();
+        clips_payload.extend_from_slice(&second);
+        let mut event_stream = Vec::new();
+        append_data_event(&mut event_stream, 0xC7, b"26.0.0\0");
+        event_stream.extend_from_slice(&[0x63, 3, 0]);
+        append_data_event(&mut event_stream, 0xE9, &clips_payload);
+        let input = flp_fixture(&event_stream, &[0xA1], &[0xB2]);
+        let mut document = FlpDocument::parse(&input).expect("the project fixture should parse");
+
+        assert!(document.delete_playlist_clip(3, 2).is_err());
+        assert_eq!(document.encode_lossless().unwrap(), input);
+
+        document
+            .delete_playlist_clip(3, 0)
+            .expect("the first clip should be removable");
+        let arrangements = document
+            .arrangements()
+            .expect("the Playlist should decode after deletion");
+        assert_eq!(arrangements[0].clips.len(), 1);
+        assert_eq!(
+            arrangements[0].clips[0].target(),
+            PlaylistClipTarget::Pattern { id: 8 }
+        );
+        let clip_event = document
+            .events()
+            .iter()
+            .find(|event| event.opcode() == 0xE9)
+            .expect("the Playlist event should remain present");
+        assert_eq!(clip_event.payload(), second);
+
+        document
+            .delete_playlist_clip(3, 0)
+            .expect("the final clip should be removable");
+        assert!(document.arrangements().unwrap()[0].clips.is_empty());
+        let encoded = document
+            .encode_lossless()
+            .expect("the empty Playlist should encode");
+        FlpDocument::parse(&encoded).expect("the edited project should parse again");
     }
 
     #[test]
