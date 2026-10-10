@@ -1698,6 +1698,7 @@ struct DawUi {
     channel_vst3_instances: BTreeMap<u16, u64>,
     audio_catalog: AudioDeviceCatalog,
     audio_settings: AudioSettings,
+    live_resampling_quality: ResamplingQuality,
     read_sample_root_note: bool,
     audio_engine: Option<AudioEngine>,
     audio_recording: Option<AudioRecordingSession>,
@@ -1885,6 +1886,7 @@ impl DawUi {
         if let Some(rate) = audio_catalog.default_sample_rate {
             audio_settings.sample_rate = rate;
         }
+        let live_resampling_quality = load_live_resampling_quality();
         let read_sample_root_note = load_read_sample_root_note();
         let browser_path = initial_project
             .as_deref()
@@ -2058,6 +2060,7 @@ impl DawUi {
             channel_vst3_instances: BTreeMap::new(),
             audio_catalog,
             audio_settings,
+            live_resampling_quality,
             read_sample_root_note,
             audio_engine: None,
             audio_recording: None,
@@ -4087,6 +4090,7 @@ impl DawUi {
         let options = PlaylistRenderOptions {
             arrangement_id: self.selected_arrangement.unwrap_or(0),
             sample_rate,
+            resampling_quality: self.live_resampling_quality,
             tail_seconds: 2,
             soloed_playlist_track_range: self.soloed_playlist_track_range,
             read_sample_root_note: self.read_sample_root_note,
@@ -14690,6 +14694,7 @@ impl DawUi {
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
         let read_sample_root_note = self.read_sample_root_note;
+        let resampling_quality = self.live_resampling_quality;
         let (sender, receiver) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
             .name("sampler-note-preview".to_owned())
@@ -14703,6 +14708,7 @@ impl DawUi {
                             SamplerPatternRenderOptions {
                                 pattern_id,
                                 sample_rate: device_rate,
+                                resampling_quality,
                                 read_sample_root_note,
                                 ..SamplerPatternRenderOptions::default()
                             },
@@ -14927,6 +14933,7 @@ impl DawUi {
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
         let read_sample_root_note = self.read_sample_root_note;
+        let resampling_quality = self.live_resampling_quality;
         let (sender, receiver) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
             .name("sampler-pattern-stream".to_owned())
@@ -14940,6 +14947,7 @@ impl DawUi {
                             SamplerPatternRenderOptions {
                                 pattern_id,
                                 sample_rate: device_rate,
+                                resampling_quality,
                                 read_sample_root_note,
                                 ..SamplerPatternRenderOptions::default()
                             },
@@ -14998,6 +15006,7 @@ impl DawUi {
         let options = AudioClipRenderOptions {
             arrangement_id: self.selected_arrangement.unwrap_or_default(),
             sample_rate: self.audio_settings.sample_rate,
+            resampling_quality: self.playlist_render_quality,
             soloed_playlist_track_range: self.soloed_playlist_track_range,
             ..AudioClipRenderOptions::default()
         };
@@ -15044,6 +15053,7 @@ impl DawUi {
         let options = AudioClipRenderOptions {
             arrangement_id,
             sample_rate: self.audio_settings.sample_rate,
+            resampling_quality: self.playlist_render_quality,
             clip_index: Some(clip_index),
             start_from_song_start,
             soloed_playlist_track_range: self.soloed_playlist_track_range,
@@ -15338,6 +15348,7 @@ impl DawUi {
         let options = SamplerPatternRenderOptions {
             pattern_id,
             sample_rate: self.audio_settings.sample_rate,
+            resampling_quality: self.playlist_render_quality,
             read_sample_root_note: self.read_sample_root_note,
             ..SamplerPatternRenderOptions::default()
         };
@@ -18667,6 +18678,38 @@ impl DawUi {
             ui.checkbox(&mut self.audio_settings.enable_input, "Enable input");
             ui.checkbox(&mut self.audio_settings.enable_output, "Enable output");
         });
+        let mut resampling_quality_changed = false;
+        ui.horizontal(|ui| {
+            ui.label("Live resampling");
+            egui::ComboBox::from_id_salt("live-audio-resampling-quality")
+                .selected_text(self.live_resampling_quality.label())
+                .show_ui(ui, |ui| {
+                    for quality in [
+                        ResamplingQuality::Linear,
+                        ResamplingQuality::Hermite6,
+                        ResamplingQuality::Sinc64,
+                    ] {
+                        resampling_quality_changed |= ui
+                            .selectable_value(
+                                &mut self.live_resampling_quality,
+                                quality,
+                                quality.label(),
+                            )
+                            .changed();
+                    }
+                });
+        });
+        ui.label(
+            egui::RichText::new(
+                "Applies to the next live Playlist or Sampler playback. Higher quality uses more CPU; the Playlist render has its own setting.",
+            )
+            .color(MUTED),
+        );
+        if resampling_quality_changed
+            && let Err(error) = save_live_resampling_quality(self.live_resampling_quality)
+        {
+            self.status = format!("Could not save live resampling quality: {error}");
+        }
         let root_note_preference_changed = ui
             .checkbox(&mut self.read_sample_root_note, "Read sample root note")
             .on_hover_text(
@@ -20437,6 +20480,31 @@ fn read_sample_root_note_settings_file() -> Option<PathBuf> {
     browser_favorites_file()?
         .parent()
         .map(|directory| directory.join("read-sample-root-note.txt"))
+}
+
+fn live_resampling_quality_settings_file() -> Option<PathBuf> {
+    browser_favorites_file()?
+        .parent()
+        .map(|directory| directory.join("live-resampling-quality.txt"))
+}
+
+fn load_live_resampling_quality() -> ResamplingQuality {
+    live_resampling_quality_settings_file()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|contents| ResamplingQuality::from_settings_key(contents.trim()))
+        .unwrap_or(ResamplingQuality::Linear)
+}
+
+fn save_live_resampling_quality(quality: ResamplingQuality) -> Result<(), String> {
+    let path = live_resampling_quality_settings_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the live resampling setting path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(&path, format!("{}\n", quality.settings_key()))
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
 }
 
 fn load_read_sample_root_note() -> bool {

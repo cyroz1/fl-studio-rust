@@ -41,6 +41,7 @@ fn resolve_sampler_root_key(
 pub struct AudioClipRenderOptions {
     pub arrangement_id: u16,
     pub sample_rate: u32,
+    pub resampling_quality: ResamplingQuality,
     /// Render only this zero-based arrangement clip, rebased to output time zero.
     pub clip_index: Option<usize>,
     /// Keep the selected clip at its original arrangement position in the output.
@@ -54,6 +55,7 @@ impl Default for AudioClipRenderOptions {
         Self {
             arrangement_id: 0,
             sample_rate: DEFAULT_SAMPLE_RATE,
+            resampling_quality: ResamplingQuality::Linear,
             clip_index: None,
             start_from_song_start: false,
             soloed_playlist_track_range: None,
@@ -66,6 +68,7 @@ pub struct SamplerPatternRenderOptions {
     pub pattern_id: u16,
     pub sample_rate: u32,
     pub voice_limit: usize,
+    pub resampling_quality: ResamplingQuality,
     pub read_sample_root_note: bool,
 }
 
@@ -75,6 +78,7 @@ impl Default for SamplerPatternRenderOptions {
             pattern_id: 0,
             sample_rate: DEFAULT_SAMPLE_RATE,
             voice_limit: DEFAULT_SAMPLER_VOICE_LIMIT,
+            resampling_quality: ResamplingQuality::Linear,
             read_sample_root_note: true,
         }
     }
@@ -163,6 +167,23 @@ impl ResamplingQuality {
             Self::Linear => "Linear",
             Self::Hermite6 => "6-point Hermite",
             Self::Sinc64 => "64-point sinc",
+        }
+    }
+
+    pub const fn settings_key(self) -> &'static str {
+        match self {
+            Self::Linear => "linear",
+            Self::Hermite6 => "hermite6",
+            Self::Sinc64 => "sinc64",
+        }
+    }
+
+    pub fn from_settings_key(key: &str) -> Option<Self> {
+        match key {
+            "linear" => Some(Self::Linear),
+            "hermite6" => Some(Self::Hermite6),
+            "sinc64" => Some(Self::Sinc64),
+            _ => None,
         }
     }
 }
@@ -461,6 +482,7 @@ pub fn stream_playlist_with_vst3_to_device_from_frame(
         AudioClipRenderOptions {
             arrangement_id: options.arrangement_id,
             sample_rate: options.sample_rate,
+            resampling_quality: options.resampling_quality,
             clip_index: None,
             start_from_song_start: false,
             soloed_playlist_track_range: options.soloed_playlist_track_range,
@@ -565,6 +587,7 @@ pub fn render_playlist_with_vst3_to_wav_cancellable(
         AudioClipRenderOptions {
             arrangement_id: options.arrangement_id,
             sample_rate: options.sample_rate,
+            resampling_quality: options.resampling_quality,
             clip_index: None,
             start_from_song_start: false,
             soloed_playlist_track_range: options.soloed_playlist_track_range,
@@ -1033,12 +1056,13 @@ fn stream_prepared_sampler_pattern(
     let release_frames = (f64::from(render.summary.sample_rate) * SAMPLER_RELEASE_SECONDS)
         .round()
         .max(1.0) as usize;
-    let mut engine = SamplerVoiceEngine::new(
+    let mut engine = SamplerVoiceEngine::with_resampling_quality(
         &render.sources_by_channel,
         &render.notes,
         render.voice_limit,
         release_frames,
         render.summary.sample_rate,
+        render.resampling_quality,
     );
     let mut block = vec![0.0f32; SAMPLER_BLOCK_FRAMES * 2];
     let mut block_start = 0u64;
@@ -1086,12 +1110,13 @@ fn stream_prepared_audio_clip_render(
                 .decoded_by_path
                 .get(&clip.path)
                 .expect("prepared clips have decoded sources");
-            mix_clip_window_into_stereo(
+            mix_clip_window_into_stereo_with_quality(
                 &mut block,
                 block_start,
                 audio,
                 clip,
                 output_rate,
+                render.resampling_quality,
                 Some(cancelled),
             )
             .map_err(|error| {
@@ -1143,14 +1168,21 @@ fn render_audio_clips_to_stereo_buffer_inner(
             .decoded_by_path
             .get(&clip.path)
             .expect("prepared clips have decoded sources");
-        mix_clip_into_stereo(&mut mix, audio, clip, options.sample_rate, cancelled).map_err(
-            |error| {
-                format!(
-                    "could not mix Playlist clip {} from audio channel {}: {error}",
-                    clip.clip_index, clip.channel_id
-                )
-            },
-        )?;
+        mix_clip_window_into_stereo_with_quality(
+            &mut mix,
+            0,
+            audio,
+            clip,
+            options.sample_rate,
+            options.resampling_quality,
+            cancelled,
+        )
+        .map_err(|error| {
+            format!(
+                "could not mix Playlist clip {} from audio channel {}: {error}",
+                clip.clip_index, clip.channel_id
+            )
+        })?;
     }
 
     Ok((mix, render.summary))
@@ -1358,6 +1390,7 @@ fn prepare_audio_clip_render(
             clips_skipped_unsupported_scale,
             source_files: decoded_by_path.len(),
         },
+        resampling_quality: options.resampling_quality,
         decoded_by_path,
         clips,
     })
@@ -1851,6 +1884,7 @@ struct PreparedSamplerPattern {
     notes: Vec<ScheduledSamplerNote>,
     sources_by_channel: HashMap<u16, SamplerVoiceSource>,
     voice_limit: usize,
+    resampling_quality: ResamplingQuality,
 }
 
 #[derive(Clone)]
@@ -2133,6 +2167,7 @@ fn prepare_sampler_pattern(
         notes,
         sources_by_channel,
         voice_limit: options.voice_limit,
+        resampling_quality: options.resampling_quality,
     })
 }
 
@@ -2539,6 +2574,7 @@ struct PreparedClip {
 
 struct PreparedAudioClipRender {
     summary: AudioClipRenderSummary,
+    resampling_quality: ResamplingQuality,
     decoded_by_path: HashMap<PathBuf, DecodedAudio>,
     clips: Vec<PreparedClip>,
 }
@@ -2980,6 +3016,21 @@ mod tests {
     }
 
     #[test]
+    fn resampling_quality_settings_keys_round_trip() {
+        for quality in [
+            ResamplingQuality::Linear,
+            ResamplingQuality::Hermite6,
+            ResamplingQuality::Sinc64,
+        ] {
+            assert_eq!(
+                ResamplingQuality::from_settings_key(quality.settings_key()),
+                Some(quality)
+            );
+        }
+        assert_eq!(ResamplingQuality::from_settings_key("unknown"), None);
+    }
+
+    #[test]
     fn selected_audio_clip_is_filtered_and_rebased_to_time_zero() {
         assert!(audio_clip_matches_selection(None, 0));
         assert!(audio_clip_matches_selection(Some(2), 2));
@@ -3319,6 +3370,7 @@ mod tests {
                 clips_skipped_unsupported_scale: 0,
                 source_files: 1,
             },
+            resampling_quality: ResamplingQuality::Linear,
             decoded_by_path: HashMap::from([(
                 path.clone(),
                 DecodedAudio {
@@ -3491,6 +3543,7 @@ mod tests {
                 clips_skipped_unsupported_scale: 0,
                 source_files: 1,
             },
+            resampling_quality: ResamplingQuality::Linear,
             decoded_by_path: HashMap::from([(path, source.clone())]),
             clips: vec![clip.clone()],
         };
