@@ -3810,6 +3810,230 @@ impl FlpDocument {
         Ok(clip_index.saturating_add(1))
     }
 
+    /// Joins two contiguous, un-stretched Audio Clips that play adjacent source windows.
+    /// The left record is kept and extended; the right record is removed. Both clips must be
+    /// in the same Playlist data event and have matching opaque clip fields.
+    pub fn join_adjacent_playlist_audio_clips(
+        &mut self,
+        arrangement_id: u16,
+        left_clip_index: usize,
+        right_clip_index: usize,
+    ) -> Result<usize, FlpError> {
+        if left_clip_index == right_clip_index {
+            return Err(FlpError::UnsupportedEdit(
+                "joining requires two different Playlist Audio Clips",
+            ));
+        }
+        let arrangements = self.arrangements()?;
+        let mut matching_arrangements = arrangements
+            .iter()
+            .filter(|arrangement| arrangement.id == arrangement_id);
+        let Some(arrangement) = matching_arrangements.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested arrangement does not exist",
+            ));
+        };
+        if matching_arrangements.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested arrangement id is ambiguous",
+            ));
+        }
+        let Some(left_clip) = arrangement.clips.get(left_clip_index) else {
+            return Err(FlpError::UnsupportedEdit(
+                "the left Playlist Audio Clip does not exist",
+            ));
+        };
+        let Some(right_clip) = arrangement.clips.get(right_clip_index) else {
+            return Err(FlpError::UnsupportedEdit(
+                "the right Playlist Audio Clip does not exist",
+            ));
+        };
+        let (
+            PlaylistClipTarget::Channel {
+                id: left_channel_id,
+            },
+            PlaylistClipTarget::Channel {
+                id: right_channel_id,
+            },
+        ) = (left_clip.target(), right_clip.target())
+        else {
+            return Err(FlpError::UnsupportedEdit(
+                "only Playlist Audio Clips can be joined",
+            ));
+        };
+        if left_channel_id != right_channel_id {
+            return Err(FlpError::UnsupportedEdit(
+                "joined Audio Clips must use the same sample channel",
+            ));
+        }
+        let channels = self.channels();
+        let mut matching_channels = channels
+            .iter()
+            .filter(|channel| channel.id() == left_channel_id);
+        let Some(channel) = matching_channels.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the Playlist Audio Clip channel does not exist",
+            ));
+        };
+        if matching_channels.next().is_some() || channel.kind() != Some(4) {
+            return Err(FlpError::UnsupportedEdit(
+                "the Playlist clips do not target one unambiguous Audio Clip channel",
+            ));
+        }
+        if left_clip.raw_track_index != right_clip.raw_track_index {
+            return Err(FlpError::UnsupportedEdit(
+                "joined Audio Clips must be on the same Playlist track",
+            ));
+        }
+        if left_clip.record_size != right_clip.record_size
+            || left_clip.source_event_index != right_clip.source_event_index
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "joined Audio Clips must use the same Playlist record event and layout",
+            ));
+        }
+        if left_clip.pattern_base != right_clip.pattern_base
+            || left_clip.item_index != right_clip.item_index
+            || left_clip.track_index != right_clip.track_index
+            || left_clip.group != right_clip.group
+            || left_clip.unknown_word != right_clip.unknown_word
+            || left_clip.item_flags != right_clip.item_flags
+            || left_clip.header_bytes != right_clip.header_bytes
+            || left_clip.clip_id != right_clip.clip_id
+            || left_clip.reserved != right_clip.reserved
+            || left_clip.scale != right_clip.scale
+            || left_clip.trailing_bytes != right_clip.trailing_bytes
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "joined Audio Clips must have matching clip properties",
+            ));
+        }
+        let default_scale = |clip: &PlaylistClip| {
+            clip.scale
+                .is_none_or(|scale| scale.is_finite() && (scale - 1.0).abs() <= 1e-9)
+        };
+        if !default_scale(left_clip) || !default_scale(right_clip) {
+            return Err(FlpError::UnsupportedEdit(
+                "Playlist Audio Clips with a non-default or invalid scale cannot be joined",
+            ));
+        }
+        let left_end_ticks = left_clip
+            .position_ticks
+            .checked_add(left_clip.length_ticks)
+            .ok_or(FlpError::LengthOverflow)?;
+        if left_clip.length_ticks == 0 || right_clip.length_ticks == 0 {
+            return Err(FlpError::UnsupportedEdit(
+                "joined Audio Clips must have nonzero timeline lengths",
+            ));
+        }
+        if left_end_ticks != right_clip.position_ticks {
+            return Err(FlpError::UnsupportedEdit(
+                "joined Audio Clips must touch on the Playlist timeline",
+            ));
+        }
+        if !left_clip.start_offset.is_finite()
+            || !left_clip.end_offset.is_finite()
+            || !right_clip.start_offset.is_finite()
+            || !right_clip.end_offset.is_finite()
+            || left_clip.start_offset < 0.0
+            || right_clip.start_offset < 0.0
+            || left_clip.end_offset <= left_clip.start_offset
+            || right_clip.end_offset <= right_clip.start_offset
+            || left_clip.end_offset.to_bits() != right_clip.start_offset.to_bits()
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "joined Audio Clips must have contiguous, supported sample windows",
+            ));
+        }
+        let merged_end_ticks = right_clip
+            .position_ticks
+            .checked_add(right_clip.length_ticks)
+            .ok_or(FlpError::LengthOverflow)?;
+        let merged_length_ticks = merged_end_ticks
+            .checked_sub(left_clip.position_ticks)
+            .ok_or(FlpError::LengthOverflow)?;
+        let tempo_channel_ids = channels
+            .iter()
+            .filter(|candidate| {
+                candidate.kind() == Some(5)
+                    && candidate
+                        .display_name()
+                        .is_some_and(|name| name.eq_ignore_ascii_case("TEMPO"))
+            })
+            .map(ChannelSummary::id)
+            .collect::<HashSet<_>>();
+        if arrangement.clips.iter().any(|candidate| {
+            let PlaylistClipTarget::Channel { id } = candidate.target() else {
+                return false;
+            };
+            tempo_channel_ids.contains(&id)
+                && candidate.position_ticks < merged_end_ticks
+                && candidate
+                    .position_ticks
+                    .saturating_add(candidate.length_ticks)
+                    > left_clip.position_ticks
+        }) {
+            return Err(FlpError::UnsupportedEdit(
+                "joining Audio Clips across Playlist tempo automation is unsupported",
+            ));
+        }
+
+        let record_size = left_clip.record_size;
+        let left_record_start = left_clip
+            .source_record_index
+            .checked_mul(record_size)
+            .ok_or(FlpError::LengthOverflow)?;
+        let left_record_end = left_record_start
+            .checked_add(record_size)
+            .ok_or(FlpError::LengthOverflow)?;
+        let right_record_start = right_clip
+            .source_record_index
+            .checked_mul(record_size)
+            .ok_or(FlpError::LengthOverflow)?;
+        let right_record_end = right_record_start
+            .checked_add(record_size)
+            .ok_or(FlpError::LengthOverflow)?;
+        let event_index = left_clip.source_event_index;
+        let event = self
+            .events
+            .get(event_index)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the Playlist Audio Clip event no longer exists",
+            ))?;
+        if event.opcode != 0xE9
+            || !matches!(event.encoding, PayloadEncoding::Data { .. })
+            || left_record_end > event.payload.len()
+            || right_record_end > event.payload.len()
+            || !event.payload.len().is_multiple_of(record_size)
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "the Playlist Audio Clip records do not fit their event payload",
+            ));
+        }
+        if left_record_start == right_record_start {
+            return Err(FlpError::UnsupportedEdit(
+                "the Playlist Audio Clip records are not distinct",
+            ));
+        }
+
+        let mut candidate = self.clone();
+        let mut payload = event.payload.clone();
+        payload[left_record_start + 8..left_record_start + 12]
+            .copy_from_slice(&merged_length_ticks.to_le_bytes());
+        payload[left_record_start + 28..left_record_start + 32]
+            .copy_from_slice(&right_clip.end_offset.to_le_bytes());
+        payload.drain(right_record_start..right_record_end);
+        candidate.events[event_index].replace_data_payload(payload)?;
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+
+        Ok(if right_clip_index < left_clip_index {
+            left_clip_index - 1
+        } else {
+            left_clip_index
+        })
+    }
+
     /// Edits selected fields of one existing note without changing the event's wire length.
     /// `note_index` is zero-based within the selected channel's notes in that pattern.
     pub fn edit_pattern_note(
@@ -7773,9 +7997,9 @@ mod tests {
     use super::{
         ChannelGroupSummary, ChannelNoteRouter, ChannelSortOrder, ChannelSummary, FlpDocument,
         FlpError, FlpEvent, FstPreset, FstPresetKind, MixerParameterKind, PATTERN_NOTE_SLIDE_FLAG,
-        PatternNote, PatternNoteEdit, PayloadEncoding, PlaylistClipTarget, ProjectInfoEdit,
-        ProjectSettingsEdit, TimeMarkerEdit, midi::MidiChannelMapping, midi::MidiFile,
-        parse_vst_plugin_state_metadata,
+        PatternNote, PatternNoteEdit, PayloadEncoding, PlaylistClipEdit, PlaylistClipTarget,
+        ProjectInfoEdit, ProjectSettingsEdit, TimeMarkerEdit, midi::MidiChannelMapping,
+        midi::MidiFile, parse_vst_plugin_state_metadata,
     };
 
     fn flp_fixture(event_stream: &[u8], header_extension: &[u8], trailing: &[u8]) -> Vec<u8> {
@@ -8691,6 +8915,98 @@ mod tests {
             .encode_lossless()
             .expect("the split project should encode");
         FlpDocument::parse(&encoded).expect("the split project should parse again");
+    }
+
+    #[test]
+    fn joins_adjacent_playlist_audio_clips_back_to_their_original_record() {
+        let mut clip = [0xA5; 80];
+        clip[0..4].copy_from_slice(&0u32.to_le_bytes());
+        clip[4..6].copy_from_slice(&0x5000u16.to_le_bytes());
+        clip[6..8].copy_from_slice(&9u16.to_le_bytes());
+        clip[8..12].copy_from_slice(&240u32.to_le_bytes());
+        clip[12..14].copy_from_slice(&499u16.to_le_bytes());
+        clip[20..24].copy_from_slice(&[0x40, 0x64, 0x80, 0x80]);
+        clip[24..28].copy_from_slice(&0.0f32.to_le_bytes());
+        clip[28..32].copy_from_slice(&1_000.0f32.to_le_bytes());
+        clip[64..72].copy_from_slice(&1.0f64.to_le_bytes());
+
+        let mut event_stream = vec![0x40, 9, 0, 0x15, 4, 0x48, 9, 0, 0x62, 0, 0, 0x63, 3, 0];
+        append_data_event(&mut event_stream, 0xE9, &clip);
+        let input = flp_fixture(&event_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&input).expect("the project fixture should parse");
+
+        document
+            .split_playlist_audio_clip(3, 0, 96, None)
+            .expect("the sample should split into two contiguous clips");
+        let joined_index = document
+            .join_adjacent_playlist_audio_clips(3, 0, 1)
+            .expect("the contiguous audio segments should join");
+
+        assert_eq!(joined_index, 0);
+        let arrangements = document
+            .arrangements()
+            .expect("the joined arrangement should decode");
+        assert_eq!(arrangements[0].clips.len(), 1);
+        assert_eq!(arrangements[0].clips[0].length_ticks, 240);
+        assert_eq!(arrangements[0].clips[0].start_offset, 0.0);
+        assert_eq!(arrangements[0].clips[0].end_offset, 1_000.0);
+        let clip_event = document
+            .events()
+            .iter()
+            .find(|event| event.opcode() == 0xE9)
+            .expect("the Playlist event should remain present");
+        assert_eq!(clip_event.payload(), clip);
+
+        let encoded = document
+            .encode_lossless()
+            .expect("the joined project should encode");
+        FlpDocument::parse(&encoded).expect("the joined project should parse again");
+    }
+
+    #[test]
+    fn playlist_audio_clip_join_rejects_discontinuous_source_windows_atomically() {
+        let mut clip = [0xA5; 80];
+        clip[0..4].copy_from_slice(&0u32.to_le_bytes());
+        clip[4..6].copy_from_slice(&0x5000u16.to_le_bytes());
+        clip[6..8].copy_from_slice(&9u16.to_le_bytes());
+        clip[8..12].copy_from_slice(&240u32.to_le_bytes());
+        clip[12..14].copy_from_slice(&499u16.to_le_bytes());
+        clip[20..24].copy_from_slice(&[0x40, 0x64, 0x80, 0x80]);
+        clip[24..28].copy_from_slice(&0.0f32.to_le_bytes());
+        clip[28..32].copy_from_slice(&1_000.0f32.to_le_bytes());
+        clip[64..72].copy_from_slice(&1.0f64.to_le_bytes());
+        let mut event_stream = vec![0x40, 9, 0, 0x15, 4, 0x48, 9, 0, 0x62, 0, 0, 0x63, 3, 0];
+        append_data_event(&mut event_stream, 0xE9, &clip);
+        let input = flp_fixture(&event_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&input).expect("the project fixture should parse");
+        document
+            .split_playlist_audio_clip(3, 0, 96, None)
+            .expect("the sample should split into two clips");
+        document
+            .edit_playlist_clip(
+                3,
+                1,
+                PlaylistClipEdit {
+                    start_offset: Some(430.0),
+                    ..PlaylistClipEdit::default()
+                },
+            )
+            .expect("the right source offset should be editable");
+        let before_join = document
+            .encode_lossless()
+            .expect("the split project should encode");
+
+        assert!(
+            document
+                .join_adjacent_playlist_audio_clips(3, 0, 1)
+                .is_err()
+        );
+        assert_eq!(
+            document
+                .encode_lossless()
+                .expect("the project should still encode after a rejected join"),
+            before_join
+        );
     }
 
     #[test]

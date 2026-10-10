@@ -645,6 +645,17 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_optional_f32(source_length, "full source length in milliseconds")?,
             )
         }
+        [command, input, output, arrangement_id, left_clip_index, right_clip_index]
+            if command == "join-audio-clips" =>
+        {
+            join_audio_clips(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(arrangement_id, "arrangement id")?,
+                parse_usize(left_clip_index, "left clip index")?,
+                parse_usize(right_clip_index, "right clip index")?,
+            )
+        }
         [command, input, output, arrangement_id, marker_index, position, is_signature, numerator, denominator, name]
             if command == "edit-time-marker" =>
         {
@@ -767,6 +778,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild edit-clip-properties <input.flp> <output.flp> <arrangement-id> <clip-index> <item-index-raw|-> <track-index-raw|-> <group-raw|-> <flags-raw|-> <start-offset|-> <end-offset|-> <scale|->\n",
             "  flp-rebuild duplicate-clip <input.flp> <output.flp> <arrangement-id> <clip-index> <position|-> <track-index-raw|->\n",
             "  flp-rebuild split-audio-clip <input.flp> <output.flp> <arrangement-id> <clip-index> <split-position-ticks> <source-length-ms|->\n",
+            "  flp-rebuild join-audio-clips <input.flp> <output.flp> <arrangement-id> <left-clip-index> <right-clip-index>\n",
             "  flp-rebuild edit-time-marker <input.flp> <output.flp> <arrangement-id> <marker-index> <position-ticks|-> <signature:0|1|-> <numerator|-> <denominator|-> <name|->\n",
             "  flp-rebuild create-time-marker <input.flp> <output.flp> <arrangement-id> <position-ticks> <signature:0|1> <numerator|-> <denominator|-> <name|->\n",
             "  flp-rebuild delete-time-marker <input.flp> <output.flp> <arrangement-id> <marker-index>"
@@ -2803,6 +2815,29 @@ fn split_audio_clip(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "split arrangement {arrangement_id} Audio Clip {clip_index} at tick {split_position_ticks}; right clip is {right_clip_index} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn join_audio_clips(
+    input: &Path,
+    output: &Path,
+    arrangement_id: u16,
+    left_clip_index: usize,
+    right_clip_index: usize,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let joined_clip_index = document
+        .join_adjacent_playlist_audio_clips(arrangement_id, left_clip_index, right_clip_index)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "joined arrangement {arrangement_id} Audio Clips {left_clip_index} and {right_clip_index} as clip {joined_clip_index} in {}",
         output.display()
     );
     Ok(())
