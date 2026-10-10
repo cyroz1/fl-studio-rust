@@ -1200,6 +1200,12 @@ pub enum PlaylistClipTarget {
     Channel { id: u16 },
 }
 
+/// An opaque, lossless copy of one Playlist clip record for later insertion.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlaylistClipClipboard {
+    raw_record: Vec<u8>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PlaylistClipEdit {
     pub position_ticks: Option<u32>,
@@ -3367,6 +3373,188 @@ impl FlpDocument {
         candidate.refresh_event_offsets()?;
         *self = candidate;
         Ok(())
+    }
+
+    /// Copies a complete Playlist clip record for a later lossless paste.
+    pub fn copy_playlist_clip(
+        &self,
+        arrangement_id: u16,
+        clip_index: usize,
+    ) -> Result<PlaylistClipClipboard, FlpError> {
+        let arrangements = self.arrangements()?;
+        let mut matching_arrangements = arrangements
+            .iter()
+            .filter(|arrangement| arrangement.id == arrangement_id);
+        let Some(arrangement) = matching_arrangements.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested arrangement does not exist",
+            ));
+        };
+        if matching_arrangements.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested arrangement id is ambiguous",
+            ));
+        }
+        let Some(clip) = arrangement.clips.get(clip_index) else {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested playlist clip does not exist",
+            ));
+        };
+        let record_start = clip
+            .source_record_index
+            .checked_mul(clip.record_size)
+            .ok_or(FlpError::LengthOverflow)?;
+        let record_end = record_start
+            .checked_add(clip.record_size)
+            .ok_or(FlpError::LengthOverflow)?;
+        let event = self
+            .events
+            .get(clip.source_event_index)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the Playlist clip event no longer exists",
+            ))?;
+        if event.opcode != 0xE9 || !matches!(event.encoding, PayloadEncoding::Data { .. }) {
+            return Err(FlpError::UnsupportedEdit(
+                "the Playlist clip is not in a length-prefixed data event",
+            ));
+        }
+        if record_end > event.payload.len() || !event.payload.len().is_multiple_of(clip.record_size)
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "the Playlist clip record does not fit its event payload",
+            ));
+        }
+
+        Ok(PlaylistClipClipboard {
+            raw_record: event.payload[record_start..record_end].to_vec(),
+        })
+    }
+
+    /// Pastes a copied clip record into an arrangement, changing only its position and track.
+    /// The complete record is appended to the arrangement's final clip event, or a new clip event
+    /// is created at the end of the arrangement when it has no clip event yet.
+    pub fn paste_playlist_clip(
+        &mut self,
+        arrangement_id: u16,
+        clipboard: &PlaylistClipClipboard,
+        position_ticks: u32,
+        raw_track_index: u16,
+    ) -> Result<usize, FlpError> {
+        let record_size = clipboard.raw_record.len();
+        if !FLP_PLAYLIST_RECORD_SIZES.contains(&record_size) {
+            return Err(FlpError::UnsupportedEdit(
+                "the copied Playlist clip has an unsupported record size",
+            ));
+        }
+        if raw_track_index > 499 {
+            return Err(FlpError::UnsupportedEdit(
+                "Playlist track index must be between 0 and 499",
+            ));
+        }
+
+        let arrangements = self.arrangements()?;
+        let mut matching_arrangements = arrangements
+            .iter()
+            .filter(|arrangement| arrangement.id == arrangement_id);
+        let Some(arrangement) = matching_arrangements.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested arrangement does not exist",
+            ));
+        };
+        if matching_arrangements.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested arrangement id is ambiguous",
+            ));
+        }
+        let insertion_clip_index = arrangement.clips.len();
+        let established_record_size = arrangement.clips.last().map(|clip| clip.record_size);
+
+        let has_arrangement_markers = self
+            .events
+            .iter()
+            .any(|event| event.opcode == 0x63 && event.payload.len() == 2);
+        let (region_start, region_end) = if has_arrangement_markers {
+            let mut marker_indices = self
+                .events
+                .iter()
+                .enumerate()
+                .filter(|(_, event)| event.opcode == 0x63 && event.payload.len() == 2)
+                .filter(|(_, event)| {
+                    u16::from_le_bytes([event.payload[0], event.payload[1]]) == arrangement_id
+                })
+                .map(|(index, _)| index);
+            let Some(marker_index) = marker_indices.next() else {
+                return Err(FlpError::UnsupportedEdit(
+                    "the requested arrangement does not exist",
+                ));
+            };
+            if marker_indices.next().is_some() {
+                return Err(FlpError::UnsupportedEdit(
+                    "the requested arrangement id is ambiguous",
+                ));
+            }
+            let region_end = self
+                .events
+                .iter()
+                .enumerate()
+                .skip(marker_index + 1)
+                .find(|(_, event)| {
+                    event.opcode == 0x62 || (event.opcode == 0x63 && event.payload.len() == 2)
+                })
+                .map_or(self.events.len(), |(index, _)| index);
+            (marker_index + 1, region_end)
+        } else {
+            (0, self.events.len())
+        };
+        let target_event_index = self.events[region_start..region_end]
+            .iter()
+            .rposition(|event| event.opcode == 0xE9)
+            .map(|offset| region_start + offset);
+
+        let mut record = clipboard.raw_record.clone();
+        record[0..4].copy_from_slice(&position_ticks.to_le_bytes());
+        record[12..14].copy_from_slice(&raw_track_index.to_le_bytes());
+
+        let mut candidate = self.clone();
+        if let Some(event_index) = target_event_index {
+            let event = &candidate.events[event_index];
+            if !matches!(event.encoding, PayloadEncoding::Data { .. }) {
+                return Err(FlpError::UnsupportedEdit(
+                    "the target Playlist clip event is not length-prefixed data",
+                ));
+            }
+            let target_record_size = if let Some(record_size) = established_record_size {
+                record_size
+            } else if event.payload.is_empty() {
+                record_size
+            } else {
+                playlist_clip_record_size(
+                    candidate.project_version.as_deref(),
+                    &event.payload,
+                    event.file_offset,
+                )?
+            };
+            if target_record_size != record_size {
+                return Err(FlpError::UnsupportedEdit(
+                    "the copied clip record layout does not match the target arrangement",
+                ));
+            }
+            if !event.payload.len().is_multiple_of(record_size) {
+                return Err(FlpError::InvalidEvent {
+                    offset: event.file_offset,
+                    detail: "playlist clip payload is not a whole number of supported records",
+                });
+            }
+            let mut payload = event.payload.clone();
+            payload.extend_from_slice(&record);
+            candidate.events[event_index].replace_data_payload(payload)?;
+        } else {
+            let event = FlpEvent::new_data(0xE9, record)?;
+            candidate.events.insert(region_end, event);
+        }
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(insertion_clip_index)
     }
 
     /// Duplicates one clip's complete stored record into the same Playlist event.
@@ -8261,6 +8449,112 @@ mod tests {
             .encode_lossless()
             .expect("the empty Playlist should encode");
         FlpDocument::parse(&encoded).expect("the edited project should parse again");
+    }
+
+    #[test]
+    fn playlist_clip_clipboard_survives_cut_and_pastes_into_an_empty_arrangement() {
+        let mut source_record = [0xA5; 80];
+        source_record[0..4].copy_from_slice(&1_920u32.to_le_bytes());
+        source_record[4..6].copy_from_slice(&0x5000u16.to_le_bytes());
+        source_record[6..8].copy_from_slice(&0x5007u16.to_le_bytes());
+        source_record[8..12].copy_from_slice(&960u32.to_le_bytes());
+        source_record[12..14].copy_from_slice(&499u16.to_le_bytes());
+        source_record[20..24].copy_from_slice(&[0x40, 0x64, 0x80, 0x80]);
+        source_record[24..28].copy_from_slice(&0.0f32.to_le_bytes());
+        source_record[28..32].copy_from_slice(&1.0f32.to_le_bytes());
+
+        let mut event_stream = Vec::new();
+        append_data_event(&mut event_stream, 0xC7, b"26.0.0\0");
+        event_stream.extend_from_slice(&[0x63, 3, 0]);
+        append_data_event(&mut event_stream, 0xE9, &source_record);
+        event_stream.extend_from_slice(&[0x62, 0, 0, 0x63, 4, 0, 0x62, 0, 0]);
+        let input = flp_fixture(&event_stream, &[], &[0xAA, 0xBB]);
+        let mut document = FlpDocument::parse(&input).expect("the project fixture should parse");
+
+        let clipboard = document
+            .copy_playlist_clip(3, 0)
+            .expect("the first clip should copy losslessly");
+        assert_eq!(clipboard.raw_record, source_record);
+        document
+            .delete_playlist_clip(3, 0)
+            .expect("the source clip should be cut from its arrangement");
+        let inserted_index = document
+            .paste_playlist_clip(4, &clipboard, 3_840, 495)
+            .expect("the clip should paste into the empty arrangement");
+
+        let arrangements = document
+            .arrangements()
+            .expect("both arrangements should decode after paste");
+        assert!(arrangements[0].clips.is_empty());
+        assert_eq!(inserted_index, 0);
+        assert_eq!(arrangements[1].clips.len(), 1);
+        let pasted = &arrangements[1].clips[0];
+        assert_eq!(pasted.position_ticks, 3_840);
+        assert_eq!(pasted.raw_track_index, 495);
+        assert_eq!(pasted.track_index, Some(4));
+        assert_eq!(pasted.target(), PlaylistClipTarget::Pattern { id: 7 });
+
+        let mut expected_record = source_record;
+        expected_record[0..4].copy_from_slice(&3_840u32.to_le_bytes());
+        expected_record[12..14].copy_from_slice(&495u16.to_le_bytes());
+        let clip_events = document
+            .events()
+            .iter()
+            .filter(|event| event.opcode() == 0xE9)
+            .collect::<Vec<_>>();
+        assert_eq!(clip_events.len(), 2);
+        assert!(clip_events[0].payload().is_empty());
+        assert_eq!(clip_events[1].payload(), expected_record);
+
+        let encoded = document
+            .encode_lossless()
+            .expect("the edited project should encode");
+        FlpDocument::parse(&encoded).expect("the edited project should parse again");
+    }
+
+    #[test]
+    fn playlist_clip_paste_rejects_a_different_record_layout_atomically() {
+        let mut source_record = [0xA5; 80];
+        source_record[4..6].copy_from_slice(&0x5000u16.to_le_bytes());
+        source_record[6..8].copy_from_slice(&0x5007u16.to_le_bytes());
+        source_record[8..12].copy_from_slice(&960u32.to_le_bytes());
+        source_record[12..14].copy_from_slice(&499u16.to_le_bytes());
+        source_record[20..24].copy_from_slice(&[0x40, 0x64, 0x80, 0x80]);
+        source_record[24..28].copy_from_slice(&0.0f32.to_le_bytes());
+        source_record[28..32].copy_from_slice(&1.0f32.to_le_bytes());
+        let mut source_events = Vec::new();
+        append_data_event(&mut source_events, 0xC7, b"26.0.0\0");
+        source_events.extend_from_slice(&[0x63, 3, 0]);
+        append_data_event(&mut source_events, 0xE9, &source_record);
+        let source = FlpDocument::parse(&flp_fixture(&source_events, &[], &[]))
+            .expect("the source fixture should parse");
+        let clipboard = source
+            .copy_playlist_clip(3, 0)
+            .expect("the source clip should copy");
+
+        let mut target_record = [0x5A; 32];
+        target_record[4..6].copy_from_slice(&0x5000u16.to_le_bytes());
+        target_record[6..8].copy_from_slice(&0x5008u16.to_le_bytes());
+        target_record[8..12].copy_from_slice(&960u32.to_le_bytes());
+        target_record[12..14].copy_from_slice(&499u16.to_le_bytes());
+        target_record[20..24].copy_from_slice(&[0x40, 0x64, 0x80, 0x80]);
+        let mut target_events = Vec::new();
+        append_data_event(&mut target_events, 0xC7, b"20.0.0\0");
+        target_events.extend_from_slice(&[0x63, 4, 0]);
+        append_data_event(&mut target_events, 0xE9, &target_record);
+        let original = flp_fixture(&target_events, &[], &[0xCC]);
+        let mut target = FlpDocument::parse(&original).expect("the target fixture should parse");
+
+        assert!(
+            target
+                .paste_playlist_clip(4, &clipboard, 1_920, 498)
+                .is_err()
+        );
+        assert_eq!(
+            target.encode_lossless().expect("target should encode"),
+            original,
+            "a rejected paste must leave every project byte unchanged"
+        );
     }
 
     #[test]
