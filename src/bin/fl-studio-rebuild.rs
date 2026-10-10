@@ -18174,7 +18174,6 @@ impl DawUi {
             }
             session.capture_active = false;
         }
-        let _ = session.worker.join();
         self.finish_audio_recording(session, result, history_snapshot_available);
     }
 
@@ -18184,6 +18183,7 @@ impl DawUi {
         result: Result<AudioRecordingSummary, String>,
         history_snapshot_available: bool,
     ) {
+        let _ = session.worker.join();
         let summary = match result {
             Ok(summary) => summary,
             Err(error) => {
