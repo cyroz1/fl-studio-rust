@@ -1396,6 +1396,9 @@ struct DawUi {
     randomizer_reset_levels: bool,
     scale_levels_multiplier_percent: u16,
     scale_levels_offset_percent: i16,
+    articulate_multiplier_percent: u8,
+    articulate_use_original_lengths: bool,
+    articulate_only_with_selection: bool,
     humanize_timing_range_ticks: u32,
     humanize_velocity_variation_percent: u8,
     note_limit_minimum_key: u8,
@@ -1726,6 +1729,9 @@ impl DawUi {
             randomizer_reset_levels: false,
             scale_levels_multiplier_percent: 100,
             scale_levels_offset_percent: 0,
+            articulate_multiplier_percent: 100,
+            articulate_use_original_lengths: true,
+            articulate_only_with_selection: false,
             humanize_timing_range_ticks: 12,
             humanize_velocity_variation_percent: 10,
             note_limit_minimum_key: 36,
@@ -11183,6 +11189,7 @@ impl DawUi {
         let mut flam_requested = false;
         let mut randomize_requested = false;
         let mut scale_levels_requested = false;
+        let mut articulate_requested = false;
         let mut humanize_requested = false;
         let mut limit_requested = false;
         let mut arpeggiate_requested = false;
@@ -11685,6 +11692,39 @@ impl DawUi {
                             }
                         });
                     });
+                    ui.menu_button("Articulate", |ui| {
+                        ui.add(
+                            egui::Slider::new(&mut self.articulate_multiplier_percent, 10..=100)
+                                .text("Multiply %"),
+                        );
+                        ui.checkbox(&mut self.articulate_use_original_lengths, "Use lengths");
+                        if !self.articulate_use_original_lengths && edit_selection_only {
+                            ui.checkbox(
+                                &mut self.articulate_only_with_selection,
+                                "Only with selection",
+                            );
+                        }
+                        if !self.articulate_use_original_lengths {
+                            ui.small("Use the next note onset as each legato boundary.");
+                        }
+                        ui.horizontal(|ui| {
+                            if ui.button("Reset").clicked() {
+                                self.articulate_multiplier_percent = 100;
+                                self.articulate_use_original_lengths = true;
+                                self.articulate_only_with_selection = false;
+                            }
+                            if ui
+                                .add_enabled(
+                                    edit_scope_available,
+                                    egui::Button::new(format!("Apply to {edit_target}")),
+                                )
+                                .clicked()
+                            {
+                                articulate_requested = true;
+                                ui.close();
+                            }
+                        });
+                    });
                     if ui
                         .add_enabled(
                             edit_scope_available,
@@ -11869,6 +11909,7 @@ impl DawUi {
             flam_requested = false;
             randomize_requested = false;
             scale_levels_requested = false;
+            articulate_requested = false;
             humanize_requested = false;
             limit_requested = false;
             arpeggiate_requested = false;
@@ -11930,6 +11971,51 @@ impl DawUi {
                     );
                 }
                 Err(error) => self.status = format!("Could not scale note levels: {error}"),
+            }
+        }
+
+        if articulate_requested
+            && let (Some(pattern_id), Some(channel_id)) =
+                (self.selected_pattern, self.selected_note_channel)
+        {
+            let multiplier_percent = self.articulate_multiplier_percent;
+            let use_original_lengths = self.articulate_use_original_lengths;
+            let only_with_selection =
+                edit_selection_only && !use_original_lengths && self.articulate_only_with_selection;
+            let result = self
+                .document
+                .as_mut()
+                .ok_or_else(|| "no project is open".to_owned())
+                .and_then(|document| {
+                    let result = if edit_selection_only {
+                        document.articulate_pattern_note_selection(
+                            pattern_id,
+                            channel_id,
+                            &selected_quantize_indices,
+                            multiplier_percent,
+                            use_original_lengths,
+                            only_with_selection,
+                        )
+                    } else {
+                        document.articulate_pattern_notes(
+                            pattern_id,
+                            channel_id,
+                            multiplier_percent,
+                            use_original_lengths,
+                        )
+                    };
+                    result.map_err(|error| error.to_string())
+                });
+            match result {
+                Ok(changed) => {
+                    if changed > 0 {
+                        self.dirty = true;
+                    }
+                    self.status = format!(
+                        "Articulated {changed} note lengths for {edit_scope_description} in pattern {pattern_id}"
+                    );
+                }
+                Err(error) => self.status = format!("Could not articulate note lengths: {error}"),
             }
         }
 

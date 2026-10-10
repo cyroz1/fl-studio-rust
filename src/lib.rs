@@ -5360,6 +5360,134 @@ impl FlpDocument {
         Ok(edits.len())
     }
 
+    /// Scales channel note lengths, using original lengths or legato distances.
+    pub fn articulate_pattern_notes(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        multiplier_percent: u8,
+        use_original_lengths: bool,
+    ) -> Result<usize, FlpError> {
+        self.articulate_pattern_notes_in_scope(
+            pattern_id,
+            channel_id,
+            None,
+            multiplier_percent,
+            use_original_lengths,
+            false,
+        )
+    }
+
+    /// Scales selected note lengths; optional selected-only context controls legato boundaries.
+    pub fn articulate_pattern_note_selection(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: &[usize],
+        multiplier_percent: u8,
+        use_original_lengths: bool,
+        only_with_selection: bool,
+    ) -> Result<usize, FlpError> {
+        self.articulate_pattern_notes_in_scope(
+            pattern_id,
+            channel_id,
+            Some(note_indices),
+            multiplier_percent,
+            use_original_lengths,
+            only_with_selection,
+        )
+    }
+
+    fn articulate_pattern_notes_in_scope(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: Option<&[usize]>,
+        multiplier_percent: u8,
+        use_original_lengths: bool,
+        only_with_selection: bool,
+    ) -> Result<usize, FlpError> {
+        if !(10..=100).contains(&multiplier_percent) {
+            return Err(FlpError::UnsupportedEdit(
+                "Articulate multiplier must be between 10 and 100 percent",
+            ));
+        }
+        if only_with_selection && (note_indices.is_none() || use_original_lengths) {
+            return Err(FlpError::UnsupportedEdit(
+                "Only with selection requires selected notes and legato lengths",
+            ));
+        }
+        let patterns = self.patterns()?;
+        let pattern = patterns
+            .iter()
+            .find(|pattern| pattern.id == pattern_id)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested pattern does not exist",
+            ))?;
+        let selected_indices =
+            note_indices.map(|indices| indices.iter().copied().collect::<HashSet<_>>());
+        let mut onset_positions = pattern
+            .notes
+            .iter()
+            .filter(|note| note.channel_id == channel_id)
+            .enumerate()
+            .filter(|(note_index, _)| {
+                !only_with_selection || note_index_in_scope(*note_index, selected_indices.as_ref())
+            })
+            .map(|(_, note)| note.position)
+            .collect::<Vec<_>>();
+        onset_positions.sort_unstable();
+        onset_positions.dedup();
+
+        let multiplier = f64::from(multiplier_percent) / 100.0;
+        let edits = pattern
+            .notes
+            .iter()
+            .filter(|note| note.channel_id == channel_id)
+            .enumerate()
+            .filter(|(note_index, _)| note_index_in_scope(*note_index, selected_indices.as_ref()))
+            .filter_map(|(note_index, note)| {
+                let base_length = if use_original_lengths {
+                    note.length
+                } else {
+                    let next_onset =
+                        onset_positions.partition_point(|position| *position <= note.position);
+                    onset_positions
+                        .get(next_onset)
+                        .map_or(note.length, |position| {
+                            position.saturating_sub(note.position)
+                        })
+                };
+                let length = if base_length == 0 {
+                    0
+                } else {
+                    (f64::from(base_length) * multiplier)
+                        .round()
+                        .clamp(1.0, f64::from(u32::MAX)) as u32
+                };
+                (length != note.length).then_some((note_index, length))
+            })
+            .collect::<Vec<_>>();
+        if edits.is_empty() {
+            return Ok(0);
+        }
+
+        let mut updated = self.clone();
+        for (note_index, length) in &edits {
+            updated.edit_pattern_note(
+                pattern_id,
+                channel_id,
+                *note_index,
+                PatternNoteEdit {
+                    length: Some(*length),
+                    ..PatternNoteEdit::default()
+                },
+            )?;
+        }
+        *self = updated;
+        Ok(edits.len())
+    }
+
     /// Splits eligible channel notes into equal-duration segments without changing note properties.
     /// The remainder of a non-divisible length is assigned to the final segment.
     pub fn chop_pattern_notes(
@@ -12536,6 +12664,80 @@ mod tests {
         assert_eq!(document.scale_pattern_note_levels(7, 0, 100, 0).unwrap(), 0);
         assert!(document.scale_pattern_note_levels(7, 0, 201, 0).is_err());
         assert!(document.scale_pattern_note_levels(7, 0, 100, 101).is_err());
+    }
+
+    #[test]
+    fn articulate_uses_original_or_legato_lengths_and_selected_context() {
+        let mut first = note_record(0, 0, 96, 48, 100);
+        first[4..6].copy_from_slice(&0x9494_u16.to_le_bytes());
+        let next = note_record(48, 0, 24, 55, 90);
+        let other_channel = note_record(24, 1, 30, 60, 80);
+        let input = pattern_fixture(&[first, next, other_channel], &[0xFF, 1, 0xA7]);
+
+        let mut legato = FlpDocument::parse(&input).expect("fixture should parse");
+        let changed = legato
+            .articulate_pattern_notes(7, 0, 50, false)
+            .expect("channel articulation should succeed");
+        assert_eq!(changed, 2);
+        let notes = legato.patterns().unwrap()[0].notes.clone();
+        assert_eq!(notes[0].length, 24);
+        assert_eq!(notes[0].flags, 0x9494);
+        assert_eq!(notes[1].length, 12);
+        assert_eq!(notes[2].length, 30);
+
+        let mut selected_context = FlpDocument::parse(&input).expect("fixture should parse");
+        selected_context
+            .articulate_pattern_note_selection(7, 0, &[0], 50, false, true)
+            .expect("selected-only articulation context should succeed");
+        let notes = selected_context.patterns().unwrap()[0].notes.clone();
+        assert_eq!(notes[0].length, 48);
+        assert_eq!(notes[1].length, 24);
+
+        let mut use_lengths = FlpDocument::parse(&input).expect("fixture should parse");
+        use_lengths
+            .articulate_pattern_note_selection(7, 0, &[0], 50, true, false)
+            .expect("original-length articulation should succeed");
+        let reparsed = FlpDocument::parse(&use_lengths.encode_lossless().unwrap())
+            .expect("edited FLP should parse");
+        let notes = reparsed.patterns().unwrap()[0].notes.clone();
+        assert_eq!(notes[0].length, 48);
+        assert_eq!(notes[1].length, 24);
+        assert_eq!(
+            reparsed.events().last().unwrap().wire_bytes(),
+            &[0xFF, 1, 0xA7]
+        );
+    }
+
+    #[test]
+    fn articulate_validates_ranges_and_context_requirements() {
+        let note = note_record(0, 0, 48, 60, 100);
+        let mut document = FlpDocument::parse(&pattern_fixture(&[note], &[0xFF, 0]))
+            .expect("fixture should parse");
+
+        assert!(document.articulate_pattern_notes(7, 0, 9, true).is_err());
+        assert!(document.articulate_pattern_notes(7, 0, 101, true).is_err());
+        assert!(document.articulate_pattern_notes(7, 0, 50, false).is_ok());
+        assert!(
+            document
+                .articulate_pattern_note_selection(7, 0, &[0], 50, false, true)
+                .is_ok()
+        );
+        assert!(
+            document
+                .articulate_pattern_note_selection(7, 0, &[0], 50, true, true)
+                .is_err()
+        );
+
+        let zero_length_note = note_record(0, 0, 0, 48, 90);
+        let mut zero_length = FlpDocument::parse(&pattern_fixture(&[zero_length_note], &[0xFF, 0]))
+            .expect("zero-length fixture should parse");
+        assert_eq!(
+            zero_length
+                .articulate_pattern_notes(7, 0, 50, true)
+                .unwrap(),
+            0
+        );
+        assert_eq!(zero_length.patterns().unwrap()[0].notes[0].length, 0);
     }
 
     #[test]

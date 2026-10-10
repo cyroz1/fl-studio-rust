@@ -80,6 +80,8 @@ PyFLP identifies bit 3 of the 16-bit note flags as the Slide flag. The selected-
 
 Image-Line's [Scale Levels tool](https://www.image-line.com/fl-studio-learning-content/fl-studio-online-manual/html/pianoroll_scale.htm) adjusts velocity data with Center, Tension, Multiply, and Offset controls. The desktop and project API currently implement the documented Multiply and Offset ranges for selected notes or the target channel. Changes touch only the velocity byte at offset 21 in each 24-byte score record; Center, Tension, and exact native scaling equivalence remain unverified.
 
+Image-Line's [Articulate tool](https://www.image-line.com/fl-studio-learning/fl-studio-beta-online-manual/html/pianoroll_articulate.htm) documents note-length Multiply, Use lengths, and an Only with selection option for legato context. The API and Piano roll implement the 10–100% length multiplier, original-length scaling, and next-onset legato boundaries; Only with selection limits those boundaries to the selected notes. Edits touch only the 32-bit note length at offset 8 in each score record. Variation, Seed, chord chopping, preset values, and exact native behavior remain incomplete.
+
 ## Playlist clip observations
 
 The FL 25.2.3 NewStuff project has an explicit arrangement marker at event 2257: `0x63` carries arrangement id 0, and the following `0xF1` event contains the UTF-16LE name `Arrangement`. Event 2260 (`0xE9`) carries 119,520 bytes, exactly 1,494 records of 80 bytes each. The first record begins with position 0, pattern base `0x5000`, item index 29, length 30,816, raw track index 471, group 0, and flags `0x0040`. The last 16 bytes contain a scale value of 1.0 plus eight trailing bytes. Records retain their original bytes in the event stream.
