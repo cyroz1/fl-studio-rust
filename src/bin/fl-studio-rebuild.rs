@@ -1523,6 +1523,7 @@ struct DawUi {
     humanize_velocity_variation_percent: u8,
     note_limit_minimum_key: u8,
     note_limit_maximum_key: u8,
+    note_limit_wrap_to_bottom: bool,
     note_limit_snap_to_scale: bool,
     note_limit_snap_direction: LimitSnapDirection,
     arpeggiator_step_ticks: u32,
@@ -1794,6 +1795,7 @@ impl DawUi {
             humanize_velocity_variation_percent: 10,
             note_limit_minimum_key: 36,
             note_limit_maximum_key: 83,
+            note_limit_wrap_to_bottom: false,
             note_limit_snap_to_scale: false,
             note_limit_snap_direction: LimitSnapDirection::Up,
             arpeggiator_step_ticks: 24,
@@ -12321,6 +12323,7 @@ impl DawUi {
                     egui::Slider::new(&mut self.note_limit_maximum_key, 0..=127)
                         .text("Limit highest key"),
                 );
+                ui.checkbox(&mut self.note_limit_wrap_to_bottom, "Wrap to lowest octave");
                 ui.add_enabled_ui(self.piano_roll_scale != PianoRollScale::None, |ui| {
                     ui.checkbox(&mut self.note_limit_snap_to_scale, "Limit: snap to current scale");
                 });
@@ -12798,51 +12801,35 @@ impl DawUi {
         {
             let minimum_key = u16::from(self.note_limit_minimum_key);
             let maximum_key = u16::from(self.note_limit_maximum_key);
-            let scale_root = self.piano_roll_scale_root;
             let scale_intervals = (self.note_limit_snap_to_scale
                 && self.piano_roll_scale != PianoRollScale::None)
                 .then(|| self.piano_roll_scale.intervals());
+            let scale_root = scale_intervals.map(|_| self.piano_roll_scale_root);
             let snap_direction = self.note_limit_snap_direction;
+            let wrap_to_bottom = self.note_limit_wrap_to_bottom;
             let result = self
                 .document
                 .as_mut()
                 .ok_or_else(|| "no project is open".to_owned())
                 .and_then(|document| {
-                    let result = if let Some(scale_intervals) = scale_intervals {
-                        let options = LimitNoteOptions {
-                            minimum_key,
-                            maximum_key,
-                            scale_root,
-                            scale_intervals,
-                            snap_direction,
-                        };
-                        if edit_selection_only {
-                            document.limit_pattern_note_selection_range_with_scale(
-                                pattern_id,
-                                channel_id,
-                                &selected_quantize_indices,
-                                options,
-                            )
-                        } else {
-                            document.limit_pattern_note_range_with_scale(
-                                pattern_id, channel_id, options,
-                            )
-                        }
-                    } else if edit_selection_only {
-                        document.limit_pattern_note_selection_range(
+                    let options = LimitNoteOptions {
+                        minimum_key,
+                        maximum_key,
+                        wrap_to_bottom,
+                        scale_root,
+                        scale_intervals,
+                        snap_direction,
+                    };
+                    let result = if edit_selection_only {
+                        document.limit_pattern_note_selection_range_with_options(
                             pattern_id,
                             channel_id,
                             &selected_quantize_indices,
-                            minimum_key,
-                            maximum_key,
+                            options,
                         )
                     } else {
-                        document.limit_pattern_note_range(
-                            pattern_id,
-                            channel_id,
-                            minimum_key,
-                            maximum_key,
-                        )
+                        document
+                            .limit_pattern_note_range_with_options(pattern_id, channel_id, options)
                     };
                     result.map_err(|error| error.to_string())
                 });

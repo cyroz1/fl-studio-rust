@@ -862,13 +862,14 @@ pub enum LimitSnapDirection {
     Alternate,
 }
 
-/// Pitch range and scale settings for the Piano roll Limit operation.
+/// Pitch range, wrap mode, and optional scale settings for the Piano roll Limit operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LimitNoteOptions<'a> {
     pub minimum_key: u16,
     pub maximum_key: u16,
-    pub scale_root: u8,
-    pub scale_intervals: &'a [u8],
+    pub wrap_to_bottom: bool,
+    pub scale_root: Option<u8>,
+    pub scale_intervals: Option<&'a [u8]>,
     pub snap_direction: LimitSnapDirection,
 }
 
@@ -1057,6 +1058,29 @@ fn note_index_in_scope(note_index: usize, selected_indices: Option<&HashSet<usiz
 fn note_pitch_in_scale(key: i32, scale_root: u8, scale_intervals: &[u8]) -> bool {
     let pitch_class = (key.rem_euclid(12) - i32::from(scale_root)).rem_euclid(12) as u8;
     scale_intervals.contains(&pitch_class)
+}
+
+fn fold_note_pitch_to_limit(key: i32, minimum: i32, maximum: i32, wrap_to_bottom: bool) -> i32 {
+    if wrap_to_bottom {
+        return (minimum + (key - minimum).rem_euclid(12)).min(maximum);
+    }
+
+    let mut key = key;
+    while key > maximum && key - 12 >= minimum {
+        key -= 12;
+    }
+    while key < minimum && key + 12 <= maximum {
+        key += 12;
+    }
+    if key < minimum || key > maximum {
+        if (key - minimum).abs() <= (key - maximum).abs() {
+            minimum
+        } else {
+            maximum
+        }
+    } else {
+        key
+    }
 }
 
 fn snap_note_pitch_to_scale(
@@ -6670,31 +6694,25 @@ impl FlpDocument {
             pattern_id,
             channel_id,
             None,
-            minimum_key,
-            maximum_key,
-            None,
+            LimitNoteOptions {
+                minimum_key,
+                maximum_key,
+                wrap_to_bottom: false,
+                scale_root: None,
+                scale_intervals: None,
+                snap_direction: LimitSnapDirection::Up,
+            },
         )
     }
 
-    /// Limits channel note pitches and snaps out-of-scale notes using the given scale intervals.
-    pub fn limit_pattern_note_range_with_scale(
+    /// Limits channel note pitches using optional wrapping and scale snapping.
+    pub fn limit_pattern_note_range_with_options(
         &mut self,
         pattern_id: u16,
         channel_id: u16,
         options: LimitNoteOptions<'_>,
     ) -> Result<usize, FlpError> {
-        self.limit_pattern_note_range_in_scope(
-            pattern_id,
-            channel_id,
-            None,
-            options.minimum_key,
-            options.maximum_key,
-            Some((
-                options.scale_root,
-                options.scale_intervals,
-                options.snap_direction,
-            )),
-        )
+        self.limit_pattern_note_range_in_scope(pattern_id, channel_id, None, options)
     }
 
     /// Folds or clamps only selected note pitches into the requested key range.
@@ -6710,32 +6728,26 @@ impl FlpDocument {
             pattern_id,
             channel_id,
             Some(note_indices),
-            minimum_key,
-            maximum_key,
-            None,
+            LimitNoteOptions {
+                minimum_key,
+                maximum_key,
+                wrap_to_bottom: false,
+                scale_root: None,
+                scale_intervals: None,
+                snap_direction: LimitSnapDirection::Up,
+            },
         )
     }
 
-    /// Limits selected channel note pitches and snaps out-of-scale notes.
-    pub fn limit_pattern_note_selection_range_with_scale(
+    /// Limits selected channel note pitches using optional wrapping and scale snapping.
+    pub fn limit_pattern_note_selection_range_with_options(
         &mut self,
         pattern_id: u16,
         channel_id: u16,
         note_indices: &[usize],
         options: LimitNoteOptions<'_>,
     ) -> Result<usize, FlpError> {
-        self.limit_pattern_note_range_in_scope(
-            pattern_id,
-            channel_id,
-            Some(note_indices),
-            options.minimum_key,
-            options.maximum_key,
-            Some((
-                options.scale_root,
-                options.scale_intervals,
-                options.snap_direction,
-            )),
-        )
+        self.limit_pattern_note_range_in_scope(pattern_id, channel_id, Some(note_indices), options)
     }
 
     fn limit_pattern_note_range_in_scope(
@@ -6743,33 +6755,43 @@ impl FlpDocument {
         pattern_id: u16,
         channel_id: u16,
         note_indices: Option<&[usize]>,
-        minimum_key: u16,
-        maximum_key: u16,
-        scale_snap: Option<(u8, &[u8], LimitSnapDirection)>,
+        options: LimitNoteOptions<'_>,
     ) -> Result<usize, FlpError> {
-        if minimum_key > maximum_key || maximum_key > 127 {
+        if options.minimum_key > options.maximum_key || options.maximum_key > 127 {
             return Err(FlpError::UnsupportedEdit(
                 "note range must be ordered and remain within keys 0 through 127",
             ));
         }
-        if let Some((scale_root, scale_intervals, _)) = scale_snap {
-            if scale_root > 11
-                || scale_intervals.is_empty()
-                || scale_intervals.iter().any(|interval| *interval > 11)
-            {
+        let scale_snap = match (options.scale_root, options.scale_intervals) {
+            (None, None) => None,
+            (Some(scale_root), Some(scale_intervals)) => {
+                if scale_root > 11
+                    || scale_intervals.is_empty()
+                    || scale_intervals.iter().any(|interval| *interval > 11)
+                {
+                    return Err(FlpError::UnsupportedEdit(
+                        "scale root and intervals must describe pitch classes 0 through 11",
+                    ));
+                }
+                let minimum = i32::from(options.minimum_key);
+                let maximum = i32::from(options.maximum_key);
+                if !(minimum..=maximum)
+                    .any(|key| note_pitch_in_scale(key, scale_root, scale_intervals))
+                {
+                    return Err(FlpError::UnsupportedEdit(
+                        "the requested key range contains no notes from the selected scale",
+                    ));
+                }
+                Some((scale_root, scale_intervals, options.snap_direction))
+            }
+            _ => {
                 return Err(FlpError::UnsupportedEdit(
-                    "scale root and intervals must describe pitch classes 0 through 11",
+                    "scale root and scale intervals must both be provided",
                 ));
             }
-            let minimum = i32::from(minimum_key);
-            let maximum = i32::from(maximum_key);
-            if !(minimum..=maximum).any(|key| note_pitch_in_scale(key, scale_root, scale_intervals))
-            {
-                return Err(FlpError::UnsupportedEdit(
-                    "the requested key range contains no notes from the selected scale",
-                ));
-            }
-        }
+        };
+        let minimum = i32::from(options.minimum_key);
+        let maximum = i32::from(options.maximum_key);
         let patterns = self.patterns()?;
         let pattern = patterns
             .iter()
@@ -6788,22 +6810,12 @@ impl FlpDocument {
             .enumerate()
             .filter(|(note_index, _)| note_index_in_scope(*note_index, selected_indices.as_ref()))
         {
-            let mut key = i32::from(note.key);
-            let minimum = i32::from(minimum_key);
-            let maximum = i32::from(maximum_key);
-            while key > maximum && key - 12 >= minimum {
-                key -= 12;
-            }
-            while key < minimum && key + 12 <= maximum {
-                key += 12;
-            }
-            if key < minimum || key > maximum {
-                key = if (key - minimum).abs() <= (key - maximum).abs() {
-                    minimum
-                } else {
-                    maximum
-                };
-            }
+            let mut key = fold_note_pitch_to_limit(
+                i32::from(note.key),
+                minimum,
+                maximum,
+                options.wrap_to_bottom,
+            );
             if let Some((scale_root, scale_intervals, snap_direction)) = scale_snap
                 && !note_pitch_in_scale(key, scale_root, scale_intervals)
             {
@@ -13028,14 +13040,15 @@ mod tests {
 
         let mut snap_up = FlpDocument::parse(&input).expect("fixture should parse");
         snap_up
-            .limit_pattern_note_range_with_scale(
+            .limit_pattern_note_range_with_options(
                 7,
                 0,
                 LimitNoteOptions {
                     minimum_key: 60,
                     maximum_key: 66,
-                    scale_root: 0,
-                    scale_intervals: MAJOR_INTERVALS,
+                    wrap_to_bottom: false,
+                    scale_root: Some(0),
+                    scale_intervals: Some(MAJOR_INTERVALS),
                     snap_direction: LimitSnapDirection::Up,
                 },
             )
@@ -13048,14 +13061,15 @@ mod tests {
 
         let mut snap_down = FlpDocument::parse(&input).expect("fixture should parse");
         snap_down
-            .limit_pattern_note_range_with_scale(
+            .limit_pattern_note_range_with_options(
                 7,
                 0,
                 LimitNoteOptions {
                     minimum_key: 60,
                     maximum_key: 66,
-                    scale_root: 0,
-                    scale_intervals: MAJOR_INTERVALS,
+                    wrap_to_bottom: false,
+                    scale_root: Some(0),
+                    scale_intervals: Some(MAJOR_INTERVALS),
                     snap_direction: LimitSnapDirection::Down,
                 },
             )
@@ -13066,15 +13080,16 @@ mod tests {
 
         let mut alternating = FlpDocument::parse(&input).expect("fixture should parse");
         alternating
-            .limit_pattern_note_selection_range_with_scale(
+            .limit_pattern_note_selection_range_with_options(
                 7,
                 0,
                 &[0, 1],
                 LimitNoteOptions {
                     minimum_key: 60,
                     maximum_key: 66,
-                    scale_root: 0,
-                    scale_intervals: MAJOR_INTERVALS,
+                    wrap_to_bottom: false,
+                    scale_root: Some(0),
+                    scale_intervals: Some(MAJOR_INTERVALS),
                     snap_direction: LimitSnapDirection::Alternate,
                 },
             )
@@ -13088,19 +13103,46 @@ mod tests {
         let mut no_in_scale_key = FlpDocument::parse(&input).expect("fixture should parse");
         assert!(
             no_in_scale_key
-                .limit_pattern_note_range_with_scale(
+                .limit_pattern_note_range_with_options(
                     7,
                     0,
                     LimitNoteOptions {
                         minimum_key: 61,
                         maximum_key: 61,
-                        scale_root: 0,
-                        scale_intervals: MAJOR_INTERVALS,
+                        wrap_to_bottom: false,
+                        scale_root: Some(0),
+                        scale_intervals: Some(MAJOR_INTERVALS),
                         snap_direction: LimitSnapDirection::Up,
                     },
                 )
                 .is_err()
         );
+
+        let mut wrapped = FlpDocument::parse(&pattern_fixture(
+            &[
+                note_record(0, 0, 60, 72, 100),
+                note_record(24, 0, 60, 84, 80),
+            ],
+            &[0xFF, 0],
+        ))
+        .expect("fixture should parse");
+        wrapped
+            .limit_pattern_note_range_with_options(
+                7,
+                0,
+                LimitNoteOptions {
+                    minimum_key: 48,
+                    maximum_key: 83,
+                    wrap_to_bottom: true,
+                    scale_root: None,
+                    scale_intervals: None,
+                    snap_direction: LimitSnapDirection::Up,
+                },
+            )
+            .expect("notes should wrap to the lowest octave in the range");
+        let wrapped_notes = wrapped.patterns().unwrap().remove(0).notes;
+        assert_eq!(wrapped_notes[0].key, 48);
+        assert_eq!(wrapped_notes[1].key, 48);
     }
 
     #[test]
