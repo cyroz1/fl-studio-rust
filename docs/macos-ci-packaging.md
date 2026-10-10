@@ -1,6 +1,6 @@
 # macOS CI packaging
 
-The macOS CI job always runs formatting, Clippy, and tests. Without signing credentials, it builds an unsigned `.app`, checks that its executable and `.flp` file association are present, and uploads a short-lived `macos-unsigned-gui-preview` artifact for local UI testing. This artifact is not a distributable installer and may be blocked by Gatekeeper. To open a preview from this trusted repository, download and extract the artifact, extract the included `fl-studio-rebuild-macos-unsigned-preview.zip`, then run:
+The macOS CI job always runs formatting, Clippy, and tests. Without signing credentials, it builds an unsigned `.app`, checks that its executable and `.flp` file association are present, and uploads a short-lived `macos-unsigned-gui-preview` artifact for local UI testing. This artifact is not a distributable installer and Gatekeeper may report that the app is “damaged” because it is unsigned and quarantined. The included `README-FIRST.txt` has the same steps. To open a preview from this trusted repository, download and extract the artifact, extract the included `fl-studio-rebuild-macos-unsigned-preview.zip`, then run:
 
 ```sh
 xattr -dr com.apple.quarantine "FL Studio Rebuild.app"

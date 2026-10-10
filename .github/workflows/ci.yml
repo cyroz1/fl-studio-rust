@@ -178,8 +178,23 @@ jobs:
             echo "::error::Cargo Packager did not produce a macOS app bundle."
             exit 1
           fi
+          preview_dir="dist/macos-unsigned-preview"
+          mkdir -p "$preview_dir"
+          ditto "$app_path" "$preview_dir/$(basename "$app_path")"
+          cat > "$preview_dir/README-FIRST.txt" <<'EOF'
+          This is an unsigned macOS CI preview. Gatekeeper can label it “damaged” because
+          it was downloaded from the internet without a Developer ID signature and notarization.
+
+          To open this preview, open Terminal, change to this folder, then run:
+
+              xattr -dr com.apple.quarantine "FL Studio Rebuild.app"
+              open "FL Studio Rebuild.app"
+
+          A signed and notarized disk image is produced only when the repository's Apple
+          Developer ID and notarization secrets are configured.
+          EOF
           ditto -c -k --sequesterRsrc --keepParent \
-            "$app_path" dist/fl-studio-rebuild-macos-unsigned-preview.zip
+            "$preview_dir" dist/fl-studio-rebuild-macos-unsigned-preview.zip
 
       - name: Verify macOS signature and notarization
         if: runner.os == 'macOS' && steps.macos-signing.outputs.configured == 'true'
