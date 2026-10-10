@@ -313,6 +313,16 @@ pub struct MidiRecordingResult {
     pub overflowed: bool,
 }
 
+pub struct MidiPatternRecorderSettings {
+    pub pattern_id: u16,
+    pub channel_id: u16,
+    pub project_path: Option<PathBuf>,
+    pub ppq: u16,
+    pub tempo_bpm: f64,
+    pub start_tick: u32,
+    pub snap_ticks: Option<u32>,
+}
+
 pub struct MidiPatternRecorder {
     pattern_id: u16,
     channel_id: u16,
@@ -332,15 +342,18 @@ pub struct MidiPatternRecorder {
 
 impl MidiPatternRecorder {
     pub fn new(
-        pattern_id: u16,
-        channel_id: u16,
-        project_path: Option<PathBuf>,
-        ppq: u16,
-        tempo_bpm: f64,
-        start_tick: u32,
-        snap_ticks: Option<u32>,
+        settings: MidiPatternRecorderSettings,
         started_at: Instant,
     ) -> Result<Self, &'static str> {
+        let MidiPatternRecorderSettings {
+            pattern_id,
+            channel_id,
+            project_path,
+            ppq,
+            tempo_bpm,
+            start_tick,
+            snap_ticks,
+        } = settings;
         if ppq == 0 {
             return Err("MIDI recording requires a non-zero project PPQ value");
         }
@@ -577,13 +590,15 @@ mod tests {
     fn records_note_timing_velocity_channel_and_target() {
         let started_at = Instant::now();
         let mut recorder = MidiPatternRecorder::new(
-            7,
-            42,
-            Some(PathBuf::from("song.flp")),
-            96,
-            120.0,
-            0,
-            None,
+            MidiPatternRecorderSettings {
+                pattern_id: 7,
+                channel_id: 42,
+                project_path: Some(PathBuf::from("song.flp")),
+                ppq: 96,
+                tempo_bpm: 120.0,
+                start_tick: 0,
+                snap_ticks: None,
+            },
             started_at,
         )
         .expect("valid project timing should create a recorder");
@@ -620,8 +635,19 @@ mod tests {
     #[test]
     fn closes_held_notes_when_recording_stops() {
         let started_at = Instant::now();
-        let mut recorder = MidiPatternRecorder::new(1, 2, None, 96, 120.0, 0, None, started_at)
-            .expect("valid project timing should create a recorder");
+        let mut recorder = MidiPatternRecorder::new(
+            MidiPatternRecorderSettings {
+                pattern_id: 1,
+                channel_id: 2,
+                project_path: None,
+                ppq: 96,
+                tempo_bpm: 120.0,
+                start_tick: 0,
+                snap_ticks: None,
+            },
+            started_at,
+        )
+        .expect("valid project timing should create a recorder");
         recorder.record(ReceivedMidiMessage {
             timestamp_micros: 110_000,
             received_at: started_at + Duration::from_millis(100),
@@ -639,8 +665,19 @@ mod tests {
     #[test]
     fn quantizes_recorded_note_start_and_end_to_the_nearest_grid() {
         let started_at = Instant::now();
-        let mut recorder = MidiPatternRecorder::new(1, 2, None, 96, 120.0, 0, Some(24), started_at)
-            .expect("valid project timing and snap should create a recorder");
+        let mut recorder = MidiPatternRecorder::new(
+            MidiPatternRecorderSettings {
+                pattern_id: 1,
+                channel_id: 2,
+                project_path: None,
+                ppq: 96,
+                tempo_bpm: 120.0,
+                start_tick: 0,
+                snap_ticks: Some(24),
+            },
+            started_at,
+        )
+        .expect("valid project timing and snap should create a recorder");
         recorder.record(ReceivedMidiMessage {
             timestamp_micros: 1_135_417,
             received_at: started_at + Duration::from_micros(135_417),
@@ -669,7 +706,18 @@ mod tests {
     #[test]
     fn rejects_a_zero_length_recording_snap() {
         assert!(matches!(
-            MidiPatternRecorder::new(1, 2, None, 96, 120.0, 0, Some(0), Instant::now()),
+            MidiPatternRecorder::new(
+                MidiPatternRecorderSettings {
+                    pattern_id: 1,
+                    channel_id: 2,
+                    project_path: None,
+                    ppq: 96,
+                    tempo_bpm: 120.0,
+                    start_tick: 0,
+                    snap_ticks: Some(0),
+                },
+                Instant::now(),
+            ),
             Err("MIDI recording snap requires a non-zero tick value")
         ));
     }
@@ -677,8 +725,19 @@ mod tests {
     #[test]
     fn offsets_recorded_notes_from_the_selected_pattern_playhead_position() {
         let started_at = Instant::now();
-        let mut recorder = MidiPatternRecorder::new(1, 2, None, 96, 120.0, 192, None, started_at)
-            .expect("valid project timing and playhead should create a recorder");
+        let mut recorder = MidiPatternRecorder::new(
+            MidiPatternRecorderSettings {
+                pattern_id: 1,
+                channel_id: 2,
+                project_path: None,
+                ppq: 96,
+                tempo_bpm: 120.0,
+                start_tick: 192,
+                snap_ticks: None,
+            },
+            started_at,
+        )
+        .expect("valid project timing and playhead should create a recorder");
         recorder.record(ReceivedMidiMessage {
             timestamp_micros: 1_200_000,
             received_at: started_at + Duration::from_millis(200),

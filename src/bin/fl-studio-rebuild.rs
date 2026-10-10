@@ -41,8 +41,9 @@ use flp_rebuild::{
 mod midi_input;
 
 use midi_input::{
-    ConnectedMidiInput, MidiInputDevice, MidiInputEvent, MidiPatternRecorder, MidiTransportCommand,
-    ReceivedMidiMessage, connect_input_device, describe_event, enumerate_input_devices,
+    ConnectedMidiInput, MidiInputDevice, MidiInputEvent, MidiPatternRecorder,
+    MidiPatternRecorderSettings, MidiTransportCommand, ReceivedMidiMessage, connect_input_device,
+    describe_event, enumerate_input_devices,
 };
 
 const APP_BACKGROUND: Color32 = Color32::from_rgb(29, 29, 29);
@@ -16563,13 +16564,15 @@ impl DawUi {
             )
         });
         match MidiPatternRecorder::new(
-            pattern_id,
-            channel_id,
-            self.current_path.clone(),
-            document.header().ppq(),
-            self.tempo_bpm,
-            recording_start_tick,
-            snap_ticks,
+            MidiPatternRecorderSettings {
+                pattern_id,
+                channel_id,
+                project_path: self.current_path.clone(),
+                ppq: document.header().ppq(),
+                tempo_bpm: self.tempo_bpm,
+                start_tick: recording_start_tick,
+                snap_ticks,
+            },
             Instant::now(),
         ) {
             Ok(recorder) => {
