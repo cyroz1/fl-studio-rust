@@ -7211,13 +7211,21 @@ impl DawUi {
     }
 
     fn playlist(&mut self, ui: &mut egui::Ui) {
-        let Some(document) = &self.document else {
+        if self.document.is_none() {
             self.empty_project_view(ui);
             return;
+        }
+        let (arrangements, tracks, channels, ppq, patterns, project_time_signature) = {
+            let document = self.document.as_ref().expect("document checked above");
+            (
+                document.arrangements().unwrap_or_default(),
+                document.playlist_tracks(),
+                document.channels(),
+                document.header().ppq().max(1),
+                document.patterns().unwrap_or_default(),
+                document.metadata().time_signature(),
+            )
         };
-        let arrangements = document.arrangements().unwrap_or_default();
-        let tracks = document.playlist_tracks();
-        let channels = document.channels();
         let tempo_channel_ids = channels
             .iter()
             .filter(|channel| {
@@ -7232,8 +7240,6 @@ impl DawUi {
             .into_iter()
             .map(|channel| (channel.id(), channel.kind()))
             .collect();
-        let ppq = document.header().ppq().max(1);
-        let patterns = document.patterns().unwrap_or_default();
         let selected_pattern_id = self
             .selected_pattern
             .filter(|pattern_id| patterns.iter().any(|pattern| pattern.id == *pattern_id))
@@ -7358,7 +7364,7 @@ impl DawUi {
         let measure_length_ticks = playlist_bar_ticks(
             ppq,
             playlist_signature_at_tick(
-                document.metadata().time_signature(),
+                project_time_signature,
                 &signature_changes,
                 new_pattern_clip_position,
             ),
@@ -7410,7 +7416,7 @@ impl DawUi {
             .clamp(0.0, u32::MAX as f32) as u32;
         let measure_boundaries = playlist_measure_boundaries(
             ppq,
-            document.metadata().time_signature(),
+            project_time_signature,
             &signature_changes,
             measure_tick_limit,
         );
