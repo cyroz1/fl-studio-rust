@@ -17312,6 +17312,52 @@ impl DawUi {
                                     "Off"
                                 }
                             ));
+                            let flags_editable = insert.flags().is_some();
+                            let mut polarity_reversed =
+                                insert.polarity_reversed().unwrap_or(false);
+                            let mut swap_left_right =
+                                insert.swap_left_right().unwrap_or(false);
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add_enabled(
+                                        flags_editable,
+                                        egui::Checkbox::new(
+                                            &mut polarity_reversed,
+                                            "Phase invert",
+                                        ),
+                                    )
+                                    .on_hover_text(
+                                        "Reverse polarity for supported sources routed to this insert",
+                                    )
+                                    .changed()
+                                {
+                                    flag_edits.push((
+                                        insert.ordinal(),
+                                        MixerInsertEdit {
+                                            polarity_reversed: Some(polarity_reversed),
+                                            ..MixerInsertEdit::default()
+                                        },
+                                    ));
+                                }
+                                if ui
+                                    .add_enabled(
+                                        flags_editable,
+                                        egui::Checkbox::new(&mut swap_left_right, "Swap L/R"),
+                                    )
+                                    .on_hover_text(
+                                        "Swap left and right for supported sources routed to this insert",
+                                    )
+                                    .changed()
+                                {
+                                    flag_edits.push((
+                                        insert.ordinal(),
+                                        MixerInsertEdit {
+                                            swap_left_right: Some(swap_left_right),
+                                            ..MixerInsertEdit::default()
+                                        },
+                                    ));
+                                }
+                            });
                             ui.small(format!(
                                 "Effects: {} · Polarity: {} · L/R swap: {}",
                                 if insert.effects_enabled().unwrap_or(false) {
@@ -17449,7 +17495,7 @@ impl DawUi {
                         } else {
                             format!("Insert {insert_ordinal}")
                         };
-                        self.status = format!("Updated {track_name} mute/solo state");
+                        self.status = format!("Updated {track_name} state");
                     }
                     Err(error) => {
                         self.status = format!("Could not update Mixer track state: {error}");
