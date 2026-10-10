@@ -7765,7 +7765,7 @@ impl DawUi {
                                     egui::pos2(center.x, center.y + 3.0),
                                 ]
                             };
-                            ui.painter().add(egui::Shape::convex_polygon(
+                            ui.painter_at(label_rect).add(egui::Shape::convex_polygon(
                                 chevron,
                                 if group_toggle.hovered() { TEXT } else { MUTED },
                                 Stroke::NONE,
