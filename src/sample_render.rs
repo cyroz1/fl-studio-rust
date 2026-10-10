@@ -2197,6 +2197,7 @@ struct SamplerVoice {
 }
 
 impl<'a> SamplerVoiceEngine<'a> {
+    #[cfg(test)]
     fn new(
         sources_by_channel: &'a HashMap<u16, SamplerVoiceSource>,
         notes: &'a [ScheduledSamplerNote],
@@ -2677,6 +2678,7 @@ fn check_cancelled(cancelled: Option<&AtomicBool>) -> Result<(), String> {
     }
 }
 
+#[cfg(test)]
 fn mix_clip_into_stereo(
     mix: &mut [f32],
     source: &DecodedAudio,
@@ -2687,6 +2689,7 @@ fn mix_clip_into_stereo(
     mix_clip_window_into_stereo(mix, 0, source, clip, output_rate, cancelled)
 }
 
+#[cfg(test)]
 fn mix_clip_window_into_stereo(
     mix: &mut [f32],
     mix_start_frame: u64,
