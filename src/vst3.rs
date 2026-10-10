@@ -25,6 +25,9 @@ use crate::PatternNote;
 
 static NEXT_RENDER_FILE_ID: AtomicU64 = AtomicU64::new(1);
 const MAX_STEREO_BUFFER_BYTES: usize = 512 * 1024 * 1024;
+const MAX_VST3_AUTOMATION_POINTS: usize = 1_000_000;
+// Leave headroom below vst3-host's 4096-change processing queue for concurrent editor edits.
+const MAX_VST3_AUTOMATION_CHANGES_PER_BLOCK: usize = 2_048;
 const FLP_VST3_STATE_MARKER: u32 = 1;
 const VST3_HOST_STATE_MAGIC: &[u8; 16] = b"VST3HOST_STATE\0\0";
 const VST3_HOST_STATE_VERSION: u32 = 1;
@@ -50,12 +53,25 @@ pub struct Vst3RenderSummary {
 
 struct PreparedPatternRender {
     events: Vec<ScheduledMidiEvent>,
+    parameter_automation: Vec<PreparedParameterAutomation>,
     note_count: usize,
     sample_rate: f64,
     sample_rate_u32: u32,
     output_channels: usize,
     block_size: usize,
     total_frames: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ScheduledParameterPoint {
+    frame: u64,
+    value: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct PreparedParameterAutomation {
+    parameter_id: u32,
+    points: Vec<ScheduledParameterPoint>,
 }
 
 /// A prepared VST3 pattern render that can stream processed blocks to a live audio device.
@@ -123,6 +139,26 @@ pub struct Vst3PatternRenderOptions {
     pub tail_seconds: f64,
     pub global_swing_mix_raw: u8,
     pub channel_swing_mix_raw: u16,
+}
+
+/// One normalized VST3 parameter value at a pattern-relative beat position.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Vst3AutomationPoint {
+    pub position_beats: f64,
+    pub value: f64,
+}
+
+/// Explicit VST3 parameter automation for a pattern render.
+///
+/// `parameter_id` must be an ID reported by the loaded VST3, and point positions are
+/// measured from the start of the rendered pattern. Values use the VST3 normalized
+/// 0..=1 range. Points are scheduled at their sample offsets; when a segment crosses a
+/// processing-block boundary, its value is evaluated linearly at the next block start.
+/// Automation is limited to 2,048 scheduled changes per processing block.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Vst3ParameterAutomation {
+    pub parameter_id: u32,
+    pub points: Vec<Vst3AutomationPoint>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -291,6 +327,12 @@ impl PlaylistPluginStream {
                         .plugin
                         .lock()
                         .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
+                    set_parameter_automation_for_block(
+                        &mut plugin,
+                        &self.render.parameter_automation,
+                        self.source_frame,
+                        source_count,
+                    )?;
                     while let Some(event) = self.render.events.get(self.next_event)
                         && event.frame < block_end
                     {
@@ -853,11 +895,27 @@ impl Vst3HostRuntime {
         options: Vst3PatternRenderOptions,
         path: impl AsRef<Path>,
     ) -> Result<Vst3RenderSummary, String> {
+        self.render_pattern_channel_to_wav_with_automation(id, notes, options, &[], path)
+    }
+
+    /// Render a pattern channel with explicitly mapped VST3 parameter automation lanes.
+    ///
+    /// The automation uses pattern-relative beats and normalized values. It does not decode
+    /// FL Studio automation target links; callers must supply the VST3 parameter IDs.
+    pub fn render_pattern_channel_to_wav_with_automation(
+        &self,
+        id: u64,
+        notes: &[PatternNote],
+        options: Vst3PatternRenderOptions,
+        parameter_automation: &[Vst3ParameterAutomation],
+        path: impl AsRef<Path>,
+    ) -> Result<Vst3RenderSummary, String> {
         let plugin = self.plugin(id)?;
         let mut plugin = plugin
             .lock()
             .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
-        let render = prepare_pattern_render(&plugin, notes, options)?;
+        let render =
+            prepare_pattern_render_with_automation(&plugin, notes, options, parameter_automation)?;
         let data_bytes = render
             .total_frames
             .checked_mul(render.output_channels as u64)
@@ -909,11 +967,23 @@ impl Vst3HostRuntime {
         notes: &[PatternNote],
         options: Vst3PatternRenderOptions,
     ) -> Result<(Vec<f32>, Vst3RenderSummary), String> {
+        self.render_pattern_channel_to_stereo_buffer_with_automation(id, notes, options, &[])
+    }
+
+    /// Render a pattern channel to stereo samples with explicit parameter automation lanes.
+    pub fn render_pattern_channel_to_stereo_buffer_with_automation(
+        &self,
+        id: u64,
+        notes: &[PatternNote],
+        options: Vst3PatternRenderOptions,
+        parameter_automation: &[Vst3ParameterAutomation],
+    ) -> Result<(Vec<f32>, Vst3RenderSummary), String> {
         let plugin = self.plugin(id)?;
         let mut plugin = plugin
             .lock()
             .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
-        let render = prepare_pattern_render(&plugin, notes, options)?;
+        let render =
+            prepare_pattern_render_with_automation(&plugin, notes, options, parameter_automation)?;
         if !(1..=2).contains(&render.output_channels) {
             return Err(format!(
                 "VST3 preview supports mono or stereo output buses; this instrument has {} channels",
@@ -956,12 +1026,28 @@ impl Vst3HostRuntime {
         notes: &[PatternNote],
         options: Vst3PatternRenderOptions,
     ) -> Result<Vst3PatternStream, String> {
+        self.prepare_pattern_channel_stream_with_automation(id, notes, options, &[])
+    }
+
+    /// Prepare a pattern stream with explicit VST3 parameter automation lanes.
+    pub fn prepare_pattern_channel_stream_with_automation(
+        &self,
+        id: u64,
+        notes: &[PatternNote],
+        options: Vst3PatternRenderOptions,
+        parameter_automation: &[Vst3ParameterAutomation],
+    ) -> Result<Vst3PatternStream, String> {
         let plugin = self.plugin(id)?.clone();
         let render = {
             let plugin_guard = plugin
                 .lock()
                 .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
-            prepare_pattern_render(&plugin_guard, notes, options)?
+            prepare_pattern_render_with_automation(
+                &plugin_guard,
+                notes,
+                options,
+                parameter_automation,
+            )?
         };
         if !(1..=2).contains(&render.output_channels) {
             return Err(format!(
@@ -1364,6 +1450,15 @@ fn prepare_pattern_render(
     notes: &[PatternNote],
     options: Vst3PatternRenderOptions,
 ) -> Result<PreparedPatternRender, String> {
+    prepare_pattern_render_with_automation(plugin, notes, options, &[])
+}
+
+fn prepare_pattern_render_with_automation(
+    plugin: &Plugin,
+    notes: &[PatternNote],
+    options: Vst3PatternRenderOptions,
+    parameter_automation: &[Vst3ParameterAutomation],
+) -> Result<PreparedPatternRender, String> {
     let Vst3PatternRenderOptions {
         channel_id,
         ppq,
@@ -1395,6 +1490,8 @@ fn prepare_pattern_render(
     if output_channels == 0 || output_channels > 64 {
         return Err("VST3 instrument has no supported audio output buses".to_owned());
     }
+    let parameter_automation =
+        prepare_parameter_automation(parameter_automation, sample_rate, tempo_bpm)?;
 
     let (events, note_count) = scheduled_pattern_events(
         notes,
@@ -1422,9 +1519,11 @@ fn prepare_pattern_render(
     let total_frames = final_note_frame
         .checked_add((tail_frames as u64).max(1))
         .ok_or_else(|| "render length overflow".to_owned())?;
+    validate_parameter_automation_block_density(&parameter_automation, block_size, total_frames)?;
 
     Ok(PreparedPatternRender {
         events,
+        parameter_automation,
         note_count,
         sample_rate,
         sample_rate_u32,
@@ -1432,6 +1531,206 @@ fn prepare_pattern_render(
         block_size,
         total_frames,
     })
+}
+
+fn prepare_parameter_automation(
+    automation: &[Vst3ParameterAutomation],
+    sample_rate: f64,
+    tempo_bpm: f64,
+) -> Result<Vec<PreparedParameterAutomation>, String> {
+    let mut point_count = 0usize;
+    let mut parameter_ids = BTreeSet::new();
+    let mut prepared = Vec::with_capacity(automation.len());
+    for lane in automation {
+        if lane.points.is_empty() {
+            continue;
+        }
+        if !parameter_ids.insert(lane.parameter_id) {
+            return Err(format!(
+                "VST3 parameter {} has more than one automation lane",
+                lane.parameter_id
+            ));
+        }
+        point_count = point_count
+            .checked_add(lane.points.len())
+            .filter(|count| *count <= MAX_VST3_AUTOMATION_POINTS)
+            .ok_or_else(|| {
+                format!("VST3 automation exceeds {MAX_VST3_AUTOMATION_POINTS} points")
+            })?;
+
+        let mut points = Vec::with_capacity(lane.points.len());
+        for point in &lane.points {
+            if !point.position_beats.is_finite() || point.position_beats < 0.0 {
+                return Err("VST3 automation positions must be finite and non-negative".to_owned());
+            }
+            if !point.value.is_finite() || !(0.0..=1.0).contains(&point.value) {
+                return Err(
+                    "VST3 automation values must be finite and normalized to 0..=1".to_owned(),
+                );
+            }
+            let frame = point.position_beats * 60.0 / tempo_bpm * sample_rate;
+            if !frame.is_finite() || frame < 0.0 || frame >= u64::MAX as f64 {
+                return Err("VST3 automation position is outside the renderable range".to_owned());
+            }
+            points.push(ScheduledParameterPoint {
+                frame: frame.round() as u64,
+                value: point.value,
+            });
+        }
+        points.sort_by_key(|point| point.frame);
+        let mut unique_points: Vec<ScheduledParameterPoint> = Vec::with_capacity(points.len());
+        for point in points {
+            if let Some(previous) = unique_points.last_mut()
+                && previous.frame == point.frame
+            {
+                previous.value = point.value;
+            } else {
+                unique_points.push(point);
+            }
+        }
+        prepared.push(PreparedParameterAutomation {
+            parameter_id: lane.parameter_id,
+            points: unique_points,
+        });
+    }
+    Ok(prepared)
+}
+
+fn parameter_automation_value_at_frame(
+    points: &[ScheduledParameterPoint],
+    frame: u64,
+) -> Option<f64> {
+    let next_index = points.partition_point(|point| point.frame <= frame);
+    if next_index == 0 {
+        return None;
+    }
+    let from = points[next_index - 1];
+    let Some(to) = points.get(next_index) else {
+        return Some(from.value);
+    };
+    let span = to.frame.saturating_sub(from.frame);
+    if span == 0 {
+        return Some(from.value);
+    }
+    let fraction = frame.saturating_sub(from.frame) as f64 / span as f64;
+    Some(from.value + (to.value - from.value) * fraction.clamp(0.0, 1.0))
+}
+
+fn validate_parameter_automation_block_density(
+    automation: &[PreparedParameterAutomation],
+    block_size: usize,
+    total_frames: u64,
+) -> Result<(), String> {
+    if block_size == 0 || total_frames == 0 {
+        return Ok(());
+    }
+    let block_size =
+        u64::try_from(block_size).map_err(|_| "VST3 automation block size overflow".to_owned())?;
+    let mut active_from_blocks = Vec::with_capacity(automation.len());
+    let mut in_block_point_counts = BTreeMap::<u64, usize>::new();
+
+    for lane in automation {
+        let first_point = lane.points.iter().find(|point| point.frame < total_frames);
+        let Some(first_point) = first_point else {
+            continue;
+        };
+        let first_block = first_point.frame / block_size;
+        let first_offset = first_point.frame % block_size;
+        active_from_blocks.push(first_block + (first_offset > 0) as u64);
+
+        for point in lane
+            .points
+            .iter()
+            .filter(|point| point.frame < total_frames)
+        {
+            let offset = point.frame % block_size;
+            if offset > 0 {
+                let count = in_block_point_counts
+                    .entry(point.frame / block_size)
+                    .or_default();
+                *count = count.saturating_add(1);
+            }
+        }
+    }
+
+    active_from_blocks.sort_unstable();
+    let mut candidate_blocks = active_from_blocks.iter().copied().collect::<BTreeSet<_>>();
+    candidate_blocks.extend(in_block_point_counts.keys().copied());
+    for block in candidate_blocks {
+        let active_lanes = active_from_blocks.partition_point(|active| *active <= block);
+        let in_block_points = in_block_point_counts
+            .get(&block)
+            .copied()
+            .unwrap_or_default();
+        let scheduled_changes = active_lanes.saturating_add(in_block_points);
+        if scheduled_changes > MAX_VST3_AUTOMATION_CHANGES_PER_BLOCK {
+            return Err(format!(
+                "VST3 automation schedules {scheduled_changes} parameter changes in one block; the limit is {MAX_VST3_AUTOMATION_CHANGES_PER_BLOCK}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn set_parameter_automation_for_block(
+    plugin: &mut Plugin,
+    automation: &[PreparedParameterAutomation],
+    block_start_frame: u64,
+    frame_count: usize,
+) -> Result<(), String> {
+    if frame_count == 0 {
+        return Ok(());
+    }
+    for lane in automation {
+        for_each_parameter_change_for_block(
+            lane,
+            block_start_frame,
+            frame_count,
+            |offset, value| {
+                plugin
+                    .set_parameter_at(lane.parameter_id, value, offset)
+                    .map_err(|error| {
+                        format!(
+                            "could not automate VST3 parameter {}: {error}",
+                            lane.parameter_id
+                        )
+                    })
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn for_each_parameter_change_for_block(
+    lane: &PreparedParameterAutomation,
+    block_start_frame: u64,
+    frame_count: usize,
+    mut visit: impl FnMut(i32, f64) -> Result<(), String>,
+) -> Result<(), String> {
+    if frame_count == 0 {
+        return Ok(());
+    }
+    let block_end_frame = block_start_frame
+        .checked_add(
+            u64::try_from(frame_count)
+                .map_err(|_| "VST3 automation block size overflow".to_owned())?,
+        )
+        .ok_or_else(|| "VST3 automation block end overflow".to_owned())?;
+    if let Some(value) = parameter_automation_value_at_frame(&lane.points, block_start_frame) {
+        visit(0, value)?;
+    }
+    let first_in_block = lane
+        .points
+        .partition_point(|point| point.frame <= block_start_frame);
+    for point in &lane.points[first_in_block..] {
+        if point.frame >= block_end_frame {
+            break;
+        }
+        let offset = i32::try_from(point.frame - block_start_frame)
+            .map_err(|_| "VST3 automation offset exceeds the host range".to_owned())?;
+        visit(offset, point.value)?;
+    }
+    Ok(())
 }
 
 fn process_pattern_render(
@@ -1455,6 +1754,12 @@ fn process_pattern_render(
             let frame_count =
                 (render.total_frames - rendered_frames).min(render.block_size as u64) as usize;
             let block_end = rendered_frames + frame_count as u64;
+            set_parameter_automation_for_block(
+                plugin,
+                &render.parameter_automation,
+                rendered_frames,
+                frame_count,
+            )?;
             while let Some(event) = render.events.get(event_index)
                 && event.frame < block_end
             {
@@ -1529,6 +1834,12 @@ fn stream_pattern_render(
                 let mut plugin = plugin
                     .lock()
                     .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
+                set_parameter_automation_for_block(
+                    &mut plugin,
+                    &render.parameter_automation,
+                    rendered_frames,
+                    frame_count,
+                )?;
                 while let Some(event) = render.events.get(event_index)
                     && event.frame < block_end
                 {
@@ -1948,6 +2259,172 @@ fn reported_tail_seconds(tail_samples: u32, sample_rate_hz: f64) -> Option<f64> 
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn parameter_automation_uses_pattern_beats_and_emits_block_offsets() {
+        let lanes = [Vst3ParameterAutomation {
+            parameter_id: 17,
+            points: vec![
+                Vst3AutomationPoint {
+                    position_beats: 0.0,
+                    value: 0.0,
+                },
+                Vst3AutomationPoint {
+                    position_beats: 0.02,
+                    value: 1.0,
+                },
+                Vst3AutomationPoint {
+                    position_beats: 0.04,
+                    value: 0.0,
+                },
+            ],
+        }];
+        let prepared = prepare_parameter_automation(&lanes, 48_000.0, 120.0)
+            .expect("normalized automation should prepare");
+        assert_eq!(
+            prepared[0].points,
+            vec![
+                ScheduledParameterPoint {
+                    frame: 0,
+                    value: 0.0,
+                },
+                ScheduledParameterPoint {
+                    frame: 480,
+                    value: 1.0,
+                },
+                ScheduledParameterPoint {
+                    frame: 960,
+                    value: 0.0,
+                },
+            ]
+        );
+
+        let collect_changes = |block_start_frame, frame_count| {
+            let mut changes = Vec::new();
+            for_each_parameter_change_for_block(
+                &prepared[0],
+                block_start_frame,
+                frame_count,
+                |offset, value| {
+                    changes.push((offset, value));
+                    Ok(())
+                },
+            )
+            .expect("block automation should be schedulable");
+            changes
+        };
+        assert_eq!(collect_changes(0, 512), vec![(0, 0.0), (480, 1.0)]);
+        assert_eq!(
+            collect_changes(512, 512),
+            vec![(0, 56.0 / 60.0), (448, 0.0)]
+        );
+        assert_eq!(collect_changes(1024, 512), vec![(0, 0.0)]);
+    }
+
+    #[test]
+    fn parameter_automation_preserves_future_points_and_collapses_same_frame_points() {
+        let future = [Vst3ParameterAutomation {
+            parameter_id: 18,
+            points: vec![Vst3AutomationPoint {
+                position_beats: 0.02,
+                value: 0.75,
+            }],
+        }];
+        let prepared = prepare_parameter_automation(&future, 48_000.0, 120.0)
+            .expect("future automation should prepare");
+        let mut changes = Vec::new();
+        for_each_parameter_change_for_block(&prepared[0], 0, 256, |offset, value| {
+            changes.push((offset, value));
+            Ok(())
+        })
+        .unwrap();
+        assert!(changes.is_empty());
+
+        for_each_parameter_change_for_block(&prepared[0], 256, 256, |offset, value| {
+            changes.push((offset, value));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(changes, vec![(224, 0.75)]);
+
+        let same_frame = [Vst3ParameterAutomation {
+            parameter_id: 19,
+            points: vec![
+                Vst3AutomationPoint {
+                    position_beats: 0.0,
+                    value: 0.1,
+                },
+                Vst3AutomationPoint {
+                    position_beats: 0.000001,
+                    value: 0.9,
+                },
+            ],
+        }];
+        let prepared = prepare_parameter_automation(&same_frame, 48_000.0, 120.0)
+            .expect("same-frame values should prepare");
+        assert_eq!(
+            prepared[0].points,
+            vec![ScheduledParameterPoint {
+                frame: 0,
+                value: 0.9,
+            }]
+        );
+    }
+
+    #[test]
+    fn parameter_automation_rejects_invalid_values_and_ambiguous_duplicate_lanes() {
+        let invalid = [Vst3ParameterAutomation {
+            parameter_id: 17,
+            points: vec![Vst3AutomationPoint {
+                position_beats: 0.0,
+                value: f64::NAN,
+            }],
+        }];
+        assert!(prepare_parameter_automation(&invalid, 48_000.0, 120.0).is_err());
+
+        let duplicate_ids = [
+            Vst3ParameterAutomation {
+                parameter_id: 17,
+                points: vec![Vst3AutomationPoint {
+                    position_beats: 0.0,
+                    value: 0.0,
+                }],
+            },
+            Vst3ParameterAutomation {
+                parameter_id: 17,
+                points: vec![Vst3AutomationPoint {
+                    position_beats: 1.0,
+                    value: 1.0,
+                }],
+            },
+        ];
+        assert!(prepare_parameter_automation(&duplicate_ids, 48_000.0, 120.0).is_err());
+    }
+
+    #[test]
+    fn parameter_automation_rejects_dense_blocks_before_the_host_drops_points() {
+        let automation = vec![
+            PreparedParameterAutomation {
+                parameter_id: 1,
+                points: vec![ScheduledParameterPoint {
+                    frame: 0,
+                    value: 0.0,
+                }],
+            },
+            PreparedParameterAutomation {
+                parameter_id: 2,
+                points: (1..=MAX_VST3_AUTOMATION_CHANGES_PER_BLOCK)
+                    .map(|frame| ScheduledParameterPoint {
+                        frame: frame as u64,
+                        value: 0.5,
+                    })
+                    .collect(),
+            },
+        ];
+        let error = validate_parameter_automation_block_density(&automation, 4096, 4097)
+            .expect_err("dense block should be rejected");
+        assert!(error.contains("parameter changes in one block"));
+    }
 
     #[test]
     fn reported_latency_uses_the_plugin_sample_rate() {
