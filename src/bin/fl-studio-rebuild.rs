@@ -261,21 +261,41 @@ fn candidate_matches_vst_metadata(
     candidate: &PluginCandidate,
     metadata: &VstPluginStateMetadata,
 ) -> bool {
+    let class_uid = metadata.class_uid();
+    candidate_matches_vst_identity(
+        candidate,
+        class_uid.as_deref(),
+        metadata.path(),
+        metadata.name(),
+    )
+}
+
+fn candidate_matches_vst_identity(
+    candidate: &PluginCandidate,
+    class_uid: Option<&str>,
+    plugin_path: Option<&str>,
+    plugin_name: Option<&str>,
+) -> bool {
     if candidate.format != PluginFormat::Vst3 {
         return false;
     }
 
+    if let Some(class_uid) = class_uid.filter(|_| !candidate.class_ids.is_empty()) {
+        return candidate
+            .class_ids
+            .iter()
+            .any(|candidate_uid| candidate_uid.eq_ignore_ascii_case(class_uid));
+    }
+
     let candidate_name = candidate.name.to_lowercase();
-    let source_bundle = metadata.path().and_then(|path| {
+    let source_bundle = plugin_path.and_then(|path| {
         Path::new(path)
             .file_stem()
             .or_else(|| Path::new(path).file_name())
             .map(|value| value.to_string_lossy().to_lowercase())
     });
     source_bundle.as_deref() == Some(candidate_name.as_str())
-        || metadata
-            .name()
-            .is_some_and(|name| name.eq_ignore_ascii_case(&candidate.name))
+        || plugin_name.is_some_and(|name| name.eq_ignore_ascii_case(&candidate.name))
 }
 
 fn detect_chord_name(notes: &[PatternNote], channel_id: u16, position: u32) -> String {
@@ -19244,16 +19264,58 @@ fn note_from_grid_position(
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
+    use std::path::PathBuf;
 
     use super::{
         ActivePlaylistClipDrag, ChannelDisplayFilter, FlpDocument, Pattern, PatternNote,
-        PianoRollGrid, PianoRollSnap, PlaylistClip, PlaylistClipDragKind,
-        next_piano_roll_note_group, note_from_grid_position, piano_roll_note_group_members,
+        PianoRollGrid, PianoRollSnap, PlaylistClip, PlaylistClipDragKind, PluginCandidate,
+        PluginFormat, candidate_matches_vst_identity, next_piano_roll_note_group,
+        note_from_grid_position, piano_roll_note_group_members,
         playlist_audio_clip_join_candidates, playlist_clip_drag_edit, playlist_clip_split_position,
         playlist_pattern_clip_join_candidates, snap_note_tick,
         toggle_piano_roll_note_group_selection, update_channel_rack_selection,
         update_layer_child_selection, update_piano_roll_box_selection,
     };
+
+    #[test]
+    fn vst3_autoload_uses_moduleinfo_class_id_before_names() {
+        let candidate = PluginCandidate {
+            format: PluginFormat::Vst3,
+            name: "Example".to_owned(),
+            path: PathBuf::from("/plugins/Example.vst3"),
+            class_ids: vec!["00112233445566778899AABBCCDDEEFF".to_owned()],
+        };
+
+        assert!(candidate_matches_vst_identity(
+            &candidate,
+            Some("00112233445566778899aabbccddeeff"),
+            Some("/old/Other.vst3"),
+            Some("Different display name"),
+        ));
+        assert!(!candidate_matches_vst_identity(
+            &candidate,
+            Some("FFEEDDCCBBAA99887766554433221100"),
+            Some("/old/Example.vst3"),
+            Some("Example"),
+        ));
+    }
+
+    #[test]
+    fn vst3_autoload_keeps_name_fallback_when_moduleinfo_is_unavailable() {
+        let candidate = PluginCandidate {
+            format: PluginFormat::Vst3,
+            name: "Example".to_owned(),
+            path: PathBuf::from("/plugins/Example.vst3"),
+            class_ids: Vec::new(),
+        };
+
+        assert!(candidate_matches_vst_identity(
+            &candidate,
+            Some("00112233445566778899AABBCCDDEEFF"),
+            Some("/old/Example.vst3"),
+            Some("Different display name"),
+        ));
+    }
 
     fn test_grid() -> PianoRollGrid {
         PianoRollGrid {

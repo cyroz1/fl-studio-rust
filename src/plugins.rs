@@ -25,6 +25,9 @@ pub struct PluginCandidate {
     pub format: PluginFormat,
     pub name: String,
     pub path: PathBuf,
+    /// VST3 processor class IDs declared by a bundle's validated moduleinfo.json,
+    /// including IDs retired by its compatibility mappings.
+    pub class_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -273,11 +276,45 @@ fn add_candidate(
         .or_else(|| path.file_name())
         .map(|value| value.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string());
+    let mut class_ids = Vec::new();
+    if format == PluginFormat::Vst3 {
+        match vst3_host::discovery::read_module_info(path) {
+            Ok(Some(module_info)) => {
+                for class in module_info
+                    .classes
+                    .iter()
+                    .filter(|class| class.category.contains("Audio Module Class"))
+                {
+                    push_unique_class_id(&mut class_ids, &class.class_id);
+                }
+                for compatibility in module_info.compatibility {
+                    push_unique_class_id(&mut class_ids, &compatibility.new_class_id);
+                    for old_class_id in compatibility.old_class_ids {
+                        push_unique_class_id(&mut class_ids, &old_class_id);
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(error) => report
+                .scan_errors
+                .push((path.to_path_buf(), error.to_string())),
+        }
+    }
     report.candidates.push(PluginCandidate {
         format,
         name,
         path: path.to_path_buf(),
+        class_ids,
     });
+}
+
+fn push_unique_class_id(class_ids: &mut Vec<String>, class_id: &str) {
+    if !class_ids
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(class_id))
+    {
+        class_ids.push(class_id.to_owned());
+    }
 }
 
 fn normalized_path(path: &Path) -> String {
@@ -359,5 +396,68 @@ mod tests {
         assert!(report.candidates.iter().any(|candidate| {
             candidate.format == PluginFormat::Vst2Candidate && candidate.path == dll
         }));
+    }
+
+    #[test]
+    fn scan_reads_vst3_processor_and_retired_class_ids_without_loading_the_bundle() {
+        const CURRENT_CLASS_ID: &str = "00112233445566778899AABBCCDDEEFF";
+        const RETIRED_CLASS_ID: &str = "FFEEDDCCBBAA99887766554433221100";
+
+        let temp = TestDirectory::new();
+        let vst3 = temp.0.join("Vendor").join("Example.vst3");
+        let module_info = vst3.join("Contents/Resources/moduleinfo.json");
+        fs::create_dir_all(
+            module_info
+                .parent()
+                .expect("moduleinfo file should have a parent"),
+        )
+        .expect("VST3 resources directory should be created");
+        fs::write(
+            &module_info,
+            format!(
+                r#"{{
+                    "Name": "Example",
+                    "Classes": [
+                        {{
+                            "CID": "{CURRENT_CLASS_ID}",
+                            "Category": "Audio Module Class",
+                            "Name": "Example Processor"
+                        }},
+                        {{
+                            "CID": "1234567890ABCDEF1234567890ABCDEF",
+                            "Category": "Component Controller Class",
+                            "Name": "Example Controller"
+                        }}
+                    ],
+                    "Compatibility": [
+                        {{ "New": "{CURRENT_CLASS_ID}", "Old": ["{RETIRED_CLASS_ID}"] }}
+                    ]
+                }}"#
+            ),
+        )
+        .expect("VST3 module metadata should be written");
+
+        let mut report = PluginScanReport::default();
+        let mut visited = HashSet::new();
+        let mut found = HashSet::new();
+        walk(
+            &temp.0,
+            PluginFormat::Vst3,
+            0,
+            &mut report,
+            &mut visited,
+            &mut found,
+        );
+
+        let candidate = report
+            .candidates
+            .iter()
+            .find(|candidate| candidate.path == vst3)
+            .expect("VST3 bundle should remain a candidate");
+        assert_eq!(
+            candidate.class_ids,
+            vec![CURRENT_CLASS_ID.to_owned(), RETIRED_CLASS_ID.to_owned()]
+        );
+        assert!(report.scan_errors.is_empty());
     }
 }
