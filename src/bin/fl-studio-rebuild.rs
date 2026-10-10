@@ -18722,11 +18722,12 @@ fn encode_midi_device_id(id: &str) -> String {
 }
 
 fn decode_midi_device_id(encoded: &str) -> Option<String> {
-    if encoded.is_empty() || encoded.len() % 2 != 0 {
+    let (pairs, remainder) = encoded.as_bytes().as_chunks::<2>();
+    if pairs.is_empty() || !remainder.is_empty() {
         return None;
     }
-    let mut bytes = Vec::with_capacity(encoded.len() / 2);
-    for pair in encoded.as_bytes().chunks_exact(2) {
+    let mut bytes = Vec::with_capacity(pairs.len());
+    for pair in pairs {
         let high = hex_digit(pair[0])?;
         let low = hex_digit(pair[1])?;
         bytes.push((high << 4) | low);
