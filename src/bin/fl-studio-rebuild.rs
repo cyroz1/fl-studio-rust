@@ -4864,23 +4864,29 @@ impl DawUi {
         let Some(tick) = self.current_playhead_tick() else {
             return "1:01:000".to_owned();
         };
-        let ppq = self
-            .document
-            .as_ref()
-            .map(|document| u64::from(document.header().ppq().max(1)))
-            .unwrap_or(96);
-        let (numerator, denominator) = self
-            .document
-            .as_ref()
-            .and_then(|document| document.metadata().time_signature())
-            .unwrap_or((4, 4));
-        let beat_ticks = ppq as f64 * 4.0 / f64::from(denominator.max(1));
-        let bar_ticks = beat_ticks * f64::from(numerator.max(1));
-        let bar = (tick / bar_ticks).floor() as u64 + 1;
-        let within_bar = tick % bar_ticks;
-        let beat = (within_bar / beat_ticks).floor() as u64 + 1;
-        let tick_in_beat = (within_bar % beat_ticks).floor() as u64;
-        format!("{bar}:{beat:02}:{tick_in_beat:03}")
+        let Some(document) = self.document.as_ref() else {
+            return "1:01:000".to_owned();
+        };
+        let arrangement_id = self.selected_arrangement.unwrap_or(0);
+        let signature_changes = document
+            .time_markers()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(id, marker)| *id == arrangement_id && marker.is_signature())
+            .filter_map(|(_, marker)| {
+                Some((
+                    marker.position_ticks(),
+                    marker.numerator()?,
+                    marker.denominator()?,
+                ))
+            })
+            .collect::<Vec<_>>();
+        playlist_song_position_label(
+            tick,
+            document.header().ppq(),
+            document.metadata().time_signature(),
+            &signature_changes,
+        )
     }
 
     fn transport_bar(&mut self, ui: &mut egui::Ui) {
@@ -21155,6 +21161,84 @@ fn playlist_seek_tick_to_frame(tick: u32, ppq: u16, tempo_bpm: f64, sample_rate:
     }
 }
 
+fn playlist_measure_at_tick(
+    ppq: u16,
+    initial_time_signature: Option<(u8, u8)>,
+    signature_changes: &[(u32, u8, u8)],
+    tick: u32,
+) -> (u32, u64) {
+    let mut changes = signature_changes.to_vec();
+    changes.sort_by_key(|(position, _, _)| *position);
+    let mut signature = initial_time_signature.unwrap_or((4, 4));
+    signature.0 = signature.0.max(1);
+    signature.1 = signature.1.max(1);
+    let mut segment_start = 0u32;
+    let mut measure_number = 1u64;
+    let mut change_index = 0usize;
+
+    while let Some((position, _, _)) = changes.get(change_index).copied() {
+        if position > tick {
+            break;
+        }
+        if position > segment_start {
+            let bar_ticks = playlist_bar_ticks(ppq, signature);
+            let elapsed_ticks = u64::from(position - segment_start);
+            let completed_bars = elapsed_ticks / bar_ticks;
+            measure_number = measure_number.saturating_add(completed_bars);
+            let last_boundary =
+                u64::from(segment_start).saturating_add(completed_bars.saturating_mul(bar_ticks));
+            if last_boundary < u64::from(position) {
+                measure_number = measure_number.saturating_add(1);
+            }
+            segment_start = position;
+        }
+        while changes
+            .get(change_index)
+            .is_some_and(|(change_position, _, _)| *change_position == position)
+        {
+            let (_, numerator, denominator) = changes[change_index];
+            signature = (numerator.max(1), denominator.max(1));
+            change_index += 1;
+        }
+    }
+
+    let bar_ticks = playlist_bar_ticks(ppq, signature);
+    let elapsed_ticks = u64::from(tick - segment_start);
+    let completed_bars = elapsed_ticks / bar_ticks;
+    let bar_start = u64::from(segment_start).saturating_add(completed_bars * bar_ticks);
+    (
+        bar_start.min(u64::from(u32::MAX)) as u32,
+        measure_number.saturating_add(completed_bars),
+    )
+}
+
+fn playlist_song_position_label(
+    tick: f64,
+    ppq: u16,
+    initial_time_signature: Option<(u8, u8)>,
+    signature_changes: &[(u32, u8, u8)],
+) -> String {
+    let tick = if tick.is_finite() {
+        tick.clamp(0.0, f64::from(u32::MAX))
+    } else {
+        0.0
+    };
+    let position_ticks = tick.floor() as u32;
+    let (bar_start, bar) = playlist_measure_at_tick(
+        ppq,
+        initial_time_signature,
+        signature_changes,
+        position_ticks,
+    );
+    let (_, denominator) =
+        playlist_signature_at_tick(initial_time_signature, signature_changes, position_ticks);
+    let beat_ticks = f64::from(ppq.max(1)) * 4.0 / f64::from(denominator.max(1));
+    let within_bar = tick - f64::from(bar_start);
+    let beat = (within_bar / beat_ticks).floor() as u64 + 1;
+    let tick_in_beat = (within_bar % beat_ticks).floor() as u64;
+    format!("{bar}:{beat:02}:{tick_in_beat:03}")
+}
+
 fn playlist_signature_at_tick(
     initial_time_signature: Option<(u8, u8)>,
     signature_changes: &[(u32, u8, u8)],
@@ -21356,8 +21440,8 @@ mod tests {
         playlist_audio_clip_join_candidates, playlist_bar_ticks, playlist_clip_drag_edit,
         playlist_clip_local_recording_offset, playlist_clip_split_position,
         playlist_measure_boundaries, playlist_pattern_clip_join_candidates,
-        playlist_seek_tick_to_frame, playlist_signature_at_tick, snap_note_tick,
-        toggle_piano_roll_note_group_selection, update_channel_rack_selection,
+        playlist_seek_tick_to_frame, playlist_signature_at_tick, playlist_song_position_label,
+        snap_note_tick, toggle_piano_roll_note_group_selection, update_channel_rack_selection,
         update_layer_child_selection, update_piano_roll_box_selection,
     };
 
@@ -21779,6 +21863,35 @@ mod tests {
         );
         assert_eq!(playlist_seek_tick_to_frame(384, 96, 0.0, 48_000), 0);
         assert_eq!(playlist_seek_tick_to_frame(384, 96, 120.0, 0), 0);
+    }
+
+    #[test]
+    fn playlist_song_position_uses_active_marker_meter() {
+        let signature_changes = [(0, 3, 4), (576, 5, 8)];
+        assert_eq!(
+            playlist_song_position_label(96.0, 96, Some((4, 4)), &[]),
+            "1:02:000"
+        );
+        assert_eq!(
+            playlist_song_position_label(384.0, 96, Some((4, 4)), &[]),
+            "2:01:000"
+        );
+        assert_eq!(
+            playlist_song_position_label(700.0, 96, Some((4, 4)), &[(576, 3, 4)]),
+            "3:02:028"
+        );
+        assert_eq!(
+            playlist_song_position_label(500.0, 96, Some((4, 4)), &signature_changes),
+            "2:03:020"
+        );
+        assert_eq!(
+            playlist_song_position_label(700.0, 96, Some((4, 4)), &signature_changes),
+            "3:03:028"
+        );
+        assert_eq!(
+            playlist_song_position_label(1_900.0, 96, Some((4, 4)), &signature_changes),
+            "8:03:028"
+        );
     }
 
     #[test]
