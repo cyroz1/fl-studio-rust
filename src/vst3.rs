@@ -941,13 +941,13 @@ impl Vst3HostRuntime {
                 let plugin_guard = plugin
                     .lock()
                     .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
-                if include_plugin_reported_tails {
-                    if let Some(tail_seconds) = reported_tail_seconds(
+                if include_plugin_reported_tails
+                    && let Some(tail_seconds) = reported_tail_seconds(
                         plugin_guard.tail_samples(),
                         plugin_guard.sample_rate(),
-                    ) {
-                        longest_plugin_tail_seconds = longest_plugin_tail_seconds.max(tail_seconds);
-                    }
+                    )
+                {
+                    longest_plugin_tail_seconds = longest_plugin_tail_seconds.max(tail_seconds);
                 }
                 let source_frames = (output_frames as f64 * plugin_guard.sample_rate()
                     / f64::from(output_sample_rate))
