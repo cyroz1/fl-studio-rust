@@ -1533,6 +1533,9 @@ struct DawUi {
     riff_seed: u64,
     riff_velocity_variation_percent: u8,
     riff_length_multiplier_percent: u8,
+    riff_mirror_horizontal: bool,
+    riff_preserve_start_times: bool,
+    riff_mirror_vertical: bool,
     claw_period_ticks: u32,
     claw_trash_every: u8,
     claw_time_distortion_percent: i16,
@@ -1813,6 +1816,9 @@ impl DawUi {
             riff_seed: 1,
             riff_velocity_variation_percent: 10,
             riff_length_multiplier_percent: 100,
+            riff_mirror_horizontal: false,
+            riff_preserve_start_times: false,
+            riff_mirror_vertical: false,
             claw_period_ticks: 384,
             claw_trash_every: 4,
             claw_time_distortion_percent: 0,
@@ -11892,6 +11898,14 @@ impl DawUi {
                                     "Up / Down",
                                 );
                             });
+                        ui.checkbox(&mut self.riff_mirror_horizontal, "Flip horizontally");
+                        ui.add_enabled_ui(self.riff_mirror_horizontal, |ui| {
+                            ui.checkbox(
+                                &mut self.riff_preserve_start_times,
+                                "Preserve start times",
+                            );
+                        });
+                        ui.checkbox(&mut self.riff_mirror_vertical, "Flip vertically");
                         ui.add(
                             egui::Slider::new(&mut self.note_limit_minimum_key, 0..=127)
                                 .text("Lowest key"),
@@ -11956,6 +11970,9 @@ impl DawUi {
                                     defaults.velocity_variation_percent;
                                 self.riff_length_multiplier_percent =
                                     defaults.length_multiplier_percent;
+                                self.riff_mirror_horizontal = defaults.mirror_horizontal;
+                                self.riff_preserve_start_times = defaults.preserve_start_times;
+                                self.riff_mirror_vertical = defaults.mirror_vertical;
                             }
                             if self.riff_velocity_variation_percent > 0
                                 && ui.button("New seed").clicked()
@@ -13098,6 +13115,9 @@ impl DawUi {
                 range_octaves: self.arpeggiator_range_octaves,
                 gate_percent: self.arpeggiator_gate_percent,
                 direction: self.arpeggiator_direction,
+                mirror_horizontal: self.riff_mirror_horizontal,
+                preserve_start_times: self.riff_preserve_start_times,
+                mirror_vertical: self.riff_mirror_vertical,
                 length_multiplier_percent: self.riff_length_multiplier_percent,
                 velocity_variation_percent: self.riff_velocity_variation_percent,
                 seed: self.riff_seed,

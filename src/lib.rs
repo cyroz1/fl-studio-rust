@@ -895,6 +895,12 @@ pub struct RiffMachineOptions<'a> {
     pub range_octaves: u8,
     pub gate_percent: u8,
     pub direction: ArpeggioDirection,
+    /// Reverse the generated riff's note time order, or pitch order when preserving onsets.
+    pub mirror_horizontal: bool,
+    /// Keep generated onsets fixed and reverse the pitch sequence during horizontal mirroring.
+    pub preserve_start_times: bool,
+    /// Reflect generated pitches around the midpoint of their current pitch range.
+    pub mirror_vertical: bool,
     pub length_multiplier_percent: u8,
     pub velocity_variation_percent: u8,
     pub seed: u64,
@@ -913,6 +919,9 @@ impl<'a> Default for RiffMachineOptions<'a> {
             range_octaves: 1,
             gate_percent: 80,
             direction: ArpeggioDirection::Up,
+            mirror_horizontal: false,
+            preserve_start_times: false,
+            mirror_vertical: false,
             length_multiplier_percent: 100,
             velocity_variation_percent: 10,
             seed: 1,
@@ -5429,6 +5438,94 @@ impl FlpDocument {
         ))
     }
 
+    fn edit_pattern_notes_batch(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        edits: &HashMap<usize, PatternNoteEdit>,
+    ) -> Result<(), FlpError> {
+        if edits.is_empty() {
+            return Ok(());
+        }
+
+        let mut event_index = 0usize;
+        while event_index < self.events.len() {
+            let marker = &self.events[event_index];
+            if marker.opcode != 0x41 || marker.payload.len() != 2 {
+                event_index += 1;
+                continue;
+            }
+            let marker_id = u16::from_le_bytes([marker.payload[0], marker.payload[1]]);
+            let notes_index = event_index + 1;
+            let Some(notes_event) = self.events.get(notes_index) else {
+                break;
+            };
+            if marker_id != pattern_id || !Self::is_pattern_note_event(notes_event) {
+                event_index += 1;
+                continue;
+            }
+            if !notes_event
+                .payload
+                .len()
+                .is_multiple_of(FLP_NOTE_RECORD_SIZE)
+            {
+                return Err(FlpError::InvalidEvent {
+                    offset: notes_event.file_offset,
+                    detail: "pattern note payload is not a whole number of 24-byte records",
+                });
+            }
+            let prefix_length = match &notes_event.encoding {
+                PayloadEncoding::Data { length_prefix } => length_prefix.len(),
+                _ => {
+                    return Err(FlpError::InvalidEvent {
+                        offset: notes_event.file_offset,
+                        detail: "pattern note event does not have a data payload",
+                    });
+                }
+            };
+            if notes_event.wire_bytes.len() != 1 + prefix_length + notes_event.payload.len() {
+                return Err(FlpError::InvalidEvent {
+                    offset: notes_event.file_offset,
+                    detail: "pattern note wire payload does not match its decoded bytes",
+                });
+            }
+            let channel_note_count = notes_event
+                .payload
+                .chunks_exact(FLP_NOTE_RECORD_SIZE)
+                .filter(|record| u16::from_le_bytes([record[6], record[7]]) == channel_id)
+                .count();
+            if edits.keys().any(|index| *index >= channel_note_count) {
+                return Err(FlpError::UnsupportedEdit(
+                    "the requested pattern, channel, or note index does not exist",
+                ));
+            }
+
+            let event = &mut self.events[notes_index];
+            let mut channel_note_index = 0usize;
+            for record_index in 0..event.payload.len() / FLP_NOTE_RECORD_SIZE {
+                let byte_offset = record_index * FLP_NOTE_RECORD_SIZE;
+                let payload_end = byte_offset + FLP_NOTE_RECORD_SIZE;
+                let mut note = PatternNote::decode(&event.payload[byte_offset..payload_end]);
+                if note.channel_id != channel_id {
+                    continue;
+                }
+                if let Some(edit) = edits.get(&channel_note_index) {
+                    note.apply(edit.clone());
+                    note.encode_into(&mut event.payload[byte_offset..payload_end]);
+                    let wire_start = 1 + prefix_length + byte_offset;
+                    let wire_end = wire_start + FLP_NOTE_RECORD_SIZE;
+                    event.wire_bytes[wire_start..wire_end]
+                        .copy_from_slice(&event.payload[byte_offset..payload_end]);
+                }
+                channel_note_index += 1;
+            }
+            return Ok(());
+        }
+        Err(FlpError::UnsupportedEdit(
+            "the requested pattern or note event does not exist",
+        ))
+    }
+
     /// Moves selected channel notes toward the closest grid point with optional strength and swing.
     /// Only note positions change; all other score fields and bytes remain intact.
     pub fn quantize_pattern_notes(
@@ -6522,6 +6619,93 @@ impl FlpDocument {
         }
         let generated_indices =
             (unaffected_note_count..unaffected_note_count + arpeggiated).collect::<Vec<_>>();
+        if options.mirror_horizontal || options.mirror_vertical {
+            let generated_index_set = generated_indices.iter().copied().collect::<HashSet<_>>();
+            let patterns = updated.patterns()?;
+            let pattern = patterns
+                .iter()
+                .find(|pattern| pattern.id == pattern_id)
+                .ok_or(FlpError::UnsupportedEdit(
+                    "the requested pattern does not exist",
+                ))?;
+            let mut generated_notes = pattern
+                .notes
+                .iter()
+                .filter(|note| note.channel_id == channel_id)
+                .enumerate()
+                .filter(|(note_index, _)| generated_index_set.contains(note_index))
+                .map(|(note_index, note)| (note_index, note.position, note.length, note.key))
+                .collect::<Vec<_>>();
+            if generated_notes.is_empty() {
+                return Err(FlpError::UnsupportedEdit(
+                    "Riff Machine could not find its generated notes to mirror",
+                ));
+            }
+
+            let mut mirror_edits = HashMap::new();
+            if options.mirror_horizontal && options.preserve_start_times {
+                generated_notes.sort_by_key(|(_, position, _, key)| (*position, *key));
+                let reversed_keys = generated_notes
+                    .iter()
+                    .map(|(_, _, _, key)| *key)
+                    .rev()
+                    .collect::<Vec<_>>();
+                for ((note_index, _, _, _), key) in generated_notes.iter().zip(reversed_keys) {
+                    mirror_edits
+                        .entry(*note_index)
+                        .or_insert_with(PatternNoteEdit::default)
+                        .key = Some(key);
+                }
+            }
+            if options.mirror_horizontal && !options.preserve_start_times {
+                let start = generated_notes
+                    .iter()
+                    .map(|(_, position, _, _)| u64::from(*position))
+                    .min()
+                    .unwrap_or(0);
+                let extent = generated_notes
+                    .iter()
+                    .map(|(_, position, length, _)| u64::from(*position) + u64::from(*length))
+                    .max()
+                    .unwrap_or(start);
+                if extent > u64::from(u32::MAX) {
+                    return Err(FlpError::LengthOverflow);
+                }
+                for (note_index, position, length, _) in &generated_notes {
+                    let end = u64::from(*position) + u64::from(*length);
+                    let mirrored_position = start + extent.saturating_sub(end);
+                    let mirrored_position =
+                        u32::try_from(mirrored_position).map_err(|_| FlpError::LengthOverflow)?;
+                    mirror_edits
+                        .entry(*note_index)
+                        .or_insert_with(PatternNoteEdit::default)
+                        .position = Some(mirrored_position);
+                }
+            }
+            if options.mirror_vertical {
+                let minimum = generated_notes
+                    .iter()
+                    .map(|(_, _, _, key)| *key)
+                    .min()
+                    .unwrap_or(0);
+                let maximum = generated_notes
+                    .iter()
+                    .map(|(_, _, _, key)| *key)
+                    .max()
+                    .unwrap_or(minimum);
+                for (note_index, _, _, key) in &generated_notes {
+                    let horizontally_mirrored_key = mirror_edits
+                        .get(note_index)
+                        .and_then(|edit| edit.key)
+                        .unwrap_or(*key);
+                    mirror_edits
+                        .entry(*note_index)
+                        .or_insert_with(PatternNoteEdit::default)
+                        .key = Some(minimum + maximum - horizontally_mirrored_key);
+                }
+            }
+            updated.edit_pattern_notes_batch(pattern_id, channel_id, &mirror_edits)?;
+        }
         if options.velocity_variation_percent > 0 {
             updated.randomize_pattern_note_selection(
                 pattern_id,
@@ -13692,6 +13876,130 @@ mod tests {
                 .is_err()
         );
         assert_eq!(invalid.encode_lossless().unwrap(), original);
+    }
+
+    #[test]
+    fn riff_machine_horizontal_mirror_can_preserve_onsets() {
+        let input = pattern_fixture(
+            &[
+                note_record(0, 0, 96, 60, 100),
+                note_record(96, 0, 96, 62, 90),
+            ],
+            &[0xFF, 0],
+        );
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+
+        document
+            .riff_machine_pattern_notes(
+                7,
+                0,
+                RiffMachineOptions {
+                    velocity_variation_percent: 0,
+                    mirror_horizontal: true,
+                    preserve_start_times: true,
+                    ..RiffMachineOptions::default()
+                },
+            )
+            .expect("Riff Machine should preserve onsets while reversing pitches");
+
+        let notes = document.patterns().unwrap().remove(0).notes;
+        let channel_notes = notes
+            .iter()
+            .filter(|note| note.channel_id == 0)
+            .map(|note| (note.position, note.key))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            channel_notes,
+            [
+                (0, 62),
+                (24, 69),
+                (48, 65),
+                (72, 62),
+                (96, 60),
+                (120, 67),
+                (144, 64),
+                (168, 60),
+            ]
+        );
+    }
+
+    #[test]
+    fn riff_machine_mirror_reverses_time_or_pitch_without_touching_other_channels() {
+        let input = pattern_fixture(
+            &[
+                note_record(0, 0, 96, 60, 100),
+                note_record(96, 0, 96, 62, 90),
+                note_record(0, 1, 96, 48, 70),
+            ],
+            &[0xFF, 0],
+        );
+        let mut time_mirrored = FlpDocument::parse(&input).expect("fixture should parse");
+        time_mirrored
+            .riff_machine_pattern_notes(
+                7,
+                0,
+                RiffMachineOptions {
+                    velocity_variation_percent: 0,
+                    mirror_horizontal: true,
+                    ..RiffMachineOptions::default()
+                },
+            )
+            .expect("Riff Machine should reverse note times");
+        let notes = time_mirrored.patterns().unwrap().remove(0).notes;
+        let channel_notes = notes
+            .iter()
+            .filter(|note| note.channel_id == 0)
+            .map(|note| (note.position, note.key))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            channel_notes,
+            [
+                (168, 60),
+                (144, 64),
+                (120, 67),
+                (96, 60),
+                (72, 62),
+                (48, 65),
+                (24, 69),
+                (0, 62),
+            ]
+        );
+        assert_eq!(notes[0].channel_id, 1);
+        assert_eq!(notes[0].key, 48);
+
+        let mut pitch_mirrored = FlpDocument::parse(&input).expect("fixture should parse");
+        pitch_mirrored
+            .riff_machine_pattern_notes(
+                7,
+                0,
+                RiffMachineOptions {
+                    velocity_variation_percent: 0,
+                    mirror_vertical: true,
+                    ..RiffMachineOptions::default()
+                },
+            )
+            .expect("Riff Machine should invert note pitches");
+        let notes = pitch_mirrored.patterns().unwrap().remove(0).notes;
+        let channel_notes = notes
+            .iter()
+            .filter(|note| note.channel_id == 0)
+            .map(|note| (note.position, note.key))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            channel_notes,
+            [
+                (0, 69),
+                (24, 65),
+                (48, 62),
+                (72, 69),
+                (96, 67),
+                (120, 64),
+                (144, 60),
+                (168, 67),
+            ]
+        );
+        assert_eq!(notes[0].channel_id, 1);
+        assert_eq!(notes[0].key, 48);
     }
 
     #[test]
