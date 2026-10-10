@@ -1347,6 +1347,7 @@ fn prepare_playlist_pattern_render(
         .ok_or_else(|| "VST3 Playlist channel has no renderable notes".to_owned())?;
     Ok(PreparedPatternRender {
         events,
+        parameter_automation: Vec::new(),
         note_count,
         sample_rate,
         sample_rate_u32,
