@@ -6223,7 +6223,7 @@ impl DawUi {
                                 if ui
                                     .selectable_label(
                                         current_folder == *root || current_folder.starts_with(root),
-                                        format!("▸ {name}"),
+                                        format!("› {name}"),
                                     )
                                     .on_hover_text(root.display().to_string())
                                     .clicked()
@@ -6531,7 +6531,7 @@ impl DawUi {
                         .map(|tags| tags.iter().cloned().collect::<Vec<_>>().join(", "));
                     let row = ui.horizontal(|ui| {
                         let icon = if entry.is_directory {
-                            "▸"
+                            "›"
                         } else {
                             browser_file_icon(&entry.path)
                         };
@@ -11300,7 +11300,7 @@ impl DawUi {
                     if ui
                         .add_sized(
                             Vec2::new(360.0, 28.0),
-                            egui::Button::new(name).fill(PANEL_LIGHT),
+                            egui::Button::new(name).truncate().fill(PANEL_LIGHT),
                         )
                         .on_hover_text(path.display().to_string())
                         .clicked()
