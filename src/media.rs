@@ -135,6 +135,8 @@ pub(crate) struct WavSamplerMetadata {
     pub(crate) root_key: Option<u16>,
     /// Fine tuning in cents from WAVE `inst` or `smpl` pitch metadata.
     pub(crate) fine_tune_cents: Option<f64>,
+    /// Suggested sample gain from the signed `inst` decibel field.
+    pub(crate) gain_db: Option<i8>,
     /// First valid `smpl` loop as half-open source-frame bounds.
     pub(crate) loop_points: Option<(usize, usize)>,
 }
@@ -163,6 +165,7 @@ pub(crate) fn wav_sampler_metadata(path: &Path) -> Option<WavSamplerMetadata> {
     let mut cursor = 12u64;
     let mut inst_root_key = None;
     let mut inst_fine_tune_cents = None;
+    let mut inst_gain_db = None;
     let mut smpl_root_key = None;
     let mut smpl_fine_tune_cents = None;
     let mut loop_points = None;
@@ -182,6 +185,7 @@ pub(crate) fn wav_sampler_metadata(path: &Path) -> Option<WavSamplerMetadata> {
                 file.seek(SeekFrom::Start(body_start)).ok()?;
                 let mut instrument = [0; 7];
                 file.read_exact(&mut instrument).ok()?;
+                inst_gain_db.get_or_insert_with(|| i8::from_le_bytes([instrument[2]]));
                 if instrument[0] <= 127 {
                     inst_root_key = Some(u16::from(instrument[0]));
                     let fine_tune_cents = i8::from_le_bytes([instrument[1]]);
@@ -253,9 +257,11 @@ pub(crate) fn wav_sampler_metadata(path: &Path) -> Option<WavSamplerMetadata> {
     let metadata = WavSamplerMetadata {
         root_key: inst_root_key.or(smpl_root_key),
         fine_tune_cents: inst_fine_tune_cents.or(smpl_fine_tune_cents),
+        gain_db: inst_gain_db,
         loop_points,
     };
-    (metadata.root_key.is_some() || metadata.loop_points.is_some()).then_some(metadata)
+    (metadata.root_key.is_some() || metadata.gain_db.is_some() || metadata.loop_points.is_some())
+        .then_some(metadata)
 }
 
 /// Decode an audio file for the Browser and return interleaved stereo samples at the output rate.
@@ -1339,7 +1345,15 @@ mod tests {
         let root = fixture_root();
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("root-note.wav");
-        let instrument = [72, (-23i8).to_le_bytes()[0], 0, 0, 127, 0, 127];
+        let instrument = [
+            72,
+            (-23i8).to_le_bytes()[0],
+            (-6i8).to_le_bytes()[0],
+            0,
+            127,
+            0,
+            127,
+        ];
         let mut sampler = [0u8; 36];
         sampler[12..16].copy_from_slice(&60u32.to_le_bytes());
         sampler[16..20].copy_from_slice(&0x8000_0000u32.to_le_bytes());
@@ -1358,6 +1372,7 @@ mod tests {
             let metadata = wav_sampler_metadata(&path).expect("WAVE root metadata should parse");
             assert_eq!(metadata.root_key, Some(72));
             assert_eq!(metadata.fine_tune_cents, Some(-23.0));
+            assert_eq!(metadata.gain_db, Some(-6));
             assert_eq!(metadata.loop_points, None);
         }
 
@@ -1398,6 +1413,21 @@ mod tests {
         let metadata = wav_sampler_metadata(&path).expect("valid smpl root should parse");
         assert_eq!(metadata.root_key, Some(60));
         assert_eq!(metadata.fine_tune_cents, Some(25.0));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reads_wav_inst_gain_even_without_a_valid_root_note() {
+        let root = fixture_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("inst-gain.wav");
+        let instrument = [128, 0, (-6i8).to_le_bytes()[0], 0, 127, 0, 127];
+        std::fs::write(&path, wave_with_sampler_chunks(&[("inst", &instrument)])).unwrap();
+
+        let metadata = wav_sampler_metadata(&path).expect("WAVE instrument gain should parse");
+        assert_eq!(metadata.root_key, None);
+        assert_eq!(metadata.gain_db, Some(-6));
 
         std::fs::remove_dir_all(root).unwrap();
     }

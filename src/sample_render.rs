@@ -1754,7 +1754,7 @@ fn prepare_sampler_arrangement(
             let (gain, pan) = channel_gain_pan(channel.volume(), channel.pan());
             source_entry.insert(SamplerVoiceSource {
                 audio,
-                gain,
+                gain: gain * sampler_wav_gain(wave_metadata.gain_db),
                 pan,
                 reverse: channel.sample_reversed(),
                 root_key: resolve_sampler_root_key(
@@ -2018,7 +2018,7 @@ fn prepare_sampler_pattern(
             let (gain, pan) = channel_gain_pan(channel.volume(), channel.pan());
             source_entry.insert(SamplerVoiceSource {
                 audio,
-                gain,
+                gain: gain * sampler_wav_gain(wave_metadata.gain_db),
                 pan,
                 reverse: channel.sample_reversed(),
                 root_key: resolve_sampler_root_key(
@@ -2394,6 +2394,10 @@ fn sampler_pan_gains(pan: f32, mono: bool) -> (f32, f32) {
     } else {
         (1.0 - pan, 1.0)
     }
+}
+
+fn sampler_wav_gain(gain_db: Option<i8>) -> f32 {
+    gain_db.map_or(1.0, |gain_db| 10.0f32.powf(f32::from(gain_db) / 20.0))
 }
 
 fn sampler_source_step(
@@ -3695,6 +3699,14 @@ mod tests {
             SAMPLER_ROOT_KEY
         );
         assert_eq!(resolve_sampler_root_key(None, None, true), SAMPLER_ROOT_KEY);
+    }
+
+    #[test]
+    fn sampler_wav_gain_converts_decibels_to_linear_amplitude() {
+        assert_eq!(sampler_wav_gain(None), 1.0);
+        assert_eq!(sampler_wav_gain(Some(0)), 1.0);
+        assert!((sampler_wav_gain(Some(-6)) - 10.0f32.powf(-6.0 / 20.0)).abs() < 1e-6);
+        assert_eq!(sampler_wav_gain(Some(20)), 10.0);
     }
 
     #[test]
