@@ -16965,6 +16965,9 @@ impl eframe::App for DawUi {
         ui.ctx().set_theme(egui::Theme::Dark);
         let dark_style = ui.ctx().global_style();
         ui.set_style(dark_style);
+        // The root Ui can be created before a native backend reports its
+        // system theme. Keep its widget visuals on the app palette as well.
+        *ui.visuals_mut() = app_visuals();
         self.guard_window_close(ui.ctx());
         if self.view != MainView::Playlist {
             self.active_playlist_clip_drag = None;
