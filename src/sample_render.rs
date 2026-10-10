@@ -1742,6 +1742,7 @@ fn prepare_sampler_arrangement(
                 gain,
                 pan,
                 reverse: channel.sample_reversed(),
+                root_key: channel.sampler_root_key().unwrap_or(SAMPLER_ROOT_KEY),
                 loop_bounds,
                 ping_pong_loop: channel.sampler_ping_pong_loop_enabled(),
             });
@@ -1764,7 +1765,12 @@ fn prepare_sampler_arrangement(
             })
             .transpose()?;
         let natural_duration = (source.audio.frame_count() as f64
-            / sampler_source_step(source.audio.sample_rate, options.sample_rate, note.key))
+            / sampler_source_step(
+                source.audio.sample_rate,
+                options.sample_rate,
+                note.key,
+                source.root_key,
+            ))
         .ceil();
         if !natural_duration.is_finite()
             || natural_duration < 1.0
@@ -1830,6 +1836,7 @@ struct SamplerVoiceSource {
     gain: f32,
     pan: f32,
     reverse: bool,
+    root_key: u16,
     loop_bounds: Option<SampleBounds>,
     ping_pong_loop: bool,
 }
@@ -1991,6 +1998,7 @@ fn prepare_sampler_pattern(
                 gain,
                 pan,
                 reverse: channel.sample_reversed(),
+                root_key: channel.sampler_root_key().unwrap_or(SAMPLER_ROOT_KEY),
                 loop_bounds,
                 ping_pong_loop: channel.sampler_ping_pong_loop_enabled(),
             });
@@ -2030,7 +2038,12 @@ fn prepare_sampler_pattern(
             )
         };
         let natural_duration = (source.audio.frame_count() as f64
-            / sampler_source_step(source.audio.sample_rate, options.sample_rate, note.key))
+            / sampler_source_step(
+                source.audio.sample_rate,
+                options.sample_rate,
+                note.key,
+                source.root_key,
+            ))
         .ceil();
         if !natural_duration.is_finite()
             || natural_duration < 1.0
@@ -2252,8 +2265,12 @@ impl<'a> SamplerVoiceEngine<'a> {
         if self.voices[slot_index].is_some() {
             self.voices_stolen += 1;
         }
-        let source_step =
-            sampler_source_step(source.audio.sample_rate, self.output_sample_rate, note.key);
+        let source_step = sampler_source_step(
+            source.audio.sample_rate,
+            self.output_sample_rate,
+            note.key,
+            source.root_key,
+        );
         let source_step = if source.reverse {
             -source_step
         } else {
@@ -2349,8 +2366,8 @@ fn sampler_pan_gains(pan: f32, mono: bool) -> (f32, f32) {
     }
 }
 
-fn sampler_source_step(source_rate: u32, output_rate: u32, key: u16) -> f64 {
-    let semitones = (i32::from(key) - i32::from(SAMPLER_ROOT_KEY)).clamp(-48, 48);
+fn sampler_source_step(source_rate: u32, output_rate: u32, key: u16, root_key: u16) -> f64 {
+    let semitones = (i32::from(key) - i32::from(root_key)).clamp(-48, 48);
     f64::from(source_rate) / f64::from(output_rate.max(1))
         * 2.0f64.powf(f64::from(semitones) / 12.0)
 }
@@ -3247,6 +3264,7 @@ mod tests {
                     gain: 1.0,
                     pan: -1.0,
                     reverse: false,
+                    root_key: SAMPLER_ROOT_KEY,
                     loop_bounds: None,
                     ping_pong_loop: false,
                 },
@@ -3421,6 +3439,7 @@ mod tests {
                 gain: 1.0,
                 pan: 0.0,
                 reverse: false,
+                root_key: SAMPLER_ROOT_KEY,
                 loop_bounds: None,
                 ping_pong_loop: false,
             },
@@ -3462,6 +3481,7 @@ mod tests {
                 gain: 1.0,
                 pan: -1.0,
                 reverse: true,
+                root_key: SAMPLER_ROOT_KEY,
                 loop_bounds: None,
                 ping_pong_loop: false,
             },
@@ -3492,6 +3512,7 @@ mod tests {
                 gain: 1.0,
                 pan: -1.0,
                 reverse: false,
+                root_key: SAMPLER_ROOT_KEY,
                 loop_bounds: Some(SampleBounds { start: 1, end: 4 }),
                 ping_pong_loop: false,
             },
@@ -3528,6 +3549,7 @@ mod tests {
                 gain: 1.0,
                 pan: -1.0,
                 reverse: false,
+                root_key: SAMPLER_ROOT_KEY,
                 loop_bounds: Some(SampleBounds { start: 1, end: 4 }),
                 ping_pong_loop: true,
             },
@@ -3565,6 +3587,7 @@ mod tests {
                 gain: 1.0,
                 pan: -1.0,
                 reverse: false,
+                root_key: SAMPLER_ROOT_KEY,
                 loop_bounds: None,
                 ping_pong_loop: false,
             },
@@ -3586,6 +3609,37 @@ mod tests {
     }
 
     #[test]
+    fn sampler_voice_transposes_from_the_saved_channel_root_key() {
+        let sources = HashMap::from([(
+            2,
+            SamplerVoiceSource {
+                audio: Arc::new(DecodedAudio {
+                    sample_rate: 4,
+                    channels: vec![(0..8).map(|frame| frame as f32).collect()],
+                }),
+                gain: 1.0,
+                pan: -1.0,
+                reverse: false,
+                root_key: 48,
+                loop_bounds: None,
+                ping_pong_loop: false,
+            },
+        )]);
+        let notes = [ScheduledSamplerNote {
+            start_frame: 0,
+            stop_frame: Some(100),
+            channel_id: 2,
+            key: SAMPLER_ROOT_KEY,
+            velocity: 127,
+        }];
+        let mut engine = SamplerVoiceEngine::new(&sources, &notes, 1, 4, 4);
+        let mut output = vec![0.0; 8];
+        engine.render_block(0, 4, &mut output);
+
+        assert_eq!(output, vec![0.0, 0.0, 2.0, 0.0, 4.0, 0.0, 6.0, 0.0]);
+    }
+
+    #[test]
     fn zero_length_sampler_note_plays_the_sample_to_its_end() {
         let source = Arc::new(DecodedAudio {
             sample_rate: 4,
@@ -3598,6 +3652,7 @@ mod tests {
                 gain: 1.0,
                 pan: -1.0,
                 reverse: false,
+                root_key: SAMPLER_ROOT_KEY,
                 loop_bounds: None,
                 ping_pong_loop: false,
             },
@@ -3638,6 +3693,7 @@ mod tests {
                     gain: 1.0,
                     pan: -1.0,
                     reverse: false,
+                    root_key: SAMPLER_ROOT_KEY,
                     loop_bounds: None,
                     ping_pong_loop: false,
                 },
@@ -3649,6 +3705,7 @@ mod tests {
                     gain: 1.0,
                     pan: -1.0,
                     reverse: false,
+                    root_key: SAMPLER_ROOT_KEY,
                     loop_bounds: None,
                     ping_pong_loop: false,
                 },

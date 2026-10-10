@@ -403,6 +403,7 @@ pub struct ChannelSummary {
     mixer_track: Option<i8>,
     sampler_fx_flags: Option<u16>,
     sampler_flags: Option<u32>,
+    sampler_root_note: Option<u32>,
     ping_pong_loop: bool,
     swing_mix: Option<u16>,
     group_number: Option<i32>,
@@ -617,6 +618,16 @@ impl ChannelSummary {
     /// Whether a kind-0 Sampler has its Ping-pong loop option enabled (`0x14`).
     pub fn sampler_ping_pong_loop_enabled(&self) -> bool {
         self.kind == Some(0) && self.ping_pong_loop
+    }
+
+    /// Saved root note for a kind-0 Sampler, when the raw value is a MIDI key number.
+    pub fn sampler_root_key(&self) -> Option<u16> {
+        if self.kind != Some(0) {
+            return None;
+        }
+        self.sampler_root_note
+            .filter(|note| *note <= 127)
+            .map(|note| note as u16)
     }
 
     /// Raw four-byte channel color value, in little-endian RGBA byte order.
@@ -2011,6 +2022,16 @@ impl FlpDocument {
                     && channel.sampler_flags.is_none() =>
                 {
                     channel.sampler_flags = Some(u32::from_le_bytes(
+                        event.payload[..4]
+                            .try_into()
+                            .expect("a dword event has four payload bytes"),
+                    ));
+                }
+                0x87 if event.encoding == PayloadEncoding::Dword
+                    && event.payload.len() == 4
+                    && channel.sampler_root_note.is_none() =>
+                {
+                    channel.sampler_root_note = Some(u32::from_le_bytes(
                         event.payload[..4]
                             .try_into()
                             .expect("a dword event has four payload bytes"),
@@ -13884,6 +13905,22 @@ mod tests {
                 document.channels()[0].sampler_ping_pong_loop_enabled(),
                 expected_ping_pong
             );
+            assert_eq!(document.encode_lossless().unwrap(), input);
+        }
+    }
+
+    #[test]
+    fn decodes_sampler_root_note_and_ignores_non_sampler_or_invalid_values() {
+        for (kind, root_note, expected_root_key) in
+            [(0, 72_u32, Some(72_u16)), (0, 128, None), (4, 72, None)]
+        {
+            let mut event_stream = vec![0x40, 7, 0, 0x15, kind, 0x87];
+            event_stream.extend_from_slice(&root_note.to_le_bytes());
+            event_stream.extend_from_slice(&[0x62, 0, 0]);
+            let input = flp_fixture(&event_stream, &[], &[]);
+            let document = FlpDocument::parse(&input).expect("fixture should parse");
+
+            assert_eq!(document.channels()[0].sampler_root_key(), expected_root_key);
             assert_eq!(document.encode_lossless().unwrap(), input);
         }
     }
