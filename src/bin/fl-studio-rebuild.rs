@@ -863,6 +863,23 @@ struct ActiveNoteDrag {
     kind: NoteDragKind,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlaylistClipDragKind {
+    Move,
+    Resize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ActivePlaylistClipDrag {
+    arrangement_id: u16,
+    clip_index: usize,
+    start_pointer: egui::Pos2,
+    start_position_ticks: u32,
+    start_length_ticks: u32,
+    start_track_index: u16,
+    kind: PlaylistClipDragKind,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct PianoRollSelectionDrag {
     pattern_id: u16,
@@ -1384,6 +1401,7 @@ struct DawUi {
     midi_channel_mapping: MidiChannelMapping,
     selected_arrangement: Option<u16>,
     selected_clip: Option<usize>,
+    active_playlist_clip_drag: Option<ActivePlaylistClipDrag>,
     selected_time_marker: Option<usize>,
     selected_mixer_insert: Option<usize>,
     new_time_marker_position: u32,
@@ -1694,6 +1712,7 @@ impl DawUi {
             midi_channel_mapping: MidiChannelMapping::PreserveNoteChannels,
             selected_arrangement: None,
             selected_clip: None,
+            active_playlist_clip_drag: None,
             selected_time_marker: None,
             selected_mixer_insert: None,
             new_time_marker_position: 0,
@@ -2127,6 +2146,7 @@ impl DawUi {
                 }
                 self.rack_selection_anchor = self.selected_graph_channel;
                 self.selected_clip = None;
+                self.active_playlist_clip_drag = None;
                 self.selected_time_marker = None;
                 self.selected_note = None;
                 self.selected_piano_notes.clear();
@@ -3259,6 +3279,7 @@ impl DawUi {
         }
         self.selected_note = None;
         self.selected_clip = None;
+        self.active_playlist_clip_drag = None;
         self.selected_time_marker = None;
         self.selected_automation_point = None;
         self.active_note_drag = None;
@@ -6944,7 +6965,7 @@ impl DawUi {
                             let response = ui.interact(
                                 clip_rect,
                                 Id::new(("playlist-clip", arrangement.id, clip_index)),
-                                Sense::click(),
+                                Sense::click_and_drag(),
                             );
                             let response = if let flp_rebuild::PlaylistClipTarget::Channel { id } =
                                 clip.target()
@@ -6955,12 +6976,115 @@ impl DawUi {
                             } else {
                                 response
                             };
+                            if selected || response.hovered() {
+                                painter.line_segment(
+                                    [
+                                        egui::pos2(clip_rect.right() - 2.0, clip_rect.top() + 5.0),
+                                        egui::pos2(
+                                            clip_rect.right() - 2.0,
+                                            clip_rect.bottom() - 5.0,
+                                        ),
+                                    ],
+                                    Stroke::new(2.0, Color32::from_white_alpha(170)),
+                                );
+                            }
+                            let response = response.on_hover_text(
+                                "Drag to move. Shift-drag the right edge to resize. Hold Alt to ignore the 1/16 grid.",
+                            );
                             response.context_menu(|ui| {
                                 if ui.button("Delete clip").clicked() {
                                     delete_clip_requested = Some(clip_index);
                                     ui.close();
                                 }
                             });
+                            if response.drag_started_by(PointerButton::Primary)
+                                && self.active_playlist_clip_drag.is_none()
+                                && let Some(pointer) = ui
+                                    .input(|input| input.pointer.press_origin())
+                                    .or_else(|| response.interact_pointer_pos())
+                            {
+                                let resize = ui.input(|input| input.modifiers.shift)
+                                    && pointer.x >= clip_rect.right() - 8.0;
+                                self.selected_arrangement = Some(arrangement.id);
+                                self.selected_clip = Some(clip_index);
+                                self.active_playlist_clip_drag = Some(ActivePlaylistClipDrag {
+                                    arrangement_id: arrangement.id,
+                                    clip_index,
+                                    start_pointer: pointer,
+                                    start_position_ticks: clip.position_ticks,
+                                    start_length_ticks: clip.length_ticks,
+                                    start_track_index: clip.track_index.unwrap_or(row),
+                                    kind: if resize {
+                                        PlaylistClipDragKind::Resize
+                                    } else {
+                                        PlaylistClipDragKind::Move
+                                    },
+                                });
+                            }
+                            let clip_drag = self.active_playlist_clip_drag.filter(|drag| {
+                                drag.arrangement_id == arrangement.id
+                                    && drag.clip_index == clip_index
+                            });
+                            if (response.dragged() || response.drag_stopped())
+                                && let Some(drag) = clip_drag
+                                && let Some(pointer) = response.interact_pointer_pos()
+                            {
+                                let edit = playlist_clip_drag_edit(
+                                    drag,
+                                    pointer,
+                                    tick_scale,
+                                    row_height,
+                                    ppq,
+                                    !ui.input(|input| input.modifiers.alt),
+                                    last_track.min(499),
+                                );
+                                let unchanged = edit
+                                    .position_ticks
+                                    .is_none_or(|value| value == clip.position_ticks)
+                                    && edit
+                                        .length_ticks
+                                        .is_none_or(|value| value == clip.length_ticks)
+                                    && edit
+                                        .raw_track_index
+                                        .is_none_or(|value| value == clip.raw_track_index);
+                                if !unchanged {
+                                    let mut updated = self.document.clone();
+                                    let result = updated.as_mut().map(|document| {
+                                        document.edit_playlist_clip(
+                                            arrangement.id,
+                                            clip_index,
+                                            edit,
+                                        )
+                                    });
+                                    match result {
+                                        Some(Ok(())) => {
+                                            self.document = updated;
+                                            self.stop_project_playback();
+                                            self.dirty = true;
+                                            self.status = match drag.kind {
+                                                PlaylistClipDragKind::Move => {
+                                                    format!("Moved Playlist clip {}", clip_index + 1)
+                                                }
+                                                PlaylistClipDragKind::Resize => {
+                                                    format!("Resized Playlist clip {}", clip_index + 1)
+                                                }
+                                            };
+                                        }
+                                        Some(Err(error)) => {
+                                            self.status = format!(
+                                                "Could not edit Playlist clip: {error}"
+                                            );
+                                        }
+                                        None => {
+                                            self.status =
+                                                "Open a project to edit Playlist clips".to_owned();
+                                        }
+                                    }
+                                }
+                            }
+                            if response.drag_stopped() && clip_drag.is_some() {
+                                self.active_playlist_clip_drag = None;
+                            }
                             if response.clicked() {
                                 self.selected_arrangement = Some(arrangement.id);
                                 self.selected_clip = Some(clip_index);
@@ -7011,6 +7135,7 @@ impl DawUi {
             if deleted {
                 self.stop_project_playback();
                 self.selected_clip = None;
+                self.active_playlist_clip_drag = None;
                 self.dirty = true;
                 self.status = format!("Deleted Playlist clip {}", clip_index + 1);
                 playlist_clip_list_changed = true;
@@ -7073,6 +7198,7 @@ impl DawUi {
             Some(Ok(())) => {
                 self.stop_project_playback();
                 self.selected_clip = None;
+                self.active_playlist_clip_drag = None;
                 self.dirty = true;
                 self.status = format!("Deleted Playlist clip {}", clip_index + 1);
             }
@@ -14257,6 +14383,9 @@ impl DawUi {
 impl eframe::App for DawUi {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.guard_window_close(ui.ctx());
+        if self.view != MainView::Playlist {
+            self.active_playlist_clip_drag = None;
+        }
         ui.painter()
             .rect_filled(ui.max_rect(), egui::CornerRadius::ZERO, APP_BACKGROUND);
         let play_pause_requested = !ui.ctx().egui_wants_keyboard_input()
@@ -15967,6 +16096,56 @@ fn snap_note_tick(value: i64, quantum: u32, minimum: u32) -> u32 {
     snapped as u32
 }
 
+fn playlist_clip_drag_edit(
+    drag: ActivePlaylistClipDrag,
+    pointer: egui::Pos2,
+    tick_scale: f32,
+    row_height: f32,
+    ppq: u16,
+    snap: bool,
+    max_track_index: u16,
+) -> PlaylistClipEdit {
+    let tick_scale = tick_scale.max(f32::EPSILON);
+    let tick_delta = ((pointer.x - drag.start_pointer.x) / tick_scale).round() as i64;
+    let snap_ticks = if snap {
+        (u32::from(ppq.max(1)) / 4).max(1)
+    } else {
+        1
+    };
+
+    match drag.kind {
+        PlaylistClipDragKind::Move => {
+            let track_delta = if row_height > 0.0 {
+                ((pointer.y - drag.start_pointer.y) / row_height).round() as i32
+            } else {
+                0
+            };
+            let max_track_index = max_track_index
+                .min(499)
+                .max(drag.start_track_index.min(499));
+            let track_index = (i32::from(drag.start_track_index) + track_delta)
+                .clamp(0, i32::from(max_track_index)) as u16;
+            PlaylistClipEdit {
+                position_ticks: Some(snap_note_tick(
+                    i64::from(drag.start_position_ticks).saturating_add(tick_delta),
+                    snap_ticks,
+                    0,
+                )),
+                raw_track_index: Some(499 - track_index),
+                ..PlaylistClipEdit::default()
+            }
+        }
+        PlaylistClipDragKind::Resize => PlaylistClipEdit {
+            length_ticks: Some(snap_note_tick(
+                i64::from(drag.start_length_ticks).saturating_add(tick_delta),
+                snap_ticks,
+                1,
+            )),
+            ..PlaylistClipEdit::default()
+        },
+    }
+}
+
 fn note_from_grid_position(
     pointer: egui::Pos2,
     grid: PianoRollGrid,
@@ -16001,8 +16180,9 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::{
-        ChannelDisplayFilter, PianoRollGrid, PianoRollSnap, note_from_grid_position,
-        snap_note_tick, update_channel_rack_selection, update_layer_child_selection,
+        ActivePlaylistClipDrag, ChannelDisplayFilter, PianoRollGrid, PianoRollSnap,
+        PlaylistClipDragKind, note_from_grid_position, playlist_clip_drag_edit, snap_note_tick,
+        update_channel_rack_selection, update_layer_child_selection,
     };
 
     fn test_grid() -> PianoRollGrid {
@@ -16019,6 +16199,92 @@ mod tests {
             snap_ticks: 24,
             ppq: 96,
         }
+    }
+
+    #[test]
+    fn playlist_clip_move_snaps_and_changes_track() {
+        let drag = ActivePlaylistClipDrag {
+            arrangement_id: 3,
+            clip_index: 1,
+            start_pointer: eframe::egui::pos2(100.0, 100.0),
+            start_position_ticks: 120,
+            start_length_ticks: 384,
+            start_track_index: 2,
+            kind: PlaylistClipDragKind::Move,
+        };
+        let edit = playlist_clip_drag_edit(
+            drag,
+            eframe::egui::pos2(119.2, 128.0),
+            0.1,
+            27.0,
+            96,
+            true,
+            15,
+        );
+
+        assert_eq!(edit.position_ticks, Some(312));
+        assert_eq!(edit.raw_track_index, Some(496));
+        assert_eq!(edit.length_ticks, None);
+    }
+
+    #[test]
+    fn playlist_clip_move_uses_free_ticks_with_alt_and_clamps_tracks() {
+        let drag = ActivePlaylistClipDrag {
+            arrangement_id: 3,
+            clip_index: 1,
+            start_pointer: eframe::egui::pos2(100.0, 100.0),
+            start_position_ticks: 120,
+            start_length_ticks: 384,
+            start_track_index: 2,
+            kind: PlaylistClipDragKind::Move,
+        };
+        let edit = playlist_clip_drag_edit(
+            drag,
+            eframe::egui::pos2(101.3, 228.0),
+            0.1,
+            27.0,
+            96,
+            false,
+            3,
+        );
+
+        assert_eq!(edit.position_ticks, Some(133));
+        assert_eq!(edit.raw_track_index, Some(496));
+    }
+
+    #[test]
+    fn playlist_clip_resize_snaps_and_keeps_a_positive_length() {
+        let drag = ActivePlaylistClipDrag {
+            arrangement_id: 3,
+            clip_index: 1,
+            start_pointer: eframe::egui::pos2(100.0, 100.0),
+            start_position_ticks: 120,
+            start_length_ticks: 384,
+            start_track_index: 2,
+            kind: PlaylistClipDragKind::Resize,
+        };
+        let edit = playlist_clip_drag_edit(
+            drag,
+            eframe::egui::pos2(112.0, 100.0),
+            0.1,
+            27.0,
+            96,
+            true,
+            15,
+        );
+        assert_eq!(edit.length_ticks, Some(504));
+        assert_eq!(edit.position_ticks, None);
+
+        let minimum = playlist_clip_drag_edit(
+            drag,
+            eframe::egui::pos2(-100.0, 100.0),
+            0.1,
+            27.0,
+            96,
+            false,
+            15,
+        );
+        assert_eq!(minimum.length_ticks, Some(1));
     }
 
     #[test]
