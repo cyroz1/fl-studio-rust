@@ -312,12 +312,13 @@ automation, full Mixer routing/effects, or PDC. Supported Master flags and direc
   level comparison, and other export options remain incomplete; recognized
   Mixer mute/solo/phase/swap flags are applied to supported sources as noted
   above.
-- `[partial]` Formats: the desktop Playlist renderer writes 16/24-bit integer PCM or 32-bit float WAV, with stereo, merged mono, left-only, or right-only channels as documented by [Image-Line](https://www.image-line.com/fl-studio-learning/fl-studio-online-manual/html/fformats_save_export.htm); MP3, OGG, and FLAC export remain todo
+- `[partial]` Formats: the desktop Playlist mix, audio-clip, selected Audio Clip, and Sampler-pattern renderers support 16/24-bit integer PCM or 32-bit float WAV; these actions share stereo, merged mono, left-only, or right-only channel modes, with TPDF dither for 16-bit output, as documented by [Image-Line](https://www.image-line.com/fl-studio-learning/fl-studio-online-manual/html/fformats_save_export.htm); MP3, OGG, and FLAC export remain todo
 - `[partial]` Render options: the Playlist mix dialog offers channel modes, 0/1/2/5-second base tails, optional finite VST3 instrument tail extension capped at 60 seconds (infinite reports use the selected base tail), optional unshaped TPDF dither for 16-bit PCM, and Linear, 6-point Hermite, or 16/24/32/64/128/256/512-point windowed-sinc resampling, defaulting to 32-point sinc and retaining the selected quality between launches. Live playback offers Linear, 6-point Hermite, and 24/64/128/256/512-point sinc, defaulting to 24-point sinc as documented by Image-Line. High-frequency shaped dither, automatic “Leave remainder” tail rendering, exact interpolation coefficients, and Mixer effect tail detection remain todo. Hermite remains a local six-sample quintic curve; sinc modes share a local variable-width Blackman-windowed kernel. These are not claims of bit-identical FL Studio output ([Image-Line export manual](https://www.image-line.com/fl-studio-learning/fl-studio-online-manual/html/fformats_save_export.htm), [Audio settings manual](https://www.image-line.com/fl-studio-learning/fl-studio-online-manual/html/envsettings_audio.htm), [Image-Line export quality discussion](https://forum.image-line.com/viewtopic.php?p=1886536)).
 - `[todo]` Stem export: split mixer tracks, "split channel tracks"
 - `[partial]` Selected Playlist clip render: File > Export can write one
-  selected enabled audio-channel clip's supported sample source to float stereo
-  WAV from either the clip start or its original song position, clipped to the
+  selected enabled audio-channel clip's supported sample source to WAV with the
+  shared 16/24-bit PCM or 32-bit float depth, dither, and channel-mode settings,
+  from either the clip start or its original song position, clipped to the
   Playlist endpoint. Looping or stretching clips beyond their source duration,
   Pattern Clip rendering, multiple selection, automatic Audio
   Clip insertion, source muting, automation, and Mixer effects remain
@@ -325,7 +326,8 @@ automation, full Mixer routing/effects, or PDC. Supported Master flags and direc
   song-start placement with source muting ([Image-Line Playlist
   manual](https://www.image-line.com/fl-studio-learning-content/fl-studio-online-manual/html/playlist.htm)).
 - `[partial]` Pattern render: the Piano roll can render enabled Sampler notes
-  from the selected pattern to float stereo WAV, applying supported directly
+  from the selected pattern to WAV with the shared bit depth, dither, and
+  channel-mode settings, applying supported directly
   assigned insert mute/solo/phase/swap state and Master flags; a mapped VST3 channel can
   render its selected pattern notes to WAV. FL Studio renders selected patterns
   to audio clips with configurable render settings; this app's Sampler export is

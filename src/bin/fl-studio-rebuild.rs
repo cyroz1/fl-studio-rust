@@ -4595,6 +4595,48 @@ impl DawUi {
                     }
                 });
                 ui.menu_button("Export", |ui| {
+                    ui.menu_button(
+                        format!("WAV output: {}", self.playlist_render_format.label()),
+                        |ui| {
+                            ui.weak("Used by Playlist, audio clip, and Sampler exports");
+                            ui.separator();
+                            for format in [
+                                WavSampleFormat::Pcm16,
+                                WavSampleFormat::Pcm24,
+                                WavSampleFormat::Float32,
+                            ] {
+                                ui.selectable_value(
+                                    &mut self.playlist_render_format,
+                                    format,
+                                    format.label(),
+                                );
+                            }
+                            ui.add_enabled_ui(
+                                self.playlist_render_format == WavSampleFormat::Pcm16,
+                                |ui| {
+                                    ui.checkbox(&mut self.playlist_render_dither, "TPDF dither");
+                                },
+                            );
+                            ui.menu_button(
+                                format!("Channels: {}", self.playlist_render_channel_mode.label()),
+                                |ui| {
+                                    for mode in [
+                                        WavChannelMode::Stereo,
+                                        WavChannelMode::MonoMerged,
+                                        WavChannelMode::MonoLeft,
+                                        WavChannelMode::MonoRight,
+                                    ] {
+                                        ui.selectable_value(
+                                            &mut self.playlist_render_channel_mode,
+                                            mode,
+                                            mode.label(),
+                                        );
+                                    }
+                                },
+                            );
+                        },
+                    );
+                    ui.separator();
                     if ui
                         .add_enabled(
                             self.document.is_some()
@@ -15053,6 +15095,13 @@ impl DawUi {
         let options = AudioClipRenderOptions {
             arrangement_id: self.selected_arrangement.unwrap_or_default(),
             sample_rate: self.audio_settings.sample_rate,
+            wav_sample_format: self.playlist_render_format,
+            wav_dither_mode: if self.playlist_render_dither {
+                WavDitherMode::Tpdf
+            } else {
+                WavDitherMode::Off
+            },
+            wav_channel_mode: self.playlist_render_channel_mode,
             resampling_quality: self.playlist_render_quality,
             soloed_playlist_track_range: self.soloed_playlist_track_range,
             ..AudioClipRenderOptions::default()
@@ -15100,6 +15149,13 @@ impl DawUi {
         let options = AudioClipRenderOptions {
             arrangement_id,
             sample_rate: self.audio_settings.sample_rate,
+            wav_sample_format: self.playlist_render_format,
+            wav_dither_mode: if self.playlist_render_dither {
+                WavDitherMode::Tpdf
+            } else {
+                WavDitherMode::Off
+            },
+            wav_channel_mode: self.playlist_render_channel_mode,
             resampling_quality: self.playlist_render_quality,
             clip_index: Some(clip_index),
             start_from_song_start,
@@ -15397,6 +15453,13 @@ impl DawUi {
             sample_rate: self.audio_settings.sample_rate,
             resampling_quality: self.playlist_render_quality,
             read_sample_root_note: self.read_sample_root_note,
+            wav_sample_format: self.playlist_render_format,
+            wav_dither_mode: if self.playlist_render_dither {
+                WavDitherMode::Tpdf
+            } else {
+                WavDitherMode::Off
+            },
+            wav_channel_mode: self.playlist_render_channel_mode,
             ..SamplerPatternRenderOptions::default()
         };
         let document = document.clone();

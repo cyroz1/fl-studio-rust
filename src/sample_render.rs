@@ -56,6 +56,9 @@ fn resolve_sampler_root_key(
 pub struct AudioClipRenderOptions {
     pub arrangement_id: u16,
     pub sample_rate: u32,
+    pub wav_sample_format: WavSampleFormat,
+    pub wav_dither_mode: WavDitherMode,
+    pub wav_channel_mode: WavChannelMode,
     pub resampling_quality: ResamplingQuality,
     /// Render only this zero-based arrangement clip, rebased to output time zero.
     pub clip_index: Option<usize>,
@@ -70,6 +73,9 @@ impl Default for AudioClipRenderOptions {
         Self {
             arrangement_id: 0,
             sample_rate: DEFAULT_SAMPLE_RATE,
+            wav_sample_format: WavSampleFormat::Float32,
+            wav_dither_mode: WavDitherMode::Off,
+            wav_channel_mode: WavChannelMode::Stereo,
             resampling_quality: ResamplingQuality::RENDER_DEFAULT,
             clip_index: None,
             start_from_song_start: false,
@@ -83,6 +89,9 @@ pub struct SamplerPatternRenderOptions {
     pub pattern_id: u16,
     pub sample_rate: u32,
     pub voice_limit: usize,
+    pub wav_sample_format: WavSampleFormat,
+    pub wav_dither_mode: WavDitherMode,
+    pub wav_channel_mode: WavChannelMode,
     pub resampling_quality: ResamplingQuality,
     pub read_sample_root_note: bool,
 }
@@ -93,6 +102,9 @@ impl Default for SamplerPatternRenderOptions {
             pattern_id: 0,
             sample_rate: DEFAULT_SAMPLE_RATE,
             voice_limit: DEFAULT_SAMPLER_VOICE_LIMIT,
+            wav_sample_format: WavSampleFormat::Float32,
+            wav_dither_mode: WavDitherMode::Off,
+            wav_channel_mode: WavChannelMode::Stereo,
             resampling_quality: ResamplingQuality::RENDER_DEFAULT,
             read_sample_root_note: true,
         }
@@ -359,7 +371,7 @@ pub struct PlaylistRenderSummary {
     pub vst3_plugin_channels_unloaded: usize,
 }
 
-/// Render audio-channel Playlist clips into a stereo 32-bit-float WAV.
+/// Render audio-channel Playlist clips into a WAV using the selected bit depth and channel mode.
 ///
 /// This early render path uses the project's base tempo, clip positions, observed audio source
 /// offsets, and decoded audio-channel volume/pan. Clips with default `-1` offsets use the full
@@ -376,7 +388,15 @@ pub fn render_audio_clips_to_wav(
     let output_path = output_path.as_ref();
     validate_output_path(project_path, output_path)?;
     let (mix, summary) = render_audio_clips_to_stereo_buffer(document, project_path, options)?;
-    write_float_stereo_wav(output_path, &mix, options.sample_rate, summary.frames)?;
+    write_stereo_wav_from_buffer(
+        output_path,
+        &mix,
+        options.sample_rate,
+        summary.frames,
+        options.wav_sample_format,
+        options.wav_dither_mode,
+        options.wav_channel_mode,
+    )?;
     Ok(summary)
 }
 
@@ -571,6 +591,9 @@ pub fn stream_playlist_with_vst3_to_device_from_frame(
         AudioClipRenderOptions {
             arrangement_id: options.arrangement_id,
             sample_rate: options.sample_rate,
+            wav_sample_format: options.wav_sample_format,
+            wav_dither_mode: options.wav_dither_mode,
+            wav_channel_mode: options.wav_channel_mode,
             resampling_quality: options.resampling_quality,
             clip_index: None,
             start_from_song_start: false,
@@ -679,6 +702,9 @@ pub fn render_playlist_with_vst3_to_wav_cancellable(
         AudioClipRenderOptions {
             arrangement_id: options.arrangement_id,
             sample_rate: options.sample_rate,
+            wav_sample_format: options.wav_sample_format,
+            wav_dither_mode: options.wav_dither_mode,
+            wav_channel_mode: options.wav_channel_mode,
             resampling_quality: options.resampling_quality,
             clip_index: None,
             start_from_song_start: false,
@@ -1104,7 +1130,7 @@ fn stream_prepared_playlist_render(
     Ok(sampler_engine.voices_stolen)
 }
 
-/// Render the sample voices in one FLP pattern to a stereo 32-bit-float WAV.
+/// Render the sample voices in one FLP pattern to a WAV using the selected bit depth and channel mode.
 ///
 /// This initial Sampler path schedules kind-0 channel notes on the project timeline, reads the
 /// channel's `0xC4` sample path, resamples by note key, applies velocity and the channel's
@@ -1121,7 +1147,15 @@ pub fn render_sampler_pattern_to_wav(
     let output_path = output_path.as_ref();
     validate_output_path(project_path, output_path)?;
     let (mix, summary) = render_sampler_pattern_to_stereo_buffer(document, project_path, options)?;
-    write_float_stereo_wav(output_path, &mix, options.sample_rate, summary.frames)?;
+    write_stereo_wav_from_buffer(
+        output_path,
+        &mix,
+        options.sample_rate,
+        summary.frames,
+        options.wav_sample_format,
+        options.wav_dither_mode,
+        options.wav_channel_mode,
+    )?;
     Ok(summary)
 }
 
@@ -3042,6 +3076,12 @@ fn decoded_audio_bytes(audio: &DecodedAudio) -> Result<usize, String> {
 }
 
 fn validate_output_path(project_path: &Path, output_path: &Path) -> Result<(), String> {
+    if !output_path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("wav"))
+    {
+        return Err("render output must use the .wav extension".to_owned());
+    }
     let project = fs::canonicalize(project_path).map_err(|error| {
         format!(
             "could not resolve project path {}: {error}",
@@ -3081,48 +3121,58 @@ fn validate_output_path(project_path: &Path, output_path: &Path) -> Result<(), S
     Ok(())
 }
 
-fn write_float_stereo_wav(
+fn write_stereo_wav_from_buffer(
     output_path: &Path,
     samples: &[f32],
     sample_rate: u32,
     frames: u64,
+    sample_format: WavSampleFormat,
+    dither_mode: WavDitherMode,
+    channel_mode: WavChannelMode,
 ) -> Result<(), String> {
     let frames =
         u32::try_from(frames).map_err(|_| "render is too long for a RIFF/WAVE file".to_owned())?;
-    let data_bytes = frames
-        .checked_mul(2)
-        .and_then(|value| value.checked_mul(4))
-        .ok_or_else(|| "rendered WAV size overflow".to_owned())?;
-    if samples.len() != (frames as usize) * 2 || data_bytes > u32::MAX - 36 {
+    let expected_samples = usize::try_from(frames)
+        .ok()
+        .and_then(|frames| frames.checked_mul(2))
+        .ok_or_else(|| "rendered WAV sample count overflow".to_owned())?;
+    if samples.len() != expected_samples {
         return Err("rendered WAV buffer does not match its header".to_owned());
     }
-    let byte_rate = sample_rate
-        .checked_mul(8)
-        .ok_or_else(|| "rendered WAV byte rate overflow".to_owned())?;
+    let block_align = sample_format.bytes_per_sample() * channel_mode.channel_count();
+    let data_bytes = frames
+        .checked_mul(u32::from(block_align))
+        .filter(|bytes| *bytes <= u32::MAX - 36)
+        .ok_or_else(|| "rendered WAV size exceeds the RIFF/WAVE limit".to_owned())?;
     let mut temporary = TemporaryWav::create(output_path)?;
     {
         let file = temporary.file.as_mut().expect("temporary WAV is open");
-        file.write_all(b"RIFF")
-            .and_then(|()| file.write_all(&(36 + data_bytes).to_le_bytes()))
-            .and_then(|()| file.write_all(b"WAVEfmt "))
-            .and_then(|()| file.write_all(&16u32.to_le_bytes()))
-            .and_then(|()| file.write_all(&3u16.to_le_bytes()))
-            .and_then(|()| file.write_all(&2u16.to_le_bytes()))
-            .and_then(|()| file.write_all(&sample_rate.to_le_bytes()))
-            .and_then(|()| file.write_all(&byte_rate.to_le_bytes()))
-            .and_then(|()| file.write_all(&8u16.to_le_bytes()))
-            .and_then(|()| file.write_all(&32u16.to_le_bytes()))
-            .and_then(|()| file.write_all(b"data"))
-            .and_then(|()| file.write_all(&data_bytes.to_le_bytes()))
-            .map_err(|error| format!("could not write WAV header: {error}"))?;
-        let mut block = Vec::with_capacity(32_768);
-        for chunk in samples.chunks(8_192) {
-            block.clear();
-            for sample in chunk {
-                block.extend_from_slice(&sample.to_le_bytes());
-            }
-            file.write_all(&block)
-                .map_err(|error| format!("could not write WAV audio data: {error}"))?;
+        write_wav_header(
+            file,
+            sample_rate,
+            frames,
+            data_bytes,
+            sample_format,
+            channel_mode,
+        )?;
+        let samples_per_frame = usize::from(channel_mode.channel_count());
+        let bytes_per_sample = usize::from(sample_format.bytes_per_sample());
+        let mut bytes =
+            Vec::with_capacity(STREAM_BLOCK_FRAMES * samples_per_frame * bytes_per_sample);
+        let mut dither_state = (dither_mode == WavDitherMode::Tpdf
+            && sample_format == WavSampleFormat::Pcm16)
+            .then(TpdfDither::new);
+        for block in samples.chunks(STREAM_BLOCK_FRAMES * 2) {
+            bytes.clear();
+            append_wav_block_samples_with_dither(
+                block,
+                sample_format,
+                channel_mode,
+                dither_state.as_mut(),
+                &mut bytes,
+            )?;
+            file.write_all(&bytes)
+                .map_err(|error| format!("could not write rendered WAV audio data: {error}"))?;
         }
     }
     temporary.commit(output_path)?;
@@ -4450,12 +4500,22 @@ mod tests {
             NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(&root).unwrap();
-        let project = root.join("song.flp");
+        let project = root.join("song.wav");
         let output = root.join("mix.wav");
         fs::write(&project, b"FLP project fixture").unwrap();
 
         assert!(validate_output_path(&project, &project).is_err());
-        write_float_stereo_wav(&output, &[0.25, -0.5], 48_000, 1).unwrap();
+        assert!(validate_output_path(&project, &root.join("mix.mp3")).is_err());
+        write_stereo_wav_from_buffer(
+            &output,
+            &[0.25, -0.5],
+            48_000,
+            1,
+            WavSampleFormat::Float32,
+            WavDitherMode::Off,
+            WavChannelMode::Stereo,
+        )
+        .unwrap();
 
         let bytes = fs::read(&output).unwrap();
         assert_eq!(bytes.len(), 52);
@@ -4588,7 +4648,7 @@ mod tests {
                 u32::from_le_bytes(bytes[40..44].try_into().unwrap()),
                 samples.len() as u32
             );
-            assert_eq!(&bytes[44..], expected_samples);
+            assert_eq!(&bytes[44..], expected_samples.as_slice());
         }
 
         assert_eq!(
@@ -4600,6 +4660,94 @@ mod tests {
             32_767
         );
         assert_eq!(quantize_signed_pcm(f32::NAN, 32_768.0, 32_767.0), 0);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn writes_audio_export_buffers_with_selected_depth_and_channel_mode() {
+        let root = std::env::temp_dir().join(format!(
+            "flp-audio-export-format-test-{}-{}",
+            std::process::id(),
+            NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+
+        let cases = [
+            (
+                "stereo-pcm16.wav",
+                WavSampleFormat::Pcm16,
+                WavChannelMode::Stereo,
+                2_u16,
+                16_u16,
+                4_u16,
+                vec![0x00, 0x80, 0xff, 0x7f],
+                vec![-1.0, 1.0],
+            ),
+            (
+                "left-mono-pcm24.wav",
+                WavSampleFormat::Pcm24,
+                WavChannelMode::MonoLeft,
+                1_u16,
+                24_u16,
+                3_u16,
+                vec![0x00, 0x00, 0x80],
+                vec![-1.0, 1.0],
+            ),
+            (
+                "merged-mono-float.wav",
+                WavSampleFormat::Float32,
+                WavChannelMode::MonoMerged,
+                1_u16,
+                32_u16,
+                4_u16,
+                0.375_f32.to_le_bytes().to_vec(),
+                vec![0.5, 0.25],
+            ),
+        ];
+
+        for (
+            file_name,
+            sample_format,
+            channel_mode,
+            expected_channels,
+            expected_bits,
+            expected_block_align,
+            expected_samples,
+            samples,
+        ) in cases
+        {
+            let output = root.join(file_name);
+            write_stereo_wav_from_buffer(
+                &output,
+                &samples,
+                48_000,
+                1,
+                sample_format,
+                WavDitherMode::Off,
+                channel_mode,
+            )
+            .unwrap();
+
+            let bytes = fs::read(&output).unwrap();
+            assert_eq!(
+                u16::from_le_bytes(bytes[22..24].try_into().unwrap()),
+                expected_channels
+            );
+            assert_eq!(
+                u16::from_le_bytes(bytes[32..34].try_into().unwrap()),
+                expected_block_align
+            );
+            assert_eq!(
+                u16::from_le_bytes(bytes[34..36].try_into().unwrap()),
+                expected_bits
+            );
+            assert_eq!(
+                u32::from_le_bytes(bytes[40..44].try_into().unwrap()),
+                expected_samples.len() as u32
+            );
+            assert_eq!(&bytes[44..], expected_samples);
+        }
 
         fs::remove_dir_all(root).unwrap();
     }
