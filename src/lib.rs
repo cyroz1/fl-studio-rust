@@ -6150,6 +6150,105 @@ impl FlpDocument {
         Ok(edits.len())
     }
 
+    /// Scales velocity levels for every note in one channel of a pattern.
+    /// The offset is a percentage of the full 0–127 velocity range.
+    pub fn scale_pattern_note_levels(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        multiplier_percent: u16,
+        offset_percent: i16,
+    ) -> Result<usize, FlpError> {
+        self.scale_pattern_note_levels_in_scope(
+            pattern_id,
+            channel_id,
+            None,
+            multiplier_percent,
+            offset_percent,
+        )
+    }
+
+    /// Scales velocity levels only for the selected channel-local note indices.
+    /// The offset is a percentage of the full 0–127 velocity range.
+    pub fn scale_pattern_note_selection_levels(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: &[usize],
+        multiplier_percent: u16,
+        offset_percent: i16,
+    ) -> Result<usize, FlpError> {
+        self.scale_pattern_note_levels_in_scope(
+            pattern_id,
+            channel_id,
+            Some(note_indices),
+            multiplier_percent,
+            offset_percent,
+        )
+    }
+
+    fn scale_pattern_note_levels_in_scope(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: Option<&[usize]>,
+        multiplier_percent: u16,
+        offset_percent: i16,
+    ) -> Result<usize, FlpError> {
+        if multiplier_percent > 200 {
+            return Err(FlpError::UnsupportedEdit(
+                "Scale Levels multiplier must be between 0 and 200 percent",
+            ));
+        }
+        if !(-100..=100).contains(&offset_percent) {
+            return Err(FlpError::UnsupportedEdit(
+                "Scale Levels offset must be between -100 and 100 percent",
+            ));
+        }
+        let patterns = self.patterns()?;
+        let pattern = patterns
+            .iter()
+            .find(|pattern| pattern.id == pattern_id)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested pattern does not exist",
+            ))?;
+        let selected_indices =
+            note_indices.map(|indices| indices.iter().copied().collect::<HashSet<_>>());
+        let offset = f64::from(offset_percent) * 1.27;
+        let multiplier = f64::from(multiplier_percent) / 100.0;
+        let edits = pattern
+            .notes
+            .iter()
+            .filter(|note| note.channel_id == channel_id)
+            .enumerate()
+            .filter(|(note_index, _)| note_index_in_scope(*note_index, selected_indices.as_ref()))
+            .filter_map(|(note_index, note)| {
+                let velocity = (f64::from(note.velocity) * multiplier + offset)
+                    .round()
+                    .clamp(0.0, 127.0) as u8;
+                (velocity != note.velocity).then_some((note_index, velocity))
+            })
+            .collect::<Vec<_>>();
+        if edits.is_empty() {
+            return Ok(0);
+        }
+
+        let mut updated = self.clone();
+        for (note_index, velocity) in &edits {
+            updated.edit_pattern_note(
+                pattern_id,
+                channel_id,
+                *note_index,
+                PatternNoteEdit {
+                    velocity: Some(*velocity),
+                    ..PatternNoteEdit::default()
+                },
+            )?;
+        }
+        *self = updated;
+        Ok(edits.len())
+    }
+
     /// Adds deterministic timing and velocity variation to channel notes.
     pub fn humanize_pattern_notes(
         &mut self,
@@ -12388,6 +12487,55 @@ mod tests {
             reparsed.events().last().unwrap().wire_bytes(),
             &[0xFF, 1, 0xAA]
         );
+    }
+
+    #[test]
+    fn scale_levels_updates_only_selected_channel_velocities_and_roundtrips() {
+        let mut first = note_record(0, 0, 48, 60, 20);
+        first[4..6].copy_from_slice(&0xA5A5_u16.to_le_bytes());
+        first[17] = 0xD3;
+        let other_channel = note_record(24, 1, 52, 60, 64);
+        let unselected = note_record(48, 0, 55, 60, 40);
+        let mut clamped = note_record(72, 0, 60, 60, 100);
+        clamped[20] = 0x91;
+        let input = pattern_fixture(
+            &[first, other_channel, unselected, clamped],
+            &[0xFF, 1, 0xAA],
+        );
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+
+        let changed = document
+            .scale_pattern_note_selection_levels(7, 0, &[0, 2], 150, 10)
+            .expect("selected note levels should scale");
+        assert_eq!(changed, 2);
+
+        let encoded = document
+            .encode_lossless()
+            .expect("edited FLP should encode");
+        let reparsed = FlpDocument::parse(&encoded).expect("edited FLP should parse");
+        let notes = reparsed.patterns().unwrap()[0].notes.clone();
+        assert_eq!(notes[0].velocity, 43);
+        assert_eq!(notes[0].flags, 0xA5A5);
+        assert_eq!(notes[0].reserved, 0xD3);
+        assert_eq!(notes[1].velocity, 64);
+        assert_eq!(notes[2].velocity, 40);
+        assert_eq!(notes[3].velocity, 127);
+        assert_eq!(notes[3].pan, 0x91);
+        assert_eq!(
+            reparsed.events().last().unwrap().wire_bytes(),
+            &[0xFF, 1, 0xAA]
+        );
+    }
+
+    #[test]
+    fn scale_levels_validates_limits_and_returns_zero_for_unchanged_notes() {
+        let note = note_record(0, 0, 48, 60, 100);
+        let mut document = FlpDocument::parse(&pattern_fixture(&[note], &[0xFF, 0]))
+            .expect("fixture should parse");
+
+        assert_eq!(document.scale_pattern_note_levels(7, 0, 100, 0).unwrap(), 0);
+        assert!(document.scale_pattern_note_levels(7, 0, 201, 0).is_err());
+        assert!(document.scale_pattern_note_levels(7, 0, 100, 101).is_err());
     }
 
     #[test]

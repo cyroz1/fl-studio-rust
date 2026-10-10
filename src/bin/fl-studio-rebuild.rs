@@ -1394,6 +1394,8 @@ struct DawUi {
     randomizer_pitch_range: u8,
     randomizer_bipolar: bool,
     randomizer_reset_levels: bool,
+    scale_levels_multiplier_percent: u16,
+    scale_levels_offset_percent: i16,
     humanize_timing_range_ticks: u32,
     humanize_velocity_variation_percent: u8,
     note_limit_minimum_key: u8,
@@ -1722,6 +1724,8 @@ impl DawUi {
             randomizer_pitch_range: 0,
             randomizer_bipolar: true,
             randomizer_reset_levels: false,
+            scale_levels_multiplier_percent: 100,
+            scale_levels_offset_percent: 0,
             humanize_timing_range_ticks: 12,
             humanize_velocity_variation_percent: 10,
             note_limit_minimum_key: 36,
@@ -11178,6 +11182,7 @@ impl DawUi {
         let mut strum_requested = false;
         let mut flam_requested = false;
         let mut randomize_requested = false;
+        let mut scale_levels_requested = false;
         let mut humanize_requested = false;
         let mut limit_requested = false;
         let mut arpeggiate_requested = false;
@@ -11652,6 +11657,34 @@ impl DawUi {
                         humanize_requested = true;
                         ui.close();
                     }
+                    ui.menu_button("Scale levels", |ui| {
+                        ui.label("Velocity");
+                        ui.add(
+                            egui::Slider::new(&mut self.scale_levels_multiplier_percent, 0..=200)
+                                .text("Multiply %"),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut self.scale_levels_offset_percent, -100..=100)
+                                .text("Offset %"),
+                        );
+                        ui.small("Offset is relative to the full 0–127 velocity range.");
+                        ui.horizontal(|ui| {
+                            if ui.button("Reset").clicked() {
+                                self.scale_levels_multiplier_percent = 100;
+                                self.scale_levels_offset_percent = 0;
+                            }
+                            if ui
+                                .add_enabled(
+                                    edit_scope_available,
+                                    egui::Button::new(format!("Apply to {edit_target}")),
+                                )
+                                .clicked()
+                            {
+                                scale_levels_requested = true;
+                                ui.close();
+                            }
+                        });
+                    });
                     if ui
                         .add_enabled(
                             edit_scope_available,
@@ -11835,6 +11868,7 @@ impl DawUi {
             strum_requested = false;
             flam_requested = false;
             randomize_requested = false;
+            scale_levels_requested = false;
             humanize_requested = false;
             limit_requested = false;
             arpeggiate_requested = false;
@@ -11856,6 +11890,48 @@ impl DawUi {
         } else {
             "channel"
         };
+
+        if scale_levels_requested
+            && let (Some(pattern_id), Some(channel_id)) =
+                (self.selected_pattern, self.selected_note_channel)
+        {
+            let multiplier_percent = self.scale_levels_multiplier_percent;
+            let offset_percent = self.scale_levels_offset_percent;
+            let result = self
+                .document
+                .as_mut()
+                .ok_or_else(|| "no project is open".to_owned())
+                .and_then(|document| {
+                    let result = if edit_selection_only {
+                        document.scale_pattern_note_selection_levels(
+                            pattern_id,
+                            channel_id,
+                            &selected_quantize_indices,
+                            multiplier_percent,
+                            offset_percent,
+                        )
+                    } else {
+                        document.scale_pattern_note_levels(
+                            pattern_id,
+                            channel_id,
+                            multiplier_percent,
+                            offset_percent,
+                        )
+                    };
+                    result.map_err(|error| error.to_string())
+                });
+            match result {
+                Ok(changed) => {
+                    if changed > 0 {
+                        self.dirty = true;
+                    }
+                    self.status = format!(
+                        "Scaled velocity for {changed} {edit_scope_description} in pattern {pattern_id}"
+                    );
+                }
+                Err(error) => self.status = format!("Could not scale note levels: {error}"),
+            }
+        }
 
         if duplicate_notes_requested
             && let (Some(pattern_id), Some(channel_id)) =
