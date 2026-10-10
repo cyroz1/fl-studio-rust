@@ -3551,11 +3551,7 @@ impl DawUi {
                     egui::ComboBox::from_id_salt("playlist-render-resampling-quality")
                         .selected_text(self.playlist_render_quality.label())
                         .show_ui(ui, |ui| {
-                            for quality in [
-                                ResamplingQuality::Linear,
-                                ResamplingQuality::Hermite6,
-                                ResamplingQuality::Sinc64,
-                            ] {
+                            for quality in ResamplingQuality::RENDER_OPTIONS {
                                 ui.selectable_value(
                                     &mut self.playlist_render_quality,
                                     quality,
@@ -18684,11 +18680,7 @@ impl DawUi {
             egui::ComboBox::from_id_salt("live-audio-resampling-quality")
                 .selected_text(self.live_resampling_quality.label())
                 .show_ui(ui, |ui| {
-                    for quality in [
-                        ResamplingQuality::Linear,
-                        ResamplingQuality::Hermite6,
-                        ResamplingQuality::Sinc64,
-                    ] {
+                    for quality in ResamplingQuality::LIVE_OPTIONS {
                         resampling_quality_changed |= ui
                             .selectable_value(
                                 &mut self.live_resampling_quality,
@@ -18701,7 +18693,7 @@ impl DawUi {
         });
         ui.label(
             egui::RichText::new(
-                "Applies to the next live Playlist or Sampler playback. Higher quality uses more CPU; the Playlist render has its own setting.",
+                "Applies to the next live Playlist or Sampler playback. 128-point sinc and higher can use substantial CPU in real time; the Playlist render has its own setting.",
             )
             .color(MUTED),
         );
@@ -20492,7 +20484,7 @@ fn load_live_resampling_quality() -> ResamplingQuality {
     live_resampling_quality_settings_file()
         .and_then(|path| fs::read_to_string(path).ok())
         .and_then(|contents| ResamplingQuality::from_settings_key(contents.trim()))
-        .unwrap_or(ResamplingQuality::Linear)
+        .unwrap_or(ResamplingQuality::LIVE_DEFAULT)
 }
 
 fn save_live_resampling_quality(quality: ResamplingQuality) -> Result<(), String> {

@@ -158,15 +158,61 @@ pub enum WavDitherMode {
 pub enum ResamplingQuality {
     Linear,
     Hermite6,
+    Sinc16,
+    Sinc24,
+    Sinc32,
     Sinc64,
+    Sinc128,
+    Sinc256,
+    Sinc512,
 }
 
 impl ResamplingQuality {
+    pub const LIVE_DEFAULT: Self = Self::Sinc24;
+
+    pub const SINC_OPTIONS: [Self; 7] = [
+        Self::Sinc16,
+        Self::Sinc24,
+        Self::Sinc32,
+        Self::Sinc64,
+        Self::Sinc128,
+        Self::Sinc256,
+        Self::Sinc512,
+    ];
+
+    pub const LIVE_OPTIONS: [Self; 7] = [
+        Self::Linear,
+        Self::Hermite6,
+        Self::Sinc24,
+        Self::Sinc64,
+        Self::Sinc128,
+        Self::Sinc256,
+        Self::Sinc512,
+    ];
+
+    pub const RENDER_OPTIONS: [Self; 9] = [
+        Self::Linear,
+        Self::Hermite6,
+        Self::Sinc16,
+        Self::Sinc24,
+        Self::Sinc32,
+        Self::Sinc64,
+        Self::Sinc128,
+        Self::Sinc256,
+        Self::Sinc512,
+    ];
+
     pub const fn label(self) -> &'static str {
         match self {
             Self::Linear => "Linear",
             Self::Hermite6 => "6-point Hermite",
+            Self::Sinc16 => "16-point sinc",
+            Self::Sinc24 => "24-point sinc",
+            Self::Sinc32 => "32-point sinc",
             Self::Sinc64 => "64-point sinc",
+            Self::Sinc128 => "128-point sinc",
+            Self::Sinc256 => "256-point sinc",
+            Self::Sinc512 => "512-point sinc",
         }
     }
 
@@ -174,7 +220,13 @@ impl ResamplingQuality {
         match self {
             Self::Linear => "linear",
             Self::Hermite6 => "hermite6",
+            Self::Sinc16 => "sinc16",
+            Self::Sinc24 => "sinc24",
+            Self::Sinc32 => "sinc32",
             Self::Sinc64 => "sinc64",
+            Self::Sinc128 => "sinc128",
+            Self::Sinc256 => "sinc256",
+            Self::Sinc512 => "sinc512",
         }
     }
 
@@ -182,8 +234,27 @@ impl ResamplingQuality {
         match key {
             "linear" => Some(Self::Linear),
             "hermite6" => Some(Self::Hermite6),
+            "sinc16" => Some(Self::Sinc16),
+            "sinc24" => Some(Self::Sinc24),
+            "sinc32" => Some(Self::Sinc32),
             "sinc64" => Some(Self::Sinc64),
+            "sinc128" => Some(Self::Sinc128),
+            "sinc256" => Some(Self::Sinc256),
+            "sinc512" => Some(Self::Sinc512),
             _ => None,
+        }
+    }
+
+    const fn sinc_taps(self) -> Option<usize> {
+        match self {
+            Self::Sinc16 => Some(16),
+            Self::Sinc24 => Some(24),
+            Self::Sinc32 => Some(32),
+            Self::Sinc64 => Some(64),
+            Self::Sinc128 => Some(128),
+            Self::Sinc256 => Some(256),
+            Self::Sinc512 => Some(512),
+            Self::Linear | Self::Hermite6 => None,
         }
     }
 }
@@ -2460,17 +2531,26 @@ fn resample_sample(
     if channel.is_empty() || !position.is_finite() {
         return 0.0;
     }
-    match quality {
-        ResamplingQuality::Linear => {
-            let first_index = (position.floor() as usize).min(channel.len() - 1);
-            let second_index = (first_index + 1).min(channel.len() - 1);
-            let fraction = (position - first_index as f64) as f32;
-            let first = finite_audio_sample(channel[first_index]);
-            let second = finite_audio_sample(channel[second_index]);
-            first + (second - first) * fraction
-        }
-        ResamplingQuality::Hermite6 => hermite6_sample(channel, position),
-        ResamplingQuality::Sinc64 => windowed_sinc64_sample(channel, position, source_step),
+    match quality.sinc_taps() {
+        Some(taps) => windowed_sinc_sample(channel, position, source_step, taps),
+        None => match quality {
+            ResamplingQuality::Linear => {
+                let first_index = (position.floor() as usize).min(channel.len() - 1);
+                let second_index = (first_index + 1).min(channel.len() - 1);
+                let fraction = (position - first_index as f64) as f32;
+                let first = finite_audio_sample(channel[first_index]);
+                let second = finite_audio_sample(channel[second_index]);
+                first + (second - first) * fraction
+            }
+            ResamplingQuality::Hermite6 => hermite6_sample(channel, position),
+            ResamplingQuality::Sinc16
+            | ResamplingQuality::Sinc24
+            | ResamplingQuality::Sinc32
+            | ResamplingQuality::Sinc64
+            | ResamplingQuality::Sinc128
+            | ResamplingQuality::Sinc256
+            | ResamplingQuality::Sinc512 => unreachable!("sinc quality has a tap count"),
+        },
     }
 }
 
@@ -2511,9 +2591,10 @@ fn finite_audio_sample(sample: f32) -> f32 {
     if sample.is_finite() { sample } else { 0.0 }
 }
 
-fn windowed_sinc64_sample(channel: &[f32], position: f64, source_step: f64) -> f32 {
-    const TAPS: isize = 64;
-    const LEFT_TAPS: isize = 31;
+fn windowed_sinc_sample(channel: &[f32], position: f64, source_step: f64, taps: usize) -> f32 {
+    let taps = taps as isize;
+    let left_taps = taps / 2 - 1;
+    let window_radius = taps as f64 / 2.0;
     let center = position.floor() as isize;
     let last_index = (channel.len() - 1) as isize;
     let source_step = source_step.abs();
@@ -2525,10 +2606,10 @@ fn windowed_sinc64_sample(channel: &[f32], position: f64, source_step: f64) -> f
     let mut weighted_sample = 0.0;
     let mut weight_sum = 0.0;
 
-    for tap in 0..TAPS {
-        let source_index = center + tap - LEFT_TAPS;
+    for tap in 0..taps {
+        let source_index = center + tap - left_taps;
         let distance = source_index as f64 - position;
-        let window_position = distance / 32.0;
+        let window_position = distance / window_radius;
         if window_position.abs() >= 1.0 {
             continue;
         }
@@ -3020,16 +3101,25 @@ mod tests {
 
     #[test]
     fn resampling_quality_settings_keys_round_trip() {
-        for quality in [
-            ResamplingQuality::Linear,
-            ResamplingQuality::Hermite6,
-            ResamplingQuality::Sinc64,
-        ] {
+        for quality in ResamplingQuality::RENDER_OPTIONS {
             assert_eq!(
                 ResamplingQuality::from_settings_key(quality.settings_key()),
                 Some(quality)
             );
         }
+        assert_eq!(ResamplingQuality::LIVE_DEFAULT, ResamplingQuality::Sinc24);
+        assert_eq!(
+            ResamplingQuality::LIVE_OPTIONS,
+            [
+                ResamplingQuality::Linear,
+                ResamplingQuality::Hermite6,
+                ResamplingQuality::Sinc24,
+                ResamplingQuality::Sinc64,
+                ResamplingQuality::Sinc128,
+                ResamplingQuality::Sinc256,
+                ResamplingQuality::Sinc512,
+            ]
+        );
         assert_eq!(ResamplingQuality::from_settings_key("unknown"), None);
     }
 
@@ -3049,8 +3139,13 @@ mod tests {
     #[test]
     fn sinc_resampling_preserves_dc_at_fractional_positions() {
         let samples = vec![0.375; 1024];
-        let rendered = resample_sample(&samples, 512.25, 1.0, ResamplingQuality::Sinc64);
-        assert!((rendered - 0.375).abs() < 1.0e-6);
+        for quality in ResamplingQuality::SINC_OPTIONS {
+            let rendered = resample_sample(&samples, 512.25, 1.0, quality);
+            assert!(
+                (rendered - 0.375).abs() < 1.0e-6,
+                "{quality:?} did not preserve DC: {rendered}"
+            );
+        }
     }
 
     #[test]
@@ -3058,11 +3153,13 @@ mod tests {
         let samples = (0usize..2048)
             .map(|index| if index.is_multiple_of(2) { 1.0 } else { -1.0 })
             .collect::<Vec<_>>();
-        let rendered = resample_sample(&samples, 1024.0, 2.0, ResamplingQuality::Sinc64);
-        assert!(
-            rendered.abs() < 0.01,
-            "unexpected aliased output: {rendered}"
-        );
+        for quality in ResamplingQuality::SINC_OPTIONS {
+            let rendered = resample_sample(&samples, 1024.0, 2.0, quality);
+            assert!(
+                rendered.abs() < 0.01,
+                "{quality:?} left unexpected aliased output: {rendered}"
+            );
+        }
     }
 
     #[test]
