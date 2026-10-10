@@ -806,6 +806,7 @@ pub struct Pattern {
     pub name: Option<String>,
     pub length_ticks: Option<u32>,
     pub notes: Vec<PatternNote>,
+    pub time_markers: Vec<TimeMarker>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -2026,6 +2027,7 @@ impl FlpDocument {
         let mut patterns = Vec::<Pattern>::new();
         let mut pattern_indices = HashMap::<u16, usize>::new();
         let mut current_pattern = None;
+        let mut current_time_marker = None;
         let mut event_index = 0usize;
 
         while event_index < self.events.len() {
@@ -2042,6 +2044,7 @@ impl FlpDocument {
                         index
                     });
                     current_pattern = Some(pattern_index);
+                    current_time_marker = None;
 
                     if let Some(notes_event) = self.events.get(event_index + 1)
                         && Self::is_pattern_note_event(notes_event)
@@ -2067,7 +2070,10 @@ impl FlpDocument {
                         event_index += 1;
                     }
                 }
-                0x40 | 0x62 | 0x63 => current_pattern = None,
+                0x40 | 0x62 | 0x63 => {
+                    current_pattern = None;
+                    current_time_marker = None;
+                }
                 0xC1 => {
                     if let Some(pattern_index) = current_pattern
                         && patterns[pattern_index].name.is_none()
@@ -2087,12 +2093,261 @@ impl FlpDocument {
                         ]));
                     }
                 }
+                0x94 if event.payload.len() == 4 => {
+                    current_time_marker = current_pattern.map(|pattern_index| {
+                        let marker_index = patterns[pattern_index].time_markers.len();
+                        patterns[pattern_index].time_markers.push(TimeMarker {
+                            raw_position: u32::from_le_bytes(
+                                event.payload[..4]
+                                    .try_into()
+                                    .expect("a dword time-marker event has four bytes"),
+                            ),
+                            source_events: TimeMarkerSourceEvents {
+                                position: Some(event_index),
+                                ..TimeMarkerSourceEvents::default()
+                            },
+                            ..TimeMarker::default()
+                        });
+                        (pattern_index, marker_index)
+                    });
+                }
+                0x21 if event.payload.len() == 1 => {
+                    if let Some((pattern_index, marker_index)) = current_time_marker
+                        && let Some(marker) = patterns
+                            .get_mut(pattern_index)
+                            .and_then(|pattern| pattern.time_markers.get_mut(marker_index))
+                    {
+                        marker.numerator = Some(event.payload[0]);
+                        marker.source_events.numerator = Some(event_index);
+                    }
+                }
+                0x22 if event.payload.len() == 1 => {
+                    if let Some((pattern_index, marker_index)) = current_time_marker
+                        && let Some(marker) = patterns
+                            .get_mut(pattern_index)
+                            .and_then(|pattern| pattern.time_markers.get_mut(marker_index))
+                    {
+                        marker.denominator = Some(event.payload[0]);
+                        marker.source_events.denominator = Some(event_index);
+                    }
+                }
+                0xCD => {
+                    if let Some((pattern_index, marker_index)) = current_time_marker
+                        && let Some(marker) = patterns
+                            .get_mut(pattern_index)
+                            .and_then(|pattern| pattern.time_markers.get_mut(marker_index))
+                    {
+                        marker.name =
+                            decode_project_string(&event.payload, self.project_version.as_deref())
+                                .filter(|name| !name.is_empty());
+                        marker.source_events.name = Some(event_index);
+                    }
+                    current_time_marker = None;
+                }
                 _ => {}
             }
             event_index += 1;
         }
         patterns.sort_by_key(|pattern| pattern.id);
         Ok(patterns)
+    }
+
+    /// Sets or creates a time-signature marker within one Pattern.
+    /// Pattern markers are scoped by the `0x41` Pattern ID events and remain separate from
+    /// project defaults and Playlist arrangement markers.
+    pub fn set_pattern_time_signature(
+        &mut self,
+        pattern_id: u16,
+        position_ticks: u32,
+        numerator: u8,
+        denominator: u8,
+    ) -> Result<usize, FlpError> {
+        if numerator == 0 || denominator == 0 {
+            return Err(FlpError::UnsupportedEdit(
+                "time signature numerator and denominator must be positive",
+            ));
+        }
+        if position_ticks > TIME_MARKER_TICK_MASK {
+            return Err(FlpError::UnsupportedEdit(
+                "pattern time-signature positions must fit in the low 27 position bits",
+            ));
+        }
+
+        let patterns = self.patterns()?;
+        let pattern = patterns
+            .iter()
+            .find(|pattern| pattern.id == pattern_id)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested Pattern does not exist",
+            ))?;
+        let matching_markers = pattern
+            .time_markers
+            .iter()
+            .filter(|marker| marker.is_signature() && marker.position_ticks() == position_ticks)
+            .collect::<Vec<_>>();
+        if matching_markers.len() > 1 {
+            return Err(FlpError::UnsupportedEdit(
+                "the Pattern has ambiguous signatures at the requested position",
+            ));
+        }
+
+        let mut candidate = self.clone();
+        if let Some(marker) = matching_markers.first() {
+            let position_event_index =
+                marker
+                    .source_events
+                    .position
+                    .ok_or(FlpError::UnsupportedEdit(
+                        "the selected Pattern time signature has no source position event",
+                    ))?;
+            let mut insertion_index = position_event_index + 1;
+            for event_index in [
+                marker.source_events.numerator,
+                marker.source_events.denominator,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                insertion_index = insertion_index.max(event_index + 1);
+            }
+            if let Some(name_event_index) = marker.source_events.name {
+                insertion_index = insertion_index.min(name_event_index);
+            }
+
+            let mut insertions = Vec::<(usize, u8, FlpEvent)>::new();
+            for (value, event_index, opcode, rank) in [
+                (numerator, marker.source_events.numerator, 0x21, 0),
+                (denominator, marker.source_events.denominator, 0x22, 1),
+            ] {
+                if let Some(event_index) = event_index {
+                    candidate.events[event_index].replace_byte_payload(value)?;
+                } else {
+                    insertions.push((insertion_index, rank, FlpEvent::new_byte(opcode, value)));
+                }
+            }
+            insertions
+                .sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
+            for (event_index, _, event) in insertions {
+                candidate.events.insert(event_index, event);
+            }
+        } else {
+            let marker_index = candidate
+                .events
+                .iter()
+                .enumerate()
+                .filter(|(_, event)| {
+                    event.opcode == 0x41
+                        && event.payload.len() == 2
+                        && event.payload.as_slice() == pattern_id.to_le_bytes()
+                })
+                .map(|(index, _)| index)
+                .next_back()
+                .ok_or(FlpError::UnsupportedEdit(
+                    "the requested Pattern has no source marker",
+                ))?;
+            let region_start = marker_index + 1;
+            let region_end = candidate.events[region_start..]
+                .iter()
+                .position(|event| {
+                    event.opcode == 0x41 || matches!(event.opcode, 0x40 | 0x62 | 0x63)
+                })
+                .map_or(candidate.events.len(), |offset| region_start + offset);
+            let later_signature = pattern
+                .time_markers
+                .iter()
+                .filter(|marker| marker.is_signature() && marker.position_ticks() > position_ticks)
+                .filter_map(|marker| marker.source_events.position)
+                .find(|event_index| *event_index >= region_start && *event_index < region_end);
+            let last_marker_end = pattern
+                .time_markers
+                .iter()
+                .flat_map(|marker| {
+                    [
+                        marker.source_events.position,
+                        marker.source_events.numerator,
+                        marker.source_events.denominator,
+                        marker.source_events.name,
+                    ]
+                })
+                .flatten()
+                .filter(|event_index| *event_index >= region_start && *event_index < region_end)
+                .max()
+                .map(|event_index| event_index + 1);
+            let insertion_index = later_signature.or(last_marker_end).unwrap_or(region_end);
+            let raw_position = position_ticks | TIME_MARKER_SIGNATURE_BIT;
+            candidate.events.splice(
+                insertion_index..insertion_index,
+                [
+                    FlpEvent::new_dword(0x94, raw_position),
+                    FlpEvent::new_byte(0x21, numerator),
+                    FlpEvent::new_byte(0x22, denominator),
+                ],
+            );
+        }
+        candidate.refresh_event_offsets()?;
+        let marker_index = candidate
+            .patterns()?
+            .into_iter()
+            .find(|pattern| pattern.id == pattern_id)
+            .and_then(|pattern| {
+                pattern.time_markers.iter().position(|marker| {
+                    marker.is_signature() && marker.position_ticks() == position_ticks
+                })
+            })
+            .ok_or(FlpError::UnsupportedEdit(
+                "the updated Pattern time signature could not be decoded",
+            ))?;
+        *self = candidate;
+        Ok(marker_index)
+    }
+
+    /// Deletes one Pattern time-signature marker at the requested tick.
+    pub fn delete_pattern_time_signature(
+        &mut self,
+        pattern_id: u16,
+        position_ticks: u32,
+    ) -> Result<(), FlpError> {
+        let patterns = self.patterns()?;
+        let pattern = patterns
+            .iter()
+            .find(|pattern| pattern.id == pattern_id)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested Pattern does not exist",
+            ))?;
+        let matching_markers = pattern
+            .time_markers
+            .iter()
+            .filter(|marker| marker.is_signature() && marker.position_ticks() == position_ticks)
+            .collect::<Vec<_>>();
+        if matching_markers.len() != 1 {
+            return Err(FlpError::UnsupportedEdit(if matching_markers.is_empty() {
+                "the requested Pattern time signature does not exist"
+            } else {
+                "the Pattern has ambiguous signatures at the requested position"
+            }));
+        }
+        let marker = matching_markers[0];
+        let source_event_indices = [
+            marker.source_events.position,
+            marker.source_events.numerator,
+            marker.source_events.denominator,
+            marker.source_events.name,
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<BTreeSet<_>>();
+        if source_event_indices.is_empty() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested Pattern time signature has no source events",
+            ));
+        }
+        let mut candidate = self.clone();
+        for event_index in source_event_indices.into_iter().rev() {
+            candidate.events.remove(event_index);
+        }
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
     }
 
     /// Creates an empty pattern using the note-event encoding already present in the project.
@@ -2684,6 +2939,7 @@ impl FlpDocument {
         let mut arrangements = Vec::<Arrangement>::new();
         let mut current_arrangement = None;
         let mut current_time_marker = None;
+        let mut current_pattern = false;
         let mut pending_time_markers = Vec::new();
         let has_arrangement_markers = self
             .events
@@ -2692,7 +2948,16 @@ impl FlpDocument {
 
         for (event_index, event) in self.events.iter().enumerate() {
             match event.opcode {
+                0x41 if event.payload.len() == 2 => {
+                    current_pattern = true;
+                    current_time_marker = None;
+                }
+                0x40 => {
+                    current_pattern = false;
+                    current_time_marker = None;
+                }
                 0x63 if event.payload.len() == 2 => {
+                    current_pattern = false;
                     let id = u16::from_le_bytes([event.payload[0], event.payload[1]]);
                     arrangements.push(Arrangement {
                         id,
@@ -2722,6 +2987,7 @@ impl FlpDocument {
                     }
                 }
                 0x62 => {
+                    current_pattern = false;
                     if has_arrangement_markers {
                         current_arrangement = None;
                     }
@@ -2736,7 +3002,7 @@ impl FlpDocument {
                                 .filter(|name| !name.is_empty());
                     }
                 }
-                0x94 if event.payload.len() == 4 => {
+                0x94 if event.payload.len() == 4 && !current_pattern => {
                     let raw_position = u32::from_le_bytes(
                         event.payload[..4]
                             .try_into()
@@ -11961,6 +12227,122 @@ mod tests {
         let reparsed = FlpDocument::parse(&encoded).expect("edited file should parse");
         assert_eq!(reparsed.patterns().unwrap()[0].notes.len(), 2);
         assert_eq!(reparsed.trailing_bytes(), &[0xB2]);
+    }
+
+    #[test]
+    fn pattern_time_signatures_are_scoped_editable_and_roundtrip_losslessly() {
+        let pattern_position = 120;
+        let pattern_raw_position =
+            super::TIME_MARKER_SIGNATURE_BIT | 0x1000_0000 | pattern_position;
+        let playlist_position = 480;
+        let mut event_stream = vec![
+            0x11, 4, 0x12, 4, 0x40, 0, 0, 0x41, 7, 0, 0xD0, 0, 0x40, 0, 0, 0x41, 7, 0,
+        ];
+        append_time_marker(
+            &mut event_stream,
+            pattern_raw_position,
+            3,
+            8,
+            "Pattern meter",
+        );
+        event_stream.extend_from_slice(&[0xFF, 2, 0xAA, 0xBB, 0x40, 0, 0]);
+        event_stream.extend_from_slice(&[0x63, 1, 0]);
+        append_time_marker(
+            &mut event_stream,
+            super::TIME_MARKER_SIGNATURE_BIT | playlist_position,
+            5,
+            4,
+            "Playlist meter",
+        );
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        let input = flp_fixture(&event_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+
+        let pattern = document
+            .patterns()
+            .unwrap()
+            .into_iter()
+            .find(|pattern| pattern.id == 7)
+            .expect("pattern 7 should decode");
+        assert_eq!(pattern.time_markers.len(), 1);
+        assert_eq!(pattern.time_markers[0].raw_position(), pattern_raw_position);
+        assert!(pattern.time_markers[0].is_signature());
+        assert_eq!(pattern.time_markers[0].position_ticks(), pattern_position);
+        assert_eq!(pattern.time_markers[0].numerator(), Some(3));
+        assert_eq!(pattern.time_markers[0].denominator(), Some(8));
+        assert_eq!(pattern.time_markers[0].name(), Some("Pattern meter"));
+        assert_eq!(document.metadata().time_signature(), Some((4, 4)));
+        let playlist_markers = document.time_markers().unwrap();
+        assert_eq!(playlist_markers.len(), 1);
+        assert_eq!(playlist_markers[0].1.position_ticks(), playlist_position);
+        assert_eq!(playlist_markers[0].1.numerator(), Some(5));
+        let playlist_marker_summary = |document: &FlpDocument| {
+            document
+                .time_markers()
+                .unwrap()
+                .into_iter()
+                .map(|(arrangement_id, marker)| {
+                    (
+                        arrangement_id,
+                        marker.raw_position(),
+                        marker.numerator(),
+                        marker.denominator(),
+                        marker.name().map(str::to_owned),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let original_playlist_marker_summary = playlist_marker_summary(&document);
+
+        let edited_index = document
+            .set_pattern_time_signature(7, pattern_position, 5, 16)
+            .expect("the existing Pattern signature should be editable");
+        assert_eq!(edited_index, 0);
+        let edited_pattern = document.patterns().unwrap().remove(0);
+        assert_eq!(
+            edited_pattern.time_markers[0].raw_position(),
+            pattern_raw_position
+        );
+        assert_eq!(edited_pattern.time_markers[0].numerator(), Some(5));
+        assert_eq!(edited_pattern.time_markers[0].denominator(), Some(16));
+
+        let created_index = document
+            .set_pattern_time_signature(7, 384, 7, 8)
+            .expect("a second Pattern signature should be created");
+        assert_eq!(created_index, 1);
+        let signatures = document.patterns().unwrap().remove(0).time_markers;
+        assert_eq!(signatures.len(), 2);
+        assert_eq!(signatures[1].position_ticks(), 384);
+        assert_eq!(signatures[1].numerator(), Some(7));
+        assert_eq!(signatures[1].denominator(), Some(8));
+
+        document
+            .delete_pattern_time_signature(7, 384)
+            .expect("the created Pattern signature should be removable");
+        document
+            .delete_pattern_time_signature(7, pattern_position)
+            .expect("the original Pattern signature should be removable");
+        assert!(document.patterns().unwrap()[0].time_markers.is_empty());
+        assert_eq!(document.metadata().time_signature(), Some((4, 4)));
+        assert_eq!(
+            playlist_marker_summary(&document),
+            original_playlist_marker_summary
+        );
+        assert!(
+            document
+                .events()
+                .iter()
+                .any(|event| { event.opcode() == 0xFF && event.payload() == [0xAA, 0xBB] })
+        );
+
+        let encoded = document.encode_lossless().unwrap();
+        let reparsed = FlpDocument::parse(&encoded).expect("edited project should parse");
+        assert!(reparsed.patterns().unwrap()[0].time_markers.is_empty());
+        assert_eq!(
+            playlist_marker_summary(&reparsed),
+            original_playlist_marker_summary
+        );
+        assert_eq!(reparsed.metadata().time_signature(), Some((4, 4)));
     }
 
     #[test]

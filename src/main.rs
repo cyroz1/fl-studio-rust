@@ -304,6 +304,28 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 },
             )
         }
+        [command, input, output, pattern_id, position, numerator, denominator]
+            if command == "set-pattern-time-signature" =>
+        {
+            set_pattern_time_signature(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u32(position, "pattern time-signature position")?,
+                parse_u8(numerator, "time-signature numerator")?,
+                parse_u8(denominator, "time-signature denominator")?,
+            )
+        }
+        [command, input, output, pattern_id, position]
+            if command == "delete-pattern-time-signature" =>
+        {
+            delete_pattern_time_signature(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u32(position, "pattern time-signature position")?,
+            )
+        }
         [command, input, output, percent] if command == "set-global-swing" => {
             let percent = parse_u32(percent, "global swing mix percentage")?;
             if percent > 100 {
@@ -817,6 +839,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild set-project-info <input.flp> <output.flp> <title|-> <author|-> <genre|-> <comments|-> <web-link|->\n",
             "  flp-rebuild set-project-settings <input.flp> <output.flp> <play-truncated:0|1|-> <fast-declick:0|1|-> [pan-law-raw|-]\n",
             "  flp-rebuild set-project-time-signature <input.flp> <output.flp> <numerator> <denominator>\n",
+            "  flp-rebuild set-pattern-time-signature <input.flp> <output.flp> <pattern-id> <position-ticks> <numerator> <denominator>\n",
+            "  flp-rebuild delete-pattern-time-signature <input.flp> <output.flp> <pattern-id> <position-ticks>\n",
             "  flp-rebuild set-global-swing <input.flp> <output.flp> <percent-0..100>\n",
             "  flp-rebuild rename-channel <input.flp> <output.flp> <channel-id> <name>\n",
             "  flp-rebuild set-channel-color <input.flp> <output.flp> <channel-id> <RRGGBB>\n",
@@ -1982,7 +2006,7 @@ fn list_patterns(path: &Path) -> Result<(), String> {
             .collect::<Vec<_>>()
             .join(",");
         println!(
-            "id={} name={} length_ticks={} notes={} channels=[{}]",
+            "id={} name={} length_ticks={} notes={} channels=[{}] time_signatures=[{}]",
             pattern.id,
             pattern.name.as_deref().unwrap_or("(unnamed)"),
             pattern
@@ -1990,6 +2014,22 @@ fn list_patterns(path: &Path) -> Result<(), String> {
                 .map_or_else(|| "default".to_owned(), |length| length.to_string()),
             pattern.notes.len(),
             channel_summary,
+            pattern
+                .time_markers
+                .iter()
+                .filter(|marker| marker.is_signature())
+                .map(|marker| format!(
+                    "{}:{}/{}",
+                    marker.position_ticks(),
+                    marker
+                        .numerator()
+                        .map_or_else(|| "?".to_owned(), |value| value.to_string()),
+                    marker
+                        .denominator()
+                        .map_or_else(|| "?".to_owned(), |value| value.to_string()),
+                ))
+                .collect::<Vec<_>>()
+                .join(","),
         );
     }
     Ok(())
@@ -3044,6 +3084,52 @@ fn edit_time_marker(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "edited time marker {marker_index} in arrangement {arrangement_id} to {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn set_pattern_time_signature(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    position_ticks: u32,
+    numerator: u8,
+    denominator: u8,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let marker_index = document
+        .set_pattern_time_signature(pattern_id, position_ticks, numerator, denominator)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "set Pattern {pattern_id} time-signature marker {marker_index} to {numerator}/{denominator} at tick {position_ticks} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn delete_pattern_time_signature(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    position_ticks: u32,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .delete_pattern_time_signature(pattern_id, position_ticks)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "deleted Pattern {pattern_id} time signature at tick {position_ticks} from {}",
         output.display()
     );
     Ok(())
