@@ -22,9 +22,10 @@ use flp_rebuild::sample_render::{
     AudioClipRenderOptions, AudioClipRenderSummary, AudioRecordingSummary, PlaylistRenderOptions,
     PlaylistRenderSummary, ResamplingQuality, SamplerPatternRenderOptions,
     SamplerPatternRenderSummary, WavChannelMode, WavDitherMode, WavSampleFormat,
-    render_audio_clips_to_wav, render_playlist_with_vst3_to_wav_cancellable,
-    render_sampler_pattern_to_wav, stream_playlist_with_vst3_to_device_from_frame,
-    stream_sampler_pattern_to_device, write_input_recording_to_wav,
+    render_audio_clips_to_wav, render_playlist_with_vst3_to_flac_cancellable,
+    render_playlist_with_vst3_to_wav_cancellable, render_sampler_pattern_to_wav,
+    stream_playlist_with_vst3_to_device_from_frame, stream_sampler_pattern_to_device,
+    write_input_recording_to_wav,
 };
 use flp_rebuild::vst3::{
     MAX_REPORTED_TAIL_SECONDS, Vst3HostRuntime, Vst3PatternRenderOptions, Vst3PatternStreamHandle,
@@ -90,6 +91,30 @@ const BROWSER_SEARCH_ROOT_LIMIT: usize = 30;
 const MAX_BROWSER_RECURSIVE_SCAN_ENTRIES: usize = 20_000;
 const AUTOSAVE_INTERVALS_MINUTES: [u8; 5] = [0, 1, 5, 10, 15];
 const BACKUP_RETENTION_OPTIONS: [usize; 4] = [5, 10, 20, 50];
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum PlaylistSongOutputFormat {
+    #[default]
+    Wav,
+    Flac,
+}
+
+impl PlaylistSongOutputFormat {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Wav => "WAV",
+            Self::Flac => "FLAC",
+        }
+    }
+
+    const fn extension(self) -> &'static str {
+        match self {
+            Self::Wav => "wav",
+            Self::Flac => "flac",
+        }
+    }
+}
+
 const PITCH_CLASSES: [&str; 12] = [
     "C", "C♯", "D", "D♯", "E", "F", "F♯", "G", "G♯", "A", "A♯", "B",
 ];
@@ -1795,7 +1820,9 @@ struct DawUi {
     project_settings_time_signature_numerator: u8,
     project_settings_time_signature_denominator: u8,
     playlist_render_options_open: bool,
+    playlist_song_output_format: PlaylistSongOutputFormat,
     playlist_render_format: WavSampleFormat,
+    playlist_render_flac_bits_per_sample: u8,
     playlist_render_dither: bool,
     playlist_render_quality: ResamplingQuality,
     playlist_render_channel_mode: WavChannelMode,
@@ -2158,7 +2185,9 @@ impl DawUi {
             project_settings_time_signature_numerator: 4,
             project_settings_time_signature_denominator: 4,
             playlist_render_options_open: false,
+            playlist_song_output_format: PlaylistSongOutputFormat::Wav,
             playlist_render_format: WavSampleFormat::Float32,
+            playlist_render_flac_bits_per_sample: 24,
             playlist_render_dither: false,
             playlist_render_quality,
             playlist_render_channel_mode: WavChannelMode::Stereo,
@@ -3526,28 +3555,78 @@ impl DawUi {
             .default_width(360.0)
             .show(context, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label("WAV format");
-                    egui::ComboBox::from_id_salt("playlist-render-wav-format")
-                        .selected_text(self.playlist_render_format.label())
+                    ui.label("Output format");
+                    egui::ComboBox::from_id_salt("playlist-song-output-format")
+                        .selected_text(self.playlist_song_output_format.label())
                         .show_ui(ui, |ui| {
-                            for format in [
-                                WavSampleFormat::Pcm16,
-                                WavSampleFormat::Pcm24,
-                                WavSampleFormat::Float32,
-                            ] {
-                                ui.selectable_value(
-                                    &mut self.playlist_render_format,
-                                    format,
-                                    format.label(),
-                                );
-                            }
+                            ui.selectable_value(
+                                &mut self.playlist_song_output_format,
+                                PlaylistSongOutputFormat::Wav,
+                                "WAV",
+                            );
+                            ui.selectable_value(
+                                &mut self.playlist_song_output_format,
+                                PlaylistSongOutputFormat::Flac,
+                                "FLAC",
+                            );
                         });
                 });
-                let dither_enabled = self.playlist_render_format == WavSampleFormat::Pcm16;
-                ui.add_enabled_ui(dither_enabled, |ui| {
-                    ui.checkbox(&mut self.playlist_render_dither, "TPDF dither");
-                });
-                ui.label("Adds triangular dither during 16-bit output only.");
+                match self.playlist_song_output_format {
+                    PlaylistSongOutputFormat::Wav => {
+                        ui.horizontal(|ui| {
+                            ui.label("WAV format");
+                            egui::ComboBox::from_id_salt("playlist-render-wav-format")
+                                .selected_text(self.playlist_render_format.label())
+                                .show_ui(ui, |ui| {
+                                    for format in [
+                                        WavSampleFormat::Pcm16,
+                                        WavSampleFormat::Pcm24,
+                                        WavSampleFormat::Float32,
+                                    ] {
+                                        ui.selectable_value(
+                                            &mut self.playlist_render_format,
+                                            format,
+                                            format.label(),
+                                        );
+                                    }
+                                });
+                        });
+                        let dither_enabled =
+                            self.playlist_render_format == WavSampleFormat::Pcm16;
+                        ui.add_enabled_ui(dither_enabled, |ui| {
+                            ui.checkbox(&mut self.playlist_render_dither, "TPDF dither");
+                        });
+                        ui.label("Adds triangular dither during 16-bit output only.");
+                        ui.label(match self.playlist_render_format {
+                            WavSampleFormat::Pcm16 | WavSampleFormat::Pcm24 => {
+                                "Integer PCM clips samples to the [-1, 1] range."
+                            }
+                            WavSampleFormat::Float32 => {
+                                "Float WAV preserves levels outside [-1, 1]."
+                            }
+                        });
+                    }
+                    PlaylistSongOutputFormat::Flac => {
+                        ui.horizontal(|ui| {
+                            ui.label("FLAC bit depth");
+                            egui::ComboBox::from_id_salt("playlist-render-flac-depth")
+                                .selected_text(format!(
+                                    "{}-bit",
+                                    self.playlist_render_flac_bits_per_sample
+                                ))
+                                .show_ui(ui, |ui| {
+                                    for depth in [16, 24] {
+                                        ui.selectable_value(
+                                            &mut self.playlist_render_flac_bits_per_sample,
+                                            depth,
+                                            format!("{depth}-bit"),
+                                        );
+                                    }
+                                });
+                        });
+                        ui.label("FLAC is lossless compressed audio. TPDF dither is not applied.");
+                    }
+                }
                 let mut render_quality_changed = false;
                 ui.horizontal(|ui| {
                     ui.label("Resampling");
@@ -3614,12 +3693,6 @@ impl DawUi {
                     "Extends to the longest finite VST3 instrument tail, up to {:.0} seconds. Infinite reports use the selected tail length.",
                     MAX_REPORTED_TAIL_SECONDS
                 ));
-                ui.label(match self.playlist_render_format {
-                    WavSampleFormat::Pcm16 | WavSampleFormat::Pcm24 => {
-                        "Integer PCM clips samples to the [-1, 1] range."
-                    }
-                    WavSampleFormat::Float32 => "Float WAV preserves levels outside [-1, 1].",
-                });
                 ui.horizontal(|ui| {
                     if ui.button("Render…").clicked() {
                         start_render = true;
@@ -4595,6 +4668,33 @@ impl DawUi {
                     }
                 });
                 ui.menu_button("Export", |ui| {
+                    ui.menu_button(
+                        format!("Song output: {}", self.playlist_song_output_format.label()),
+                        |ui| {
+                            ui.selectable_value(
+                                &mut self.playlist_song_output_format,
+                                PlaylistSongOutputFormat::Wav,
+                                "WAV",
+                            );
+                            ui.selectable_value(
+                                &mut self.playlist_song_output_format,
+                                PlaylistSongOutputFormat::Flac,
+                                "FLAC",
+                            );
+                            if self.playlist_song_output_format == PlaylistSongOutputFormat::Flac {
+                                ui.separator();
+                                ui.label("FLAC bit depth");
+                                for depth in [16, 24] {
+                                    ui.selectable_value(
+                                        &mut self.playlist_render_flac_bits_per_sample,
+                                        depth,
+                                        format!("{depth}-bit"),
+                                    );
+                                }
+                            }
+                        },
+                    );
+                    ui.separator();
                     ui.menu_button(
                         format!("WAV output: {}", self.playlist_render_format.label()),
                         |ui| {
@@ -15296,14 +15396,18 @@ impl DawUi {
             .file_stem()
             .map(|stem| stem.to_string_lossy().into_owned())
             .unwrap_or_else(|| "FL_Studio_Project".to_owned());
-        let Some(output_path) = rfd::FileDialog::new()
+        let output_format = self.playlist_song_output_format;
+        let file_dialog = rfd::FileDialog::new()
             .set_title("Render Playlist mix")
-            .set_file_name(format!("{project_stem}.wav"))
-            .add_filter("WAV audio", &["wav"])
-            .save_file()
-        else {
+            .set_file_name(format!("{project_stem}.{}", output_format.extension()));
+        let file_dialog = match output_format {
+            PlaylistSongOutputFormat::Wav => file_dialog.add_filter("WAV audio", &["wav"]),
+            PlaylistSongOutputFormat::Flac => file_dialog.add_filter("FLAC audio", &["flac"]),
+        };
+        let Some(output_path) = file_dialog.save_file() else {
             return;
         };
+        let flac_bits_per_sample = self.playlist_render_flac_bits_per_sample;
 
         let options = PlaylistRenderOptions {
             arrangement_id: self.selected_arrangement.unwrap_or_default(),
@@ -15350,16 +15454,29 @@ impl DawUi {
         let worker_cancelled = Arc::clone(&cancelled);
         let (sender, receiver) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
-            .name("playlist-wav-render".to_owned())
+            .name("playlist-render".to_owned())
             .spawn(move || {
-                let result = render_playlist_with_vst3_to_wav_cancellable(
-                    &document,
-                    &project_path,
-                    options,
-                    &output_path_for_worker,
-                    vst3_processor,
-                    &worker_cancelled,
-                );
+                let result = match output_format {
+                    PlaylistSongOutputFormat::Wav => render_playlist_with_vst3_to_wav_cancellable(
+                        &document,
+                        &project_path,
+                        options,
+                        &output_path_for_worker,
+                        vst3_processor,
+                        &worker_cancelled,
+                    ),
+                    PlaylistSongOutputFormat::Flac => {
+                        render_playlist_with_vst3_to_flac_cancellable(
+                            &document,
+                            &project_path,
+                            options,
+                            &output_path_for_worker,
+                            flac_bits_per_sample,
+                            vst3_processor,
+                            &worker_cancelled,
+                        )
+                    }
+                };
                 let _ = sender.send(result);
             });
         match worker {

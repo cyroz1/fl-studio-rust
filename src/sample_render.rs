@@ -9,6 +9,12 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use flacenc::bitsink::ByteSink;
+use flacenc::component::{BitRepr, Frame, FrameOffset, Stream};
+use flacenc::error::Verify;
+use flacenc::source::{Fill, FrameBuf};
+use md5::{Digest, Md5};
+
 use crate::audio::{AudioInputRecording, StreamingAudioWriter};
 use crate::media::{DecodedAudio, SamplePathResolver, decode_audio_file, wav_sampler_metadata};
 use crate::vst3::Vst3PlaylistStreamProcessor;
@@ -25,6 +31,8 @@ const MAX_SAMPLER_VOICE_LIMIT: usize = 256;
 const SAMPLER_RELEASE_SECONDS: f64 = 0.005;
 const SAMPLER_ROOT_KEY: u16 = 60;
 const SAMPLER_BLOCK_FRAMES: usize = 1_024;
+const FLAC_BLOCK_FRAMES: usize = 4_096;
+const FLAC_MAX_SAMPLE_FRAMES: u64 = (1_u64 << 36) - 1;
 static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -421,8 +429,11 @@ pub fn write_input_recording_to_wav(
         return Err("audio recording sample rate must be between 8,000 and 384,000 Hz".to_owned());
     }
 
-    let mut temporary = TemporaryWav::create(output_path)?;
-    let file = temporary.file.as_mut().expect("temporary WAV is open");
+    let mut temporary = TemporaryRenderFile::create(output_path)?;
+    let file = temporary
+        .file
+        .as_mut()
+        .expect("temporary render file is open");
     // Reserve a stereo float header; the frame and data sizes are patched after capture ends.
     write_wav_header(
         file,
@@ -689,12 +700,67 @@ pub fn render_playlist_with_vst3_to_wav_cancellable(
     project_path: impl AsRef<Path>,
     options: PlaylistRenderOptions,
     output_path: impl AsRef<Path>,
+    vst3_processor: Option<Vst3PlaylistStreamProcessor>,
+    cancelled: &AtomicBool,
+) -> Result<PlaylistRenderSummary, String> {
+    render_playlist_with_vst3_cancellable(
+        document,
+        project_path,
+        options,
+        output_path,
+        PlaylistRenderOutput::Wav,
+        vst3_processor,
+        cancelled,
+    )
+}
+
+/// Render a full Playlist arrangement to 16- or 24-bit FLAC in bounded audio blocks.
+pub fn render_playlist_with_vst3_to_flac_cancellable(
+    document: &FlpDocument,
+    project_path: impl AsRef<Path>,
+    options: PlaylistRenderOptions,
+    output_path: impl AsRef<Path>,
+    bits_per_sample: u8,
+    vst3_processor: Option<Vst3PlaylistStreamProcessor>,
+    cancelled: &AtomicBool,
+) -> Result<PlaylistRenderSummary, String> {
+    render_playlist_with_vst3_cancellable(
+        document,
+        project_path,
+        options,
+        output_path,
+        PlaylistRenderOutput::Flac { bits_per_sample },
+        vst3_processor,
+        cancelled,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum PlaylistRenderOutput {
+    Wav,
+    Flac { bits_per_sample: u8 },
+}
+
+fn render_playlist_with_vst3_cancellable(
+    document: &FlpDocument,
+    project_path: impl AsRef<Path>,
+    options: PlaylistRenderOptions,
+    output_path: impl AsRef<Path>,
+    output: PlaylistRenderOutput,
     mut vst3_processor: Option<Vst3PlaylistStreamProcessor>,
     cancelled: &AtomicBool,
 ) -> Result<PlaylistRenderSummary, String> {
     let project_path = project_path.as_ref();
     let output_path = output_path.as_ref();
-    validate_output_path(project_path, output_path)?;
+    match output {
+        PlaylistRenderOutput::Wav => validate_output_path(project_path, output_path)?,
+        PlaylistRenderOutput::Flac { bits_per_sample } => {
+            validate_flac_output_path(project_path, output_path)?;
+            if !matches!(bits_per_sample, 16 | 24) {
+                return Err("FLAC output supports 16- or 24-bit samples".to_owned());
+            }
+        }
+    }
     let master_output = MixerMasterOutput::from_document(document);
     let audio = prepare_audio_clip_render(
         document,
@@ -746,14 +812,9 @@ pub fn render_playlist_with_vst3_to_wav_cancellable(
     if let Some(processor) = vst3_processor.as_mut() {
         processor.extend_to_output_frames(frames)?;
     }
-    let frames_u32 =
-        u32::try_from(frames).map_err(|_| "render is too long for a RIFF/WAVE file".to_owned())?;
-    let block_align =
-        options.wav_sample_format.bytes_per_sample() * options.wav_channel_mode.channel_count();
-    let data_bytes = frames_u32
-        .checked_mul(u32::from(block_align))
-        .filter(|bytes| *bytes <= u32::MAX - 36)
-        .ok_or_else(|| "rendered WAV size exceeds the RIFF/WAVE limit".to_owned())?;
+    if matches!(output, PlaylistRenderOutput::Flac { .. }) && frames > FLAC_MAX_SAMPLE_FRAMES {
+        return Err("rendered FLAC exceeds the 36-bit sample-count limit".to_owned());
+    }
     let mut source_paths: std::collections::BTreeSet<PathBuf> =
         audio.decoded_by_path.keys().cloned().collect();
     source_paths.extend(sampler.source_paths.iter().cloned());
@@ -780,52 +841,283 @@ pub fn render_playlist_with_vst3_to_wav_cancellable(
             .map_or(0, |summary| summary.unloaded_plugin_channels.len()),
     };
 
-    let mut temporary = TemporaryWav::create(output_path)?;
-    {
-        let file = temporary.file.as_mut().expect("temporary WAV is open");
-        write_wav_header(
-            file,
-            options.sample_rate,
-            frames_u32,
-            data_bytes,
-            options.wav_sample_format,
-            options.wav_channel_mode,
-        )?;
-        let mut bytes = Vec::with_capacity(
-            STREAM_BLOCK_FRAMES
-                * usize::from(options.wav_channel_mode.channel_count())
-                * usize::from(options.wav_sample_format.bytes_per_sample()),
-        );
-        let mut dither_state = (options.wav_dither_mode == WavDitherMode::Tpdf
-            && options.wav_sample_format == WavSampleFormat::Pcm16)
-            .then(TpdfDither::new);
-        summary.voices_stolen = stream_prepared_playlist_render(
-            PreparedPlaylistBlockMix {
-                audio: &audio,
-                sampler: &sampler,
-                options,
-                frames,
-                master_output,
-                vst3_processor: vst3_processor.as_mut(),
-            },
-            cancelled,
-            || false,
-            |block| {
-                bytes.clear();
-                append_wav_block_samples_with_dither(
-                    block,
-                    options.wav_sample_format,
-                    options.wav_channel_mode,
-                    dither_state.as_mut(),
-                    &mut bytes,
-                )?;
-                file.write_all(&bytes)
-                    .map_err(|error| format!("could not write rendered WAV data: {error}"))
-            },
-        )?;
+    let mut temporary = TemporaryRenderFile::create(output_path)?;
+    let file = temporary
+        .file
+        .as_mut()
+        .expect("temporary render file is open");
+    match output {
+        PlaylistRenderOutput::Wav => {
+            let frames_u32 = u32::try_from(frames)
+                .map_err(|_| "render is too long for a RIFF/WAVE file".to_owned())?;
+            let block_align = options.wav_sample_format.bytes_per_sample()
+                * options.wav_channel_mode.channel_count();
+            let data_bytes = frames_u32
+                .checked_mul(u32::from(block_align))
+                .filter(|bytes| *bytes <= u32::MAX - 36)
+                .ok_or_else(|| "rendered WAV size exceeds the RIFF/WAVE limit".to_owned())?;
+            write_wav_header(
+                file,
+                options.sample_rate,
+                frames_u32,
+                data_bytes,
+                options.wav_sample_format,
+                options.wav_channel_mode,
+            )?;
+            let mut bytes = Vec::with_capacity(
+                STREAM_BLOCK_FRAMES
+                    * usize::from(options.wav_channel_mode.channel_count())
+                    * usize::from(options.wav_sample_format.bytes_per_sample()),
+            );
+            let mut dither_state = (options.wav_dither_mode == WavDitherMode::Tpdf
+                && options.wav_sample_format == WavSampleFormat::Pcm16)
+                .then(TpdfDither::new);
+            summary.voices_stolen = stream_prepared_playlist_render(
+                PreparedPlaylistBlockMix {
+                    audio: &audio,
+                    sampler: &sampler,
+                    options,
+                    frames,
+                    master_output,
+                    vst3_processor: vst3_processor.as_mut(),
+                },
+                cancelled,
+                || false,
+                |block| {
+                    bytes.clear();
+                    append_wav_block_samples_with_dither(
+                        block,
+                        options.wav_sample_format,
+                        options.wav_channel_mode,
+                        dither_state.as_mut(),
+                        &mut bytes,
+                    )?;
+                    file.write_all(&bytes)
+                        .map_err(|error| format!("could not write rendered WAV data: {error}"))
+                },
+            )?;
+        }
+        PlaylistRenderOutput::Flac { bits_per_sample } => {
+            let mut encoder = StreamingFlacWriter::new(
+                file,
+                options.sample_rate,
+                options.wav_channel_mode,
+                bits_per_sample,
+            )?;
+            summary.voices_stolen = stream_prepared_playlist_render(
+                PreparedPlaylistBlockMix {
+                    audio: &audio,
+                    sampler: &sampler,
+                    options,
+                    frames,
+                    master_output,
+                    vst3_processor: vst3_processor.as_mut(),
+                },
+                cancelled,
+                || false,
+                |block| encoder.write_stereo_block(block, options.wav_channel_mode),
+            )?;
+            encoder.finalize(frames)?;
+        }
     }
     temporary.commit(output_path)?;
     Ok(summary)
+}
+
+struct StreamingFlacWriter<'a> {
+    file: &'a mut File,
+    stream: Stream,
+    config: flacenc::error::Verified<flacenc::config::Encoder>,
+    channel_count: usize,
+    bits_per_sample: u8,
+    pending_pcm: Vec<i32>,
+    frame_number: usize,
+    sample_frames_written: u64,
+    md5: Md5,
+}
+
+impl<'a> StreamingFlacWriter<'a> {
+    fn new(
+        file: &'a mut File,
+        sample_rate: u32,
+        channel_mode: WavChannelMode,
+        bits_per_sample: u8,
+    ) -> Result<Self, String> {
+        if !matches!(bits_per_sample, 16 | 24) {
+            return Err("FLAC output supports 16- or 24-bit samples".to_owned());
+        }
+        let channel_count = usize::from(channel_mode.channel_count());
+        let stream = Stream::new(
+            sample_rate as usize,
+            channel_count,
+            usize::from(bits_per_sample),
+        )
+        .map_err(|error| format!("could not initialize FLAC stream: {error}"))?;
+        write_flac_stream_header(file, &stream)?;
+
+        let mut config = flacenc::config::Encoder::default();
+        config.block_size = FLAC_BLOCK_FRAMES;
+        config.multithread = false;
+        let config = config
+            .into_verified()
+            .map_err(|(_, error)| format!("invalid FLAC encoder settings: {error}"))?;
+
+        Ok(Self {
+            file,
+            stream,
+            config,
+            channel_count,
+            bits_per_sample,
+            pending_pcm: Vec::with_capacity(FLAC_BLOCK_FRAMES * channel_count),
+            frame_number: 0,
+            sample_frames_written: 0,
+            md5: Md5::new(),
+        })
+    }
+
+    fn write_stereo_block(
+        &mut self,
+        stereo_block: &[f32],
+        channel_mode: WavChannelMode,
+    ) -> Result<(), String> {
+        if !stereo_block.len().is_multiple_of(2) {
+            return Err("render block must contain interleaved stereo frames".to_owned());
+        }
+        if channel_mode.channel_count() as usize != self.channel_count {
+            return Err("FLAC channel mode changed during rendering".to_owned());
+        }
+
+        let scale = 2.0_f64.powi(i32::from(self.bits_per_sample) - 1);
+        let max = scale - 1.0;
+        let bytes_per_sample = usize::from(self.bits_per_sample / 8);
+        for frame in stereo_block.as_chunks::<2>().0 {
+            let samples = match channel_mode {
+                WavChannelMode::Stereo => [Some(frame[0]), Some(frame[1])],
+                WavChannelMode::MonoMerged => [Some(frame[0] * 0.5 + frame[1] * 0.5), None],
+                WavChannelMode::MonoLeft => [Some(frame[0]), None],
+                WavChannelMode::MonoRight => [Some(frame[1]), None],
+            };
+            for sample in samples.into_iter().take(self.channel_count).flatten() {
+                let pcm = quantize_signed_pcm(sample, scale, max) as i32;
+                self.pending_pcm.push(pcm);
+                let pcm_bytes = pcm.to_le_bytes();
+                self.md5.update(&pcm_bytes[..bytes_per_sample]);
+            }
+            if self.pending_pcm.len() >= FLAC_BLOCK_FRAMES * self.channel_count {
+                self.write_pending_frame(FLAC_BLOCK_FRAMES, FLAC_BLOCK_FRAMES)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn write_pending_frame(
+        &mut self,
+        encoded_frames: usize,
+        sample_frames: usize,
+    ) -> Result<(), String> {
+        if !(16..=FLAC_BLOCK_FRAMES).contains(&encoded_frames) || sample_frames > encoded_frames {
+            return Err("FLAC frame size must be between 16 and 4096 samples".to_owned());
+        }
+        let needed_samples = encoded_frames
+            .checked_mul(self.channel_count)
+            .ok_or_else(|| "FLAC frame sample count overflow".to_owned())?;
+        if self.pending_pcm.len() < needed_samples {
+            return Err("FLAC frame buffer ended before the requested block".to_owned());
+        }
+
+        let mut frame_buffer = FrameBuf::with_size(self.channel_count, encoded_frames)
+            .map_err(|error| format!("could not allocate FLAC frame: {error}"))?;
+        frame_buffer
+            .fill_interleaved(&self.pending_pcm[..needed_samples])
+            .map_err(|error| format!("could not prepare FLAC frame: {error}"))?;
+        let encoded = flacenc::encode_fixed_size_frame(
+            &self.config,
+            &frame_buffer,
+            self.frame_number,
+            self.stream.stream_info(),
+        )
+        .map_err(|error| format!("could not encode FLAC frame: {error}"))?;
+        let (mut header, subframes) = encoded.into_parts();
+        header.set_frame_offset(FrameOffset::StartSample(self.sample_frames_written));
+        let frame = Frame::new(header, subframes.into_iter())
+            .map_err(|error| format!("could not finalize FLAC frame header: {error}"))?;
+        let mut sink = ByteSink::with_capacity(frame.count_bits());
+        frame
+            .write(&mut sink)
+            .map_err(|error| format!("could not serialize FLAC frame: {error}"))?;
+        self.file
+            .write_all(sink.as_slice())
+            .map_err(|error| format!("could not write rendered FLAC frame: {error}"))?;
+        self.stream.stream_info_mut().update_frame_info(&frame);
+        self.frame_number = self
+            .frame_number
+            .checked_add(1)
+            .ok_or_else(|| "FLAC frame count overflow".to_owned())?;
+        self.sample_frames_written = self
+            .sample_frames_written
+            .checked_add(sample_frames as u64)
+            .ok_or_else(|| "FLAC sample count overflow".to_owned())?;
+        self.pending_pcm.drain(..needed_samples);
+        Ok(())
+    }
+
+    fn finalize(mut self, expected_frames: u64) -> Result<(), String> {
+        if expected_frames == 0 {
+            return Err("rendered FLAC contains no samples".to_owned());
+        }
+        if !self.pending_pcm.len().is_multiple_of(self.channel_count) {
+            return Err("FLAC render ended on a partial sample frame".to_owned());
+        }
+        let pending_frames = self.pending_pcm.len() / self.channel_count;
+        if pending_frames > 0 {
+            if pending_frames < 16 {
+                self.pending_pcm.resize(16 * self.channel_count, 0);
+                self.write_pending_frame(16, pending_frames)?;
+            } else {
+                self.write_pending_frame(pending_frames, pending_frames)?;
+            }
+        }
+        if self.sample_frames_written != expected_frames {
+            return Err("FLAC encoder frame count does not match rendered audio".to_owned());
+        }
+
+        let total_samples = usize::try_from(expected_frames)
+            .map_err(|_| "rendered FLAC sample count exceeds this platform".to_owned())?;
+        self.stream
+            .stream_info_mut()
+            .set_total_samples(total_samples);
+        let digest: [u8; 16] = self.md5.finalize().into();
+        self.stream.stream_info_mut().set_md5_digest(&digest);
+        rewrite_flac_stream_header(self.file, &self.stream)
+    }
+}
+
+fn write_flac_stream_header(file: &mut File, stream: &Stream) -> Result<(), String> {
+    let mut sink = ByteSink::new();
+    stream
+        .write(&mut sink)
+        .map_err(|error| format!("could not serialize FLAC stream header: {error}"))?;
+    let header = sink.as_slice();
+    if header.len() != 42 {
+        return Err("FLAC stream header has an unexpected size".to_owned());
+    }
+    file.write_all(header)
+        .map_err(|error| format!("could not write FLAC stream header: {error}"))
+}
+
+fn rewrite_flac_stream_header(file: &mut File, stream: &Stream) -> Result<(), String> {
+    let mut sink = ByteSink::new();
+    stream
+        .write(&mut sink)
+        .map_err(|error| format!("could not serialize final FLAC metadata: {error}"))?;
+    let header = sink.as_slice();
+    if header.len() != 42 {
+        return Err("final FLAC stream header has an unexpected size".to_owned());
+    }
+    file.seek(SeekFrom::Start(0))
+        .and_then(|_| file.write_all(header))
+        .and_then(|()| file.seek(SeekFrom::End(0)).map(|_| ()))
+        .map_err(|error| format!("could not finalize FLAC metadata: {error}"))
 }
 
 fn write_wav_header(
@@ -3076,11 +3368,23 @@ fn decoded_audio_bytes(audio: &DecodedAudio) -> Result<usize, String> {
 }
 
 fn validate_output_path(project_path: &Path, output_path: &Path) -> Result<(), String> {
+    validate_output_path_with_extension(project_path, output_path, "wav")
+}
+
+fn validate_flac_output_path(project_path: &Path, output_path: &Path) -> Result<(), String> {
+    validate_output_path_with_extension(project_path, output_path, "flac")
+}
+
+fn validate_output_path_with_extension(
+    project_path: &Path,
+    output_path: &Path,
+    extension: &str,
+) -> Result<(), String> {
     if !output_path
         .extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("wav"))
+        .is_some_and(|output_extension| output_extension.eq_ignore_ascii_case(extension))
     {
-        return Err("render output must use the .wav extension".to_owned());
+        return Err(format!("render output must use the .{extension} extension"));
     }
     let project = fs::canonicalize(project_path).map_err(|error| {
         format!(
@@ -3105,7 +3409,7 @@ fn validate_output_path(project_path: &Path, output_path: &Path) -> Result<(), S
         })?;
         let file_name = output_path
             .file_name()
-            .ok_or_else(|| "output WAV path must include a file name".to_owned())?;
+            .ok_or_else(|| "render output path must include a file name".to_owned())?;
         parent.join(file_name)
     };
     let same = if cfg!(windows) {
@@ -3116,7 +3420,7 @@ fn validate_output_path(project_path: &Path, output_path: &Path) -> Result<(), S
         project == output
     };
     if same {
-        return Err("output WAV path must not overwrite the FLP project".to_owned());
+        return Err("render output path must not overwrite the FLP project".to_owned());
     }
     Ok(())
 }
@@ -3144,9 +3448,12 @@ fn write_stereo_wav_from_buffer(
         .checked_mul(u32::from(block_align))
         .filter(|bytes| *bytes <= u32::MAX - 36)
         .ok_or_else(|| "rendered WAV size exceeds the RIFF/WAVE limit".to_owned())?;
-    let mut temporary = TemporaryWav::create(output_path)?;
+    let mut temporary = TemporaryRenderFile::create(output_path)?;
     {
-        let file = temporary.file.as_mut().expect("temporary WAV is open");
+        let file = temporary
+            .file
+            .as_mut()
+            .expect("temporary render file is open");
         write_wav_header(
             file,
             sample_rate,
@@ -3179,18 +3486,18 @@ fn write_stereo_wav_from_buffer(
     Ok(())
 }
 
-struct TemporaryWav {
+struct TemporaryRenderFile {
     path: PathBuf,
     file: Option<File>,
     committed: bool,
 }
 
-impl TemporaryWav {
+impl TemporaryRenderFile {
     fn create(output_path: &Path) -> Result<Self, String> {
         let parent = output_path.parent().unwrap_or_else(|| Path::new("."));
         let file_name = output_path
             .file_name()
-            .ok_or_else(|| "output WAV path must include a file name".to_owned())?;
+            .ok_or_else(|| "render output path must include a file name".to_owned())?;
         for _ in 0..100 {
             let id = NEXT_TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
             let mut temporary_name = file_name.to_os_string();
@@ -3207,21 +3514,21 @@ impl TemporaryWav {
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(error) => {
                     return Err(format!(
-                        "could not create temporary WAV beside {}: {error}",
+                        "could not create temporary render file beside {}: {error}",
                         output_path.display()
                     ));
                 }
             }
         }
-        Err("could not allocate a unique temporary WAV file".to_owned())
+        Err("could not allocate a unique temporary render file".to_owned())
     }
 
     fn commit(mut self, output_path: &Path) -> Result<(), String> {
-        let mut file = self.file.take().expect("temporary WAV is open");
+        let mut file = self.file.take().expect("temporary render file is open");
         file.flush()
-            .map_err(|error| format!("could not flush rendered WAV: {error}"))?;
+            .map_err(|error| format!("could not flush rendered audio: {error}"))?;
         file.sync_all()
-            .map_err(|error| format!("could not sync rendered WAV: {error}"))?;
+            .map_err(|error| format!("could not sync rendered audio: {error}"))?;
         drop(file);
         if output_path.exists() {
             fs::remove_file(output_path)
@@ -3234,7 +3541,7 @@ impl TemporaryWav {
     }
 }
 
-impl Drop for TemporaryWav {
+impl Drop for TemporaryRenderFile {
     fn drop(&mut self) {
         if !self.committed {
             let _ = fs::remove_file(&self.path);
