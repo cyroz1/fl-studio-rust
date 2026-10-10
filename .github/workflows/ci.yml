@@ -172,6 +172,23 @@ jobs:
               + bytes([0x62, 0, 0])
           )
 
+          def playlist_track(track_id, name, grouped=False):
+              state = bytearray(70)
+              struct.pack_into("<I", state, 0, track_id)
+              state[12] = 1
+              state[46] = int(grouped)
+              return (
+                  data_event(0xEE, bytes(state))
+                  + bytes([0x2B, 0])
+                  + data_event(0xEF, name.encode("utf-8") + b"\0")
+              )
+
+          playlist_track_states = (
+              playlist_track(1, "Drums")
+              + playlist_track(2, "Percussion", grouped=True)
+              + playlist_track(3, "Bass")
+          )
+
           target = 64 << 6
           parameters = (
               bytes([0xAA, 0xBB, 0xCC, 0xDD, 192, 0])
@@ -183,6 +200,7 @@ jobs:
           )
           event_stream = (
               arrangement_meter_markers
+              + playlist_track_states
               + dword_event(0x9A, -1)
               + dword_event(0x93, 0)
               + dword_event(0x95, 0x006A8DCE)
@@ -233,6 +251,14 @@ jobs:
           sleep 1
           ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
             -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/playlist-seek.png"
+          xdotool mousemove 351 302 keydown Control_L click 1 keyup Control_L
+          sleep 0.5
+          ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
+            -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/playlist-solo.png"
+          xdotool mousemove 351 329 keydown Alt_L click 3 keyup Alt_L
+          sleep 0.5
+          ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
+            -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/playlist-group-solo.png"
           xdotool mousemove 625 111 click 1
           sleep 2
           ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
@@ -277,6 +303,13 @@ jobs:
             cat "$RUNNER_TEMP/controller-preview.log"
             exit 1
           fi
+          for capture in playlist-solo.png playlist-group-solo.png; do
+            if [[ "$(stat -c%s "$GITHUB_WORKSPACE/dist/gui-preview/$capture")" -lt 10000 ]]; then
+              echo "The $capture capture is blank or incomplete."
+              cat "$RUNNER_TEMP/mixer-preview.log"
+              exit 1
+            fi
+          done
           BASH
           xvfb-run --auto-servernum --server-args="-screen 0 1600x900x24 +extension GLX" \
             bash "$RUNNER_TEMP/capture-ui.sh"

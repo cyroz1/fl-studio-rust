@@ -1666,6 +1666,7 @@ struct DawUi {
     playlist_clip_context_split: Option<(u16, usize, u32)>,
     playlist_clip_clipboard: Option<PlaylistClipClipboard>,
     playlist_slip_tool_active: bool,
+    soloed_playlist_track_range: Option<(u32, u32)>,
     active_playlist_clip_drag: Option<ActivePlaylistClipDrag>,
     selected_time_marker: Option<usize>,
     selected_pattern_time_signature: Option<usize>,
@@ -2006,6 +2007,7 @@ impl DawUi {
             playlist_clip_context_split: None,
             playlist_clip_clipboard: None,
             playlist_slip_tool_active: false,
+            soloed_playlist_track_range: None,
             active_playlist_clip_drag: None,
             selected_time_marker: None,
             selected_pattern_time_signature: None,
@@ -2438,6 +2440,7 @@ impl DawUi {
         }) {
             Ok((package_workspace, document)) => {
                 self.stop_project_playback();
+                self.soloed_playlist_track_range = None;
                 self.clear_history();
                 self.history_reset_during_frame = true;
                 self.autosave_deadline = None;
@@ -4035,6 +4038,7 @@ impl DawUi {
         let options = PlaylistRenderOptions {
             arrangement_id: self.selected_arrangement.unwrap_or(0),
             sample_rate,
+            soloed_playlist_track_range: self.soloed_playlist_track_range,
             ..PlaylistRenderOptions::default()
         };
         let vst3_processor = self
@@ -4044,6 +4048,7 @@ impl DawUi {
                 host.prepare_playlist_stream(
                     self.document.as_ref().expect("project was checked above"),
                     options.arrangement_id,
+                    options.soloed_playlist_track_range,
                     &self.channel_vst3_instances,
                     sample_rate,
                     2.0,
@@ -7306,6 +7311,7 @@ impl DawUi {
 
         let mut create_pattern_clip_requested = false;
         let mut playlist_track_edits_requested = Vec::new();
+        let mut solo_playlist_track_requested = None;
         let mut delete_clip_requested = None;
         let mut copy_clip_requested = None;
         let mut cut_clip_requested = None;
@@ -7544,6 +7550,14 @@ impl DawUi {
                     let track_state = tracks.iter().find(|track| track.id == track_id);
                     let track_muted = track_state.is_some_and(|track| track.enabled == Some(false));
                     let track_grouped = track_state.is_some_and(|track| track.grouped == Some(true));
+                    let track_soloed = self
+                        .soloed_playlist_track_range
+                        .is_some_and(|(first, last)| (first..=last).contains(&track_id));
+                    let track_filtered_by_solo = self
+                        .soloed_playlist_track_range
+                        .is_some_and(|(first, last)| !(first..=last).contains(&track_id));
+                    let track_effectively_muted =
+                        (track_muted && !track_soloed) || track_filtered_by_solo;
                     let track_name = tracks
                         .iter()
                         .find(|track| track.id == track_id)
@@ -7557,7 +7571,11 @@ impl DawUi {
                         ui.painter().rect_filled(
                             label_rect,
                             0,
-                            if track_muted { PANEL_DARK } else { PANEL_LIGHT },
+                            if track_effectively_muted {
+                                PANEL_DARK
+                            } else {
+                                PANEL_LIGHT
+                            },
                         );
                         ui.painter().rect_stroke(
                             label_rect,
@@ -7570,19 +7588,65 @@ impl DawUi {
                             Vec2::new(22.0, row_height - 6.0),
                         );
                         if track_state.is_some() {
-                            let mute_color = if track_muted { ORANGE } else { PANEL_DARK };
+                            let mute_color = if track_soloed {
+                                BLUE
+                            } else if track_muted {
+                                ORANGE
+                            } else {
+                                PANEL_DARK
+                            };
                             let mute_response = ui.put(
                                 mute_rect,
                                 egui::Button::new(
-                                    egui::RichText::new("M")
+                                    egui::RichText::new(if track_soloed { "S" } else { "M" })
                                         .size(10.0)
                                         .strong()
-                                        .color(if track_muted { Color32::WHITE } else { MUTED }),
+                                        .color(if track_soloed || track_muted {
+                                            Color32::WHITE
+                                        } else {
+                                            MUTED
+                                        }),
                                 )
                                 .fill(mute_color)
                                 .stroke(Stroke::NONE),
                             );
-                            if mute_response.clicked() {
+                            let modifiers = ui.input(|input| input.modifiers);
+                            if mute_response.clicked_by(PointerButton::Primary)
+                                && (modifiers.ctrl || modifiers.command)
+                            {
+                                solo_playlist_track_requested = Some((track_id, track_id));
+                            } else if mute_response.clicked_by(PointerButton::Secondary)
+                                && modifiers.alt
+                            {
+                                solo_playlist_track_requested =
+                                    playlist_track_group_range(track_id, &tracks);
+                            } else if mute_response.clicked_by(PointerButton::Secondary) {
+                                solo_playlist_track_requested = Some((track_id, track_id));
+                            } else if mute_response.clicked_by(PointerButton::Primary)
+                                && modifiers.alt
+                            {
+                                if let Some((first, last)) =
+                                    playlist_track_group_range(track_id, &tracks)
+                                {
+                                    let group_tracks = tracks
+                                        .iter()
+                                        .filter(|track| (first..=last).contains(&track.id))
+                                        .collect::<Vec<_>>();
+                                    let group_is_muted = !group_tracks.is_empty()
+                                        && group_tracks
+                                            .iter()
+                                            .all(|track| track.enabled == Some(false));
+                                    for track in group_tracks {
+                                        playlist_track_edits_requested.push((
+                                            track.id,
+                                            PlaylistTrackEdit {
+                                                enabled: Some(group_is_muted),
+                                                ..PlaylistTrackEdit::default()
+                                            },
+                                        ));
+                                    }
+                                }
+                            } else if mute_response.clicked_by(PointerButton::Primary) {
                                 playlist_track_edits_requested.push((
                                     track_id,
                                     PlaylistTrackEdit {
@@ -7591,11 +7655,9 @@ impl DawUi {
                                     },
                                 ));
                             }
-                            mute_response.on_hover_text(if track_muted {
-                                "Unmute this Playlist track"
-                            } else {
-                                "Mute this Playlist track"
-                            });
+                            mute_response.on_hover_text(
+                                "Click to mute · Ctrl-click or right-click to solo · Alt/Option-click mutes the group · Alt/Option-right-click solos the group",
+                            );
                         }
                         let group_mark = if track_grouped { "↳" } else { "" };
                         let name_x = label_rect.left() + 33.0 + if track_grouped { 9.0 } else { 0.0 };
@@ -7604,7 +7666,7 @@ impl DawUi {
                             Align2::LEFT_CENTER,
                             format!("{:02}  {group_mark}{track_name}", row + 1),
                             FontId::proportional(11.0),
-                            if track_muted { MUTED } else { TEXT },
+                            if track_effectively_muted { MUTED } else { TEXT },
                         );
                         let context_rect = egui::Rect::from_min_max(
                             egui::pos2(mute_rect.right() + 2.0, label_rect.top()),
@@ -8233,6 +8295,42 @@ impl DawUi {
             if restart_playback {
                 self.start_project_playback();
             }
+        }
+
+        if let Some(soloed_range) = solo_playlist_track_requested {
+            let playback_was_loaded = self.playlist_playback_loaded;
+            let playback_was_playing = self.playing;
+            let resume_tick = self
+                .current_playhead_tick()
+                .map(|tick| tick.round().clamp(0.0, f64::from(u32::MAX)) as u32)
+                .unwrap_or(self.playlist_seek_tick);
+            if playback_was_loaded {
+                self.stop_project_playback();
+                self.playlist_seek_tick = resume_tick;
+            }
+            self.soloed_playlist_track_range =
+                if self.soloed_playlist_track_range == Some(soloed_range) {
+                    None
+                } else {
+                    Some(soloed_range)
+                };
+            self.status = self.soloed_playlist_track_range.map_or_else(
+                || "Playlist solo cleared".to_owned(),
+                |(first, last)| {
+                    if first == last {
+                        format!("Soloed Playlist track {first}")
+                    } else {
+                        format!("Soloed Playlist tracks {first}–{last}")
+                    }
+                },
+            );
+            if playback_was_loaded {
+                self.start_project_playback();
+                if !playback_was_playing && self.playing {
+                    self.toggle_project_playback();
+                }
+            }
+            ui.ctx().request_repaint();
         }
 
         for (track_id, edit) in playlist_track_edits_requested {
@@ -14650,6 +14748,7 @@ impl DawUi {
         let options = AudioClipRenderOptions {
             arrangement_id: self.selected_arrangement.unwrap_or_default(),
             sample_rate: self.audio_settings.sample_rate,
+            soloed_playlist_track_range: self.soloed_playlist_track_range,
             ..AudioClipRenderOptions::default()
         };
         self.start_audio_clip_export(options, output_path);
@@ -14697,6 +14796,7 @@ impl DawUi {
             sample_rate: self.audio_settings.sample_rate,
             clip_index: Some(clip_index),
             start_from_song_start,
+            soloed_playlist_track_range: self.soloed_playlist_track_range,
         };
         self.start_audio_clip_export(options, output_path);
     }
@@ -14849,6 +14949,7 @@ impl DawUi {
         let options = PlaylistRenderOptions {
             arrangement_id: self.selected_arrangement.unwrap_or_default(),
             sample_rate: self.audio_settings.sample_rate,
+            soloed_playlist_track_range: self.soloed_playlist_track_range,
             wav_sample_format: self.playlist_render_format,
             wav_dither_mode: if self.playlist_render_dither {
                 WavDitherMode::Tpdf
@@ -14867,6 +14968,7 @@ impl DawUi {
                 host.prepare_playlist_stream(
                     document,
                     options.arrangement_id,
+                    options.soloed_playlist_track_range,
                     &self.channel_vst3_instances,
                     options.sample_rate,
                     f64::from(options.tail_seconds),
@@ -21148,6 +21250,27 @@ fn playlist_bar_ticks(ppq: u16, time_signature: (u8, u8)) -> u64 {
     .max(1)
 }
 
+fn playlist_track_group_range(track_id: u32, tracks: &[PlaylistTrack]) -> Option<(u32, u32)> {
+    let mut ordered_tracks = tracks.iter().collect::<Vec<_>>();
+    ordered_tracks.sort_by_key(|track| track.id);
+    let mut first_index = ordered_tracks
+        .iter()
+        .position(|track| track.id == track_id)?;
+    while first_index > 0 && ordered_tracks[first_index].grouped == Some(true) {
+        first_index -= 1;
+    }
+    let mut last_index = first_index;
+    while last_index + 1 < ordered_tracks.len()
+        && ordered_tracks[last_index + 1].grouped == Some(true)
+    {
+        last_index += 1;
+    }
+    Some((
+        ordered_tracks[first_index].id,
+        ordered_tracks[last_index].id,
+    ))
+}
+
 fn playlist_seek_tick_to_frame(tick: u32, ppq: u16, tempo_bpm: f64, sample_rate: u32) -> u64 {
     if !tempo_bpm.is_finite() || tempo_bpm <= 0.0 || sample_rate == 0 {
         return 0;
@@ -21433,16 +21556,17 @@ mod tests {
     use super::{
         ActivePlaylistClipDrag, ChannelDisplayFilter, FlpDocument, Pattern, PatternController,
         PatternNote, PianoRollGrid, PianoRollSnap, PlaylistClip, PlaylistClipDragKind,
-        PluginCandidate, PluginFormat, candidate_matches_vst_identity, candidate_mixer_controls,
-        encode_midi_device_selections, next_piano_roll_note_group, note_from_grid_position,
-        parse_midi_device_selections, piano_roll_controller_value_at,
+        PlaylistTrack, PluginCandidate, PluginFormat, candidate_matches_vst_identity,
+        candidate_mixer_controls, encode_midi_device_selections, next_piano_roll_note_group,
+        note_from_grid_position, parse_midi_device_selections, piano_roll_controller_value_at,
         piano_roll_controller_value_range, piano_roll_note_group_members,
         playlist_audio_clip_join_candidates, playlist_bar_ticks, playlist_clip_drag_edit,
         playlist_clip_local_recording_offset, playlist_clip_split_position,
         playlist_measure_boundaries, playlist_pattern_clip_join_candidates,
         playlist_seek_tick_to_frame, playlist_signature_at_tick, playlist_song_position_label,
-        snap_note_tick, toggle_piano_roll_note_group_selection, update_channel_rack_selection,
-        update_layer_child_selection, update_piano_roll_box_selection,
+        playlist_track_group_range, snap_note_tick, toggle_piano_roll_note_group_selection,
+        update_channel_rack_selection, update_layer_child_selection,
+        update_piano_roll_box_selection,
     };
 
     fn mixer_parameter_fixture(records: &[(u8, u16, i32)]) -> FlpDocument {
@@ -21851,6 +21975,26 @@ mod tests {
             playlist_signature_at_tick(Some((4, 4)), &[(384, 3, 4), (768, 5, 8)], 768),
             (5, 8)
         );
+    }
+
+    #[test]
+    fn playlist_group_range_includes_parent_and_following_child_tracks() {
+        let tracks = (1..=4)
+            .map(|id| PlaylistTrack {
+                id,
+                state_byte: None,
+                name: None,
+                enabled: Some(true),
+                grouped: Some(matches!(id, 2 | 3)),
+                state_bytes: vec![0; 70],
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(playlist_track_group_range(1, &tracks), Some((1, 3)));
+        assert_eq!(playlist_track_group_range(2, &tracks), Some((1, 3)));
+        assert_eq!(playlist_track_group_range(3, &tracks), Some((1, 3)));
+        assert_eq!(playlist_track_group_range(4, &tracks), Some((4, 4)));
+        assert_eq!(playlist_track_group_range(5, &tracks), None);
     }
 
     #[test]

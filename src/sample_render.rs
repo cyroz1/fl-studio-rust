@@ -35,6 +35,8 @@ pub struct AudioClipRenderOptions {
     pub clip_index: Option<usize>,
     /// Keep the selected clip at its original arrangement position in the output.
     pub start_from_song_start: bool,
+    /// Render only this inclusive one-based Playlist track range when soloing.
+    pub soloed_playlist_track_range: Option<(u32, u32)>,
 }
 
 impl Default for AudioClipRenderOptions {
@@ -44,6 +46,7 @@ impl Default for AudioClipRenderOptions {
             sample_rate: DEFAULT_SAMPLE_RATE,
             clip_index: None,
             start_from_song_start: false,
+            soloed_playlist_track_range: None,
         }
     }
 }
@@ -188,6 +191,8 @@ pub struct PlaylistRenderOptions {
     pub resampling_quality: ResamplingQuality,
     pub wav_channel_mode: WavChannelMode,
     pub tail_seconds: u8,
+    /// Render only this inclusive one-based Playlist track range when soloing.
+    pub soloed_playlist_track_range: Option<(u32, u32)>,
 }
 
 impl Default for PlaylistRenderOptions {
@@ -201,6 +206,7 @@ impl Default for PlaylistRenderOptions {
             resampling_quality: ResamplingQuality::Linear,
             wav_channel_mode: WavChannelMode::Stereo,
             tail_seconds: 0,
+            soloed_playlist_track_range: None,
         }
     }
 }
@@ -349,6 +355,7 @@ pub fn stream_playlist_with_vst3_to_device_from_frame(
             sample_rate: options.sample_rate,
             clip_index: None,
             start_from_song_start: false,
+            soloed_playlist_track_range: options.soloed_playlist_track_range,
         },
         Some(cancelled),
     )?;
@@ -452,6 +459,7 @@ pub fn render_playlist_with_vst3_to_wav_cancellable(
             sample_rate: options.sample_rate,
             clip_index: None,
             start_from_song_start: false,
+            soloed_playlist_track_range: options.soloed_playlist_track_range,
         },
         Some(cancelled),
     )?;
@@ -1124,10 +1132,11 @@ fn prepare_audio_clip_render(
         let relative_position =
             audio_clip_render_start_tick(clip.position_ticks, selection_start_tick)?;
         max_tick = max_tick.max(relative_position + u64::from(clip.length_ticks));
-        if clip
-            .playlist_track_id()
-            .is_some_and(|track_id| disabled_track_ids.contains(&track_id))
-        {
+        if playlist_clip_is_muted(
+            clip,
+            &disabled_track_ids,
+            options.soloed_playlist_track_range,
+        ) {
             continue;
         }
         let PlaylistClipTarget::Channel { id } = clip.target() else {
@@ -1301,10 +1310,23 @@ pub(crate) struct PlaylistPatternSchedule<'a> {
     pub(crate) clips_skipped_unsupported_scale: usize,
 }
 
+fn playlist_clip_is_muted(
+    clip: &PlaylistClip,
+    disabled_track_ids: &BTreeSet<u32>,
+    soloed_track_range: Option<(u32, u32)>,
+) -> bool {
+    let track_id = clip.playlist_track_id();
+    if let Some((first_track, last_track)) = soloed_track_range {
+        return !track_id.is_some_and(|track_id| (first_track..=last_track).contains(&track_id));
+    }
+    track_id.is_some_and(|track_id| disabled_track_ids.contains(&track_id))
+}
+
 pub(crate) fn schedule_playlist_pattern_notes<'a>(
     patterns: &'a [Pattern],
     arrangement: &Arrangement,
     disabled_track_ids: &BTreeSet<u32>,
+    soloed_track_range: Option<(u32, u32)>,
     ppq: u16,
     global_swing_mix_raw: u8,
     mut channel_swing_mix_raw: impl FnMut(u16) -> u16,
@@ -1320,10 +1342,7 @@ pub(crate) fn schedule_playlist_pattern_notes<'a>(
     };
 
     for (clip_index, clip) in arrangement.clips.iter().enumerate() {
-        if clip
-            .playlist_track_id()
-            .is_some_and(|track_id| disabled_track_ids.contains(&track_id))
-        {
+        if playlist_clip_is_muted(clip, disabled_track_ids, soloed_track_range) {
             continue;
         }
         let PlaylistClipTarget::Pattern { id } = clip.target() else {
@@ -1491,6 +1510,7 @@ fn prepare_sampler_arrangement(
         &patterns,
         &arrangement,
         &disabled_track_ids,
+        options.soloed_playlist_track_range,
         ppq,
         document.metadata().global_swing_mix(),
         |channel_id| {
@@ -2729,6 +2749,7 @@ mod tests {
             &patterns,
             &arrangement,
             &BTreeSet::new(),
+            None,
             96,
             0,
             |_| 128,
@@ -2771,6 +2792,7 @@ mod tests {
             &patterns,
             &arrangement,
             &BTreeSet::from([1]),
+            None,
             96,
             0,
             |_| 128,
@@ -2779,6 +2801,72 @@ mod tests {
         .unwrap();
 
         assert!(schedule.notes.is_empty());
+    }
+
+    #[test]
+    fn playlist_solo_filter_uses_track_range_and_preserves_mute_state() {
+        let first_track_clip = test_pattern_clip(2, 0, 96);
+        let mut second_track_clip = test_pattern_clip(2, 0, 96);
+        second_track_clip.track_index = Some(1);
+        let mut unassigned_clip = test_pattern_clip(2, 0, 96);
+        unassigned_clip.track_index = None;
+        let disabled_track_ids = BTreeSet::from([1]);
+
+        assert!(playlist_clip_is_muted(
+            &first_track_clip,
+            &disabled_track_ids,
+            None
+        ));
+        assert!(!playlist_clip_is_muted(
+            &first_track_clip,
+            &disabled_track_ids,
+            Some((1, 1))
+        ));
+        assert!(playlist_clip_is_muted(
+            &second_track_clip,
+            &disabled_track_ids,
+            Some((1, 1))
+        ));
+        assert!(playlist_clip_is_muted(
+            &unassigned_clip,
+            &disabled_track_ids,
+            Some((1, 1))
+        ));
+    }
+
+    #[test]
+    fn soloed_playlist_track_overrides_mute_and_excludes_other_tracks() {
+        let pattern = Pattern {
+            id: 2,
+            length_ticks: Some(96),
+            notes: vec![PatternNote {
+                length: 48,
+                channel_id: 1,
+                ..PatternNote::default()
+            }],
+            ..Pattern::default()
+        };
+        let mut other_track_clip = test_pattern_clip(2, 96, 96);
+        other_track_clip.track_index = Some(1);
+        let arrangement = Arrangement {
+            clips: vec![test_pattern_clip(2, 0, 96), other_track_clip],
+            ..Arrangement::default()
+        };
+        let patterns = [pattern];
+        let schedule = schedule_playlist_pattern_notes(
+            &patterns,
+            &arrangement,
+            &BTreeSet::from([1]),
+            Some((1, 1)),
+            96,
+            0,
+            |_| 128,
+            |channel_id, _| vec![channel_id],
+        )
+        .unwrap();
+
+        assert_eq!(schedule.notes.len(), 1);
+        assert_eq!(schedule.notes[0].start_tick, 0);
     }
 
     #[test]
@@ -2804,6 +2892,7 @@ mod tests {
             &patterns,
             &arrangement,
             &BTreeSet::new(),
+            None,
             96,
             0,
             |_| 128,
@@ -2848,6 +2937,7 @@ mod tests {
             &patterns,
             &arrangement,
             &BTreeSet::new(),
+            None,
             96,
             0,
             |_| 128,
@@ -2882,6 +2972,7 @@ mod tests {
             &patterns,
             &arrangement,
             &BTreeSet::new(),
+            None,
             96,
             128,
             |channel_id| if channel_id == 7 { 128 } else { 0 },
@@ -2970,6 +3061,7 @@ mod tests {
                     resampling_quality: ResamplingQuality::Linear,
                     wav_channel_mode: WavChannelMode::Stereo,
                     tail_seconds: 0,
+                    soloed_playlist_track_range: None,
                 },
                 frames: 2,
                 vst3_processor: None,

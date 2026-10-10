@@ -1067,6 +1067,7 @@ impl Vst3HostRuntime {
         &self,
         document: &FlpDocument,
         arrangement_id: u16,
+        soloed_playlist_track_range: Option<(u32, u32)>,
         channel_instances: &BTreeMap<u16, u64>,
         output_sample_rate: u32,
         tail_seconds: f64,
@@ -1122,6 +1123,7 @@ impl Vst3HostRuntime {
             &patterns,
             &arrangement,
             &disabled_track_ids,
+            soloed_playlist_track_range,
             ppq,
             document.metadata().global_swing_mix(),
             |channel_id| {
