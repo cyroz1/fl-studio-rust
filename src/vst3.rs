@@ -14,8 +14,8 @@ use std::thread;
 
 use crate::audio::StreamingAudioWriter;
 use crate::sample_render::{
-    PlaylistRenderOptions, PlaylistTrackFilter, channel_gain_pan, channel_pan_gains,
-    project_pan_law, schedule_playlist_pattern_notes, swing_note_start_tick,
+    PlaylistPatternScheduleOptions, PlaylistRenderOptions, PlaylistTrackFilter, channel_gain_pan,
+    channel_pan_gains, project_pan_law, schedule_playlist_pattern_notes, swing_note_start_tick,
 };
 use crate::{
     ChannelNoteRouter, ChannelPluginState, FlpDocument, MixerInsertSignalTransform,
@@ -1135,11 +1135,13 @@ impl Vst3HostRuntime {
             &patterns,
             &arrangement,
             track_filter,
-            ppq,
-            document.metadata().global_swing_mix(),
-            document
-                .project_settings()
-                .is_none_or(|settings| settings.play_truncated_notes_in_clips),
+            PlaylistPatternScheduleOptions {
+                ppq,
+                global_swing_mix_raw: document.metadata().global_swing_mix(),
+                play_truncated_notes_in_clips: document
+                    .project_settings()
+                    .is_none_or(|settings| settings.play_truncated_notes_in_clips),
+            },
             |channel_id| {
                 channels_by_id
                     .get(&channel_id)

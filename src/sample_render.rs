@@ -1638,13 +1638,18 @@ impl<'a> PlaylistTrackFilter<'a> {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct PlaylistPatternScheduleOptions {
+    pub(crate) ppq: u16,
+    pub(crate) global_swing_mix_raw: u8,
+    pub(crate) play_truncated_notes_in_clips: bool,
+}
+
 pub(crate) fn schedule_playlist_pattern_notes<'a>(
     patterns: &'a [Pattern],
     arrangement: &Arrangement,
     track_filter: PlaylistTrackFilter<'_>,
-    ppq: u16,
-    global_swing_mix_raw: u8,
-    play_truncated_notes_in_clips: bool,
+    options: PlaylistPatternScheduleOptions,
     mut channel_swing_mix_raw: impl FnMut(u16) -> u16,
     mut resolve_targets: impl FnMut(u16, u64, u16) -> Vec<u16>,
 ) -> Result<PlaylistPatternSchedule<'a>, String> {
@@ -1720,8 +1725,8 @@ pub(crate) fn schedule_playlist_pattern_notes<'a>(
                     .ok_or_else(|| "Playlist pattern note position overflow".to_owned())?;
                 let swung_relative_start = swing_note_start_tick(
                     relative_start,
-                    ppq,
-                    global_swing_mix_raw,
+                    options.ppq,
+                    options.global_swing_mix_raw,
                     channel_swing_mix_raw(note.channel_id),
                 )?;
                 let swing_offset = swung_relative_start.saturating_sub(relative_start);
@@ -1738,7 +1743,7 @@ pub(crate) fn schedule_playlist_pattern_notes<'a>(
                         .checked_add(u64::from(note.length))
                         .and_then(|stop_tick| stop_tick.checked_add(swing_offset))
                         .ok_or_else(|| "Playlist pattern note end position overflow".to_owned())?;
-                    Some(if play_truncated_notes_in_clips {
+                    Some(if options.play_truncated_notes_in_clips {
                         note_end_tick
                     } else {
                         note_end_tick.min(clip_end)
@@ -1834,11 +1839,13 @@ fn prepare_sampler_arrangement(
         &patterns,
         &arrangement,
         track_filter,
-        ppq,
-        document.metadata().global_swing_mix(),
-        document
-            .project_settings()
-            .is_none_or(|settings| settings.play_truncated_notes_in_clips),
+        PlaylistPatternScheduleOptions {
+            ppq,
+            global_swing_mix_raw: document.metadata().global_swing_mix(),
+            play_truncated_notes_in_clips: document
+                .project_settings()
+                .is_none_or(|settings| settings.play_truncated_notes_in_clips),
+        },
         |channel_id| {
             channels_by_id
                 .get(&channel_id)
@@ -3428,9 +3435,11 @@ mod tests {
             &patterns,
             &arrangement,
             PlaylistTrackFilter::new(&BTreeSet::new(), None),
-            96,
-            0,
-            false,
+            PlaylistPatternScheduleOptions {
+                ppq: 96,
+                global_swing_mix_raw: 0,
+                play_truncated_notes_in_clips: false,
+            },
             |_| 128,
             |channel_id, _, _| vec![channel_id],
         )
@@ -3471,9 +3480,11 @@ mod tests {
             &patterns,
             &arrangement,
             PlaylistTrackFilter::new(&BTreeSet::from([1]), None),
-            96,
-            0,
-            false,
+            PlaylistPatternScheduleOptions {
+                ppq: 96,
+                global_swing_mix_raw: 0,
+                play_truncated_notes_in_clips: false,
+            },
             |_| 128,
             |channel_id, _, _| vec![channel_id],
         )
@@ -3531,9 +3542,11 @@ mod tests {
             &patterns,
             &arrangement,
             PlaylistTrackFilter::new(&BTreeSet::from([1]), Some((1, 1))),
-            96,
-            0,
-            false,
+            PlaylistPatternScheduleOptions {
+                ppq: 96,
+                global_swing_mix_raw: 0,
+                play_truncated_notes_in_clips: false,
+            },
             |_| 128,
             |channel_id, _, _| vec![channel_id],
         )
@@ -3567,9 +3580,11 @@ mod tests {
             &patterns,
             &arrangement,
             PlaylistTrackFilter::new(&BTreeSet::new(), None),
-            96,
-            0,
-            false,
+            PlaylistPatternScheduleOptions {
+                ppq: 96,
+                global_swing_mix_raw: 0,
+                play_truncated_notes_in_clips: false,
+            },
             |_| 128,
             |channel_id, _, key| {
                 assert_eq!(key, 72);
@@ -3613,9 +3628,11 @@ mod tests {
             &patterns,
             &arrangement,
             PlaylistTrackFilter::new(&BTreeSet::new(), None),
-            96,
-            0,
-            false,
+            PlaylistPatternScheduleOptions {
+                ppq: 96,
+                global_swing_mix_raw: 0,
+                play_truncated_notes_in_clips: false,
+            },
             |_| 128,
             |channel_id, _, _| vec![channel_id],
         )
@@ -3648,9 +3665,11 @@ mod tests {
             &patterns,
             &arrangement,
             PlaylistTrackFilter::new(&BTreeSet::new(), None),
-            96,
-            128,
-            false,
+            PlaylistPatternScheduleOptions {
+                ppq: 96,
+                global_swing_mix_raw: 128,
+                play_truncated_notes_in_clips: false,
+            },
             |channel_id| if channel_id == 7 { 128 } else { 0 },
             |channel_id, _, _| vec![channel_id],
         )
@@ -3684,9 +3703,11 @@ mod tests {
                 &patterns,
                 &arrangement,
                 PlaylistTrackFilter::new(&BTreeSet::new(), None),
-                96,
-                0,
-                play_truncated_notes_in_clips,
+                PlaylistPatternScheduleOptions {
+                    ppq: 96,
+                    global_swing_mix_raw: 0,
+                    play_truncated_notes_in_clips,
+                },
                 |_| 128,
                 |channel_id, _, _| vec![channel_id],
             )
