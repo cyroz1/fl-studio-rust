@@ -5491,7 +5491,9 @@ impl FlpDocument {
             }
             let channel_note_count = notes_event
                 .payload
-                .chunks_exact(FLP_NOTE_RECORD_SIZE)
+                .as_chunks::<FLP_NOTE_RECORD_SIZE>()
+                .0
+                .iter()
                 .filter(|record| u16::from_le_bytes([record[6], record[7]]) == channel_id)
                 .count();
             if edits.keys().any(|index| *index >= channel_note_count) {
