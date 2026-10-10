@@ -1489,8 +1489,10 @@ struct DawUi {
     project_info_genre: String,
     project_info_web_link: String,
     project_settings_open: bool,
+    project_settings_advanced_supported: bool,
     project_settings_play_truncated: bool,
     project_settings_fast_declick: bool,
+    project_settings_pan_law_raw: u8,
     playlist_render_options_open: bool,
     playlist_render_format: WavSampleFormat,
     playlist_render_dither: bool,
@@ -1806,8 +1808,10 @@ impl DawUi {
             project_info_genre: String::new(),
             project_info_web_link: String::new(),
             project_settings_open: false,
+            project_settings_advanced_supported: false,
             project_settings_play_truncated: false,
             project_settings_fast_declick: false,
+            project_settings_pan_law_raw: 0,
             playlist_render_options_open: false,
             playlist_render_format: WavSampleFormat::Float32,
             playlist_render_dither: false,
@@ -2141,13 +2145,16 @@ impl DawUi {
                     .web_link()
                     .unwrap_or_default()
                     .to_owned();
-                if let Some(settings) = document.project_settings() {
+                let project_settings = document.project_settings();
+                self.project_settings_advanced_supported = project_settings.is_some();
+                if let Some(settings) = project_settings {
                     self.project_settings_play_truncated = settings.play_truncated_notes_in_clips;
                     self.project_settings_fast_declick = settings.fast_declick_for_cut_groups;
                 } else {
                     self.project_settings_play_truncated = false;
                     self.project_settings_fast_declick = false;
                 }
+                self.project_settings_pan_law_raw = document.metadata().pan_law_raw().unwrap_or(0);
                 self.selected_pattern = document
                     .patterns()
                     .ok()
@@ -2909,17 +2916,21 @@ impl DawUi {
     }
 
     fn open_project_settings(&mut self) {
-        let settings = self
-            .document
-            .as_ref()
-            .and_then(FlpDocument::project_settings);
+        let Some(document) = self.document.as_ref() else {
+            self.status = "Open a project before editing Project settings".to_owned();
+            return;
+        };
+        let settings = document.project_settings();
+        self.project_settings_advanced_supported = settings.is_some();
         if let Some(settings) = settings {
             self.project_settings_play_truncated = settings.play_truncated_notes_in_clips;
             self.project_settings_fast_declick = settings.fast_declick_for_cut_groups;
-            self.project_settings_open = true;
         } else {
-            self.status = "This project's settings block is not recognized yet".to_owned();
+            self.project_settings_play_truncated = false;
+            self.project_settings_fast_declick = false;
         }
+        self.project_settings_pan_law_raw = document.metadata().pan_law_raw().unwrap_or(0);
+        self.project_settings_open = true;
     }
 
     fn apply_project_settings(&mut self) {
@@ -2928,8 +2939,13 @@ impl DawUi {
             return;
         };
         match document.set_project_settings(ProjectSettingsEdit {
-            play_truncated_notes_in_clips: Some(self.project_settings_play_truncated),
-            fast_declick_for_cut_groups: Some(self.project_settings_fast_declick),
+            play_truncated_notes_in_clips: self
+                .project_settings_advanced_supported
+                .then_some(self.project_settings_play_truncated),
+            fast_declick_for_cut_groups: self
+                .project_settings_advanced_supported
+                .then_some(self.project_settings_fast_declick),
+            pan_law_raw: Some(self.project_settings_pan_law_raw),
         }) {
             Ok(()) => {
                 self.dirty = true;
@@ -2983,14 +2999,45 @@ impl DawUi {
             .resizable(false)
             .default_width(360.0)
             .show(context, |ui| {
-                ui.checkbox(
-                    &mut self.project_settings_play_truncated,
-                    "Play truncated notes in clips",
-                );
-                ui.checkbox(
-                    &mut self.project_settings_fast_declick,
-                    "Fast declick for cut groups",
-                );
+                if self.project_settings_advanced_supported {
+                    ui.checkbox(
+                        &mut self.project_settings_play_truncated,
+                        "Play truncated notes in clips",
+                    );
+                    ui.checkbox(
+                        &mut self.project_settings_fast_declick,
+                        "Fast declick for cut groups",
+                    );
+                } else {
+                    ui.label(
+                        egui::RichText::new(
+                            "Advanced project settings are not recognized for this file.",
+                        )
+                        .color(MUTED),
+                    );
+                }
+                ui.horizontal(|ui| {
+                    let pan_law_label = match self.project_settings_pan_law_raw {
+                        0 => "Circular".to_owned(),
+                        2 => "Triangular".to_owned(),
+                        raw => format!("Unknown ({raw})"),
+                    };
+                    ui.label("Pan law");
+                    egui::ComboBox::from_id_salt("project-settings-pan-law")
+                        .selected_text(pan_law_label)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.project_settings_pan_law_raw,
+                                0,
+                                "Circular",
+                            );
+                            ui.selectable_value(
+                                &mut self.project_settings_pan_law_raw,
+                                2,
+                                "Triangular",
+                            );
+                        });
+                });
                 ui.horizontal(|ui| {
                     if ui.button("Apply").clicked() {
                         apply = true;
@@ -3267,10 +3314,16 @@ impl DawUi {
                 .web_link()
                 .unwrap_or_default()
                 .to_owned();
-            if let Some(settings) = document.project_settings() {
+            let project_settings = document.project_settings();
+            self.project_settings_advanced_supported = project_settings.is_some();
+            if let Some(settings) = project_settings {
                 self.project_settings_play_truncated = settings.play_truncated_notes_in_clips;
                 self.project_settings_fast_declick = settings.fast_declick_for_cut_groups;
+            } else {
+                self.project_settings_play_truncated = false;
+                self.project_settings_fast_declick = false;
             }
+            self.project_settings_pan_law_raw = document.metadata().pan_law_raw().unwrap_or(0);
             let patterns = document.patterns().unwrap_or_default();
             if self
                 .selected_pattern

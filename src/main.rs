@@ -250,6 +250,25 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 },
             )
         }
+        [command, input, output, play_truncated, fast_declick, pan_law]
+            if command == "set-project-settings" =>
+        {
+            write_project_settings(
+                Path::new(input),
+                Path::new(output),
+                ProjectSettingsEdit {
+                    play_truncated_notes_in_clips: parse_optional_bool(
+                        play_truncated,
+                        "Play truncated notes setting",
+                    )?,
+                    fast_declick_for_cut_groups: parse_optional_bool(
+                        fast_declick,
+                        "Fast declick setting",
+                    )?,
+                    pan_law_raw: parse_optional_u8(pan_law, "raw pan law")?,
+                },
+            )
+        }
         [command, input, output, play_truncated, fast_declick]
             if command == "set-project-settings" =>
         {
@@ -265,6 +284,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                         fast_declick,
                         "Fast declick setting",
                     )?,
+                    ..ProjectSettingsEdit::default()
                 },
             )
         }
@@ -779,7 +799,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild set-tempo <input.flp> <output.flp> <bpm>\n",
             "  flp-rebuild create-pattern <input.flp> <output.flp>\n",
             "  flp-rebuild set-project-info <input.flp> <output.flp> <title|-> <author|-> <genre|-> <comments|-> <web-link|->\n",
-            "  flp-rebuild set-project-settings <input.flp> <output.flp> <play-truncated:0|1|-> <fast-declick:0|1|->\n",
+            "  flp-rebuild set-project-settings <input.flp> <output.flp> <play-truncated:0|1|-> <fast-declick:0|1|-> [pan-law-raw|-]\n",
             "  flp-rebuild set-global-swing <input.flp> <output.flp> <percent-0..100>\n",
             "  flp-rebuild rename-channel <input.flp> <output.flp> <channel-id> <name>\n",
             "  flp-rebuild set-channel-color <input.flp> <output.flp> <channel-id> <RRGGBB>\n",
@@ -1243,20 +1263,24 @@ fn show_project_info(path: &Path) -> Result<(), String> {
 
 fn show_project_settings(path: &Path) -> Result<(), String> {
     let (_, document) = load_document(path)?;
-    let settings = document.project_settings().ok_or_else(|| {
-        format!(
-            "could not identify the supported Project settings block in {}",
-            path.display()
-        )
-    })?;
-    println!(
-        "play truncated notes in clips: {}",
-        settings.play_truncated_notes_in_clips
-    );
-    println!(
-        "fast declick for cut groups: {}",
-        settings.fast_declick_for_cut_groups
-    );
+    if let Some(settings) = document.project_settings() {
+        println!(
+            "play truncated notes in clips: {}",
+            settings.play_truncated_notes_in_clips
+        );
+        println!(
+            "fast declick for cut groups: {}",
+            settings.fast_declick_for_cut_groups
+        );
+    } else {
+        println!("advanced project settings: unsupported event layout");
+    }
+    match document.metadata().pan_law_raw() {
+        Some(0) => println!("pan law: Circular (raw 0)"),
+        Some(2) => println!("pan law: Triangular (raw 2)"),
+        Some(raw) => println!("pan law: unknown (raw {raw})"),
+        None => println!("pan law: Circular (default; event absent or ambiguous)"),
+    }
     Ok(())
 }
 

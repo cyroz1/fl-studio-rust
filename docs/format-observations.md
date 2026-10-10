@@ -46,6 +46,8 @@ Controlled toggles in FL Studio 26.1.6 Project settings > Project > Advanced map
 
 The Rust model, CLI, and desktop dialog only edit this recognized event block, preserve unrelated events, and reject files where the block is missing or ambiguous. These mappings were verified against one FL Studio 26.1.6 project; other project settings, older-version layouts, and behavior across a broader project corpus remain to be mapped.
 
+The project-level `0x17` byte event stores pan law: `0` means Circular and is the default; `2` means Triangular. This mapping is cross-checked against the independent [flpdiff FLP format specification](https://github.com/dawhubapp/flpdiff/blob/main/docs/fl-format/flp-format-spec.md), which reports non-default values in its FL 25 corpus. It has not yet been confirmed against a controlled native FL Studio toggle. The Rust model retains any raw byte, and the CLI and desktop Project Settings dialog can edit it; when the event is absent, the default Circular value is reported and a non-default edit inserts the event before channel data.
+
 ## Channel Rack swing observations
 
 Image-Line documents global swing as a 0–100% Channel Rack amount, with each channel's swing setting acting as a multiplier of the global value; both amounts must be above zero for swing to take effect ([Channel Rack manual](https://www.image-line.com/fl-studio-learning-content/fl-studio-online-manual/html/channelrack.htm)). PyFLP identifies global swing as project-level event `0x0B`, stored in one byte with a 0–128 range and a default of 0 ([PyFLP Channel Rack model](https://pyflp.readthedocs.io/en/v2.1.0/_modules/pyflp/channel.html)).

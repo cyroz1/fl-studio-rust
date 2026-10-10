@@ -307,6 +307,7 @@ pub struct ProjectMetadata {
     tempo_milli_bpm: Option<u32>,
     time_signature: Option<(u8, u8)>,
     global_swing_mix: Option<u8>,
+    pan_law_raw: Option<u8>,
     build_number: Option<u32>,
     title: Option<String>,
     author: Option<String>,
@@ -341,6 +342,8 @@ pub struct ProjectSettings {
 pub struct ProjectSettingsEdit {
     pub play_truncated_notes_in_clips: Option<bool>,
     pub fast_declick_for_cut_groups: Option<bool>,
+    /// Raw project pan-law value from the global `0x17` byte event.
+    pub pan_law_raw: Option<u8>,
 }
 
 /// A known FL channel kind, while retaining unrecognized raw values.
@@ -1334,6 +1337,12 @@ impl ProjectMetadata {
     /// Global Channel Rack swing mix in FL's 0..=128 range; missing events default to zero.
     pub fn global_swing_mix(&self) -> u8 {
         self.global_swing_mix.unwrap_or(0)
+    }
+
+    /// Raw project pan-law value from the global `0x17` byte event.
+    /// FL Studio uses 0 for Circular (the default) and 2 for Triangular.
+    pub fn pan_law_raw(&self) -> Option<u8> {
+        self.pan_law_raw
     }
 
     pub fn build_number(&self) -> Option<u32> {
@@ -6503,46 +6512,84 @@ impl FlpDocument {
 
     /// Updates the supported Project settings while preserving unrelated FLP events.
     pub fn set_project_settings(&mut self, edit: ProjectSettingsEdit) -> Result<(), FlpError> {
-        if edit.play_truncated_notes_in_clips.is_none()
-            && edit.fast_declick_for_cut_groups.is_none()
-        {
+        let advanced_edit = edit.play_truncated_notes_in_clips.is_some()
+            || edit.fast_declick_for_cut_groups.is_some();
+        if !advanced_edit && edit.pan_law_raw.is_none() {
             return Ok(());
         }
         let mut candidate = self.clone();
-        let anchor =
-            find_project_settings_anchor(&candidate.events).ok_or(FlpError::UnsupportedEdit(
-                "the supported Project settings event block could not be identified",
-            ))?;
 
-        if let Some(enabled) = edit.fast_declick_for_cut_groups {
-            candidate.events[anchor + 2].replace_byte_payload(u8::from(enabled))?;
-        }
+        if advanced_edit {
+            let anchor = find_project_settings_anchor(&candidate.events).ok_or(
+                FlpError::UnsupportedEdit(
+                    "the supported Project settings event block could not be identified",
+                ),
+            )?;
 
-        if let Some(enabled) = edit.play_truncated_notes_in_clips {
-            let existing_event = anchor.checked_sub(1).and_then(|index| {
-                candidate
-                    .events
-                    .get(index)
-                    .filter(|event| event.opcode == 0x64)
-                    .map(|_| index)
-            });
-            if let Some(index) = existing_event {
-                let event = &candidate.events[index];
-                if event.encoding != PayloadEncoding::Word || event.payload != [0, 0] {
-                    return Err(FlpError::UnsupportedEdit(
-                        "the Play truncated notes event has an unrecognized payload",
-                    ));
+            if let Some(enabled) = edit.fast_declick_for_cut_groups {
+                candidate.events[anchor + 2].replace_byte_payload(u8::from(enabled))?;
+            }
+
+            if let Some(enabled) = edit.play_truncated_notes_in_clips {
+                let existing_event = anchor.checked_sub(1).and_then(|index| {
+                    candidate
+                        .events
+                        .get(index)
+                        .filter(|event| event.opcode == 0x64)
+                        .map(|_| index)
+                });
+                if let Some(index) = existing_event {
+                    let event = &candidate.events[index];
+                    if event.encoding != PayloadEncoding::Word || event.payload != [0, 0] {
+                        return Err(FlpError::UnsupportedEdit(
+                            "the Play truncated notes event has an unrecognized payload",
+                        ));
+                    }
+                }
+                match (enabled, existing_event) {
+                    (true, Some(index)) => {
+                        candidate.events.remove(index);
+                    }
+                    (false, None) => candidate.events.insert(anchor, FlpEvent::new_word(0x64, 0)),
+                    _ => {}
                 }
             }
-            match (enabled, existing_event) {
-                (true, Some(index)) => {
-                    candidate.events.remove(index);
+        }
+
+        if let Some(pan_law_raw) = edit.pan_law_raw {
+            let channel_start = candidate
+                .events
+                .iter()
+                .position(|event| event.opcode == 0x40)
+                .unwrap_or(candidate.events.len());
+            let mut pan_law_event = None;
+            for (index, event) in candidate.events.iter().take(channel_start).enumerate() {
+                if event.opcode != 0x17 {
+                    continue;
                 }
-                (false, None) => candidate.events.insert(anchor, FlpEvent::new_word(0x64, 0)),
-                _ => {}
+                if pan_law_event.is_some() {
+                    return Err(FlpError::UnsupportedEdit(
+                        "the project has multiple global 0x17 pan-law events",
+                    ));
+                }
+                if event.encoding != PayloadEncoding::Byte || event.payload.len() != 1 {
+                    return Err(FlpError::UnsupportedEdit(
+                        "the project's 0x17 pan-law event is not a one-byte value",
+                    ));
+                }
+                pan_law_event = Some(index);
+            }
+            if let Some(index) = pan_law_event {
+                candidate.events[index].replace_byte_payload(pan_law_raw)?;
+            } else if pan_law_raw != 0 {
+                candidate
+                    .events
+                    .insert(channel_start, FlpEvent::new_byte(0x17, pan_law_raw));
             }
         }
         candidate.refresh_event_offsets()?;
+        candidate.metadata =
+            read_project_metadata(&candidate.events, candidate.project_version.as_deref());
         *self = candidate;
         Ok(())
     }
@@ -8507,6 +8554,8 @@ fn read_project_metadata(events: &[FlpEvent], project_version: Option<&str>) -> 
     let mut numerator = None;
     let mut denominator = None;
     let mut global_swing_mix = None;
+    let mut pan_law_event = None;
+    let mut duplicate_pan_law_events = false;
     let mut build_number = None;
     let mut title = None;
     let mut author = None;
@@ -8528,6 +8577,13 @@ fn read_project_metadata(events: &[FlpEvent], project_version: Option<&str>) -> 
                 && global_swing_mix.is_none() =>
             {
                 global_swing_mix = Some(event.payload[0]);
+            }
+            0x17 if event_index < channel_start => {
+                if pan_law_event.is_some() {
+                    duplicate_pan_law_events = true;
+                } else {
+                    pan_law_event = Some(event);
+                }
             }
             0x42 if event.payload.len() == 2 => {
                 legacy_coarse_tempo = Some(u32::from(u16::from_le_bytes([
@@ -8575,6 +8631,14 @@ fn read_project_metadata(events: &[FlpEvent], project_version: Option<&str>) -> 
     }
 
     let time_signature = numerator.zip(denominator);
+    let pan_law_raw = if duplicate_pan_law_events {
+        None
+    } else {
+        pan_law_event.and_then(|event| {
+            (event.encoding == PayloadEncoding::Byte && event.payload.len() == 1)
+                .then_some(event.payload[0])
+        })
+    };
     let tempo_milli_bpm = modern_tempo.or_else(|| {
         legacy_coarse_tempo.map(|coarse| {
             coarse
@@ -8587,6 +8651,7 @@ fn read_project_metadata(events: &[FlpEvent], project_version: Option<&str>) -> 
         tempo_milli_bpm,
         time_signature,
         global_swing_mix,
+        pan_law_raw,
         build_number,
         title,
         author,
@@ -9127,7 +9192,7 @@ mod tests {
 
     #[test]
     fn project_settings_decode_edit_and_roundtrip_losslessly() {
-        let mut event_stream = vec![0xF2, 28];
+        let mut event_stream = vec![0x17, 2, 0xF2, 28];
         event_stream.extend_from_slice(&[0; 28]);
         append_project_settings_block(&mut event_stream, true, true);
         event_stream.extend_from_slice(&[0x62, 0, 0, 0x33, 1]);
@@ -9144,13 +9209,14 @@ mod tests {
         let unrelated_events: Vec<_> = document
             .events()
             .iter()
-            .filter(|event| !matches!(event.opcode(), 0x64 | 0x28))
+            .filter(|event| !matches!(event.opcode(), 0x17 | 0x64 | 0x28))
             .map(|event| event.wire_bytes().to_vec())
             .collect();
         document
             .set_project_settings(ProjectSettingsEdit {
                 play_truncated_notes_in_clips: Some(false),
                 fast_declick_for_cut_groups: Some(false),
+                pan_law_raw: Some(0),
             })
             .expect("supported Project settings should be editable");
         assert_eq!(
@@ -9160,11 +9226,12 @@ mod tests {
                 fast_declick_for_cut_groups: false,
             })
         );
+        assert_eq!(document.metadata().pan_law_raw(), Some(0));
         assert_eq!(
             document
                 .events()
                 .iter()
-                .filter(|event| !matches!(event.opcode(), 0x64 | 0x28))
+                .filter(|event| !matches!(event.opcode(), 0x17 | 0x64 | 0x28))
                 .map(|event| event.wire_bytes().to_vec())
                 .collect::<Vec<_>>(),
             unrelated_events
@@ -9175,6 +9242,7 @@ mod tests {
             .set_project_settings(ProjectSettingsEdit {
                 play_truncated_notes_in_clips: Some(true),
                 fast_declick_for_cut_groups: Some(true),
+                pan_law_raw: Some(2),
             })
             .expect("settings should be re-enabled");
         let encoded = document.encode_lossless().expect("document should encode");
@@ -9186,7 +9254,60 @@ mod tests {
                 fast_declick_for_cut_groups: true,
             })
         );
+        assert_eq!(reparsed.metadata().pan_law_raw(), Some(2));
         assert_eq!(reparsed.trailing_bytes(), &[0xD1, 0xD2]);
+    }
+
+    #[test]
+    fn pan_law_defaults_to_circular_and_can_be_added_without_advanced_settings() {
+        let original = flp_fixture(&[0x20, 7, 0x40, 0, 0], &[], &[0xD1, 0xD2]);
+        let mut document = FlpDocument::parse(&original).expect("fixture should parse");
+        assert_eq!(document.metadata().pan_law_raw(), None);
+
+        document
+            .set_project_settings(ProjectSettingsEdit {
+                pan_law_raw: Some(0),
+                ..ProjectSettingsEdit::default()
+            })
+            .expect("the default pan law should not need a new event");
+        assert!(!document.events().iter().any(|event| event.opcode() == 0x17));
+
+        document
+            .set_project_settings(ProjectSettingsEdit {
+                pan_law_raw: Some(2),
+                ..ProjectSettingsEdit::default()
+            })
+            .expect("pan law should be editable without the Advanced settings block");
+        assert_eq!(document.metadata().pan_law_raw(), Some(2));
+        let encoded = document.encode_lossless().expect("document should encode");
+        let reparsed = FlpDocument::parse(&encoded).expect("edited project should reparse");
+        assert_eq!(reparsed.metadata().pan_law_raw(), Some(2));
+        let event_order = reparsed
+            .events()
+            .iter()
+            .map(FlpEvent::opcode)
+            .collect::<Vec<_>>();
+        assert!(
+            event_order.iter().position(|opcode| *opcode == 0x17)
+                < event_order.iter().position(|opcode| *opcode == 0x40)
+        );
+        assert_eq!(reparsed.trailing_bytes(), &[0xD1, 0xD2]);
+    }
+
+    #[test]
+    fn pan_law_edits_reject_duplicate_global_events_without_mutation() {
+        let original = flp_fixture(&[0x17, 0, 0x17, 2], &[], &[0xD1]);
+        let mut document = FlpDocument::parse(&original).expect("fixture should parse");
+        assert_eq!(document.metadata().pan_law_raw(), None);
+        assert!(
+            document
+                .set_project_settings(ProjectSettingsEdit {
+                    pan_law_raw: Some(0),
+                    ..ProjectSettingsEdit::default()
+                })
+                .is_err()
+        );
+        assert_eq!(document.encode_lossless().unwrap(), original);
     }
 
     #[test]
