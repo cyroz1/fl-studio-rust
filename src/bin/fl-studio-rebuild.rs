@@ -4982,12 +4982,15 @@ impl DawUi {
                 }
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let title = self
-                    .current_path
-                    .as_deref()
-                    .and_then(Path::file_name)
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "Untitled".to_owned());
+                let title = if self.document.is_none() {
+                    "No project".to_owned()
+                } else {
+                    self.current_path
+                        .as_deref()
+                        .and_then(Path::file_name)
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "Untitled".to_owned())
+                };
                 ui.label(format!("{}{}", title, if self.dirty { " *" } else { "" }));
             });
         });
@@ -6751,7 +6754,6 @@ impl DawUi {
             requested_folder = Some(root);
         }
 
-        let mut refresh = false;
         ui.horizontal(|ui| {
             let parent = self.browser_path.parent().map(Path::to_path_buf);
             if ui
@@ -6768,15 +6770,9 @@ impl DawUi {
                 .unwrap_or_else(|| self.browser_path.display().to_string());
             ui.label(egui::RichText::new(path_label).small())
                 .on_hover_text(self.browser_path.display().to_string());
-            refresh = ui
-                .small_button("↻")
-                .on_hover_text("Read this folder again")
-                .clicked();
         });
         if let Some(path) = requested_folder {
             self.set_browser_directory(path);
-        } else if refresh {
-            self.refresh_browser_directory();
         }
 
         let current_indexed = self.browser_index.as_ref().is_some_and(|index| {
@@ -20537,10 +20533,17 @@ fn browser_entry_is_hidden(name: &str) -> bool {
 }
 
 fn default_browser_directory() -> PathBuf {
-    std::env::var_os("HOME")
+    let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
-        .filter(|path| path.is_dir())
+        .filter(|path| path.is_dir());
+    browser_factory_packs_directory()
+        .or_else(|| {
+            home.as_ref()
+                .map(|path| path.join("Music"))
+                .filter(|path| path.is_dir())
+        })
+        .or(home)
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_default()
 }
