@@ -1788,6 +1788,7 @@ impl DawUi {
             Ok(devices) => (devices, None),
             Err(error) => (Vec::new(), Some(error)),
         };
+        let (midi_selected_input_id, midi_selected_output_id) = load_midi_device_selections();
         let mut audio_settings = AudioSettings::default();
         if let Some(rate) = audio_catalog.default_sample_rate {
             audio_settings.sample_rate = rate;
@@ -1961,7 +1962,7 @@ impl DawUi {
             audio_settings,
             audio_engine: None,
             midi_input_devices,
-            midi_selected_input_id: None,
+            midi_selected_input_id,
             midi_input_error,
             midi_input_connection: None,
             midi_message_sender,
@@ -1975,7 +1976,7 @@ impl DawUi {
             midi_input_refresh_requested: false,
             midi_input_toggle_requested: false,
             midi_output_devices,
-            midi_selected_output_id: None,
+            midi_selected_output_id,
             midi_output_error,
             midi_output_connection: None,
             midi_output_test_note_off_at: None,
@@ -16449,21 +16450,17 @@ impl DawUi {
                     self.midi_input_connection = None;
                     self.status = "MIDI input disconnected; device list refreshed".to_owned();
                 }
-                if self.midi_input_connection.is_none()
-                    && self
-                        .midi_selected_input_id
-                        .as_ref()
-                        .is_some_and(|selected_id| {
-                            !self
-                                .midi_input_devices
-                                .iter()
-                                .any(|device| &device.id == selected_id)
-                        })
-                {
-                    self.midi_selected_input_id = None;
-                }
             }
             Err(error) => self.midi_input_error = Some(error),
+        }
+    }
+
+    fn persist_midi_device_selections(&mut self) {
+        if let Err(error) = save_midi_device_selections(
+            self.midi_selected_input_id.as_deref(),
+            self.midi_selected_output_id.as_deref(),
+        ) {
+            self.status = format!("Could not save MIDI device selections: {error}");
         }
     }
 
@@ -16549,19 +16546,6 @@ impl DawUi {
                     self.disconnect_midi_output();
                     self.midi_output_error =
                         Some("The connected MIDI output is no longer available".to_owned());
-                }
-                if self.midi_output_connection.is_none()
-                    && self
-                        .midi_selected_output_id
-                        .as_ref()
-                        .is_some_and(|selected_id| {
-                            !self
-                                .midi_output_devices
-                                .iter()
-                                .any(|device| &device.id == selected_id)
-                        })
-                {
-                    self.midi_selected_output_id = None;
                 }
             }
             Err(error) => self.midi_output_error = Some(error),
@@ -16954,7 +16938,14 @@ impl DawUi {
                         .find(|device| &device.id == id)
                 })
                 .map(|device| device.name.as_str())
-                .unwrap_or("Select a MIDI input");
+                .unwrap_or_else(|| {
+                    if self.midi_selected_input_id.is_some() {
+                        "Saved MIDI input unavailable"
+                    } else {
+                        "Select a MIDI input"
+                    }
+                });
+            let mut selection_changed = false;
             egui::ComboBox::from_id_salt("midi_input_device")
                 .selected_text(selected_name)
                 .width(280.0)
@@ -16963,13 +16954,18 @@ impl DawUi {
                         ui.weak("No MIDI input devices found");
                     }
                     for device in &self.midi_input_devices {
-                        ui.selectable_value(
-                            &mut self.midi_selected_input_id,
-                            Some(device.id.clone()),
-                            &device.name,
-                        );
+                        selection_changed |= ui
+                            .selectable_value(
+                                &mut self.midi_selected_input_id,
+                                Some(device.id.clone()),
+                                &device.name,
+                            )
+                            .changed();
                     }
                 });
+            if selection_changed {
+                self.persist_midi_device_selections();
+            }
             if ui.button("Refresh MIDI inputs").clicked() {
                 self.midi_input_refresh_requested = true;
             }
@@ -16987,8 +16983,15 @@ impl DawUi {
             } else {
                 "Connect"
             };
-            let can_toggle =
-                self.midi_selected_input_id.is_some() || self.midi_input_connection.is_some();
+            let selected_is_available =
+                self.midi_selected_input_id
+                    .as_ref()
+                    .is_some_and(|selected_id| {
+                        self.midi_input_devices
+                            .iter()
+                            .any(|device| &device.id == selected_id)
+                    });
+            let can_toggle = selected_is_available || self.midi_input_connection.is_some();
             if ui
                 .add_enabled(can_toggle, egui::Button::new(connection_label))
                 .clicked()
@@ -17070,7 +17073,14 @@ impl DawUi {
                         .find(|device| &device.id == id)
                 })
                 .map(|device| device.name.as_str())
-                .unwrap_or("Select a MIDI output");
+                .unwrap_or_else(|| {
+                    if self.midi_selected_output_id.is_some() {
+                        "Saved MIDI output unavailable"
+                    } else {
+                        "Select a MIDI output"
+                    }
+                });
+            let mut selection_changed = false;
             egui::ComboBox::from_id_salt("midi_output_device")
                 .selected_text(selected_name)
                 .width(280.0)
@@ -17079,13 +17089,18 @@ impl DawUi {
                         ui.weak("No MIDI output devices found");
                     }
                     for device in &self.midi_output_devices {
-                        ui.selectable_value(
-                            &mut self.midi_selected_output_id,
-                            Some(device.id.clone()),
-                            &device.name,
-                        );
+                        selection_changed |= ui
+                            .selectable_value(
+                                &mut self.midi_selected_output_id,
+                                Some(device.id.clone()),
+                                &device.name,
+                            )
+                            .changed();
                     }
                 });
+            if selection_changed {
+                self.persist_midi_device_selections();
+            }
             if ui.button("Refresh MIDI outputs").clicked() {
                 self.midi_output_refresh_requested = true;
             }
@@ -17103,8 +17118,15 @@ impl DawUi {
             } else {
                 "Connect"
             };
-            let can_toggle =
-                self.midi_selected_output_id.is_some() || self.midi_output_connection.is_some();
+            let selected_is_available =
+                self.midi_selected_output_id
+                    .as_ref()
+                    .is_some_and(|selected_id| {
+                        self.midi_output_devices
+                            .iter()
+                            .any(|device| &device.id == selected_id)
+                    });
+            let can_toggle = selected_is_available || self.midi_output_connection.is_some();
             if ui
                 .add_enabled(can_toggle, egui::Button::new(connection_label))
                 .clicked()
@@ -18635,6 +18657,90 @@ fn recent_projects_file() -> Option<PathBuf> {
     browser_favorites_file()?
         .parent()
         .map(|directory| directory.join("recent-projects.txt"))
+}
+
+fn midi_device_selections_file() -> Option<PathBuf> {
+    browser_favorites_file()?
+        .parent()
+        .map(|directory| directory.join("midi-device-selections.txt"))
+}
+
+fn load_midi_device_selections() -> (Option<String>, Option<String>) {
+    let Some(path) = midi_device_selections_file() else {
+        return (None, None);
+    };
+    let Ok(contents) = fs::read_to_string(path) else {
+        return (None, None);
+    };
+    parse_midi_device_selections(&contents)
+}
+
+fn save_midi_device_selections(
+    input_id: Option<&str>,
+    output_id: Option<&str>,
+) -> Result<(), String> {
+    let path = midi_device_selections_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the MIDI device settings path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(&path, encode_midi_device_selections(input_id, output_id))
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
+fn encode_midi_device_selections(input_id: Option<&str>, output_id: Option<&str>) -> String {
+    format!(
+        "input={}\noutput={}\n",
+        encode_midi_device_id(input_id.unwrap_or_default()),
+        encode_midi_device_id(output_id.unwrap_or_default())
+    )
+}
+
+fn parse_midi_device_selections(contents: &str) -> (Option<String>, Option<String>) {
+    let mut input_id = None;
+    let mut output_id = None;
+    for line in contents.lines() {
+        if let Some(encoded_id) = line.strip_prefix("input=") {
+            input_id = decode_midi_device_id(encoded_id);
+        } else if let Some(encoded_id) = line.strip_prefix("output=") {
+            output_id = decode_midi_device_id(encoded_id);
+        }
+    }
+    (input_id, output_id)
+}
+
+fn encode_midi_device_id(id: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(id.len() * 2);
+    for byte in id.bytes() {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0F)]));
+    }
+    encoded
+}
+
+fn decode_midi_device_id(encoded: &str) -> Option<String> {
+    if encoded.is_empty() || encoded.len() % 2 != 0 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(encoded.len() / 2);
+    for pair in encoded.as_bytes().chunks_exact(2) {
+        let high = hex_digit(pair[0])?;
+        let low = hex_digit(pair[1])?;
+        bytes.push((high << 4) | low);
+    }
+    String::from_utf8(bytes).ok().filter(|id| !id.is_empty())
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn load_recent_projects() -> Vec<PathBuf> {
@@ -20228,14 +20334,34 @@ mod tests {
     use super::{
         ActivePlaylistClipDrag, ChannelDisplayFilter, FlpDocument, Pattern, PatternNote,
         PianoRollGrid, PianoRollSnap, PlaylistClip, PlaylistClipDragKind, PluginCandidate,
-        PluginFormat, candidate_matches_vst_identity, next_piano_roll_note_group,
-        note_from_grid_position, piano_roll_note_group_members,
-        playlist_audio_clip_join_candidates, playlist_clip_drag_edit,
-        playlist_clip_local_recording_offset, playlist_clip_split_position,
-        playlist_pattern_clip_join_candidates, snap_note_tick,
+        PluginFormat, candidate_matches_vst_identity, encode_midi_device_selections,
+        next_piano_roll_note_group, note_from_grid_position, parse_midi_device_selections,
+        piano_roll_note_group_members, playlist_audio_clip_join_candidates,
+        playlist_clip_drag_edit, playlist_clip_local_recording_offset,
+        playlist_clip_split_position, playlist_pattern_clip_join_candidates, snap_note_tick,
         toggle_piano_roll_note_group_selection, update_channel_rack_selection,
         update_layer_child_selection, update_piano_roll_box_selection,
     };
+
+    #[test]
+    fn midi_device_selections_round_trip_opaque_port_ids() {
+        let input_id = "alsa:card=Keyboard\tport\n雪";
+        let output_id = "CoreMIDI:0123456789ABCDEF";
+        let encoded = encode_midi_device_selections(Some(input_id), Some(output_id));
+
+        assert_eq!(
+            parse_midi_device_selections(&encoded),
+            (Some(input_id.to_owned()), Some(output_id.to_owned()))
+        );
+    }
+
+    #[test]
+    fn midi_device_selections_skip_malformed_or_unknown_entries() {
+        assert_eq!(
+            parse_midi_device_selections("input=0\noutput=xyz\nother=01\n"),
+            (None, None)
+        );
+    }
 
     #[test]
     fn vst3_autoload_uses_moduleinfo_class_id_before_names() {
