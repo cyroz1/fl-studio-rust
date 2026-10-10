@@ -88,6 +88,25 @@ pub struct AudioClipRenderOptions {
     pub soloed_playlist_track_range: Option<(u32, u32)>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AudioClipRenderOutput {
+    Wav,
+    Flac { bits_per_sample: u8 },
+    Ogg { bitrate_kbps: u16 },
+    Mp3 { bitrate_kbps: u16 },
+}
+
+impl AudioClipRenderOutput {
+    pub const fn extension(self) -> &'static str {
+        match self {
+            Self::Wav => "wav",
+            Self::Flac { .. } => "flac",
+            Self::Ogg { .. } => "ogg",
+            Self::Mp3 { .. } => "mp3",
+        }
+    }
+}
+
 impl Default for AudioClipRenderOptions {
     fn default() -> Self {
         Self {
@@ -404,19 +423,28 @@ pub fn render_audio_clips_to_wav(
     options: AudioClipRenderOptions,
     output_path: impl AsRef<Path>,
 ) -> Result<AudioClipRenderSummary, String> {
+    render_audio_clips_to_file(
+        document,
+        project_path,
+        options,
+        output_path,
+        AudioClipRenderOutput::Wav,
+    )
+}
+
+/// Render Playlist audio clips to WAV, FLAC, Ogg Vorbis, or MP3.
+pub fn render_audio_clips_to_file(
+    document: &FlpDocument,
+    project_path: impl AsRef<Path>,
+    options: AudioClipRenderOptions,
+    output_path: impl AsRef<Path>,
+    output_format: AudioClipRenderOutput,
+) -> Result<AudioClipRenderSummary, String> {
     let project_path = project_path.as_ref();
     let output_path = output_path.as_ref();
-    validate_output_path(project_path, output_path)?;
+    validate_output_path_with_extension(project_path, output_path, output_format.extension())?;
     let (mix, summary) = render_audio_clips_to_stereo_buffer(document, project_path, options)?;
-    write_stereo_wav_from_buffer(
-        output_path,
-        &mix,
-        options.sample_rate,
-        summary.frames,
-        options.wav_sample_format,
-        options.wav_dither_mode,
-        options.wav_channel_mode,
-    )?;
+    write_audio_buffer_to_file(output_path, &mix, summary.frames, options, output_format)?;
     Ok(summary)
 }
 
@@ -3818,6 +3846,107 @@ fn write_stereo_wav_from_buffer(
     Ok(())
 }
 
+fn write_audio_buffer_to_file(
+    output_path: &Path,
+    samples: &[f32],
+    frames: u64,
+    options: AudioClipRenderOptions,
+    output_format: AudioClipRenderOutput,
+) -> Result<(), String> {
+    let expected_samples = usize::try_from(frames)
+        .ok()
+        .and_then(|frames| frames.checked_mul(2))
+        .ok_or_else(|| "rendered audio sample count overflow".to_owned())?;
+    if samples.len() != expected_samples {
+        return Err("rendered audio buffer does not match its frame count".to_owned());
+    }
+    if output_format == AudioClipRenderOutput::Wav {
+        return write_stereo_wav_from_buffer(
+            output_path,
+            samples,
+            options.sample_rate,
+            frames,
+            options.wav_sample_format,
+            options.wav_dither_mode,
+            options.wav_channel_mode,
+        );
+    }
+
+    match output_format {
+        AudioClipRenderOutput::Wav => unreachable!(),
+        AudioClipRenderOutput::Flac { bits_per_sample } => {
+            if !matches!(bits_per_sample, 16 | 24) {
+                return Err("FLAC output supports 16- or 24-bit samples".to_owned());
+            }
+        }
+        AudioClipRenderOutput::Ogg { bitrate_kbps } => {
+            if !(OGG_MIN_BITRATE_KBPS..=OGG_MAX_BITRATE_KBPS).contains(&bitrate_kbps) {
+                return Err(format!(
+                    "Ogg Vorbis bitrate must be between {OGG_MIN_BITRATE_KBPS} and {OGG_MAX_BITRATE_KBPS} kbps"
+                ));
+            }
+        }
+        AudioClipRenderOutput::Mp3 { bitrate_kbps } => {
+            if !MP3_BITRATES_KBPS.contains(&bitrate_kbps) {
+                return Err(format!("unsupported MP3 bitrate: {bitrate_kbps} kbps"));
+            }
+            if !MP3_SAMPLE_RATES.contains(&options.sample_rate) {
+                return Err(
+                    "MP3 output supports sample rates of 32000, 44100, or 48000 Hz".to_owned(),
+                );
+            }
+        }
+    }
+
+    let mut temporary = TemporaryRenderFile::create(output_path)?;
+    {
+        let file = temporary
+            .file
+            .as_mut()
+            .expect("temporary render file is open");
+        match output_format {
+            AudioClipRenderOutput::Wav => unreachable!(),
+            AudioClipRenderOutput::Flac { bits_per_sample } => {
+                let mut encoder = StreamingFlacWriter::new(
+                    file,
+                    options.sample_rate,
+                    options.wav_channel_mode,
+                    bits_per_sample,
+                )?;
+                for block in samples.chunks(STREAM_BLOCK_FRAMES * 2) {
+                    encoder.write_stereo_block(block, options.wav_channel_mode)?;
+                }
+                encoder.finalize(frames)?;
+            }
+            AudioClipRenderOutput::Ogg { bitrate_kbps } => {
+                let mut encoder = StreamingOggWriter::new(
+                    file,
+                    options.sample_rate,
+                    options.wav_channel_mode,
+                    bitrate_kbps,
+                )?;
+                for block in samples.chunks(STREAM_BLOCK_FRAMES * 2) {
+                    encoder.write_stereo_block(block)?;
+                }
+                encoder.finalize()?;
+            }
+            AudioClipRenderOutput::Mp3 { bitrate_kbps } => {
+                let mut encoder = StreamingMp3Writer::new(
+                    file,
+                    options.sample_rate,
+                    options.wav_channel_mode,
+                    bitrate_kbps,
+                )?;
+                for block in samples.chunks(STREAM_BLOCK_FRAMES * 2) {
+                    encoder.write_stereo_block(block)?;
+                }
+                encoder.finalize()?;
+            }
+        }
+    }
+    temporary.commit(output_path)
+}
+
 struct TemporaryRenderFile {
     path: PathBuf,
     file: Option<File>,
@@ -5403,6 +5532,59 @@ mod tests {
                     .flatten()
                     .any(|sample| sample.abs() > 0.01)
             );
+        }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn writes_decodable_audio_clip_formats_with_shared_channel_mode() {
+        let root = std::env::temp_dir().join(format!(
+            "flp-audio-clip-format-test-{}-{}",
+            std::process::id(),
+            NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+
+        let frames = STREAM_BLOCK_FRAMES * 2 + 137;
+        let mut samples = Vec::with_capacity(frames * 2);
+        for frame in 0..frames {
+            let phase = std::f32::consts::TAU * frame as f32 / 96.0;
+            samples.extend_from_slice(&[phase.sin() * 0.25, phase.cos() * 0.25]);
+        }
+        let cases = [
+            (AudioClipRenderOutput::Wav, "wav"),
+            (
+                AudioClipRenderOutput::Flac {
+                    bits_per_sample: 24,
+                },
+                "flac",
+            ),
+            (AudioClipRenderOutput::Ogg { bitrate_kbps: 192 }, "ogg"),
+            (AudioClipRenderOutput::Mp3 { bitrate_kbps: 192 }, "mp3"),
+        ];
+
+        for (index, (output_format, extension)) in cases.into_iter().enumerate() {
+            let output = root.join(format!("clip-{index}.{extension}"));
+            write_audio_buffer_to_file(
+                &output,
+                &samples,
+                frames as u64,
+                AudioClipRenderOptions {
+                    sample_rate: 48_000,
+                    wav_sample_format: WavSampleFormat::Pcm16,
+                    wav_channel_mode: WavChannelMode::MonoMerged,
+                    ..AudioClipRenderOptions::default()
+                },
+                output_format,
+            )
+            .unwrap();
+
+            let decoded = decode_audio_file(&output).unwrap();
+            assert_eq!(decoded.sample_rate, 48_000);
+            assert_eq!(decoded.channels.len(), 1);
+            assert!(!decoded.channels[0].is_empty());
+            assert!(decoded.channels[0].iter().any(|sample| sample.abs() > 0.01));
         }
 
         fs::remove_dir_all(root).unwrap();

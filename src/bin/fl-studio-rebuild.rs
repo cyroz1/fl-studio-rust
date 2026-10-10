@@ -19,10 +19,10 @@ use flp_rebuild::midi::{MidiChannelMapping, MidiFile};
 use flp_rebuild::plugins::{PluginCandidate, PluginFormat, scan_installed_plugins};
 use flp_rebuild::project_package::ProjectPackageWorkspace;
 use flp_rebuild::sample_render::{
-    AudioClipRenderOptions, AudioClipRenderSummary, AudioRecordingSummary, MP3_BITRATES_KBPS,
-    PlaylistRenderOptions, PlaylistRenderSummary, ResamplingQuality, SamplerPatternRenderOptions,
-    SamplerPatternRenderSummary, WavChannelMode, WavDitherMode, WavSampleFormat,
-    render_audio_clips_to_wav, render_playlist_with_vst3_to_flac_cancellable,
+    AudioClipRenderOptions, AudioClipRenderOutput, AudioClipRenderSummary, AudioRecordingSummary,
+    MP3_BITRATES_KBPS, PlaylistRenderOptions, PlaylistRenderSummary, ResamplingQuality,
+    SamplerPatternRenderOptions, SamplerPatternRenderSummary, WavChannelMode, WavDitherMode,
+    WavSampleFormat, render_audio_clips_to_file, render_playlist_with_vst3_to_flac_cancellable,
     render_playlist_with_vst3_to_mp3_cancellable, render_playlist_with_vst3_to_ogg_cancellable,
     render_playlist_with_vst3_to_wav_cancellable, render_sampler_pattern_to_wav,
     stream_playlist_with_vst3_to_device_from_frame, stream_sampler_pattern_to_device,
@@ -119,6 +119,18 @@ impl PlaylistSongOutputFormat {
             Self::Ogg => "ogg",
             Self::Mp3 => "mp3",
         }
+    }
+}
+
+fn add_audio_render_file_filter(
+    file_dialog: rfd::FileDialog,
+    output_format: PlaylistSongOutputFormat,
+) -> rfd::FileDialog {
+    match output_format {
+        PlaylistSongOutputFormat::Wav => file_dialog.add_filter("WAV audio", &["wav"]),
+        PlaylistSongOutputFormat::Flac => file_dialog.add_filter("FLAC audio", &["flac"]),
+        PlaylistSongOutputFormat::Ogg => file_dialog.add_filter("Ogg Vorbis audio", &["ogg"]),
+        PlaylistSongOutputFormat::Mp3 => file_dialog.add_filter("MP3 audio", &["mp3"]),
     }
 }
 
@@ -4723,7 +4735,7 @@ impl DawUi {
                 });
                 ui.menu_button("Export", |ui| {
                     ui.menu_button(
-                        format!("Song output: {}", self.playlist_song_output_format.label()),
+                        format!("Audio output: {}", self.playlist_song_output_format.label()),
                         |ui| {
                             ui.selectable_value(
                                 &mut self.playlist_song_output_format,
@@ -4789,6 +4801,7 @@ impl DawUi {
                                         }
                                     },
                                 );
+                                ui.weak("MP3 render rates: 32, 44.1, or 48 kHz");
                             }
                         },
                     );
@@ -4796,7 +4809,7 @@ impl DawUi {
                     ui.menu_button(
                         format!("WAV output: {}", self.playlist_render_format.label()),
                         |ui| {
-                            ui.weak("Used by Playlist, audio clip, and Sampler exports");
+                            ui.weak("Used when WAV is selected for a render");
                             ui.separator();
                             for format in [
                                 WavSampleFormat::Pcm16,
@@ -15278,12 +15291,17 @@ impl DawUi {
             .file_stem()
             .map(|stem| stem.to_string_lossy().into_owned())
             .unwrap_or_else(|| "FL_Studio_Project".to_owned());
-        let Some(output_path) = rfd::FileDialog::new()
-            .set_title("Render Playlist audio clips")
-            .set_file_name(format!("{project_stem}_audio.wav"))
-            .add_filter("WAV audio", &["wav"])
-            .save_file()
-        else {
+        let output_format = self.playlist_song_output_format;
+        let Some(output_path) = add_audio_render_file_filter(
+            rfd::FileDialog::new()
+                .set_title("Render Playlist audio clips")
+                .set_file_name(format!(
+                    "{project_stem}_audio.{}",
+                    output_format.extension()
+                )),
+            output_format,
+        )
+        .save_file() else {
             return;
         };
         let options = AudioClipRenderOptions {
@@ -15300,7 +15318,8 @@ impl DawUi {
             soloed_playlist_track_range: self.soloed_playlist_track_range,
             ..AudioClipRenderOptions::default()
         };
-        self.start_audio_clip_export(options, output_path);
+        let output = self.audio_clip_render_output();
+        self.start_audio_clip_export(options, output_path, output);
     }
 
     fn render_selected_audio_clip_dialog(&mut self, start_from_song_start: bool) {
@@ -15320,24 +15339,27 @@ impl DawUi {
             .file_stem()
             .map(|stem| stem.to_string_lossy().into_owned())
             .unwrap_or_else(|| "FL_Studio_Project".to_owned());
-        let Some(output_path) = rfd::FileDialog::new()
-            .set_title(if start_from_song_start {
-                "Render selected Playlist audio clip from song start"
-            } else {
-                "Render selected Playlist audio clip from clip start"
-            })
-            .set_file_name(format!(
-                "{project_stem}_clip_{}_{}.wav",
-                clip_index + 1,
-                if start_from_song_start {
-                    "song_start"
+        let output_format = self.playlist_song_output_format;
+        let Some(output_path) = add_audio_render_file_filter(
+            rfd::FileDialog::new()
+                .set_title(if start_from_song_start {
+                    "Render selected Playlist audio clip from song start"
                 } else {
-                    "clip_start"
-                }
-            ))
-            .add_filter("WAV audio", &["wav"])
-            .save_file()
-        else {
+                    "Render selected Playlist audio clip from clip start"
+                })
+                .set_file_name(format!(
+                    "{project_stem}_clip_{}_{}.{}",
+                    clip_index + 1,
+                    if start_from_song_start {
+                        "song_start"
+                    } else {
+                        "clip_start"
+                    },
+                    output_format.extension()
+                )),
+            output_format,
+        )
+        .save_file() else {
             return;
         };
         let options = AudioClipRenderOptions {
@@ -15355,10 +15377,31 @@ impl DawUi {
             start_from_song_start,
             soloed_playlist_track_range: self.soloed_playlist_track_range,
         };
-        self.start_audio_clip_export(options, output_path);
+        let output = self.audio_clip_render_output();
+        self.start_audio_clip_export(options, output_path, output);
     }
 
-    fn start_audio_clip_export(&mut self, options: AudioClipRenderOptions, output_path: PathBuf) {
+    fn audio_clip_render_output(&self) -> AudioClipRenderOutput {
+        match self.playlist_song_output_format {
+            PlaylistSongOutputFormat::Wav => AudioClipRenderOutput::Wav,
+            PlaylistSongOutputFormat::Flac => AudioClipRenderOutput::Flac {
+                bits_per_sample: self.playlist_render_flac_bits_per_sample,
+            },
+            PlaylistSongOutputFormat::Ogg => AudioClipRenderOutput::Ogg {
+                bitrate_kbps: self.playlist_render_ogg_bitrate_kbps,
+            },
+            PlaylistSongOutputFormat::Mp3 => AudioClipRenderOutput::Mp3 {
+                bitrate_kbps: self.playlist_render_mp3_bitrate_kbps,
+            },
+        }
+    }
+
+    fn start_audio_clip_export(
+        &mut self,
+        options: AudioClipRenderOptions,
+        output_path: PathBuf,
+        output_format: AudioClipRenderOutput,
+    ) {
         let Some(project_path) = self.sample_project_path() else {
             self.status = "Save the project before rendering its audio clips".to_owned();
             return;
@@ -15376,14 +15419,15 @@ impl DawUi {
         let output_path_for_worker = output_path.clone();
         let (sender, receiver) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
-            .name("playlist-audio-clip-wav-render".to_owned())
+            .name("playlist-audio-clip-render".to_owned())
             .spawn(move || {
                 let _package_workspace = package_workspace;
-                let result = render_audio_clips_to_wav(
+                let result = render_audio_clips_to_file(
                     &document,
                     &project_path,
                     options,
                     &output_path_for_worker,
+                    output_format,
                 );
                 let _ = sender.send(result);
             });
