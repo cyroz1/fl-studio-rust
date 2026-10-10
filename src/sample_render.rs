@@ -316,7 +316,29 @@ pub fn stream_playlist_with_vst3_to_device(
     options: PlaylistRenderOptions,
     writer: &StreamingAudioWriter,
     cancelled: &AtomicBool,
+    vst3_processor: Option<Vst3PlaylistStreamProcessor>,
+) -> Result<PlaylistRenderSummary, String> {
+    stream_playlist_with_vst3_to_device_from_frame(
+        document,
+        project_path,
+        options,
+        writer,
+        cancelled,
+        vst3_processor,
+        0,
+    )
+}
+
+/// Stream the Playlist from a song-frame offset while rendering earlier frames silently so
+/// sampler voices and hosted instruments reach the requested position with their state intact.
+pub fn stream_playlist_with_vst3_to_device_from_frame(
+    document: &FlpDocument,
+    project_path: impl AsRef<Path>,
+    options: PlaylistRenderOptions,
+    writer: &StreamingAudioWriter,
+    cancelled: &AtomicBool,
     mut vst3_processor: Option<Vst3PlaylistStreamProcessor>,
+    start_frame: u64,
 ) -> Result<PlaylistRenderSummary, String> {
     let project_path = project_path.as_ref();
     let audio = prepare_audio_clip_render(
@@ -387,6 +409,7 @@ pub fn stream_playlist_with_vst3_to_device(
             .map_or(0, |summary| summary.unloaded_plugin_channels.len()),
     };
 
+    let mut frames_to_skip = start_frame.min(frames);
     summary.voices_stolen = stream_prepared_playlist_render(
         PreparedPlaylistBlockMix {
             audio: &audio,
@@ -397,7 +420,11 @@ pub fn stream_playlist_with_vst3_to_device(
         },
         cancelled,
         || writer.is_cancelled(),
-        |block| writer.write_stereo_samples(block),
+        |block| {
+            let skipped_frames = frames_to_skip.min((block.len() / 2) as u64) as usize;
+            frames_to_skip -= skipped_frames as u64;
+            writer.write_stereo_samples(&block[skipped_frames * 2..])
+        },
     )?;
     Ok(summary)
 }

@@ -308,7 +308,7 @@ impl PlaybackState {
         [samples[0] * gain, samples[1] * gain]
     }
 
-    fn start_streaming(&self) -> StreamingAudioWriter {
+    fn start_streaming(&self, initial_position_frames: u64) -> StreamingAudioWriter {
         self.stop();
         let playback = Arc::new(StreamingPlayback {
             ring: AudioRingBuffer::new(AUDIO_RING_CAPACITY),
@@ -317,7 +317,7 @@ impl PlaybackState {
             finished: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
             underrun_frames: AtomicU64::new(0),
-            consumed_frames: AtomicU64::new(0),
+            consumed_frames: AtomicU64::new(initial_position_frames),
         });
         self.streaming.store(Some(Arc::clone(&playback)));
         StreamingAudioWriter { playback }
@@ -566,10 +566,21 @@ impl AudioEngine {
     /// VST3 and other block processors can render on a worker thread while the shared or
     /// WASAPI-exclusive device callback pulls frames without allocating or locking.
     pub fn begin_streaming_playback(&self) -> Result<StreamingAudioWriter, String> {
+        self.begin_streaming_playback_from_frame(0)
+    }
+
+    /// Begin streaming playback with the device position initialized to a song-frame offset.
+    ///
+    /// The producer must omit audio before this frame from its stream. The offset keeps the
+    /// transport display and MIDI clock aligned with the requested song position.
+    pub fn begin_streaming_playback_from_frame(
+        &self,
+        start_frame: u64,
+    ) -> Result<StreamingAudioWriter, String> {
         if !self.output_active {
             return Err("Start an output device before streaming audio".into());
         }
-        let writer = self.playback.start_streaming();
+        let writer = self.playback.start_streaming(start_frame);
         self.source.store(AUDIO_SOURCE_STREAM, Ordering::Release);
         Ok(writer)
     }
@@ -614,7 +625,7 @@ impl AudioEngine {
             .unwrap_or(0)
     }
 
-    /// Number of project audio frames consumed by the device since the current play started.
+    /// Current song position in device frames, including a streaming seek offset when present.
     pub fn project_playback_position_frames(&self) -> u64 {
         self.playback.position_frames()
     }

@@ -23,7 +23,7 @@ use flp_rebuild::sample_render::{
     ResamplingQuality, SamplerPatternRenderOptions, SamplerPatternRenderSummary, WavChannelMode,
     WavDitherMode, WavSampleFormat, render_audio_clips_to_wav,
     render_playlist_with_vst3_to_wav_cancellable, render_sampler_pattern_to_wav,
-    stream_playlist_with_vst3_to_device, stream_sampler_pattern_to_device,
+    stream_playlist_with_vst3_to_device_from_frame, stream_sampler_pattern_to_device,
 };
 use flp_rebuild::vst3::{
     MAX_REPORTED_TAIL_SECONDS, Vst3HostRuntime, Vst3PatternRenderOptions, Vst3PatternStreamHandle,
@@ -1557,6 +1557,7 @@ struct DawUi {
     playing: bool,
     project_playback_loaded: bool,
     playlist_playback_loaded: bool,
+    playlist_seek_tick: u32,
     tempo_bpm: f64,
     selected_pattern: Option<u16>,
     channel_display_filter: ChannelDisplayFilter,
@@ -1896,6 +1897,7 @@ impl DawUi {
             playing: false,
             project_playback_loaded: false,
             playlist_playback_loaded: false,
+            playlist_seek_tick: 0,
             tempo_bpm: 140.0,
             selected_pattern: None,
             channel_display_filter: ChannelDisplayFilter::All,
@@ -4056,7 +4058,17 @@ impl DawUi {
                 return;
             }
         };
-        let writer = match engine.begin_streaming_playback() {
+        let start_frame = playlist_tick_to_frame(
+            self.playlist_seek_tick,
+            self.document
+                .as_ref()
+                .expect("project was checked above")
+                .header()
+                .ppq(),
+            self.tempo_bpm,
+            sample_rate,
+        );
+        let writer = match engine.begin_streaming_playback_from_frame(start_frame) {
             Ok(writer) => writer,
             Err(error) => {
                 self.status = format!("Could not start Playlist audio output: {error}");
@@ -4072,13 +4084,14 @@ impl DawUi {
                 let result = FlpDocument::parse(&project_bytes)
                     .map_err(|error| error.to_string())
                     .and_then(|document| {
-                        stream_playlist_with_vst3_to_device(
+                        stream_playlist_with_vst3_to_device_from_frame(
                             &document,
                             &project_path,
                             options,
                             &writer,
                             &worker_cancelled,
                             vst3_processor,
+                            start_frame,
                         )
                     });
                 writer.finish();
@@ -4289,6 +4302,7 @@ impl DawUi {
         self.playing = false;
         self.project_playback_loaded = false;
         self.playlist_playback_loaded = false;
+        self.playlist_seek_tick = 0;
     }
 
     fn reap_vst3_workers(&mut self) {
@@ -4828,10 +4842,13 @@ impl DawUi {
     }
 
     fn current_playhead_tick(&self) -> Option<f64> {
-        if !self.playlist_playback_loaded || !self.tempo_bpm.is_finite() || self.tempo_bpm <= 0.0 {
+        if !self.tempo_bpm.is_finite() || self.tempo_bpm <= 0.0 {
             return None;
         }
         let document = self.document.as_ref()?;
+        if !self.playlist_playback_loaded {
+            return (self.playlist_seek_tick > 0).then_some(f64::from(self.playlist_seek_tick));
+        }
         let engine = self.audio_engine.as_ref()?;
         let sample_rate = engine.sample_rate();
         if sample_rate == 0 {
@@ -7291,6 +7308,7 @@ impl DawUi {
         let mut join_clip_requested = None;
         let mut join_pattern_clip_requested = None;
         let mut merge_pattern_clips_requested = None;
+        let mut seek_tick_requested = None;
         ui.horizontal_wrapped(|ui| {
             ui.label("Arrangement");
             ui.strong(arrangement.name.as_deref().unwrap_or("Arrangement"));
@@ -7435,8 +7453,20 @@ impl DawUi {
                         FontId::proportional(10.0),
                         MUTED,
                     );
-                    let (ruler_rect, _) =
-                        ui.allocate_exact_size(Vec2::new(grid_width, 34.0), Sense::hover());
+                    let (ruler_rect, ruler_response) =
+                        ui.allocate_exact_size(Vec2::new(grid_width, 34.0), Sense::click());
+                    let ruler_response = ruler_response.on_hover_text("Click to move song position");
+                    if ruler_response.clicked_by(PointerButton::Primary)
+                        && let Some(pointer) = ruler_response.interact_pointer_pos()
+                    {
+                        seek_tick_requested = Some(
+                            ((pointer.x - ruler_rect.left()).max(0.0)
+                                / tick_scale.max(0.001))
+                            .round()
+                            .clamp(0.0, u32::MAX as f32)
+                                as u32,
+                        );
+                    }
                     let painter = ui.painter_at(ruler_rect);
                     painter.rect_filled(ruler_rect, 0, PANEL_DARK);
                     for (measure_tick, measure_number) in &measure_boundaries {
@@ -8184,6 +8214,20 @@ impl DawUi {
                     });
                 }
             });
+
+        if let Some(tick) = seek_tick_requested {
+            let restart_playback = self.playlist_playback_loaded && self.playing;
+            let stop_existing_playback =
+                self.playlist_playback_loaded || self.pending_audio_render.is_some();
+            if stop_existing_playback {
+                self.stop_project_playback();
+            }
+            self.playlist_seek_tick = tick;
+            self.status = format!("Song position set to tick {tick}");
+            if restart_playback {
+                self.start_project_playback();
+            }
+        }
 
         for (track_id, edit) in playlist_track_edits_requested {
             let result = self
@@ -21098,6 +21142,19 @@ fn playlist_bar_ticks(ppq: u16, time_signature: (u8, u8)) -> u64 {
     .max(1)
 }
 
+fn playlist_tick_to_frame(tick: u32, ppq: u16, tempo_bpm: f64, sample_rate: u32) -> u64 {
+    if !tempo_bpm.is_finite() || tempo_bpm <= 0.0 || sample_rate == 0 {
+        return 0;
+    }
+    let frames =
+        f64::from(tick) * 60.0 * f64::from(sample_rate) / (tempo_bpm * f64::from(ppq.max(1)));
+    if frames.is_finite() && frames > 0.0 {
+        frames.round() as u64
+    } else {
+        0
+    }
+}
+
 fn playlist_signature_at_tick(
     initial_time_signature: Option<(u8, u8)>,
     signature_changes: &[(u32, u8, u8)],
@@ -21710,6 +21767,15 @@ mod tests {
             playlist_signature_at_tick(Some((4, 4)), &[(384, 3, 4), (768, 5, 8)], 768),
             (5, 8)
         );
+    }
+
+    #[test]
+    fn playlist_seek_tick_converts_to_song_frames() {
+        assert_eq!(playlist_tick_to_frame(384, 96, 120.0, 48_000), 96_000);
+        assert_eq!(playlist_tick_to_frame(0, 96, 120.0, 48_000), 0);
+        assert_eq!(playlist_tick_to_frame(384, 0, 120.0, 48_000), 96_000);
+        assert_eq!(playlist_tick_to_frame(384, 96, 0.0, 48_000), 0);
+        assert_eq!(playlist_tick_to_frame(384, 96, 120.0, 0), 0);
     }
 
     #[test]
