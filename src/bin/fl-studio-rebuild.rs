@@ -11201,8 +11201,6 @@ impl DawUi {
             _ => Vec::new(),
         };
         ui.horizontal_wrapped(|ui| {
-            ui.strong("Piano roll");
-            ui.separator();
             egui::ComboBox::from_id_salt("pattern-picker")
                 .selected_text(format!("Pattern {}", self.selected_pattern.unwrap_or(0)))
                 .show_ui(ui, |ui| {
@@ -11218,8 +11216,8 @@ impl DawUi {
                     }
                 });
             if ui
-                .button("Time signatures…")
-                .on_hover_text("Edit this Pattern's signatures (Shift+Ctrl/Cmd+P)")
+                .button("Meter")
+                .on_hover_text("Pattern time signatures (Shift+Ctrl/Cmd+P)")
                 .clicked()
             {
                 self.pattern_time_signature_dialog_open = true;
@@ -11247,47 +11245,7 @@ impl DawUi {
                         ui.selectable_value(&mut self.piano_roll_snap, snap, snap.label());
                     }
                 });
-            egui::ComboBox::from_id_salt("piano-roll-edit-scope")
-                .selected_text(format!("Edit: {}", self.piano_roll_edit_scope.label()))
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.piano_roll_edit_scope,
-                        PianoRollEditScope::Automatic,
-                        "Auto (selection if any)",
-                    );
-                    ui.selectable_value(
-                        &mut self.piano_roll_edit_scope,
-                        PianoRollEditScope::Channel,
-                        "Channel",
-                    );
-                    ui.selectable_value(
-                        &mut self.piano_roll_edit_scope,
-                        PianoRollEditScope::Selection,
-                        "Selected notes",
-                    );
-                });
-            egui::ComboBox::from_id_salt("piano-roll-scale-root")
-                .selected_text(format!(
-                    "Key: {}",
-                    PITCH_CLASSES[self.piano_roll_scale_root as usize]
-                ))
-                .show_ui(ui, |ui| {
-                    for (root, label) in PITCH_CLASSES.iter().enumerate() {
-                        ui.selectable_value(&mut self.piano_roll_scale_root, root as u8, *label);
-                    }
-                });
-            egui::ComboBox::from_id_salt("piano-roll-scale")
-                .selected_text(format!("Scale: {}", self.piano_roll_scale.label()))
-                .show_ui(ui, |ui| {
-                    for scale in PianoRollScale::ALL {
-                        ui.selectable_value(&mut self.piano_roll_scale, scale, scale.label());
-                    }
-                });
-            ui.checkbox(&mut self.piano_roll_ghost_channels, "Ghost channels");
-            ui.checkbox(
-                &mut self.piano_roll_color_by_midi_channel,
-                "Color by MIDI channel",
-            );
+            ui.separator();
             if ui
                 .selectable_label(
                     !self.piano_roll_paint_mode
@@ -11295,8 +11253,9 @@ impl DawUi {
                         && !self.piano_roll_zoom_mode
                         && !self.piano_roll_playback_mode
                         && !self.piano_roll_stamp_mode,
-                    "Draw (P)",
+                    "Draw",
                 )
+                .on_hover_text("Draw notes (P)")
                 .clicked()
             {
                 self.piano_roll_paint_mode = false;
@@ -11306,7 +11265,8 @@ impl DawUi {
                 self.piano_roll_stamp_mode = false;
             }
             if ui
-                .selectable_label(self.piano_roll_paint_mode, "Paint (B)")
+                .selectable_label(self.piano_roll_paint_mode, "Paint")
+                .on_hover_text("Paint notes (B)")
                 .clicked()
             {
                 self.piano_roll_paint_mode = !self.piano_roll_paint_mode;
@@ -11318,29 +11278,8 @@ impl DawUi {
                 }
             }
             if ui
-                .selectable_label(self.piano_roll_stamp_mode, "Stamp")
-                .clicked()
-            {
-                self.piano_roll_stamp_mode = !self.piano_roll_stamp_mode;
-                if self.piano_roll_stamp_mode {
-                    self.piano_roll_paint_mode = false;
-                    self.piano_roll_select_mode = false;
-                    self.piano_roll_zoom_mode = false;
-                    self.piano_roll_playback_mode = false;
-                }
-            }
-            egui::ComboBox::from_id_salt("piano-roll-chord-stamp")
-                .selected_text(format!("Chord: {}", self.piano_roll_chord_stamp.label()))
-                .show_ui(ui, |ui| {
-                    for stamp in PianoRollChordStamp::ALL {
-                        ui.selectable_value(&mut self.piano_roll_chord_stamp, stamp, stamp.label());
-                    }
-                });
-            if self.piano_roll_stamp_mode {
-                ui.checkbox(&mut self.piano_roll_stamp_only_one, "Only one");
-            }
-            if ui
-                .selectable_label(self.piano_roll_select_mode, "Select (E)")
+                .selectable_label(self.piano_roll_select_mode, "Select")
+                .on_hover_text("Select notes (E)")
                 .clicked()
             {
                 self.piano_roll_select_mode = !self.piano_roll_select_mode;
@@ -11351,15 +11290,71 @@ impl DawUi {
                     self.piano_roll_stamp_mode = false;
                 }
             }
+            ui.menu_button("Tools", |ui| {
+                if ui
+                    .selectable_label(self.piano_roll_stamp_mode, "Chord stamp")
+                    .clicked()
+                {
+                    self.piano_roll_stamp_mode = !self.piano_roll_stamp_mode;
+                    if self.piano_roll_stamp_mode {
+                        self.piano_roll_paint_mode = false;
+                        self.piano_roll_select_mode = false;
+                        self.piano_roll_zoom_mode = false;
+                        self.piano_roll_playback_mode = false;
+                    }
+                }
+                egui::ComboBox::from_id_salt("piano-roll-chord-stamp")
+                    .selected_text(format!("Chord: {}", self.piano_roll_chord_stamp.label()))
+                    .show_ui(ui, |ui| {
+                        for stamp in PianoRollChordStamp::ALL {
+                            ui.selectable_value(
+                                &mut self.piano_roll_chord_stamp,
+                                stamp,
+                                stamp.label(),
+                            );
+                        }
+                    });
+                if self.piano_roll_stamp_mode {
+                    ui.checkbox(&mut self.piano_roll_stamp_only_one, "Only one");
+                }
+                ui.separator();
+                if ui
+                    .selectable_label(self.piano_roll_zoom_mode, "Zoom tool (Z)")
+                    .clicked()
+                {
+                    self.piano_roll_zoom_mode = !self.piano_roll_zoom_mode;
+                    if self.piano_roll_zoom_mode {
+                        self.piano_roll_paint_mode = false;
+                        self.piano_roll_select_mode = false;
+                        self.piano_roll_playback_mode = false;
+                        self.piano_roll_stamp_mode = false;
+                    }
+                }
+                if ui
+                    .selectable_label(self.piano_roll_playback_mode, "Playback tool (Y)")
+                    .clicked()
+                {
+                    self.piano_roll_playback_mode = !self.piano_roll_playback_mode;
+                    if self.piano_roll_playback_mode {
+                        self.piano_roll_paint_mode = false;
+                        self.piano_roll_select_mode = false;
+                        self.piano_roll_zoom_mode = false;
+                        self.piano_roll_stamp_mode = false;
+                    }
+                }
+            });
             ui.menu_button("Selection", |ui| {
                 if ui.button("Select all notes (Ctrl/Cmd+A)").clicked() {
                     self.apply_piano_roll_selection_command(PianoRollSelectionCommand::All);
+                    ui.close();
                 }
                 if ui.button("Invert selection (Shift+I)").clicked() {
                     self.apply_piano_roll_selection_command(PianoRollSelectionCommand::Invert);
+                    ui.close();
                 }
                 if ui.button("Deselect notes (Ctrl/Cmd+D)").clicked() {
                     self.apply_piano_roll_selection_command(PianoRollSelectionCommand::Clear);
+                    ui.close();
                 }
                 if ui.button("Duplicate to right (Ctrl/Cmd+B)").clicked() {
                     duplicate_notes_requested = true;
@@ -11367,48 +11362,11 @@ impl DawUi {
                 }
             });
             if ui
-                .selectable_label(self.piano_roll_zoom_mode, "Zoom (Z)")
-                .clicked()
-            {
-                self.piano_roll_zoom_mode = !self.piano_roll_zoom_mode;
-                if self.piano_roll_zoom_mode {
-                    self.piano_roll_paint_mode = false;
-                    self.piano_roll_select_mode = false;
-                    self.piano_roll_playback_mode = false;
-                    self.piano_roll_stamp_mode = false;
-                }
-            }
-            if ui
-                .selectable_label(self.piano_roll_playback_mode, "Playback (Y)")
-                .clicked()
-            {
-                self.piano_roll_playback_mode = !self.piano_roll_playback_mode;
-                if self.piano_roll_playback_mode {
-                    self.piano_roll_paint_mode = false;
-                    self.piano_roll_select_mode = false;
-                    self.piano_roll_zoom_mode = false;
-                    self.piano_roll_stamp_mode = false;
-                }
-            }
-            if ui
                 .selectable_label(self.piano_roll_event_editor_open, "Events")
                 .on_hover_text("Show note properties below the grid (Shift+F cycles target)")
                 .clicked()
             {
                 self.piano_roll_event_editor_open = !self.piano_roll_event_editor_open;
-            }
-            if self.piano_roll_event_editor_open {
-                egui::ComboBox::from_id_salt("piano-roll-event-target")
-                    .selected_text(self.piano_roll_event_target.label())
-                    .show_ui(ui, |ui| {
-                        for target in PianoRollEventTarget::ALL {
-                            ui.selectable_value(
-                                &mut self.piano_roll_event_target,
-                                target,
-                                target.label(),
-                            );
-                        }
-                    });
             }
             let zoom_center = self
                 .piano_roll_grid_viewport
@@ -11432,167 +11390,328 @@ impl DawUi {
             if (zoom_slider_value - self.piano_roll_zoom).abs() > f32::EPSILON {
                 self.request_piano_roll_zoom(zoom_slider_value, zoom_center, zoom_center);
             }
-            let edit_selection_only = self.piano_roll_edit_scope == PianoRollEditScope::Selection
-                || (self.piano_roll_edit_scope == PianoRollEditScope::Automatic
-                    && !selected_quantize_indices.is_empty());
-            let edit_target = if edit_selection_only {
-                "selected"
-            } else {
-                "channel"
-            };
-            let edit_scope_available = self.selected_pattern.is_some()
-                && self.selected_note_channel.is_some()
-                && (self.piano_roll_edit_scope != PianoRollEditScope::Selection
-                    || !selected_quantize_indices.is_empty());
-            quantize_requested = ui
-                .add_enabled(
-                    self.selected_pattern.is_some()
-                        && self.selected_note_channel.is_some()
-                        && self.piano_roll_snap != PianoRollSnap::None,
-                    egui::Button::new("Quantize channel"),
-                )
-                .clicked();
-            quantize_selected_requested = ui
-                .add_enabled(
-                    self.selected_pattern.is_some()
-                        && self.selected_note_channel.is_some()
-                        && self.piano_roll_snap != PianoRollSnap::None
-                        && !selected_quantize_indices.is_empty(),
-                    egui::Button::new(format!(
-                        "Quantize selected ({})",
-                        selected_quantize_indices.len()
-                    )),
-                )
-                .clicked();
-            legato_requested = ui
-                .add_enabled(
-                    edit_scope_available,
-                    egui::Button::new(format!("Legato {edit_target}")),
-                )
-                .clicked();
-            chop_requested = ui
-                .add_enabled(
-                    edit_scope_available,
-                    egui::Button::new(format!("Chop {edit_target}")),
-                )
-                .clicked();
-            glue_requested = ui
-                .add_enabled(
-                    edit_scope_available,
-                    egui::Button::new(format!("Glue {edit_target}")),
-                )
-                .clicked();
-            flip_requested = ui
-                .add_enabled(
-                    edit_scope_available,
-                    egui::Button::new(format!("Flip {edit_target}")),
-                )
-                .clicked();
-            strum_requested = ui
-                .add_enabled(
-                    edit_scope_available,
-                    egui::Button::new(format!("Strum {edit_target}")),
-                )
-                .clicked();
-            flam_requested = ui
-                .add_enabled(
-                    edit_scope_available,
-                    egui::Button::new(format!("Flam {edit_target}")),
-                )
-                .clicked();
-            randomize_requested = ui
-                .add_enabled(
-                    edit_scope_available,
-                    egui::Button::new(format!("Randomize {edit_target}")),
-                )
-                .clicked();
-            humanize_requested = ui
-                .add_enabled(
-                    edit_scope_available,
-                    egui::Button::new(format!("Humanize {edit_target}")),
-                )
-                .clicked();
-            limit_requested = ui
-                .add_enabled(
-                    edit_scope_available,
-                    egui::Button::new(format!("Limit {edit_target}")),
-                )
-                .clicked();
-            arpeggiate_requested = ui
-                .add_enabled(
-                    edit_scope_available,
-                    egui::Button::new(format!("Arpeggiate {edit_target}")),
-                )
-                .clicked();
-            slice_requested = ui
-                .add_enabled(
-                    edit_scope_available,
-                    egui::Button::new(format!("Slice {edit_target}")),
-                )
-                .clicked();
-            egui::ComboBox::from_id_salt("midi-channel-mapping")
-                .selected_text(match self.midi_channel_mapping {
-                    MidiChannelMapping::PreserveNoteChannels => "MIDI channels: Stored",
-                    MidiChannelMapping::AssignProjectChannels => "MIDI channels: Per channel",
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.midi_channel_mapping,
-                        MidiChannelMapping::PreserveNoteChannels,
-                        "Stored note channels",
-                    );
-                    ui.selectable_value(
-                        &mut self.midi_channel_mapping,
-                        MidiChannelMapping::AssignProjectChannels,
-                        "One per FL channel",
-                    );
+        });
+
+        let edit_selection_only = self.piano_roll_edit_scope == PianoRollEditScope::Selection
+            || (self.piano_roll_edit_scope == PianoRollEditScope::Automatic
+                && !selected_quantize_indices.is_empty());
+        let edit_target = if edit_selection_only {
+            "selected"
+        } else {
+            "channel"
+        };
+        let edit_scope_available = self.selected_pattern.is_some()
+            && self.selected_note_channel.is_some()
+            && (self.piano_roll_edit_scope != PianoRollEditScope::Selection
+                || !selected_quantize_indices.is_empty());
+        let selected_note_count = self
+            .selected_pattern
+            .map(|pattern_id| {
+                self.selected_piano_notes
+                    .iter()
+                    .filter(|(selected_pattern, _, _)| *selected_pattern == pattern_id)
+                    .count()
+            })
+            .unwrap_or(0);
+        let has_loaded_instrument = self
+            .selected_note_channel
+            .is_some_and(|channel_id| self.channel_vst3_instances.contains_key(&channel_id));
+
+        ui.horizontal_wrapped(|ui| {
+            ui.menu_button("Edit", |ui| {
+                egui::ComboBox::from_id_salt("piano-roll-edit-scope")
+                    .selected_text(format!("Edit: {}", self.piano_roll_edit_scope.label()))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.piano_roll_edit_scope,
+                            PianoRollEditScope::Automatic,
+                            "Auto (selection if any)",
+                        );
+                        ui.selectable_value(
+                            &mut self.piano_roll_edit_scope,
+                            PianoRollEditScope::Channel,
+                            "Channel",
+                        );
+                        ui.selectable_value(
+                            &mut self.piano_roll_edit_scope,
+                            PianoRollEditScope::Selection,
+                            "Selected notes",
+                        );
+                    });
+                ui.menu_button("Quantize", |ui| {
+                    if ui
+                        .add_enabled(
+                            self.selected_pattern.is_some()
+                                && self.selected_note_channel.is_some()
+                                && self.piano_roll_snap != PianoRollSnap::None,
+                            egui::Button::new("Channel notes"),
+                        )
+                        .clicked()
+                    {
+                        quantize_requested = true;
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.selected_pattern.is_some()
+                                && self.selected_note_channel.is_some()
+                                && self.piano_roll_snap != PianoRollSnap::None
+                                && !selected_quantize_indices.is_empty(),
+                            egui::Button::new(format!(
+                                "Selected notes ({})",
+                                selected_quantize_indices.len()
+                            )),
+                        )
+                        .clicked()
+                    {
+                        quantize_selected_requested = true;
+                        ui.close();
+                    }
                 });
-            export_midi_requested = ui
-                .add_enabled(
-                    self.selected_pattern.is_some(),
-                    egui::Button::new("Export pattern MIDI…"),
-                )
-                .clicked();
-            add_note_requested = ui
-                .add_enabled(
-                    self.selected_note_channel.is_some(),
-                    egui::Button::new("Add note"),
-                )
-                .clicked();
-            let has_loaded_instrument = self
-                .selected_note_channel
-                .is_some_and(|channel_id| self.channel_vst3_instances.contains_key(&channel_id));
-            render_requested = ui
-                .add_enabled(
-                    has_loaded_instrument && self.selected_pattern.is_some(),
-                    egui::Button::new("Render WAV…"),
-                )
-                .clicked();
-            preview_requested = ui
-                .add_enabled(
-                    has_loaded_instrument && self.selected_pattern.is_some(),
-                    egui::Button::new("Preview VST3"),
-                )
-                .clicked();
-            sampler_preview_requested = ui
-                .add_enabled(has_sampler_notes, egui::Button::new("Preview Samplers"))
-                .clicked();
-            open_midi_requested = ui.button("Open MIDI…").clicked();
-            let selected_note_count = self
-                .selected_pattern
-                .map(|pattern_id| {
-                    self.selected_piano_notes
-                        .iter()
-                        .filter(|(selected_pattern, _, _)| *selected_pattern == pattern_id)
-                        .count()
-                })
-                .unwrap_or(0);
-            delete_selection_requested = ui
-                .add_enabled(
-                    selected_note_count > 0,
-                    egui::Button::new(format!("Delete selection ({selected_note_count})")),
-                )
-                .clicked();
+                ui.menu_button("Transform", |ui| {
+                    if ui
+                        .add_enabled(
+                            edit_scope_available,
+                            egui::Button::new(format!("Legato {edit_target}")),
+                        )
+                        .clicked()
+                    {
+                        legato_requested = true;
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            edit_scope_available,
+                            egui::Button::new(format!("Chop {edit_target}")),
+                        )
+                        .clicked()
+                    {
+                        chop_requested = true;
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            edit_scope_available,
+                            egui::Button::new(format!("Glue {edit_target}")),
+                        )
+                        .clicked()
+                    {
+                        glue_requested = true;
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            edit_scope_available,
+                            egui::Button::new(format!("Flip {edit_target}")),
+                        )
+                        .clicked()
+                    {
+                        flip_requested = true;
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            edit_scope_available,
+                            egui::Button::new(format!("Strum {edit_target}")),
+                        )
+                        .clicked()
+                    {
+                        strum_requested = true;
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            edit_scope_available,
+                            egui::Button::new(format!("Flam {edit_target}")),
+                        )
+                        .clicked()
+                    {
+                        flam_requested = true;
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            edit_scope_available,
+                            egui::Button::new(format!("Randomize {edit_target}")),
+                        )
+                        .clicked()
+                    {
+                        randomize_requested = true;
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            edit_scope_available,
+                            egui::Button::new(format!("Humanize {edit_target}")),
+                        )
+                        .clicked()
+                    {
+                        humanize_requested = true;
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            edit_scope_available,
+                            egui::Button::new(format!("Limit {edit_target}")),
+                        )
+                        .clicked()
+                    {
+                        limit_requested = true;
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            edit_scope_available,
+                            egui::Button::new(format!("Arpeggiate {edit_target}")),
+                        )
+                        .clicked()
+                    {
+                        arpeggiate_requested = true;
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            edit_scope_available,
+                            egui::Button::new(format!("Slice {edit_target}")),
+                        )
+                        .clicked()
+                    {
+                        slice_requested = true;
+                        ui.close();
+                    }
+                });
+                ui.separator();
+                if ui
+                    .add_enabled(
+                        selected_note_count > 0,
+                        egui::Button::new(format!("Delete selected notes ({selected_note_count})")),
+                    )
+                    .clicked()
+                {
+                    delete_selection_requested = true;
+                    ui.close();
+                }
+                if ui.button("Duplicate to right (Ctrl/Cmd+B)").clicked() {
+                    duplicate_notes_requested = true;
+                    ui.close();
+                }
+            });
+            ui.menu_button("View", |ui| {
+                egui::ComboBox::from_id_salt("piano-roll-scale-root")
+                    .selected_text(format!(
+                        "Key: {}",
+                        PITCH_CLASSES[self.piano_roll_scale_root as usize]
+                    ))
+                    .show_ui(ui, |ui| {
+                        for (root, label) in PITCH_CLASSES.iter().enumerate() {
+                            ui.selectable_value(
+                                &mut self.piano_roll_scale_root,
+                                root as u8,
+                                *label,
+                            );
+                        }
+                    });
+                egui::ComboBox::from_id_salt("piano-roll-scale")
+                    .selected_text(format!("Scale: {}", self.piano_roll_scale.label()))
+                    .show_ui(ui, |ui| {
+                        for scale in PianoRollScale::ALL {
+                            ui.selectable_value(&mut self.piano_roll_scale, scale, scale.label());
+                        }
+                    });
+                ui.checkbox(&mut self.piano_roll_ghost_channels, "Ghost channels");
+                ui.checkbox(
+                    &mut self.piano_roll_color_by_midi_channel,
+                    "Color by MIDI channel",
+                );
+                if self.piano_roll_event_editor_open {
+                    egui::ComboBox::from_id_salt("piano-roll-event-target")
+                        .selected_text(self.piano_roll_event_target.label())
+                        .show_ui(ui, |ui| {
+                            for target in PianoRollEventTarget::ALL {
+                                ui.selectable_value(
+                                    &mut self.piano_roll_event_target,
+                                    target,
+                                    target.label(),
+                                );
+                            }
+                        });
+                }
+            });
+            ui.menu_button("MIDI", |ui| {
+                egui::ComboBox::from_id_salt("midi-channel-mapping")
+                    .selected_text(match self.midi_channel_mapping {
+                        MidiChannelMapping::PreserveNoteChannels => "Channels: Stored",
+                        MidiChannelMapping::AssignProjectChannels => "Channels: Per FL channel",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.midi_channel_mapping,
+                            MidiChannelMapping::PreserveNoteChannels,
+                            "Stored note channels",
+                        );
+                        ui.selectable_value(
+                            &mut self.midi_channel_mapping,
+                            MidiChannelMapping::AssignProjectChannels,
+                            "One per FL channel",
+                        );
+                    });
+                if ui
+                    .add_enabled(
+                        self.selected_pattern.is_some(),
+                        egui::Button::new("Export pattern MIDI…"),
+                    )
+                    .clicked()
+                {
+                    export_midi_requested = true;
+                    ui.close();
+                }
+                if ui.button("Open MIDI…").clicked() {
+                    open_midi_requested = true;
+                    ui.close();
+                }
+            });
+            ui.menu_button("Audio", |ui| {
+                if ui
+                    .add_enabled(
+                        self.selected_note_channel.is_some(),
+                        egui::Button::new("Add note"),
+                    )
+                    .clicked()
+                {
+                    add_note_requested = true;
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        has_loaded_instrument && self.selected_pattern.is_some(),
+                        egui::Button::new("Render WAV…"),
+                    )
+                    .clicked()
+                {
+                    render_requested = true;
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        has_loaded_instrument && self.selected_pattern.is_some(),
+                        egui::Button::new("Preview VST3"),
+                    )
+                    .clicked()
+                {
+                    preview_requested = true;
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(has_sampler_notes, egui::Button::new("Preview Samplers"))
+                    .clicked()
+                {
+                    sampler_preview_requested = true;
+                    ui.close();
+                }
+            });
+            if selected_note_count > 0 {
+                ui.small(format!("{selected_note_count} selected"));
+            }
         });
 
         if selection_pattern_before_toolbar != self.selected_pattern
