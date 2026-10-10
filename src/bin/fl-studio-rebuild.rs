@@ -1493,6 +1493,9 @@ struct DawUi {
     project_settings_play_truncated: bool,
     project_settings_fast_declick: bool,
     project_settings_pan_law_raw: u8,
+    project_settings_time_signature_enabled: bool,
+    project_settings_time_signature_numerator: u8,
+    project_settings_time_signature_denominator: u8,
     playlist_render_options_open: bool,
     playlist_render_format: WavSampleFormat,
     playlist_render_dither: bool,
@@ -1812,6 +1815,9 @@ impl DawUi {
             project_settings_play_truncated: false,
             project_settings_fast_declick: false,
             project_settings_pan_law_raw: 0,
+            project_settings_time_signature_enabled: false,
+            project_settings_time_signature_numerator: 4,
+            project_settings_time_signature_denominator: 4,
             playlist_render_options_open: false,
             playlist_render_format: WavSampleFormat::Float32,
             playlist_render_dither: false,
@@ -2155,6 +2161,15 @@ impl DawUi {
                     self.project_settings_fast_declick = false;
                 }
                 self.project_settings_pan_law_raw = document.metadata().pan_law_raw().unwrap_or(0);
+                if let Some((numerator, denominator)) = document.metadata().time_signature() {
+                    self.project_settings_time_signature_enabled = true;
+                    self.project_settings_time_signature_numerator = numerator;
+                    self.project_settings_time_signature_denominator = denominator;
+                } else {
+                    self.project_settings_time_signature_enabled = false;
+                    self.project_settings_time_signature_numerator = 4;
+                    self.project_settings_time_signature_denominator = 4;
+                }
                 self.selected_pattern = document
                     .patterns()
                     .ok()
@@ -2930,6 +2945,15 @@ impl DawUi {
             self.project_settings_fast_declick = false;
         }
         self.project_settings_pan_law_raw = document.metadata().pan_law_raw().unwrap_or(0);
+        if let Some((numerator, denominator)) = document.metadata().time_signature() {
+            self.project_settings_time_signature_enabled = true;
+            self.project_settings_time_signature_numerator = numerator;
+            self.project_settings_time_signature_denominator = denominator;
+        } else {
+            self.project_settings_time_signature_enabled = false;
+            self.project_settings_time_signature_numerator = 4;
+            self.project_settings_time_signature_denominator = 4;
+        }
         self.project_settings_open = true;
     }
 
@@ -2946,6 +2970,10 @@ impl DawUi {
                 .project_settings_advanced_supported
                 .then_some(self.project_settings_fast_declick),
             pan_law_raw: Some(self.project_settings_pan_law_raw),
+            time_signature: self.project_settings_time_signature_enabled.then_some((
+                self.project_settings_time_signature_numerator,
+                self.project_settings_time_signature_denominator,
+            )),
         }) {
             Ok(()) => {
                 self.dirty = true;
@@ -3038,6 +3066,38 @@ impl DawUi {
                             );
                         });
                 });
+                ui.separator();
+                if self.project_settings_time_signature_enabled {
+                    ui.horizontal(|ui| {
+                        ui.label("Project time signature");
+                        ui.add(
+                            egui::DragValue::new(
+                                &mut self.project_settings_time_signature_numerator,
+                            )
+                            .range(1..=u8::MAX),
+                        );
+                        ui.label("/");
+                        ui.add(
+                            egui::DragValue::new(
+                                &mut self.project_settings_time_signature_denominator,
+                            )
+                            .range(1..=u8::MAX),
+                        );
+                    });
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.label("Project time signature");
+                        if ui.button("Set as time signature…").clicked() {
+                            self.project_settings_time_signature_enabled = true;
+                        }
+                    });
+                    ui.label(
+                        egui::RichText::new(
+                            "No unique project signature is stored; time division or marker settings apply.",
+                        )
+                        .color(MUTED),
+                    );
+                }
                 ui.horizontal(|ui| {
                     if ui.button("Apply").clicked() {
                         apply = true;
@@ -3324,6 +3384,15 @@ impl DawUi {
                 self.project_settings_fast_declick = false;
             }
             self.project_settings_pan_law_raw = document.metadata().pan_law_raw().unwrap_or(0);
+            if let Some((numerator, denominator)) = document.metadata().time_signature() {
+                self.project_settings_time_signature_enabled = true;
+                self.project_settings_time_signature_numerator = numerator;
+                self.project_settings_time_signature_denominator = denominator;
+            } else {
+                self.project_settings_time_signature_enabled = false;
+                self.project_settings_time_signature_numerator = 4;
+                self.project_settings_time_signature_denominator = 4;
+            }
             let patterns = document.patterns().unwrap_or_default();
             if self
                 .selected_pattern

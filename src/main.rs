@@ -266,6 +266,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                         "Fast declick setting",
                     )?,
                     pan_law_raw: parse_optional_u8(pan_law, "raw pan law")?,
+                    ..ProjectSettingsEdit::default()
                 },
             )
         }
@@ -284,6 +285,21 @@ fn run(args: Vec<String>) -> Result<(), String> {
                         fast_declick,
                         "Fast declick setting",
                     )?,
+                    ..ProjectSettingsEdit::default()
+                },
+            )
+        }
+        [command, input, output, numerator, denominator]
+            if command == "set-project-time-signature" =>
+        {
+            write_project_settings(
+                Path::new(input),
+                Path::new(output),
+                ProjectSettingsEdit {
+                    time_signature: Some((
+                        parse_u8(numerator, "time-signature numerator")?,
+                        parse_u8(denominator, "time-signature denominator")?,
+                    )),
                     ..ProjectSettingsEdit::default()
                 },
             )
@@ -800,6 +816,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild create-pattern <input.flp> <output.flp>\n",
             "  flp-rebuild set-project-info <input.flp> <output.flp> <title|-> <author|-> <genre|-> <comments|-> <web-link|->\n",
             "  flp-rebuild set-project-settings <input.flp> <output.flp> <play-truncated:0|1|-> <fast-declick:0|1|-> [pan-law-raw|-]\n",
+            "  flp-rebuild set-project-time-signature <input.flp> <output.flp> <numerator> <denominator>\n",
             "  flp-rebuild set-global-swing <input.flp> <output.flp> <percent-0..100>\n",
             "  flp-rebuild rename-channel <input.flp> <output.flp> <channel-id> <name>\n",
             "  flp-rebuild set-channel-color <input.flp> <output.flp> <channel-id> <RRGGBB>\n",
@@ -1280,6 +1297,12 @@ fn show_project_settings(path: &Path) -> Result<(), String> {
         Some(2) => println!("pan law: Triangular (raw 2)"),
         Some(raw) => println!("pan law: unknown (raw {raw})"),
         None => println!("pan law: Circular (default; event absent or ambiguous)"),
+    }
+    match document.metadata().time_signature() {
+        Some((numerator, denominator)) => {
+            println!("project time signature: {numerator}/{denominator}");
+        }
+        None => println!("project time signature: not uniquely stored"),
     }
     Ok(())
 }

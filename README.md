@@ -55,6 +55,7 @@ flp-rebuild set-tempo <input.flp> <output.flp> <bpm>
 flp-rebuild create-pattern <input.flp> <output.flp>
 flp-rebuild set-project-info <input.flp> <output.flp> <title|-> <author|-> <genre|-> <comments|-> <web-link|->
 flp-rebuild set-project-settings <input.flp> <output.flp> <play-truncated:0|1|-> <fast-declick:0|1|-> [pan-law-raw|-]
+flp-rebuild set-project-time-signature <input.flp> <output.flp> <numerator> <denominator>
 flp-rebuild set-global-swing <input.flp> <output.flp> <percent-0..100>
 flp-rebuild rename-channel <input.flp> <output.flp> <channel-id> <name>
 flp-rebuild set-channel-color <input.flp> <output.flp> <channel-id> <RRGGBB>
@@ -116,7 +117,7 @@ The desktop executable also accepts an `.flp` path as its first argument to open
 
 The **Project Info…** control edits the project's title, author, genre, comments, and web link. `project-info` prints those fields; `set-project-info` accepts `-` for fields to leave unchanged and an empty quoted string to clear a field. Missing fields are inserted before the first channel marker, and all other event bytes remain unchanged.
 
-The **Project settings…** control edits the currently mapped Advanced options: “Play truncated notes in clips” and “Fast declick for cut groups.” It also reads and edits project pan law: Circular (`0`, the default) or Triangular (`2`). `project-settings` prints the mapped values; `set-project-settings` accepts `0`, `1`, or `-` for each Advanced field and an optional raw pan-law byte (or `-`). The Channel Rack also reads and edits its global swing amount through the `0x0B` project event; `global-swing` reports it and `set-global-swing` accepts 0–100 percent. Supported Pattern playback shifts every second 16th-step onset using the combined global and source-channel swing mix. The one-third-step maximum is an inferred triplet mapping and still needs comparison with native FL Studio audio. Master pitch, metronome, recording settings, and the remaining project controls are not yet decoded.
+The **Project settings…** control edits the currently mapped Advanced options: “Play truncated notes in clips” and “Fast declick for cut groups.” It also reads and edits project pan law: Circular (`0`, the default) or Triangular (`2`), and the project-wide time signature. `project-settings` prints the mapped values; `set-project-settings` accepts `0`, `1`, or `-` for each Advanced field and an optional raw pan-law byte (or `-`). `set-project-time-signature` writes the project numerator and denominator. These are the project defaults; Playlist and Pattern time signatures are separate. The Channel Rack also reads and edits its global swing amount through the `0x0B` project event; `global-swing` reports it and `set-global-swing` accepts 0–100 percent. Supported Pattern playback shifts every second 16th-step onset using the combined global and source-channel swing mix. The one-third-step maximum is an inferred triplet mapping and still needs comparison with native FL Studio audio. Master pitch, metronome, recording settings, and the remaining project controls are not yet decoded.
 
 `create-pattern` adds an empty pattern after the highest recognized pattern ID. It only works when the project has a unique, recognized `D0` or `E0` note-event encoding; ambiguous or unrecognized layouts are refused without editing the source.
 

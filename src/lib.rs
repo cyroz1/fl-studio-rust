@@ -344,6 +344,8 @@ pub struct ProjectSettingsEdit {
     pub fast_declick_for_cut_groups: Option<bool>,
     /// Raw project pan-law value from the global `0x17` byte event.
     pub pan_law_raw: Option<u8>,
+    /// Project time-signature numerator and denominator from global `0x11`/`0x12` events.
+    pub time_signature: Option<(u8, u8)>,
 }
 
 /// A known FL channel kind, while retaining unrecognized raw values.
@@ -6512,9 +6514,17 @@ impl FlpDocument {
 
     /// Updates the supported Project settings while preserving unrelated FLP events.
     pub fn set_project_settings(&mut self, edit: ProjectSettingsEdit) -> Result<(), FlpError> {
+        if edit
+            .time_signature
+            .is_some_and(|(numerator, denominator)| numerator == 0 || denominator == 0)
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "project time-signature numerator and denominator must be positive",
+            ));
+        }
         let advanced_edit = edit.play_truncated_notes_in_clips.is_some()
             || edit.fast_declick_for_cut_groups.is_some();
-        if !advanced_edit && edit.pan_law_raw.is_none() {
+        if !advanced_edit && edit.pan_law_raw.is_none() && edit.time_signature.is_none() {
             return Ok(());
         }
         let mut candidate = self.clone();
@@ -6585,6 +6595,66 @@ impl FlpDocument {
                 candidate
                     .events
                     .insert(channel_start, FlpEvent::new_byte(0x17, pan_law_raw));
+            }
+        }
+
+        if let Some((numerator, denominator)) = edit.time_signature {
+            let channel_start = candidate
+                .events
+                .iter()
+                .position(|event| event.opcode == 0x40)
+                .unwrap_or(candidate.events.len());
+            let mut numerator_event = None;
+            let mut denominator_event = None;
+            for (index, event) in candidate.events.iter().take(channel_start).enumerate() {
+                let slot = match event.opcode {
+                    0x11 => &mut numerator_event,
+                    0x12 => &mut denominator_event,
+                    _ => continue,
+                };
+                if slot.is_some() {
+                    return Err(FlpError::UnsupportedEdit(
+                        "the project has duplicate global time-signature events",
+                    ));
+                }
+                if event.encoding != PayloadEncoding::Byte
+                    || event.payload.len() != 1
+                    || event.payload[0] == 0
+                {
+                    return Err(FlpError::UnsupportedEdit(
+                        "a global time-signature event has an invalid byte value",
+                    ));
+                }
+                *slot = Some(index);
+            }
+
+            if let Some(index) = numerator_event {
+                candidate.events[index].replace_byte_payload(numerator)?;
+            }
+            if let Some(index) = denominator_event {
+                candidate.events[index].replace_byte_payload(denominator)?;
+            }
+            if numerator_event.is_none() {
+                let insert_index = denominator_event.unwrap_or(channel_start);
+                candidate
+                    .events
+                    .insert(insert_index, FlpEvent::new_byte(0x11, numerator));
+            }
+            if denominator_event.is_none() {
+                let new_channel_start = candidate
+                    .events
+                    .iter()
+                    .position(|event| event.opcode == 0x40)
+                    .unwrap_or(candidate.events.len());
+                let numerator_index = candidate
+                    .events
+                    .iter()
+                    .take(new_channel_start)
+                    .position(|event| event.opcode == 0x11)
+                    .unwrap_or(new_channel_start);
+                candidate
+                    .events
+                    .insert(numerator_index + 1, FlpEvent::new_byte(0x12, denominator));
             }
         }
         candidate.refresh_event_offsets()?;
@@ -8553,6 +8623,8 @@ fn read_project_metadata(events: &[FlpEvent], project_version: Option<&str>) -> 
     let mut legacy_fine_tempo = 0u32;
     let mut numerator = None;
     let mut denominator = None;
+    let mut duplicate_time_signature_events = false;
+    let mut invalid_time_signature_event = false;
     let mut global_swing_mix = None;
     let mut pan_law_event = None;
     let mut duplicate_pan_law_events = false;
@@ -8569,8 +8641,23 @@ fn read_project_metadata(events: &[FlpEvent], project_version: Option<&str>) -> 
 
     for (event_index, event) in events.iter().enumerate() {
         match event.opcode {
-            0x11 if event.payload.len() == 1 => numerator = Some(event.payload[0]),
-            0x12 if event.payload.len() == 1 => denominator = Some(event.payload[0]),
+            0x11 | 0x12 if event_index < channel_start => {
+                let slot = if event.opcode == 0x11 {
+                    &mut numerator
+                } else {
+                    &mut denominator
+                };
+                if slot.is_some() {
+                    duplicate_time_signature_events = true;
+                } else if event.encoding != PayloadEncoding::Byte
+                    || event.payload.len() != 1
+                    || event.payload[0] == 0
+                {
+                    invalid_time_signature_event = true;
+                } else {
+                    *slot = Some(event.payload[0]);
+                }
+            }
             0x0B if event_index < channel_start
                 && event.encoding == PayloadEncoding::Byte
                 && event.payload.len() == 1
@@ -8630,7 +8717,11 @@ fn read_project_metadata(events: &[FlpEvent], project_version: Option<&str>) -> 
         }
     }
 
-    let time_signature = numerator.zip(denominator);
+    let time_signature = if duplicate_time_signature_events || invalid_time_signature_event {
+        None
+    } else {
+        numerator.zip(denominator)
+    };
     let pan_law_raw = if duplicate_pan_law_events {
         None
     } else {
@@ -9217,6 +9308,7 @@ mod tests {
                 play_truncated_notes_in_clips: Some(false),
                 fast_declick_for_cut_groups: Some(false),
                 pan_law_raw: Some(0),
+                ..ProjectSettingsEdit::default()
             })
             .expect("supported Project settings should be editable");
         assert_eq!(
@@ -9243,6 +9335,7 @@ mod tests {
                 play_truncated_notes_in_clips: Some(true),
                 fast_declick_for_cut_groups: Some(true),
                 pan_law_raw: Some(2),
+                ..ProjectSettingsEdit::default()
             })
             .expect("settings should be re-enabled");
         let encoded = document.encode_lossless().expect("document should encode");
@@ -9256,6 +9349,129 @@ mod tests {
         );
         assert_eq!(reparsed.metadata().pan_law_raw(), Some(2));
         assert_eq!(reparsed.trailing_bytes(), &[0xD1, 0xD2]);
+    }
+
+    #[test]
+    fn project_time_signature_edits_preserve_other_events_and_roundtrip() {
+        let original = flp_fixture(
+            &[0x11, 4, 0x12, 4, 0x20, 7, 0x40, 7, 0, 0x15, 0],
+            &[0xA1, 0xA2],
+            &[0xD1, 0xD2],
+        );
+        let mut document = FlpDocument::parse(&original).expect("fixture should parse");
+        assert_eq!(document.metadata().time_signature(), Some((4, 4)));
+        let unrelated_events: Vec<_> = document
+            .events()
+            .iter()
+            .filter(|event| !matches!(event.opcode(), 0x11 | 0x12))
+            .map(|event| event.wire_bytes().to_vec())
+            .collect();
+
+        document
+            .set_project_settings(ProjectSettingsEdit {
+                time_signature: Some((7, 8)),
+                ..ProjectSettingsEdit::default()
+            })
+            .expect("the global project time signature should be editable");
+        assert_eq!(document.metadata().time_signature(), Some((7, 8)));
+        assert_eq!(
+            document
+                .events()
+                .iter()
+                .filter(|event| !matches!(event.opcode(), 0x11 | 0x12))
+                .map(|event| event.wire_bytes().to_vec())
+                .collect::<Vec<_>>(),
+            unrelated_events
+        );
+
+        let encoded = document
+            .encode_lossless()
+            .expect("edited project should encode");
+        let reparsed = FlpDocument::parse(&encoded).expect("edited project should reparse");
+        assert_eq!(reparsed.metadata().time_signature(), Some((7, 8)));
+        assert_eq!(reparsed.trailing_bytes(), &[0xD1, 0xD2]);
+    }
+
+    #[test]
+    fn project_time_signature_can_be_added_before_channels_without_reading_channel_bytes() {
+        let original = flp_fixture(&[0x40, 7, 0, 0x11, 9, 0x12, 3, 0x15, 0], &[], &[0xD1]);
+        let mut document = FlpDocument::parse(&original).expect("fixture should parse");
+        assert_eq!(document.metadata().time_signature(), None);
+        let channel_events: Vec<_> = document
+            .events()
+            .iter()
+            .skip_while(|event| event.opcode() != 0x40)
+            .map(|event| event.wire_bytes().to_vec())
+            .collect();
+
+        document
+            .set_project_settings(ProjectSettingsEdit {
+                time_signature: Some((3, 8)),
+                ..ProjectSettingsEdit::default()
+            })
+            .expect("the project signature should be inserted before channel data");
+
+        assert_eq!(document.metadata().time_signature(), Some((3, 8)));
+        let first_channel = document
+            .events()
+            .iter()
+            .position(|event| event.opcode() == 0x40)
+            .expect("the channel marker should remain");
+        assert_eq!(
+            document.events()[..first_channel]
+                .iter()
+                .filter(|event| matches!(event.opcode(), 0x11 | 0x12))
+                .map(|event| (event.opcode(), event.payload()[0]))
+                .collect::<Vec<_>>(),
+            [(0x11, 3), (0x12, 8)]
+        );
+        assert_eq!(
+            document.events()[first_channel..]
+                .iter()
+                .map(|event| event.wire_bytes().to_vec())
+                .collect::<Vec<_>>(),
+            channel_events
+        );
+        let encoded = document
+            .encode_lossless()
+            .expect("edited project should encode");
+        assert_eq!(
+            FlpDocument::parse(&encoded)
+                .expect("edited project should reparse")
+                .metadata()
+                .time_signature(),
+            Some((3, 8))
+        );
+
+        for partial_events in [&[0x11, 4][..], &[0x12, 8][..]] {
+            let mut partial = FlpDocument::parse(&flp_fixture(partial_events, &[], &[]))
+                .expect("partial-signature fixture should parse");
+            partial
+                .set_project_settings(ProjectSettingsEdit {
+                    time_signature: Some((5, 16)),
+                    ..ProjectSettingsEdit::default()
+                })
+                .expect("a missing time-signature byte should be added");
+            assert_eq!(partial.metadata().time_signature(), Some((5, 16)));
+        }
+    }
+
+    #[test]
+    fn ambiguous_or_invalid_global_time_signatures_are_refused_without_mutation() {
+        for event_stream in [&[0x11, 4, 0x11, 3, 0x12, 4][..], &[0x11, 0, 0x12, 4][..]] {
+            let original = flp_fixture(event_stream, &[], &[0xD1]);
+            let mut document = FlpDocument::parse(&original).expect("fixture should parse");
+            assert_eq!(document.metadata().time_signature(), None);
+            assert!(
+                document
+                    .set_project_settings(ProjectSettingsEdit {
+                        time_signature: Some((5, 8)),
+                        ..ProjectSettingsEdit::default()
+                    })
+                    .is_err()
+            );
+            assert_eq!(document.encode_lossless().unwrap(), original);
+        }
     }
 
     #[test]
