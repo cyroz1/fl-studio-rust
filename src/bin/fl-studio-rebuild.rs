@@ -7739,19 +7739,37 @@ impl DawUi {
                                 label_rect.left_top() + Vec2::new(31.0, 3.0),
                                 Vec2::new(18.0, row_height - 6.0),
                             );
-                            let group_toggle = ui.put(
+                            let group_toggle = ui.interact(
                                 group_toggle_rect,
-                                egui::Button::new(
-                                    egui::RichText::new(if group_is_collapsed {
-                                        "▸"
-                                    } else {
-                                        "▾"
-                                    })
-                                    .size(11.0)
-                                    .color(MUTED),
-                                )
-                                .frame(false),
+                                Id::new(("playlist-group-toggle", arrangement.id, track_id)),
+                                Sense::click(),
                             );
+                            if group_toggle.hovered() {
+                                ui.painter().rect_filled(
+                                    group_toggle_rect,
+                                    3,
+                                    PANEL,
+                                );
+                            }
+                            let center = group_toggle_rect.center();
+                            let chevron = if group_is_collapsed {
+                                vec![
+                                    egui::pos2(center.x - 2.0, center.y - 4.0),
+                                    egui::pos2(center.x + 3.0, center.y),
+                                    egui::pos2(center.x - 2.0, center.y + 4.0),
+                                ]
+                            } else {
+                                vec![
+                                    egui::pos2(center.x - 4.0, center.y - 2.0),
+                                    egui::pos2(center.x + 4.0, center.y - 2.0),
+                                    egui::pos2(center.x, center.y + 3.0),
+                                ]
+                            };
+                            ui.painter().add(egui::Shape::convex_polygon(
+                                chevron,
+                                if group_toggle.hovered() { TEXT } else { MUTED },
+                                Stroke::NONE,
+                            ));
                             if group_toggle.clicked() {
                                 let key = (arrangement.id, track_id);
                                 if group_is_collapsed {
