@@ -6738,6 +6738,7 @@ impl DawUi {
         let mut paste_clip_after_requested = None;
         let mut split_clip_requested = None;
         let mut join_clip_requested = None;
+        let mut join_pattern_clip_requested = None;
         ui.horizontal_wrapped(|ui| {
             ui.label("Arrangement");
             ui.strong(arrangement.name.as_deref().unwrap_or("Arrangement"));
@@ -7103,6 +7104,10 @@ impl DawUi {
                                 }
                                 flp_rebuild::PlaylistClipTarget::Pattern { .. } => false,
                             };
+                            let is_pattern_clip = matches!(
+                                clip.target(),
+                                flp_rebuild::PlaylistClipTarget::Pattern { .. }
+                            );
                             let sample_length_ms = match clip.target() {
                                 flp_rebuild::PlaylistClipTarget::Channel { id }
                                     if is_audio_clip => self
@@ -7281,6 +7286,31 @@ impl DawUi {
                                         && ui.button("Join with next Audio Clip").clicked()
                                     {
                                         join_clip_requested = Some((clip_index, next_clip_index));
+                                        ui.close();
+                                    }
+                                } else if is_pattern_clip {
+                                    let (join_previous_clip, join_next_clip) =
+                                        playlist_pattern_clip_join_candidates(
+                                            &arrangement.clips,
+                                            clip_index,
+                                            &patterns,
+                                            &tempo_channel_ids,
+                                        );
+                                    if join_previous_clip.is_some() || join_next_clip.is_some() {
+                                        ui.separator();
+                                    }
+                                    if let Some(previous_clip_index) = join_previous_clip
+                                        && ui.button("Join with previous Pattern Clip").clicked()
+                                    {
+                                        join_pattern_clip_requested =
+                                            Some((previous_clip_index, clip_index));
+                                        ui.close();
+                                    }
+                                    if let Some(next_clip_index) = join_next_clip
+                                        && ui.button("Join with next Pattern Clip").clicked()
+                                    {
+                                        join_pattern_clip_requested =
+                                            Some((clip_index, next_clip_index));
                                         ui.close();
                                     }
                                 }
@@ -7550,6 +7580,36 @@ impl DawUi {
                 }
             } else {
                 self.status = "Open a project to join Playlist Audio Clips".to_owned();
+            }
+        }
+
+        if let Some((left_clip_index, right_clip_index)) = join_pattern_clip_requested {
+            if let Some(document) = self.document.as_mut() {
+                match document.join_adjacent_playlist_pattern_clips(
+                    arrangement.id,
+                    left_clip_index,
+                    right_clip_index,
+                ) {
+                    Ok(joined_clip_index) => {
+                        self.stop_project_playback();
+                        self.selected_arrangement = Some(arrangement.id);
+                        self.selected_clip = Some(joined_clip_index);
+                        self.playlist_clip_context_split = None;
+                        self.active_playlist_clip_drag = None;
+                        self.dirty = true;
+                        self.status = format!(
+                            "Joined Pattern Clips {} and {}",
+                            left_clip_index + 1,
+                            right_clip_index + 1
+                        );
+                        playlist_clip_list_changed = true;
+                    }
+                    Err(error) => {
+                        self.status = format!("Could not join Pattern Clips: {error}");
+                    }
+                }
+            } else {
+                self.status = "Open a project to join Playlist Pattern Clips".to_owned();
             }
         }
 
@@ -16850,6 +16910,147 @@ fn playlist_audio_clip_join_candidates(
     (previous_clip_index, next_clip_index)
 }
 
+fn playlist_pattern_clip_joinable(
+    left: &PlaylistClip,
+    right: &PlaylistClip,
+    patterns: &[Pattern],
+) -> bool {
+    let (
+        flp_rebuild::PlaylistClipTarget::Pattern {
+            id: left_pattern_id,
+        },
+        flp_rebuild::PlaylistClipTarget::Pattern {
+            id: right_pattern_id,
+        },
+    ) = (left.target(), right.target())
+    else {
+        return false;
+    };
+    if left_pattern_id != right_pattern_id
+        || left.raw_track_index != right.raw_track_index
+        || left.record_size != right.record_size
+        || left.pattern_base != right.pattern_base
+        || left.item_index != right.item_index
+        || left.track_index != right.track_index
+        || left.group != right.group
+        || left.unknown_word != right.unknown_word
+        || left.item_flags != right.item_flags
+        || left.header_bytes != right.header_bytes
+        || left.start_offset.to_bits() != right.start_offset.to_bits()
+        || left.end_offset.to_bits() != right.end_offset.to_bits()
+        || left.clip_id != right.clip_id
+        || left.reserved != right.reserved
+        || left.scale.map(f64::to_bits) != right.scale.map(f64::to_bits)
+        || left.trailing_bytes != right.trailing_bytes
+        || left.length_ticks == 0
+        || right.length_ticks == 0
+    {
+        return false;
+    }
+    if left
+        .scale
+        .is_some_and(|scale| !scale.is_finite() || (scale - 1.0).abs() > 1e-9)
+    {
+        return false;
+    }
+    let Some(left_end_ticks) = left.position_ticks.checked_add(left.length_ticks) else {
+        return false;
+    };
+    if left_end_ticks != right.position_ticks
+        || right
+            .position_ticks
+            .checked_add(right.length_ticks)
+            .is_none()
+    {
+        return false;
+    }
+
+    let Some(pattern) = patterns
+        .iter()
+        .find(|pattern| pattern.id == left_pattern_id)
+    else {
+        return false;
+    };
+    let inferred_length = pattern
+        .notes
+        .iter()
+        .filter(|note| note.length > 0)
+        .map(|note| u64::from(note.position) + u64::from(note.length))
+        .max()
+        .unwrap_or(0);
+    let Some(repeat_length) = pattern
+        .length_ticks
+        .map(u64::from)
+        .filter(|length| *length > 0)
+        .or_else(|| (inferred_length > 0).then_some(inferred_length))
+    else {
+        return false;
+    };
+    u64::from(left.length_ticks).is_multiple_of(repeat_length)
+        && !pattern.notes.iter().any(|note| {
+            u64::from(note.position) >= repeat_length
+                || (note.length > 0
+                    && u64::from(note.position) % repeat_length + u64::from(note.length)
+                        > repeat_length)
+        })
+}
+
+fn playlist_pattern_clip_join_candidates(
+    clips: &[PlaylistClip],
+    clip_index: usize,
+    patterns: &[Pattern],
+    tempo_channel_ids: &BTreeSet<u16>,
+) -> (Option<usize>, Option<usize>) {
+    let Some(clip) = clips.get(clip_index) else {
+        return (None, None);
+    };
+    let mut previous = clips
+        .iter()
+        .enumerate()
+        .filter(|(candidate_index, candidate)| {
+            *candidate_index != clip_index
+                && playlist_pattern_clip_joinable(candidate, clip, patterns)
+                && !playlist_tempo_overlaps_range(
+                    clips,
+                    tempo_channel_ids,
+                    candidate.position_ticks,
+                    clip.position_ticks.saturating_add(clip.length_ticks),
+                )
+        })
+        .map(|(candidate_index, _)| candidate_index);
+    let previous_clip_index = previous.next();
+    let previous_clip_index = if previous.next().is_none() {
+        previous_clip_index
+    } else {
+        None
+    };
+
+    let mut next = clips
+        .iter()
+        .enumerate()
+        .filter(|(candidate_index, candidate)| {
+            *candidate_index != clip_index
+                && playlist_pattern_clip_joinable(clip, candidate, patterns)
+                && !playlist_tempo_overlaps_range(
+                    clips,
+                    tempo_channel_ids,
+                    clip.position_ticks,
+                    candidate
+                        .position_ticks
+                        .saturating_add(candidate.length_ticks),
+                )
+        })
+        .map(|(candidate_index, _)| candidate_index);
+    let next_clip_index = next.next();
+    let next_clip_index = if next.next().is_none() {
+        next_clip_index
+    } else {
+        None
+    };
+
+    (previous_clip_index, next_clip_index)
+}
+
 fn playlist_tempo_overlaps_range(
     clips: &[PlaylistClip],
     tempo_channel_ids: &BTreeSet<u16>,
@@ -16996,10 +17197,11 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use super::{
-        ActivePlaylistClipDrag, ChannelDisplayFilter, FlpDocument, PianoRollGrid, PianoRollSnap,
-        PlaylistClip, PlaylistClipDragKind, note_from_grid_position,
+        ActivePlaylistClipDrag, ChannelDisplayFilter, FlpDocument, Pattern, PatternNote,
+        PianoRollGrid, PianoRollSnap, PlaylistClip, PlaylistClipDragKind, note_from_grid_position,
         playlist_audio_clip_join_candidates, playlist_clip_drag_edit, playlist_clip_split_position,
-        snap_note_tick, update_channel_rack_selection, update_layer_child_selection,
+        playlist_pattern_clip_join_candidates, snap_note_tick, update_channel_rack_selection,
+        update_layer_child_selection,
     };
 
     fn test_grid() -> PianoRollGrid {
@@ -17257,6 +17459,82 @@ mod tests {
                 &clips,
                 clips.len(),
                 &channel_kinds,
+                &BTreeSet::new()
+            ),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn playlist_join_menu_finds_only_repeat_safe_pattern_neighbors() {
+        let (mut clips, _) = playlist_audio_clip_fixture();
+        for clip in &mut clips {
+            clip.pattern_base = 0x5000;
+            clip.item_index = 0x5007;
+            clip.start_offset = 0.0;
+            clip.end_offset = 1.0;
+        }
+        let pattern = Pattern {
+            id: 7,
+            name: None,
+            length_ticks: Some(96),
+            notes: Vec::new(),
+        };
+        assert_eq!(
+            playlist_pattern_clip_join_candidates(
+                &clips,
+                0,
+                std::slice::from_ref(&pattern),
+                &BTreeSet::new()
+            ),
+            (None, Some(1))
+        );
+
+        clips[0].length_ticks = 100;
+        clips[1].position_ticks = 100;
+        assert_eq!(
+            playlist_pattern_clip_join_candidates(
+                &clips,
+                0,
+                std::slice::from_ref(&pattern),
+                &BTreeSet::new()
+            ),
+            (None, None)
+        );
+
+        let pattern_with_crossing_note = Pattern {
+            notes: vec![PatternNote {
+                position: 80,
+                length: 24,
+                ..PatternNote::default()
+            }],
+            ..pattern.clone()
+        };
+        clips[0].length_ticks = 192;
+        clips[1].position_ticks = 192;
+        assert_eq!(
+            playlist_pattern_clip_join_candidates(
+                &clips,
+                0,
+                std::slice::from_ref(&pattern_with_crossing_note),
+                &BTreeSet::new()
+            ),
+            (None, None)
+        );
+
+        let pattern_with_outside_one_shot = Pattern {
+            notes: vec![PatternNote {
+                position: 96,
+                length: 0,
+                ..PatternNote::default()
+            }],
+            ..pattern
+        };
+        assert_eq!(
+            playlist_pattern_clip_join_candidates(
+                &clips,
+                0,
+                std::slice::from_ref(&pattern_with_outside_one_shot),
                 &BTreeSet::new()
             ),
             (None, None)

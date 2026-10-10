@@ -4034,6 +4034,241 @@ impl FlpDocument {
         })
     }
 
+    /// Joins adjacent Pattern Clips that repeat the same pattern without changing its playback.
+    /// The left record is kept and extended; the right record is removed. The left clip length
+    /// must end on a pattern repeat boundary, and notes may not cross that boundary.
+    pub fn join_adjacent_playlist_pattern_clips(
+        &mut self,
+        arrangement_id: u16,
+        left_clip_index: usize,
+        right_clip_index: usize,
+    ) -> Result<usize, FlpError> {
+        if left_clip_index == right_clip_index {
+            return Err(FlpError::UnsupportedEdit(
+                "joining requires two different Playlist Pattern Clips",
+            ));
+        }
+        let arrangements = self.arrangements()?;
+        let mut matching_arrangements = arrangements
+            .iter()
+            .filter(|arrangement| arrangement.id == arrangement_id);
+        let Some(arrangement) = matching_arrangements.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested arrangement does not exist",
+            ));
+        };
+        if matching_arrangements.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested arrangement id is ambiguous",
+            ));
+        }
+        let Some(left_clip) = arrangement.clips.get(left_clip_index) else {
+            return Err(FlpError::UnsupportedEdit(
+                "the left Playlist Pattern Clip does not exist",
+            ));
+        };
+        let Some(right_clip) = arrangement.clips.get(right_clip_index) else {
+            return Err(FlpError::UnsupportedEdit(
+                "the right Playlist Pattern Clip does not exist",
+            ));
+        };
+        let (
+            PlaylistClipTarget::Pattern {
+                id: left_pattern_id,
+            },
+            PlaylistClipTarget::Pattern {
+                id: right_pattern_id,
+            },
+        ) = (left_clip.target(), right_clip.target())
+        else {
+            return Err(FlpError::UnsupportedEdit(
+                "only Playlist Pattern Clips can be joined",
+            ));
+        };
+        if left_pattern_id != right_pattern_id {
+            return Err(FlpError::UnsupportedEdit(
+                "joined Pattern Clips must reference the same pattern",
+            ));
+        }
+        if left_clip.raw_track_index != right_clip.raw_track_index {
+            return Err(FlpError::UnsupportedEdit(
+                "joined Pattern Clips must be on the same Playlist track",
+            ));
+        }
+        if left_clip.record_size != right_clip.record_size
+            || left_clip.source_event_index != right_clip.source_event_index
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "joined Pattern Clips must use the same Playlist record event and layout",
+            ));
+        }
+        if left_clip.pattern_base != right_clip.pattern_base
+            || left_clip.item_index != right_clip.item_index
+            || left_clip.track_index != right_clip.track_index
+            || left_clip.group != right_clip.group
+            || left_clip.unknown_word != right_clip.unknown_word
+            || left_clip.item_flags != right_clip.item_flags
+            || left_clip.header_bytes != right_clip.header_bytes
+            || left_clip.start_offset.to_bits() != right_clip.start_offset.to_bits()
+            || left_clip.end_offset.to_bits() != right_clip.end_offset.to_bits()
+            || left_clip.clip_id != right_clip.clip_id
+            || left_clip.reserved != right_clip.reserved
+            || left_clip.scale.map(f64::to_bits) != right_clip.scale.map(f64::to_bits)
+            || left_clip.trailing_bytes != right_clip.trailing_bytes
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "joined Pattern Clips must have matching clip properties",
+            ));
+        }
+        if left_clip
+            .scale
+            .is_some_and(|scale| !scale.is_finite() || (scale - 1.0).abs() > 1e-9)
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "Pattern Clips with a non-default or invalid scale cannot be joined",
+            ));
+        }
+        if left_clip.length_ticks == 0 || right_clip.length_ticks == 0 {
+            return Err(FlpError::UnsupportedEdit(
+                "joined Pattern Clips must have nonzero timeline lengths",
+            ));
+        }
+        let left_end_ticks = left_clip
+            .position_ticks
+            .checked_add(left_clip.length_ticks)
+            .ok_or(FlpError::LengthOverflow)?;
+        if left_end_ticks != right_clip.position_ticks {
+            return Err(FlpError::UnsupportedEdit(
+                "joined Pattern Clips must touch on the Playlist timeline",
+            ));
+        }
+        let merged_end_ticks = right_clip
+            .position_ticks
+            .checked_add(right_clip.length_ticks)
+            .ok_or(FlpError::LengthOverflow)?;
+        let merged_length_ticks = merged_end_ticks
+            .checked_sub(left_clip.position_ticks)
+            .ok_or(FlpError::LengthOverflow)?;
+
+        let pattern = self
+            .patterns()?
+            .into_iter()
+            .find(|pattern| pattern.id == left_pattern_id)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the Playlist Pattern Clip pattern does not exist",
+            ))?;
+        let inferred_length = pattern
+            .notes
+            .iter()
+            .filter(|note| note.length > 0)
+            .map(|note| u64::from(note.position) + u64::from(note.length))
+            .max()
+            .unwrap_or(0);
+        let repeat_length = pattern
+            .length_ticks
+            .map(u64::from)
+            .filter(|length| *length > 0)
+            .or_else(|| (inferred_length > 0).then_some(inferred_length))
+            .ok_or(FlpError::UnsupportedEdit(
+                "joining Pattern Clips requires a known nonzero pattern repeat length",
+            ))?;
+        if !u64::from(left_clip.length_ticks).is_multiple_of(repeat_length) {
+            return Err(FlpError::UnsupportedEdit(
+                "the left Pattern Clip must end on a pattern repeat boundary",
+            ));
+        }
+        if pattern.notes.iter().any(|note| {
+            u64::from(note.position) >= repeat_length
+                || (note.length > 0
+                    && u64::from(note.position) % repeat_length + u64::from(note.length)
+                        > repeat_length)
+        }) {
+            return Err(FlpError::UnsupportedEdit(
+                "joining these Pattern Clips would let a note cross the clip boundary",
+            ));
+        }
+
+        let channels = self.channels();
+        let tempo_channel_ids = channels
+            .iter()
+            .filter(|candidate| {
+                candidate.kind() == Some(5)
+                    && candidate
+                        .display_name()
+                        .is_some_and(|name| name.eq_ignore_ascii_case("TEMPO"))
+            })
+            .map(ChannelSummary::id)
+            .collect::<HashSet<_>>();
+        if arrangement.clips.iter().any(|candidate| {
+            let PlaylistClipTarget::Channel { id } = candidate.target() else {
+                return false;
+            };
+            tempo_channel_ids.contains(&id)
+                && candidate.position_ticks < merged_end_ticks
+                && candidate
+                    .position_ticks
+                    .saturating_add(candidate.length_ticks)
+                    > left_clip.position_ticks
+        }) {
+            return Err(FlpError::UnsupportedEdit(
+                "joining Pattern Clips across Playlist tempo automation is unsupported",
+            ));
+        }
+
+        let record_size = left_clip.record_size;
+        let left_record_start = left_clip
+            .source_record_index
+            .checked_mul(record_size)
+            .ok_or(FlpError::LengthOverflow)?;
+        let left_record_end = left_record_start
+            .checked_add(record_size)
+            .ok_or(FlpError::LengthOverflow)?;
+        let right_record_start = right_clip
+            .source_record_index
+            .checked_mul(record_size)
+            .ok_or(FlpError::LengthOverflow)?;
+        let right_record_end = right_record_start
+            .checked_add(record_size)
+            .ok_or(FlpError::LengthOverflow)?;
+        let event_index = left_clip.source_event_index;
+        let event = self
+            .events
+            .get(event_index)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the Playlist Pattern Clip event no longer exists",
+            ))?;
+        if event.opcode != 0xE9
+            || !matches!(event.encoding, PayloadEncoding::Data { .. })
+            || left_record_end > event.payload.len()
+            || right_record_end > event.payload.len()
+            || !event.payload.len().is_multiple_of(record_size)
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "the Playlist Pattern Clip records do not fit their event payload",
+            ));
+        }
+        if left_record_start == right_record_start {
+            return Err(FlpError::UnsupportedEdit(
+                "the Playlist Pattern Clip records are not distinct",
+            ));
+        }
+
+        let mut candidate = self.clone();
+        let mut payload = event.payload.clone();
+        payload[left_record_start + 8..left_record_start + 12]
+            .copy_from_slice(&merged_length_ticks.to_le_bytes());
+        payload.drain(right_record_start..right_record_end);
+        candidate.events[event_index].replace_data_payload(payload)?;
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+
+        Ok(if right_clip_index < left_clip_index {
+            left_clip_index - 1
+        } else {
+            left_clip_index
+        })
+    }
+
     /// Slips the source window inside one Playlist Audio Clip while keeping its timeline bounds.
     /// The requested offset is in milliseconds; `source_length_ms` bounds the window to the file.
     /// Clips under Playlist tempo automation or with non-default scale are rejected.
@@ -8320,6 +8555,37 @@ mod tests {
         flp_fixture(&event_stream, &[0xA1], &[0xB2])
     }
 
+    fn adjacent_pattern_clip_fixture(
+        left_length_ticks: u32,
+        right_length_ticks: u32,
+        note_position: u32,
+        note_length: u32,
+    ) -> FlpDocument {
+        let note = note_record(note_position, 0, note_length, 60, 100);
+        let mut event_stream = vec![0x40, 0, 0, 0x41, 7, 0, 0xD0, 24];
+        event_stream.extend_from_slice(&note);
+        event_stream.extend_from_slice(&[0xA4]);
+        event_stream.extend_from_slice(&96u32.to_le_bytes());
+
+        let mut left_clip = [0u8; 80];
+        left_clip[4..6].copy_from_slice(&0x5000u16.to_le_bytes());
+        left_clip[6..8].copy_from_slice(&0x5007u16.to_le_bytes());
+        left_clip[8..12].copy_from_slice(&left_length_ticks.to_le_bytes());
+        left_clip[12..14].copy_from_slice(&499u16.to_le_bytes());
+        left_clip[28..32].copy_from_slice(&1.0f32.to_le_bytes());
+        left_clip[64..72].copy_from_slice(&1.0f64.to_le_bytes());
+        let mut right_clip = left_clip;
+        right_clip[..4].copy_from_slice(&left_length_ticks.to_le_bytes());
+        right_clip[8..12].copy_from_slice(&right_length_ticks.to_le_bytes());
+        let mut clip_payload = left_clip.to_vec();
+        clip_payload.extend_from_slice(&right_clip);
+
+        event_stream.extend_from_slice(&[0x40, 9, 0, 0x15, 4, 0x48, 9, 0, 0x62, 0, 0, 0x63, 3, 0]);
+        append_data_event(&mut event_stream, 0xE9, &clip_payload);
+        FlpDocument::parse(&flp_fixture(&event_stream, &[], &[]))
+            .expect("Pattern Clip fixture should parse")
+    }
+
     #[test]
     fn project_info_strings_decode_edit_and_roundtrip_losslessly() {
         let mut event_stream = Vec::new();
@@ -9140,6 +9406,65 @@ mod tests {
             .encode_lossless()
             .expect("the joined project should encode");
         FlpDocument::parse(&encoded).expect("the joined project should parse again");
+    }
+
+    #[test]
+    fn joins_adjacent_playlist_pattern_clips_when_repeat_boundaries_match() {
+        let mut document = adjacent_pattern_clip_fixture(192, 96, 0, 48);
+        let joined_index = document
+            .join_adjacent_playlist_pattern_clips(3, 0, 1)
+            .expect("aligned Pattern Clips that share a pattern should join");
+
+        assert_eq!(joined_index, 0);
+        let arrangements = document
+            .arrangements()
+            .expect("the joined arrangement should decode");
+        assert_eq!(arrangements[0].clips.len(), 1);
+        assert_eq!(arrangements[0].clips[0].position_ticks, 0);
+        assert_eq!(arrangements[0].clips[0].length_ticks, 288);
+        assert_eq!(
+            arrangements[0].clips[0].target(),
+            PlaylistClipTarget::Pattern { id: 7 }
+        );
+
+        let clip_event = document
+            .events()
+            .iter()
+            .find(|event| event.opcode() == 0xE9)
+            .expect("the Playlist clip event should remain present");
+        assert_eq!(clip_event.payload().len(), 80);
+        assert_eq!(
+            u32::from_le_bytes(clip_event.payload()[8..12].try_into().unwrap()),
+            288
+        );
+        let encoded = document
+            .encode_lossless()
+            .expect("the joined project should encode");
+        FlpDocument::parse(&encoded).expect("the joined project should parse again");
+    }
+
+    #[test]
+    fn playlist_pattern_clip_join_rejects_unsafe_boundaries_atomically() {
+        for (left_length, note_position, note_length) in [(144, 0, 48), (192, 80, 24), (192, 96, 0)]
+        {
+            let mut document =
+                adjacent_pattern_clip_fixture(left_length, 96, note_position, note_length);
+            let before_join = document
+                .encode_lossless()
+                .expect("the original project should encode");
+
+            assert!(
+                document
+                    .join_adjacent_playlist_pattern_clips(3, 0, 1)
+                    .is_err()
+            );
+            assert_eq!(
+                document
+                    .encode_lossless()
+                    .expect("the project should still encode after a rejected join"),
+                before_join
+            );
+        }
     }
 
     #[test]
