@@ -204,7 +204,7 @@ FL Studio's piano roll is famously deep — the full toolset:
 - `[todo]` Riff machine, Claw machine
 - `[partial]` Limit folds channel or selected note pitches into a key range by octave and clamps keys that cannot fit; scale snapping remains
 - `[partial]` Slice-at-tick splits notes crossing the chosen tick in the channel or selection; native directional cut gestures remain
-- `[partial]` Scale Levels applies velocity Multiply and Offset to selected notes or the target channel; Center and Tension remain
+- `[partial]` Scale Levels applies Center, logarithmic Tension, Multiply, and Offset to selected notes or the target channel; Center and Tension use documented ranges with local formulas pending comparison against native FL Studio
 - `[partial]` Articulate scales original note lengths or derives legato boundaries from the next onset, with selected-only context, seeded Variation, next-onset chord chopping, and quick Legato/Portato/Staccato/small-gap/chord-chop presets; exact native variation distribution and preset values remain unverified
 - `[partial]` The Piano roll displays the observed per-note slide flag as a start marker and can toggle it while preserving other flag bits; native-instrument slide playback, portamento flag encoding, and portamento playback remain unsupported
 - `[partial]` Ghost channels show notes from all channels in the selected pattern with the target channel emphasized; independent ghost editing controls remain

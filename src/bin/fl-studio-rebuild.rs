@@ -31,7 +31,8 @@ use flp_rebuild::{
     AutomationPointEdit, ChannelGroupSummary, ChannelSortOrder, ChannelSummary, FlpDocument,
     FstPreset, FstPresetKind, Pattern, PatternNote, PatternNoteEdit, PlaylistClip,
     PlaylistClipClipboard, PlaylistClipEdit, PlaylistClipTarget, PlaylistTrack, ProjectInfoEdit,
-    ProjectSettingsEdit, RandomizerOptions, TimeMarker, TimeMarkerEdit, VstPluginStateMetadata,
+    ProjectSettingsEdit, RandomizerOptions, ScaleLevelsOptions, TimeMarker, TimeMarkerEdit,
+    VstPluginStateMetadata,
 };
 
 const APP_BACKGROUND: Color32 = Color32::from_rgb(29, 29, 29);
@@ -1508,6 +1509,8 @@ struct DawUi {
     randomizer_pitch_range: u8,
     randomizer_bipolar: bool,
     randomizer_reset_levels: bool,
+    scale_levels_center_percent: i16,
+    scale_levels_tension_percent: i16,
     scale_levels_multiplier_percent: u16,
     scale_levels_offset_percent: i16,
     articulate_multiplier_percent: u8,
@@ -1775,6 +1778,8 @@ impl DawUi {
             randomizer_pitch_range: 0,
             randomizer_bipolar: true,
             randomizer_reset_levels: false,
+            scale_levels_center_percent: 0,
+            scale_levels_tension_percent: 0,
             scale_levels_multiplier_percent: 100,
             scale_levels_offset_percent: 0,
             articulate_multiplier_percent: 100,
@@ -11718,6 +11723,14 @@ impl DawUi {
                     ui.menu_button("Scale levels", |ui| {
                         ui.label("Velocity");
                         ui.add(
+                            egui::Slider::new(&mut self.scale_levels_center_percent, -100..=100)
+                                .text("Center %"),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut self.scale_levels_tension_percent, -100..=100)
+                                .text("Tension %"),
+                        );
+                        ui.add(
                             egui::Slider::new(&mut self.scale_levels_multiplier_percent, 0..=200)
                                 .text("Multiply %"),
                         );
@@ -11725,9 +11738,12 @@ impl DawUi {
                             egui::Slider::new(&mut self.scale_levels_offset_percent, -100..=100)
                                 .text("Offset %"),
                         );
+                        ui.small("Center shifts the pivot; Tension curves levels logarithmically.");
                         ui.small("Offset is relative to the full 0–127 velocity range.");
                         ui.horizontal(|ui| {
                             if ui.button("Reset").clicked() {
+                                self.scale_levels_center_percent = 0;
+                                self.scale_levels_tension_percent = 0;
                                 self.scale_levels_multiplier_percent = 100;
                                 self.scale_levels_offset_percent = 0;
                             }
@@ -12024,28 +12040,31 @@ impl DawUi {
             && let (Some(pattern_id), Some(channel_id)) =
                 (self.selected_pattern, self.selected_note_channel)
         {
+            let center_percent = self.scale_levels_center_percent;
+            let tension_percent = self.scale_levels_tension_percent;
             let multiplier_percent = self.scale_levels_multiplier_percent;
             let offset_percent = self.scale_levels_offset_percent;
+            let options = ScaleLevelsOptions {
+                center_percent,
+                tension_percent,
+                multiplier_percent,
+                offset_percent,
+            };
             let result = self
                 .document
                 .as_mut()
                 .ok_or_else(|| "no project is open".to_owned())
                 .and_then(|document| {
                     let result = if edit_selection_only {
-                        document.scale_pattern_note_selection_levels(
+                        document.scale_pattern_note_selection_levels_with_options(
                             pattern_id,
                             channel_id,
                             &selected_quantize_indices,
-                            multiplier_percent,
-                            offset_percent,
+                            options,
                         )
                     } else {
-                        document.scale_pattern_note_levels(
-                            pattern_id,
-                            channel_id,
-                            multiplier_percent,
-                            offset_percent,
-                        )
+                        document
+                            .scale_pattern_note_levels_with_options(pattern_id, channel_id, options)
                     };
                     result.map_err(|error| error.to_string())
                 });

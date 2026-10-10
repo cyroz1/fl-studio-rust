@@ -874,6 +874,26 @@ pub struct RandomizerOptions {
     pub reset_levels: bool,
 }
 
+/// Parameters for scaling note velocity with a pivot and logarithmic tension.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScaleLevelsOptions {
+    pub center_percent: i16,
+    pub tension_percent: i16,
+    pub multiplier_percent: u16,
+    pub offset_percent: i16,
+}
+
+impl Default for ScaleLevelsOptions {
+    fn default() -> Self {
+        Self {
+            center_percent: 0,
+            tension_percent: 0,
+            multiplier_percent: 100,
+            offset_percent: 0,
+        }
+    }
+}
+
 /// Parameters for scaling note lengths with an optional seeded variation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArticulateOptions {
@@ -1014,6 +1034,26 @@ fn randomizer_offset(state: &mut u64, range: i32, negative: bool, bipolar: bool)
 
 fn note_index_in_scope(note_index: usize, selected_indices: Option<&HashSet<usize>>) -> bool {
     selected_indices.is_none_or(|indices| indices.contains(&note_index))
+}
+
+fn scale_note_level(level: u8, options: ScaleLevelsOptions) -> u8 {
+    let pivot = f64::from(options.center_percent) * 1.27;
+    let distance = f64::from(level) - pivot;
+    let distance_scale = pivot.abs().max((127.0 - pivot).abs()).max(1.0);
+    let normalized_distance = (distance.abs() / distance_scale).clamp(0.0, 1.0);
+    let tension = f64::from(options.tension_percent) / 100.0 * std::f64::consts::LN_10;
+    let curved_distance = if tension == 0.0 {
+        distance.abs()
+    } else {
+        let curved = ((1.0 + (tension.exp() - 1.0) * normalized_distance).ln()) / tension;
+        curved * distance_scale
+    };
+    let tensioned = pivot + distance.signum() * curved_distance;
+    let multiplier = f64::from(options.multiplier_percent) / 100.0;
+    let offset = f64::from(options.offset_percent) * 1.27;
+    (pivot + (tensioned - pivot) * multiplier + offset)
+        .round()
+        .clamp(0.0, 127.0) as u8
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -6331,13 +6371,25 @@ impl FlpDocument {
         multiplier_percent: u16,
         offset_percent: i16,
     ) -> Result<usize, FlpError> {
-        self.scale_pattern_note_levels_in_scope(
+        self.scale_pattern_note_levels_with_options(
             pattern_id,
             channel_id,
-            None,
-            multiplier_percent,
-            offset_percent,
+            ScaleLevelsOptions {
+                multiplier_percent,
+                offset_percent,
+                ..ScaleLevelsOptions::default()
+            },
         )
+    }
+
+    /// Scales velocity levels for every note in one channel using Scale Levels controls.
+    pub fn scale_pattern_note_levels_with_options(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        options: ScaleLevelsOptions,
+    ) -> Result<usize, FlpError> {
+        self.scale_pattern_note_levels_in_scope(pattern_id, channel_id, None, options)
     }
 
     /// Scales velocity levels only for the selected channel-local note indices.
@@ -6350,13 +6402,27 @@ impl FlpDocument {
         multiplier_percent: u16,
         offset_percent: i16,
     ) -> Result<usize, FlpError> {
-        self.scale_pattern_note_levels_in_scope(
+        self.scale_pattern_note_selection_levels_with_options(
             pattern_id,
             channel_id,
-            Some(note_indices),
-            multiplier_percent,
-            offset_percent,
+            note_indices,
+            ScaleLevelsOptions {
+                multiplier_percent,
+                offset_percent,
+                ..ScaleLevelsOptions::default()
+            },
         )
+    }
+
+    /// Scales selected channel-local note indices using Scale Levels controls.
+    pub fn scale_pattern_note_selection_levels_with_options(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: &[usize],
+        options: ScaleLevelsOptions,
+    ) -> Result<usize, FlpError> {
+        self.scale_pattern_note_levels_in_scope(pattern_id, channel_id, Some(note_indices), options)
     }
 
     fn scale_pattern_note_levels_in_scope(
@@ -6364,17 +6430,26 @@ impl FlpDocument {
         pattern_id: u16,
         channel_id: u16,
         note_indices: Option<&[usize]>,
-        multiplier_percent: u16,
-        offset_percent: i16,
+        options: ScaleLevelsOptions,
     ) -> Result<usize, FlpError> {
-        if multiplier_percent > 200 {
+        if options.multiplier_percent > 200 {
             return Err(FlpError::UnsupportedEdit(
                 "Scale Levels multiplier must be between 0 and 200 percent",
             ));
         }
-        if !(-100..=100).contains(&offset_percent) {
+        if !(-100..=100).contains(&options.offset_percent) {
             return Err(FlpError::UnsupportedEdit(
                 "Scale Levels offset must be between -100 and 100 percent",
+            ));
+        }
+        if !(-100..=100).contains(&options.center_percent) {
+            return Err(FlpError::UnsupportedEdit(
+                "Scale Levels center must be between -100 and 100 percent",
+            ));
+        }
+        if !(-100..=100).contains(&options.tension_percent) {
+            return Err(FlpError::UnsupportedEdit(
+                "Scale Levels tension must be between -100 and 100 percent",
             ));
         }
         let patterns = self.patterns()?;
@@ -6386,8 +6461,6 @@ impl FlpDocument {
             ))?;
         let selected_indices =
             note_indices.map(|indices| indices.iter().copied().collect::<HashSet<_>>());
-        let offset = f64::from(offset_percent) * 1.27;
-        let multiplier = f64::from(multiplier_percent) / 100.0;
         let edits = pattern
             .notes
             .iter()
@@ -6395,9 +6468,7 @@ impl FlpDocument {
             .enumerate()
             .filter(|(note_index, _)| note_index_in_scope(*note_index, selected_indices.as_ref()))
             .filter_map(|(note_index, note)| {
-                let velocity = (f64::from(note.velocity) * multiplier + offset)
-                    .round()
-                    .clamp(0.0, 127.0) as u8;
+                let velocity = scale_note_level(note.velocity, options);
                 (velocity != note.velocity).then_some((note_index, velocity))
             })
             .collect::<Vec<_>>();
@@ -9465,8 +9536,9 @@ mod tests {
         ArticulateOptions, ChannelGroupSummary, ChannelNoteRouter, ChannelSortOrder,
         ChannelSummary, FlpDocument, FlpError, FlpEvent, FstPreset, FstPresetKind,
         MixerParameterKind, PATTERN_NOTE_SLIDE_FLAG, PatternNote, PatternNoteEdit, PayloadEncoding,
-        PlaylistClipEdit, PlaylistClipTarget, ProjectInfoEdit, ProjectSettingsEdit, TimeMarkerEdit,
-        midi::MidiChannelMapping, midi::MidiFile, parse_vst_plugin_state_metadata,
+        PlaylistClipEdit, PlaylistClipTarget, ProjectInfoEdit, ProjectSettingsEdit,
+        ScaleLevelsOptions, TimeMarkerEdit, midi::MidiChannelMapping, midi::MidiFile,
+        parse_vst_plugin_state_metadata,
     };
 
     fn articulate_options(
@@ -12723,6 +12795,90 @@ mod tests {
         assert_eq!(document.scale_pattern_note_levels(7, 0, 100, 0).unwrap(), 0);
         assert!(document.scale_pattern_note_levels(7, 0, 201, 0).is_err());
         assert!(document.scale_pattern_note_levels(7, 0, 100, 101).is_err());
+        assert!(
+            document
+                .scale_pattern_note_levels_with_options(
+                    7,
+                    0,
+                    ScaleLevelsOptions {
+                        center_percent: 101,
+                        ..ScaleLevelsOptions::default()
+                    },
+                )
+                .is_err()
+        );
+        assert!(
+            document
+                .scale_pattern_note_levels_with_options(
+                    7,
+                    0,
+                    ScaleLevelsOptions {
+                        tension_percent: -101,
+                        ..ScaleLevelsOptions::default()
+                    },
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn scale_levels_applies_center_pivot_and_logarithmic_tension() {
+        let input = pattern_fixture(
+            &[
+                note_record(0, 0, 48, 60, 32),
+                note_record(24, 0, 52, 60, 64),
+                note_record(48, 0, 55, 60, 127),
+            ],
+            &[0xFF, 1, 0xAA],
+        );
+        let mut brighter = FlpDocument::parse(&input).expect("fixture should parse");
+        brighter
+            .scale_pattern_note_levels_with_options(
+                7,
+                0,
+                ScaleLevelsOptions {
+                    tension_percent: 100,
+                    ..ScaleLevelsOptions::default()
+                },
+            )
+            .expect("positive tension should scale notes");
+        let brighter_notes = brighter.patterns().unwrap().remove(0).notes;
+        assert!(brighter_notes[0].velocity > 32);
+        assert!(brighter_notes[1].velocity > 64);
+        assert_eq!(brighter_notes[2].velocity, 127);
+
+        let mut softer = FlpDocument::parse(&input).expect("fixture should parse");
+        softer
+            .scale_pattern_note_levels_with_options(
+                7,
+                0,
+                ScaleLevelsOptions {
+                    tension_percent: -100,
+                    ..ScaleLevelsOptions::default()
+                },
+            )
+            .expect("negative tension should scale notes");
+        let softer_notes = softer.patterns().unwrap().remove(0).notes;
+        assert!(softer_notes[0].velocity < 32);
+        assert!(softer_notes[1].velocity < 64);
+
+        let mut centered = FlpDocument::parse(&pattern_fixture(
+            &[note_record(0, 0, 48, 60, 64)],
+            &[0xFF, 0],
+        ))
+        .expect("fixture should parse");
+        centered
+            .scale_pattern_note_levels_with_options(
+                7,
+                0,
+                ScaleLevelsOptions {
+                    center_percent: 50,
+                    multiplier_percent: 200,
+                    ..ScaleLevelsOptions::default()
+                },
+            )
+            .expect("centered multiply should scale around its pivot");
+        assert_eq!(centered.patterns().unwrap()[0].notes[0].velocity, 65);
     }
 
     #[test]
