@@ -14,6 +14,9 @@ use flacenc::component::{BitRepr, Frame, FrameOffset, Stream};
 use flacenc::error::Verify;
 use flacenc::source::{Fill, FrameBuf};
 use md5::{Digest, Md5};
+#[cfg(test)]
+use vorbis_rs::VorbisDecoder;
+use vorbis_rs::{VorbisBitrateManagementStrategy, VorbisEncoder, VorbisEncoderBuilder};
 
 use crate::audio::{AudioInputRecording, StreamingAudioWriter};
 use crate::media::{DecodedAudio, SamplePathResolver, decode_audio_file, wav_sampler_metadata};
@@ -33,6 +36,8 @@ const SAMPLER_ROOT_KEY: u16 = 60;
 const SAMPLER_BLOCK_FRAMES: usize = 1_024;
 const FLAC_BLOCK_FRAMES: usize = 4_096;
 const FLAC_MAX_SAMPLE_FRAMES: u64 = (1_u64 << 36) - 1;
+const OGG_MIN_BITRATE_KBPS: u16 = 64;
+const OGG_MAX_BITRATE_KBPS: u16 = 450;
 static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -735,10 +740,32 @@ pub fn render_playlist_with_vst3_to_flac_cancellable(
     )
 }
 
+/// Render a full Playlist arrangement to Ogg Vorbis at the requested target bitrate.
+pub fn render_playlist_with_vst3_to_ogg_cancellable(
+    document: &FlpDocument,
+    project_path: impl AsRef<Path>,
+    options: PlaylistRenderOptions,
+    output_path: impl AsRef<Path>,
+    bitrate_kbps: u16,
+    vst3_processor: Option<Vst3PlaylistStreamProcessor>,
+    cancelled: &AtomicBool,
+) -> Result<PlaylistRenderSummary, String> {
+    render_playlist_with_vst3_cancellable(
+        document,
+        project_path,
+        options,
+        output_path,
+        PlaylistRenderOutput::Ogg { bitrate_kbps },
+        vst3_processor,
+        cancelled,
+    )
+}
+
 #[derive(Clone, Copy)]
 enum PlaylistRenderOutput {
     Wav,
     Flac { bits_per_sample: u8 },
+    Ogg { bitrate_kbps: u16 },
 }
 
 fn render_playlist_with_vst3_cancellable(
@@ -758,6 +785,14 @@ fn render_playlist_with_vst3_cancellable(
             validate_flac_output_path(project_path, output_path)?;
             if !matches!(bits_per_sample, 16 | 24) {
                 return Err("FLAC output supports 16- or 24-bit samples".to_owned());
+            }
+        }
+        PlaylistRenderOutput::Ogg { bitrate_kbps } => {
+            validate_ogg_output_path(project_path, output_path)?;
+            if !(OGG_MIN_BITRATE_KBPS..=OGG_MAX_BITRATE_KBPS).contains(&bitrate_kbps) {
+                return Err(format!(
+                    "OGG output bitrate must be between {OGG_MIN_BITRATE_KBPS} and {OGG_MAX_BITRATE_KBPS} kbps"
+                ));
             }
         }
     }
@@ -919,9 +954,109 @@ fn render_playlist_with_vst3_cancellable(
             )?;
             encoder.finalize(frames)?;
         }
+        PlaylistRenderOutput::Ogg { bitrate_kbps } => {
+            let mut encoder = StreamingOggWriter::new(
+                file,
+                options.sample_rate,
+                options.wav_channel_mode,
+                bitrate_kbps,
+            )?;
+            summary.voices_stolen = stream_prepared_playlist_render(
+                PreparedPlaylistBlockMix {
+                    audio: &audio,
+                    sampler: &sampler,
+                    options,
+                    frames,
+                    master_output,
+                    vst3_processor: vst3_processor.as_mut(),
+                },
+                cancelled,
+                || false,
+                |block| encoder.write_stereo_block(block),
+            )?;
+            encoder.finalize()?;
+        }
     }
     temporary.commit(output_path)?;
     Ok(summary)
+}
+
+struct StreamingOggWriter<'a> {
+    encoder: Option<VorbisEncoder<&'a mut File>>,
+    channel_mode: WavChannelMode,
+    channel_buffers: Vec<Vec<f32>>,
+}
+
+impl<'a> StreamingOggWriter<'a> {
+    fn new(
+        file: &'a mut File,
+        sample_rate: u32,
+        channel_mode: WavChannelMode,
+        bitrate_kbps: u16,
+    ) -> Result<Self, String> {
+        let sample_rate = std::num::NonZeroU32::new(sample_rate)
+            .ok_or_else(|| "OGG sample rate must be greater than zero".to_owned())?;
+        let channel_count = channel_mode.channel_count() as u8;
+        let channels = std::num::NonZeroU8::new(channel_count)
+            .ok_or_else(|| "OGG channel count must be greater than zero".to_owned())?;
+        let bitrate_bps = u32::from(bitrate_kbps)
+            .checked_mul(1_000)
+            .ok_or_else(|| "OGG bitrate is too large".to_owned())?;
+        let bitrate = std::num::NonZeroU32::new(bitrate_bps)
+            .ok_or_else(|| "OGG bitrate must be greater than zero".to_owned())?;
+        let mut builder = VorbisEncoderBuilder::new(sample_rate, channels, file)
+            .map_err(|error| format!("could not initialize OGG encoder: {error}"))?;
+        builder.bitrate_management_strategy(VorbisBitrateManagementStrategy::Abr {
+            average_bitrate: bitrate,
+        });
+        let encoder = builder
+            .build()
+            .map_err(|error| format!("could not configure OGG encoder: {error}"))?;
+
+        Ok(Self {
+            encoder: Some(encoder),
+            channel_mode,
+            channel_buffers: (0..usize::from(channel_count))
+                .map(|_| Vec::with_capacity(STREAM_BLOCK_FRAMES))
+                .collect(),
+        })
+    }
+
+    fn write_stereo_block(&mut self, stereo_block: &[f32]) -> Result<(), String> {
+        if !stereo_block.len().is_multiple_of(2) {
+            return Err("render block must contain interleaved stereo frames".to_owned());
+        }
+        for channel in &mut self.channel_buffers {
+            channel.clear();
+        }
+        for frame in stereo_block.as_chunks::<2>().0 {
+            match self.channel_mode {
+                WavChannelMode::Stereo => {
+                    self.channel_buffers[0].push(frame[0]);
+                    self.channel_buffers[1].push(frame[1]);
+                }
+                WavChannelMode::MonoMerged => {
+                    self.channel_buffers[0].push(frame[0] * 0.5 + frame[1] * 0.5);
+                }
+                WavChannelMode::MonoLeft => self.channel_buffers[0].push(frame[0]),
+                WavChannelMode::MonoRight => self.channel_buffers[0].push(frame[1]),
+            }
+        }
+        self.encoder
+            .as_mut()
+            .expect("OGG encoder is available before finalization")
+            .encode_audio_block(&self.channel_buffers)
+            .map_err(|error| format!("could not encode OGG audio block: {error}"))
+    }
+
+    fn finalize(mut self) -> Result<(), String> {
+        self.encoder
+            .take()
+            .expect("OGG encoder is available before finalization")
+            .finish()
+            .map(|_| ())
+            .map_err(|error| format!("could not finalize OGG stream: {error}"))
+    }
 }
 
 struct StreamingFlacWriter<'a> {
@@ -3375,6 +3510,10 @@ fn validate_flac_output_path(project_path: &Path, output_path: &Path) -> Result<
     validate_output_path_with_extension(project_path, output_path, "flac")
 }
 
+fn validate_ogg_output_path(project_path: &Path, output_path: &Path) -> Result<(), String> {
+    validate_output_path_with_extension(project_path, output_path, "ogg")
+}
+
 fn validate_output_path_with_extension(
     project_path: &Path,
     output_path: &Path,
@@ -4967,6 +5106,62 @@ mod tests {
             32_767
         );
         assert_eq!(quantize_signed_pcm(f32::NAN, 32_768.0, 32_767.0), 0);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn streams_decodable_ogg_blocks_for_each_channel_mode() {
+        let root = std::env::temp_dir().join(format!(
+            "flp-ogg-render-test-{}-{}",
+            std::process::id(),
+            NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+
+        for (index, (channel_mode, expected_channels)) in [
+            (WavChannelMode::Stereo, 2),
+            (WavChannelMode::MonoMerged, 1),
+            (WavChannelMode::MonoLeft, 1),
+            (WavChannelMode::MonoRight, 1),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let output = root.join(format!("stream-{index}.ogg"));
+            let mut file = File::create(&output).unwrap();
+            let mut writer = StreamingOggWriter::new(&mut file, 48_000, channel_mode, 192).unwrap();
+            for block_index in 0..48 {
+                let mut stereo_block = Vec::with_capacity(STREAM_BLOCK_FRAMES * 2);
+                for frame_index in 0..STREAM_BLOCK_FRAMES {
+                    let sample_index = block_index * STREAM_BLOCK_FRAMES + frame_index;
+                    let phase = std::f32::consts::TAU * sample_index as f32 / 96.0;
+                    stereo_block.extend_from_slice(&[phase.sin() * 0.25, phase.cos() * 0.25]);
+                }
+                writer.write_stereo_block(&stereo_block).unwrap();
+            }
+            writer.finalize().unwrap();
+            drop(file);
+
+            let mut source = File::open(&output).unwrap();
+            let mut decoder = VorbisDecoder::new(&mut source).unwrap();
+            assert_eq!(decoder.sampling_frequency().get(), 48_000);
+            assert_eq!(usize::from(decoder.channels().get()), expected_channels);
+            let mut decoded_frames = 0;
+            let mut contains_audio = false;
+            while let Some(block) = decoder.decode_audio_block().unwrap() {
+                let channels = block.samples();
+                assert_eq!(channels.len(), expected_channels);
+                assert!(channels.iter().all(|channel| !channel.is_empty()));
+                decoded_frames += channels[0].len();
+                contains_audio |= channels
+                    .iter()
+                    .flat_map(|channel| channel.iter())
+                    .any(|sample| sample.abs() > 0.01);
+            }
+            assert!(decoded_frames > 0);
+            assert!(contains_audio);
+        }
 
         fs::remove_dir_all(root).unwrap();
     }

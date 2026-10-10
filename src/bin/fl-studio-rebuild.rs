@@ -23,9 +23,9 @@ use flp_rebuild::sample_render::{
     PlaylistRenderSummary, ResamplingQuality, SamplerPatternRenderOptions,
     SamplerPatternRenderSummary, WavChannelMode, WavDitherMode, WavSampleFormat,
     render_audio_clips_to_wav, render_playlist_with_vst3_to_flac_cancellable,
-    render_playlist_with_vst3_to_wav_cancellable, render_sampler_pattern_to_wav,
-    stream_playlist_with_vst3_to_device_from_frame, stream_sampler_pattern_to_device,
-    write_input_recording_to_wav,
+    render_playlist_with_vst3_to_ogg_cancellable, render_playlist_with_vst3_to_wav_cancellable,
+    render_sampler_pattern_to_wav, stream_playlist_with_vst3_to_device_from_frame,
+    stream_sampler_pattern_to_device, write_input_recording_to_wav,
 };
 use flp_rebuild::vst3::{
     MAX_REPORTED_TAIL_SECONDS, Vst3HostRuntime, Vst3PatternRenderOptions, Vst3PatternStreamHandle,
@@ -97,6 +97,7 @@ enum PlaylistSongOutputFormat {
     #[default]
     Wav,
     Flac,
+    Ogg,
 }
 
 impl PlaylistSongOutputFormat {
@@ -104,6 +105,7 @@ impl PlaylistSongOutputFormat {
         match self {
             Self::Wav => "WAV",
             Self::Flac => "FLAC",
+            Self::Ogg => "OGG",
         }
     }
 
@@ -111,6 +113,7 @@ impl PlaylistSongOutputFormat {
         match self {
             Self::Wav => "wav",
             Self::Flac => "flac",
+            Self::Ogg => "ogg",
         }
     }
 }
@@ -1823,6 +1826,7 @@ struct DawUi {
     playlist_song_output_format: PlaylistSongOutputFormat,
     playlist_render_format: WavSampleFormat,
     playlist_render_flac_bits_per_sample: u8,
+    playlist_render_ogg_bitrate_kbps: u16,
     playlist_render_dither: bool,
     playlist_render_quality: ResamplingQuality,
     playlist_render_channel_mode: WavChannelMode,
@@ -2188,6 +2192,7 @@ impl DawUi {
             playlist_song_output_format: PlaylistSongOutputFormat::Wav,
             playlist_render_format: WavSampleFormat::Float32,
             playlist_render_flac_bits_per_sample: 24,
+            playlist_render_ogg_bitrate_kbps: 192,
             playlist_render_dither: false,
             playlist_render_quality,
             playlist_render_channel_mode: WavChannelMode::Stereo,
@@ -3569,6 +3574,11 @@ impl DawUi {
                                 PlaylistSongOutputFormat::Flac,
                                 "FLAC",
                             );
+                            ui.selectable_value(
+                                &mut self.playlist_song_output_format,
+                                PlaylistSongOutputFormat::Ogg,
+                                "OGG",
+                            );
                         });
                 });
                 match self.playlist_song_output_format {
@@ -3625,6 +3635,19 @@ impl DawUi {
                                 });
                         });
                         ui.label("FLAC is lossless compressed audio. TPDF dither is not applied.");
+                    }
+                    PlaylistSongOutputFormat::Ogg => {
+                        ui.horizontal(|ui| {
+                            ui.label("OGG bit rate");
+                            ui.add(
+                                egui::Slider::new(
+                                    &mut self.playlist_render_ogg_bitrate_kbps,
+                                    64..=450,
+                                )
+                                .suffix(" kbps"),
+                            );
+                        });
+                        ui.label("Ogg Vorbis is lossy. This sets the target average bit rate.");
                     }
                 }
                 let mut render_quality_changed = false;
@@ -4681,6 +4704,11 @@ impl DawUi {
                                 PlaylistSongOutputFormat::Flac,
                                 "FLAC",
                             );
+                            ui.selectable_value(
+                                &mut self.playlist_song_output_format,
+                                PlaylistSongOutputFormat::Ogg,
+                                "OGG",
+                            );
                             if self.playlist_song_output_format == PlaylistSongOutputFormat::Flac {
                                 ui.separator();
                                 ui.label("FLAC bit depth");
@@ -4691,6 +4719,23 @@ impl DawUi {
                                         format!("{depth}-bit"),
                                     );
                                 }
+                            }
+                            if self.playlist_song_output_format == PlaylistSongOutputFormat::Ogg {
+                                ui.menu_button(
+                                    format!(
+                                        "OGG target: {} kbps",
+                                        self.playlist_render_ogg_bitrate_kbps
+                                    ),
+                                    |ui| {
+                                        for bitrate in [64, 96, 128, 160, 192, 224, 256, 320, 450] {
+                                            ui.selectable_value(
+                                                &mut self.playlist_render_ogg_bitrate_kbps,
+                                                bitrate,
+                                                format!("{bitrate} kbps"),
+                                            );
+                                        }
+                                    },
+                                );
                             }
                         },
                     );
@@ -15403,11 +15448,13 @@ impl DawUi {
         let file_dialog = match output_format {
             PlaylistSongOutputFormat::Wav => file_dialog.add_filter("WAV audio", &["wav"]),
             PlaylistSongOutputFormat::Flac => file_dialog.add_filter("FLAC audio", &["flac"]),
+            PlaylistSongOutputFormat::Ogg => file_dialog.add_filter("Ogg Vorbis audio", &["ogg"]),
         };
         let Some(output_path) = file_dialog.save_file() else {
             return;
         };
         let flac_bits_per_sample = self.playlist_render_flac_bits_per_sample;
+        let ogg_bitrate_kbps = self.playlist_render_ogg_bitrate_kbps;
 
         let options = PlaylistRenderOptions {
             arrangement_id: self.selected_arrangement.unwrap_or_default(),
@@ -15476,6 +15523,15 @@ impl DawUi {
                             &worker_cancelled,
                         )
                     }
+                    PlaylistSongOutputFormat::Ogg => render_playlist_with_vst3_to_ogg_cancellable(
+                        &document,
+                        &project_path,
+                        options,
+                        &output_path_for_worker,
+                        ogg_bitrate_kbps,
+                        vst3_processor,
+                        &worker_cancelled,
+                    ),
                 };
                 let _ = sender.send(result);
             });
