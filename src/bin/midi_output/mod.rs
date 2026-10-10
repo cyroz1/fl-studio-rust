@@ -33,6 +33,34 @@ pub struct ConnectedMidiOutput {
 
 pub const MIDI_TEST_NOTE_ON: [u8; 3] = [0x90, 60, 96];
 pub const MIDI_TEST_NOTE_OFF: [u8; 3] = [0x80, 60, 0];
+pub const MIDI_CLOCK_TICK: [u8; 1] = [0xF8];
+pub const MIDI_START: [u8; 1] = [0xFA];
+pub const MIDI_CONTINUE: [u8; 1] = [0xFB];
+pub const MIDI_STOP: [u8; 1] = [0xFC];
+
+pub fn midi_clock_interval(tempo_bpm: f64) -> Option<Duration> {
+    if !tempo_bpm.is_finite() || tempo_bpm <= 0.0 {
+        return None;
+    }
+    let micros = (60_000_000.0 / (tempo_bpm * 24.0)).round();
+    if !micros.is_finite() || micros > u64::MAX as f64 {
+        return None;
+    }
+    Some(Duration::from_micros((micros as u64).max(1)))
+}
+
+pub fn midi_song_position_pointer_message(sixteenth_notes: u16) -> [u8; 3] {
+    let pointer = sixteenth_notes.min(0x3FFF);
+    [0xF2, (pointer & 0x7F) as u8, ((pointer >> 7) & 0x7F) as u8]
+}
+
+pub fn midi_sixteenth_notes_from_frames(frames: u64, sample_rate: u32, tempo_bpm: f64) -> u16 {
+    if sample_rate == 0 || !tempo_bpm.is_finite() || tempo_bpm <= 0.0 {
+        return 0;
+    }
+    let sixteenth_notes = frames as f64 * tempo_bpm * 4.0 / (f64::from(sample_rate) * 60.0);
+    sixteenth_notes.floor().clamp(0.0, 16_383.0) as u16
+}
 
 pub fn pattern_preview_messages(
     pattern: &Pattern,
@@ -169,7 +197,10 @@ mod tests {
 
     use flp_rebuild::{Pattern, PatternNote};
 
-    use super::{all_notes_off_message, pattern_preview_messages};
+    use super::{
+        all_notes_off_message, midi_clock_interval, midi_sixteenth_notes_from_frames,
+        midi_song_position_pointer_message, pattern_preview_messages,
+    };
 
     #[test]
     fn all_notes_off_uses_the_requested_midi_channel() {
@@ -239,5 +270,31 @@ mod tests {
     fn pattern_preview_rejects_invalid_project_timing() {
         assert!(pattern_preview_messages(&Pattern::default(), 0, 120.0).is_err());
         assert!(pattern_preview_messages(&Pattern::default(), 96, f64::NAN).is_err());
+    }
+
+    #[test]
+    fn midi_clock_uses_twenty_four_ticks_per_quarter_note() {
+        assert_eq!(
+            midi_clock_interval(120.0),
+            Some(Duration::from_micros(20_833))
+        );
+        assert_eq!(midi_clock_interval(0.0), None);
+        assert_eq!(midi_clock_interval(f64::INFINITY), None);
+    }
+
+    #[test]
+    fn midi_song_position_pointer_uses_seven_bit_bytes_and_clamps_to_fourteen_bits() {
+        assert_eq!(midi_song_position_pointer_message(130), [0xF2, 2, 1]);
+        assert_eq!(
+            midi_song_position_pointer_message(u16::MAX),
+            [0xF2, 127, 127]
+        );
+    }
+
+    #[test]
+    fn midi_song_position_from_frames_uses_tempo_and_caps_to_the_protocol_range() {
+        assert_eq!(midi_sixteenth_notes_from_frames(48_000, 48_000, 120.0), 8);
+        assert_eq!(midi_sixteenth_notes_from_frames(0, 48_000, 120.0), 0);
+        assert_eq!(midi_sixteenth_notes_from_frames(u64::MAX, 1, 999.0), 16_383);
     }
 }

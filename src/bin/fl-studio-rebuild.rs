@@ -47,9 +47,10 @@ use midi_input::{
     describe_event, enumerate_input_devices,
 };
 use midi_output::{
-    ConnectedMidiOutput, MIDI_TEST_NOTE_OFF, MIDI_TEST_NOTE_ON, MidiOutputDevice,
-    ScheduledMidiMessage, connect_output_device, enumerate_output_devices,
-    pattern_preview_messages,
+    ConnectedMidiOutput, MIDI_CLOCK_TICK, MIDI_CONTINUE, MIDI_START, MIDI_STOP, MIDI_TEST_NOTE_OFF,
+    MIDI_TEST_NOTE_ON, MidiOutputDevice, ScheduledMidiMessage, connect_output_device,
+    enumerate_output_devices, midi_clock_interval, midi_sixteenth_notes_from_frames,
+    midi_song_position_pointer_message, pattern_preview_messages,
 };
 
 const APP_BACKGROUND: Color32 = Color32::from_rgb(29, 29, 29);
@@ -1474,6 +1475,11 @@ struct ActiveMidiPatternPlayback {
     next_message: usize,
 }
 
+struct ActiveMidiClock {
+    interval: Duration,
+    next_tick_at: Instant,
+}
+
 struct DawUi {
     document: Option<FlpDocument>,
     current_path: Option<PathBuf>,
@@ -1655,6 +1661,8 @@ struct DawUi {
     midi_selected_output_id: Option<String>,
     midi_output_error: Option<String>,
     midi_output_connection: Option<ConnectedMidiOutput>,
+    midi_output_send_clock: bool,
+    midi_output_clock: Option<ActiveMidiClock>,
     midi_pattern_playback: Option<ActiveMidiPatternPlayback>,
     midi_pattern_play_requested: bool,
     midi_pattern_stop_requested: bool,
@@ -1799,7 +1807,8 @@ impl DawUi {
             Ok(devices) => (devices, None),
             Err(error) => (Vec::new(), Some(error)),
         };
-        let (midi_selected_input_id, midi_selected_output_id) = load_midi_device_selections();
+        let (midi_selected_input_id, midi_selected_output_id, midi_output_send_clock) =
+            load_midi_device_selections();
         let mut audio_settings = AudioSettings::default();
         if let Some(rate) = audio_catalog.default_sample_rate {
             audio_settings.sample_rate = rate;
@@ -1990,6 +1999,8 @@ impl DawUi {
             midi_selected_output_id,
             midi_output_error,
             midi_output_connection: None,
+            midi_output_send_clock,
+            midi_output_clock: None,
             midi_pattern_playback: None,
             midi_pattern_play_requested: false,
             midi_pattern_stop_requested: false,
@@ -4031,8 +4042,10 @@ impl DawUi {
                     cancelled,
                     worker,
                 });
+                self.stop_midi_pattern_preview();
                 self.status =
                     "Preparing Playlist audio, Samplers, and VST3 instruments…".to_owned();
+                self.start_midi_clock(false);
             }
             Err(error) => {
                 self.stop_project_playback();
@@ -4178,6 +4191,7 @@ impl DawUi {
             }
             self.playing = false;
             self.status = "Project playback paused".to_owned();
+            self.stop_midi_clock();
         } else if self.project_playback_loaded {
             let result = self
                 .audio_engine
@@ -4188,6 +4202,7 @@ impl DawUi {
                 Ok(()) => {
                     self.playing = true;
                     self.status = "Project playback resumed".to_owned();
+                    self.start_midi_clock(true);
                 }
                 Err(error) => self.status = format!("Could not resume project playback: {error}"),
             }
@@ -4199,6 +4214,7 @@ impl DawUi {
     }
 
     fn stop_project_playback(&mut self) {
+        self.stop_midi_clock();
         self.stop_midi_pattern_preview();
         if let Some(pending) = self.pending_audio_render.take() {
             pending.cancelled.store(true, Ordering::Release);
@@ -16474,6 +16490,7 @@ impl DawUi {
         if let Err(error) = save_midi_device_selections(
             self.midi_selected_input_id.as_deref(),
             self.midi_selected_output_id.as_deref(),
+            self.midi_output_send_clock,
         ) {
             self.status = format!("Could not save MIDI device selections: {error}");
         }
@@ -16598,6 +16615,9 @@ impl DawUi {
                         )
                     },
                 );
+                if self.playing && self.midi_output_send_clock {
+                    self.start_midi_clock(true);
+                }
             }
             Err(error) => {
                 self.midi_output_error = Some(error.clone());
@@ -16609,6 +16629,7 @@ impl DawUi {
     fn disconnect_midi_output(&mut self) {
         self.midi_output_test_note_off_at = None;
         self.midi_pattern_playback = None;
+        self.stop_midi_clock();
         let Some(mut connection) = self.midi_output_connection.take() else {
             return;
         };
@@ -16662,6 +16683,95 @@ impl DawUi {
         {
             self.midi_output_error = Some(error.clone());
             self.status = format!("Could not stop MIDI test note: {error}");
+        }
+    }
+
+    fn current_midi_sixteenth_position(&self) -> u16 {
+        let Some(engine) = &self.audio_engine else {
+            return 0;
+        };
+        midi_sixteenth_notes_from_frames(
+            engine.project_playback_position_frames(),
+            engine.sample_rate(),
+            self.tempo_bpm,
+        )
+    }
+
+    fn start_midi_clock(&mut self, resume: bool) {
+        if !self.midi_output_send_clock {
+            return;
+        }
+        let Some(interval) = midi_clock_interval(self.tempo_bpm) else {
+            self.midi_output_error = Some("Project tempo is invalid for MIDI clock".to_owned());
+            return;
+        };
+        let song_position = self.current_midi_sixteenth_position();
+        let Some(connection) = self.midi_output_connection.as_mut() else {
+            return;
+        };
+        let result = if resume {
+            connection
+                .send(&midi_song_position_pointer_message(song_position))
+                .and_then(|()| connection.send(&MIDI_CONTINUE))
+        } else {
+            connection.send(&MIDI_START)
+        };
+        if let Err(error) = result {
+            self.midi_output_error = Some(error);
+            return;
+        }
+        self.midi_output_clock = Some(ActiveMidiClock {
+            interval,
+            next_tick_at: Instant::now() + interval,
+        });
+    }
+
+    fn stop_midi_clock(&mut self) {
+        if self.midi_output_clock.take().is_none() {
+            return;
+        }
+        if let Some(connection) = self.midi_output_connection.as_mut()
+            && let Err(error) = connection.send(&MIDI_STOP)
+        {
+            self.midi_output_error = Some(error);
+        }
+    }
+
+    fn service_midi_clock(&mut self) {
+        if self.midi_output_clock.is_none() {
+            return;
+        }
+        let now = Instant::now();
+        let mut send_error = None;
+        let mut clock_lost = false;
+        if let Some(clock) = self.midi_output_clock.as_mut() {
+            if let Some(connection) = self.midi_output_connection.as_mut() {
+                let interval = clock.interval;
+                let mut sent = 0;
+                while clock.next_tick_at <= now && sent < 4 {
+                    if let Err(error) = connection.send(&MIDI_CLOCK_TICK) {
+                        send_error = Some(error);
+                        let _ = connection.send(&MIDI_STOP);
+                        break;
+                    }
+                    clock.next_tick_at += interval;
+                    sent += 1;
+                }
+                if sent == 4 && clock.next_tick_at <= now {
+                    clock.next_tick_at = now + interval;
+                }
+            } else {
+                clock_lost = true;
+            }
+        }
+        if let Some(error) = send_error {
+            self.midi_output_clock = None;
+            self.midi_output_error = Some(error.clone());
+            self.status = format!("MIDI clock stopped after an output error: {error}");
+        } else if clock_lost {
+            self.midi_output_clock = None;
+            self.midi_output_error =
+                Some("MIDI output disconnected while sending clock".to_owned());
         }
     }
 
@@ -17315,6 +17425,24 @@ impl DawUi {
                 }
             }
         });
+        let send_clock_changed = ui
+            .add_enabled_ui(!self.playing, |ui| {
+                ui.checkbox(
+                    &mut self.midi_output_send_clock,
+                    "Send MIDI clock with transport",
+                )
+            })
+            .inner
+            .changed();
+        if send_clock_changed {
+            self.persist_midi_device_selections();
+        }
+        ui.label(
+            egui::RichText::new(
+                "Sends transport and 24 clock ticks per beat; enable only for hardware set to receive MIDI sync.",
+            )
+            .color(MUTED),
+        );
         if let Some(playback) = &self.midi_pattern_playback {
             ui.label(
                 egui::RichText::new(format!(
@@ -18173,6 +18301,7 @@ impl eframe::App for DawUi {
         self.poll_midi_input(self.history_snapshot_available_this_frame);
         self.finish_midi_output_test_note();
         self.service_midi_pattern_preview();
+        self.service_midi_clock();
         let playlist_clip_shortcuts_enabled =
             self.view == MainView::Playlist && !ui.ctx().egui_wants_keyboard_input();
         let (
@@ -18276,14 +18405,22 @@ impl eframe::App for DawUi {
             self.project_playback_loaded = false;
             self.playlist_playback_loaded = false;
             self.status = "Project playback reached the end".to_owned();
+            self.stop_midi_clock();
         }
         if self.audio_engine.is_some()
             || self.midi_input_connection.is_some()
             || self.midi_output_test_note_off_at.is_some()
             || self.midi_pattern_playback.is_some()
+            || self.midi_output_clock.is_some()
         {
             let repaint_delay = if self.midi_pattern_playback.is_some() {
                 Duration::from_millis(5)
+            } else if let Some(clock) = &self.midi_output_clock {
+                clock
+                    .next_tick_at
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(33))
+                    .max(Duration::from_millis(1))
             } else {
                 Duration::from_millis(33)
             };
@@ -18850,12 +18987,12 @@ fn midi_device_selections_file() -> Option<PathBuf> {
         .map(|directory| directory.join("midi-device-selections.txt"))
 }
 
-fn load_midi_device_selections() -> (Option<String>, Option<String>) {
+fn load_midi_device_selections() -> (Option<String>, Option<String>, bool) {
     let Some(path) = midi_device_selections_file() else {
-        return (None, None);
+        return (None, None, false);
     };
     let Ok(contents) = fs::read_to_string(path) else {
-        return (None, None);
+        return (None, None, false);
     };
     parse_midi_device_selections(&contents)
 }
@@ -18863,6 +19000,7 @@ fn load_midi_device_selections() -> (Option<String>, Option<String>) {
 fn save_midi_device_selections(
     input_id: Option<&str>,
     output_id: Option<&str>,
+    send_clock: bool,
 ) -> Result<(), String> {
     let path = midi_device_selections_file()
         .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
@@ -18871,29 +19009,40 @@ fn save_midi_device_selections(
         .ok_or_else(|| "the MIDI device settings path has no parent folder".to_owned())?;
     fs::create_dir_all(parent)
         .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
-    fs::write(&path, encode_midi_device_selections(input_id, output_id))
-        .map_err(|error| format!("could not write {}: {error}", path.display()))
+    fs::write(
+        &path,
+        encode_midi_device_selections(input_id, output_id, send_clock),
+    )
+    .map_err(|error| format!("could not write {}: {error}", path.display()))
 }
 
-fn encode_midi_device_selections(input_id: Option<&str>, output_id: Option<&str>) -> String {
+fn encode_midi_device_selections(
+    input_id: Option<&str>,
+    output_id: Option<&str>,
+    send_clock: bool,
+) -> String {
     format!(
-        "input={}\noutput={}\n",
+        "input={}\noutput={}\nclock={}\n",
         encode_midi_device_id(input_id.unwrap_or_default()),
-        encode_midi_device_id(output_id.unwrap_or_default())
+        encode_midi_device_id(output_id.unwrap_or_default()),
+        u8::from(send_clock)
     )
 }
 
-fn parse_midi_device_selections(contents: &str) -> (Option<String>, Option<String>) {
+fn parse_midi_device_selections(contents: &str) -> (Option<String>, Option<String>, bool) {
     let mut input_id = None;
     let mut output_id = None;
+    let mut send_clock = false;
     for line in contents.lines() {
         if let Some(encoded_id) = line.strip_prefix("input=") {
             input_id = decode_midi_device_id(encoded_id);
         } else if let Some(encoded_id) = line.strip_prefix("output=") {
             output_id = decode_midi_device_id(encoded_id);
+        } else if let Some(enabled) = line.strip_prefix("clock=") {
+            send_clock = enabled == "1";
         }
     }
-    (input_id, output_id)
+    (input_id, output_id, send_clock)
 }
 
 fn encode_midi_device_id(id: &str) -> String {
@@ -20533,19 +20682,19 @@ mod tests {
     fn midi_device_selections_round_trip_opaque_port_ids() {
         let input_id = "alsa:card=Keyboard\tport\n雪";
         let output_id = "CoreMIDI:0123456789ABCDEF";
-        let encoded = encode_midi_device_selections(Some(input_id), Some(output_id));
+        let encoded = encode_midi_device_selections(Some(input_id), Some(output_id), true);
 
         assert_eq!(
             parse_midi_device_selections(&encoded),
-            (Some(input_id.to_owned()), Some(output_id.to_owned()))
+            (Some(input_id.to_owned()), Some(output_id.to_owned()), true)
         );
     }
 
     #[test]
     fn midi_device_selections_skip_malformed_or_unknown_entries() {
         assert_eq!(
-            parse_midi_device_selections("input=0\noutput=xyz\nother=01\n"),
-            (None, None)
+            parse_midi_device_selections("input=0\noutput=xyz\nclock=invalid\nother=01\n"),
+            (None, None, false)
         );
     }
 
