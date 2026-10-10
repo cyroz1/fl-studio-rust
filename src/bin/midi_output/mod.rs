@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use flp_rebuild::{Pattern, PatternNote};
+use flp_rebuild::Pattern;
 use midir::{MidiOutput, MidiOutputConnection as MidirOutputConnection};
 
 const MAX_PATTERN_PREVIEW_NOTES: usize = 100_000;
