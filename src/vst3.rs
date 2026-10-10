@@ -418,7 +418,7 @@ fn encode_flp_vst3_state_snapshot(nested: &[u8]) -> Result<Vec<u8>, String> {
         let data_end = header_end
             .checked_add(length)
             .ok_or_else(|| "FLP VST3 state record length overflow".to_owned())?;
-        let data = nested
+        nested
             .get(header_end..data_end)
             .ok_or_else(|| "truncated FLP VST3 state record data".to_owned())?;
         match id {
@@ -470,6 +470,138 @@ fn encode_flp_vst3_state_snapshot(nested: &[u8]) -> Result<Vec<u8>, String> {
         snapshot.extend_from_slice(controller);
     }
     Ok(snapshot)
+}
+
+fn decode_vst3_host_state_snapshot(snapshot: &[u8]) -> Result<(&[u8], Option<&[u8]>), String> {
+    if snapshot.get(..16) != Some(VST3_HOST_STATE_MAGIC.as_slice()) {
+        return Err("unsupported VST3 host state snapshot header".to_owned());
+    }
+    let version = read_u32(snapshot, 16)?;
+    if version != VST3_HOST_STATE_VERSION {
+        return Err(format!("unsupported VST3 host state version {version}"));
+    }
+    let component_length = usize::try_from(read_u32(snapshot, 20)?)
+        .map_err(|_| "VST3 component state is too large for this platform".to_owned())?;
+    let controller_length = read_u32(snapshot, 24)?;
+    let component_end = VST3_HOST_STATE_HEADER_SIZE
+        .checked_add(component_length)
+        .ok_or_else(|| "VST3 component state length overflow".to_owned())?;
+    let component = snapshot
+        .get(VST3_HOST_STATE_HEADER_SIZE..component_end)
+        .ok_or_else(|| "truncated VST3 component state snapshot".to_owned())?;
+    let controller = if controller_length == VST3_HOST_NO_CONTROLLER_STATE {
+        if component_end != snapshot.len() {
+            return Err("VST3 snapshot has unexpected bytes after component state".to_owned());
+        }
+        None
+    } else {
+        let controller_length = usize::try_from(controller_length)
+            .map_err(|_| "VST3 controller state is too large for this platform".to_owned())?;
+        let controller_end = component_end
+            .checked_add(controller_length)
+            .ok_or_else(|| "VST3 controller state length overflow".to_owned())?;
+        let controller = snapshot
+            .get(component_end..controller_end)
+            .ok_or_else(|| "truncated VST3 controller state snapshot".to_owned())?;
+        if controller_end != snapshot.len() {
+            return Err("VST3 snapshot has unexpected bytes after controller state".to_owned());
+        }
+        Some(controller)
+    };
+    let payload_length = component
+        .len()
+        .checked_add(controller.map_or(0, <[u8]>::len))
+        .ok_or_else(|| "VST3 state payload length overflow".to_owned())?;
+    if payload_length > MAX_VST3_STATE_PAYLOAD_BYTES {
+        return Err(format!(
+            "VST3 state payload is too large ({} bytes, maximum {})",
+            payload_length, MAX_VST3_STATE_PAYLOAD_BYTES
+        ));
+    }
+    Ok((component, controller))
+}
+
+fn replace_flp_vst3_state_snapshot(nested: &[u8], snapshot: &[u8]) -> Result<Vec<u8>, String> {
+    let marker = read_u32(nested, 0)?;
+    if marker != FLP_VST3_STATE_MARKER {
+        return Err(format!("unsupported FLP nested VST3 state marker {marker}"));
+    }
+    if nested.len() > MAX_VST3_STATE_PAYLOAD_BYTES {
+        return Err("FLP VST3 nested state is too large to update safely".to_owned());
+    }
+    let (component_state, controller_state) = decode_vst3_host_state_snapshot(snapshot)?;
+
+    let mut output = Vec::new();
+    output
+        .try_reserve(nested.len())
+        .map_err(|error| format!("could not allocate FLP VST3 state: {error}"))?;
+    output.extend_from_slice(&nested[..4]);
+    let mut cursor = 4usize;
+    let mut component_seen = false;
+    let mut controller_seen = false;
+    while cursor < nested.len() {
+        let header_end = cursor
+            .checked_add(12)
+            .ok_or_else(|| "FLP VST3 state record header offset overflow".to_owned())?;
+        if header_end > nested.len() {
+            return Err("truncated FLP VST3 state record header".to_owned());
+        }
+        let id = read_u32(nested, cursor)?;
+        let encoded_length = u64::from_le_bytes(
+            nested[cursor + 4..header_end]
+                .try_into()
+                .map_err(|_| "truncated FLP VST3 state record length".to_owned())?,
+        );
+        let length = usize::try_from(encoded_length)
+            .map_err(|_| "FLP VST3 state record is too large for this platform".to_owned())?;
+        let data_end = header_end
+            .checked_add(length)
+            .ok_or_else(|| "FLP VST3 state record length overflow".to_owned())?;
+        let data = nested
+            .get(header_end..data_end)
+            .ok_or_else(|| "truncated FLP VST3 state record data".to_owned())?;
+        match id {
+            3 if component_seen => {
+                return Err("FLP VST3 state contains duplicate component records".to_owned());
+            }
+            3 => {
+                component_seen = true;
+                append_flp_vst3_state_record(&mut output, id, component_state)?;
+            }
+            4 if controller_seen => {
+                return Err("FLP VST3 state contains duplicate controller records".to_owned());
+            }
+            4 => {
+                controller_seen = true;
+                if let Some(controller) = controller_state {
+                    append_flp_vst3_state_record(&mut output, id, controller)?;
+                }
+            }
+            _ => output.extend_from_slice(&nested[cursor..data_end]),
+        }
+        cursor = data_end;
+    }
+    if !component_seen {
+        return Err("FLP VST3 state has no component record (field 3)".to_owned());
+    }
+    if let Some(controller) = controller_state
+        && !controller_seen
+    {
+        append_flp_vst3_state_record(&mut output, 4, controller)?;
+    }
+    if output.len() > MAX_VST3_STATE_PAYLOAD_BYTES {
+        return Err("updated FLP VST3 nested state exceeds the size limit".to_owned());
+    }
+    Ok(output)
+}
+
+fn append_flp_vst3_state_record(payload: &mut Vec<u8>, id: u32, data: &[u8]) -> Result<(), String> {
+    let length =
+        u64::try_from(data.len()).map_err(|_| "FLP VST3 state record is too large".to_owned())?;
+    payload.extend_from_slice(&id.to_le_bytes());
+    payload.extend_from_slice(&length.to_le_bytes());
+    payload.extend_from_slice(data);
+    Ok(())
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, String> {
@@ -611,6 +743,46 @@ impl Vst3HostRuntime {
             .map_err(|_| "plug-in state lock was poisoned".to_owned())?
             .save_state()
             .map_err(|error| error.to_string())
+    }
+
+    /// Save an FLP VST3 channel's current component and controller state into its
+    /// marker-12 nested state stream, retaining unrelated FLP records byte-for-byte.
+    pub fn save_flp_channel_state(
+        &self,
+        id: u64,
+        state: &ChannelPluginState,
+    ) -> Result<Vec<u8>, String> {
+        let metadata = state
+            .vst_metadata()
+            .ok_or_else(|| "FLP channel has no recognized VST state envelope".to_owned())?;
+        if metadata.format_marker() != 12 {
+            return Err(format!(
+                "unsupported FLP VST wrapper marker {}; state write-back requires marker 12",
+                metadata.format_marker()
+            ));
+        }
+        if metadata.fourcc().is_some() {
+            return Err("FLP channel state identifies a VST2 plug-in, not VST3".to_owned());
+        }
+        let expected_uid = metadata
+            .class_uid()
+            .ok_or_else(|| "FLP VST3 state has no valid 16-byte class UID".to_owned())?;
+        let loaded = self
+            .loaded
+            .iter()
+            .find(|loaded| loaded.info.id == id)
+            .ok_or_else(|| format!("no loaded VST3 instance with id {id}"))?;
+        if !loaded.info.uid.eq_ignore_ascii_case(&expected_uid) {
+            return Err(format!(
+                "FLP state class UID {expected_uid} does not match loaded plug-in UID {}",
+                loaded.info.uid
+            ));
+        }
+        let nested_state = state
+            .vst_state_bytes()
+            .ok_or_else(|| "FLP VST3 state has no nested field 53".to_owned())?;
+        let snapshot = self.save_state(id)?;
+        replace_flp_vst3_state_snapshot(nested_state, &snapshot)
     }
 
     pub fn open_editor(&mut self, id: u64) -> Result<(), String> {
@@ -1868,6 +2040,92 @@ mod tests {
             VST3_HOST_NO_CONTROLLER_STATE
         );
         assert_eq!(&snapshot[VST3_HOST_STATE_HEADER_SIZE..], component);
+    }
+
+    fn host_snapshot(component: &[u8], controller: Option<&[u8]>) -> Vec<u8> {
+        let mut snapshot = VST3_HOST_STATE_MAGIC.to_vec();
+        snapshot.extend_from_slice(&VST3_HOST_STATE_VERSION.to_le_bytes());
+        snapshot.extend_from_slice(&(component.len() as u32).to_le_bytes());
+        snapshot.extend_from_slice(
+            &controller
+                .map_or(VST3_HOST_NO_CONTROLLER_STATE, |state| state.len() as u32)
+                .to_le_bytes(),
+        );
+        snapshot.extend_from_slice(component);
+        if let Some(controller) = controller {
+            snapshot.extend_from_slice(controller);
+        }
+        snapshot
+    }
+
+    #[test]
+    fn writes_host_state_back_and_preserves_unknown_flp_records() {
+        let mut nested = FLP_VST3_STATE_MARKER.to_le_bytes().to_vec();
+        append_flp_vst3_state_record(&mut nested, 1, &[0xA1, 0xA2]);
+        append_flp_vst3_state_record(&mut nested, 3, &[0x10]);
+        append_flp_vst3_state_record(&mut nested, 2, &[0xB1, 0xB2, 0xB3]);
+        append_flp_vst3_state_record(&mut nested, 4, &[0x20]);
+        append_flp_vst3_state_record(&mut nested, 999, &[0xC1]);
+        let snapshot = host_snapshot(&[0x31, 0x32], Some(&[0x41, 0x42]));
+
+        let updated = replace_flp_vst3_state_snapshot(&nested, &snapshot)
+            .expect("host state should convert back to FLP records");
+        let mut expected = FLP_VST3_STATE_MARKER.to_le_bytes().to_vec();
+        append_flp_vst3_state_record(&mut expected, 1, &[0xA1, 0xA2]);
+        append_flp_vst3_state_record(&mut expected, 3, &[0x31, 0x32]);
+        append_flp_vst3_state_record(&mut expected, 2, &[0xB1, 0xB2, 0xB3]);
+        append_flp_vst3_state_record(&mut expected, 4, &[0x41, 0x42]);
+        append_flp_vst3_state_record(&mut expected, 999, &[0xC1]);
+        assert_eq!(updated, expected);
+    }
+
+    #[test]
+    fn host_state_writeback_adds_or_removes_the_controller_record() {
+        let component_only = host_snapshot(&[0x31], None);
+        let mut nested = FLP_VST3_STATE_MARKER.to_le_bytes().to_vec();
+        append_flp_vst3_state_record(&mut nested, 3, &[0x10]);
+        let with_controller =
+            replace_flp_vst3_state_snapshot(&nested, &host_snapshot(&[0x31], Some(&[0x41])))
+                .expect("controller state should be added");
+        let mut expected = FLP_VST3_STATE_MARKER.to_le_bytes().to_vec();
+        append_flp_vst3_state_record(&mut expected, 3, &[0x31]);
+        append_flp_vst3_state_record(&mut expected, 4, &[0x41]);
+        assert_eq!(with_controller, expected);
+
+        let mut nested_with_controller = nested.clone();
+        append_flp_vst3_state_record(&mut nested_with_controller, 4, &[0x20]);
+        let without_controller =
+            replace_flp_vst3_state_snapshot(&nested_with_controller, &component_only)
+                .expect("absent controller state should remove its old FLP record");
+        let mut expected_without_controller = FLP_VST3_STATE_MARKER.to_le_bytes().to_vec();
+        append_flp_vst3_state_record(&mut expected_without_controller, 3, &[0x31]);
+        assert_eq!(without_controller, expected_without_controller);
+    }
+
+    #[test]
+    fn host_state_writeback_rejects_truncated_or_ambiguous_snapshots() {
+        let nested = FLP_VST3_STATE_MARKER.to_le_bytes().to_vec();
+        assert!(replace_flp_vst3_state_snapshot(&nested, &[]).is_err());
+
+        let mut no_component = nested.clone();
+        append_flp_vst3_state_record(&mut no_component, 4, &[0x20]);
+        assert!(
+            replace_flp_vst3_state_snapshot(&no_component, &host_snapshot(&[1], None)).is_err()
+        );
+
+        let mut duplicate = nested;
+        append_flp_vst3_state_record(&mut duplicate, 3, &[0x10]);
+        append_flp_vst3_state_record(&mut duplicate, 3, &[0x11]);
+        assert!(replace_flp_vst3_state_snapshot(&duplicate, &host_snapshot(&[1], None)).is_err());
+
+        let mut truncated_snapshot = host_snapshot(&[1], None);
+        truncated_snapshot.pop();
+        let valid_nested = {
+            let mut bytes = FLP_VST3_STATE_MARKER.to_le_bytes().to_vec();
+            append_flp_vst3_state_record(&mut bytes, 3, &[0x10]);
+            bytes
+        };
+        assert!(replace_flp_vst3_state_snapshot(&valid_nested, &truncated_snapshot).is_err());
     }
 
     #[test]

@@ -2416,6 +2416,63 @@ impl FlpDocument {
             .collect()
     }
 
+    /// Replaces field 53 of a marker-12 VST3 channel state while retaining its
+    /// wrapper metadata, identity fields, and every unrelated field byte-for-byte.
+    pub fn replace_vst3_channel_state_bytes(
+        &mut self,
+        channel_id: u16,
+        nested_state: &[u8],
+    ) -> Result<(), FlpError> {
+        let mut candidate = self.clone();
+        let channel = candidate
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id() == channel_id)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the VST3 state channel does not exist",
+            ))?;
+        let data_events = channel
+            .event_range()
+            .filter(|index| candidate.events[*index].opcode == 0xD5)
+            .collect::<Vec<_>>();
+        let [data_event_index] = data_events.as_slice() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the channel must contain exactly one VST plug-in data event",
+            ));
+        };
+        let state = candidate
+            .channel_plugin_states()
+            .into_iter()
+            .find(|state| state.channel_id() == channel_id)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the channel VST plug-in data event could not be decoded",
+            ))?;
+        let Some(metadata) = state.vst_metadata() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the channel has an unsupported VST plug-in state envelope",
+            ));
+        };
+        if metadata.format_marker() != 12 || metadata.fourcc().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "VST3 state write-back requires a marker-12 VST3 envelope",
+            ));
+        }
+        if metadata.class_uid().is_none() {
+            return Err(FlpError::UnsupportedEdit(
+                "the channel VST3 state has no valid class UID",
+            ));
+        }
+        let replacement_payload = replace_vst_state_field(
+            state.data_payload(),
+            metadata.state_data_range.as_ref(),
+            nested_state,
+        )?;
+        candidate.events[*data_event_index].replace_data_payload(replacement_payload)?;
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
     /// Returns pattern metadata and note records from the version-specific score event.
     pub fn patterns(&self) -> Result<Vec<Pattern>, FlpError> {
         let mut patterns = Vec::<Pattern>::new();
@@ -10768,6 +10825,73 @@ fn parse_vst_plugin_state_metadata(payload: &[u8]) -> Option<VstPluginStateMetad
     (field_count > 0).then_some(metadata)
 }
 
+fn replace_vst_state_field(
+    payload: &[u8],
+    state_data_range: Option<&std::ops::Range<usize>>,
+    state_bytes: &[u8],
+) -> Result<Vec<u8>, FlpError> {
+    let state_data_range = state_data_range.ok_or(FlpError::UnsupportedEdit(
+        "the VST envelope has no state field 53",
+    ))?;
+    let mut cursor = 4usize;
+    let mut state_field_count = 0usize;
+    while cursor < payload.len() {
+        let id_end = cursor.checked_add(4).ok_or(FlpError::LengthOverflow)?;
+        let header_end = cursor.checked_add(12).ok_or(FlpError::LengthOverflow)?;
+        let id = read_u32(payload, cursor, "VST field ID")?;
+        let encoded_length = payload
+            .get(id_end..header_end)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the VST envelope contains a truncated field header",
+            ))?;
+        let encoded_length = u64::from_le_bytes(
+            encoded_length
+                .try_into()
+                .map_err(|_| FlpError::LengthOverflow)?,
+        );
+        let length = usize::try_from(encoded_length).map_err(|_| FlpError::LengthOverflow)?;
+        let data_end = header_end
+            .checked_add(length)
+            .ok_or(FlpError::LengthOverflow)?;
+        if data_end > payload.len() {
+            return Err(FlpError::UnsupportedEdit(
+                "the VST envelope contains a truncated field payload",
+            ));
+        }
+        if id == 53 {
+            state_field_count += 1;
+            if state_data_range != &(header_end..data_end) {
+                return Err(FlpError::UnsupportedEdit(
+                    "the VST state field range could not be verified",
+                ));
+            }
+        }
+        cursor = data_end;
+    }
+    if state_field_count != 1 {
+        return Err(FlpError::UnsupportedEdit(
+            "VST state write-back requires exactly one field 53",
+        ));
+    }
+    let field_start = state_data_range
+        .start
+        .checked_sub(12)
+        .ok_or(FlpError::LengthOverflow)?;
+    let state_length = u64::try_from(state_bytes.len()).map_err(|_| FlpError::LengthOverflow)?;
+    let capacity = payload
+        .len()
+        .checked_sub(state_data_range.len())
+        .and_then(|length| length.checked_add(state_bytes.len()))
+        .ok_or(FlpError::LengthOverflow)?;
+    let mut replacement = Vec::with_capacity(capacity);
+    replacement.extend_from_slice(&payload[..field_start]);
+    replacement.extend_from_slice(&payload[field_start..field_start + 4]);
+    replacement.extend_from_slice(&state_length.to_le_bytes());
+    replacement.extend_from_slice(state_bytes);
+    replacement.extend_from_slice(&payload[state_data_range.end..]);
+    Ok(replacement)
+}
+
 fn decode_vst_text(bytes: &[u8]) -> Option<String> {
     let value = std::str::from_utf8(bytes)
         .ok()?
@@ -12895,6 +13019,144 @@ mod tests {
             vst_metadata: Some(metadata),
         };
         assert_eq!(state.vst_state_bytes(), Some(&[1, 2, 3, 4][..]));
+    }
+
+    fn marker_12_vst3_state_fixture() -> Vec<u8> {
+        let mut nested = 1u32.to_le_bytes().to_vec();
+        nested.extend_from_slice(&3u32.to_le_bytes());
+        nested.extend_from_slice(&2u64.to_le_bytes());
+        nested.extend_from_slice(&[0x10, 0x20]);
+        nested.extend_from_slice(&2u32.to_le_bytes());
+        nested.extend_from_slice(&1u64.to_le_bytes());
+        nested.push(0x55);
+        nested.extend_from_slice(&4u32.to_le_bytes());
+        nested.extend_from_slice(&1u64.to_le_bytes());
+        nested.push(0xA0);
+
+        let mut payload = 12u32.to_le_bytes().to_vec();
+        append_vst_field(&mut payload, 50, &[0; 16]);
+        append_vst_field(
+            &mut payload,
+            52,
+            &[
+                0xDF, 0x55, 0x47, 0x32, 0xDF, 0x8F, 0x88, 0x47, 0xB4, 0xCE, 0x5B, 0x70, 0xA8, 0x03,
+                0x7E, 0xC4,
+            ],
+        );
+        append_vst_field(&mut payload, 53, &nested);
+        append_vst_field(&mut payload, 54, b"Test VST3");
+        append_vst_field(&mut payload, 999, &[0x99, 0x98]);
+
+        let mut event_stream = vec![0x40, 7, 0, 0x15, 2];
+        append_data_event(&mut event_stream, 0xD4, &[0xD4, 0xA5]);
+        append_data_event(&mut event_stream, 0xD5, &payload);
+        event_stream.extend_from_slice(&[0x62, 0]);
+        flp_fixture(&event_stream, &[], &[0xD1, 0xD2])
+    }
+
+    #[test]
+    fn replaces_vst3_channel_state_and_preserves_all_other_bytes() {
+        let input = marker_12_vst3_state_fixture();
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+        let original_state = document
+            .channel_plugin_states()
+            .into_iter()
+            .next()
+            .expect("fixture should have VST state");
+        let original_payload = original_state.data_payload().to_vec();
+        let original_wrapper = original_state.wrapper_payload().map(<[u8]>::to_vec);
+        let original_events = document.events().len();
+        let mut replacement = 1u32.to_le_bytes().to_vec();
+        replacement.extend_from_slice(&3u32.to_le_bytes());
+        replacement.extend_from_slice(&3u64.to_le_bytes());
+        replacement.extend_from_slice(&[0x21, 0x22, 0x23]);
+        replacement.extend_from_slice(&2u32.to_le_bytes());
+        replacement.extend_from_slice(&1u64.to_le_bytes());
+        replacement.push(0x55);
+        replacement.extend_from_slice(&4u32.to_le_bytes());
+        replacement.extend_from_slice(&2u64.to_le_bytes());
+        replacement.extend_from_slice(&[0xA1, 0xA2]);
+
+        document
+            .replace_vst3_channel_state_bytes(7, &replacement)
+            .expect("marker-12 VST3 state should be replaceable");
+        let state = document
+            .channel_plugin_states()
+            .into_iter()
+            .next()
+            .expect("updated project should retain VST state");
+        assert_eq!(state.vst_state_bytes(), Some(replacement.as_slice()));
+        assert_eq!(state.wrapper_payload(), original_wrapper.as_deref());
+        assert_eq!(document.events().len(), original_events);
+
+        let updated_payload = state.data_payload();
+        let original_range = original_state
+            .vst_metadata()
+            .unwrap()
+            .state_data_range
+            .clone()
+            .unwrap();
+        let updated_metadata = state
+            .vst_metadata()
+            .expect("updated envelope should remain recognizable");
+        assert_eq!(updated_metadata.name(), Some("Test VST3"));
+        assert_eq!(
+            updated_metadata.class_uid(),
+            original_state.vst_metadata().unwrap().class_uid()
+        );
+        let updated_range = updated_metadata.state_data_range.as_ref().unwrap();
+        let original_field_start = original_range.start - 12;
+        let updated_field_start = updated_range.start - 12;
+        assert_eq!(
+            &updated_payload[..updated_field_start],
+            &original_payload[..original_field_start]
+        );
+        assert_eq!(
+            &updated_payload[updated_range.end..],
+            &original_payload[original_range.end..]
+        );
+        let original_unknown_field = original_payload
+            .windows(4)
+            .position(|bytes| bytes == 999u32.to_le_bytes())
+            .expect("fixture should have an unknown field");
+        let updated_unknown_field = updated_payload
+            .windows(4)
+            .position(|bytes| bytes == 999u32.to_le_bytes())
+            .expect("unknown field should be retained");
+        assert_eq!(
+            updated_payload[updated_unknown_field..],
+            original_payload[original_unknown_field..]
+        );
+
+        let encoded = document
+            .encode_lossless()
+            .expect("updated project should encode");
+        let reparsed = FlpDocument::parse(&encoded).expect("updated project should reparse");
+        assert_eq!(
+            reparsed.channel_plugin_states()[0].vst_state_bytes(),
+            Some(replacement.as_slice())
+        );
+        assert_eq!(reparsed.trailing_bytes(), &[0xD1, 0xD2]);
+    }
+
+    #[test]
+    fn vst3_channel_state_replacement_rejects_ambiguous_fields_without_mutation() {
+        let mut input = marker_12_vst3_state_fixture();
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+        let before = document.encode_lossless().expect("document should encode");
+        assert!(document.replace_vst3_channel_state_bytes(99, &[1]).is_err());
+        assert_eq!(document.encode_lossless().unwrap(), before);
+
+        let mut payload = document.channel_plugin_states()[0].data_payload().to_vec();
+        append_vst_field(&mut payload, 53, &[0x66]);
+        let mut duplicate_stream = vec![0x40, 7, 0, 0x15, 2];
+        append_data_event(&mut duplicate_stream, 0xD5, &payload);
+        duplicate_stream.extend_from_slice(&[0x62, 0]);
+        input = flp_fixture(&duplicate_stream, &[], &[]);
+        document = FlpDocument::parse(&input).expect("duplicate-field fixture should parse");
+        let before = document.encode_lossless().expect("document should encode");
+        assert!(document.replace_vst3_channel_state_bytes(7, &[1]).is_err());
+        assert_eq!(document.encode_lossless().unwrap(), before);
     }
 
     #[test]

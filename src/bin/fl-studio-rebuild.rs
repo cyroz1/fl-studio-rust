@@ -1398,6 +1398,7 @@ struct PendingBrowserPreview {
 struct PendingBackupWrite {
     source_path: PathBuf,
     purpose: BackupPurpose,
+    plugin_state_warnings: Vec<String>,
     receiver: Receiver<Result<PathBuf, String>>,
     worker: thread::JoinHandle<()>,
 }
@@ -2678,6 +2679,8 @@ impl DawUi {
         else {
             return;
         };
+        let mut document = document.clone();
+        let plugin_state_warnings = self.capture_loaded_vst3_state(&mut document);
         let result = document
             .encode_lossless()
             .map_err(|error| error.to_string())
@@ -2692,9 +2695,17 @@ impl DawUi {
         match result {
             Ok(path) => {
                 self.last_autosave_path = Some(path.clone());
-                self.status = format!("Autosaved before {operation}");
+                self.status = format!(
+                    "Autosaved before {operation}{}",
+                    plugin_state_warning_suffix(&plugin_state_warnings)
+                );
             }
-            Err(error) => self.status = format!("Could not autosave before {operation}: {error}"),
+            Err(error) => {
+                self.status = format!(
+                    "Could not autosave before {operation}: {error}{}",
+                    plugin_state_warning_suffix(&plugin_state_warnings)
+                );
+            }
         }
     }
 
@@ -2705,6 +2716,8 @@ impl DawUi {
             self.status = "Save the project before creating a backup".to_owned();
             return;
         };
+        let mut document = document.clone();
+        let plugin_state_warnings = self.capture_loaded_vst3_state(&mut document);
         let bytes = match document.encode_lossless() {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -2731,6 +2744,7 @@ impl DawUi {
         self.pending_backup_write = Some(PendingBackupWrite {
             source_path,
             purpose,
+            plugin_state_warnings,
             receiver,
             worker,
         });
@@ -2742,16 +2756,22 @@ impl DawUi {
     fn poll_backup_write(&mut self) {
         let result = self.pending_backup_write.as_ref().and_then(|pending| {
             match pending.receiver.try_recv() {
-                Ok(result) => Some((pending.source_path.clone(), pending.purpose, result)),
+                Ok(result) => Some((
+                    pending.source_path.clone(),
+                    pending.purpose,
+                    pending.plugin_state_warnings.clone(),
+                    result,
+                )),
                 Err(TryRecvError::Disconnected) => Some((
                     pending.source_path.clone(),
                     pending.purpose,
+                    pending.plugin_state_warnings.clone(),
                     Err("backup writer stopped unexpectedly".to_owned()),
                 )),
                 Err(TryRecvError::Empty) => None,
             }
         });
-        let Some((source_path, purpose, result)) = result else {
+        let Some((source_path, purpose, plugin_state_warnings, result)) = result else {
             return;
         };
         if let Some(pending) = self.pending_backup_write.take() {
@@ -2765,13 +2785,26 @@ impl DawUi {
                     .is_some_and(|current_path| project_paths_equal(current_path, &source_path));
                 if is_current_project {
                     self.last_autosave_path = Some(path.clone());
-                    self.status = format!("Autosaved to {}", path.display());
+                    self.status = format!(
+                        "Autosaved to {}{}",
+                        path.display(),
+                        plugin_state_warning_suffix(&plugin_state_warnings)
+                    );
                 }
             }
             (BackupPurpose::Manual, Ok(path)) => {
-                self.status = format!("Backup created at {}", path.display());
+                self.status = format!(
+                    "Backup created at {}{}",
+                    path.display(),
+                    plugin_state_warning_suffix(&plugin_state_warnings)
+                );
             }
-            (_, Err(error)) => self.status = format!("Could not write backup: {error}"),
+            (_, Err(error)) => {
+                self.status = format!(
+                    "Could not write backup: {error}{}",
+                    plugin_state_warning_suffix(&plugin_state_warnings)
+                );
+            }
         }
     }
 
@@ -3600,11 +3633,38 @@ impl DawUi {
         self.status = format!("{action} project edit");
     }
 
+    fn capture_loaded_vst3_state(&self, document: &mut FlpDocument) -> Vec<String> {
+        let Some(host) = self.vst3_host.as_ref() else {
+            return Vec::new();
+        };
+        let instances = &self.channel_vst3_instances;
+        let mut warnings = Vec::new();
+        for state in document.channel_plugin_states() {
+            let Some(instance_id) = instances.get(&state.channel_id()).copied() else {
+                continue;
+            };
+            let updated_state = match host.save_flp_channel_state(instance_id, &state) {
+                Ok(updated_state) => updated_state,
+                Err(error) => {
+                    warnings.push(format!("channel {}: {error}", state.channel_id()));
+                    continue;
+                }
+            };
+            if let Err(error) =
+                document.replace_vst3_channel_state_bytes(state.channel_id(), &updated_state)
+            {
+                warnings.push(format!("channel {}: {error}", state.channel_id()));
+            }
+        }
+        warnings
+    }
+
     fn write_project(&mut self, path: &Path) {
-        let Some(document) = self.document.as_ref().cloned() else {
+        let Some(mut document) = self.document.as_ref().cloned() else {
             self.status = "Open a project before saving".to_owned();
             return;
         };
+        let plugin_state_warnings = self.capture_loaded_vst3_state(&mut document);
         let encoded = match document.encode_lossless() {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -3615,7 +3675,7 @@ impl DawUi {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         let backups = self.backup_before_manual_save(path);
         let mut package_workspace_after_save = None;
-        let mut document_after_save = None;
+        let mut document_after_save = Some(document.clone());
         let mut sample_bundle_summary = None;
         let mut saved_bytes = encoded.clone();
         let save_result = if has_extension(path, "zip") {
@@ -3685,6 +3745,8 @@ impl DawUi {
                     ),
                     _ => format!("Saved {}", path.display()),
                 };
+                self.status
+                    .push_str(&plugin_state_warning_suffix(&plugin_state_warnings));
                 if let Some(summary) = sample_bundle_summary {
                     if summary.bundled_files > 0 {
                         self.status.push_str(&format!(
@@ -16898,11 +16960,16 @@ impl DawUi {
             }
         }
         if let Some(host) = &self.vst3_host {
+            let mut parameter_changed = false;
             for (id, parameter_id, value) in parameter_edits {
-                if let Err(error) = host.set_parameter(id, parameter_id, value) {
-                    self.status = format!("Could not update VST3 parameter: {error}");
+                match host.set_parameter(id, parameter_id, value) {
+                    Ok(()) => parameter_changed = true,
+                    Err(error) => {
+                        self.status = format!("Could not update VST3 parameter: {error}");
+                    }
                 }
             }
+            self.dirty |= parameter_changed;
         }
     }
 
@@ -17403,6 +17470,17 @@ fn empty_view(ui: &mut egui::Ui, message: &str) {
     ui.centered_and_justified(|ui| {
         ui.label(egui::RichText::new(message).size(18.0).color(MUTED));
     });
+}
+
+fn plugin_state_warning_suffix(warnings: &[String]) -> String {
+    if warnings.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " · VST3 state kept from its previous save for {}",
+            warnings.join("; ")
+        )
+    }
 }
 
 fn layer_child_selection_label(child_ids: &[u16], channels: &[ChannelSummary]) -> String {
