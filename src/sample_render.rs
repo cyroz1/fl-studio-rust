@@ -55,7 +55,7 @@ impl Default for AudioClipRenderOptions {
         Self {
             arrangement_id: 0,
             sample_rate: DEFAULT_SAMPLE_RATE,
-            resampling_quality: ResamplingQuality::Linear,
+            resampling_quality: ResamplingQuality::RENDER_DEFAULT,
             clip_index: None,
             start_from_song_start: false,
             soloed_playlist_track_range: None,
@@ -78,7 +78,7 @@ impl Default for SamplerPatternRenderOptions {
             pattern_id: 0,
             sample_rate: DEFAULT_SAMPLE_RATE,
             voice_limit: DEFAULT_SAMPLER_VOICE_LIMIT,
-            resampling_quality: ResamplingQuality::Linear,
+            resampling_quality: ResamplingQuality::RENDER_DEFAULT,
             read_sample_root_note: true,
         }
     }
@@ -169,6 +169,7 @@ pub enum ResamplingQuality {
 
 impl ResamplingQuality {
     pub const LIVE_DEFAULT: Self = Self::Sinc24;
+    pub const RENDER_DEFAULT: Self = Self::Sinc32;
 
     pub const SINC_OPTIONS: [Self; 7] = [
         Self::Sinc16,
@@ -317,7 +318,7 @@ impl Default for PlaylistRenderOptions {
             sampler_voice_limit: DEFAULT_SAMPLER_VOICE_LIMIT,
             wav_sample_format: WavSampleFormat::Float32,
             wav_dither_mode: WavDitherMode::Off,
-            resampling_quality: ResamplingQuality::Linear,
+            resampling_quality: ResamplingQuality::RENDER_DEFAULT,
             wav_channel_mode: WavChannelMode::Stereo,
             tail_seconds: 0,
             soloed_playlist_track_range: None,
@@ -3108,6 +3109,19 @@ mod tests {
             );
         }
         assert_eq!(ResamplingQuality::LIVE_DEFAULT, ResamplingQuality::Sinc24);
+        assert_eq!(ResamplingQuality::RENDER_DEFAULT, ResamplingQuality::Sinc32);
+        assert_eq!(
+            AudioClipRenderOptions::default().resampling_quality,
+            ResamplingQuality::RENDER_DEFAULT
+        );
+        assert_eq!(
+            SamplerPatternRenderOptions::default().resampling_quality,
+            ResamplingQuality::RENDER_DEFAULT
+        );
+        assert_eq!(
+            PlaylistRenderOptions::default().resampling_quality,
+            ResamplingQuality::RENDER_DEFAULT
+        );
         assert_eq!(
             ResamplingQuality::LIVE_OPTIONS,
             [

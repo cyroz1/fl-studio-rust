@@ -1887,6 +1887,7 @@ impl DawUi {
             audio_settings.sample_rate = rate;
         }
         let live_resampling_quality = load_live_resampling_quality();
+        let playlist_render_quality = load_playlist_render_quality();
         let read_sample_root_note = load_read_sample_root_note();
         let browser_path = initial_project
             .as_deref()
@@ -2158,7 +2159,7 @@ impl DawUi {
             playlist_render_options_open: false,
             playlist_render_format: WavSampleFormat::Float32,
             playlist_render_dither: false,
-            playlist_render_quality: ResamplingQuality::Linear,
+            playlist_render_quality,
             playlist_render_channel_mode: WavChannelMode::Stereo,
             playlist_render_tail_seconds: 0,
             playlist_render_include_plugin_tails: false,
@@ -3546,20 +3547,28 @@ impl DawUi {
                     ui.checkbox(&mut self.playlist_render_dither, "TPDF dither");
                 });
                 ui.label("Adds triangular dither during 16-bit output only.");
+                let mut render_quality_changed = false;
                 ui.horizontal(|ui| {
                     ui.label("Resampling");
                     egui::ComboBox::from_id_salt("playlist-render-resampling-quality")
                         .selected_text(self.playlist_render_quality.label())
                         .show_ui(ui, |ui| {
                             for quality in ResamplingQuality::RENDER_OPTIONS {
-                                ui.selectable_value(
-                                    &mut self.playlist_render_quality,
-                                    quality,
-                                    quality.label(),
-                                );
+                                render_quality_changed |= ui
+                                    .selectable_value(
+                                        &mut self.playlist_render_quality,
+                                        quality,
+                                        quality.label(),
+                                    )
+                                    .changed();
                             }
                         });
                 });
+                if render_quality_changed
+                    && let Err(error) = save_playlist_render_quality(self.playlist_render_quality)
+                {
+                    self.status = format!("Could not save Playlist render quality: {error}");
+                }
                 ui.label("Hermite gives curved interpolation at low CPU cost; sinc reduces aliasing during pitch shifts and downsampling.");
                 ui.horizontal(|ui| {
                     ui.label("Channels");
@@ -20480,11 +20489,24 @@ fn live_resampling_quality_settings_file() -> Option<PathBuf> {
         .map(|directory| directory.join("live-resampling-quality.txt"))
 }
 
+fn playlist_render_quality_settings_file() -> Option<PathBuf> {
+    browser_favorites_file()?
+        .parent()
+        .map(|directory| directory.join("playlist-render-quality.txt"))
+}
+
 fn load_live_resampling_quality() -> ResamplingQuality {
     live_resampling_quality_settings_file()
         .and_then(|path| fs::read_to_string(path).ok())
         .and_then(|contents| ResamplingQuality::from_settings_key(contents.trim()))
         .unwrap_or(ResamplingQuality::LIVE_DEFAULT)
+}
+
+fn load_playlist_render_quality() -> ResamplingQuality {
+    playlist_render_quality_settings_file()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|contents| ResamplingQuality::from_settings_key(contents.trim()))
+        .unwrap_or(ResamplingQuality::RENDER_DEFAULT)
 }
 
 fn save_live_resampling_quality(quality: ResamplingQuality) -> Result<(), String> {
@@ -20493,6 +20515,18 @@ fn save_live_resampling_quality(quality: ResamplingQuality) -> Result<(), String
     let parent = path
         .parent()
         .ok_or_else(|| "the live resampling setting path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(&path, format!("{}\n", quality.settings_key()))
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
+fn save_playlist_render_quality(quality: ResamplingQuality) -> Result<(), String> {
+    let path = playlist_render_quality_settings_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the Playlist render quality path has no parent folder".to_owned())?;
     fs::create_dir_all(parent)
         .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
     fs::write(&path, format!("{}\n", quality.settings_key()))
