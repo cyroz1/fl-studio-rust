@@ -7540,8 +7540,14 @@ impl DawUi {
                         ui.selectable_value(&mut self.playlist_waveform_mode, mode, mode.label());
                     }
                 });
-            let can_create_pattern_clip =
-                selected_pattern_id.is_some() && !arrangement.clips.is_empty();
+            let has_project_pattern_clip_template = arrangements.iter().any(|candidate| {
+                candidate
+                    .clips
+                    .iter()
+                    .any(|clip| matches!(clip.target(), PlaylistClipTarget::Pattern { .. }))
+            });
+            let can_create_pattern_clip = selected_pattern_id.is_some()
+                && (!arrangement.clips.is_empty() || has_project_pattern_clip_template);
             create_pattern_clip_requested = ui
                 .add_enabled(
                     can_create_pattern_clip,
@@ -7549,8 +7555,8 @@ impl DawUi {
                 )
                 .on_hover_text(if selected_pattern_id.is_none() {
                     "Create a pattern before adding it to the Playlist"
-                } else if arrangement.clips.is_empty() {
-                    "This arrangement needs an existing clip to establish its clip format"
+                } else if arrangement.clips.is_empty() && !has_project_pattern_clip_template {
+                    "Add a Pattern Clip to another arrangement or paste a clip template first"
                 } else {
                     "Add the selected pattern at the end of the arrangement"
                 })

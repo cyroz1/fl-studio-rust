@@ -4579,9 +4579,10 @@ impl FlpDocument {
         Ok(())
     }
 
-    /// Creates a Pattern Clip by copying a recognized Playlist clip record in the arrangement.
-    /// Its position, item index, length, track, and (when present) clip ID are assigned; all
-    /// other record bytes come from the existing template and remain opaque.
+    /// Creates a Pattern Clip from a recognized Playlist record in the target arrangement.
+    /// For an empty arrangement, a Pattern Clip record from another arrangement is reused.
+    /// Position, item index, length, track, and (when present) clip ID are assigned; other
+    /// record bytes come from the template and remain opaque.
     pub fn create_playlist_pattern_clip(
         &mut self,
         arrangement_id: u16,
@@ -4628,22 +4629,71 @@ impl FlpDocument {
                 "the requested arrangement id is ambiguous",
             ));
         }
-        let Some((template_index, template)) = arrangement
+        let template_in_arrangement = arrangement
             .clips
             .iter()
             .enumerate()
             .find(|(_, clip)| matches!(clip.target(), PlaylistClipTarget::Pattern { .. }))
-            .or_else(|| arrangement.clips.iter().enumerate().next())
-        else {
-            return Err(FlpError::UnsupportedEdit(
-                "the arrangement has no recognized Playlist clip record to use as a template",
-            ));
-        };
-
-        let item_index = template
-            .pattern_base
+            .or_else(|| arrangement.clips.iter().enumerate().next());
+        let item_index = template_in_arrangement
+            .map(|(_, template)| template.pattern_base)
+            .or_else(|| {
+                arrangements
+                    .iter()
+                    .flat_map(|arrangement| arrangement.clips.iter())
+                    .find(|clip| matches!(clip.target(), PlaylistClipTarget::Pattern { .. }))
+                    .map(|template| template.pattern_base)
+            })
+            .ok_or(FlpError::UnsupportedEdit(
+                "the project has no recognized Pattern Clip record to use as a template",
+            ))?
             .checked_add(pattern_id)
             .ok_or(FlpError::LengthOverflow)?;
+
+        if template_in_arrangement.is_none() {
+            let template = arrangements
+                .iter()
+                .flat_map(|arrangement| arrangement.clips.iter())
+                .find(|clip| matches!(clip.target(), PlaylistClipTarget::Pattern { .. }))
+                .expect("a Pattern Clip template was checked above");
+            let record_size = template.record_size;
+            let record_start = template
+                .source_record_index
+                .checked_mul(record_size)
+                .ok_or(FlpError::LengthOverflow)?;
+            let record_end = record_start
+                .checked_add(record_size)
+                .ok_or(FlpError::LengthOverflow)?;
+            let event =
+                self.events
+                    .get(template.source_event_index)
+                    .ok_or(FlpError::UnsupportedEdit(
+                        "the Playlist clip template event no longer exists",
+                    ))?;
+            if event.opcode != 0xE9
+                || !matches!(event.encoding, PayloadEncoding::Data { .. })
+                || record_end > event.payload.len()
+                || !event.payload.len().is_multiple_of(record_size)
+            {
+                return Err(FlpError::UnsupportedEdit(
+                    "the Playlist Pattern Clip template record is not recognized",
+                ));
+            }
+            let mut record = event.payload[record_start..record_end].to_vec();
+            record[6..8].copy_from_slice(&item_index.to_le_bytes());
+            record[8..12].copy_from_slice(&length_ticks.to_le_bytes());
+            let clipboard = PlaylistClipClipboard { raw_record: record };
+            return self.paste_playlist_clip(
+                arrangement_id,
+                &clipboard,
+                position_ticks,
+                499u16 - track_index,
+            );
+        }
+
+        let (template_index, template) =
+            template_in_arrangement.expect("a clip in the target arrangement was checked above");
+
         let record_size = template.record_size;
         let record_start = template
             .source_record_index
@@ -12920,6 +12970,65 @@ mod tests {
             .encode_lossless()
             .expect("the edited project should encode");
         FlpDocument::parse(&encoded).expect("the edited project should parse again");
+    }
+
+    #[test]
+    fn creates_playlist_pattern_clip_in_empty_arrangement_from_project_template() {
+        let mut template = [0; 80];
+        template[4..6].copy_from_slice(&0x5000u16.to_le_bytes());
+        template[6..8].copy_from_slice(&0x5001u16.to_le_bytes());
+        template[8..12].copy_from_slice(&960u32.to_le_bytes());
+        template[12..14].copy_from_slice(&499u16.to_le_bytes());
+        template[16..18].copy_from_slice(&120u16.to_le_bytes());
+        template[18..20].copy_from_slice(&0x40u16.to_le_bytes());
+        template[20..24].copy_from_slice(&[0x40, 0x64, 0x80, 0x80]);
+        template[24..28].copy_from_slice(&(-1.0f32).to_le_bytes());
+        template[28..32].copy_from_slice(&(-1.0f32).to_le_bytes());
+        template[32..36].copy_from_slice(&10u32.to_le_bytes());
+        template[64..72].copy_from_slice(&1.0f64.to_le_bytes());
+
+        let mut event_stream = Vec::new();
+        append_data_event(&mut event_stream, 0xC7, b"26.0.0\0");
+        event_stream.extend_from_slice(&[0x41, 7, 0]);
+        append_data_event(&mut event_stream, 0xD0, &[]);
+        event_stream.extend_from_slice(&[0x63, 3, 0]);
+        event_stream.extend_from_slice(&[0x63, 4, 0]);
+        append_data_event(&mut event_stream, 0xE9, &template);
+        let input = flp_fixture(&event_stream, &[0xA1], &[0xB2]);
+        let mut document = FlpDocument::parse(&input).expect("the project fixture should parse");
+
+        let inserted_index = document
+            .create_playlist_pattern_clip(3, 7, 1_920, 480, 2)
+            .expect("an empty arrangement should reuse a project Pattern Clip template");
+        assert_eq!(inserted_index, 0);
+
+        let arrangements = document.arrangements().expect("the Playlist should decode");
+        assert_eq!(arrangements.len(), 2);
+        assert_eq!(arrangements[0].id, 3);
+        assert_eq!(arrangements[0].clips.len(), 1);
+        let added_clip = &arrangements[0].clips[0];
+        assert_eq!(added_clip.position_ticks, 1_920);
+        assert_eq!(added_clip.length_ticks, 480);
+        assert_eq!(added_clip.track_index, Some(2));
+        assert_eq!(added_clip.target(), PlaylistClipTarget::Pattern { id: 7 });
+        assert_eq!(added_clip.clip_id, Some(10));
+        assert_eq!(arrangements[1].id, 4);
+        assert_eq!(arrangements[1].clips.len(), 1);
+
+        let clip_events = document
+            .events()
+            .iter()
+            .filter(|event| event.opcode() == 0xE9)
+            .collect::<Vec<_>>();
+        assert_eq!(clip_events.len(), 2);
+        assert_eq!(clip_events[0].payload().len(), 80);
+        assert_eq!(clip_events[1].payload(), template.as_slice());
+
+        let encoded = document
+            .encode_lossless()
+            .expect("the project with a new Pattern Clip should encode");
+        let reparsed = FlpDocument::parse(&encoded).expect("the updated project should parse");
+        assert_eq!(reparsed.arrangements().unwrap(), arrangements);
     }
 
     #[test]
