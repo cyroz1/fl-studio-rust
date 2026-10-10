@@ -4359,6 +4359,130 @@ impl FlpDocument {
         Ok(template_index.saturating_add(1))
     }
 
+    /// Creates an Audio Clip by copying a recognized Playlist clip record.
+    ///
+    /// The requested channel must be an Audio Clip channel. Position, channel target, length,
+    /// and track are updated; all other record bytes remain copied from the template.
+    pub fn create_playlist_audio_clip(
+        &mut self,
+        arrangement_id: u16,
+        channel_id: u16,
+        position_ticks: u32,
+        length_ticks: u32,
+        track_index: u16,
+    ) -> Result<usize, FlpError> {
+        if length_ticks == 0 {
+            return Err(FlpError::UnsupportedEdit(
+                "Playlist Audio Clip length must be greater than zero",
+            ));
+        }
+        if track_index > 499 {
+            return Err(FlpError::UnsupportedEdit(
+                "Playlist track index must be between 0 and 499",
+            ));
+        }
+
+        let channels = self.channels();
+        let mut matching_channels = channels.iter().filter(|channel| channel.id() == channel_id);
+        let Some(channel) = matching_channels.next() else {
+            return Err(FlpError::ChannelNotFound(channel_id));
+        };
+        if matching_channels.next().is_some() || channel.kind() != Some(4) {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested channel is not one unambiguous Audio Clip channel",
+            ));
+        }
+        if channel.sample_path().is_none() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested Audio Clip channel has no recognized sample path",
+            ));
+        }
+
+        let arrangements = self.arrangements()?;
+        let mut matching_arrangements = arrangements
+            .iter()
+            .filter(|arrangement| arrangement.id == arrangement_id);
+        let Some(arrangement) = matching_arrangements.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested arrangement does not exist",
+            ));
+        };
+        if matching_arrangements.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested arrangement id is ambiguous",
+            ));
+        }
+        let channel_ids = channels
+            .iter()
+            .filter(|channel| channel.kind() == Some(4))
+            .map(ChannelSummary::id)
+            .collect::<HashSet<_>>();
+        let Some((template_index, template)) = arrangement
+            .clips
+            .iter()
+            .enumerate()
+            .find(|(_, clip)| {
+                matches!(clip.target(), PlaylistClipTarget::Channel { id } if id == channel_id)
+            })
+            .or_else(|| {
+                arrangement.clips.iter().enumerate().find(|(_, clip)| {
+                    matches!(clip.target(), PlaylistClipTarget::Channel { id } if channel_ids.contains(&id))
+                })
+            })
+            .or_else(|| arrangement.clips.iter().enumerate().next())
+        else {
+            return Err(FlpError::UnsupportedEdit(
+                "the arrangement has no recognized Playlist clip record to use as a template",
+            ));
+        };
+        if channel_id >= template.pattern_base {
+            return Err(FlpError::UnsupportedEdit(
+                "the Audio Clip channel ID does not fit the template's channel target range",
+            ));
+        }
+
+        let record_size = template.record_size;
+        let record_start = template
+            .source_record_index
+            .checked_mul(record_size)
+            .ok_or(FlpError::LengthOverflow)?;
+        let event_index = template.source_event_index;
+        let event = self
+            .events
+            .get(event_index)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the Playlist clip template event no longer exists",
+            ))?;
+        if event.opcode != 0xE9 || !matches!(event.encoding, PayloadEncoding::Data { .. }) {
+            return Err(FlpError::UnsupportedEdit(
+                "the Playlist clip template is not in a length-prefixed data event",
+            ));
+        }
+        let record_end = record_start
+            .checked_add(record_size)
+            .ok_or(FlpError::LengthOverflow)?;
+        if record_end > event.payload.len() || !event.payload.len().is_multiple_of(record_size) {
+            return Err(FlpError::UnsupportedEdit(
+                "the Playlist clip template does not fit its event payload",
+            ));
+        }
+
+        let raw_track_index = 499u16 - track_index;
+        let mut record = event.payload[record_start..record_end].to_vec();
+        record[0..4].copy_from_slice(&position_ticks.to_le_bytes());
+        record[6..8].copy_from_slice(&channel_id.to_le_bytes());
+        record[8..12].copy_from_slice(&length_ticks.to_le_bytes());
+        record[12..14].copy_from_slice(&raw_track_index.to_le_bytes());
+
+        let mut candidate = self.clone();
+        let mut payload = event.payload.clone();
+        payload.splice(record_end..record_end, record);
+        candidate.events[event_index].replace_data_payload(payload)?;
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(template_index.saturating_add(1))
+    }
+
     /// Removes one Playlist clip's complete stored record without rewriting its neighbors.
     pub fn delete_playlist_clip(
         &mut self,
@@ -9959,9 +10083,20 @@ impl FlpDocument {
     /// channel ID, and is inserted before the channel-list terminator so existing event bytes
     /// remain in order. Projects whose string encoding cannot be inferred are rejected.
     pub fn create_sampler_channel(&mut self, path: &str, name: &str) -> Result<u16, FlpError> {
+        self.create_sample_channel(path, name, 0)
+    }
+
+    /// Adds a sample-backed Audio Clip channel with the given source path and display name.
+    ///
+    /// The channel uses the same recognized string encoding and unique-ID rules as a Sampler.
+    pub fn create_audio_channel(&mut self, path: &str, name: &str) -> Result<u16, FlpError> {
+        self.create_sample_channel(path, name, 4)
+    }
+
+    fn create_sample_channel(&mut self, path: &str, name: &str, kind: u8) -> Result<u16, FlpError> {
         if path.is_empty() || path.contains('\0') {
             return Err(FlpError::UnsupportedEdit(
-                "a new Sampler channel requires a non-empty path without embedded NUL characters",
+                "a new sample channel requires a non-empty path without embedded NUL characters",
             ));
         }
         if name.contains('\0') {
@@ -9995,7 +10130,7 @@ impl FlpDocument {
         let display_name = encode_project_string(name, uses_utf16)?;
         let new_events = vec![
             FlpEvent::new_word(0x40, next_id),
-            FlpEvent::new_byte(0x15, 0),
+            FlpEvent::new_byte(0x15, kind),
             FlpEvent::new_byte(0x00, 1),
             FlpEvent::new_data(0xC4, sample_path)?,
             FlpEvent::new_data(0xCB, display_name)?,
@@ -11433,6 +11568,38 @@ mod tests {
             .expect("Pattern Clip fixture should parse")
     }
 
+    fn audio_clip_fixture() -> FlpDocument {
+        let mut event_stream = vec![0x40, 9, 0, 0x15, 4];
+        append_data_event(
+            &mut event_stream,
+            0xC4,
+            &utf16_project_string("/samples/recording.wav"),
+        );
+        event_stream.extend_from_slice(&[0x48, 9, 0, 0x62, 0, 0, 0x63, 3, 0]);
+
+        let mut pattern_clip = [0xA5u8; 80];
+        pattern_clip[0..4].copy_from_slice(&1920u32.to_le_bytes());
+        pattern_clip[4..6].copy_from_slice(&0x5000u16.to_le_bytes());
+        pattern_clip[6..8].copy_from_slice(&0x5007u16.to_le_bytes());
+        pattern_clip[8..12].copy_from_slice(&960u32.to_le_bytes());
+        pattern_clip[12..14].copy_from_slice(&499u16.to_le_bytes());
+        pattern_clip[20..24].copy_from_slice(&[0x40, 0x64, 0x80, 0x80]);
+        pattern_clip[24..28].copy_from_slice(&0.0f32.to_le_bytes());
+        pattern_clip[28..32].copy_from_slice(&1.0f32.to_le_bytes());
+        pattern_clip[64..72].copy_from_slice(&1.0f64.to_le_bytes());
+
+        let mut audio_clip = pattern_clip;
+        audio_clip[0..4].copy_from_slice(&0u32.to_le_bytes());
+        audio_clip[6..8].copy_from_slice(&9u16.to_le_bytes());
+        let mut clip_payload = pattern_clip.to_vec();
+        clip_payload.extend_from_slice(&audio_clip);
+        append_data_event(&mut event_stream, 0xE9, &clip_payload);
+
+        let mut input = flp_fixture(&event_stream, &[], &[]);
+        input[10..12].copy_from_slice(&1u16.to_le_bytes());
+        FlpDocument::parse(&input).expect("Audio Clip fixture should parse")
+    }
+
     fn merge_pattern_clips_fixture(include_unsupported_pattern_event: bool) -> FlpDocument {
         let mut event_stream = vec![0x40, 0, 0, 0x41, 7, 0];
         let receiver_note = note_record(0, 7, 48, 60, 100);
@@ -12364,6 +12531,65 @@ mod tests {
             .encode_lossless()
             .expect("the edited project should encode");
         FlpDocument::parse(&encoded).expect("the edited project should parse again");
+    }
+
+    #[test]
+    fn creates_playlist_audio_clip_from_an_audio_clip_template() {
+        let mut document = audio_clip_fixture();
+        let original_pattern_clip = document.arrangements().unwrap()[0].clips[0].clone();
+        let original_audio_record = document
+            .events()
+            .iter()
+            .find(|event| event.opcode() == 0xE9)
+            .unwrap()
+            .payload()[80..160]
+            .to_vec();
+
+        let inserted_index = document
+            .create_playlist_audio_clip(3, 9, 3840, 720, 4)
+            .expect("an Audio Clip should be created from its channel template");
+        assert_eq!(inserted_index, 2);
+
+        let arrangement = &document.arrangements().unwrap()[0];
+        assert_eq!(arrangement.clips.len(), 3);
+        assert_eq!(arrangement.clips[0], original_pattern_clip);
+        let added_clip = &arrangement.clips[inserted_index];
+        assert_eq!(added_clip.position_ticks, 3840);
+        assert_eq!(added_clip.length_ticks, 720);
+        assert_eq!(added_clip.track_index, Some(4));
+        assert_eq!(added_clip.target(), PlaylistClipTarget::Channel { id: 9 });
+
+        let mut expected_new_record = original_audio_record.clone();
+        expected_new_record[0..4].copy_from_slice(&3840u32.to_le_bytes());
+        expected_new_record[6..8].copy_from_slice(&9u16.to_le_bytes());
+        expected_new_record[8..12].copy_from_slice(&720u32.to_le_bytes());
+        expected_new_record[12..14].copy_from_slice(&495u16.to_le_bytes());
+        let event = document
+            .events()
+            .iter()
+            .find(|event| event.opcode() == 0xE9)
+            .expect("the Playlist clip event should remain present");
+        assert_eq!(&event.payload()[80..160], original_audio_record);
+        assert_eq!(&event.payload()[160..240], expected_new_record);
+
+        let encoded = document
+            .encode_lossless()
+            .expect("edited project should encode");
+        let reparsed = FlpDocument::parse(&encoded).expect("edited project should parse");
+        assert_eq!(reparsed.arrangements().unwrap()[0].clips.len(), 3);
+    }
+
+    #[test]
+    fn rejects_playlist_audio_clip_creation_for_invalid_channels_or_length_atomically() {
+        let input = audio_clip_fixture().encode_lossless().unwrap();
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+        assert!(document.create_playlist_audio_clip(3, 9, 0, 0, 0).is_err());
+        assert!(
+            document
+                .create_playlist_audio_clip(3, 7, 0, 960, 0)
+                .is_err()
+        );
+        assert_eq!(document.encode_lossless().unwrap(), input);
     }
 
     #[test]
@@ -14291,6 +14517,44 @@ mod tests {
         assert_eq!(
             round_trip.channels()[1].sample_path(),
             Some("/samples/snare.wav")
+        );
+    }
+
+    #[test]
+    fn creates_audio_clip_channel_before_channel_terminator() {
+        let mut event_stream = vec![0x40, 7, 0, 0x15, 0];
+        append_data_event(
+            &mut event_stream,
+            0xC4,
+            &utf16_project_string("/samples/kick.wav"),
+        );
+        append_project_info_string(&mut event_stream, 0xCB, "Kick");
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        let mut input = flp_fixture(&event_stream, &[], &[0xA5, 0x5A]);
+        input[10..12].copy_from_slice(&1u16.to_le_bytes());
+
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+        let channel_id = document
+            .create_audio_channel("/samples/take.wav", "Take")
+            .expect("Audio Clip channel should be created");
+
+        assert_eq!(channel_id, 8);
+        assert_eq!(document.header().legacy_channel_count(), 2);
+        let channels = document.channels();
+        assert_eq!(channels.len(), 2);
+        assert_eq!(channels[1].id(), channel_id);
+        assert_eq!(channels[1].kind(), Some(4));
+        assert_eq!(channels[1].enabled(), Some(true));
+        assert_eq!(channels[1].display_name(), Some("Take"));
+        assert_eq!(channels[1].sample_path(), Some("/samples/take.wav"));
+
+        let encoded = document.encode_lossless().expect("document should encode");
+        assert!(encoded.ends_with(&[0xA5, 0x5A]));
+        let round_trip = FlpDocument::parse(&encoded).expect("created channel should parse");
+        assert_eq!(round_trip.channels()[1].kind(), Some(4));
+        assert_eq!(
+            round_trip.channels()[1].sample_path(),
+            Some("/samples/take.wav")
         );
     }
 
