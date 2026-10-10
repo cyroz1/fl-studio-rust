@@ -48,7 +48,8 @@ use midi_input::{
 };
 use midi_output::{
     ConnectedMidiOutput, MIDI_TEST_NOTE_OFF, MIDI_TEST_NOTE_ON, MidiOutputDevice,
-    connect_output_device, enumerate_output_devices,
+    ScheduledMidiMessage, connect_output_device, enumerate_output_devices,
+    pattern_preview_messages,
 };
 
 const APP_BACKGROUND: Color32 = Color32::from_rgb(29, 29, 29);
@@ -1466,6 +1467,13 @@ impl MainView {
     }
 }
 
+struct ActiveMidiPatternPlayback {
+    pattern_id: u16,
+    started_at: Instant,
+    messages: Vec<ScheduledMidiMessage>,
+    next_message: usize,
+}
+
 struct DawUi {
     document: Option<FlpDocument>,
     current_path: Option<PathBuf>,
@@ -1647,6 +1655,9 @@ struct DawUi {
     midi_selected_output_id: Option<String>,
     midi_output_error: Option<String>,
     midi_output_connection: Option<ConnectedMidiOutput>,
+    midi_pattern_playback: Option<ActiveMidiPatternPlayback>,
+    midi_pattern_play_requested: bool,
+    midi_pattern_stop_requested: bool,
     midi_output_test_note_off_at: Option<Instant>,
     midi_output_refresh_requested: bool,
     midi_output_toggle_requested: bool,
@@ -1979,6 +1990,9 @@ impl DawUi {
             midi_selected_output_id,
             midi_output_error,
             midi_output_connection: None,
+            midi_pattern_playback: None,
+            midi_pattern_play_requested: false,
+            midi_pattern_stop_requested: false,
             midi_output_test_note_off_at: None,
             midi_output_refresh_requested: false,
             midi_output_toggle_requested: false,
@@ -4185,6 +4199,7 @@ impl DawUi {
     }
 
     fn stop_project_playback(&mut self) {
+        self.stop_midi_pattern_preview();
         if let Some(pending) = self.pending_audio_render.take() {
             pending.cancelled.store(true, Ordering::Release);
             self.audio_render_workers.push(pending);
@@ -16593,6 +16608,7 @@ impl DawUi {
 
     fn disconnect_midi_output(&mut self) {
         self.midi_output_test_note_off_at = None;
+        self.midi_pattern_playback = None;
         let Some(mut connection) = self.midi_output_connection.take() else {
             return;
         };
@@ -16646,6 +16662,129 @@ impl DawUi {
         {
             self.midi_output_error = Some(error.clone());
             self.status = format!("Could not stop MIDI test note: {error}");
+        }
+    }
+
+    fn start_midi_pattern_preview(&mut self) {
+        if self.midi_output_connection.is_none() {
+            self.status = "Connect a MIDI output before previewing a Pattern".to_owned();
+            return;
+        }
+        if self.midi_pattern_playback.is_some() {
+            self.status = "Stop the current MIDI Pattern preview first".to_owned();
+            return;
+        }
+        let Some(pattern_id) = self.selected_pattern else {
+            self.status = "Select a Pattern before starting MIDI preview".to_owned();
+            return;
+        };
+        let Some(document) = self.document.as_ref() else {
+            self.status = "Open a project before starting MIDI preview".to_owned();
+            return;
+        };
+        let ppq = document.header().ppq();
+        let patterns = match document.patterns() {
+            Ok(patterns) => patterns,
+            Err(error) => {
+                self.status = format!("Could not read project Patterns: {error}");
+                return;
+            }
+        };
+        let Some(pattern) = patterns
+            .into_iter()
+            .find(|pattern| pattern.id == pattern_id)
+        else {
+            self.status = format!("Pattern {pattern_id} is no longer available");
+            return;
+        };
+        let messages = match pattern_preview_messages(&pattern, ppq, self.tempo_bpm) {
+            Ok(messages) => messages,
+            Err(error) => {
+                self.status = format!("Could not prepare MIDI Pattern preview: {error}");
+                return;
+            }
+        };
+        if messages.is_empty() {
+            self.status = format!("Pattern {pattern_id} has no MIDI-playable notes");
+            return;
+        }
+        self.midi_pattern_playback = Some(ActiveMidiPatternPlayback {
+            pattern_id,
+            started_at: Instant::now(),
+            messages,
+            next_message: 0,
+        });
+        self.status = format!("Playing Pattern {pattern_id} through MIDI output");
+    }
+
+    fn stop_midi_pattern_preview(&mut self) {
+        let Some(playback) = self.midi_pattern_playback.take() else {
+            return;
+        };
+        let cleanup_error = self
+            .midi_output_connection
+            .as_mut()
+            .and_then(|connection| connection.send_all_notes_off().err());
+        if let Some(error) = cleanup_error {
+            self.midi_output_error = Some(error.clone());
+            self.status = format!(
+                "Stopped Pattern {} MIDI preview; All Notes Off failed: {error}",
+                playback.pattern_id
+            );
+        } else {
+            self.status = format!("Stopped Pattern {} MIDI preview", playback.pattern_id);
+        }
+    }
+
+    fn service_midi_pattern_preview(&mut self) {
+        if self.midi_pattern_playback.is_none() {
+            return;
+        }
+        let mut send_error = None;
+        let mut completed_pattern = None;
+        if let (Some(playback), Some(connection)) = (
+            self.midi_pattern_playback.as_mut(),
+            self.midi_output_connection.as_mut(),
+        ) {
+            let elapsed = playback.started_at.elapsed();
+            while let Some(message) = playback.messages.get(playback.next_message) {
+                if elapsed < message.after {
+                    break;
+                }
+                if let Err(error) = connection.send(&message.bytes) {
+                    send_error = Some(error);
+                    break;
+                }
+                playback.next_message += 1;
+            }
+            if send_error.is_none() && playback.next_message == playback.messages.len() {
+                completed_pattern = Some(playback.pattern_id);
+            }
+        } else {
+            send_error = Some("MIDI output disconnected during Pattern preview".to_owned());
+        }
+
+        if let Some(error) = send_error {
+            self.midi_pattern_playback = None;
+            if let Some(connection) = self.midi_output_connection.as_mut() {
+                let _ = connection.send_all_notes_off();
+            }
+            self.midi_output_error = Some(error.clone());
+            self.status = format!("MIDI Pattern preview stopped: {error}");
+        } else if let Some(pattern_id) = completed_pattern {
+            self.midi_pattern_playback = None;
+            let cleanup_error = self
+                .midi_output_connection
+                .as_mut()
+                .and_then(|connection| connection.send_all_notes_off().err());
+            if let Some(error) = cleanup_error {
+                self.midi_output_error = Some(error.clone());
+                self.status = format!(
+                    "Pattern {pattern_id} MIDI preview finished; All Notes Off failed: {error}"
+                );
+            } else {
+                self.status = format!("Pattern {pattern_id} MIDI preview finished");
+            }
         }
     }
 
@@ -17145,23 +17284,53 @@ impl DawUi {
                     egui::RichText::new("No MIDI outputs are currently available").color(MUTED),
                 );
             }
+            let pattern_preview_active = self.midi_pattern_playback.is_some();
             if ui
                 .add_enabled(
-                    self.midi_output_connection.is_some(),
+                    self.midi_output_connection.is_some() && !pattern_preview_active,
                     egui::Button::new("Test C4"),
                 )
                 .clicked()
             {
                 self.midi_output_test_requested = true;
             }
+            let pattern_preview_enabled = self.midi_output_connection.is_some()
+                && (pattern_preview_active
+                    || (self.document.is_some() && self.selected_pattern.is_some()));
+            if ui
+                .add_enabled(
+                    pattern_preview_enabled,
+                    egui::Button::new(if pattern_preview_active {
+                        "Stop pattern"
+                    } else {
+                        "Preview pattern"
+                    }),
+                )
+                .clicked()
+            {
+                if pattern_preview_active {
+                    self.midi_pattern_stop_requested = true;
+                } else {
+                    self.midi_pattern_play_requested = true;
+                }
+            }
         });
+        if let Some(playback) = &self.midi_pattern_playback {
+            ui.label(
+                egui::RichText::new(format!(
+                    "● Playing Pattern {} through MIDI output",
+                    playback.pattern_id
+                ))
+                .color(GREEN),
+            );
+        }
         if let Some(error) = &self.midi_output_error {
             ui.label(egui::RichText::new(format!("MIDI output: {error}")).color(ORANGE));
         }
         ui.separator();
         ui.label(
             egui::RichText::new(
-                "Audio input monitoring routes into the selected audio output. MIDI output sends control data to external instruments.",
+                "Audio input monitoring routes into the selected audio output. MIDI preview sends note data to external instruments; it is not included in audio renders.",
             )
             .color(MUTED),
         );
@@ -18003,6 +18172,7 @@ impl eframe::App for DawUi {
             frame_snapshot.is_some() || self.pending_history_snapshot.is_some();
         self.poll_midi_input(self.history_snapshot_available_this_frame);
         self.finish_midi_output_test_note();
+        self.service_midi_pattern_preview();
         let playlist_clip_shortcuts_enabled =
             self.view == MainView::Playlist && !ui.ctx().egui_wants_keyboard_input();
         let (
@@ -18110,9 +18280,14 @@ impl eframe::App for DawUi {
         if self.audio_engine.is_some()
             || self.midi_input_connection.is_some()
             || self.midi_output_test_note_off_at.is_some()
+            || self.midi_pattern_playback.is_some()
         {
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(33));
+            let repaint_delay = if self.midi_pattern_playback.is_some() {
+                Duration::from_millis(5)
+            } else {
+                Duration::from_millis(33)
+            };
+            ui.ctx().request_repaint_after(repaint_delay);
         }
         let width = ui.available_width();
         ui.vertical(|ui| {
@@ -18270,6 +18445,8 @@ impl eframe::App for DawUi {
         let midi_output_refresh_requested = std::mem::take(&mut self.midi_output_refresh_requested);
         let midi_output_toggle_requested = std::mem::take(&mut self.midi_output_toggle_requested);
         let midi_output_test_requested = std::mem::take(&mut self.midi_output_test_requested);
+        let midi_pattern_play_requested = std::mem::take(&mut self.midi_pattern_play_requested);
+        let midi_pattern_stop_requested = std::mem::take(&mut self.midi_pattern_stop_requested);
         if midi_output_refresh_requested {
             self.refresh_midi_output_devices();
         }
@@ -18280,9 +18457,17 @@ impl eframe::App for DawUi {
             self.test_midi_output();
             ui.ctx().request_repaint_after(Duration::from_millis(33));
         }
+        if midi_pattern_stop_requested {
+            self.stop_midi_pattern_preview();
+        }
+        if midi_pattern_play_requested {
+            self.start_midi_pattern_preview();
+        }
         if midi_output_refresh_requested
             || midi_output_toggle_requested
             || midi_output_test_requested
+            || midi_pattern_play_requested
+            || midi_pattern_stop_requested
         {
             ui.ctx().request_repaint();
         }
