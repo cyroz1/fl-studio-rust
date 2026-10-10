@@ -126,7 +126,7 @@ where real-time constraints punish sloppy code.
 
 ### 3.5 Recording
 
-- `[partial]` Audio recording into Playlist: shared and WASAPI-exclusive input callbacks can copy stereo frames into a bounded lock-free reader queue without doing disk I/O; a worker can drain that queue to a temporary-file-backed float WAV and reports the input rate and overflow count. FLP editing can create a sample-backed Audio Clip channel and add a Playlist Audio Clip by copying a recognized clip record as its template. Desktop recording controls and handoff, Mixer input routing, and per-track input selection remain incomplete; insertion requires an existing recognized Playlist clip record.
+- `[partial]` Audio recording into Playlist: shared and WASAPI-exclusive input callbacks copy stereo frames into a bounded lock-free reader queue without doing disk I/O; a worker writes float WAV and reports the input rate and overflow count. The Audio settings view and transport Record/Stop buttons can capture the selected input, save a WAV, and add a sample-backed Audio Clip at the playhead on the first non-overlapping Playlist lane. Duration uses the project's base tempo and PPQ, so tempo automation alignment and input-latency compensation remain incomplete. Insertion copies a recognized existing Audio Clip record and assigns a new clip ID; recording requires one in the selected arrangement. This path captures direct device input without Mixer routing/effects or per-track input selection.
 - `[todo]` Edison-class audio editor: record, trim, spectral view, scripting
 - `[partial]` Latency-compensated input monitoring: shared and WASAPI-exclusive input monitoring paths exist, but they are not latency compensated.
 

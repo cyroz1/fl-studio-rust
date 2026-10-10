@@ -4253,8 +4253,8 @@ impl FlpDocument {
     }
 
     /// Creates a Pattern Clip by copying a recognized Playlist clip record in the arrangement.
-    /// Only its position, item index, length, and track fields are changed; all other record
-    /// bytes come from the existing template and remain opaque.
+    /// Its position, item index, length, track, and (when present) clip ID are assigned; all
+    /// other record bytes come from the existing template and remain opaque.
     pub fn create_playlist_pattern_clip(
         &mut self,
         arrangement_id: u16,
@@ -4349,6 +4349,9 @@ impl FlpDocument {
         record[6..8].copy_from_slice(&item_index.to_le_bytes());
         record[8..12].copy_from_slice(&length_ticks.to_le_bytes());
         record[12..14].copy_from_slice(&raw_track_index.to_le_bytes());
+        if record_size >= 60 {
+            record[32..36].copy_from_slice(&next_playlist_clip_id(arrangement)?.to_le_bytes());
+        }
 
         let mut candidate = self.clone();
         let mut payload = event.payload.clone();
@@ -4362,7 +4365,8 @@ impl FlpDocument {
     /// Creates an Audio Clip by copying a recognized Playlist clip record.
     ///
     /// The requested channel must be an Audio Clip channel. Position, channel target, length,
-    /// and track are updated; all other record bytes remain copied from the template.
+    /// track, and (when present) clip ID are assigned; all other record bytes remain copied from
+    /// the template.
     pub fn create_playlist_audio_clip(
         &mut self,
         arrangement_id: u16,
@@ -4429,10 +4433,9 @@ impl FlpDocument {
                     matches!(clip.target(), PlaylistClipTarget::Channel { id } if channel_ids.contains(&id))
                 })
             })
-            .or_else(|| arrangement.clips.iter().enumerate().next())
         else {
             return Err(FlpError::UnsupportedEdit(
-                "the arrangement has no recognized Playlist clip record to use as a template",
+                "the arrangement has no recognized Audio Clip record to use as a template",
             ));
         };
         if channel_id >= template.pattern_base {
@@ -4473,6 +4476,9 @@ impl FlpDocument {
         record[6..8].copy_from_slice(&channel_id.to_le_bytes());
         record[8..12].copy_from_slice(&length_ticks.to_le_bytes());
         record[12..14].copy_from_slice(&raw_track_index.to_le_bytes());
+        if record_size >= 60 {
+            record[32..36].copy_from_slice(&next_playlist_clip_id(arrangement)?.to_le_bytes());
+        }
 
         let mut candidate = self.clone();
         let mut payload = event.payload.clone();
@@ -10540,6 +10546,19 @@ fn validate_automation_point_tension(tension: f32) -> Result<(), FlpError> {
     Ok(())
 }
 
+fn next_playlist_clip_id(arrangement: &Arrangement) -> Result<u32, FlpError> {
+    arrangement
+        .clips
+        .iter()
+        .filter_map(|clip| clip.clip_id)
+        .max()
+        .ok_or(FlpError::UnsupportedEdit(
+            "the arrangement has no recognized Playlist clip ID to use as a template",
+        ))?
+        .checked_add(1)
+        .ok_or(FlpError::LengthOverflow)
+}
+
 fn decode_playlist_clip(
     record: &[u8],
     source_event_index: usize,
@@ -11583,6 +11602,7 @@ mod tests {
         pattern_clip[6..8].copy_from_slice(&0x5007u16.to_le_bytes());
         pattern_clip[8..12].copy_from_slice(&960u32.to_le_bytes());
         pattern_clip[12..14].copy_from_slice(&499u16.to_le_bytes());
+        pattern_clip[32..36].copy_from_slice(&1u32.to_le_bytes());
         pattern_clip[20..24].copy_from_slice(&[0x40, 0x64, 0x80, 0x80]);
         pattern_clip[24..28].copy_from_slice(&0.0f32.to_le_bytes());
         pattern_clip[28..32].copy_from_slice(&1.0f32.to_le_bytes());
@@ -11591,6 +11611,7 @@ mod tests {
         let mut audio_clip = pattern_clip;
         audio_clip[0..4].copy_from_slice(&0u32.to_le_bytes());
         audio_clip[6..8].copy_from_slice(&9u16.to_le_bytes());
+        audio_clip[32..36].copy_from_slice(&2u32.to_le_bytes());
         let mut clip_payload = pattern_clip.to_vec();
         clip_payload.extend_from_slice(&audio_clip);
         append_data_event(&mut event_stream, 0xE9, &clip_payload);
@@ -12480,6 +12501,7 @@ mod tests {
         template[8..12].copy_from_slice(&960u32.to_le_bytes());
         template[12..14].copy_from_slice(&499u16.to_le_bytes());
         template[14..16].copy_from_slice(&0x1234u16.to_le_bytes());
+        template[32..36].copy_from_slice(&10u32.to_le_bytes());
         template[20..24].copy_from_slice(&[0x40, 0x64, 0x80, 0x80]);
         template[24..28].copy_from_slice(&0.0f32.to_le_bytes());
         template[28..32].copy_from_slice(&1.0f32.to_le_bytes());
@@ -12512,12 +12534,14 @@ mod tests {
         assert_eq!(added_clip.length_ticks, 720);
         assert_eq!(added_clip.track_index, Some(4));
         assert_eq!(added_clip.target(), PlaylistClipTarget::Pattern { id: 8 });
+        assert_eq!(added_clip.clip_id, Some(11));
 
         let mut expected_new_record = template;
         expected_new_record[0..4].copy_from_slice(&3840u32.to_le_bytes());
         expected_new_record[6..8].copy_from_slice(&0x5008u16.to_le_bytes());
         expected_new_record[8..12].copy_from_slice(&720u32.to_le_bytes());
         expected_new_record[12..14].copy_from_slice(&495u16.to_le_bytes());
+        expected_new_record[32..36].copy_from_slice(&11u32.to_le_bytes());
         let mut expected_payload = template.to_vec();
         expected_payload.extend_from_slice(&expected_new_record);
         let clip_event = document
@@ -12558,12 +12582,14 @@ mod tests {
         assert_eq!(added_clip.length_ticks, 720);
         assert_eq!(added_clip.track_index, Some(4));
         assert_eq!(added_clip.target(), PlaylistClipTarget::Channel { id: 9 });
+        assert_eq!(added_clip.clip_id, Some(3));
 
         let mut expected_new_record = original_audio_record.clone();
         expected_new_record[0..4].copy_from_slice(&3840u32.to_le_bytes());
         expected_new_record[6..8].copy_from_slice(&9u16.to_le_bytes());
         expected_new_record[8..12].copy_from_slice(&720u32.to_le_bytes());
         expected_new_record[12..14].copy_from_slice(&495u16.to_le_bytes());
+        expected_new_record[32..36].copy_from_slice(&3u32.to_le_bytes());
         let event = document
             .events()
             .iter()
@@ -12587,6 +12613,22 @@ mod tests {
         assert!(
             document
                 .create_playlist_audio_clip(3, 7, 0, 960, 0)
+                .is_err()
+        );
+        assert_eq!(document.encode_lossless().unwrap(), input);
+    }
+
+    #[test]
+    fn rejects_playlist_audio_clip_creation_without_an_audio_template_atomically() {
+        let mut document = audio_clip_fixture();
+        document
+            .delete_playlist_clip(3, 1)
+            .expect("the only Audio Clip template should be removable");
+        let input = document.encode_lossless().unwrap();
+
+        assert!(
+            document
+                .create_playlist_audio_clip(3, 9, 0, 960, 0)
                 .is_err()
         );
         assert_eq!(document.encode_lossless().unwrap(), input);

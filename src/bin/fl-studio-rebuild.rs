@@ -19,24 +19,25 @@ use flp_rebuild::midi::{MidiChannelMapping, MidiFile};
 use flp_rebuild::plugins::{PluginCandidate, PluginFormat, scan_installed_plugins};
 use flp_rebuild::project_package::ProjectPackageWorkspace;
 use flp_rebuild::sample_render::{
-    AudioClipRenderOptions, AudioClipRenderSummary, PlaylistRenderOptions, PlaylistRenderSummary,
-    ResamplingQuality, SamplerPatternRenderOptions, SamplerPatternRenderSummary, WavChannelMode,
-    WavDitherMode, WavSampleFormat, render_audio_clips_to_wav,
-    render_playlist_with_vst3_to_wav_cancellable, render_sampler_pattern_to_wav,
-    stream_playlist_with_vst3_to_device_from_frame, stream_sampler_pattern_to_device,
+    AudioClipRenderOptions, AudioClipRenderSummary, AudioRecordingSummary, PlaylistRenderOptions,
+    PlaylistRenderSummary, ResamplingQuality, SamplerPatternRenderOptions,
+    SamplerPatternRenderSummary, WavChannelMode, WavDitherMode, WavSampleFormat,
+    render_audio_clips_to_wav, render_playlist_with_vst3_to_wav_cancellable,
+    render_sampler_pattern_to_wav, stream_playlist_with_vst3_to_device_from_frame,
+    stream_sampler_pattern_to_device, write_input_recording_to_wav,
 };
 use flp_rebuild::vst3::{
     MAX_REPORTED_TAIL_SECONDS, Vst3HostRuntime, Vst3PatternRenderOptions, Vst3PatternStreamHandle,
 };
 use flp_rebuild::{
-    ArpeggioDirection, ArpeggioOptions, ArticulateOptions, AutomationChannel, AutomationPoint,
-    AutomationPointEdit, ChannelGroupSummary, ChannelSortOrder, ChannelSummary, ClawMachineOptions,
-    FlpDocument, FstPreset, FstPresetKind, LimitNoteOptions, LimitSnapDirection,
-    MixerParameterKind, MixerParameterRecord, Pattern, PatternController, PatternControllerEdit,
-    PatternNote, PatternNoteEdit, PlaylistClip, PlaylistClipClipboard, PlaylistClipEdit,
-    PlaylistClipTarget, PlaylistTrack, PlaylistTrackEdit, ProjectInfoEdit, ProjectSettingsEdit,
-    RandomizerOptions, RiffMachineOptions, RiffMachineQuantizeMode, ScaleLevelsOptions, TimeMarker,
-    TimeMarkerEdit, VstPluginStateMetadata,
+    ArpeggioDirection, ArpeggioOptions, Arrangement, ArticulateOptions, AutomationChannel,
+    AutomationPoint, AutomationPointEdit, ChannelGroupSummary, ChannelSortOrder, ChannelSummary,
+    ClawMachineOptions, FlpDocument, FstPreset, FstPresetKind, LimitNoteOptions,
+    LimitSnapDirection, MixerParameterKind, MixerParameterRecord, Pattern, PatternController,
+    PatternControllerEdit, PatternNote, PatternNoteEdit, PlaylistClip, PlaylistClipClipboard,
+    PlaylistClipEdit, PlaylistClipTarget, PlaylistTrack, PlaylistTrackEdit, ProjectInfoEdit,
+    ProjectSettingsEdit, RandomizerOptions, RiffMachineOptions, RiffMachineQuantizeMode,
+    ScaleLevelsOptions, TimeMarker, TimeMarkerEdit, VstPluginStateMetadata,
 };
 
 mod midi_input;
@@ -142,7 +143,7 @@ fn app_visuals() -> egui::Visuals {
     visuals.window_shadow = egui::Shadow::NONE;
     visuals.popup_shadow = egui::Shadow::NONE;
     visuals.window_stroke = Stroke::new(1.0, BORDER);
-    visuals.disabled_alpha = 0.84;
+    visuals.disabled_alpha = 0.94;
     visuals.button_frame = true;
     visuals.striped = true;
 
@@ -1542,6 +1543,7 @@ struct DawUi {
     redo_history: Vec<Vec<u8>>,
     pending_history_snapshot: Option<Vec<u8>>,
     saved_project_hash: Option<u64>,
+    project_generation: u64,
     autosave_minutes: u8,
     autosave_before_risky: bool,
     backup_retention: usize,
@@ -1697,6 +1699,9 @@ struct DawUi {
     audio_catalog: AudioDeviceCatalog,
     audio_settings: AudioSettings,
     audio_engine: Option<AudioEngine>,
+    audio_recording: Option<AudioRecordingSession>,
+    audio_record_start_requested: bool,
+    audio_record_stop_requested: bool,
     midi_input_devices: Vec<MidiInputDevice>,
     midi_selected_input_id: Option<String>,
     midi_input_error: Option<String>,
@@ -1834,6 +1839,18 @@ struct PendingWaveformLoad {
     worker: thread::JoinHandle<()>,
 }
 
+struct AudioRecordingSession {
+    receiver: Receiver<Result<AudioRecordingSummary, String>>,
+    worker: thread::JoinHandle<()>,
+    output_path: PathBuf,
+    arrangement_id: u16,
+    start_tick: u32,
+    tempo_bpm: f64,
+    ppq: u16,
+    project_generation: u64,
+    capture_active: bool,
+}
+
 impl DawUi {
     fn new(creation: &eframe::CreationContext<'_>, initial_project: Option<PathBuf>) -> Self {
         install_ui_fonts(&creation.egui_ctx);
@@ -1884,6 +1901,7 @@ impl DawUi {
             redo_history: Vec::new(),
             pending_history_snapshot: None,
             saved_project_hash: None,
+            project_generation: 0,
             autosave_minutes: DEFAULT_AUTOSAVE_MINUTES,
             autosave_before_risky: false,
             backup_retention: DEFAULT_BACKUP_RETENTION,
@@ -2039,6 +2057,9 @@ impl DawUi {
             audio_catalog,
             audio_settings,
             audio_engine: None,
+            audio_recording: None,
+            audio_record_start_requested: false,
+            audio_record_stop_requested: false,
             midi_input_devices,
             midi_selected_input_id,
             midi_input_error,
@@ -2392,6 +2413,12 @@ impl DawUi {
     }
 
     fn open_project(&mut self, path: &Path) {
+        if self.audio_recording.is_some() {
+            self.stop_audio_recording();
+            self.status =
+                "Audio recording is finalizing; wait for the take to reach the Playlist before switching projects".to_owned();
+            return;
+        }
         self.finish_active_midi_recording();
         if self.dirty {
             self.recovery_prompt = None;
@@ -2407,6 +2434,12 @@ impl DawUi {
         target_path: &Path,
         check_recovery: bool,
     ) -> bool {
+        if self.audio_recording.is_some() {
+            self.stop_audio_recording();
+            self.status =
+                "Audio recording is finalizing; wait for the take to reach the Playlist before switching projects".to_owned();
+            return false;
+        }
         self.recovery_prompt = None;
         self.pending_project_change = None;
         let package_result = if has_extension(project_file, "zip") {
@@ -2442,6 +2475,7 @@ impl DawUi {
         }) {
             Ok((package_workspace, document)) => {
                 self.stop_project_playback();
+                self.project_generation = self.project_generation.wrapping_add(1);
                 self.soloed_playlist_track_range = None;
                 self.collapsed_playlist_groups.clear();
                 self.clear_history();
@@ -3071,6 +3105,14 @@ impl DawUi {
         }
         if self.close_approved {
             self.close_approved = false;
+            return;
+        }
+        if self.audio_recording.is_some() {
+            self.stop_audio_recording();
+            self.status =
+                "Audio recording is finalizing; close again after the take reaches the Playlist"
+                    .to_owned();
+            context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             return;
         }
         self.finish_active_midi_recording();
@@ -4951,24 +4993,62 @@ impl DawUi {
         ui.horizontal_centered(|ui| {
             ui.add_space(4.0);
             let recording_midi = self.midi_recording.is_some();
-            let can_record_midi =
-                recording_midi || (self.midi_input_connection.is_some() && self.document.is_some());
+            let recording_audio = self
+                .audio_recording
+                .as_ref()
+                .is_some_and(|recording| recording.capture_active);
+            let audio_recording_finalizing = self.audio_recording.is_some() && !recording_audio;
+            let audio_input_available = self
+                .audio_engine
+                .as_ref()
+                .is_some_and(AudioEngine::input_active)
+                || self.audio_settings.input_device_id.is_some()
+                || self.audio_catalog.default_input_id.is_some()
+                || !self.audio_catalog.inputs.is_empty();
+            let can_record_audio = self.audio_recording_template_available()
+                && self.audio_settings.enable_input
+                && audio_input_available
+                && self
+                    .audio_engine
+                    .as_ref()
+                    .is_none_or(AudioEngine::input_active)
+                && !audio_recording_finalizing;
+            let can_record = recording_midi
+                || recording_audio
+                || (self.midi_input_connection.is_some() && self.document.is_some())
+                || can_record_audio;
+            let recording = recording_midi || recording_audio;
             let record_button = egui::Button::new(
-                egui::RichText::new(if recording_midi { "■" } else { "●" })
-                    .color(if recording_midi { Color32::WHITE } else { RED }),
+                egui::RichText::new(if recording { "■" } else { "●" }).color(if recording {
+                    Color32::WHITE
+                } else {
+                    RED
+                }),
             )
-            .fill(if recording_midi { RED } else { PANEL })
+            .fill(if recording { RED } else { PANEL })
             .stroke(Stroke::NONE);
             if ui
-                .add_enabled(can_record_midi, record_button)
-                .on_hover_text(if recording_midi {
+                .add_enabled(can_record, record_button)
+                .on_hover_text(if recording_audio {
+                    "Finish audio recording"
+                } else if recording_midi {
                     "Finish MIDI note recording"
+                } else if audio_recording_finalizing {
+                    "Finalizing the recorded audio take"
+                } else if self.midi_input_connection.is_some() {
+                    "Record MIDI notes; use Audio settings to record audio"
                 } else {
-                    "Record MIDI notes into the selected pattern and channel"
+                    "Record audio to the Playlist or MIDI notes into the selected pattern"
                 })
                 .clicked()
             {
-                self.midi_record_toggle_requested = true;
+                if recording_audio {
+                    self.audio_record_stop_requested = true;
+                } else if recording_midi || self.midi_input_connection.is_some() {
+                    self.midi_record_toggle_requested = true;
+                } else {
+                    self.audio_record_start_requested = true;
+                }
             }
             if ui.button("■").on_hover_text("Stop").clicked() {
                 let was_preparing =
@@ -4976,6 +5056,9 @@ impl DawUi {
                 self.stop_project_playback();
                 if self.midi_recording.is_some() {
                     self.midi_record_toggle_requested = true;
+                }
+                if recording_audio {
+                    self.audio_record_stop_requested = true;
                 }
                 self.status = if was_preparing {
                     "Audio preparation or render cancelled".to_owned()
@@ -17917,6 +18000,334 @@ impl DawUi {
         }
     }
 
+    fn start_audio_recording(&mut self) {
+        if self.audio_recording.is_some() {
+            self.status = "An audio recording is already active or being finalized".to_owned();
+            return;
+        }
+        let Some(document) = self.document.as_ref() else {
+            self.status = "Open a project before recording audio into the Playlist".to_owned();
+            return;
+        };
+        if !self.audio_settings.enable_input {
+            self.status = "Enable audio input in Audio settings before recording".to_owned();
+            return;
+        }
+        let arrangements = match document.arrangements() {
+            Ok(arrangements) => arrangements,
+            Err(error) => {
+                self.status = format!("Could not inspect the Playlist for recording: {error}");
+                return;
+            }
+        };
+        let arrangement_id = self
+            .selected_arrangement
+            .filter(|id| arrangements.iter().any(|arrangement| arrangement.id == *id))
+            .or_else(|| arrangements.first().map(|arrangement| arrangement.id));
+        let Some(arrangement_id) = arrangement_id else {
+            self.status =
+                "The project has no recognized Playlist arrangement to record into".to_owned();
+            return;
+        };
+        if !arrangement_has_audio_clip_template(document, arrangement_id) {
+            self.status = "Add an Audio Clip to this Playlist before recording; its recognized FLP record is used as a safe template".to_owned();
+            return;
+        }
+
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Record audio to Playlist")
+            .add_filter("Wave audio", &["wav"])
+            .set_file_name("Audio recording.wav");
+        if let Some(directory) = self
+            .current_path
+            .as_deref()
+            .and_then(Path::parent)
+            .filter(|directory| directory.is_dir())
+        {
+            dialog = dialog.set_directory(directory);
+        }
+        let Some(mut output_path) = dialog.save_file() else {
+            return;
+        };
+        if !output_path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("wav"))
+        {
+            output_path.set_extension("wav");
+        }
+
+        if self.audio_engine.is_none() {
+            match AudioEngine::start(&self.audio_settings) {
+                Ok(engine) => self.audio_engine = Some(engine),
+                Err(error) => {
+                    self.status = format!("Could not start audio input: {error}");
+                    return;
+                }
+            }
+        }
+        let Some(engine) = self.audio_engine.as_ref() else {
+            self.status = "Audio input is not available".to_owned();
+            return;
+        };
+        if !engine.input_active() {
+            self.status =
+                "Audio input is not active; enable input and restart the audio engine before recording".to_owned();
+            return;
+        }
+
+        let start_tick = self
+            .current_playhead_tick()
+            .unwrap_or(0.0)
+            .round()
+            .clamp(0.0, f64::from(u32::MAX)) as u32;
+        let (tempo_bpm, ppq, project_generation) = (
+            self.tempo_bpm,
+            document.header().ppq().max(1),
+            self.project_generation,
+        );
+        let recording = match engine.start_input_recording() {
+            Ok(recording) => recording,
+            Err(error) => {
+                self.status = format!("Could not start audio recording: {error}");
+                return;
+            }
+        };
+        let worker_path = output_path.clone();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name("audio-input-recording-writer".to_owned())
+            .spawn(move || {
+                let result = write_input_recording_to_wav(&recording, &worker_path);
+                let _ = sender.send(result);
+            });
+        let worker = match worker {
+            Ok(worker) => worker,
+            Err(error) => {
+                engine.stop_input_recording();
+                self.status = format!("Could not start the recording writer: {error}");
+                return;
+            }
+        };
+
+        self.audio_recording = Some(AudioRecordingSession {
+            receiver,
+            worker,
+            output_path: output_path.clone(),
+            arrangement_id,
+            start_tick,
+            tempo_bpm,
+            ppq,
+            project_generation,
+            capture_active: true,
+        });
+        self.status = format!("Recording audio to {}", output_path.display());
+        self.view = MainView::Audio;
+    }
+
+    fn stop_audio_recording(&mut self) {
+        let Some(session) = self.audio_recording.as_mut() else {
+            return;
+        };
+        if session.capture_active {
+            if let Some(engine) = self.audio_engine.as_ref() {
+                engine.stop_input_recording();
+            }
+            session.capture_active = false;
+            self.status = "Finalizing audio recording…".to_owned();
+        }
+    }
+
+    fn audio_recording_template_available(&self) -> bool {
+        let Some(document) = self.document.as_ref() else {
+            return false;
+        };
+        let Ok(arrangements) = document.arrangements() else {
+            return false;
+        };
+        let arrangement_id = self
+            .selected_arrangement
+            .filter(|id| arrangements.iter().any(|arrangement| arrangement.id == *id))
+            .or_else(|| arrangements.first().map(|arrangement| arrangement.id));
+        arrangement_id.is_some_and(|id| arrangement_has_audio_clip_template(document, id))
+    }
+
+    fn poll_audio_recording(&mut self, history_snapshot_available: bool) {
+        let completed =
+            self.audio_recording
+                .as_ref()
+                .and_then(|session| match session.receiver.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(TryRecvError::Disconnected) => {
+                        Some(Err("audio recording writer stopped unexpectedly".to_owned()))
+                    }
+                    Err(TryRecvError::Empty) => None,
+                });
+        let Some(result) = completed else {
+            return;
+        };
+        let Some(mut session) = self.audio_recording.take() else {
+            return;
+        };
+        if session.capture_active {
+            if let Some(engine) = self.audio_engine.as_ref() {
+                engine.stop_input_recording();
+            }
+            session.capture_active = false;
+        }
+        let _ = session.worker.join();
+        self.finish_audio_recording(session, result, history_snapshot_available);
+    }
+
+    fn finish_audio_recording(
+        &mut self,
+        session: AudioRecordingSession,
+        result: Result<AudioRecordingSummary, String>,
+        history_snapshot_available: bool,
+    ) {
+        let summary = match result {
+            Ok(summary) => summary,
+            Err(error) => {
+                self.status = format!("Audio recording failed: {error}");
+                return;
+            }
+        };
+        if session.project_generation != self.project_generation {
+            self.status = format!(
+                "Saved {}, but the active project changed before Playlist insertion",
+                session.output_path.display()
+            );
+            return;
+        }
+        let Some(document) = self.document.as_ref() else {
+            self.status = format!(
+                "Saved {}, but no project is open for Playlist insertion",
+                session.output_path.display()
+            );
+            return;
+        };
+        let arrangement = match document.arrangements().map(|arrangements| {
+            arrangements
+                .into_iter()
+                .find(|arrangement| arrangement.id == session.arrangement_id)
+        }) {
+            Ok(Some(arrangement)) => arrangement,
+            Ok(None) => {
+                self.status = format!(
+                    "Saved {}, but the recorded arrangement no longer exists",
+                    session.output_path.display()
+                );
+                return;
+            }
+            Err(error) => {
+                self.status = format!(
+                    "Saved {}, but the Playlist could not be decoded: {error}",
+                    session.output_path.display()
+                );
+                return;
+            }
+        };
+        let Some(length_ticks) = audio_recording_length_ticks(
+            summary.frames,
+            summary.sample_rate,
+            session.ppq,
+            session.tempo_bpm,
+        ) else {
+            self.status = format!(
+                "Saved {}, but its duration does not fit the Playlist",
+                session.output_path.display()
+            );
+            return;
+        };
+        if session.start_tick.checked_add(length_ticks).is_none() {
+            self.status = format!(
+                "Saved {}, but the take extends beyond the supported Playlist timeline",
+                session.output_path.display()
+            );
+            return;
+        }
+        let Some(track_index) =
+            first_available_playlist_track(&arrangement, session.start_tick, length_ticks)
+        else {
+            self.status = format!(
+                "Saved {}, but all Playlist tracks overlap the take",
+                session.output_path.display()
+            );
+            return;
+        };
+        let undo_snapshot = if history_snapshot_available {
+            None
+        } else {
+            match document.encode_lossless() {
+                Ok(snapshot) => Some(snapshot),
+                Err(error) => {
+                    self.status =
+                        format!("Could not capture undo state for audio recording: {error}");
+                    return;
+                }
+            }
+        };
+        let mut updated = document.clone();
+        let sample_path = session.output_path.to_string_lossy();
+        let channel_name = session
+            .output_path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| "Audio recording".to_owned());
+        let channel_id = match updated.create_audio_channel(&sample_path, &channel_name) {
+            Ok(channel_id) => channel_id,
+            Err(error) => {
+                self.status = format!(
+                    "Saved {}, but could not create its Audio Clip channel: {error}",
+                    session.output_path.display()
+                );
+                return;
+            }
+        };
+        let clip_index = match updated.create_playlist_audio_clip(
+            session.arrangement_id,
+            channel_id,
+            session.start_tick,
+            length_ticks,
+            track_index,
+        ) {
+            Ok(clip_index) => clip_index,
+            Err(error) => {
+                self.status = format!(
+                    "Saved {}, but could not add it to the Playlist: {error}",
+                    session.output_path.display()
+                );
+                return;
+            }
+        };
+        self.document = Some(updated);
+        if let Some(snapshot) = undo_snapshot {
+            self.remember_undo_snapshot(snapshot);
+        }
+        self.selected_arrangement = Some(session.arrangement_id);
+        self.selected_clip = Some(clip_index);
+        self.selected_playlist_clips.clear();
+        self.selected_playlist_clips.insert(clip_index);
+        self.playlist_selection_anchor = Some(clip_index);
+        self.dirty = true;
+        self.view = MainView::Playlist;
+        self.refresh_audio_waveform_paths();
+        let seconds = summary.frames as f64 / f64::from(summary.sample_rate.max(1));
+        self.status = if summary.overflow_frames == 0 {
+            format!(
+                "Recorded {seconds:.1} s to Playlist track {} · {}",
+                track_index + 1,
+                session.output_path.display()
+            )
+        } else {
+            format!(
+                "Recorded {seconds:.1} s to Playlist track {} · {} input frames overflowed",
+                track_index + 1,
+                summary.overflow_frames
+            )
+        };
+    }
+
     fn audio_settings_view(&mut self, ui: &mut egui::Ui) {
         let mut start_requested = false;
         let mut stop_requested = false;
@@ -18271,6 +18682,70 @@ impl DawUi {
                     }
                 });
         });
+
+        ui.separator();
+        ui.strong("Audio recording");
+        ui.label(
+            egui::RichText::new(
+                "Records the selected input to WAV and adds the take to the Playlist. This path records the direct device input without Mixer effects.",
+            )
+            .color(MUTED),
+        );
+        let recording_active = self
+            .audio_recording
+            .as_ref()
+            .is_some_and(|recording| recording.capture_active);
+        let recording_finalizing = self.audio_recording.is_some() && !recording_active;
+        let recording_template_available = self.audio_recording_template_available();
+        let input_engine_ready = self
+            .audio_engine
+            .as_ref()
+            .is_none_or(AudioEngine::input_active);
+        let can_start_audio_recording = recording_template_available
+            && self.audio_recording.is_none()
+            && self.audio_settings.enable_input
+            && input_engine_ready;
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    can_start_audio_recording,
+                    egui::Button::new("Record to Playlist"),
+                )
+                .clicked()
+            {
+                self.audio_record_start_requested = true;
+            }
+            if ui
+                .add_enabled(recording_active, egui::Button::new("Stop recording"))
+                .clicked()
+            {
+                self.audio_record_stop_requested = true;
+            }
+            if recording_finalizing {
+                ui.label(egui::RichText::new("Finalizing take…").color(ORANGE));
+            } else if !can_start_audio_recording && !recording_active {
+                let reason = if self.document.is_none() {
+                    "Open a project to record"
+                } else if !self.audio_settings.enable_input {
+                    "Enable audio input to record"
+                } else if !recording_template_available {
+                    "Add an Audio Clip to the Playlist before recording"
+                } else {
+                    "Restart the audio engine to record"
+                };
+                ui.label(egui::RichText::new(reason).color(MUTED));
+            }
+        });
+        if let Some(recording) = &self.audio_recording {
+            ui.label(
+                egui::RichText::new(if recording.capture_active {
+                    format!("● Recording · {}", recording.output_path.display())
+                } else {
+                    format!("● Finalizing · {}", recording.output_path.display())
+                })
+                .color(RED),
+            );
+        }
 
         let output_name = self
             .audio_settings
@@ -19168,6 +19643,7 @@ impl eframe::App for DawUi {
             self.stop_midi_clock();
         }
         if self.audio_engine.is_some()
+            || self.audio_recording.is_some()
             || self.midi_input_connection.is_some()
             || self.midi_output_test_note_off_at.is_some()
             || self.midi_pattern_playback.is_some()
@@ -19336,6 +19812,13 @@ impl eframe::App for DawUi {
         if std::mem::take(&mut self.midi_input_toggle_requested) {
             self.toggle_midi_input_connection();
         }
+        let audio_record_stop_requested = std::mem::take(&mut self.audio_record_stop_requested);
+        let audio_record_start_requested = std::mem::take(&mut self.audio_record_start_requested);
+        if audio_record_stop_requested {
+            self.stop_audio_recording();
+        } else if audio_record_start_requested {
+            self.start_audio_recording();
+        }
         if std::mem::take(&mut self.midi_record_toggle_requested) {
             self.toggle_midi_recording(history_snapshot_available);
         }
@@ -19378,6 +19861,7 @@ impl eframe::App for DawUi {
         self.browser_fst_details_dialog(ui.ctx());
         self.recovery_prompt_dialog(ui.ctx());
         self.unsaved_changes_dialog(ui.ctx());
+        self.poll_audio_recording(history_snapshot_available);
         self.finish_history_frame(frame_snapshot.take(), pointer_down, history_navigation);
         self.history_snapshot_available_this_frame = false;
     }
@@ -19386,6 +19870,14 @@ impl eframe::App for DawUi {
 impl Drop for DawUi {
     fn drop(&mut self) {
         self.stop_project_playback();
+        if let Some(session) = self.audio_recording.take() {
+            if session.capture_active
+                && let Some(engine) = self.audio_engine.as_ref()
+            {
+                engine.stop_input_recording();
+            }
+            let _ = session.worker.join();
+        }
         for worker in self.audio_render_workers.drain(..) {
             let _ = worker.worker.join();
         }
@@ -21448,6 +21940,65 @@ fn playlist_seek_tick_to_frame(tick: u32, ppq: u16, tempo_bpm: f64, sample_rate:
     }
 }
 
+fn audio_recording_length_ticks(
+    frames: u64,
+    sample_rate: u32,
+    ppq: u16,
+    tempo_bpm: f64,
+) -> Option<u32> {
+    if frames == 0 || sample_rate == 0 || !tempo_bpm.is_finite() || tempo_bpm <= 0.0 {
+        return None;
+    }
+    let ticks = frames as f64 * tempo_bpm * f64::from(ppq.max(1)) / (f64::from(sample_rate) * 60.0);
+    if !ticks.is_finite() || ticks.ceil() > f64::from(u32::MAX) {
+        return None;
+    }
+    Some((ticks.ceil() as u32).max(1))
+}
+
+fn first_available_playlist_track(
+    arrangement: &Arrangement,
+    start_tick: u32,
+    length_ticks: u32,
+) -> Option<u16> {
+    let end_tick = start_tick.checked_add(length_ticks)?;
+    (0..=499).find(|track_index| {
+        arrangement.clips.iter().all(|clip| {
+            let clip_end = clip.position_ticks.saturating_add(clip.length_ticks);
+            let overlaps = clip.position_ticks < end_tick && start_tick < clip_end;
+            !overlaps
+                || clip
+                    .track_index
+                    .is_some_and(|clip_track| clip_track != *track_index)
+        })
+    })
+}
+
+fn arrangement_has_audio_clip_template(document: &FlpDocument, arrangement_id: u16) -> bool {
+    let audio_channel_ids = document
+        .channels()
+        .into_iter()
+        .filter(|channel| channel.kind() == Some(4) && channel.sample_path().is_some())
+        .map(|channel| channel.id())
+        .collect::<BTreeSet<_>>();
+    if audio_channel_ids.is_empty() {
+        return false;
+    }
+    document
+        .arrangements()
+        .ok()
+        .and_then(|arrangements| {
+            arrangements
+                .into_iter()
+                .find(|arrangement| arrangement.id == arrangement_id)
+        })
+        .is_some_and(|arrangement| {
+            arrangement.clips.iter().any(|clip| {
+                matches!(clip.target(), PlaylistClipTarget::Channel { id } if audio_channel_ids.contains(&id))
+            })
+        })
+}
+
 fn playlist_measure_at_tick(
     ppq: u16,
     initial_time_signature: Option<(u8, u8)>,
@@ -21718,10 +22269,11 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        ActivePlaylistClipDrag, ChannelDisplayFilter, FlpDocument, Pattern, PatternController,
-        PatternNote, PianoRollGrid, PianoRollSnap, PlaylistClip, PlaylistClipDragKind,
-        PlaylistTrack, PluginCandidate, PluginFormat, candidate_matches_vst_identity,
-        candidate_mixer_controls, encode_midi_device_selections, next_piano_roll_note_group,
+        ActivePlaylistClipDrag, Arrangement, ChannelDisplayFilter, FlpDocument, Pattern,
+        PatternController, PatternNote, PianoRollGrid, PianoRollSnap, PlaylistClip,
+        PlaylistClipDragKind, PlaylistTrack, PluginCandidate, PluginFormat,
+        audio_recording_length_ticks, candidate_matches_vst_identity, candidate_mixer_controls,
+        encode_midi_device_selections, first_available_playlist_track, next_piano_roll_note_group,
         note_from_grid_position, parse_midi_device_selections, piano_roll_controller_value_at,
         piano_roll_controller_value_range, piano_roll_note_group_members,
         playlist_audio_clip_join_candidates, playlist_bar_ticks, playlist_clip_drag_edit,
@@ -21733,6 +22285,46 @@ mod tests {
         update_channel_rack_selection, update_layer_child_selection,
         update_piano_roll_box_selection,
     };
+
+    fn playlist_track_arrangement_fixture(clips: &[(u32, u32, u16)]) -> Arrangement {
+        let mut event_stream = vec![0x63, 3, 0];
+        let mut clip_payload = Vec::with_capacity(clips.len() * 80);
+        for (position, length, raw_track_index) in clips {
+            let mut record = [0u8; 80];
+            record[0..4].copy_from_slice(&position.to_le_bytes());
+            record[4..6].copy_from_slice(&0x5000u16.to_le_bytes());
+            record[6..8].copy_from_slice(&0x5007u16.to_le_bytes());
+            record[8..12].copy_from_slice(&length.to_le_bytes());
+            record[12..14].copy_from_slice(&raw_track_index.to_le_bytes());
+            record[20..24].copy_from_slice(&[0x40, 0x64, 0x80, 0x80]);
+            record[24..28].copy_from_slice(&0.0f32.to_le_bytes());
+            record[28..32].copy_from_slice(&1.0f32.to_le_bytes());
+            record[64..72].copy_from_slice(&1.0f64.to_le_bytes());
+            clip_payload.extend_from_slice(&record);
+        }
+        event_stream.push(0xE9);
+        let mut encoded_length = clip_payload.len() as u32;
+        while encoded_length >= 0x80 {
+            event_stream.push((encoded_length as u8) | 0x80);
+            encoded_length >>= 7;
+        }
+        event_stream.push(encoded_length as u8);
+        event_stream.extend_from_slice(&clip_payload);
+
+        let mut bytes = b"FLhd".to_vec();
+        bytes.extend_from_slice(&6u32.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&96u16.to_le_bytes());
+        bytes.extend_from_slice(b"FLdt");
+        bytes.extend_from_slice(&(event_stream.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&event_stream);
+        FlpDocument::parse(&bytes)
+            .expect("Playlist track fixture should parse")
+            .arrangements()
+            .expect("Playlist fixture should have an arrangement")
+            .remove(0)
+    }
 
     fn mixer_parameter_fixture(records: &[(u8, u16, i32)]) -> FlpDocument {
         let mut payload = Vec::with_capacity(records.len() * 12);
@@ -21826,6 +22418,36 @@ mod tests {
             Some("/old/Example.vst3"),
             Some("Example"),
         ));
+    }
+
+    #[test]
+    fn recorded_wav_duration_maps_to_playlist_ticks_and_covers_the_audio() {
+        assert_eq!(
+            audio_recording_length_ticks(48_000, 48_000, 96, 120.0),
+            Some(192)
+        );
+        assert_eq!(audio_recording_length_ticks(1, 48_000, 96, 120.0), Some(1));
+        assert_eq!(audio_recording_length_ticks(0, 48_000, 96, 120.0), None);
+        assert_eq!(audio_recording_length_ticks(48_000, 0, 96, 120.0), None);
+        assert_eq!(
+            audio_recording_length_ticks(48_000, 48_000, 96, f64::NAN),
+            None
+        );
+    }
+
+    #[test]
+    fn audio_recording_uses_first_non_overlapping_playlist_track() {
+        let arrangement = playlist_track_arrangement_fixture(&[(0, 960, 499), (0, 960, 498)]);
+        assert_eq!(
+            first_available_playlist_track(&arrangement, 0, 480),
+            Some(2)
+        );
+
+        let later_clip = playlist_track_arrangement_fixture(&[(960, 960, 499)]);
+        assert_eq!(first_available_playlist_track(&later_clip, 0, 480), Some(0));
+
+        let unknown_track = playlist_track_arrangement_fixture(&[(0, 960, 600)]);
+        assert_eq!(first_available_playlist_track(&unknown_track, 0, 480), None);
     }
 
     #[test]
