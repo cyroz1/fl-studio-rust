@@ -27,11 +27,11 @@ use flp_rebuild::sample_render::{
 };
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions, Vst3PatternStreamHandle};
 use flp_rebuild::{
-    ArpeggioDirection, ArpeggioOptions, AutomationChannel, AutomationPoint, AutomationPointEdit,
-    ChannelGroupSummary, ChannelSortOrder, ChannelSummary, FlpDocument, FstPreset, FstPresetKind,
-    Pattern, PatternNote, PatternNoteEdit, PlaylistClip, PlaylistClipClipboard, PlaylistClipEdit,
-    PlaylistClipTarget, PlaylistTrack, ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions,
-    TimeMarker, TimeMarkerEdit, VstPluginStateMetadata,
+    ArpeggioDirection, ArpeggioOptions, ArticulateOptions, AutomationChannel, AutomationPoint,
+    AutomationPointEdit, ChannelGroupSummary, ChannelSortOrder, ChannelSummary, FlpDocument,
+    FstPreset, FstPresetKind, Pattern, PatternNote, PatternNoteEdit, PlaylistClip,
+    PlaylistClipClipboard, PlaylistClipEdit, PlaylistClipTarget, PlaylistTrack, ProjectInfoEdit,
+    ProjectSettingsEdit, RandomizerOptions, TimeMarker, TimeMarkerEdit, VstPluginStateMetadata,
 };
 
 const APP_BACKGROUND: Color32 = Color32::from_rgb(29, 29, 29);
@@ -1472,6 +1472,8 @@ struct DawUi {
     scale_levels_multiplier_percent: u16,
     scale_levels_offset_percent: i16,
     articulate_multiplier_percent: u8,
+    articulate_variation_percent: u8,
+    articulate_seed: u64,
     articulate_use_original_lengths: bool,
     articulate_only_with_selection: bool,
     humanize_timing_range_ticks: u32,
@@ -1736,6 +1738,8 @@ impl DawUi {
             scale_levels_multiplier_percent: 100,
             scale_levels_offset_percent: 0,
             articulate_multiplier_percent: 100,
+            articulate_variation_percent: 0,
+            articulate_seed: 1,
             articulate_use_original_lengths: true,
             articulate_only_with_selection: false,
             humanize_timing_range_ticks: 12,
@@ -11703,6 +11707,20 @@ impl DawUi {
                             egui::Slider::new(&mut self.articulate_multiplier_percent, 10..=100)
                                 .text("Multiply %"),
                         );
+                        ui.add(
+                            egui::Slider::new(&mut self.articulate_variation_percent, 0..=100)
+                                .text("Variation %"),
+                        );
+                        if self.articulate_variation_percent > 0 {
+                            ui.add(
+                                egui::DragValue::new(&mut self.articulate_seed)
+                                    .speed(1.0)
+                                    .prefix("Seed "),
+                            );
+                            ui.small(
+                                "Variation adds or subtracts up to its share of the duration.",
+                            );
+                        }
                         ui.checkbox(&mut self.articulate_use_original_lengths, "Use lengths");
                         if !self.articulate_use_original_lengths && edit_selection_only {
                             ui.checkbox(
@@ -11716,8 +11734,15 @@ impl DawUi {
                         ui.horizontal(|ui| {
                             if ui.button("Reset").clicked() {
                                 self.articulate_multiplier_percent = 100;
+                                self.articulate_variation_percent = 0;
+                                self.articulate_seed = 1;
                                 self.articulate_use_original_lengths = true;
                                 self.articulate_only_with_selection = false;
+                            }
+                            if self.articulate_variation_percent > 0
+                                && ui.button("New seed").clicked()
+                            {
+                                self.articulate_seed = self.articulate_seed.saturating_add(1);
                             }
                             if ui
                                 .add_enabled(
@@ -11985,6 +12010,8 @@ impl DawUi {
                 (self.selected_pattern, self.selected_note_channel)
         {
             let multiplier_percent = self.articulate_multiplier_percent;
+            let variation_percent = self.articulate_variation_percent;
+            let seed = self.articulate_seed;
             let use_original_lengths = self.articulate_use_original_lengths;
             let only_with_selection =
                 edit_selection_only && !use_original_lengths && self.articulate_only_with_selection;
@@ -11998,16 +12025,24 @@ impl DawUi {
                             pattern_id,
                             channel_id,
                             &selected_quantize_indices,
-                            multiplier_percent,
-                            use_original_lengths,
+                            ArticulateOptions {
+                                multiplier_percent,
+                                variation_percent,
+                                seed,
+                                use_original_lengths,
+                            },
                             only_with_selection,
                         )
                     } else {
                         document.articulate_pattern_notes(
                             pattern_id,
                             channel_id,
-                            multiplier_percent,
-                            use_original_lengths,
+                            ArticulateOptions {
+                                multiplier_percent,
+                                variation_percent,
+                                seed,
+                                use_original_lengths,
+                            },
                         )
                     };
                     result.map_err(|error| error.to_string())
@@ -12016,6 +12051,9 @@ impl DawUi {
                 Ok(changed) => {
                     if changed > 0 {
                         self.dirty = true;
+                    }
+                    if variation_percent > 0 {
+                        self.articulate_seed = seed.saturating_add(1);
                     }
                     self.status = format!(
                         "Articulated {changed} note lengths for {edit_scope_description} in pattern {pattern_id}"

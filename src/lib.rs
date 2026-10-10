@@ -874,6 +874,26 @@ pub struct RandomizerOptions {
     pub reset_levels: bool,
 }
 
+/// Parameters for scaling note lengths with an optional seeded variation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ArticulateOptions {
+    pub multiplier_percent: u8,
+    pub variation_percent: u8,
+    pub seed: u64,
+    pub use_original_lengths: bool,
+}
+
+impl Default for ArticulateOptions {
+    fn default() -> Self {
+        Self {
+            multiplier_percent: 100,
+            variation_percent: 0,
+            seed: 1,
+            use_original_lengths: true,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Arrangement {
     pub id: u16,
@@ -5361,39 +5381,31 @@ impl FlpDocument {
     }
 
     /// Scales channel note lengths, using original lengths or legato distances.
+    /// Variation adds a seeded bipolar offset relative to the scaled duration.
     pub fn articulate_pattern_notes(
         &mut self,
         pattern_id: u16,
         channel_id: u16,
-        multiplier_percent: u8,
-        use_original_lengths: bool,
+        options: ArticulateOptions,
     ) -> Result<usize, FlpError> {
-        self.articulate_pattern_notes_in_scope(
-            pattern_id,
-            channel_id,
-            None,
-            multiplier_percent,
-            use_original_lengths,
-            false,
-        )
+        self.articulate_pattern_notes_in_scope(pattern_id, channel_id, None, options, false)
     }
 
     /// Scales selected note lengths; optional selected-only context controls legato boundaries.
+    /// Variation adds a seeded bipolar offset relative to the scaled duration.
     pub fn articulate_pattern_note_selection(
         &mut self,
         pattern_id: u16,
         channel_id: u16,
         note_indices: &[usize],
-        multiplier_percent: u8,
-        use_original_lengths: bool,
+        options: ArticulateOptions,
         only_with_selection: bool,
     ) -> Result<usize, FlpError> {
         self.articulate_pattern_notes_in_scope(
             pattern_id,
             channel_id,
             Some(note_indices),
-            multiplier_percent,
-            use_original_lengths,
+            options,
             only_with_selection,
         )
     }
@@ -5403,13 +5415,23 @@ impl FlpDocument {
         pattern_id: u16,
         channel_id: u16,
         note_indices: Option<&[usize]>,
-        multiplier_percent: u8,
-        use_original_lengths: bool,
+        options: ArticulateOptions,
         only_with_selection: bool,
     ) -> Result<usize, FlpError> {
+        let ArticulateOptions {
+            multiplier_percent,
+            variation_percent,
+            seed,
+            use_original_lengths,
+        } = options;
         if !(10..=100).contains(&multiplier_percent) {
             return Err(FlpError::UnsupportedEdit(
                 "Articulate multiplier must be between 10 and 100 percent",
+            ));
+        }
+        if variation_percent > 100 {
+            return Err(FlpError::UnsupportedEdit(
+                "Articulate variation must be between 0 and 100 percent",
             ));
         }
         if only_with_selection && (note_indices.is_none() || use_original_lengths) {
@@ -5440,6 +5462,11 @@ impl FlpDocument {
         onset_positions.dedup();
 
         let multiplier = f64::from(multiplier_percent) / 100.0;
+        let mut state = if seed == 0 {
+            0x9e37_79b9_7f4a_7c15
+        } else {
+            seed
+        };
         let edits = pattern
             .notes
             .iter()
@@ -5458,12 +5485,22 @@ impl FlpDocument {
                             position.saturating_sub(note.position)
                         })
                 };
-                let length = if base_length == 0 {
+                let scaled_length = if base_length == 0 {
                     0
                 } else {
                     (f64::from(base_length) * multiplier)
                         .round()
                         .clamp(1.0, f64::from(u32::MAX)) as u32
+                };
+                let length = if scaled_length == 0 || variation_percent == 0 {
+                    scaled_length
+                } else {
+                    let range = ((u64::from(scaled_length) * u64::from(variation_percent) + 50)
+                        / 100)
+                        .min((i32::MAX / 2) as u64) as i32;
+                    let offset = randomizer_offset(&mut state, range, false, true);
+                    (i64::from(scaled_length) + i64::from(offset)).clamp(1, i64::from(u32::MAX))
+                        as u32
                 };
                 (length != note.length).then_some((note_index, length))
             })
@@ -9418,12 +9455,26 @@ fn decode_vst_text(bytes: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChannelGroupSummary, ChannelNoteRouter, ChannelSortOrder, ChannelSummary, FlpDocument,
-        FlpError, FlpEvent, FstPreset, FstPresetKind, MixerParameterKind, PATTERN_NOTE_SLIDE_FLAG,
-        PatternNote, PatternNoteEdit, PayloadEncoding, PlaylistClipEdit, PlaylistClipTarget,
-        ProjectInfoEdit, ProjectSettingsEdit, TimeMarkerEdit, midi::MidiChannelMapping,
-        midi::MidiFile, parse_vst_plugin_state_metadata,
+        ArticulateOptions, ChannelGroupSummary, ChannelNoteRouter, ChannelSortOrder,
+        ChannelSummary, FlpDocument, FlpError, FlpEvent, FstPreset, FstPresetKind,
+        MixerParameterKind, PATTERN_NOTE_SLIDE_FLAG, PatternNote, PatternNoteEdit, PayloadEncoding,
+        PlaylistClipEdit, PlaylistClipTarget, ProjectInfoEdit, ProjectSettingsEdit, TimeMarkerEdit,
+        midi::MidiChannelMapping, midi::MidiFile, parse_vst_plugin_state_metadata,
     };
+
+    fn articulate_options(
+        multiplier_percent: u8,
+        variation_percent: u8,
+        seed: u64,
+        use_original_lengths: bool,
+    ) -> ArticulateOptions {
+        ArticulateOptions {
+            multiplier_percent,
+            variation_percent,
+            seed,
+            use_original_lengths,
+        }
+    }
 
     fn flp_fixture(event_stream: &[u8], header_extension: &[u8], trailing: &[u8]) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -12676,7 +12727,7 @@ mod tests {
 
         let mut legato = FlpDocument::parse(&input).expect("fixture should parse");
         let changed = legato
-            .articulate_pattern_notes(7, 0, 50, false)
+            .articulate_pattern_notes(7, 0, articulate_options(50, 0, 1, false))
             .expect("channel articulation should succeed");
         assert_eq!(changed, 2);
         let notes = legato.patterns().unwrap()[0].notes.clone();
@@ -12687,7 +12738,13 @@ mod tests {
 
         let mut selected_context = FlpDocument::parse(&input).expect("fixture should parse");
         selected_context
-            .articulate_pattern_note_selection(7, 0, &[0], 50, false, true)
+            .articulate_pattern_note_selection(
+                7,
+                0,
+                &[0],
+                articulate_options(50, 0, 1, false),
+                true,
+            )
             .expect("selected-only articulation context should succeed");
         let notes = selected_context.patterns().unwrap()[0].notes.clone();
         assert_eq!(notes[0].length, 48);
@@ -12695,7 +12752,13 @@ mod tests {
 
         let mut use_lengths = FlpDocument::parse(&input).expect("fixture should parse");
         use_lengths
-            .articulate_pattern_note_selection(7, 0, &[0], 50, true, false)
+            .articulate_pattern_note_selection(
+                7,
+                0,
+                &[0],
+                articulate_options(50, 0, 1, true),
+                false,
+            )
             .expect("original-length articulation should succeed");
         let reparsed = FlpDocument::parse(&use_lengths.encode_lossless().unwrap())
             .expect("edited FLP should parse");
@@ -12709,22 +12772,93 @@ mod tests {
     }
 
     #[test]
+    fn articulate_variation_is_seeded_and_bounded_by_the_scaled_length() {
+        let first = note_record(0, 0, 96, 60, 100);
+        let second = note_record(120, 0, 48, 64, 90);
+        let input = pattern_fixture(&[first, second], &[0xFF, 1, 0x5A]);
+
+        let mut fixed = FlpDocument::parse(&input).expect("fixture should parse");
+        assert_eq!(
+            fixed
+                .articulate_pattern_notes(7, 0, articulate_options(100, 0, 1, true))
+                .unwrap(),
+            0
+        );
+
+        let mut varied_first = FlpDocument::parse(&input).expect("fixture should parse");
+        varied_first
+            .articulate_pattern_notes(7, 0, articulate_options(100, 50, 1, true))
+            .expect("seeded variation should succeed");
+        let first_notes = varied_first.patterns().unwrap()[0].notes.clone();
+        assert_eq!(first_notes[0].length, 78);
+        assert!((48..=144).contains(&first_notes[0].length));
+        assert!((24..=72).contains(&first_notes[1].length));
+        assert_eq!(first_notes[0].key, 60);
+        assert_eq!(first_notes[0].velocity, 100);
+
+        let mut varied_again = FlpDocument::parse(&input).expect("fixture should parse");
+        varied_again
+            .articulate_pattern_notes(7, 0, articulate_options(100, 50, 1, true))
+            .expect("the same seed should be reusable");
+        let repeated_notes = varied_again.patterns().unwrap()[0].notes.clone();
+        assert_eq!(repeated_notes, first_notes);
+        assert_eq!(
+            FlpDocument::parse(&varied_first.encode_lossless().unwrap())
+                .unwrap()
+                .events()
+                .last()
+                .unwrap()
+                .wire_bytes(),
+            &[0xFF, 1, 0x5A]
+        );
+    }
+
+    #[test]
     fn articulate_validates_ranges_and_context_requirements() {
         let note = note_record(0, 0, 48, 60, 100);
         let mut document = FlpDocument::parse(&pattern_fixture(&[note], &[0xFF, 0]))
             .expect("fixture should parse");
 
-        assert!(document.articulate_pattern_notes(7, 0, 9, true).is_err());
-        assert!(document.articulate_pattern_notes(7, 0, 101, true).is_err());
-        assert!(document.articulate_pattern_notes(7, 0, 50, false).is_ok());
         assert!(
             document
-                .articulate_pattern_note_selection(7, 0, &[0], 50, false, true)
+                .articulate_pattern_notes(7, 0, articulate_options(9, 0, 1, true))
+                .is_err()
+        );
+        assert!(
+            document
+                .articulate_pattern_notes(7, 0, articulate_options(101, 0, 1, true))
+                .is_err()
+        );
+        assert!(
+            document
+                .articulate_pattern_notes(7, 0, articulate_options(50, 0, 1, false))
                 .is_ok()
         );
         assert!(
             document
-                .articulate_pattern_note_selection(7, 0, &[0], 50, true, true)
+                .articulate_pattern_note_selection(
+                    7,
+                    0,
+                    &[0],
+                    articulate_options(50, 0, 1, false),
+                    true,
+                )
+                .is_ok()
+        );
+        assert!(
+            document
+                .articulate_pattern_note_selection(
+                    7,
+                    0,
+                    &[0],
+                    articulate_options(50, 0, 1, true),
+                    true,
+                )
+                .is_err()
+        );
+        assert!(
+            document
+                .articulate_pattern_notes(7, 0, articulate_options(100, 101, 1, true))
                 .is_err()
         );
 
@@ -12733,7 +12867,7 @@ mod tests {
             .expect("zero-length fixture should parse");
         assert_eq!(
             zero_length
-                .articulate_pattern_notes(7, 0, 50, true)
+                .articulate_pattern_notes(7, 0, articulate_options(50, 50, 1, true))
                 .unwrap(),
             0
         );
