@@ -33,11 +33,12 @@ use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, Arrangement, ArticulateOptions, AutomationChannel,
     AutomationPoint, AutomationPointEdit, ChannelGroupSummary, ChannelSortOrder, ChannelSummary,
     ClawMachineOptions, FlpDocument, FstPreset, FstPresetKind, LimitNoteOptions,
-    LimitSnapDirection, MixerParameterKind, MixerParameterRecord, Pattern, PatternController,
-    PatternControllerEdit, PatternNote, PatternNoteEdit, PlaylistClip, PlaylistClipClipboard,
-    PlaylistClipEdit, PlaylistClipTarget, PlaylistTrack, PlaylistTrackEdit, ProjectInfoEdit,
-    ProjectSettingsEdit, RandomizerOptions, RiffMachineOptions, RiffMachineQuantizeMode,
-    ScaleLevelsOptions, TimeMarker, TimeMarkerEdit, VstPluginStateMetadata,
+    LimitSnapDirection, MixerInsertEdit, MixerParameterKind, MixerParameterRecord, Pattern,
+    PatternController, PatternControllerEdit, PatternNote, PatternNoteEdit, PlaylistClip,
+    PlaylistClipClipboard, PlaylistClipEdit, PlaylistClipTarget, PlaylistTrack, PlaylistTrackEdit,
+    ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions, RiffMachineOptions,
+    RiffMachineQuantizeMode, ScaleLevelsOptions, TimeMarker, TimeMarkerEdit,
+    VstPluginStateMetadata,
 };
 
 mod midi_input;
@@ -17064,6 +17065,7 @@ impl DawUi {
         self.selected_mixer_insert = active_insert;
 
         let mut rename_edits = Vec::new();
+        let mut flag_edits = Vec::new();
         let mut parameter_edits = Vec::new();
         let available_height = ui.available_height();
         let inspector_width = 238.0_f32.min((ui.available_width() * 0.3).max(190.0));
@@ -17132,6 +17134,53 @@ impl DawUi {
                                                     self.selected_mixer_insert =
                                                         Some(insert.ordinal());
                                                 }
+                                                ui.horizontal(|ui| {
+                                                    let flags_editable = insert.flags().is_some();
+                                                    let muted = insert.enabled() == Some(false);
+                                                    let mute_response = ui.add_enabled(
+                                                        flags_editable,
+                                                        egui::Button::selectable(muted, "M")
+                                                            .min_size(Vec2::new(38.0, 22.0)),
+                                                    );
+                                                    if mute_response
+                                                        .on_hover_text(if muted {
+                                                            "Unmute this Mixer track"
+                                                        } else {
+                                                            "Mute this Mixer track"
+                                                        })
+                                                        .clicked()
+                                                    {
+                                                        flag_edits.push((
+                                                            insert.ordinal(),
+                                                            MixerInsertEdit {
+                                                                enabled: Some(muted),
+                                                                ..MixerInsertEdit::default()
+                                                            },
+                                                        ));
+                                                    }
+                                                    let soloed = insert.soloed() == Some(true);
+                                                    let solo_response = ui.add_enabled(
+                                                        flags_editable,
+                                                        egui::Button::selectable(soloed, "S")
+                                                            .min_size(Vec2::new(38.0, 22.0)),
+                                                    );
+                                                    if solo_response
+                                                        .on_hover_text(if soloed {
+                                                            "Unsolo this Mixer track"
+                                                        } else {
+                                                            "Solo this Mixer track"
+                                                        })
+                                                        .clicked()
+                                                    {
+                                                        flag_edits.push((
+                                                            insert.ordinal(),
+                                                            MixerInsertEdit {
+                                                                soloed: Some(!soloed),
+                                                                ..MixerInsertEdit::default()
+                                                            },
+                                                        ));
+                                                    }
+                                                });
                                                 ui.separator();
                                                 ui.small("INPUT");
                                                 ui.monospace(insert.input_raw().to_string());
@@ -17384,6 +17433,26 @@ impl DawUi {
                     }
                     Err(error) => {
                         self.status = format!("Could not rename Mixer insert: {error}");
+                    }
+                }
+            }
+        }
+        if !flag_edits.is_empty()
+            && let Some(document) = self.document.as_mut()
+        {
+            for (insert_ordinal, edit) in flag_edits {
+                match document.edit_mixer_insert_flags(insert_ordinal, edit) {
+                    Ok(()) => {
+                        self.dirty = true;
+                        let track_name = if insert_ordinal == 0 {
+                            "Master".to_owned()
+                        } else {
+                            format!("Insert {insert_ordinal}")
+                        };
+                        self.status = format!("Updated {track_name} mute/solo state");
+                    }
+                    Err(error) => {
+                        self.status = format!("Could not update Mixer track state: {error}");
                     }
                 }
             }
