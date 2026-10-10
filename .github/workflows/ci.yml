@@ -199,7 +199,7 @@ jobs:
             fi
             sleep 1
           done
-          xdotool key F9
+          xdotool mousemove 625 111 click 1
           sleep 2
           ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
             -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/mixer.png"
