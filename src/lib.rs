@@ -919,8 +919,20 @@ pub struct RiffMachineOptions<'a> {
     /// Mix note durations or end positions toward their quantized values.
     pub groove_duration_percent: u8,
     pub groove_quantize_mode: RiffMachineQuantizeMode,
+    /// Mix seeded offsets into note panning, from 0 through 100 percent.
+    pub pan_variation_percent: u8,
     pub length_multiplier_percent: u8,
     pub velocity_variation_percent: u8,
+    /// Mix seeded offsets into release and modulation levels, from 0 through 100 percent.
+    pub release_variation_percent: u8,
+    pub mod_x_variation_percent: u8,
+    pub mod_y_variation_percent: u8,
+    /// Randomly shift generated pitches by up to this many semitones before scale fitting.
+    pub pitch_variation_semitones: u8,
+    /// Reset velocity, pan, release, and modulation values before applying offsets.
+    pub reset_levels: bool,
+    /// Randomize levels above and below their baseline when enabled.
+    pub bipolar_levels: bool,
     pub seed: u64,
 }
 
@@ -945,8 +957,15 @@ impl<'a> Default for RiffMachineOptions<'a> {
             groove_sensitivity_percent: 50,
             groove_duration_percent: 0,
             groove_quantize_mode: RiffMachineQuantizeMode::LeaveDuration,
+            pan_variation_percent: 0,
             length_multiplier_percent: 100,
             velocity_variation_percent: 10,
+            release_variation_percent: 0,
+            mod_x_variation_percent: 0,
+            mod_y_variation_percent: 0,
+            pitch_variation_semitones: 0,
+            reset_levels: false,
+            bipolar_levels: true,
             seed: 1,
         }
     }
@@ -6591,9 +6610,19 @@ impl FlpDocument {
                 "Riff Machine length multiplier must be between 10 and 100 percent",
             ));
         }
-        if options.velocity_variation_percent > 100 {
+        if options.velocity_variation_percent > 100
+            || options.pan_variation_percent > 100
+            || options.release_variation_percent > 100
+            || options.mod_x_variation_percent > 100
+            || options.mod_y_variation_percent > 100
+        {
             return Err(FlpError::UnsupportedEdit(
-                "Riff Machine velocity variation must be between 0 and 100 percent",
+                "Riff Machine level variations must be between 0 and 100 percent",
+            ));
+        }
+        if options.pitch_variation_semitones > 24 {
+            return Err(FlpError::UnsupportedEdit(
+                "Riff Machine pitch variation must be between 0 and 24 semitones",
             ));
         }
         if options.groove_start_percent > 100
@@ -6606,6 +6635,13 @@ impl FlpDocument {
         }
         let groove_enabled =
             options.groove_start_percent > 0 || options.groove_duration_percent > 0;
+        let levels_enabled = options.reset_levels
+            || options.velocity_variation_percent > 0
+            || options.pan_variation_percent > 0
+            || options.release_variation_percent > 0
+            || options.mod_x_variation_percent > 0
+            || options.mod_y_variation_percent > 0
+            || options.pitch_variation_semitones > 0;
         if groove_enabled && options.groove_snap_ticks.is_none_or(|ticks| ticks == 0) {
             return Err(FlpError::UnsupportedEdit(
                 "Riff Machine Groove needs an enabled Piano roll snap grid",
@@ -6813,19 +6849,12 @@ impl FlpDocument {
             }
             updated.edit_pattern_notes_batch(pattern_id, channel_id, &mirror_edits)?;
         }
-        if options.velocity_variation_percent > 0 {
-            updated.randomize_pattern_note_selection(
+        if levels_enabled {
+            updated.apply_riff_machine_levels(
                 pattern_id,
                 channel_id,
                 &generated_indices,
-                RandomizerOptions {
-                    seed: options.seed,
-                    velocity_amount_percent: i16::from(options.velocity_variation_percent),
-                    pan_amount_percent: 0,
-                    pitch_range_semitones: 0,
-                    bipolar: true,
-                    reset_levels: false,
-                },
+                options,
             )?;
         }
         updated.articulate_pattern_note_selection(
@@ -6864,6 +6893,108 @@ impl FlpDocument {
         )?;
         *self = updated;
         Ok(arpeggiated)
+    }
+
+    fn apply_riff_machine_levels(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: &[usize],
+        options: RiffMachineOptions<'_>,
+    ) -> Result<(), FlpError> {
+        let mut state = if options.seed == 0 {
+            0x9e37_79b9_7f4a_7c15
+        } else {
+            options.seed
+        };
+        let selected_indices = note_indices.iter().copied().collect::<HashSet<_>>();
+        let patterns = self.patterns()?;
+        let pattern = patterns
+            .iter()
+            .find(|pattern| pattern.id == pattern_id)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested pattern does not exist",
+            ))?;
+        let mut edits = HashMap::new();
+        for (note_index, note) in pattern
+            .notes
+            .iter()
+            .filter(|note| note.channel_id == channel_id)
+            .enumerate()
+            .filter(|(note_index, _)| selected_indices.contains(note_index))
+        {
+            let velocity_base = if options.reset_levels {
+                100
+            } else {
+                i32::from(note.velocity)
+            };
+            let pan_base = if options.reset_levels {
+                64
+            } else {
+                i32::from(note.pan)
+            };
+            let release_base = if options.reset_levels {
+                0
+            } else {
+                i32::from(note.release)
+            };
+            let mod_x_base = if options.reset_levels {
+                0
+            } else {
+                i32::from(note.mod_x)
+            };
+            let mod_y_base = if options.reset_levels {
+                0
+            } else {
+                i32::from(note.mod_y)
+            };
+            let velocity_range = (127 * i32::from(options.velocity_variation_percent) + 50) / 100;
+            let pan_range = (127 * i32::from(options.pan_variation_percent) + 50) / 100;
+            let pitch_range = i32::from(options.pitch_variation_semitones);
+            let release_range = (127 * i32::from(options.release_variation_percent) + 50) / 100;
+            let mod_x_range = (255 * i32::from(options.mod_x_variation_percent) + 50) / 100;
+            let mod_y_range = (255 * i32::from(options.mod_y_variation_percent) + 50) / 100;
+            // Keep the established velocity, pan, and pitch random stream order stable.
+            let velocity_offset =
+                randomizer_offset(&mut state, velocity_range, false, options.bipolar_levels);
+            let pan_offset =
+                randomizer_offset(&mut state, pan_range, false, options.bipolar_levels);
+            let pitch_offset =
+                randomizer_offset(&mut state, pitch_range, false, options.bipolar_levels);
+            let release_offset =
+                randomizer_offset(&mut state, release_range, false, options.bipolar_levels);
+            let mod_x_offset =
+                randomizer_offset(&mut state, mod_x_range, false, options.bipolar_levels);
+            let mod_y_offset =
+                randomizer_offset(&mut state, mod_y_range, false, options.bipolar_levels);
+            let velocity = (velocity_base + velocity_offset).clamp(0, 127) as u8;
+            let pan = (pan_base + pan_offset).clamp(0, 127) as u8;
+            let key = (i32::from(note.key) + pitch_offset).clamp(0, 127) as u16;
+            let release = (release_base + release_offset).clamp(0, 127) as u8;
+            let mod_x = (mod_x_base + mod_x_offset).clamp(0, 255) as u8;
+            let mod_y = (mod_y_base + mod_y_offset).clamp(0, 255) as u8;
+            if velocity != note.velocity
+                || pan != note.pan
+                || key != note.key
+                || release != note.release
+                || mod_x != note.mod_x
+                || mod_y != note.mod_y
+            {
+                edits.insert(
+                    note_index,
+                    PatternNoteEdit {
+                        velocity: Some(velocity),
+                        pan: Some(pan),
+                        key: Some(key),
+                        release: Some(release),
+                        mod_x: Some(mod_x),
+                        mod_y: Some(mod_y),
+                        ..PatternNoteEdit::default()
+                    },
+                );
+            }
+        }
+        self.edit_pattern_notes_batch(pattern_id, channel_id, &edits)
     }
 
     fn apply_riff_machine_groove(
@@ -14309,6 +14440,153 @@ mod tests {
         .expect("end-time quantization should succeed");
         assert_eq!(duration, (29, 24));
         assert_eq!(end, (29, 19));
+    }
+
+    #[test]
+    fn riff_machine_levels_randomize_all_supported_note_properties_deterministically() {
+        let mut first_root = note_record(0, 0, 96, 60, 80);
+        first_root[18] = 60;
+        first_root[20] = 30;
+        first_root[22] = 20;
+        first_root[23] = 240;
+        let mut second_root = note_record(96, 0, 96, 64, 60);
+        second_root[18] = 30;
+        second_root[20] = 80;
+        second_root[22] = 200;
+        second_root[23] = 40;
+        let mut other_channel = note_record(0, 1, 96, 48, 70);
+        other_channel[18] = 45;
+        other_channel[20] = 75;
+        other_channel[22] = 125;
+        other_channel[23] = 175;
+        let input = pattern_fixture(&[first_root, second_root, other_channel], &[0xFF, 0]);
+        let options = RiffMachineOptions {
+            velocity_variation_percent: 100,
+            pan_variation_percent: 100,
+            release_variation_percent: 100,
+            mod_x_variation_percent: 100,
+            mod_y_variation_percent: 100,
+            pitch_variation_semitones: 12,
+            bipolar_levels: true,
+            seed: 23,
+            ..RiffMachineOptions::default()
+        };
+        let mut first = FlpDocument::parse(&input).expect("fixture should parse");
+        let mut second = FlpDocument::parse(&input).expect("fixture should parse");
+        let mut without_pitch_variation = FlpDocument::parse(&input).expect("fixture should parse");
+        first
+            .riff_machine_pattern_notes(7, 0, options)
+            .expect("Riff Machine should randomize level properties");
+        second
+            .riff_machine_pattern_notes(7, 0, options)
+            .expect("the same seed should produce the same levels");
+        without_pitch_variation
+            .riff_machine_pattern_notes(
+                7,
+                0,
+                RiffMachineOptions {
+                    pitch_variation_semitones: 0,
+                    ..options
+                },
+            )
+            .expect("Riff Machine should support disabling pitch variation");
+        assert_eq!(
+            first.encode_lossless().unwrap(),
+            second.encode_lossless().unwrap()
+        );
+
+        let original_other = FlpDocument::parse(&input)
+            .expect("fixture should parse")
+            .patterns()
+            .unwrap()
+            .remove(0)
+            .notes
+            .remove(2);
+        let notes = first.patterns().unwrap().remove(0).notes;
+        let generated = notes
+            .iter()
+            .filter(|note| note.channel_id == 0)
+            .collect::<Vec<_>>();
+        let unvaried_keys = without_pitch_variation
+            .patterns()
+            .unwrap()
+            .remove(0)
+            .notes
+            .into_iter()
+            .filter(|note| note.channel_id == 0)
+            .map(|note| note.key)
+            .collect::<Vec<_>>();
+        assert_eq!(generated.len(), 8);
+        assert!(
+            generated
+                .iter()
+                .zip(unvaried_keys)
+                .any(|(varied, unvaried)| varied.key != unvaried)
+        );
+        assert!(
+            generated
+                .iter()
+                .any(|note| note.velocity != 80 && note.velocity != 60)
+        );
+        assert!(
+            generated
+                .iter()
+                .any(|note| note.pan != 30 && note.pan != 80)
+        );
+        assert!(
+            generated
+                .iter()
+                .any(|note| note.release != 60 && note.release != 30)
+        );
+        assert!(
+            generated
+                .iter()
+                .any(|note| note.mod_x != 20 && note.mod_x != 200)
+        );
+        assert!(
+            generated
+                .iter()
+                .any(|note| note.mod_y != 240 && note.mod_y != 40)
+        );
+        assert_eq!(
+            notes.iter().find(|note| note.channel_id == 1),
+            Some(&original_other)
+        );
+    }
+
+    #[test]
+    fn riff_machine_can_reset_levels_before_randomizing() {
+        let mut root = note_record(0, 0, 96, 60, 80);
+        root[18] = 45;
+        root[20] = 25;
+        root[22] = 90;
+        root[23] = 180;
+        let input = pattern_fixture(&[root], &[0xFF, 0]);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+        document
+            .riff_machine_pattern_notes(
+                7,
+                0,
+                RiffMachineOptions {
+                    velocity_variation_percent: 0,
+                    reset_levels: true,
+                    ..RiffMachineOptions::default()
+                },
+            )
+            .expect("Riff Machine should reset generated note levels");
+        let notes = document.patterns().unwrap().remove(0).notes;
+        let generated = notes
+            .iter()
+            .filter(|note| note.channel_id == 0)
+            .collect::<Vec<_>>();
+        assert!(!generated.is_empty());
+        assert!(generated.iter().all(|note| {
+            note.velocity == 100
+                && note.pan == 64
+                && note.release == 0
+                && note.mod_x == 0
+                && note.mod_y == 0
+        }));
     }
 
     #[test]
