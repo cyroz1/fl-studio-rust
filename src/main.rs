@@ -13,9 +13,9 @@ use flp_rebuild::sample_render::{
 };
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions};
 use flp_rebuild::{
-    ArpeggioDirection, ArpeggioOptions, AutomationPointEdit, FlpDocument, FstPreset, PatternNote,
-    PatternNoteEdit, PlaylistClipEdit, PlaylistTrackEdit, ProjectInfoEdit, ProjectSettingsEdit,
-    RandomizerOptions, TimeMarkerEdit,
+    ArpeggioDirection, ArpeggioOptions, AutomationPointEdit, FlpDocument, FstPreset,
+    PatternControllerEdit, PatternNote, PatternNoteEdit, PlaylistClipEdit, PlaylistTrackEdit,
+    ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions, TimeMarkerEdit,
 };
 
 fn main() -> ExitCode {
@@ -134,6 +134,23 @@ fn run(args: Vec<String>) -> Result<(), String> {
             parse_u16(channel_id, "channel id")?,
         ),
         [command, path] if command == "patterns" => list_patterns(Path::new(path)),
+        [command, path, pattern_id] if command == "pattern-controllers" => {
+            list_pattern_controllers(Path::new(path), parse_u16(pattern_id, "pattern id")?)
+        }
+        [command, input, output, pattern_id, controller_index, position, value]
+            if command == "edit-pattern-controller" =>
+        {
+            edit_pattern_controller(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_usize(controller_index, "Pattern controller index")?,
+                PatternControllerEdit {
+                    position: parse_optional_u32(position, "controller position")?,
+                    value: parse_optional_f32(value, "controller value")?,
+                },
+            )
+        }
         [command, path] if command == "playlist" => list_playlist(Path::new(path), 0, 16),
         [command, path, start] if command == "playlist" => {
             list_playlist(Path::new(path), parse_usize(start, "clip start")?, 16)
@@ -840,6 +857,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild plugin-states <file.flp>\n",
             "  flp-rebuild channel-events <file.flp> <channel-id>\n",
             "  flp-rebuild patterns <file.flp>\n",
+            "  flp-rebuild pattern-controllers <file.flp> <pattern-id>\n",
+            "  flp-rebuild edit-pattern-controller <input.flp> <output.flp> <pattern-id> <controller-index> <position-ticks|-> <value|->\n",
             "  flp-rebuild playlist <file.flp> [start] [count]\n",
             "  flp-rebuild notes <file.flp> <pattern-id> [start] [count]\n",
             "  flp-rebuild events <file.flp> [start] [count]\n",
@@ -2018,13 +2037,14 @@ fn list_patterns(path: &Path) -> Result<(), String> {
             .collect::<Vec<_>>()
             .join(",");
         println!(
-            "id={} name={} length_ticks={} notes={} channels=[{}] time_signatures=[{}]",
+            "id={} name={} length_ticks={} notes={} controllers={} channels=[{}] time_signatures=[{}]",
             pattern.id,
             pattern.name.as_deref().unwrap_or("(unnamed)"),
             pattern
                 .length_ticks
                 .map_or_else(|| "default".to_owned(), |length| length.to_string()),
             pattern.notes.len(),
+            pattern.controllers.len(),
             channel_summary,
             pattern
                 .time_markers
@@ -2042,6 +2062,32 @@ fn list_patterns(path: &Path) -> Result<(), String> {
                 ))
                 .collect::<Vec<_>>()
                 .join(","),
+        );
+    }
+    Ok(())
+}
+
+fn list_pattern_controllers(path: &Path, pattern_id: u16) -> Result<(), String> {
+    let (_, document) = load_document(path)?;
+    let patterns = document.patterns().map_err(|error| error.to_string())?;
+    let Some(pattern) = patterns.iter().find(|pattern| pattern.id == pattern_id) else {
+        return Err(format!("pattern id {pattern_id} was not found"));
+    };
+    println!(
+        "pattern={} controllers={}",
+        pattern.id,
+        pattern.controllers.len()
+    );
+    for (index, controller) in pattern.controllers.iter().enumerate() {
+        println!(
+            "{index:06} position={} channel_raw={} flags=0x{:02X} reserved={:02X}{:02X} value={} value_bits=0x{:08X}",
+            controller.position,
+            controller.channel,
+            controller.flags,
+            controller.reserved[0],
+            controller.reserved[1],
+            controller.value(),
+            controller.value_bits,
         );
     }
     Ok(())
@@ -2489,6 +2535,29 @@ fn edit_note(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "edited note {note_index} in pattern {pattern_id}, channel {channel_id} to {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn edit_pattern_controller(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    controller_index: usize,
+    edit: PatternControllerEdit,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .edit_pattern_controller(pattern_id, controller_index, edit)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "edited controller {controller_index} in pattern {pattern_id} in {}",
         output.display()
     );
     Ok(())

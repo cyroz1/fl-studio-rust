@@ -69,7 +69,7 @@ The foundation. Everything else depends on reading projects exactly.
 The decoded document must model everything the format can express.
 
 - `[partial]` Channels: summaries, sample paths, plugin state blobs, levels, known kind mapping, and Layer child relationships/raw flags
-- `[partial]` Patterns: note lists per channel; empty patterns can be created when the project supplies an unambiguous note-event encoding, and Alt/Option+C or Patterns > Duplicate selected pattern copies the selected pattern's raw note-event payload plus recognized name and explicit length. Pattern-scoped time-signature markers are read, set, and deleted. Pattern automation and other unrecognized pattern metadata remain opaque.
+- `[partial]` Patterns: note lists per channel; empty patterns can be created when the project supplies an unambiguous note-event encoding, and Alt/Option+C or Patterns > Duplicate selected pattern copies the selected pattern's raw note-event payload plus recognized name and explicit length. Pattern-scoped time-signature markers are read, set, and deleted. The candidate `0xDF` 12-byte controller stream is losslessly decoded and its position/value fields can be edited through the API and CLI; channel/flags meaning, target mapping, a Piano roll event lane, and native verification remain incomplete. Other unrecognized Pattern metadata stays opaque.
 - `[partial]` Playlist: tracks, arrangements, clips with targets, and time markers that can be edited, created, and deleted through the API, CLI, and desktop editor
 - `[partial]` Mixer: recognized insert summaries and parameter kinds, with exact-record value editing and insert-name editing; strips expose raw volume/pan controls for unique corpus-derived candidates. Full track mapping, master/sends, meters, effects, and routing remain incomplete
 - `[partial]` Automation: type-5 channel point curves can be read and points in an existing blob edited, inserted, or removed from the desktop view; linear tempo-map conversion is implemented for song MIDI export, while native curve interpolation, realtime tempo playback, parameter links, event automation, LFOs, and new clip creation remain incomplete
@@ -188,7 +188,9 @@ stored MIDI channel, pan, and modulation X/Y. Quantize has channel and selected-
 Chop, Glue, Flip, Strum, Flam, seeded Randomize and Humanize, pitch Limit,
 Arpeggiate, and Slice can target the channel or selected notes. Scale highlighting, chord labels, ghost
 channels, and MIDI-channel note colors are available in the Piano roll. The
-CLI can edit score fields individually while preserving the reserved byte.
+CLI can edit score fields individually while preserving the reserved byte. Candidate `0xDF` controller
+records can be listed and their position/value fields edited through the CLI; target mapping and the
+Piano roll event lane remain incomplete.
 FL Studio's piano roll is famously deep — the full toolset:
 
 **Tools:** `[partial]` Draw (P), Paint (B), Select (E), Zoom (Z), Playback (Y), Chord Stamp, and Slice-at-tick; single-note delete, modifier and box selection, Select All (Ctrl/Cmd+A), Invert (Shift+I), Deselect (Ctrl/Cmd+D), duplicate-to-right (Ctrl/Cmd+B) for selected notes or all notes in the target channel, Shift+G group and Alt/Option+G ungroup, and group-aware move/resize/delete. Duplicate spacing follows the copied notes' time span; timeline-defined repeat intervals remain unsupported. Playback auditions Sampler or loaded VST3 notes on click and while dragging across notes; native instrument preview and continuous playhead scrubbing remain. Mute remains `[todo]`.

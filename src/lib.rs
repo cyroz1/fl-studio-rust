@@ -13,6 +13,7 @@ const FLHD: &[u8; 4] = b"FLhd";
 const FLDT: &[u8; 4] = b"FLdt";
 const MIN_HEADER_CONTENT_LENGTH: usize = 6;
 const FLP_NOTE_RECORD_SIZE: usize = 24;
+const FLP_PATTERN_CONTROLLER_RECORD_SIZE: usize = 12;
 const FLP_PLAYLIST_RECORD_SIZES: [usize; 3] = [80, 60, 32];
 const MAX_MERGED_PATTERN_NOTES: usize = 2_000_000;
 const FLP_AUTOMATION_COUNT_OFFSET: usize = 17;
@@ -806,7 +807,35 @@ pub struct Pattern {
     pub name: Option<String>,
     pub length_ticks: Option<u32>,
     pub notes: Vec<PatternNote>,
+    pub controllers: Vec<PatternController>,
     pub time_markers: Vec<TimeMarker>,
+}
+
+/// Raw controller point record stored in a Pattern's `0xDF` event.
+///
+/// The channel and flags bytes are retained without interpretation. `value_bits` keeps the
+/// original IEEE-754 representation, including unusual or non-finite values.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PatternController {
+    pub position: u32,
+    pub reserved: [u8; 2],
+    pub channel: u8,
+    pub flags: u8,
+    pub value_bits: u32,
+}
+
+impl PatternController {
+    /// Decodes the stored float value while leaving its original bits available in `value_bits`.
+    pub fn value(&self) -> f32 {
+        f32::from_bits(self.value_bits)
+    }
+}
+
+/// Fields that can be changed on an existing Pattern controller point.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PatternControllerEdit {
+    pub position: Option<u32>,
+    pub value: Option<f32>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -2482,7 +2511,7 @@ impl FlpDocument {
         Ok(())
     }
 
-    /// Returns pattern metadata and note records from the version-specific score event.
+    /// Returns pattern metadata, note records, and raw controller points.
     pub fn patterns(&self) -> Result<Vec<Pattern>, FlpError> {
         let mut patterns = Vec::<Pattern>::new();
         let mut pattern_indices = HashMap::<u16, usize>::new();
@@ -2553,6 +2582,42 @@ impl FlpDocument {
                         ]));
                     }
                 }
+                0xDF => {
+                    if let Some(pattern_index) = current_pattern {
+                        if !event
+                            .payload
+                            .len()
+                            .is_multiple_of(FLP_PATTERN_CONTROLLER_RECORD_SIZE)
+                        {
+                            return Err(FlpError::InvalidEvent {
+                                offset: event.file_offset,
+                                detail: "pattern controller payload is not a whole number of 12-byte records",
+                            });
+                        }
+                        patterns[pattern_index].controllers.extend(
+                            event
+                                .payload
+                                .as_chunks::<FLP_PATTERN_CONTROLLER_RECORD_SIZE>()
+                                .0
+                                .iter()
+                                .map(|record| PatternController {
+                                    position: u32::from_le_bytes(
+                                        record[..4]
+                                            .try_into()
+                                            .expect("a Pattern controller position has four bytes"),
+                                    ),
+                                    reserved: [record[4], record[5]],
+                                    channel: record[6],
+                                    flags: record[7],
+                                    value_bits: u32::from_le_bytes(
+                                        record[8..12]
+                                            .try_into()
+                                            .expect("a Pattern controller value has four bytes"),
+                                    ),
+                                }),
+                        );
+                    }
+                }
                 0x94 if event.payload.len() == 4 => {
                     current_time_marker = current_pattern.map(|pattern_index| {
                         let marker_index = patterns[pattern_index].time_markers.len();
@@ -2610,6 +2675,85 @@ impl FlpDocument {
         }
         patterns.sort_by_key(|pattern| pattern.id);
         Ok(patterns)
+    }
+
+    /// Edits position or value in one raw Pattern controller record without changing its length.
+    /// Controller channel and flags bytes remain untouched because their target semantics are
+    /// still unknown.
+    pub fn edit_pattern_controller(
+        &mut self,
+        pattern_id: u16,
+        controller_index: usize,
+        edit: PatternControllerEdit,
+    ) -> Result<(), FlpError> {
+        if edit.value.is_some_and(|value| !value.is_finite()) {
+            return Err(FlpError::UnsupportedEdit(
+                "Pattern controller values must be finite",
+            ));
+        }
+        if edit.position.is_none() && edit.value.is_none() {
+            return Ok(());
+        }
+
+        let mut current_pattern = None;
+        let mut next_controller_index = 0usize;
+        let mut target = None;
+        for (event_index, event) in self.events.iter().enumerate() {
+            match event.opcode {
+                0x41 if event.payload.len() == 2 => {
+                    current_pattern =
+                        Some(u16::from_le_bytes([event.payload[0], event.payload[1]]));
+                }
+                0x40 | 0x62 | 0x63 => current_pattern = None,
+                0xDF if current_pattern == Some(pattern_id) => {
+                    if !event
+                        .payload
+                        .len()
+                        .is_multiple_of(FLP_PATTERN_CONTROLLER_RECORD_SIZE)
+                    {
+                        return Err(FlpError::InvalidEvent {
+                            offset: event.file_offset,
+                            detail: "pattern controller payload is not a whole number of 12-byte records",
+                        });
+                    }
+                    let count = event.payload.len() / FLP_PATTERN_CONTROLLER_RECORD_SIZE;
+                    if controller_index < next_controller_index.saturating_add(count) {
+                        let record_index = controller_index - next_controller_index;
+                        target = Some((
+                            event_index,
+                            record_index * FLP_PATTERN_CONTROLLER_RECORD_SIZE,
+                        ));
+                        break;
+                    }
+                    next_controller_index += count;
+                }
+                _ => {}
+            }
+        }
+        let Some((event_index, record_offset)) = target else {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested Pattern or controller index does not exist",
+            ));
+        };
+
+        let mut candidate = self.clone();
+        if let Some(position) = edit.position {
+            write_event_payload_bytes(
+                &mut candidate.events[event_index],
+                record_offset,
+                &position.to_le_bytes(),
+            )?;
+        }
+        if let Some(value) = edit.value {
+            write_event_payload_bytes(
+                &mut candidate.events[event_index],
+                record_offset + 8,
+                &value.to_bits().to_le_bytes(),
+            )?;
+        }
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
     }
 
     /// Sets or creates a time-signature marker within one Pattern.
@@ -10225,7 +10369,7 @@ fn write_event_payload_bytes(
     if event.payload.get(payload_offset..payload_end).is_none() {
         return Err(FlpError::InvalidEvent {
             offset: event.file_offset,
-            detail: "edited playlist field exceeds its source event",
+            detail: "edited field exceeds its source event",
         });
     }
     let prefix_length = match &event.encoding {
@@ -10233,7 +10377,7 @@ fn write_event_payload_bytes(
         _ => {
             return Err(FlpError::InvalidEvent {
                 offset: event.file_offset,
-                detail: "playlist clip event does not have a data payload",
+                detail: "event does not have a data payload",
             });
         }
     };
@@ -10247,7 +10391,7 @@ fn write_event_payload_bytes(
     if event.wire_bytes.get(wire_start..wire_end).is_none() {
         return Err(FlpError::InvalidEvent {
             offset: event.file_offset,
-            detail: "playlist clip wire bytes do not match the decoded payload",
+            detail: "event wire bytes do not match the decoded payload",
         });
     }
     event.payload[payload_offset..payload_end].copy_from_slice(bytes);
@@ -10915,10 +11059,10 @@ mod tests {
         ArticulateOptions, ChannelGroupSummary, ChannelNoteRouter, ChannelSortOrder,
         ChannelSummary, ClawMachineOptions, FlpDocument, FlpError, FlpEvent, FstPreset,
         FstPresetKind, LimitNoteOptions, LimitSnapDirection, MixerParameterKind,
-        PATTERN_NOTE_SLIDE_FLAG, PatternNote, PatternNoteEdit, PayloadEncoding, PlaylistClipEdit,
-        PlaylistClipTarget, PlaylistTrackEdit, ProjectInfoEdit, ProjectSettingsEdit,
-        RiffMachineOptions, RiffMachineQuantizeMode, ScaleLevelsOptions, TimeMarkerEdit,
-        midi::MidiChannelMapping, midi::MidiFile, parse_vst_plugin_state_metadata,
+        PATTERN_NOTE_SLIDE_FLAG, PatternControllerEdit, PatternNote, PatternNoteEdit,
+        PayloadEncoding, PlaylistClipEdit, PlaylistClipTarget, PlaylistTrackEdit, ProjectInfoEdit,
+        ProjectSettingsEdit, RiffMachineOptions, RiffMachineQuantizeMode, ScaleLevelsOptions,
+        TimeMarkerEdit, midi::MidiChannelMapping, midi::MidiFile, parse_vst_plugin_state_metadata,
         riff_machine_groove_note_timing,
     };
 
@@ -11140,6 +11284,22 @@ mod tests {
         }
         event_stream.extend_from_slice(trailing_event);
         flp_fixture(&event_stream, &[0xA1], &[0xB2])
+    }
+
+    fn pattern_controller_record(
+        position: u32,
+        reserved: [u8; 2],
+        channel: u8,
+        flags: u8,
+        value_bits: u32,
+    ) -> [u8; 12] {
+        let mut record = [0; 12];
+        record[..4].copy_from_slice(&position.to_le_bytes());
+        record[4..6].copy_from_slice(&reserved);
+        record[6] = channel;
+        record[7] = flags;
+        record[8..12].copy_from_slice(&value_bits.to_le_bytes());
+        record
     }
 
     fn adjacent_pattern_clip_fixture(
@@ -14126,6 +14286,100 @@ mod tests {
             }
         );
         assert_eq!(document.trailing_bytes(), &trailing);
+        assert_eq!(document.encode_lossless().unwrap(), input);
+    }
+
+    #[test]
+    fn pattern_controller_points_decode_edit_and_roundtrip_losslessly() {
+        let first = pattern_controller_record(120, [0xA5, 0x5A], 3, 0x91, 0x7FC0_0001);
+        let second = pattern_controller_record(480, [0xD3, 0x4C], 7, 0x2A, 0.25f32.to_bits());
+        let mut controller_payload = first.to_vec();
+        controller_payload.extend_from_slice(&second);
+        let mut controller_event = Vec::new();
+        append_data_event(&mut controller_event, 0xDF, &controller_payload);
+        let input = pattern_fixture(&[], &controller_event);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+
+        let pattern = &document.patterns().expect("patterns should decode")[0];
+        assert_eq!(pattern.controllers.len(), 2);
+        assert_eq!(pattern.controllers[0].position, 120);
+        assert_eq!(pattern.controllers[0].reserved, [0xA5, 0x5A]);
+        assert_eq!(pattern.controllers[0].channel, 3);
+        assert_eq!(pattern.controllers[0].flags, 0x91);
+        assert_eq!(pattern.controllers[0].value_bits, 0x7FC0_0001);
+        assert!(pattern.controllers[0].value().is_nan());
+        assert_eq!(pattern.controllers[1].value(), 0.25);
+        assert_eq!(document.encode_lossless().unwrap(), input);
+
+        document
+            .edit_pattern_controller(
+                7,
+                1,
+                PatternControllerEdit {
+                    position: Some(777),
+                    value: Some(0.75),
+                },
+            )
+            .expect("the selected controller point should be editable");
+        let pattern = &document.patterns().unwrap()[0];
+        assert_eq!(pattern.controllers[1].position, 777);
+        assert_eq!(pattern.controllers[1].reserved, [0xD3, 0x4C]);
+        assert_eq!(pattern.controllers[1].channel, 7);
+        assert_eq!(pattern.controllers[1].flags, 0x2A);
+        assert_eq!(pattern.controllers[1].value(), 0.75);
+        assert_eq!(pattern.controllers[0].value_bits, 0x7FC0_0001);
+
+        let encoded = document.encode_lossless().unwrap();
+        let reparsed = FlpDocument::parse(&encoded).expect("edited file should parse");
+        assert_eq!(reparsed.patterns().unwrap(), document.patterns().unwrap());
+        let edited_payload = reparsed
+            .events()
+            .iter()
+            .find(|event| event.opcode() == 0xDF)
+            .expect("controller event should remain")
+            .payload();
+        let mut expected_payload = first.to_vec();
+        let mut expected_second = second;
+        expected_second[..4].copy_from_slice(&777u32.to_le_bytes());
+        expected_second[8..12].copy_from_slice(&0.75f32.to_bits().to_le_bytes());
+        expected_payload.extend_from_slice(&expected_second);
+        assert_eq!(edited_payload, expected_payload);
+    }
+
+    #[test]
+    fn malformed_pattern_controller_payload_is_rejected() {
+        let mut controller_event = Vec::new();
+        append_data_event(&mut controller_event, 0xDF, &[0; 11]);
+        let input = pattern_fixture(&[], &controller_event);
+        let document = FlpDocument::parse(&input).expect("container fixture should parse");
+
+        assert!(matches!(
+            document.patterns(),
+            Err(FlpError::InvalidEvent { .. })
+        ));
+        assert_eq!(document.encode_lossless().unwrap(), input);
+    }
+
+    #[test]
+    fn pattern_controller_edit_rejects_non_finite_values_without_mutation() {
+        let record = pattern_controller_record(0, [0; 2], 0, 0, 0.5f32.to_bits());
+        let mut controller_event = Vec::new();
+        append_data_event(&mut controller_event, 0xDF, &record);
+        let input = pattern_fixture(&[], &controller_event);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+
+        assert!(
+            document
+                .edit_pattern_controller(
+                    7,
+                    0,
+                    PatternControllerEdit {
+                        value: Some(f32::INFINITY),
+                        ..PatternControllerEdit::default()
+                    },
+                )
+                .is_err()
+        );
         assert_eq!(document.encode_lossless().unwrap(), input);
     }
 

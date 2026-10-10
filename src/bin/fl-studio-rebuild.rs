@@ -21180,6 +21180,7 @@ mod tests {
             name: None,
             length_ticks: Some(96),
             notes: Vec::new(),
+            controllers: Vec::new(),
             time_markers: Vec::new(),
         };
         assert_eq!(
