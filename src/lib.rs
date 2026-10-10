@@ -8988,10 +8988,11 @@ mod tests {
     #[test]
     fn merges_selected_pattern_clips_into_the_uppermost_clip() {
         let mut document = merge_pattern_clips_fixture(false);
+        let arrangement_id = document.arrangements().unwrap()[0].id;
         let original_patterns = document.patterns().expect("source patterns should decode");
 
         let merged_clip_index = document
-            .merge_playlist_pattern_clips(9, &[0, 1])
+            .merge_playlist_pattern_clips(arrangement_id, &[0, 1])
             .expect("different Pattern Clip scores should merge");
 
         assert_eq!(merged_clip_index, 0);
@@ -9037,11 +9038,16 @@ mod tests {
     #[test]
     fn pattern_clip_merge_rejects_unmodeled_pattern_data_atomically() {
         let mut document = merge_pattern_clips_fixture(true);
+        let arrangement_id = document.arrangements().unwrap()[0].id;
         let original = document
             .encode_lossless()
             .expect("the original project should encode");
 
-        assert!(document.merge_playlist_pattern_clips(9, &[0, 1]).is_err());
+        assert!(
+            document
+                .merge_playlist_pattern_clips(arrangement_id, &[0, 1])
+                .is_err()
+        );
         assert_eq!(
             document
                 .encode_lossless()
