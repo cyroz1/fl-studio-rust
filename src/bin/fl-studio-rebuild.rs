@@ -598,6 +598,15 @@ impl PianoRollEventTarget {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PianoRollEventEditorGeometry {
+    ppq: u16,
+    tick_scale: f32,
+    keyboard_width: f32,
+    horizontal_scroll: f32,
+    snap_ticks: u32,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PianoRollEditScope {
     Automatic,
@@ -15853,11 +15862,13 @@ impl DawUi {
             self.draw_piano_roll_event_editor(
                 ui,
                 pattern,
-                ppq,
-                tick_scale,
-                keyboard_width,
-                scroll_output.state.offset.x,
-                snap_ticks,
+                PianoRollEventEditorGeometry {
+                    ppq,
+                    tick_scale,
+                    keyboard_width,
+                    horizontal_scroll: scroll_output.state.offset.x,
+                    snap_ticks,
+                },
             );
         }
         if !ui.input(|input| input.pointer.primary_down()) {
@@ -15911,22 +15922,10 @@ impl DawUi {
         &mut self,
         ui: &mut egui::Ui,
         pattern: &Pattern,
-        ppq: u16,
-        tick_scale: f32,
-        keyboard_width: f32,
-        horizontal_scroll: f32,
-        snap_ticks: u32,
+        geometry: PianoRollEventEditorGeometry,
     ) {
         if self.piano_roll_event_target == PianoRollEventTarget::RawControllers {
-            self.draw_piano_roll_controller_event_editor(
-                ui,
-                pattern,
-                ppq,
-                tick_scale,
-                keyboard_width,
-                horizontal_scroll,
-                snap_ticks,
-            );
+            self.draw_piano_roll_controller_event_editor(ui, pattern, geometry);
             return;
         }
 
@@ -15937,7 +15936,7 @@ impl DawUi {
         let size = Vec2::new(ui.available_width().max(1.0), 102.0);
         let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
         let plot_rect = egui::Rect::from_min_max(
-            egui::pos2(rect.left() + keyboard_width, rect.top() + 8.0),
+            egui::pos2(rect.left() + geometry.keyboard_width, rect.top() + 8.0),
             egui::pos2(rect.right(), rect.bottom() - 8.0),
         );
         let painter = ui.painter_at(rect);
@@ -15969,12 +15968,13 @@ impl DawUi {
             ],
             Stroke::new(1.0, GRID),
         );
-        let measure_ticks = u32::from(ppq).saturating_mul(4).max(1);
-        let measure_width = measure_ticks as f32 * tick_scale;
+        let measure_ticks = u32::from(geometry.ppq).saturating_mul(4).max(1);
+        let measure_width = measure_ticks as f32 * geometry.tick_scale;
         if measure_width > 0.0 {
             let measure_count = (rect.width() / measure_width).ceil() as u32 + 2;
             for measure in 0..measure_count {
-                let x = plot_rect.left() + measure as f32 * measure_width - horizontal_scroll;
+                let x =
+                    plot_rect.left() + measure as f32 * measure_width - geometry.horizontal_scroll;
                 if x >= plot_rect.left() && x <= plot_rect.right() {
                     painter.line_segment(
                         [egui::pos2(x, plot_rect.top()), egui::pos2(x, baseline)],
@@ -15998,8 +15998,9 @@ impl DawUi {
             let occurrence = same_onset_count.entry(note.position).or_default();
             let stagger = (*occurrence as f32 * 4.0).min(28.0);
             *occurrence = occurrence.saturating_add(1);
-            let x =
-                plot_rect.left() + note.position as f32 * tick_scale - horizontal_scroll + stagger;
+            let x = plot_rect.left() + note.position as f32 * geometry.tick_scale
+                - geometry.horizontal_scroll
+                + stagger;
             if x < plot_rect.left() - 8.0 || x > plot_rect.right() + 8.0 {
                 continue;
             }
@@ -16063,11 +16064,7 @@ impl DawUi {
         &mut self,
         ui: &mut egui::Ui,
         pattern: &Pattern,
-        ppq: u16,
-        tick_scale: f32,
-        keyboard_width: f32,
-        horizontal_scroll: f32,
-        snap_ticks: u32,
+        geometry: PianoRollEventEditorGeometry,
     ) {
         let streams = pattern
             .controllers
@@ -16111,7 +16108,7 @@ impl DawUi {
         let size = Vec2::new(ui.available_width().max(1.0), 116.0);
         let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
         let plot_rect = egui::Rect::from_min_max(
-            egui::pos2(rect.left() + keyboard_width, rect.top() + 8.0),
+            egui::pos2(rect.left() + geometry.keyboard_width, rect.top() + 8.0),
             egui::pos2(rect.right(), rect.bottom() - 8.0),
         );
         let painter = ui.painter_at(rect);
@@ -16184,12 +16181,13 @@ impl DawUi {
             );
         }
 
-        let measure_ticks = u32::from(ppq).saturating_mul(4).max(1);
-        let measure_width = measure_ticks as f32 * tick_scale;
+        let measure_ticks = u32::from(geometry.ppq).saturating_mul(4).max(1);
+        let measure_width = measure_ticks as f32 * geometry.tick_scale;
         if measure_width > 0.0 {
             let measure_count = (rect.width() / measure_width).ceil() as u32 + 2;
             for measure in 0..measure_count {
-                let x = plot_rect.left() + measure as f32 * measure_width - horizontal_scroll;
+                let x =
+                    plot_rect.left() + measure as f32 * measure_width - geometry.horizontal_scroll;
                 if x >= plot_rect.left() && x <= plot_rect.right() {
                     painter.line_segment(
                         [egui::pos2(x, plot_rect.top()), egui::pos2(x, baseline)],
@@ -16213,7 +16211,8 @@ impl DawUi {
             } else {
                 0.5
             };
-            let x = plot_rect.left() + controller.position as f32 * tick_scale - horizontal_scroll
+            let x = plot_rect.left() + controller.position as f32 * geometry.tick_scale
+                - geometry.horizontal_scroll
                 + stagger;
             if x < plot_rect.left() - 10.0 || x > plot_rect.right() + 10.0 {
                 continue;
@@ -16258,34 +16257,33 @@ impl DawUi {
             {
                 let timeline_x = (pointer.x.clamp(plot_rect.left(), plot_rect.right())
                     - plot_rect.left()
-                    + horizontal_scroll
+                    + geometry.horizontal_scroll
                     - stagger)
-                    / tick_scale.max(0.001);
+                    / geometry.tick_scale.max(0.001);
                 let position = snap_note_tick(
                     timeline_x.round().clamp(0.0, u32::MAX as f32) as i64,
-                    snap_ticks,
+                    geometry.snap_ticks,
                     0,
                 );
                 let normalized = ((baseline - pointer.y) / plot_rect.height()).clamp(0.0, 1.0);
                 let value = piano_roll_controller_value_at(normalized, minimum, maximum);
-                if position != controller.position || value.to_bits() != controller.value_bits {
-                    if let Some(document) = &mut self.document {
-                        match document.edit_pattern_controller(
-                            pattern.id,
-                            controller_index,
-                            PatternControllerEdit {
-                                position: (position != controller.position).then_some(position),
-                                value: (value.to_bits() != controller.value_bits).then_some(value),
-                            },
-                        ) {
-                            Ok(()) => {
-                                self.dirty = true;
-                                self.status = "Updated raw Pattern controller point".to_owned();
-                            }
-                            Err(error) => {
-                                self.status =
-                                    format!("Could not update Pattern controller: {error}");
-                            }
+                if (position != controller.position || value.to_bits() != controller.value_bits)
+                    && let Some(document) = &mut self.document
+                {
+                    match document.edit_pattern_controller(
+                        pattern.id,
+                        controller_index,
+                        PatternControllerEdit {
+                            position: (position != controller.position).then_some(position),
+                            value: (value.to_bits() != controller.value_bits).then_some(value),
+                        },
+                    ) {
+                        Ok(()) => {
+                            self.dirty = true;
+                            self.status = "Updated raw Pattern controller point".to_owned();
+                        }
+                        Err(error) => {
+                            self.status = format!("Could not update Pattern controller: {error}");
                         }
                     }
                 }
