@@ -2398,31 +2398,13 @@ impl<'a> SamplerVoiceEngine<'a> {
         release_frames: usize,
         output_sample_rate: u32,
     ) -> Self {
-        Self::with_resampling_quality(
-            sources_by_channel,
-            notes,
-            voice_limit,
-            release_frames,
-            output_sample_rate,
-            ResamplingQuality::Linear,
-        )
-    }
-
-    fn with_resampling_quality(
-        sources_by_channel: &'a HashMap<u16, SamplerVoiceSource>,
-        notes: &'a [ScheduledSamplerNote],
-        voice_limit: usize,
-        release_frames: usize,
-        output_sample_rate: u32,
-        resampling_quality: ResamplingQuality,
-    ) -> Self {
         Self::with_resampling_quality_and_pan_law(
             sources_by_channel,
             notes,
             voice_limit,
             release_frames,
             output_sample_rate,
-            resampling_quality,
+            ResamplingQuality::Linear,
             PanLaw::Circular,
         )
     }
