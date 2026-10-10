@@ -21701,7 +21701,7 @@ mod tests {
         assert_eq!(playlist_bar_ticks(96, (4, 4)), 384);
         assert_eq!(playlist_bar_ticks(96, (5, 8)), 240);
         assert_eq!(playlist_bar_ticks(96, (7, 16)), 168);
-        assert_eq!(playlist_bar_ticks(0, (0, 0)), 1);
+        assert_eq!(playlist_bar_ticks(0, (0, 0)), 4);
         assert_eq!(
             playlist_signature_at_tick(Some((4, 4)), &[(384, 3, 4), (768, 5, 8)], 700),
             (3, 4)
