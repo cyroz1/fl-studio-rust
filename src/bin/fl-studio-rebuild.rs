@@ -21728,9 +21728,10 @@ mod tests {
         piano_roll_controller_value_range, piano_roll_note_group_members,
         playlist_audio_clip_join_candidates, playlist_bar_ticks, playlist_clip_drag_edit,
         playlist_clip_local_recording_offset, playlist_clip_split_position,
-        playlist_measure_boundaries, playlist_pattern_clip_join_candidates,
-        playlist_seek_tick_to_frame, playlist_signature_at_tick, playlist_song_position_label,
-        playlist_track_group_range, snap_note_tick, toggle_piano_roll_note_group_selection,
+        playlist_group_parent_ids, playlist_measure_boundaries,
+        playlist_pattern_clip_join_candidates, playlist_seek_tick_to_frame,
+        playlist_signature_at_tick, playlist_song_position_label, playlist_track_group_range,
+        playlist_track_is_hidden, snap_note_tick, toggle_piano_roll_note_group_selection,
         update_channel_rack_selection, update_layer_child_selection,
         update_piano_roll_box_selection,
     };
