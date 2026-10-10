@@ -4350,7 +4350,8 @@ impl FlpDocument {
         record[8..12].copy_from_slice(&length_ticks.to_le_bytes());
         record[12..14].copy_from_slice(&raw_track_index.to_le_bytes());
         if record_size >= 60 {
-            record[32..36].copy_from_slice(&next_playlist_clip_id(arrangement)?.to_le_bytes());
+            record[32..36]
+                .copy_from_slice(&next_playlist_clip_id(arrangement, None)?.to_le_bytes());
         }
 
         let mut candidate = self.clone();
@@ -4477,7 +4478,8 @@ impl FlpDocument {
         record[8..12].copy_from_slice(&length_ticks.to_le_bytes());
         record[12..14].copy_from_slice(&raw_track_index.to_le_bytes());
         if record_size >= 60 {
-            record[32..36].copy_from_slice(&next_playlist_clip_id(arrangement)?.to_le_bytes());
+            record[32..36]
+                .copy_from_slice(&next_playlist_clip_id(arrangement, None)?.to_le_bytes());
         }
 
         let mut candidate = self.clone();
@@ -4605,7 +4607,8 @@ impl FlpDocument {
         })
     }
 
-    /// Pastes a copied clip record into an arrangement, changing only its position and track.
+    /// Pastes a copied clip record into an arrangement, updating its position, track, and clip ID
+    /// when present. A paste into an empty arrangement can reuse the copied ID.
     /// The complete record is appended to the arrangement's final clip event, or a new clip event
     /// is created at the end of the arrangement when it has no clip event yet.
     pub fn paste_playlist_clip(
@@ -4689,6 +4692,12 @@ impl FlpDocument {
         let mut record = clipboard.raw_record.clone();
         record[0..4].copy_from_slice(&position_ticks.to_le_bytes());
         record[12..14].copy_from_slice(&raw_track_index.to_le_bytes());
+        if record_size >= 60 {
+            let preferred_id = u32::from_le_bytes(record[32..36].try_into().unwrap());
+            record[32..36].copy_from_slice(
+                &next_playlist_clip_id(arrangement, Some(preferred_id))?.to_le_bytes(),
+            );
+        }
 
         let mut candidate = self.clone();
         if let Some(event_index) = target_event_index {
@@ -4732,8 +4741,9 @@ impl FlpDocument {
         Ok(insertion_clip_index)
     }
 
-    /// Duplicates one clip's complete stored record into the same Playlist event.
-    /// The duplicate is inserted immediately after the source record.
+    /// Duplicates one clip's complete stored record into the same Playlist event, assigning a new
+    /// ID when the record layout contains one. The duplicate is inserted immediately after the
+    /// source record.
     pub fn duplicate_playlist_clip(
         &mut self,
         arrangement_id: u16,
@@ -4792,6 +4802,10 @@ impl FlpDocument {
         if let Some(raw_track_index) = raw_track_index {
             duplicate[12..14].copy_from_slice(&raw_track_index.to_le_bytes());
         }
+        if record_size >= 60 {
+            duplicate[32..36]
+                .copy_from_slice(&next_playlist_clip_id(arrangement, None)?.to_le_bytes());
+        }
         let mut payload = event.payload.clone();
         payload.splice(record_end..record_end, duplicate);
         self.events[event_index].replace_data_payload(payload)?;
@@ -4802,7 +4816,8 @@ impl FlpDocument {
     /// Splits one un-stretched Audio Clip at a Playlist tick while preserving its source window.
     /// The clip is split only when its source offsets can be mapped linearly to timeline time.
     /// `full_source_length_ms` is needed only for clips whose two offsets are the `-1` sentinel.
-    /// The right-hand clip is inserted immediately after the source record.
+    /// The right-hand clip gets a new ID when the record layout contains one and is inserted
+    /// immediately after the source record.
     pub fn split_playlist_audio_clip(
         &mut self,
         arrangement_id: u16,
@@ -4971,6 +4986,10 @@ impl FlpDocument {
         right_record[8..12].copy_from_slice(&right_length.to_le_bytes());
         right_record[24..28].copy_from_slice(&split_source_ms.to_le_bytes());
         right_record[28..32].copy_from_slice(&source_end_ms.to_le_bytes());
+        if record_size >= 60 {
+            right_record[32..36]
+                .copy_from_slice(&next_playlist_clip_id(arrangement, None)?.to_le_bytes());
+        }
 
         let mut candidate = self.clone();
         let mut payload = event.payload.clone();
@@ -4987,7 +5006,7 @@ impl FlpDocument {
 
     /// Joins two contiguous, un-stretched Audio Clips that play adjacent source windows.
     /// The left record is kept and extended; the right record is removed. Both clips must be
-    /// in the same Playlist data event and have matching opaque clip fields.
+    /// in the same Playlist data event and have matching opaque clip fields, excluding their IDs.
     pub fn join_adjacent_playlist_audio_clips(
         &mut self,
         arrangement_id: u16,
@@ -5074,7 +5093,6 @@ impl FlpDocument {
             || left_clip.unknown_word != right_clip.unknown_word
             || left_clip.item_flags != right_clip.item_flags
             || left_clip.header_bytes != right_clip.header_bytes
-            || left_clip.clip_id != right_clip.clip_id
             || left_clip.reserved != right_clip.reserved
             || left_clip.scale != right_clip.scale
             || left_clip.trailing_bytes != right_clip.trailing_bytes
@@ -5211,7 +5229,8 @@ impl FlpDocument {
 
     /// Joins adjacent Pattern Clips that repeat the same pattern without changing its playback.
     /// The left record is kept and extended; the right record is removed. The left clip length
-    /// must end on a pattern repeat boundary, and notes may not cross that boundary.
+    /// must end on a pattern repeat boundary, and notes may not cross that boundary. Clip IDs
+    /// may differ and the left clip's ID is kept.
     pub fn join_adjacent_playlist_pattern_clips(
         &mut self,
         arrangement_id: u16,
@@ -5286,7 +5305,6 @@ impl FlpDocument {
             || left_clip.header_bytes != right_clip.header_bytes
             || left_clip.start_offset.to_bits() != right_clip.start_offset.to_bits()
             || left_clip.end_offset.to_bits() != right_clip.end_offset.to_bits()
-            || left_clip.clip_id != right_clip.clip_id
             || left_clip.reserved != right_clip.reserved
             || left_clip.scale.map(f64::to_bits) != right_clip.scale.map(f64::to_bits)
             || left_clip.trailing_bytes != right_clip.trailing_bytes
@@ -10546,16 +10564,27 @@ fn validate_automation_point_tension(tension: f32) -> Result<(), FlpError> {
     Ok(())
 }
 
-fn next_playlist_clip_id(arrangement: &Arrangement) -> Result<u32, FlpError> {
-    arrangement
+fn next_playlist_clip_id(
+    arrangement: &Arrangement,
+    preferred_id: Option<u32>,
+) -> Result<u32, FlpError> {
+    let used_ids = arrangement
         .clips
         .iter()
         .filter_map(|clip| clip.clip_id)
+        .collect::<HashSet<_>>();
+    if let Some(next_id) = used_ids
+        .iter()
         .max()
-        .ok_or(FlpError::UnsupportedEdit(
-            "the arrangement has no recognized Playlist clip ID to use as a template",
-        ))?
-        .checked_add(1)
+        .and_then(|clip_id| clip_id.checked_add(1))
+    {
+        return Ok(next_id);
+    }
+    if let Some(preferred_id) = preferred_id.filter(|clip_id| !used_ids.contains(clip_id)) {
+        return Ok(preferred_id);
+    }
+    (0..=u32::MAX)
+        .find(|clip_id| !used_ids.contains(clip_id))
         .ok_or(FlpError::LengthOverflow)
 }
 
@@ -11573,11 +11602,13 @@ mod tests {
         left_clip[6..8].copy_from_slice(&0x5007u16.to_le_bytes());
         left_clip[8..12].copy_from_slice(&left_length_ticks.to_le_bytes());
         left_clip[12..14].copy_from_slice(&499u16.to_le_bytes());
+        left_clip[32..36].copy_from_slice(&1u32.to_le_bytes());
         left_clip[28..32].copy_from_slice(&1.0f32.to_le_bytes());
         left_clip[64..72].copy_from_slice(&1.0f64.to_le_bytes());
         let mut right_clip = left_clip;
         right_clip[..4].copy_from_slice(&left_length_ticks.to_le_bytes());
         right_clip[8..12].copy_from_slice(&right_length_ticks.to_le_bytes());
+        right_clip[32..36].copy_from_slice(&2u32.to_le_bytes());
         let mut clip_payload = left_clip.to_vec();
         clip_payload.extend_from_slice(&right_clip);
 
@@ -12606,6 +12637,36 @@ mod tests {
     }
 
     #[test]
+    fn playlist_clip_duplicate_and_paste_assign_unique_clip_ids() {
+        let mut duplicate_document = audio_clip_fixture();
+        duplicate_document
+            .duplicate_playlist_clip(3, 1, Some(3_840), Some(495))
+            .expect("the Audio Clip should duplicate");
+        let duplicate_arrangements = duplicate_document.arrangements().unwrap();
+        let duplicate_arrangement = &duplicate_arrangements[0];
+        assert_eq!(duplicate_arrangement.clips[1].clip_id, Some(2));
+        assert_eq!(duplicate_arrangement.clips[2].clip_id, Some(3));
+        assert_eq!(duplicate_arrangement.clips[2].position_ticks, 3_840);
+        assert_eq!(duplicate_arrangement.clips[2].track_index, Some(4));
+
+        let mut paste_document = audio_clip_fixture();
+        let clipboard = paste_document
+            .copy_playlist_clip(3, 1)
+            .expect("the Audio Clip should copy");
+        paste_document
+            .paste_playlist_clip(3, &clipboard, 3_840, 495)
+            .expect("the copied Audio Clip should paste");
+        let pasted_arrangements = paste_document.arrangements().unwrap();
+        let pasted_arrangement = &pasted_arrangements[0];
+        assert_eq!(pasted_arrangement.clips[1].clip_id, Some(2));
+        assert_eq!(pasted_arrangement.clips[2].clip_id, Some(3));
+        assert_eq!(
+            pasted_arrangement.clips[2].target(),
+            PlaylistClipTarget::Channel { id: 9 }
+        );
+    }
+
+    #[test]
     fn rejects_playlist_audio_clip_creation_for_invalid_channels_or_length_atomically() {
         let input = audio_clip_fixture().encode_lossless().unwrap();
         let mut document = FlpDocument::parse(&input).expect("fixture should parse");
@@ -12720,6 +12781,7 @@ mod tests {
         clip[6..8].copy_from_slice(&9u16.to_le_bytes());
         clip[8..12].copy_from_slice(&240u32.to_le_bytes());
         clip[12..14].copy_from_slice(&499u16.to_le_bytes());
+        clip[32..36].copy_from_slice(&1u32.to_le_bytes());
         clip[20..24].copy_from_slice(&[0x40, 0x64, 0x80, 0x80]);
         clip[24..28].copy_from_slice(&0.0f32.to_le_bytes());
         clip[28..32].copy_from_slice(&1_000.0f32.to_le_bytes());
@@ -12741,6 +12803,8 @@ mod tests {
         assert_eq!(clips[0].length_ticks, 96);
         assert_eq!(clips[1].position_ticks, 96);
         assert_eq!(clips[1].length_ticks, 144);
+        assert_eq!(clips[0].clip_id, Some(1));
+        assert_eq!(clips[1].clip_id, Some(2));
         assert_eq!(clips[0].start_offset, 0.0);
         assert_eq!(clips[1].end_offset, 1_000.0);
         assert!((clips[0].end_offset - 428.57144).abs() < 0.001);
@@ -12753,6 +12817,7 @@ mod tests {
         expected_right[0..4].copy_from_slice(&96u32.to_le_bytes());
         expected_right[8..12].copy_from_slice(&144u32.to_le_bytes());
         expected_right[24..28].copy_from_slice(&clips[0].end_offset.to_le_bytes());
+        expected_right[32..36].copy_from_slice(&2u32.to_le_bytes());
         let clip_event = document
             .events()
             .iter()
@@ -12832,6 +12897,7 @@ mod tests {
             arrangements[0].clips[0].target(),
             PlaylistClipTarget::Pattern { id: 7 }
         );
+        assert_eq!(arrangements[0].clips[0].clip_id, Some(1));
 
         let clip_event = document
             .events()
@@ -13152,6 +13218,12 @@ mod tests {
         assert_eq!(pasted.raw_track_index, 495);
         assert_eq!(pasted.track_index, Some(4));
         assert_eq!(pasted.target(), PlaylistClipTarget::Pattern { id: 7 });
+        assert_eq!(
+            pasted.clip_id,
+            Some(u32::from_le_bytes(
+                source_record[32..36].try_into().unwrap()
+            ))
+        );
 
         let mut expected_record = source_record;
         expected_record[0..4].copy_from_slice(&3_840u32.to_le_bytes());
