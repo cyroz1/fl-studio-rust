@@ -418,7 +418,7 @@ fn encode_flp_vst3_state_snapshot(nested: &[u8]) -> Result<Vec<u8>, String> {
         let data_end = header_end
             .checked_add(length)
             .ok_or_else(|| "FLP VST3 state record length overflow".to_owned())?;
-        nested
+        let data = nested
             .get(header_end..data_end)
             .ok_or_else(|| "truncated FLP VST3 state record data".to_owned())?;
         match id {
@@ -557,7 +557,7 @@ fn replace_flp_vst3_state_snapshot(nested: &[u8], snapshot: &[u8]) -> Result<Vec
         let data_end = header_end
             .checked_add(length)
             .ok_or_else(|| "FLP VST3 state record length overflow".to_owned())?;
-        let data = nested
+        nested
             .get(header_end..data_end)
             .ok_or_else(|| "truncated FLP VST3 state record data".to_owned())?;
         match id {
