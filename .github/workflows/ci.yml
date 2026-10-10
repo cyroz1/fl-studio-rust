@@ -253,6 +253,51 @@ jobs:
           xcrun stapler validate "$app_path"
           spctl --assess --type execute --verbose=4 "$app_path"
 
+      - name: Launch and capture native macOS GUI
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          app_path="$(find dist -maxdepth 1 -type d -name '*.app' -print -quit)"
+          if [[ -z "$app_path" ]]; then
+            echo "::error::Cargo Packager did not produce a macOS app bundle."
+            exit 1
+          fi
+          app_executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app_path/Contents/Info.plist")"
+          app_binary="$app_path/Contents/MacOS/$app_executable"
+          if [[ ! -x "$app_binary" ]]; then
+            echo "::error::The macOS app bundle executable is missing or not executable."
+            exit 1
+          fi
+
+          preview_dir="dist/macos-gui-preview"
+          mkdir -p "$preview_dir"
+          app_pid=""
+          cleanup() {
+            if [[ -n "$app_pid" ]]; then
+              kill "$app_pid" 2>/dev/null || true
+            fi
+          }
+          trap cleanup EXIT
+          open -a "$app_path"
+          for attempt in $(seq 1 30); do
+            app_pid="$(pgrep -f "$app_binary" | head -n 1 || true)"
+            if [[ -n "$app_pid" ]]; then
+              break
+            fi
+            sleep 1
+          done
+          if [[ -z "$app_pid" ]]; then
+            echo "::error::The packaged macOS app did not stay running after launch."
+            exit 1
+          fi
+          sleep 3
+          if screencapture -x "$preview_dir/startup.png" && [[ -s "$preview_dir/startup.png" ]]; then
+            echo "Captured the native macOS startup window."
+          else
+            echo "::warning::The macOS app launched, but the runner could not capture its screen."
+            rm -f "$preview_dir/startup.png"
+          fi
+
       - name: Upload Linux and Windows installers
         if: runner.os != 'macOS'
         uses: actions/upload-artifact@v4
@@ -278,6 +323,15 @@ jobs:
           name: macos-unsigned-gui-preview
           path: dist/fl-studio-rebuild-macos-unsigned-preview.zip
           if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload native macOS screenshot
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-native-gui-preview
+          path: dist/macos-gui-preview/startup.png
+          if-no-files-found: warn
           retention-days: 14
 
       - name: Remove temporary macOS signing files
