@@ -910,6 +910,7 @@ impl AudioEngine {
             let worker_playback = Arc::clone(&playback);
             let worker_ring = Arc::clone(&ring);
             let worker_peak = Arc::clone(&input_peak);
+            let worker_recording = Arc::clone(&input_recording);
             let worker_error = Arc::clone(&error);
             let worker_stop = Arc::clone(&stop);
             let output_thread = thread::Builder::new()
@@ -923,7 +924,7 @@ impl AudioEngine {
                             playback: worker_playback,
                             ring: worker_ring,
                             input_peak: worker_peak,
-                            input_recording: Arc::clone(&input_recording),
+                            input_recording: worker_recording,
                             error: worker_error,
                             stop: worker_stop,
                         },
@@ -953,6 +954,7 @@ impl AudioEngine {
             let worker_peak = Arc::clone(&input_peak);
             let worker_source = Arc::clone(&source);
             let worker_playback = Arc::clone(&playback);
+            let worker_recording = Arc::clone(&input_recording);
             let worker_error = Arc::clone(&error);
             let worker_stop = Arc::clone(&stop);
             let input_thread = thread::Builder::new()
@@ -966,7 +968,7 @@ impl AudioEngine {
                             playback: worker_playback,
                             ring: worker_ring,
                             input_peak: worker_peak,
-                            input_recording: Arc::clone(&input_recording),
+                            input_recording: worker_recording,
                             error: worker_error,
                             stop: worker_stop,
                         },
