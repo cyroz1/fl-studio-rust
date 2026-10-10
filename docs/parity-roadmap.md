@@ -11,6 +11,7 @@ Status legend:
 - `[partial]` — started; works for a subset of cases
 - `[todo]` — not started
 - `[obsolete]` — removed from current FL Studio; not a current parity target
+- `[not supported by FL Studio]` — no equivalent behavior exists in the native application
 
 > Scope note: this covers the desktop DAW. FL Cloud, FL Studio Mobile, and
 > online services are explicitly out of scope (see Non-goals).
@@ -48,7 +49,7 @@ The foundation. Everything else depends on reading projects exactly.
 | `.fst` state preset reading (envelope level) | `[partial]` | Accepted by the lossless chunk/event reader. Browser details expand decoded channel names/kinds/plug-in IDs/sample paths, recognized plug-in identity and state-byte metadata, raw Mixer insert fields, and automation point counts. Plug-in payload contents remain opaque. |
 | `.fst` generator vs effect vs mixer-state variants | `[partial]` | `FstPreset` classifies header formats 32 (channel), 48 (native plug-in), 49 (VST generator), 50 (VST effect), and 64 (Mixer insert); format 24 is identified as automation state. `preset-info` reports the kind and decoded event/channel/insert counts while preserving the complete source stream. Applying presets to hosted plug-ins, interpreting opaque state payloads, and native FL Studio comparison remain outstanding. |
 | Zipped project packages (`.zip` with bundled samples) | `[partial]` | The desktop app opens standard ZIP packages, prefers a root-level FLP when present, extracts regular files into a temporary workspace for relative sample lookup, and writes edits back while retaining the other files. ZIP saves copy resolvable Sampler and audio-channel sample references into `Samples/`, rewrite those channel paths to package-relative references, and report unresolved paths. Plugin-internal samples and archive metadata, encrypted entries, and native FL Studio validation remain outstanding. |
-| `.flp` "save as" version targeting | `[todo]` | Writing files older FL versions can open |
+| `.flp` "save as" version targeting | `[not supported by FL Studio]` | Image-Line says projects saved by newer FL Studio versions do not open in older releases. Native “Save new version” creates sequential backup filenames; it does not convert the project to an older format. Do not rewrite the version header to claim backward compatibility ([Image-Line compatibility FAQ](https://support.image-line.com/action/knowledgebase?ans=516), [File menu manual](https://www.image-line.com/fl-studio-learning/fl-studio-online-manual/html/menu_file.htm)). |
 
 ### 1.3 MIDI files
 
