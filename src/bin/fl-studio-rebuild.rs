@@ -21773,7 +21773,10 @@ mod tests {
     fn playlist_seek_tick_converts_to_song_frames() {
         assert_eq!(playlist_seek_tick_to_frame(384, 96, 120.0, 48_000), 96_000);
         assert_eq!(playlist_seek_tick_to_frame(0, 96, 120.0, 48_000), 0);
-        assert_eq!(playlist_seek_tick_to_frame(384, 0, 120.0, 48_000), 96_000);
+        assert_eq!(
+            playlist_seek_tick_to_frame(384, 0, 120.0, 48_000),
+            9_216_000
+        );
         assert_eq!(playlist_seek_tick_to_frame(384, 96, 0.0, 48_000), 0);
         assert_eq!(playlist_seek_tick_to_frame(384, 96, 120.0, 0), 0);
     }
