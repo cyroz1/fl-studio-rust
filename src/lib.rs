@@ -1528,6 +1528,15 @@ impl MixerParameterRecord {
         ((self.channel_data >> 6) & 0x7F) as u8
     }
 
+    /// Corpus-derived insert ordinal candidate for this target index.
+    ///
+    /// Across the inspected named Mixer inserts, target 64 corresponded to the first
+    /// insert and subsequent targets advanced in order. Projects with missing or
+    /// ambiguous parameter records still require a separate mapping check.
+    pub fn candidate_insert_ordinal(&self) -> Option<usize> {
+        self.target_index().checked_sub(64).map(usize::from)
+    }
+
     /// Candidate slot index extracted from bits 0–5 of `channel_data`.
     pub fn slot_index(&self) -> u8 {
         (self.channel_data & 0x3F) as u8
@@ -12852,6 +12861,9 @@ mod tests {
         payload.extend_from_slice(&[0x11, 0x22, 0x33, 0x44, 193, 7]);
         payload.extend_from_slice(&0x4567_u16.to_le_bytes());
         payload.extend_from_slice(&(-6400_i32).to_le_bytes());
+        payload.extend_from_slice(&[0x55, 0x66, 0x77, 0x88, 192, 0]);
+        payload.extend_from_slice(&(64_u16 << 6).to_le_bytes());
+        payload.extend_from_slice(&12_800_i32.to_le_bytes());
         let mut event_stream = Vec::new();
         append_data_event(&mut event_stream, 0xE1, &payload);
         let document = FlpDocument::parse(&flp_fixture(&event_stream, &[], &[]))
@@ -12860,7 +12872,7 @@ mod tests {
         let records = document
             .mixer_parameter_records()
             .expect("12-byte records should decode");
-        assert_eq!(records.len(), 2);
+        assert_eq!(records.len(), 3);
         assert_eq!(records[0].prefix(), [0xAA, 0xBB, 0xCC, 0xDD]);
         assert_eq!(records[0].parameter_id(), 192);
         assert_eq!(records[0].kind(), MixerParameterKind::Volume);
@@ -12878,6 +12890,8 @@ mod tests {
         assert_eq!(records[1].slot_index(), 0x27);
         assert_eq!(records[1].target_scope_raw(), 2);
         assert_eq!(records[1].value(), -6400);
+        assert_eq!(records[2].target_index(), 64);
+        assert_eq!(records[2].candidate_insert_ordinal(), Some(0));
 
         let mut malformed_stream = Vec::new();
         append_data_event(&mut malformed_stream, 0xE1, &[0xAA]);

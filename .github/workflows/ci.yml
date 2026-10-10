@@ -142,6 +142,67 @@ jobs:
           sleep 1
           ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
             -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/audio-settings.png"
+
+          kill "$app_pid" 2>/dev/null || true
+          wait "$app_pid" 2>/dev/null || true
+          app_pid=""
+          python3 - "$RUNNER_TEMP/mixer-preview.flp" <<'PY'
+          import struct
+          import sys
+          from pathlib import Path
+
+          def data_event(opcode, payload):
+              size = len(payload)
+              encoded_size = bytearray()
+              while size >= 0x80:
+                  encoded_size.append((size & 0x7F) | 0x80)
+                  size >>= 7
+              encoded_size.append(size)
+              return bytes([opcode]) + bytes(encoded_size) + payload
+
+          def dword_event(opcode, value):
+              return bytes([opcode]) + struct.pack("<i", value)
+
+          target = 64 << 6
+          parameters = (
+              bytes([0xAA, 0xBB, 0xCC, 0xDD, 192, 0])
+              + struct.pack("<H", target)
+              + struct.pack("<i", 12800)
+              + bytes([0x11, 0x22, 0x33, 0x44, 193, 0])
+              + struct.pack("<H", target)
+              + struct.pack("<i", 0)
+          )
+          event_stream = (
+              dword_event(0x9A, -1)
+              + dword_event(0x93, 0)
+              + dword_event(0x95, 0x006A8DCE)
+              + data_event(0xCC, b"Drum Bus\0")
+              + data_event(0xE1, parameters)
+          )
+          project = (
+              b"FLhd"
+              + struct.pack("<IHHH", 6, 0, 0, 96)
+              + b"FLdt"
+              + struct.pack("<I", len(event_stream))
+              + event_stream
+          )
+          Path(sys.argv[1]).write_bytes(project)
+          PY
+
+          target/release/fl-studio-rebuild "$RUNNER_TEMP/mixer-preview.flp" \
+            > "$RUNNER_TEMP/mixer-preview.log" 2>&1 &
+          app_pid=$!
+          for attempt in $(seq 1 10); do
+            if ! kill -0 "$app_pid" 2>/dev/null; then
+              cat "$RUNNER_TEMP/mixer-preview.log"
+              exit 1
+            fi
+            sleep 1
+          done
+          xdotool key F9
+          sleep 2
+          ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
+            -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/mixer.png"
           BASH
           xvfb-run --auto-servernum --server-args="-screen 0 1600x900x24 +extension GLX" \
             bash "$RUNNER_TEMP/capture-ui.sh"

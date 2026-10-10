@@ -31,11 +31,12 @@ use flp_rebuild::vst3::{
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, ArticulateOptions, AutomationChannel, AutomationPoint,
     AutomationPointEdit, ChannelGroupSummary, ChannelSortOrder, ChannelSummary, ClawMachineOptions,
-    FlpDocument, FstPreset, FstPresetKind, LimitNoteOptions, LimitSnapDirection, Pattern,
-    PatternNote, PatternNoteEdit, PlaylistClip, PlaylistClipClipboard, PlaylistClipEdit,
-    PlaylistClipTarget, PlaylistTrack, PlaylistTrackEdit, ProjectInfoEdit, ProjectSettingsEdit,
-    RandomizerOptions, RiffMachineOptions, RiffMachineQuantizeMode, ScaleLevelsOptions, TimeMarker,
-    TimeMarkerEdit, VstPluginStateMetadata,
+    FlpDocument, FstPreset, FstPresetKind, LimitNoteOptions, LimitSnapDirection,
+    MixerParameterKind, MixerParameterRecord, Pattern, PatternNote, PatternNoteEdit, PlaylistClip,
+    PlaylistClipClipboard, PlaylistClipEdit, PlaylistClipTarget, PlaylistTrack, PlaylistTrackEdit,
+    ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions, RiffMachineOptions,
+    RiffMachineQuantizeMode, ScaleLevelsOptions, TimeMarker, TimeMarkerEdit,
+    VstPluginStateMetadata,
 };
 
 mod midi_input;
@@ -196,6 +197,30 @@ fn install_ui_visuals(context: &egui::Context) {
         style.spacing.menu_margin = egui::Margin::same(8);
         style.spacing.slider_rail_height = 4.0;
     });
+}
+
+fn unique_candidate_mixer_parameter(
+    parameters: &[MixerParameterRecord],
+    insert_ordinal: usize,
+    kind: MixerParameterKind,
+) -> Option<&MixerParameterRecord> {
+    let mut matches = parameters.iter().filter(|record| {
+        record.kind() == kind
+            && record.candidate_insert_ordinal() == Some(insert_ordinal)
+            && record.target_scope_raw() == 0
+    });
+    let record = matches.next()?;
+    matches.next().is_none().then_some(record)
+}
+
+fn candidate_mixer_controls(
+    parameters: &[MixerParameterRecord],
+    insert_ordinal: usize,
+) -> Option<(&MixerParameterRecord, &MixerParameterRecord)> {
+    Some((
+        unique_candidate_mixer_parameter(parameters, insert_ordinal, MixerParameterKind::Volume)?,
+        unique_candidate_mixer_parameter(parameters, insert_ordinal, MixerParameterKind::Pan)?,
+    ))
 }
 
 fn project_hash(document: &FlpDocument) -> Option<u64> {
@@ -16252,6 +16277,7 @@ impl DawUi {
         let available_height = ui.available_height();
         let inspector_width = 238.0_f32.min((ui.available_width() * 0.3).max(190.0));
         let bank_width = (ui.available_width() - inspector_width - 10.0).max(180.0);
+        let fader_height = (available_height - 248.0).clamp(120.0, 400.0);
         ui.horizontal_top(|ui| {
             ui.allocate_ui_with_layout(
                 Vec2::new(bank_width, available_height),
@@ -16314,14 +16340,85 @@ impl DawUi {
                                                 ui.small("OUTPUT");
                                                 ui.monospace(insert.output_raw().to_string());
                                                 ui.separator();
-                                                ui.centered_and_justified(|ui| {
-                                                    ui.label(
-                                                        egui::RichText::new(
-                                                            "Mixer controls\nnot decoded",
-                                                        )
-                                                        .color(MUTED),
-                                                    );
-                                                });
+                                                if let Some((volume_record, pan_record)) =
+                                                    candidate_mixer_controls(
+                                                        &parameters,
+                                                        insert.ordinal(),
+                                                    )
+                                                {
+                                                    ui.small("CANDIDATE CONTROLS")
+                                                        .on_hover_text(
+                                                            "Matched by the observed 0xE1 target = 64 + insert ordinal convention. Values edit the source records directly.",
+                                                        );
+                                                    ui.small("PAN");
+                                                    let mut pan_value = pan_record.value();
+                                                    if (-6400..=6400).contains(&pan_value) {
+                                                        if ui
+                                                            .add_sized(
+                                                                [90.0, 18.0],
+                                                                egui::Slider::new(
+                                                                    &mut pan_value,
+                                                                    -6400..=6400,
+                                                                )
+                                                                .show_value(false)
+                                                                .step_by(1.0),
+                                                            )
+                                                            .changed()
+                                                        {
+                                                            parameter_edits.push((
+                                                                pan_record.event_index(),
+                                                                pan_record.record_index(),
+                                                                pan_value,
+                                                            ));
+                                                        }
+                                                        let pan_label = if pan_value == 0 {
+                                                            "C".to_owned()
+                                                        } else if pan_value < 0 {
+                                                            format!("L {}%", -pan_value * 100 / 6400)
+                                                        } else {
+                                                            format!("R {}%", pan_value * 100 / 6400)
+                                                        };
+                                                        ui.small(pan_label);
+                                                    } else {
+                                                        ui.small(format!("PAN raw {}", pan_value));
+                                                    }
+                                                    ui.add_space(5.0);
+                                                    ui.small("LEVEL · RAW");
+                                                    let mut volume_value = volume_record.value();
+                                                    if (0..=16_000).contains(&volume_value) {
+                                                        if ui
+                                                            .add_sized(
+                                                                [28.0, fader_height],
+                                                                egui::Slider::new(
+                                                                    &mut volume_value,
+                                                                    0..=16_000,
+                                                                )
+                                                                .vertical()
+                                                                .show_value(false)
+                                                                .step_by(1.0),
+                                                            )
+                                                            .changed()
+                                                        {
+                                                            parameter_edits.push((
+                                                                volume_record.event_index(),
+                                                                volume_record.record_index(),
+                                                                volume_value,
+                                                            ));
+                                                        }
+                                                        ui.small(volume_value.to_string());
+                                                    } else {
+                                                        ui.small(format!("raw {}", volume_value));
+                                                    }
+                                                } else {
+                                                    ui.centered_and_justified(|ui| {
+                                                        ui.label(
+                                                            egui::RichText::new(
+                                                                "Track controls\nnot mapped",
+                                                            )
+                                                            .color(MUTED),
+                                                        );
+                                                    });
+                                                }
                                             });
                                         });
                                 }
@@ -20669,14 +20766,66 @@ mod tests {
     use super::{
         ActivePlaylistClipDrag, ChannelDisplayFilter, FlpDocument, Pattern, PatternNote,
         PianoRollGrid, PianoRollSnap, PlaylistClip, PlaylistClipDragKind, PluginCandidate,
-        PluginFormat, candidate_matches_vst_identity, encode_midi_device_selections,
-        next_piano_roll_note_group, note_from_grid_position, parse_midi_device_selections,
-        piano_roll_note_group_members, playlist_audio_clip_join_candidates,
-        playlist_clip_drag_edit, playlist_clip_local_recording_offset,
-        playlist_clip_split_position, playlist_pattern_clip_join_candidates, snap_note_tick,
+        PluginFormat, candidate_matches_vst_identity, candidate_mixer_controls,
+        encode_midi_device_selections, next_piano_roll_note_group, note_from_grid_position,
+        parse_midi_device_selections, piano_roll_note_group_members,
+        playlist_audio_clip_join_candidates, playlist_clip_drag_edit,
+        playlist_clip_local_recording_offset, playlist_clip_split_position,
+        playlist_pattern_clip_join_candidates, snap_note_tick,
         toggle_piano_roll_note_group_selection, update_channel_rack_selection,
         update_layer_child_selection, update_piano_roll_box_selection,
     };
+
+    fn mixer_parameter_fixture(records: &[(u8, u16, i32)]) -> FlpDocument {
+        let mut payload = Vec::with_capacity(records.len() * 12);
+        for (parameter_id, channel_data, value) in records {
+            payload.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+            payload.extend_from_slice(&[*parameter_id, 0]);
+            payload.extend_from_slice(&channel_data.to_le_bytes());
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        let mut event_stream = vec![0xE1, payload.len() as u8];
+        event_stream.extend_from_slice(&payload);
+        let mut bytes = b"FLhd".to_vec();
+        bytes.extend_from_slice(&6_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&96_u16.to_le_bytes());
+        bytes.extend_from_slice(b"FLdt");
+        bytes.extend_from_slice(&(event_stream.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&event_stream);
+        FlpDocument::parse(&bytes).expect("Mixer parameter fixture should parse")
+    }
+
+    #[test]
+    fn mixer_fader_candidate_requires_unique_zero_scope_volume_and_pan_records() {
+        let target = 64_u16 << 6;
+        let document = mixer_parameter_fixture(&[(192, target, 12_800), (193, target, 0)]);
+        let parameters = document
+            .mixer_parameter_records()
+            .expect("Mixer parameter records should decode");
+        assert!(candidate_mixer_controls(&parameters, 0).is_some());
+        assert!(candidate_mixer_controls(&parameters, 1).is_none());
+
+        let duplicate_volume = mixer_parameter_fixture(&[
+            (192, target, 12_800),
+            (192, target, 11_000),
+            (193, target, 0),
+        ]);
+        let parameters = duplicate_volume
+            .mixer_parameter_records()
+            .expect("Mixer parameter records should decode");
+        assert!(candidate_mixer_controls(&parameters, 0).is_none());
+
+        let nonzero_scope = mixer_parameter_fixture(&[
+            (192, target | (1 << 13), 12_800),
+            (193, target | (1 << 13), 0),
+        ]);
+        let parameters = nonzero_scope
+            .mixer_parameter_records()
+            .expect("Mixer parameter records should decode");
+        assert!(candidate_mixer_controls(&parameters, 0).is_none());
+    }
 
     #[test]
     fn midi_device_selections_round_trip_opaque_port_ids() {
