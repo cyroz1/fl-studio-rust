@@ -1446,14 +1446,6 @@ fn playlist_plugin_pan_gains(pan: f32, mono: bool) -> (f32, f32) {
     }
 }
 
-fn prepare_pattern_render(
-    plugin: &Plugin,
-    notes: &[PatternNote],
-    options: Vst3PatternRenderOptions,
-) -> Result<PreparedPatternRender, String> {
-    prepare_pattern_render_with_automation(plugin, notes, options, &[])
-}
-
 fn prepare_pattern_render_with_automation(
     plugin: &Plugin,
     notes: &[PatternNote],
