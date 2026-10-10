@@ -2172,6 +2172,108 @@ impl FlpDocument {
         Ok(new_id)
     }
 
+    /// Duplicates a pattern's note records, name, and explicit length into a new pattern.
+    /// Unknown events and all existing pattern bytes remain untouched.
+    pub fn duplicate_pattern(&mut self, pattern_id: u16) -> Result<u16, FlpError> {
+        let source_pattern = self
+            .patterns()?
+            .into_iter()
+            .find(|pattern| pattern.id == pattern_id)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested pattern does not exist",
+            ))?;
+        let mut matching_markers = self.events.iter().enumerate().filter(|(_, event)| {
+            event.opcode == 0x41
+                && event.payload.len() == 2
+                && event.payload.as_slice() == pattern_id.to_le_bytes()
+        });
+        let Some((source_marker_index, _)) = matching_markers.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested pattern marker does not exist",
+            ));
+        };
+        if matching_markers.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested pattern id is ambiguous",
+            ));
+        }
+        let source_note_payload = self
+            .events
+            .get(source_marker_index + 1)
+            .filter(|event| Self::is_pattern_note_event(event))
+            .map(|event| event.payload.clone());
+
+        let source_region = &self.events[source_marker_index + 1..];
+        let source_region_length = source_region
+            .iter()
+            .position(|event| {
+                (event.opcode == 0x41 && event.payload.len() == 2)
+                    || matches!(event.opcode, 0x40 | 0x62 | 0x63)
+            })
+            .unwrap_or(source_region.len());
+        let source_region = &source_region[..source_region_length];
+        let name_event_index = source_pattern.name.as_ref().and_then(|_| {
+            source_region.iter().position(|event| {
+                event.opcode == 0xC1
+                    && decode_project_string(&event.payload, self.project_version.as_deref())
+                        .is_some_and(|name| !name.is_empty())
+            })
+        });
+        let length_event_index = source_pattern.length_ticks.and_then(|_| {
+            source_region
+                .iter()
+                .rposition(|event| event.opcode == 0xA4 && event.payload.len() == 4)
+        });
+        let metadata_events = source_region
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| {
+                Some(*index) == name_event_index || Some(*index) == length_event_index
+            })
+            .map(|(_, event)| event.clone())
+            .collect::<Vec<_>>();
+
+        let mut candidate = self.clone();
+        let new_pattern_id = candidate.create_pattern()?;
+        let new_marker_index = candidate
+            .events
+            .iter()
+            .position(|event| {
+                event.opcode == 0x41
+                    && event.payload.len() == 2
+                    && event.payload.as_slice() == new_pattern_id.to_le_bytes()
+            })
+            .ok_or(FlpError::UnsupportedEdit(
+                "the duplicate pattern marker could not be found",
+            ))?;
+        let new_note_event_index = new_marker_index
+            .checked_add(1)
+            .filter(|index| *index < candidate.events.len())
+            .ok_or(FlpError::UnsupportedEdit(
+                "the duplicate pattern note event could not be found",
+            ))?;
+        if !Self::is_pattern_note_event(&candidate.events[new_note_event_index]) {
+            return Err(FlpError::UnsupportedEdit(
+                "the duplicate pattern note event could not be found",
+            ));
+        }
+        if let Some(payload) = source_note_payload {
+            candidate.events[new_note_event_index].replace_data_payload(payload)?;
+        }
+        if !metadata_events.is_empty() {
+            let insert_index = new_marker_index
+                .checked_add(2)
+                .filter(|index| *index <= candidate.events.len())
+                .ok_or(FlpError::LengthOverflow)?;
+            candidate
+                .events
+                .splice(insert_index..insert_index, metadata_events);
+        }
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(new_pattern_id)
+    }
+
     /// Returns playlist arrangements and their stored clip records.
     /// The source events remain available unchanged through `events()`.
     pub fn arrangements(&self) -> Result<Vec<Arrangement>, FlpError> {
@@ -9365,6 +9467,74 @@ mod tests {
                 .any(|pattern| pattern.id == new_id)
         );
         assert_eq!(reparsed.trailing_bytes(), &[0xB2]);
+    }
+
+    #[test]
+    fn duplicating_a_pattern_copies_notes_name_and_length_losslessly() {
+        let mut note = note_record(48, 0, 192, 64, 93);
+        note[5] = 0xA5;
+        note[11] = 0x37;
+        let mut stream = Vec::new();
+        append_data_event(&mut stream, 0xC7, b"26.0.0\0");
+        stream.extend_from_slice(&[0x40, 0, 0, 0x41, 7, 0, 0xD0, 0x18]);
+        stream.extend_from_slice(&note);
+        stream.extend_from_slice(&[0xA4, 0x80, 0x07, 0, 0]);
+        append_project_info_string(&mut stream, 0xC1, "Verse");
+        stream.extend_from_slice(&[0x40, 1, 0, 0x15, 2]);
+        let input = flp_fixture(&stream, &[0xA1], &[0xB2]);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+        let original_event_bytes = document
+            .events()
+            .iter()
+            .map(|event| event.wire_bytes().to_vec())
+            .collect::<Vec<_>>();
+
+        let new_pattern_id = document
+            .duplicate_pattern(7)
+            .expect("the recognized pattern should duplicate");
+
+        assert_eq!(new_pattern_id, 8);
+        let patterns = document.patterns().expect("patterns should decode");
+        let source = patterns.iter().find(|pattern| pattern.id == 7).unwrap();
+        let duplicate = patterns
+            .iter()
+            .find(|pattern| pattern.id == new_pattern_id)
+            .unwrap();
+        assert_eq!(duplicate.notes, source.notes);
+        assert_eq!(duplicate.length_ticks, Some(1920));
+        assert_eq!(duplicate.name.as_deref(), Some("Verse"));
+
+        let duplicate_marker = document
+            .events()
+            .iter()
+            .position(|event| {
+                event.opcode() == 0x41 && event.payload() == new_pattern_id.to_le_bytes()
+            })
+            .expect("duplicate marker should be present");
+        assert_eq!(document.events()[duplicate_marker + 1].opcode(), 0xD0);
+        assert_eq!(document.events()[duplicate_marker + 2].opcode(), 0xA4);
+        assert_eq!(document.events()[duplicate_marker + 3].opcode(), 0xC1);
+        let event_bytes_without_duplicate = document
+            .events()
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !(*index >= duplicate_marker && *index < duplicate_marker + 4))
+            .map(|(_, event)| event.wire_bytes().to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(event_bytes_without_duplicate, original_event_bytes);
+
+        let reopened = FlpDocument::parse(&document.encode_lossless().unwrap())
+            .expect("duplicated project should reparse");
+        let reopened_duplicate = reopened
+            .patterns()
+            .unwrap()
+            .into_iter()
+            .find(|pattern| pattern.id == new_pattern_id)
+            .unwrap();
+        assert_eq!(reopened_duplicate.notes, source.notes);
+        assert_eq!(reopened_duplicate.length_ticks, Some(1920));
+        assert_eq!(reopened_duplicate.name.as_deref(), Some("Verse"));
+        assert_eq!(reopened.trailing_bytes(), &[0xB2]);
     }
 
     #[test]

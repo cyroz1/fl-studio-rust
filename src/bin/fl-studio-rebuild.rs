@@ -2915,6 +2915,21 @@ impl DawUi {
         }
     }
 
+    fn duplicate_pattern(&mut self, pattern_id: u16) {
+        let Some(document) = self.document.as_mut() else {
+            self.status = "Open a project before duplicating a pattern".to_owned();
+            return;
+        };
+        match document.duplicate_pattern(pattern_id) {
+            Ok(new_pattern_id) => {
+                self.selected_pattern = Some(new_pattern_id);
+                self.dirty = true;
+                self.status = format!("Duplicated pattern {pattern_id} as {new_pattern_id}");
+            }
+            Err(error) => self.status = format!("Could not duplicate pattern: {error}"),
+        }
+    }
+
     fn project_settings_dialog(&mut self, context: &egui::Context) {
         if !self.project_settings_open {
             return;
@@ -4068,6 +4083,14 @@ impl DawUi {
                 .and_then(|document| document.patterns().ok())
                 .unwrap_or_default();
             ui.menu_button("Patterns", |ui| {
+                if let Some(pattern_id) = self
+                    .selected_pattern
+                    .filter(|pattern_id| patterns.iter().any(|pattern| pattern.id == *pattern_id))
+                    && ui.button("Duplicate selected pattern  Alt/Opt+C").clicked()
+                {
+                    self.duplicate_pattern(pattern_id);
+                    ui.close();
+                }
                 if patterns.is_empty() {
                     ui.label("Open a project to choose a pattern");
                 } else {
@@ -14102,6 +14125,12 @@ impl eframe::App for DawUi {
             && ui.input_mut(|input| input.consume_key(egui::Modifiers::ALT, egui::Key::F8));
         if toggle_browser_requested {
             self.set_browser_visibility(!self.browser_visible);
+        }
+        let duplicate_pattern_requested = self.selected_pattern.is_some()
+            && !ui.ctx().egui_wants_keyboard_input()
+            && ui.input_mut(|input| input.consume_key(egui::Modifiers::ALT, egui::Key::C));
+        if duplicate_pattern_requested && let Some(pattern_id) = self.selected_pattern {
+            self.duplicate_pattern(pattern_id);
         }
         let recent_project_index = ui.input_mut(|input| {
             if !input.modifiers.alt
