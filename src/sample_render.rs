@@ -1104,6 +1104,10 @@ fn prepare_audio_clip_render(
         .filter(|track| track.enabled == Some(false))
         .map(|track| track.id)
         .collect::<BTreeSet<_>>();
+    let track_filter = PlaylistTrackFilter {
+        disabled_track_ids: &disabled_track_ids,
+        soloed_track_range: options.soloed_playlist_track_range,
+    };
     let channels = document.channels();
     let resolver = SamplePathResolver::new(project_path);
 
@@ -1132,11 +1136,7 @@ fn prepare_audio_clip_render(
         let relative_position =
             audio_clip_render_start_tick(clip.position_ticks, selection_start_tick)?;
         max_tick = max_tick.max(relative_position + u64::from(clip.length_ticks));
-        if playlist_clip_is_muted(
-            clip,
-            &disabled_track_ids,
-            options.soloed_playlist_track_range,
-        ) {
+        if track_filter.clip_is_muted(clip) {
             continue;
         }
         let PlaylistClipTarget::Channel { id } = clip.target() else {
@@ -1310,23 +1310,37 @@ pub(crate) struct PlaylistPatternSchedule<'a> {
     pub(crate) clips_skipped_unsupported_scale: usize,
 }
 
-fn playlist_clip_is_muted(
-    clip: &PlaylistClip,
-    disabled_track_ids: &BTreeSet<u32>,
+#[derive(Clone, Copy)]
+pub(crate) struct PlaylistTrackFilter<'a> {
+    disabled_track_ids: &'a BTreeSet<u32>,
     soloed_track_range: Option<(u32, u32)>,
-) -> bool {
-    let track_id = clip.playlist_track_id();
-    if let Some((first_track, last_track)) = soloed_track_range {
-        return !track_id.is_some_and(|track_id| (first_track..=last_track).contains(&track_id));
+}
+
+impl<'a> PlaylistTrackFilter<'a> {
+    pub(crate) const fn new(
+        disabled_track_ids: &'a BTreeSet<u32>,
+        soloed_track_range: Option<(u32, u32)>,
+    ) -> Self {
+        Self {
+            disabled_track_ids,
+            soloed_track_range,
+        }
     }
-    track_id.is_some_and(|track_id| disabled_track_ids.contains(&track_id))
+
+    fn clip_is_muted(self, clip: &PlaylistClip) -> bool {
+        let track_id = clip.playlist_track_id();
+        if let Some((first_track, last_track)) = self.soloed_track_range {
+            return !track_id
+                .is_some_and(|track_id| (first_track..=last_track).contains(&track_id));
+        }
+        track_id.is_some_and(|track_id| self.disabled_track_ids.contains(&track_id))
+    }
 }
 
 pub(crate) fn schedule_playlist_pattern_notes<'a>(
     patterns: &'a [Pattern],
     arrangement: &Arrangement,
-    disabled_track_ids: &BTreeSet<u32>,
-    soloed_track_range: Option<(u32, u32)>,
+    track_filter: PlaylistTrackFilter<'_>,
     ppq: u16,
     global_swing_mix_raw: u8,
     mut channel_swing_mix_raw: impl FnMut(u16) -> u16,
@@ -1342,7 +1356,7 @@ pub(crate) fn schedule_playlist_pattern_notes<'a>(
     };
 
     for (clip_index, clip) in arrangement.clips.iter().enumerate() {
-        if playlist_clip_is_muted(clip, disabled_track_ids, soloed_track_range) {
+        if track_filter.clip_is_muted(clip) {
             continue;
         }
         let PlaylistClipTarget::Pattern { id } = clip.target() else {
@@ -1499,6 +1513,10 @@ fn prepare_sampler_arrangement(
         .filter(|track| track.enabled == Some(false))
         .map(|track| track.id)
         .collect::<BTreeSet<_>>();
+    let track_filter = PlaylistTrackFilter {
+        disabled_track_ids: &disabled_track_ids,
+        soloed_track_range: options.soloed_playlist_track_range,
+    };
     let patterns = document.patterns().map_err(|error| error.to_string())?;
     let channels = document.channels();
     let channels_by_id: HashMap<_, _> = channels
@@ -1509,8 +1527,7 @@ fn prepare_sampler_arrangement(
     let schedule = schedule_playlist_pattern_notes(
         &patterns,
         &arrangement,
-        &disabled_track_ids,
-        options.soloed_playlist_track_range,
+        track_filter,
         ppq,
         document.metadata().global_swing_mix(),
         |channel_id| {
@@ -2748,8 +2765,7 @@ mod tests {
         let schedule = schedule_playlist_pattern_notes(
             &patterns,
             &arrangement,
-            &BTreeSet::new(),
-            None,
+            PlaylistTrackFilter::new(&BTreeSet::new(), None),
             96,
             0,
             |_| 128,
@@ -2791,8 +2807,7 @@ mod tests {
         let schedule = schedule_playlist_pattern_notes(
             &patterns,
             &arrangement,
-            &BTreeSet::from([1]),
-            None,
+            PlaylistTrackFilter::new(&BTreeSet::from([1]), None),
             96,
             0,
             |_| 128,
@@ -2812,26 +2827,21 @@ mod tests {
         unassigned_clip.track_index = None;
         let disabled_track_ids = BTreeSet::from([1]);
 
-        assert!(playlist_clip_is_muted(
-            &first_track_clip,
-            &disabled_track_ids,
-            None
-        ));
-        assert!(!playlist_clip_is_muted(
-            &first_track_clip,
-            &disabled_track_ids,
-            Some((1, 1))
-        ));
-        assert!(playlist_clip_is_muted(
-            &second_track_clip,
-            &disabled_track_ids,
-            Some((1, 1))
-        ));
-        assert!(playlist_clip_is_muted(
-            &unassigned_clip,
-            &disabled_track_ids,
-            Some((1, 1))
-        ));
+        assert!(
+            PlaylistTrackFilter::new(&disabled_track_ids, None).clip_is_muted(&first_track_clip)
+        );
+        assert!(
+            !PlaylistTrackFilter::new(&disabled_track_ids, Some((1, 1)))
+                .clip_is_muted(&first_track_clip)
+        );
+        assert!(
+            PlaylistTrackFilter::new(&disabled_track_ids, Some((1, 1)))
+                .clip_is_muted(&second_track_clip)
+        );
+        assert!(
+            PlaylistTrackFilter::new(&disabled_track_ids, Some((1, 1)))
+                .clip_is_muted(&unassigned_clip)
+        );
     }
 
     #[test]
@@ -2856,8 +2866,7 @@ mod tests {
         let schedule = schedule_playlist_pattern_notes(
             &patterns,
             &arrangement,
-            &BTreeSet::from([1]),
-            Some((1, 1)),
+            PlaylistTrackFilter::new(&BTreeSet::from([1]), Some((1, 1))),
             96,
             0,
             |_| 128,
@@ -2891,8 +2900,7 @@ mod tests {
         let schedule = schedule_playlist_pattern_notes(
             &patterns,
             &arrangement,
-            &BTreeSet::new(),
-            None,
+            PlaylistTrackFilter::new(&BTreeSet::new(), None),
             96,
             0,
             |_| 128,
@@ -2936,8 +2944,7 @@ mod tests {
         let schedule = schedule_playlist_pattern_notes(
             &patterns,
             &arrangement,
-            &BTreeSet::new(),
-            None,
+            PlaylistTrackFilter::new(&BTreeSet::new(), None),
             96,
             0,
             |_| 128,
@@ -2971,8 +2978,7 @@ mod tests {
         let schedule = schedule_playlist_pattern_notes(
             &patterns,
             &arrangement,
-            &BTreeSet::new(),
-            None,
+            PlaylistTrackFilter::new(&BTreeSet::new(), None),
             96,
             128,
             |channel_id| if channel_id == 7 { 128 } else { 0 },

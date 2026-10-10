@@ -4038,6 +4038,7 @@ impl DawUi {
         let options = PlaylistRenderOptions {
             arrangement_id: self.selected_arrangement.unwrap_or(0),
             sample_rate,
+            tail_seconds: 2,
             soloed_playlist_track_range: self.soloed_playlist_track_range,
             ..PlaylistRenderOptions::default()
         };
@@ -4047,11 +4048,8 @@ impl DawUi {
             .map(|host| {
                 host.prepare_playlist_stream(
                     self.document.as_ref().expect("project was checked above"),
-                    options.arrangement_id,
-                    options.soloed_playlist_track_range,
+                    options,
                     &self.channel_vst3_instances,
-                    sample_rate,
-                    2.0,
                     true,
                 )
             })
@@ -14967,11 +14965,8 @@ impl DawUi {
             .map(|host| {
                 host.prepare_playlist_stream(
                     document,
-                    options.arrangement_id,
-                    options.soloed_playlist_track_range,
+                    options,
                     &self.channel_vst3_instances,
-                    options.sample_rate,
-                    f64::from(options.tail_seconds),
                     self.playlist_render_include_plugin_tails,
                 )
             })

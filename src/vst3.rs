@@ -14,7 +14,8 @@ use std::thread;
 
 use crate::audio::StreamingAudioWriter;
 use crate::sample_render::{
-    channel_gain_pan, schedule_playlist_pattern_notes, swing_note_start_tick,
+    PlaylistRenderOptions, PlaylistTrackFilter, channel_gain_pan, schedule_playlist_pattern_notes,
+    swing_note_start_tick,
 };
 use crate::{ChannelNoteRouter, ChannelPluginState, FlpDocument};
 use vst3_host::audio::AudioBuffers;
@@ -1066,13 +1067,13 @@ impl Vst3HostRuntime {
     pub fn prepare_playlist_stream(
         &self,
         document: &FlpDocument,
-        arrangement_id: u16,
-        soloed_playlist_track_range: Option<(u32, u32)>,
+        options: PlaylistRenderOptions,
         channel_instances: &BTreeMap<u16, u64>,
-        output_sample_rate: u32,
-        tail_seconds: f64,
         include_plugin_reported_tails: bool,
     ) -> Result<Vst3PlaylistStreamProcessor, String> {
+        let arrangement_id = options.arrangement_id;
+        let output_sample_rate = options.sample_rate;
+        let tail_seconds = f64::from(options.tail_seconds);
         if !(8_000..=384_000).contains(&output_sample_rate) {
             return Err("Playlist audio rate must be between 8000 and 384000 Hz".to_owned());
         }
@@ -1111,6 +1112,8 @@ impl Vst3HostRuntime {
             .filter(|track| track.enabled == Some(false))
             .map(|track| track.id)
             .collect::<BTreeSet<_>>();
+        let track_filter =
+            PlaylistTrackFilter::new(&disabled_track_ids, options.soloed_playlist_track_range);
         plugin_channels.extend(
             channels
                 .iter()
@@ -1122,8 +1125,7 @@ impl Vst3HostRuntime {
         let schedule = schedule_playlist_pattern_notes(
             &patterns,
             &arrangement,
-            &disabled_track_ids,
-            soloed_playlist_track_range,
+            track_filter,
             ppq,
             document.metadata().global_swing_mix(),
             |channel_id| {
