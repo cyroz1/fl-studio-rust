@@ -10579,8 +10579,8 @@ mod tests {
         FstPresetKind, LimitNoteOptions, LimitSnapDirection, MixerParameterKind,
         PATTERN_NOTE_SLIDE_FLAG, PatternNote, PatternNoteEdit, PayloadEncoding, PlaylistClipEdit,
         PlaylistClipTarget, ProjectInfoEdit, ProjectSettingsEdit, RiffMachineOptions,
-        ScaleLevelsOptions, TimeMarkerEdit, midi::MidiChannelMapping, midi::MidiFile,
-        parse_vst_plugin_state_metadata,
+        RiffMachineQuantizeMode, ScaleLevelsOptions, TimeMarkerEdit, midi::MidiChannelMapping,
+        midi::MidiFile, parse_vst_plugin_state_metadata, riff_machine_groove_note_timing,
     };
 
     fn articulate_options(
