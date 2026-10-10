@@ -16795,6 +16795,17 @@ impl DawUi {
                     }
                 });
                 ui.small(format!("{} · class {}", info.path.display(), info.uid));
+                if let Some(latency_ms) = info.latency_milliseconds() {
+                    ui.small(format!(
+                        "Reported latency: {} samples · {:.2} ms @ {:.0} Hz",
+                        info.latency_samples, latency_ms, info.sample_rate_hz
+                    ));
+                } else {
+                    ui.small(format!(
+                        "Reported latency: {} samples · sample rate unavailable",
+                        info.latency_samples
+                    ));
+                }
 
                 egui::CollapsingHeader::new("Parameters").show(ui, |ui| {
                     let parameters = self
@@ -17132,10 +17143,30 @@ impl eframe::App for DawUi {
         {
             self.step_graph_editor_open = !self.step_graph_editor_open;
         }
-        if let Some(host) = &mut self.vst3_host
-            && let Err(error) = host.service_editors()
-        {
-            self.status = format!("VST3 editor update failed: {error}");
+        let vst3_runtime_update = self
+            .vst3_host
+            .as_mut()
+            .map(Vst3HostRuntime::service_editors);
+        match vst3_runtime_update {
+            Some(Ok(true)) => {
+                let playback_active = self.playing
+                    || self.pending_audio_render.is_some()
+                    || self.pending_song_render.is_some()
+                    || self.pending_vst3_stream.is_some();
+                if playback_active {
+                    self.stop_project_playback();
+                    self.status =
+                        "A VST3 output layout changed; playback stopped to rebuild its routing"
+                            .to_owned();
+                } else {
+                    self.status =
+                        "A VST3 output layout changed; routing will refresh on playback".to_owned();
+                }
+            }
+            Some(Err(error)) => {
+                self.status = format!("VST3 editor update failed: {error}");
+            }
+            Some(Ok(false)) | None => {}
         }
         if let Some(error) = self.audio_engine.as_ref().and_then(AudioEngine::take_error) {
             self.status = format!("Audio device error: {error}");

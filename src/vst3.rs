@@ -19,7 +19,7 @@ use crate::sample_render::{
 use crate::{ChannelNoteRouter, ChannelPluginState, FlpDocument};
 use vst3_host::audio::AudioBuffers;
 use vst3_host::midi::{MidiChannel, MidiEvent};
-use vst3_host::{Plugin, PluginInfo, PluginWindow, Vst3Host};
+use vst3_host::{Plugin, PluginWindow, Vst3Host};
 
 use crate::PatternNote;
 
@@ -350,7 +350,7 @@ impl PlaylistPluginStream {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct HostedPluginInfo {
     pub id: u64,
     pub name: String,
@@ -360,6 +360,18 @@ pub struct HostedPluginInfo {
     pub uid: String,
     pub path: PathBuf,
     pub has_editor: bool,
+    /// Latency most recently reported by `IAudioProcessor::getLatencySamples`.
+    pub latency_samples: u32,
+    /// Sample rate configured for this plug-in instance when the report was read.
+    pub sample_rate_hz: f64,
+}
+
+impl HostedPluginInfo {
+    /// Convert the reported latency to milliseconds using the plug-in's configured rate.
+    pub fn latency_milliseconds(&self) -> Option<f64> {
+        (self.sample_rate_hz.is_finite() && self.sample_rate_hz > 0.0)
+            .then(|| f64::from(self.latency_samples) * 1000.0 / self.sample_rate_hz)
+    }
 }
 
 struct HostedPlugin {
@@ -509,8 +521,7 @@ impl Vst3HostRuntime {
         }
         .map_err(|error| error.to_string())?;
 
-        let plugin_info = plugin.info().clone();
-        let info = hosted_info(self.next_id, &plugin_info, plugin.has_editor());
+        let info = hosted_info(self.next_id, &plugin);
         self.next_id = self.next_id.saturating_add(1);
         self.loaded.push(HostedPlugin {
             info: info.clone(),
@@ -525,12 +536,24 @@ impl Vst3HostRuntime {
     /// The caller must provide bytes compatible with that plug-in. This method does
     /// not convert an Image-Line FLP `0xD5` envelope into a VST3 component state.
     pub fn restore_state(&mut self, id: u64, state: &[u8]) -> Result<(), String> {
-        let plugin = self.plugin(id)?;
-        plugin
+        let plugin = Arc::clone(self.plugin(id)?);
+        let mut plugin = plugin
             .lock()
-            .map_err(|_| "plug-in state lock was poisoned".to_owned())?
+            .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
+        plugin
             .load_state(state)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        let latency_samples = plugin.latency_samples();
+        let sample_rate_hz = plugin.sample_rate();
+        drop(plugin);
+        let loaded = self
+            .loaded
+            .iter_mut()
+            .find(|loaded| loaded.info.id == id)
+            .ok_or_else(|| format!("no loaded VST3 instance with id {id}"))?;
+        loaded.info.latency_samples = latency_samples;
+        loaded.info.sample_rate_hz = sample_rate_hz;
+        Ok(())
     }
 
     /// Restore both VST3 state streams stored in an FLP channel's `0xD5` record.
@@ -962,21 +985,32 @@ impl Vst3HostRuntime {
         })
     }
 
-    /// Service native editor close/resize requests and the VST3 UI run loop where needed.
-    pub fn service_editors(&mut self) -> Result<(), String> {
+    /// Service editor/UI requests and VST3 restart requests on the control thread.
+    ///
+    /// Returns `true` when a plug-in changes its audio bus layout so callers can rebuild routing.
+    pub fn service_editors(&mut self) -> Result<bool, String> {
+        let mut io_changed = false;
         for loaded in &mut self.loaded {
             if let Some(editor) = loaded.editor.as_ref() {
                 editor
                     .service_platform_events()
                     .map_err(|error| error.to_string())?;
             }
-            loaded
+            let mut plugin = loaded
                 .plugin
                 .lock()
-                .map_err(|_| "plug-in state lock was poisoned".to_owned())?
-                .service_run_loop();
+                .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
+            plugin.service_run_loop();
+            let restart_flags = plugin
+                .service_host_requests()
+                .map_err(|error| error.to_string())?;
+            if restart_flags.latency_changed() {
+                loaded.info.latency_samples = plugin.latency_samples();
+                loaded.info.sample_rate_hz = plugin.sample_rate();
+            }
+            io_changed |= restart_flags.io_changed();
         }
-        Ok(())
+        Ok(io_changed)
     }
 
     pub fn loaded_plugins(&self) -> Vec<HostedPluginInfo> {
@@ -1694,7 +1728,8 @@ impl Drop for TemporaryWaveFile {
     }
 }
 
-fn hosted_info(id: u64, info: &PluginInfo, has_editor: bool) -> HostedPluginInfo {
+fn hosted_info(id: u64, plugin: &Plugin) -> HostedPluginInfo {
+    let info = plugin.info();
     HostedPluginInfo {
         id,
         name: info.name.clone(),
@@ -1703,7 +1738,9 @@ fn hosted_info(id: u64, info: &PluginInfo, has_editor: bool) -> HostedPluginInfo
         category: info.category.clone(),
         uid: info.uid.clone(),
         path: info.path.clone(),
-        has_editor,
+        has_editor: plugin.has_editor(),
+        latency_samples: plugin.latency_samples(),
+        sample_rate_hz: plugin.sample_rate(),
     }
 }
 
@@ -1711,6 +1748,44 @@ fn hosted_info(id: u64, info: &PluginInfo, has_editor: bool) -> HostedPluginInfo
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn reported_latency_uses_the_plugin_sample_rate() {
+        let info = HostedPluginInfo {
+            id: 1,
+            name: "Test instrument".to_owned(),
+            vendor: "Test vendor".to_owned(),
+            version: "1.0".to_owned(),
+            category: "Instrument".to_owned(),
+            uid: "00000000000000000000000000000000".to_owned(),
+            path: PathBuf::from("test.vst3"),
+            has_editor: false,
+            latency_samples: 480,
+            sample_rate_hz: 48_000.0,
+        };
+
+        assert_eq!(info.latency_milliseconds(), Some(10.0));
+    }
+
+    #[test]
+    fn reported_latency_has_no_millisecond_value_for_invalid_sample_rates() {
+        let mut info = HostedPluginInfo {
+            id: 1,
+            name: "Test instrument".to_owned(),
+            vendor: "Test vendor".to_owned(),
+            version: "1.0".to_owned(),
+            category: "Instrument".to_owned(),
+            uid: "00000000000000000000000000000000".to_owned(),
+            path: PathBuf::from("test.vst3"),
+            has_editor: false,
+            latency_samples: 480,
+            sample_rate_hz: 0.0,
+        };
+
+        assert_eq!(info.latency_milliseconds(), None);
+        info.sample_rate_hz = f64::NAN;
+        assert_eq!(info.latency_milliseconds(), None);
+    }
 
     fn append_flp_vst3_state_record(payload: &mut Vec<u8>, id: u32, data: &[u8]) {
         payload.extend_from_slice(&id.to_le_bytes());
