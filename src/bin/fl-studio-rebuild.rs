@@ -1667,6 +1667,7 @@ struct DawUi {
     playlist_clip_clipboard: Option<PlaylistClipClipboard>,
     playlist_slip_tool_active: bool,
     soloed_playlist_track_range: Option<(u32, u32)>,
+    collapsed_playlist_groups: BTreeSet<(u16, u32)>,
     active_playlist_clip_drag: Option<ActivePlaylistClipDrag>,
     selected_time_marker: Option<usize>,
     selected_pattern_time_signature: Option<usize>,
@@ -2008,6 +2009,7 @@ impl DawUi {
             playlist_clip_clipboard: None,
             playlist_slip_tool_active: false,
             soloed_playlist_track_range: None,
+            collapsed_playlist_groups: BTreeSet::new(),
             active_playlist_clip_drag: None,
             selected_time_marker: None,
             selected_pattern_time_signature: None,
@@ -2441,6 +2443,7 @@ impl DawUi {
             Ok((package_workspace, document)) => {
                 self.stop_project_playback();
                 self.soloed_playlist_track_range = None;
+                self.collapsed_playlist_groups.clear();
                 self.clear_history();
                 self.history_reset_during_frame = true;
                 self.autosave_deadline = None;
@@ -4804,6 +4807,53 @@ impl DawUi {
                 if ui.button("Piano roll Event Editor").clicked() {
                     self.view = MainView::PianoRoll;
                     self.piano_roll_event_editor_open = true;
+                    ui.close();
+                }
+                let group_parent_ids = self
+                    .document
+                    .as_ref()
+                    .map(|document| playlist_group_parent_ids(&document.playlist_tracks()))
+                    .unwrap_or_default();
+                let arrangement_id = self.selected_arrangement.or_else(|| {
+                    self.document
+                        .as_ref()
+                        .and_then(|document| document.arrangements().ok())
+                        .and_then(|arrangements| arrangements.first().map(|item| item.id))
+                });
+                let can_collapse_groups = self.view == MainView::Playlist
+                    && arrangement_id.is_some()
+                    && !group_parent_ids.is_empty();
+                if can_collapse_groups {
+                    ui.separator();
+                }
+                if ui
+                    .add_enabled(
+                        can_collapse_groups,
+                        egui::Button::new("Collapse all Playlist groups"),
+                    )
+                    .clicked()
+                {
+                    let arrangement_id = arrangement_id.expect("enabled with an arrangement");
+                    self.collapsed_playlist_groups.extend(
+                        group_parent_ids
+                            .iter()
+                            .map(|track_id| (arrangement_id, *track_id)),
+                    );
+                    self.status =
+                        format!("Collapsed {} Playlist track groups", group_parent_ids.len());
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        can_collapse_groups,
+                        egui::Button::new("Expand all Playlist groups"),
+                    )
+                    .clicked()
+                {
+                    let arrangement_id = arrangement_id.expect("enabled with an arrangement");
+                    self.collapsed_playlist_groups
+                        .retain(|(scope, _)| *scope != arrangement_id);
+                    self.status = "Expanded Playlist track groups".to_owned();
                     ui.close();
                 }
             });
@@ -7433,6 +7483,14 @@ impl DawUi {
             .iter()
             .filter_map(|clip| clip.track_index)
             .max()
+            .into_iter()
+            .chain(tracks.iter().filter_map(|track| {
+                track
+                    .id
+                    .checked_sub(1)
+                    .and_then(|row| u16::try_from(row).ok())
+            }))
+            .max()
             .unwrap_or(15)
             .max(15);
         let label_width = 178.0;
@@ -7543,11 +7601,30 @@ impl DawUi {
                     }
                 });
 
+                let collapsed_group_ids = self
+                    .collapsed_playlist_groups
+                    .iter()
+                    .filter_map(|(arrangement_id, track_id)| {
+                        (*arrangement_id == arrangement.id).then_some(*track_id)
+                    })
+                    .collect::<BTreeSet<_>>();
                 for row in 0..=last_track {
                     let track_id = u32::from(row) + 1;
+                    if playlist_track_is_hidden(track_id, &tracks, &collapsed_group_ids) {
+                        continue;
+                    }
                     let track_state = tracks.iter().find(|track| track.id == track_id);
                     let track_muted = track_state.is_some_and(|track| track.enabled == Some(false));
                     let track_grouped = track_state.is_some_and(|track| track.grouped == Some(true));
+                    let track_group_range = playlist_track_group_range(track_id, &tracks);
+                    let group_parent_id = track_group_range
+                        .filter(|(first, last)| first < last)
+                        .map(|(first, _)| first);
+                    let track_is_group_parent =
+                        group_parent_id.is_some_and(|parent_id| parent_id == track_id);
+                    let group_is_collapsed = self
+                        .collapsed_playlist_groups
+                        .contains(&(arrangement.id, track_id));
                     let track_soloed = self
                         .soloed_playlist_track_range
                         .is_some_and(|(first, last)| (first..=last).contains(&track_id));
@@ -7657,8 +7734,45 @@ impl DawUi {
                                 "Click to mute · Ctrl-click or right-click to solo · Alt/Option-click mutes the group · Alt/Option-right-click solos the group",
                             );
                         }
+                        if track_is_group_parent {
+                            let group_toggle_rect = egui::Rect::from_min_size(
+                                label_rect.left_top() + Vec2::new(31.0, 3.0),
+                                Vec2::new(18.0, row_height - 6.0),
+                            );
+                            let group_toggle = ui.put(
+                                group_toggle_rect,
+                                egui::Button::new(
+                                    egui::RichText::new(if group_is_collapsed {
+                                        "▸"
+                                    } else {
+                                        "▾"
+                                    })
+                                    .size(11.0)
+                                    .color(MUTED),
+                                )
+                                .frame(false),
+                            );
+                            if group_toggle.clicked() {
+                                let key = (arrangement.id, track_id);
+                                if group_is_collapsed {
+                                    self.collapsed_playlist_groups.remove(&key);
+                                    self.status = format!("Expanded Playlist track group {track_id}");
+                                } else {
+                                    self.collapsed_playlist_groups.insert(key);
+                                    self.status = format!("Collapsed Playlist track group {track_id}");
+                                }
+                            }
+                            group_toggle.on_hover_text(if group_is_collapsed {
+                                "Expand this Playlist track group"
+                            } else {
+                                "Collapse this Playlist track group"
+                            });
+                        }
                         let group_mark = if track_grouped { "↳" } else { "" };
-                        let name_x = label_rect.left() + 33.0 + if track_grouped { 9.0 } else { 0.0 };
+                        let name_x = label_rect.left()
+                            + 33.0
+                            + if track_is_group_parent { 18.0 } else { 0.0 }
+                            + if track_grouped { 9.0 } else { 0.0 };
                         ui.painter().text(
                             egui::pos2(name_x, label_rect.center().y),
                             Align2::LEFT_CENTER,
@@ -7666,8 +7780,13 @@ impl DawUi {
                             FontId::proportional(11.0),
                             if track_effectively_muted { MUTED } else { TEXT },
                         );
+                        let context_left = if track_is_group_parent {
+                            label_rect.left() + 51.0
+                        } else {
+                            mute_rect.right() + 2.0
+                        };
                         let context_rect = egui::Rect::from_min_max(
-                            egui::pos2(mute_rect.right() + 2.0, label_rect.top()),
+                            egui::pos2(context_left, label_rect.top()),
                             label_rect.right_bottom(),
                         );
                         let context_response = ui.interact(
@@ -7702,6 +7821,31 @@ impl DawUi {
                                 }
                             } else {
                                 ui.weak("Track state is unavailable in this project");
+                            }
+                            if let Some(group_parent_id) = group_parent_id {
+                                ui.separator();
+                                if ui
+                                    .button(if group_is_collapsed {
+                                        "Expand track group"
+                                    } else {
+                                        "Collapse track group"
+                                    })
+                                    .clicked()
+                                {
+                                    let key = (arrangement.id, group_parent_id);
+                                    if group_is_collapsed {
+                                        self.collapsed_playlist_groups.remove(&key);
+                                        self.status = format!(
+                                            "Expanded Playlist track group {group_parent_id}"
+                                        );
+                                    } else {
+                                        self.collapsed_playlist_groups.insert(key);
+                                        self.status = format!(
+                                            "Collapsed Playlist track group {group_parent_id}"
+                                        );
+                                    }
+                                    ui.close();
+                                }
                             }
                             });
 
@@ -21266,6 +21410,33 @@ fn playlist_track_group_range(track_id: u32, tracks: &[PlaylistTrack]) -> Option
     ))
 }
 
+fn playlist_group_parent_ids(tracks: &[PlaylistTrack]) -> Vec<u32> {
+    let mut ordered_tracks = tracks.iter().collect::<Vec<_>>();
+    ordered_tracks.sort_by_key(|track| track.id);
+    ordered_tracks
+        .into_iter()
+        .filter(|track| track.grouped != Some(true))
+        .filter_map(|track| {
+            playlist_track_group_range(track.id, tracks)
+                .filter(|(first, last)| *first == track.id && first < last)
+                .map(|_| track.id)
+        })
+        .collect()
+}
+
+fn playlist_track_is_hidden(
+    track_id: u32,
+    tracks: &[PlaylistTrack],
+    collapsed_group_ids: &BTreeSet<u32>,
+) -> bool {
+    tracks
+        .iter()
+        .find(|track| track.id == track_id)
+        .is_some_and(|track| track.grouped == Some(true))
+        && playlist_track_group_range(track_id, tracks)
+            .is_some_and(|(parent_id, _)| collapsed_group_ids.contains(&parent_id))
+}
+
 fn playlist_seek_tick_to_frame(tick: u32, ppq: u16, tempo_bpm: f64, sample_rate: u32) -> u64 {
     if !tempo_bpm.is_finite() || tempo_bpm <= 0.0 || sample_rate == 0 {
         return 0;
@@ -21990,6 +22161,14 @@ mod tests {
         assert_eq!(playlist_track_group_range(3, &tracks), Some((1, 3)));
         assert_eq!(playlist_track_group_range(4, &tracks), Some((4, 4)));
         assert_eq!(playlist_track_group_range(5, &tracks), None);
+        assert_eq!(playlist_group_parent_ids(&tracks), vec![1]);
+
+        let collapsed = BTreeSet::from([1]);
+        assert!(!playlist_track_is_hidden(1, &tracks, &collapsed));
+        assert!(playlist_track_is_hidden(2, &tracks, &collapsed));
+        assert!(playlist_track_is_hidden(3, &tracks, &collapsed));
+        assert!(!playlist_track_is_hidden(4, &tracks, &collapsed));
+        assert!(!playlist_track_is_hidden(5, &tracks, &collapsed));
     }
 
     #[test]
