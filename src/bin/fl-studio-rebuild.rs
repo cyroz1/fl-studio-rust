@@ -7366,12 +7366,18 @@ impl DawUi {
                     if self.view == MainView::Playlist {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let zoom_percent = self.timeline_zoom / 0.10 * 100.0;
-                            ui.add_sized(
-                                Vec2::new(112.0, 22.0),
-                                egui::Slider::new(&mut self.timeline_zoom, 0.04..=0.24)
-                                    .show_value(false),
-                            )
-                            .on_hover_text("Adjust Playlist timeline zoom");
+                            ui.scope(|ui| {
+                                ui.visuals_mut().widgets.inactive.bg_fill = GRID;
+                                ui.visuals_mut().selection.bg_fill = BLUE;
+                                ui.add_sized(
+                                    Vec2::new(112.0, 22.0),
+                                    egui::Slider::new(&mut self.timeline_zoom, 0.04..=0.24)
+                                        .show_value(false)
+                                        .trailing_fill(true)
+                                        .handle_shape(egui::style::HandleShape::Circle),
+                                )
+                                .on_hover_text("Adjust Playlist timeline zoom");
+                            });
                             ui.label(
                                 egui::RichText::new(format!("{zoom_percent:.0}%"))
                                     .monospace()
