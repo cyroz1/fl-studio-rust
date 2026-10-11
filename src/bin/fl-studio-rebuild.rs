@@ -8138,6 +8138,7 @@ impl DawUi {
         let mut copy_clip_requested = None;
         let mut cut_clip_requested = None;
         let mut paste_clip_after_requested = None;
+        let mut make_audio_clip_unique_requested = None;
         let mut split_clip_requested = None;
         let mut join_clip_requested = None;
         let mut join_pattern_clip_requested = None;
@@ -9005,6 +9006,10 @@ impl DawUi {
                                     ui.close();
                                 }
                                 if is_audio_clip {
+                                    if ui.button("Make unique").clicked() {
+                                        make_audio_clip_unique_requested = Some(clip_index);
+                                        ui.close();
+                                    }
                                     let split_button = ui.add_enabled(
                                         can_split_clip,
                                         egui::Button::new("Split audio at cursor"),
@@ -9405,6 +9410,33 @@ impl DawUi {
             && self.paste_playlist_clip_into_arrangement(arrangement.id, Some(clip_index))
         {
             playlist_clip_list_changed = true;
+        }
+
+        if let Some(clip_index) = make_audio_clip_unique_requested {
+            let result = self.document.as_mut().map(|document| {
+                document.make_playlist_audio_clip_unique(arrangement.id, clip_index)
+            });
+            match result {
+                Some(Ok(channel_id)) => {
+                    self.stop_project_playback();
+                    self.selected_arrangement = Some(arrangement.id);
+                    self.selected_clip = Some(clip_index);
+                    self.selected_playlist_clips.clear();
+                    self.selected_playlist_clips.insert(clip_index);
+                    self.playlist_clip_context_split = None;
+                    self.active_playlist_clip_drag = None;
+                    self.dirty = true;
+                    self.status = format!(
+                        "Made Audio Clip {} unique as channel {channel_id}",
+                        clip_index + 1
+                    );
+                    self.refresh_audio_waveform_paths();
+                }
+                Some(Err(error)) => {
+                    self.status = format!("Could not make Audio Clip unique: {error}");
+                }
+                None => self.status = "Open a project to make an Audio Clip unique".to_owned(),
+            }
         }
 
         if let Some((clip_index, split_position_ticks, full_source_length_ms)) =

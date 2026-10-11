@@ -780,6 +780,16 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_usize(right_clip_index, "right clip index")?,
             )
         }
+        [command, input, output, arrangement_id, clip_index]
+            if command == "make-audio-clip-unique" =>
+        {
+            make_audio_clip_unique(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(arrangement_id, "arrangement id")?,
+                parse_usize(clip_index, "clip index")?,
+            )
+        }
         [command, input, output, arrangement_id, left_clip_index, right_clip_index]
             if command == "join-pattern-clips" =>
         {
@@ -945,6 +955,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild duplicate-clip <input.flp> <output.flp> <arrangement-id> <clip-index> <position|-> <track-index-raw|->\n",
             "  flp-rebuild split-audio-clip <input.flp> <output.flp> <arrangement-id> <clip-index> <split-position-ticks> <source-length-ms|->\n",
             "  flp-rebuild join-audio-clips <input.flp> <output.flp> <arrangement-id> <left-clip-index> <right-clip-index>\n",
+            "  flp-rebuild make-audio-clip-unique <input.flp> <output.flp> <arrangement-id> <clip-index>\n",
             "  flp-rebuild join-pattern-clips <input.flp> <output.flp> <arrangement-id> <left-clip-index> <right-clip-index>\n",
             "  flp-rebuild merge-pattern-clips <input.flp> <output.flp> <arrangement-id> <clip-index,clip-index,...>\n",
             "  flp-rebuild slip-audio-clip <input.flp> <output.flp> <arrangement-id> <clip-index> <delta-ms> <sample-length-ms>\n",
@@ -3216,6 +3227,28 @@ fn join_audio_clips(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "joined arrangement {arrangement_id} Audio Clips {left_clip_index} and {right_clip_index} as clip {joined_clip_index} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn make_audio_clip_unique(
+    input: &Path,
+    output: &Path,
+    arrangement_id: u16,
+    clip_index: usize,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let channel_id = document
+        .make_playlist_audio_clip_unique(arrangement_id, clip_index)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "made arrangement {arrangement_id} Audio Clip {clip_index} unique as channel {channel_id} in {}",
         output.display()
     );
     Ok(())

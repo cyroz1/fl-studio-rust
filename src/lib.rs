@@ -4731,6 +4731,148 @@ impl FlpDocument {
         Ok(())
     }
 
+    /// Makes one Playlist Audio Clip use its own copied kind-4 channel record.
+    ///
+    /// The sample path and all opaque channel events are copied byte-for-byte. Only the new
+    /// channel marker and the selected clip's item index change. The source channel and every
+    /// other Playlist clip remain attached to their original channel.
+    pub fn make_playlist_audio_clip_unique(
+        &mut self,
+        arrangement_id: u16,
+        clip_index: usize,
+    ) -> Result<u16, FlpError> {
+        let arrangements = self.arrangements()?;
+        let mut matching_arrangements = arrangements
+            .iter()
+            .filter(|arrangement| arrangement.id == arrangement_id);
+        let Some(arrangement) = matching_arrangements.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested arrangement does not exist",
+            ));
+        };
+        if matching_arrangements.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested arrangement id is ambiguous",
+            ));
+        }
+        let Some(clip) = arrangement.clips.get(clip_index) else {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested playlist clip does not exist",
+            ));
+        };
+        let PlaylistClipTarget::Channel { id: source_id } = clip.target() else {
+            return Err(FlpError::UnsupportedEdit(
+                "Make unique applies to Playlist Audio Clips",
+            ));
+        };
+
+        let channels = self.channels();
+        let mut matching_channels = channels.iter().filter(|channel| channel.id() == source_id);
+        let Some(source_channel) = matching_channels.next() else {
+            return Err(FlpError::ChannelNotFound(source_id));
+        };
+        if matching_channels.next().is_some() {
+            return Err(FlpError::AmbiguousChannelId(source_id));
+        }
+        if source_channel.kind() != Some(4) {
+            return Err(FlpError::UnsupportedEdit(
+                "Make unique applies to kind-4 Audio Clip channels",
+            ));
+        }
+
+        let source_range = source_channel.event_range();
+        let Some(source_marker) = self.events.get(source_range.start) else {
+            return Err(FlpError::UnsupportedEdit(
+                "the Audio Clip channel has no recognized channel marker",
+            ));
+        };
+        if source_marker.opcode != 0x40
+            || source_marker.encoding != PayloadEncoding::Word
+            || source_marker.payload.len() != 2
+            || u16::from_le_bytes([source_marker.payload[0], source_marker.payload[1]]) != source_id
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "the Audio Clip channel marker is not a recognized word event",
+            ));
+        }
+
+        let record_start = clip
+            .source_record_index
+            .checked_mul(clip.record_size)
+            .ok_or(FlpError::LengthOverflow)?;
+        let record_end = record_start
+            .checked_add(clip.record_size)
+            .ok_or(FlpError::LengthOverflow)?;
+        let source_clip_event =
+            self.events
+                .get(clip.source_event_index)
+                .ok_or(FlpError::UnsupportedEdit(
+                    "the Playlist Audio Clip record event no longer exists",
+                ))?;
+        if source_clip_event.opcode != 0xE9
+            || !matches!(source_clip_event.encoding, PayloadEncoding::Data { .. })
+            || clip.record_size == 0
+            || record_end > source_clip_event.payload.len()
+            || !source_clip_event
+                .payload
+                .len()
+                .is_multiple_of(clip.record_size)
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "the Playlist Audio Clip record is not recognized",
+            ));
+        }
+
+        let used_ids = channels
+            .iter()
+            .map(ChannelSummary::id)
+            .collect::<HashSet<_>>();
+        let new_id = used_ids
+            .iter()
+            .copied()
+            .filter(|id| *id < clip.pattern_base)
+            .max()
+            .and_then(|id| id.checked_add(1))
+            .filter(|id| *id < clip.pattern_base && !used_ids.contains(id))
+            .or_else(|| (0..clip.pattern_base).find(|id| !used_ids.contains(id)))
+            .ok_or(FlpError::UnsupportedEdit(
+                "the project has no unused channel ID below this clip's pattern base",
+            ))?;
+        let insertion_index = channels
+            .last()
+            .map(|channel| channel.event_range().end)
+            .unwrap_or(self.events.len());
+        if insertion_index > self.events.len() {
+            return Err(FlpError::UnsupportedEdit(
+                "Channel Rack event ranges are inconsistent",
+            ));
+        }
+        let channel_count = u16::try_from(channels.len().saturating_add(1)).map_err(|_| {
+            FlpError::UnsupportedEdit("the project has too many channels to make one unique")
+        })?;
+
+        let mut copied_events = self.events[source_range].to_vec();
+        copied_events[0] = FlpEvent::new_word(0x40, new_id);
+        let mut candidate = self.clone();
+        write_event_payload_bytes(
+            candidate
+                .events
+                .get_mut(clip.source_event_index)
+                .ok_or(FlpError::UnsupportedEdit(
+                    "the Playlist Audio Clip record event no longer exists",
+                ))?,
+            record_start + 6,
+            &new_id.to_le_bytes(),
+        )?;
+        candidate
+            .events
+            .splice(insertion_index..insertion_index, copied_events);
+        candidate.header.legacy_channel_count = channel_count;
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(new_id)
+    }
+
     /// Creates a Pattern Clip from a recognized Playlist record in the target arrangement.
     /// For an empty arrangement, a Pattern Clip record from another arrangement is reused.
     /// Position, item index, length, track, and (when present) clip ID are assigned; other
@@ -13673,6 +13815,98 @@ mod tests {
             .expect("edited project should encode");
         let reparsed = FlpDocument::parse(&encoded).expect("edited project should parse");
         assert_eq!(reparsed.arrangements().unwrap()[0].clips.len(), 3);
+    }
+
+    #[test]
+    fn makes_one_playlist_audio_clip_unique_without_rewriting_its_source_or_other_clips() {
+        let mut document = audio_clip_fixture();
+        let source_channel = document.channels()[0].clone();
+        let source_channel_events = source_channel
+            .event_range()
+            .map(|index| document.events()[index].wire_bytes().to_vec())
+            .collect::<Vec<_>>();
+        let added_index = document
+            .create_playlist_audio_clip(3, 9, 3_840, 720, 4)
+            .expect("the source Audio Clip should be duplicable");
+        assert_eq!(added_index, 2);
+        let added_record_before = document.events()
+            [document.arrangements().unwrap()[0].clips[added_index].source_event_index]
+            .payload()[160..240]
+            .to_vec();
+        let original_audio_record = document.events()
+            [document.arrangements().unwrap()[0].clips[1].source_event_index]
+            .payload()[80..160]
+            .to_vec();
+
+        let channel_id = document
+            .make_playlist_audio_clip_unique(3, added_index)
+            .expect("the copied Audio Clip should receive a unique channel");
+
+        assert_eq!(channel_id, 10);
+        assert_eq!(document.header().legacy_channel_count(), 2);
+        let channels = document.channels();
+        assert_eq!(channels.len(), 2);
+        assert_eq!(channels[0].id(), 9);
+        assert_eq!(channels[1].id(), channel_id);
+        assert_eq!(channels[1].kind(), Some(4));
+        assert_eq!(channels[1].sample_path(), Some("/samples/recording.wav"));
+
+        let copied_channel_events = channels[1]
+            .event_range()
+            .map(|index| document.events()[index].wire_bytes().to_vec())
+            .collect::<Vec<_>>();
+        let mut expected_copied_events = source_channel_events;
+        expected_copied_events[0] = [0x40, 10, 0].to_vec();
+        assert_eq!(copied_channel_events, expected_copied_events);
+
+        let arrangements = document.arrangements().unwrap();
+        let clips = &arrangements[0].clips;
+        assert_eq!(clips.len(), 3);
+        assert_eq!(clips[0].target(), PlaylistClipTarget::Pattern { id: 7 });
+        assert_eq!(clips[1].target(), PlaylistClipTarget::Channel { id: 9 });
+        assert_eq!(
+            clips[2].target(),
+            PlaylistClipTarget::Channel { id: channel_id }
+        );
+        assert_eq!(clips[2].position_ticks, 3_840);
+        assert_eq!(clips[2].length_ticks, 720);
+        assert_eq!(clips[2].track_index, Some(4));
+        assert_eq!(clips[2].clip_id, Some(3));
+
+        let clip_event = document
+            .events()
+            .iter()
+            .find(|event| event.opcode() == 0xE9)
+            .expect("the Playlist clip event should remain present");
+        assert_eq!(&clip_event.payload()[80..160], original_audio_record);
+        let mut expected_added_record = added_record_before;
+        expected_added_record[6..8].copy_from_slice(&channel_id.to_le_bytes());
+        assert_eq!(&clip_event.payload()[160..240], expected_added_record);
+
+        let encoded = document
+            .encode_lossless()
+            .expect("the project with a unique Audio Clip should encode");
+        let reparsed = FlpDocument::parse(&encoded).expect("the updated project should parse");
+        assert_eq!(
+            reparsed.channels()[1].sample_path(),
+            Some("/samples/recording.wav")
+        );
+        assert_eq!(
+            reparsed.arrangements().unwrap()[0].clips[2].target(),
+            PlaylistClipTarget::Channel { id: channel_id }
+        );
+    }
+
+    #[test]
+    fn make_unique_rejects_pattern_clips_without_mutating_the_project() {
+        let mut document = audio_clip_fixture();
+        let original = document.encode_lossless().unwrap();
+
+        assert!(matches!(
+            document.make_playlist_audio_clip_unique(3, 0),
+            Err(FlpError::UnsupportedEdit(_))
+        ));
+        assert_eq!(document.encode_lossless().unwrap(), original);
     }
 
     #[test]
