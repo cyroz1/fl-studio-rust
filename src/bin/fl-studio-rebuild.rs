@@ -17921,8 +17921,17 @@ impl DawUi {
         }
         match result {
             Ok(summary) => {
+                self.mixer_insert_peak_holds.fill(0.0);
+                let insert_peaks = summary.mixer_insert_peaks.as_deref().unwrap_or_default();
+                for insert_peak in insert_peaks {
+                    if let Some(peak_hold) =
+                        self.mixer_insert_peak_holds.get_mut(insert_peak.track())
+                    {
+                        *peak_hold = insert_peak.peak().max(*peak_hold);
+                    }
+                }
                 self.status = format!(
-                    "Rendered {} audio clips, {} Sampler clips ({} notes), and {} VST3 channels ({} notes) to {} at {} Hz; {} plug-in channels unloaded, {} scaled audio and {} scaled pattern clips skipped. Mixer effects and automation were not rendered",
+                    "Rendered {} audio clips, {} Sampler clips ({} notes), and {} VST3 channels ({} notes) to {} at {} Hz; {} plug-in channels unloaded, {} scaled audio and {} scaled pattern clips skipped. Measured pre-effect peaks for {} Mixer inserts; effects and automation were not rendered",
                     summary.audio_clips_rendered,
                     summary.sampler_pattern_clips_rendered,
                     summary.sampler_notes_rendered,
@@ -17933,6 +17942,7 @@ impl DawUi {
                     summary.vst3_plugin_channels_unloaded,
                     summary.audio_clips_skipped_unsupported_scale,
                     summary.pattern_clips_skipped_unsupported_scale,
+                    insert_peaks.len(),
                 );
             }
             Err(error) => self.status = format!("Could not render Playlist mix: {error}"),

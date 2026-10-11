@@ -642,12 +642,29 @@ impl<'a> PlaylistStreamMonitor<'a> {
         }
     }
 
-    /// Stream from a frame and publish peaks for recognized direct insert routes.
+    /// Stream from a frame and publish peaks for supported direct and send insert routes.
     pub const fn with_meters(start_frame: u64, meters: &'a MixerTrackPeakMeters) -> Self {
         Self {
             start_frame,
             meters: Some(meters),
         }
+    }
+}
+
+/// Peak sample amplitude recorded at a supported non-Master insert's pre-effect meter tap.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MixerInsertPeak {
+    track: usize,
+    peak_bits: u32,
+}
+
+impl MixerInsertPeak {
+    pub const fn track(self) -> usize {
+        self.track
+    }
+
+    pub fn peak(self) -> f32 {
+        f32::from_bits(self.peak_bits)
     }
 }
 
@@ -666,6 +683,20 @@ pub struct PlaylistRenderSummary {
     pub vst3_plugin_channels_rendered: usize,
     pub vst3_notes_rendered: usize,
     pub vst3_plugin_channels_unloaded: usize,
+    /// Non-zero supported insert peaks from a full-song offline render; `None` for live streams.
+    pub mixer_insert_peaks: Option<Vec<MixerInsertPeak>>,
+}
+
+fn take_mixer_insert_peaks(meters: &MixerTrackPeakMeters) -> Vec<MixerInsertPeak> {
+    (1..MIXER_TRACK_METER_COUNT)
+        .filter_map(|track| {
+            let peak = meters.take_peak(track);
+            (peak > 0.0).then_some(MixerInsertPeak {
+                track,
+                peak_bits: peak.to_bits(),
+            })
+        })
+        .collect()
 }
 
 /// Render audio-channel Playlist clips into a WAV using the selected bit depth and channel mode.
@@ -917,7 +948,7 @@ pub fn stream_playlist_with_vst3_to_device_from_frame(
     )
 }
 
-/// Stream a Playlist from a seek position and publish supported direct-route insert peaks.
+/// Stream a Playlist from a seek position and publish supported insert-route peaks.
 pub fn stream_playlist_with_vst3_to_device_with_monitor(
     document: &FlpDocument,
     project_path: impl AsRef<Path>,
@@ -1022,6 +1053,7 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
         vst3_plugin_channels_unloaded: vst3_summary
             .as_ref()
             .map_or(0, |summary| summary.unloaded_plugin_channels.len()),
+        mixer_insert_peaks: None,
     };
 
     let mut frames_to_skip = start_frame.min(frames);
@@ -1051,8 +1083,10 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
 /// does not determine the in-memory mix size. The recognized Master mute, polarity, and stereo-swap
 /// flags are applied to the final mix. Linear Playlist tempo automation is applied to audio,
 /// Sampler, and VST3 event timing. Automatic PDC aligns supported direct-to-Master sources using
-/// loaded VST3 instrument latency. Insert routing, effects, parameter automation, manual PDC, and
-/// effect/send-chain latency compensation are not applied.
+/// loaded VST3 instrument latency. Supported direct and paired send routes apply recognized
+/// insert mute/solo and signal transforms; the summary includes their pre-effect insert peaks.
+/// Effect processing, parameter automation, manual PDC, sidechain routing, and PDC through effect
+/// or send chains remain unsupported.
 pub fn render_playlist_with_vst3_to_wav_cancellable(
     document: &FlpDocument,
     project_path: impl AsRef<Path>,
@@ -1260,8 +1294,10 @@ fn render_playlist_with_vst3_cancellable(
         vst3_plugin_channels_unloaded: vst3_summary
             .as_ref()
             .map_or(0, |summary| summary.unloaded_plugin_channels.len()),
+        mixer_insert_peaks: Some(Vec::new()),
     };
 
+    let mixer_track_meters = MixerTrackPeakMeters::default();
     let mut temporary = TemporaryRenderFile::create(output_path)?;
     let file = temporary
         .file
@@ -1302,7 +1338,7 @@ fn render_playlist_with_vst3_cancellable(
                     master_output,
                     vst3_processor: vst3_processor.as_mut(),
                 },
-                None,
+                Some(&mixer_track_meters),
                 cancelled,
                 || false,
                 |block| {
@@ -1335,7 +1371,7 @@ fn render_playlist_with_vst3_cancellable(
                     master_output,
                     vst3_processor: vst3_processor.as_mut(),
                 },
-                None,
+                Some(&mixer_track_meters),
                 cancelled,
                 || false,
                 |block| encoder.write_stereo_block(block, options.wav_channel_mode),
@@ -1358,7 +1394,7 @@ fn render_playlist_with_vst3_cancellable(
                     master_output,
                     vst3_processor: vst3_processor.as_mut(),
                 },
-                None,
+                Some(&mixer_track_meters),
                 cancelled,
                 || false,
                 |block| encoder.write_stereo_block(block),
@@ -1381,7 +1417,7 @@ fn render_playlist_with_vst3_cancellable(
                     master_output,
                     vst3_processor: vst3_processor.as_mut(),
                 },
-                None,
+                Some(&mixer_track_meters),
                 cancelled,
                 || false,
                 |block| encoder.write_stereo_block(block),
@@ -1389,6 +1425,7 @@ fn render_playlist_with_vst3_cancellable(
             encoder.finalize()?;
         }
     }
+    summary.mixer_insert_peaks = Some(take_mixer_insert_peaks(&mixer_track_meters));
     temporary.commit(output_path)?;
     Ok(summary)
 }
@@ -5451,6 +5488,34 @@ mod tests {
         assert_eq!(meters.take_peak(1), 3.5);
         assert_eq!(meters.take_peak(2), 1.75);
         assert_eq!(meters.take_peak(1), 0.0);
+    }
+
+    #[test]
+    fn offline_mixer_peak_summary_keeps_non_master_signal_peaks() {
+        let meters = MixerTrackPeakMeters::default();
+        meters.publish_peak(0, 2.0);
+        meters.publish_peak(2, 0.75);
+        meters.publish_peak(4, 1.5);
+
+        let peaks = take_mixer_insert_peaks(&meters);
+
+        assert_eq!(
+            peaks,
+            vec![
+                MixerInsertPeak {
+                    track: 2,
+                    peak_bits: 0.75_f32.to_bits(),
+                },
+                MixerInsertPeak {
+                    track: 4,
+                    peak_bits: 1.5_f32.to_bits(),
+                },
+            ]
+        );
+        assert_eq!(peaks[0].track(), 2);
+        assert_eq!(peaks[0].peak(), 0.75);
+        assert_eq!(peaks[1].track(), 4);
+        assert_eq!(peaks[1].peak(), 1.5);
     }
 
     #[test]
