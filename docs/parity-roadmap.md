@@ -342,7 +342,7 @@ are applied where the Mixer rows below describe. Full export surface:
   settings; these exports are separate files and do not add an Audio Clip, apply
   all native render options, or include complete Mixer routing/effects ([Image-Line
   Patterns manual](https://www.image-line.com/fl-studio-learning-content/fl-studio-online-manual/html/menu_patterns.htm)).
-- `[todo]` Burn to CD-era options: skip (obsolete)
+- `[obsolete]` Burn to CD-era options.
 
 ---
 
