@@ -437,7 +437,7 @@ jobs:
           sleep 0.4
           ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
             -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/piano-roll-chord-stamp-toolbar.png"
-          xdotool mousemove 1140 158 click 1
+          xdotool mousemove 600 192 click 1
           sleep 0.5
           ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
             -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/piano-roll-chord-stamps.png"

@@ -15112,29 +15112,6 @@ impl DawUi {
                     }
                 }
             });
-            if self.piano_roll_stamp_mode {
-                egui::ComboBox::from_id_salt("piano-roll-chord-stamp")
-                    .selected_text(format!("Chord: {}", self.piano_roll_chord_stamp.label()))
-                    .show_ui(ui, |ui| {
-                        let all_stamps = PianoRollChordStamp::ALL;
-                        for (heading, stamps) in [
-                            ("Basic", &all_stamps[..10]),
-                            ("Advanced", &all_stamps[10..27]),
-                            ("Scale-derived", &all_stamps[27..29]),
-                            ("Top-down", &all_stamps[29..]),
-                        ] {
-                            ui.weak(heading);
-                            for &stamp in stamps {
-                                ui.selectable_value(
-                                    &mut self.piano_roll_chord_stamp,
-                                    stamp,
-                                    stamp.label(),
-                                );
-                            }
-                            ui.separator();
-                        }
-                    });
-            }
             ui.menu_button("Edit", |ui| {
                 if ui
                     .checkbox(
@@ -16168,6 +16145,29 @@ impl DawUi {
                     ui.close();
                 }
             });
+            if self.piano_roll_stamp_mode {
+                egui::ComboBox::from_id_salt("piano-roll-chord-stamp")
+                    .selected_text(format!("Chord: {}", self.piano_roll_chord_stamp.label()))
+                    .show_ui(ui, |ui| {
+                        let all_stamps = PianoRollChordStamp::ALL;
+                        for (heading, stamps) in [
+                            ("Basic", &all_stamps[..10]),
+                            ("Advanced", &all_stamps[10..27]),
+                            ("Scale-derived", &all_stamps[27..29]),
+                            ("Top-down", &all_stamps[29..]),
+                        ] {
+                            ui.weak(heading);
+                            for &stamp in stamps {
+                                ui.selectable_value(
+                                    &mut self.piano_roll_chord_stamp,
+                                    stamp,
+                                    stamp.label(),
+                                );
+                            }
+                            ui.separator();
+                        }
+                    });
+            }
             if selected_note_count > 0 {
                 ui.small(format!("{selected_note_count} selected"));
             }
