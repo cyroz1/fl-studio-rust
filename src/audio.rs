@@ -57,7 +57,7 @@ impl StereoFrameDelay {
         if self.frames.is_empty() {
             return Ok(());
         }
-        for frame in samples.chunks_exact_mut(2) {
+        for frame in samples.as_chunks_mut::<2>().0 {
             let delayed = self.frames[self.cursor];
             self.frames[self.cursor] = [frame[0], frame[1]];
             frame.copy_from_slice(&delayed);
