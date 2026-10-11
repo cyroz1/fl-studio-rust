@@ -1266,10 +1266,12 @@ enum PianoRollChordStamp {
     Minor7,
     ScaleTriad,
     ScaleSeventh,
+    TopDownTriad,
+    TopDownSeventh,
 }
 
 impl PianoRollChordStamp {
-    const ALL: [Self; 12] = [
+    const ALL: [Self; 14] = [
         Self::Major,
         Self::Minor,
         Self::Diminished,
@@ -1282,6 +1284,8 @@ impl PianoRollChordStamp {
         Self::Minor7,
         Self::ScaleTriad,
         Self::ScaleSeventh,
+        Self::TopDownTriad,
+        Self::TopDownSeventh,
     ];
 
     fn label(self) -> &'static str {
@@ -1298,10 +1302,15 @@ impl PianoRollChordStamp {
             Self::Minor7 => "Minor 7",
             Self::ScaleTriad => "Scale triad",
             Self::ScaleSeventh => "Scale seventh",
+            Self::TopDownTriad => "Top-down triad",
+            Self::TopDownSeventh => "Top-down seventh",
         }
     }
 
     fn pitches(self, root_key: u16, scale: PianoRollScale, scale_root: u8) -> Vec<u16> {
+        if let Some(note_count) = self.top_down_note_count() {
+            return scale_chord_pitches_from_top(root_key, scale, scale_root, note_count);
+        }
         let intervals: &[u8] = match self {
             Self::Major => &[0, 4, 7],
             Self::Minor => &[0, 3, 7],
@@ -1314,6 +1323,7 @@ impl PianoRollChordStamp {
             Self::Major7 => &[0, 4, 7, 11],
             Self::Minor7 => &[0, 3, 7, 10],
             Self::ScaleTriad | Self::ScaleSeventh => &[],
+            Self::TopDownTriad | Self::TopDownSeventh => unreachable!(),
         };
         if !intervals.is_empty() {
             return intervals
@@ -1361,6 +1371,72 @@ impl PianoRollChordStamp {
             })
             .filter(|key| *key <= 127)
             .collect()
+    }
+
+    fn top_down_note_count(self) -> Option<usize> {
+        match self {
+            Self::TopDownTriad => Some(3),
+            Self::TopDownSeventh => Some(4),
+            _ => None,
+        }
+    }
+}
+
+fn scale_chord_pitches_from_top(
+    top_key: u16,
+    scale: PianoRollScale,
+    scale_root: u8,
+    note_count: usize,
+) -> Vec<u16> {
+    let scale = if scale == PianoRollScale::None {
+        PianoRollScale::Major
+    } else {
+        scale
+    };
+    let intervals = scale.intervals();
+    if intervals.is_empty() || note_count == 0 {
+        return Vec::new();
+    }
+    let Some(top_key) = (0..=127u16)
+        .filter(|key| scale.contains(*key, scale_root))
+        .min_by_key(|key| key.abs_diff(top_key))
+    else {
+        return Vec::new();
+    };
+    let relative_pitch_class =
+        match u8::try_from((top_key % 12 + 12 - u16::from(scale_root % 12)) % 12) {
+            Ok(pitch_class) => pitch_class,
+            Err(_) => return Vec::new(),
+        };
+    let Some(top_degree) = intervals
+        .iter()
+        .position(|interval| *interval == relative_pitch_class)
+    else {
+        return Vec::new();
+    };
+    let scale_anchor = i32::from(top_key) - i32::from(intervals[top_degree]);
+    let Ok(scale_len) = i32::try_from(intervals.len()) else {
+        return Vec::new();
+    };
+    let pitches = (0..note_count)
+        .filter_map(|voice| {
+            let scale_index =
+                i32::try_from(top_degree).ok()? - i32::try_from(voice).ok()?.saturating_mul(2);
+            let octave_offset = scale_index.div_euclid(scale_len);
+            let degree = usize::try_from(scale_index.rem_euclid(scale_len)).ok()?;
+            let key = scale_anchor + octave_offset * 12 + i32::from(intervals[degree]);
+            if !(0..=127).contains(&key) {
+                return None;
+            }
+            u16::try_from(key).ok()
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if pitches.len() == note_count {
+        pitches
+    } else {
+        Vec::new()
     }
 }
 
@@ -20193,11 +20269,21 @@ impl DawUi {
                     self.piano_roll_scale,
                     self.piano_roll_scale_root,
                 );
-                notes_to_add.extend(chord_pitches.into_iter().map(|key| {
-                    let mut note = root_note.clone();
-                    note.key = key;
-                    note
-                }));
+                if self
+                    .piano_roll_chord_stamp
+                    .top_down_note_count()
+                    .is_some_and(|expected| chord_pitches.len() < expected)
+                {
+                    self.status =
+                        "Top-down chord needs more MIDI pitch range below the clicked note"
+                            .to_owned();
+                } else {
+                    notes_to_add.extend(chord_pitches.into_iter().map(|key| {
+                        let mut note = root_note.clone();
+                        note.key = key;
+                        note
+                    }));
+                }
             }
             if self.piano_roll_paint_mode
                 && !(self.piano_roll_select_mode || self.piano_roll_zoom_mode || modifiers.command)
@@ -28162,17 +28248,17 @@ mod tests {
 
     use super::{
         ActivePlaylistClipDrag, Arrangement, ChannelDisplayFilter, DetectedPianoRollScale,
-        FlpDocument, Pattern, PatternController, PatternNote, PianoRollGrid, PianoRollScale,
-        PianoRollSnap, PlaylistClip, PlaylistClipDragKind, PlaylistTempoMap, PlaylistTrack,
-        PluginCandidate, PluginFormat, TimeSelectionShift, candidate_matches_vst_identity,
-        candidate_mixer_controls, candidate_mixer_stereo_separation, detect_chord_name,
-        detect_piano_roll_channel_scale, detect_piano_roll_scale, encode_midi_device_selections,
-        first_available_playlist_track, next_piano_roll_note_group, note_from_grid_position,
-        parse_midi_device_selections, piano_roll_color_group_note_ids,
-        piano_roll_controller_stroke_points, piano_roll_controller_value_at,
-        piano_roll_controller_value_range, piano_roll_discard_length_edit,
-        piano_roll_duplicate_offset, piano_roll_key_at_y, piano_roll_note_group_members,
-        piano_roll_note_nudge_edit, piano_roll_odd_note_selection,
+        FlpDocument, Pattern, PatternController, PatternNote, PianoRollChordStamp, PianoRollGrid,
+        PianoRollScale, PianoRollSnap, PlaylistClip, PlaylistClipDragKind, PlaylistTempoMap,
+        PlaylistTrack, PluginCandidate, PluginFormat, TimeSelectionShift,
+        candidate_matches_vst_identity, candidate_mixer_controls,
+        candidate_mixer_stereo_separation, detect_chord_name, detect_piano_roll_channel_scale,
+        detect_piano_roll_scale, encode_midi_device_selections, first_available_playlist_track,
+        next_piano_roll_note_group, note_from_grid_position, parse_midi_device_selections,
+        piano_roll_color_group_note_ids, piano_roll_controller_stroke_points,
+        piano_roll_controller_value_at, piano_roll_controller_value_range,
+        piano_roll_discard_length_edit, piano_roll_duplicate_offset, piano_roll_key_at_y,
+        piano_roll_note_group_members, piano_roll_note_nudge_edit, piano_roll_odd_note_selection,
         piano_roll_overlap_note_selection, piano_roll_pitch_range_note_selection,
         piano_roll_random_note_selection, piano_roll_selection_time_range,
         piano_roll_shift_time_range, piano_roll_time_range_from_drag,
@@ -28296,6 +28382,32 @@ mod tests {
         assert_eq!(detect_chord_name(&major_ninth, 2, 96), "C maj9");
         assert_eq!(detect_chord_name(&c_sixth, 2, 96), "C 6");
         assert_eq!(detect_chord_name(&a_minor_seventh, 2, 96), "A m7");
+    }
+
+    #[test]
+    fn piano_roll_top_down_chord_stamps_keep_the_clicked_pitch_on_top() {
+        assert_eq!(
+            PianoRollChordStamp::TopDownTriad.pitches(64, PianoRollScale::Major, 0),
+            vec![57, 60, 64],
+        );
+        assert_eq!(
+            PianoRollChordStamp::TopDownSeventh.pitches(64, PianoRollScale::Major, 0),
+            vec![53, 57, 60, 64],
+        );
+        assert_eq!(
+            PianoRollChordStamp::TopDownTriad.pitches(69, PianoRollScale::Major, 2),
+            vec![62, 66, 69],
+        );
+        assert_eq!(
+            PianoRollChordStamp::TopDownTriad.pitches(64, PianoRollScale::None, 0),
+            vec![57, 60, 64],
+            "an unset scale falls back to the selected key's major scale",
+        );
+        assert_eq!(
+            PianoRollChordStamp::TopDownTriad.pitches(0, PianoRollScale::Major, 0),
+            Vec::<u16>::new(),
+            "the lowest MIDI key cannot fit a chord underneath it",
+        );
     }
 
     #[test]
