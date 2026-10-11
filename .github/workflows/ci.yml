@@ -245,7 +245,7 @@ jobs:
                   0,
               )
 
-          note_records = pattern_note(0, 60) + pattern_note(1, 64)
+          note_records = pattern_note(0, 60) + pattern_note(0, 67) + pattern_note(1, 64)
           pattern_events = (
               bytes([0x40, 0, 0, 0x40, 1, 0, 0x41, 7, 0])
               + data_event(0xD0, note_records)
@@ -336,14 +336,27 @@ jobs:
           ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
             -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/controller-ghost-visibility.png"
           xdotool key Escape
+          xdotool mousemove 400 192 click 1
+          sleep 0.3
+          xdotool mousemove 500 292 click 1
+          sleep 0.5
+          ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
+            -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/controller-ghost-editable.png"
+          xdotool key Escape
           xdotool mousemove 900 500 click 1
           xdotool key ctrl+alt+v
           sleep 0.5
           xdotool mousemove 400 192 click 1
           sleep 0.5
           ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
-            -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/controller-ghost-editable.png"
+            -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/controller-ghost-editable-shortcut.png"
           xdotool key Escape
+          xdotool mousemove 410 556 click 1
+          sleep 0.3
+          xdotool key shift+c
+          sleep 0.5
+          ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
+            -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/controller-color-selection.png"
           xdotool mousemove 455 741 click 1
           sleep 0.3
           xdotool mousemove 440 720 click 1
@@ -364,7 +377,7 @@ jobs:
           fi
           for capture in browser-search-options.png playlist-solo.png playlist-group-solo.png playlist-groups-collapsed.png \
             mixer.png mixer-muted.png mixer-muted-solo.png mixer-phase-swap.png controller-ghost-visibility.png \
-            controller-ghost-editable.png; do
+            controller-ghost-editable.png controller-ghost-editable-shortcut.png controller-color-selection.png; do
             if [[ "$(stat -c%s "$GITHUB_WORKSPACE/dist/gui-preview/$capture")" -lt 10000 ]]; then
               echo "The $capture capture is blank or incomplete."
               cat "$RUNNER_TEMP/mixer-preview.log"

@@ -12154,6 +12154,65 @@ impl DawUi {
         };
     }
 
+    fn select_piano_roll_color_group(&mut self) {
+        let Some((pattern_id, channel_id)) = self.selected_pattern.zip(self.selected_note_channel)
+        else {
+            self.status = "Select a note before selecting its color group".to_owned();
+            return;
+        };
+        let Some(selected_note_index) = self.selected_piano_notes.iter().find_map(
+            |(selected_pattern, selected_channel, note_index)| {
+                (*selected_pattern == pattern_id && *selected_channel == channel_id)
+                    .then_some(*note_index)
+            },
+        ) else {
+            self.status = "Select a note before selecting its color group".to_owned();
+            return;
+        };
+        let Some((color_group, note_ids)) = self
+            .document
+            .as_ref()
+            .and_then(|document| document.patterns().ok())
+            .and_then(|patterns| {
+                patterns
+                    .iter()
+                    .find(|pattern| pattern.id == pattern_id)
+                    .and_then(|pattern| {
+                        let channel_notes = pattern
+                            .notes
+                            .iter()
+                            .filter(|note| note.channel_id == channel_id)
+                            .collect::<Vec<_>>();
+                        let color_group = channel_notes
+                            .get(selected_note_index)
+                            .map(|note| note.midi_channel & 0x0f)?;
+                        Some((
+                            color_group,
+                            channel_notes
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, note)| note.midi_channel & 0x0f == color_group)
+                                .map(|(note_index, _)| (pattern_id, channel_id, note_index))
+                                .collect::<Vec<_>>(),
+                        ))
+                    })
+            })
+        else {
+            self.status = "The selected note's color group has no matching notes".to_owned();
+            return;
+        };
+        self.selected_piano_notes.clear();
+        self.selected_piano_notes.extend(note_ids);
+        self.selected_note = self.selected_piano_notes.iter().next_back().copied();
+        self.piano_roll_selection_drag = None;
+        self.active_note_drag = None;
+        self.status = format!(
+            "Selected {} notes in color group {}",
+            color_group + 1,
+            self.selected_piano_notes.len()
+        );
+    }
+
     fn set_selected_piano_roll_note_group(&mut self, grouped: bool) {
         let Some(pattern_id) = self.selected_pattern else {
             self.status = "Select a Pattern before grouping notes".to_owned();
@@ -12469,6 +12528,8 @@ impl DawUi {
                 ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::A));
             let invert_note_selection =
                 ui.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::I));
+            let select_color_group =
+                ui.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::C));
             let clear_note_selection =
                 ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::D));
             duplicate_notes_requested =
@@ -12495,6 +12556,9 @@ impl DawUi {
                 self.apply_piano_roll_selection_command(PianoRollSelectionCommand::Invert);
             } else if clear_note_selection {
                 self.apply_piano_roll_selection_command(PianoRollSelectionCommand::Clear);
+            }
+            if select_color_group {
+                self.select_piano_roll_color_group();
             }
             if cycle_event_target {
                 let current = PianoRollEventTarget::ALL
@@ -12707,6 +12771,16 @@ impl DawUi {
             ui.menu_button("Selection", |ui| {
                 if ui.button("Select all notes (Ctrl/Cmd+A)").clicked() {
                     self.apply_piano_roll_selection_command(PianoRollSelectionCommand::All);
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        selected_note_count > 0,
+                        egui::Button::new("Select same color group (Shift+C)"),
+                    )
+                    .clicked()
+                {
+                    self.select_piano_roll_color_group();
                     ui.close();
                 }
                 if ui.button("Invert selection (Shift+I)").clicked() {
