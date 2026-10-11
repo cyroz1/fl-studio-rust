@@ -1974,8 +1974,7 @@ struct AudioRecordingSession {
     output_path: PathBuf,
     arrangement_id: u16,
     start_tick: u32,
-    tempo_bpm: f64,
-    ppq: u16,
+    tempo_map: PlaylistTempoMap,
     project_generation: u64,
     capture_active: bool,
 }
@@ -20963,11 +20962,15 @@ impl DawUi {
             .unwrap_or(0.0)
             .round()
             .clamp(0.0, f64::from(u32::MAX)) as u32;
-        let (tempo_bpm, ppq, project_generation) = (
-            self.tempo_bpm,
-            document.header().ppq().max(1),
-            self.project_generation,
-        );
+        let tempo_map = match PlaylistTempoMap::for_arrangement(document, arrangement_id) {
+            Ok(tempo_map) => tempo_map,
+            Err(error) => {
+                self.status =
+                    format!("Could not prepare Playlist tempo map for recording: {error}");
+                return;
+            }
+        };
+        let project_generation = self.project_generation;
         let recording = match engine.start_input_recording() {
             Ok(recording) => recording,
             Err(error) => {
@@ -20998,8 +21001,7 @@ impl DawUi {
             output_path: output_path.clone(),
             arrangement_id,
             start_tick,
-            tempo_bpm,
-            ppq,
+            tempo_map,
             project_generation,
             capture_active: true,
         });
@@ -21109,17 +21111,25 @@ impl DawUi {
                 return;
             }
         };
-        let Some(length_ticks) = audio_recording_length_ticks(
-            summary.frames,
-            summary.sample_rate,
-            session.ppq,
-            session.tempo_bpm,
-        ) else {
-            self.status = format!(
-                "Saved {}, but its duration does not fit the Playlist",
-                session.output_path.display()
-            );
-            return;
+        let length_ticks = match session
+            .tempo_map
+            .ticks_for_audio_frames(
+                u64::from(session.start_tick),
+                summary.frames,
+                summary.sample_rate,
+            )
+            .and_then(|ticks| {
+                u32::try_from(ticks)
+                    .map_err(|_| "recorded audio is too long for this Playlist".to_owned())
+            }) {
+            Ok(length_ticks) => length_ticks,
+            Err(error) => {
+                self.status = format!(
+                    "Saved {}, but its duration does not fit the Playlist: {error}",
+                    session.output_path.display()
+                );
+                return;
+            }
         };
         if session.start_tick.checked_add(length_ticks).is_none() {
             self.status = format!(
@@ -25415,22 +25425,6 @@ fn playlist_seek_tick_to_frame(
     tempo_map.frame_at_tick(u64::from(tick), sample_rate)
 }
 
-fn audio_recording_length_ticks(
-    frames: u64,
-    sample_rate: u32,
-    ppq: u16,
-    tempo_bpm: f64,
-) -> Option<u32> {
-    if frames == 0 || sample_rate == 0 || !tempo_bpm.is_finite() || tempo_bpm <= 0.0 {
-        return None;
-    }
-    let ticks = frames as f64 * tempo_bpm * f64::from(ppq.max(1)) / (f64::from(sample_rate) * 60.0);
-    if !ticks.is_finite() || ticks.ceil() > f64::from(u32::MAX) {
-        return None;
-    }
-    Some((ticks.ceil() as u32).max(1))
-}
-
 fn first_available_playlist_track(
     arrangement: &Arrangement,
     start_tick: u32,
@@ -25759,13 +25753,12 @@ mod tests {
         ActivePlaylistClipDrag, Arrangement, ChannelDisplayFilter, FlpDocument, Pattern,
         PatternController, PatternNote, PianoRollGrid, PianoRollSnap, PlaylistClip,
         PlaylistClipDragKind, PlaylistTempoMap, PlaylistTrack, PluginCandidate, PluginFormat,
-        TimeSelectionShift, audio_recording_length_ticks, candidate_matches_vst_identity,
-        candidate_mixer_controls, encode_midi_device_selections, first_available_playlist_track,
-        next_piano_roll_note_group, note_from_grid_position, parse_midi_device_selections,
-        piano_roll_color_group_note_ids, piano_roll_controller_value_at,
-        piano_roll_controller_value_range, piano_roll_discard_length_edit,
-        piano_roll_duplicate_offset, piano_roll_key_at_y, piano_roll_note_group_members,
-        piano_roll_note_nudge_edit, piano_roll_odd_note_selection,
+        TimeSelectionShift, candidate_matches_vst_identity, candidate_mixer_controls,
+        encode_midi_device_selections, first_available_playlist_track, next_piano_roll_note_group,
+        note_from_grid_position, parse_midi_device_selections, piano_roll_color_group_note_ids,
+        piano_roll_controller_value_at, piano_roll_controller_value_range,
+        piano_roll_discard_length_edit, piano_roll_duplicate_offset, piano_roll_key_at_y,
+        piano_roll_note_group_members, piano_roll_note_nudge_edit, piano_roll_odd_note_selection,
         piano_roll_overlap_note_selection, piano_roll_pitch_range_note_selection,
         piano_roll_random_note_selection, piano_roll_selection_time_range,
         piano_roll_shift_time_range, piano_roll_time_range_from_drag,
@@ -26157,21 +26150,6 @@ mod tests {
             Some("/old/Example.vst3"),
             Some("Example"),
         ));
-    }
-
-    #[test]
-    fn recorded_wav_duration_maps_to_playlist_ticks_and_covers_the_audio() {
-        assert_eq!(
-            audio_recording_length_ticks(48_000, 48_000, 96, 120.0),
-            Some(192)
-        );
-        assert_eq!(audio_recording_length_ticks(1, 48_000, 96, 120.0), Some(1));
-        assert_eq!(audio_recording_length_ticks(0, 48_000, 96, 120.0), None);
-        assert_eq!(audio_recording_length_ticks(48_000, 0, 96, 120.0), None);
-        assert_eq!(
-            audio_recording_length_ticks(48_000, 48_000, 96, f64::NAN),
-            None
-        );
     }
 
     #[test]
