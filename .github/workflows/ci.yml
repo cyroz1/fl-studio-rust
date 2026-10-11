@@ -321,6 +321,13 @@ jobs:
             fi
             sleep 1
           done
+          controller_window=$(xdotool search --onlyvisible --name 'controller-preview.flp' | head -n 1 || true)
+          if [[ -z "$controller_window" ]]; then
+            echo "Could not find the controller preview window for keyboard interaction checks."
+            cat "$RUNNER_TEMP/controller-preview.log"
+            exit 1
+          fi
+          xdotool windowfocus --sync "$controller_window"
           xdotool key F7
           sleep 1
           xdotool mousemove 414 16 click 1
@@ -336,14 +343,18 @@ jobs:
           ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
             -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/controller-ghost-visibility.png"
           xdotool key Escape
+          xdotool key Escape
+          xdotool mousemove 900 500 click 1
+          sleep 0.2
+          xdotool windowfocus --sync "$controller_window"
+          xdotool key ctrl+alt+v
+          sleep 0.5
           xdotool mousemove 400 192 click 1
-          sleep 0.3
-          xdotool mousemove 500 292 click 1
           sleep 0.5
           ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
             -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/controller-ghost-editable.png"
           xdotool key Escape
-          xdotool mousemove 900 500 click 1
+          xdotool windowfocus --sync "$controller_window"
           xdotool key ctrl+alt+v
           sleep 0.5
           xdotool mousemove 400 192 click 1
@@ -353,6 +364,7 @@ jobs:
           xdotool key Escape
           xdotool mousemove 410 556 click 1
           sleep 0.3
+          xdotool windowfocus --sync "$controller_window"
           xdotool key shift+c
           sleep 0.5
           ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
