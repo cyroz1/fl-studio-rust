@@ -13368,8 +13368,8 @@ mod tests {
         PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation, PayloadEncoding,
         PlaylistClipEdit, PlaylistClipTarget, PlaylistTrackEdit, ProjectInfoEdit,
         ProjectSettingsEdit, RiffMachineOptions, RiffMachineQuantizeMode, ScaleLevelsOptions,
-        TimeMarkerEdit, apply_mixer_pan, midi::MidiChannelMapping, midi::MidiFile,
-        parse_vst_plugin_state_metadata, riff_machine_groove_note_timing,
+        TimeMarkerEdit, apply_mixer_pan, apply_mixer_stereo_separation, midi::MidiChannelMapping,
+        midi::MidiFile, parse_vst_plugin_state_metadata, riff_machine_groove_note_timing,
     };
 
     fn articulate_options(
