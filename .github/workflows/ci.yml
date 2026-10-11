@@ -227,7 +227,6 @@ jobs:
               + event_stream
           )
           Path(sys.argv[1]).write_bytes(project)
-
           controller_records = b"".join(
               struct.pack("<I2sBBf", position, b"\xA5\x5A", 2, 0x24, value)
               for position, value in [(0, 0.15), (192, 0.78), (384, 0.36), (576, 0.9)]
@@ -272,6 +271,17 @@ jobs:
           )
           Path(sys.argv[2]).write_bytes(controller_project)
           PY
+
+          mixer_summary=$(cargo run --quiet --release --bin flp-rebuild -- mixer "$RUNNER_TEMP/mixer-preview.flp")
+          printf '%s\n' "$mixer_summary"
+          if ! grep -Fq "recognized effect slot records: 10" <<< "$mixer_summary"; then
+            echo "The Mixer preview project did not decode all ten effect slots."
+            exit 1
+          fi
+          if ! grep -Fq "insert=0 slot=0 plugin=Fruity Parametric EQ 2 name=Drum EQ state_events=1" <<< "$mixer_summary"; then
+            echo "The Mixer preview effect was not assigned to slot zero."
+            exit 1
+          fi
 
           target/release/fl-studio-rebuild "$RUNNER_TEMP/mixer-preview.flp" \
             > "$RUNNER_TEMP/mixer-preview.log" 2>&1 &

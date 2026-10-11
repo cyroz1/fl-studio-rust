@@ -1868,6 +1868,7 @@ fn list_channels(path: &Path) -> Result<(), String> {
 fn list_mixer(path: &Path) -> Result<(), String> {
     let (_, document) = load_document(path)?;
     let inserts = document.mixer_inserts();
+    let effect_slots = document.mixer_effect_slots();
     let parameters = document
         .mixer_parameter_records()
         .map_err(|error| format!("could not decode Mixer parameter records: {error}"))?;
@@ -1882,6 +1883,17 @@ fn list_mixer(path: &Path) -> Result<(), String> {
             insert.color_raw(),
             insert.icon_raw(),
             insert.event_range()
+        );
+    }
+    println!("recognized effect slot records: {}", effect_slots.len());
+    for slot in effect_slots {
+        println!(
+            "insert={} slot={} plugin={} name={} state_events={}",
+            slot.insert_ordinal(),
+            slot.slot_index(),
+            slot.plugin_identifier().unwrap_or("(unknown)"),
+            slot.display_name().unwrap_or("(unnamed)"),
+            slot.state_event_count()
         );
     }
     let count_kind = |kind| {
