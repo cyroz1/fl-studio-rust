@@ -180,6 +180,32 @@ impl PlaylistTempoMap {
         ticks.is_finite().then_some(ticks.max(0.0))
     }
 
+    /// Convert an audio source's frame duration to a Playlist tick span at `start_tick`.
+    /// The sample rate is the source rate, so the source duration remains fixed in seconds
+    /// while the tick span changes with the arrangement tempo.
+    pub fn ticks_for_audio_frames(
+        &self,
+        start_tick: u64,
+        frame_count: u64,
+        sample_rate: u32,
+    ) -> Result<u64, String> {
+        if frame_count == 0 {
+            return Err("audio source duration must be greater than zero".to_owned());
+        }
+        let start_frame = self.frame_at_tick(start_tick, sample_rate)?;
+        let end_frame = start_frame
+            .checked_add(frame_count)
+            .ok_or_else(|| "audio source duration exceeds the renderable timeline".to_owned())?;
+        let end_tick = self
+            .tick_at_frame(end_frame, sample_rate)
+            .ok_or_else(|| "audio source end is outside the renderable timeline".to_owned())?;
+        let tick_span = (end_tick - start_tick as f64).ceil();
+        if !tick_span.is_finite() || tick_span <= 0.0 || tick_span > u64::MAX as f64 {
+            return Err("audio source duration is outside the Playlist timeline".to_owned());
+        }
+        Ok(tick_span as u64)
+    }
+
     /// Convert a half-open tick range to its rounded frame duration.
     pub fn frames_between_ticks(
         &self,
@@ -4568,6 +4594,17 @@ mod tests {
         assert_eq!(map.frame_at_tick(288, 48_000).unwrap(), 96_000);
         assert_eq!(map.frames_between_ticks(96, 192, 48_000).unwrap(), 48_000);
         assert!((map.tick_at_frame(48_000, 48_000).unwrap() - 144.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn playlist_tempo_map_sizes_audio_from_its_start_position() {
+        let map =
+            PlaylistTempoMap::from_tempo_events(96, 120.0, &[(96, 60.0), (192, 120.0)]).unwrap();
+
+        assert_eq!(map.ticks_for_audio_frames(0, 48_000, 48_000).unwrap(), 144);
+        assert_eq!(map.ticks_for_audio_frames(96, 48_000, 48_000).unwrap(), 96);
+        assert!(map.ticks_for_audio_frames(0, 0, 48_000).is_err());
+        assert!(map.ticks_for_audio_frames(0, 48_000, 0).is_err());
     }
 
     #[test]

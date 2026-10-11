@@ -3127,31 +3127,48 @@ impl DawUi {
             );
             return;
         }
-        let Some(length_ticks) = audio_recording_length_ticks(
-            waveform.frame_count,
-            waveform.sample_rate,
-            document.header().ppq(),
-            self.tempo_bpm,
-        ) else {
-            self.status = format!(
-                "Could not determine the Playlist length for {}",
-                pending.path.display()
-            );
-            return;
-        };
-        if pending.position_ticks.checked_add(length_ticks).is_none() {
-            self.status = format!(
-                "{} is too long to fit at this Playlist position",
-                pending.path.display()
-            );
-            return;
-        }
         if !document
             .arrangements()
             .is_ok_and(|arrangements| arrangements.iter().any(|a| a.id == pending.arrangement_id))
         {
             self.status = format!(
                 "Could not add {} because its Playlist arrangement no longer exists",
+                pending.path.display()
+            );
+            return;
+        }
+        let tempo_map = match PlaylistTempoMap::for_arrangement(document, pending.arrangement_id) {
+            Ok(tempo_map) => tempo_map,
+            Err(error) => {
+                self.status = format!(
+                    "Could not determine the Playlist tempo map for {}: {error}",
+                    pending.path.display()
+                );
+                return;
+            }
+        };
+        let length_ticks = match tempo_map
+            .ticks_for_audio_frames(
+                u64::from(pending.position_ticks),
+                waveform.frame_count,
+                waveform.sample_rate,
+            )
+            .and_then(|ticks| {
+                u32::try_from(ticks)
+                    .map_err(|_| "audio source is too long for this Playlist".to_owned())
+            }) {
+            Ok(length_ticks) => length_ticks,
+            Err(error) => {
+                self.status = format!(
+                    "Could not determine the Playlist length for {}: {error}",
+                    pending.path.display()
+                );
+                return;
+            }
+        };
+        if pending.position_ticks.checked_add(length_ticks).is_none() {
+            self.status = format!(
+                "{} is too long to fit at this Playlist position",
                 pending.path.display()
             );
             return;
