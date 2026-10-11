@@ -1648,6 +1648,7 @@ struct DawUi {
     piano_roll_hidden_ghost_channels: BTreeSet<u16>,
     piano_roll_editable_ghost_channels: bool,
     piano_roll_color_by_midi_channel: bool,
+    piano_roll_note_color_group: u8,
     piano_roll_paint_mode: bool,
     last_painted_note: Option<(u16, u16, u16, u32)>,
     quantize_strength_percent: u8,
@@ -2017,6 +2018,7 @@ impl DawUi {
             piano_roll_hidden_ghost_channels: BTreeSet::new(),
             piano_roll_editable_ghost_channels: false,
             piano_roll_color_by_midi_channel: false,
+            piano_roll_note_color_group: 0,
             piano_roll_paint_mode: false,
             last_painted_note: None,
             quantize_strength_percent: 100,
@@ -12213,6 +12215,99 @@ impl DawUi {
         );
     }
 
+    fn change_piano_roll_color_group(&mut self) {
+        let Some(pattern_id) = self.selected_pattern else {
+            self.status = "Select a Pattern before changing note colors".to_owned();
+            return;
+        };
+        let Some(target_channel_id) = self.selected_note_channel else {
+            self.status = "Select a channel before changing note colors".to_owned();
+            return;
+        };
+        let Some(document) = self.document.as_ref() else {
+            self.status = "Open a project before changing note colors".to_owned();
+            return;
+        };
+        let patterns = match document.patterns() {
+            Ok(patterns) => patterns,
+            Err(error) => {
+                self.status = format!("Could not read Pattern notes: {error}");
+                return;
+            }
+        };
+        let Some(pattern) = patterns.iter().find(|pattern| pattern.id == pattern_id) else {
+            self.status = format!("Pattern {pattern_id} does not exist");
+            return;
+        };
+
+        let mut note_indices_by_channel = BTreeMap::<u16, BTreeSet<usize>>::new();
+        for (selected_pattern, channel_id, note_index) in &self.selected_piano_notes {
+            if *selected_pattern == pattern_id {
+                note_indices_by_channel
+                    .entry(*channel_id)
+                    .or_default()
+                    .insert(*note_index);
+            }
+        }
+        if note_indices_by_channel.is_empty() {
+            note_indices_by_channel.insert(
+                target_channel_id,
+                pattern
+                    .notes
+                    .iter()
+                    .filter(|note| note.channel_id == target_channel_id)
+                    .enumerate()
+                    .map(|(note_index, _)| note_index)
+                    .collect(),
+            );
+        }
+        let note_count = note_indices_by_channel
+            .values()
+            .map(BTreeSet::len)
+            .sum::<usize>();
+        if note_count == 0 {
+            self.status = "There are no notes to recolor".to_owned();
+            return;
+        }
+
+        let mut updated = document.clone();
+        for (channel_id, note_indices) in note_indices_by_channel {
+            let channel_notes = pattern
+                .notes
+                .iter()
+                .filter(|note| note.channel_id == channel_id)
+                .collect::<Vec<_>>();
+            for note_index in note_indices {
+                let Some(note) = channel_notes.get(note_index) else {
+                    self.status = "The selected note no longer exists".to_owned();
+                    return;
+                };
+                let midi_channel =
+                    (note.midi_channel & 0xf0) | (self.piano_roll_note_color_group & 0x0f);
+                if let Err(error) = updated.edit_pattern_note(
+                    pattern_id,
+                    channel_id,
+                    note_index,
+                    PatternNoteEdit {
+                        midi_channel: Some(midi_channel),
+                        ..PatternNoteEdit::default()
+                    },
+                ) {
+                    self.status = format!("Could not change note color: {error}");
+                    return;
+                }
+            }
+        }
+        self.stop_project_playback();
+        self.document = Some(updated);
+        self.dirty = true;
+        self.status = format!(
+            "Changed color of {note_count} note{} to color {}",
+            if note_count == 1 { "" } else { "s" },
+            self.piano_roll_note_color_group + 1
+        );
+    }
+
     fn set_selected_piano_roll_note_group(&mut self, grouped: bool) {
         let Some(pattern_id) = self.selected_pattern else {
             self.status = "Select a Pattern before grouping notes".to_owned();
@@ -12515,6 +12610,7 @@ impl DawUi {
         let mut duplicate_notes_requested = false;
         let mut group_selected_notes_requested = false;
         let mut ungroup_selected_notes_requested = false;
+        let mut change_note_color_requested = false;
         let mut quantize_selected_requested = false;
         let mut open_pattern_time_signature_dialog = false;
         if ui.memory(|memory| memory.focused().is_none()) {
@@ -12530,6 +12626,8 @@ impl DawUi {
                 ui.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::I));
             let select_color_group =
                 ui.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::C));
+            change_note_color_requested =
+                ui.input_mut(|input| input.consume_key(egui::Modifiers::ALT, egui::Key::C));
             let clear_note_selection =
                 ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::D));
             duplicate_notes_requested =
@@ -12625,6 +12723,21 @@ impl DawUi {
                     .count()
             })
             .unwrap_or(0);
+        let color_change_available = self
+            .selected_pattern
+            .zip(self.selected_note_channel)
+            .is_some_and(|(pattern_id, channel_id)| {
+                patterns
+                    .iter()
+                    .find(|pattern| pattern.id == pattern_id)
+                    .is_some_and(|pattern| {
+                        selected_note_count > 0
+                            || pattern
+                                .notes
+                                .iter()
+                                .any(|note| note.channel_id == channel_id)
+                    })
+            });
         ui.horizontal_wrapped(|ui| {
             egui::ComboBox::from_id_salt("pattern-picker")
                 .selected_text(format!("Pattern {}", self.selected_pattern.unwrap_or(0)))
@@ -12668,6 +12781,20 @@ impl DawUi {
                 .show_ui(ui, |ui| {
                     for snap in PianoRollSnap::ALL {
                         ui.selectable_value(&mut self.piano_roll_snap, snap, snap.label());
+                    }
+                });
+            egui::ComboBox::from_id_salt("piano-roll-note-color")
+                .selected_text(format!(
+                    "Color {}",
+                    self.piano_roll_note_color_group + 1
+                ))
+                .show_ui(ui, |ui| {
+                    for (index, color) in MIDI_CHANNEL_COLORS.iter().enumerate() {
+                        ui.selectable_value(
+                            &mut self.piano_roll_note_color_group,
+                            index as u8,
+                            egui::RichText::new(format!("●  Color {}", index + 1)).color(*color),
+                        );
                     }
                 });
             ui.separator();
@@ -12766,6 +12893,18 @@ impl DawUi {
                         self.piano_roll_zoom_mode = false;
                         self.piano_roll_stamp_mode = false;
                     }
+                }
+            });
+            ui.menu_button("Edit", |ui| {
+                if ui
+                    .add_enabled(
+                        color_change_available,
+                        egui::Button::new("Change color (Alt/Option+C)"),
+                    )
+                    .clicked()
+                {
+                    change_note_color_requested = true;
+                    ui.close();
                 }
             });
             ui.menu_button("Selection", |ui| {
@@ -13659,6 +13798,9 @@ impl DawUi {
             self.set_selected_piano_roll_note_group(true);
         } else if ungroup_selected_notes_requested {
             self.set_selected_piano_roll_note_group(false);
+        }
+        if change_note_color_requested {
+            self.change_piano_roll_color_group();
         }
 
         let edit_selection_only = self.piano_roll_edit_scope == PianoRollEditScope::Selection
@@ -14817,6 +14959,7 @@ impl DawUi {
                 length: u32::from(ppq),
                 key: 60,
                 velocity: 100,
+                midi_channel: self.piano_roll_note_color_group & 0x0f,
                 ..PatternNote::default()
             };
             if let Some(document) = &mut self.document {
@@ -16888,6 +17031,10 @@ impl DawUi {
             self.piano_roll_zoom_drag = None;
         }
         if !notes_to_add.is_empty() {
+            for note in &mut notes_to_add {
+                note.midi_channel =
+                    (note.midi_channel & 0xf0) | (self.piano_roll_note_color_group & 0x0f);
+            }
             let stamped_chord = self.piano_roll_stamp_mode;
             let only_one = self.piano_roll_stamp_only_one;
             let channel_id = notes_to_add[0].channel_id;
@@ -23188,7 +23335,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        ActivePlaylistClipDrag, Arrangement, ChannelDisplayFilter, FlpDocument, Pattern,
+        ActivePlaylistClipDrag, Arrangement, ChannelDisplayFilter, DawUi, FlpDocument, Pattern,
         PatternController, PatternNote, PianoRollGrid, PianoRollSnap, PlaylistClip,
         PlaylistClipDragKind, PlaylistTrack, PluginCandidate, PluginFormat,
         audio_recording_length_ticks, candidate_matches_vst_identity, candidate_mixer_controls,
@@ -23264,6 +23411,69 @@ mod tests {
         bytes.extend_from_slice(&(event_stream.len() as u32).to_le_bytes());
         bytes.extend_from_slice(&event_stream);
         FlpDocument::parse(&bytes).expect("Mixer parameter fixture should parse")
+    }
+
+    fn piano_roll_color_fixture() -> FlpDocument {
+        let mut note_records = Vec::new();
+        for (channel_id, midi_channel) in [(0u16, 0xA3), (0, 0xB4), (1, 0xC5)] {
+            let mut record = [0; 24];
+            record[4..6].copy_from_slice(&0x4000u16.to_le_bytes());
+            record[6..8].copy_from_slice(&channel_id.to_le_bytes());
+            record[8..12].copy_from_slice(&192u32.to_le_bytes());
+            record[12..14].copy_from_slice(&60u16.to_le_bytes());
+            record[19] = midi_channel;
+            record[21] = 100;
+            note_records.extend_from_slice(&record);
+        }
+        let mut event_stream = vec![0x40, 0, 0, 0x40, 1, 0, 0x41, 7, 0, 0xD0, 72];
+        event_stream.extend_from_slice(&note_records);
+        let mut bytes = b"FLhd".to_vec();
+        bytes.extend_from_slice(&6u32.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&96u16.to_le_bytes());
+        bytes.extend_from_slice(b"FLdt");
+        bytes.extend_from_slice(&(event_stream.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&event_stream);
+        FlpDocument::parse(&bytes).expect("Piano roll color fixture should parse")
+    }
+
+    #[test]
+    fn piano_roll_color_change_recolors_selection_or_target_channel_and_preserves_unknown_bits() {
+        let mut app = DawUi::default();
+        app.document = Some(piano_roll_color_fixture());
+        app.selected_pattern = Some(7);
+        app.selected_note_channel = Some(0);
+        app.piano_roll_note_color_group = 2;
+        app.selected_piano_notes.insert((7, 0, 0));
+        app.change_piano_roll_color_group();
+
+        let notes = app
+            .document
+            .as_ref()
+            .unwrap()
+            .patterns()
+            .unwrap()
+            .remove(0)
+            .notes;
+        assert_eq!(notes[0].midi_channel, 0xA2);
+        assert_eq!(notes[1].midi_channel, 0xB4);
+        assert_eq!(notes[2].midi_channel, 0xC5);
+
+        app.selected_piano_notes.clear();
+        app.piano_roll_note_color_group = 6;
+        app.change_piano_roll_color_group();
+        let notes = app
+            .document
+            .as_ref()
+            .unwrap()
+            .patterns()
+            .unwrap()
+            .remove(0)
+            .notes;
+        assert_eq!(notes[0].midi_channel, 0xA6);
+        assert_eq!(notes[1].midi_channel, 0xB6);
+        assert_eq!(notes[2].midi_channel, 0xC5);
     }
 
     #[test]
