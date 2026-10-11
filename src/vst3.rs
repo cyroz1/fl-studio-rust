@@ -12,7 +12,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use crate::audio::StreamingAudioWriter;
+use crate::audio::{StereoFrameDelay, StreamingAudioWriter};
 use crate::sample_render::{
     AudioFileRenderOptions, PlaylistPatternScheduleOptions, PlaylistRenderOptions,
     PlaylistTempoMap, PlaylistTrackFilter, channel_gain_pan, channel_pan_gains, project_pan_law,
@@ -31,6 +31,7 @@ use crate::PatternNote;
 static NEXT_RENDER_FILE_ID: AtomicU64 = AtomicU64::new(1);
 const MAX_STEREO_BUFFER_BYTES: usize = 512 * 1024 * 1024;
 const MAX_VST3_AUTOMATION_POINTS: usize = 1_000_000;
+const MAX_PDC_DELAY_BYTES: u64 = 128 * 1024 * 1024;
 // Leave headroom below vst3-host's 4096-change processing queue for concurrent editor edits.
 const MAX_VST3_AUTOMATION_CHANGES_PER_BLOCK: usize = 2_048;
 const FLP_VST3_STATE_MARKER: u32 = 1;
@@ -193,6 +194,8 @@ struct PlaylistPluginStream {
     source_frame: u64,
     next_event: usize,
     resampler_finished: bool,
+    latency_frames: u64,
+    delay_line: StereoFrameDelay,
     gain: f32,
     left_pan_gain: f32,
     right_pan_gain: f32,
@@ -204,7 +207,9 @@ struct PlaylistPluginStream {
 pub struct Vst3PlaylistStreamProcessor {
     streams: Vec<PlaylistPluginStream>,
     output_sample_rate: u32,
+    content_frames: u64,
     output_frames: u64,
+    maximum_latency_frames: u64,
     notes_scheduled: usize,
     unloaded_plugin_channels: Vec<u16>,
     started_count: usize,
@@ -222,9 +227,40 @@ impl Vst3PlaylistStreamProcessor {
     }
 
     pub fn extend_to_output_frames(&mut self, frames: u64) -> Result<(), String> {
-        self.output_frames = self.output_frames.max(frames);
+        self.content_frames = self.content_frames.max(frames);
+        self.output_frames =
+            pdc_aligned_output_frames(self.content_frames, self.maximum_latency_frames)?;
+
+        let mut delay_frames = self.maximum_latency_frames;
+        for stream in &self.streams {
+            delay_frames = delay_frames
+                .checked_add(
+                    self.maximum_latency_frames
+                        .saturating_sub(stream.latency_frames),
+                )
+                .ok_or_else(|| "PDC delay storage size overflow".to_owned())?;
+        }
+        let delay_bytes = delay_frames
+            .checked_mul(std::mem::size_of::<[f32; 2]>() as u64)
+            .ok_or_else(|| "PDC delay storage size overflow".to_owned())?;
+        if delay_bytes > MAX_PDC_DELAY_BYTES {
+            return Err(format!(
+                "automatic PDC needs {delay_bytes} bytes of delay storage, exceeding the 128 MiB limit"
+            ));
+        }
+
         for stream in &mut self.streams {
-            let source_frames = (self.output_frames as f64 * stream.render.sample_rate
+            let compensation_frames = self
+                .maximum_latency_frames
+                .saturating_sub(stream.latency_frames);
+            if stream.delay_line.delay_frames() != compensation_frames {
+                stream.delay_line = StereoFrameDelay::new(compensation_frames)?;
+            }
+            let stream_frames = self
+                .content_frames
+                .checked_add(stream.latency_frames)
+                .ok_or_else(|| "VST3 PDC stream length overflow".to_owned())?;
+            let source_frames = (stream_frames as f64 * stream.render.sample_rate
                 / f64::from(self.output_sample_rate))
             .ceil();
             if !source_frames.is_finite() || source_frames > u64::MAX as f64 {
@@ -235,6 +271,10 @@ impl Vst3PlaylistStreamProcessor {
             stream.render.total_frames = source_frames as u64;
         }
         Ok(())
+    }
+
+    pub(crate) fn pdc_direct_source_delay_frames(&self) -> u64 {
+        self.maximum_latency_frames
     }
 
     pub fn start_processing(&mut self) -> Result<(), String> {
@@ -271,6 +311,7 @@ impl Vst3PlaylistStreamProcessor {
                 .try_reserve_exact(output.len())
                 .map_err(|error| format!("could not allocate VST3 Playlist block: {error}"))?;
             stream.render_output_frames(frame_count, &mut plugin_output)?;
+            stream.delay_line.process_interleaved(&mut plugin_output)?;
             for (frame_index, frame) in plugin_output.as_chunks::<2>().0.iter().enumerate() {
                 let mut routed_frame = [
                     frame[0] * stream.gain * stream.left_pan_gain,
@@ -305,6 +346,48 @@ impl Vst3PlaylistStreamProcessor {
         }
         first_error.map_or(Ok(()), Err)
     }
+}
+
+fn plugin_latency_in_output_frames(
+    channel_id: u16,
+    latency_samples: u32,
+    plugin_sample_rate: f64,
+    output_sample_rate: u32,
+) -> Result<u64, String> {
+    if latency_samples == 0 {
+        return Ok(0);
+    }
+    if !plugin_sample_rate.is_finite() || plugin_sample_rate <= 0.0 {
+        return Err(format!(
+            "VST3 channel {channel_id} reported latency with an invalid sample rate"
+        ));
+    }
+    let output_frames =
+        (f64::from(latency_samples) * f64::from(output_sample_rate) / plugin_sample_rate).ceil();
+    if !output_frames.is_finite() || output_frames > u64::MAX as f64 {
+        return Err(format!(
+            "VST3 channel {channel_id} reported latency outside the renderable range"
+        ));
+    }
+    Ok(output_frames as u64)
+}
+
+fn pdc_aligned_output_frames(
+    content_frames: u64,
+    maximum_latency_frames: u64,
+) -> Result<u64, String> {
+    content_frames
+        .checked_add(maximum_latency_frames)
+        .ok_or_else(|| "PDC-aligned Playlist length overflow".to_owned())
+}
+
+fn plan_pdc_delays(latencies: &[u64]) -> (u64, Vec<u64>) {
+    let maximum = latencies.iter().copied().max().unwrap_or(0);
+    let delays = latencies
+        .iter()
+        .map(|latency| maximum.saturating_sub(*latency))
+        .collect();
+    (maximum, delays)
 }
 
 impl PlaylistPluginStream {
@@ -1303,19 +1386,24 @@ impl Vst3HostRuntime {
             let mixer_transform = channel
                 .map(|channel| mixer_route_audibility.transform_for_channel(channel.mixer_track()))
                 .unwrap_or_default();
-            let render = {
+            let (render, latency_frames) = {
                 let plugin_guard = plugin
                     .lock()
                     .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
+                let plugin_sample_rate = plugin_guard.sample_rate();
+                let latency_frames = plugin_latency_in_output_frames(
+                    channel_id,
+                    plugin_guard.latency_samples(),
+                    plugin_sample_rate,
+                    output_sample_rate,
+                )?;
                 if include_plugin_reported_tails
-                    && let Some(tail_seconds) = reported_tail_seconds(
-                        plugin_guard.tail_samples(),
-                        plugin_guard.sample_rate(),
-                    )
+                    && let Some(tail_seconds) =
+                        reported_tail_seconds(plugin_guard.tail_samples(), plugin_sample_rate)
                 {
                     longest_plugin_tail_seconds = longest_plugin_tail_seconds.max(tail_seconds);
                 }
-                let source_frames = (output_frames as f64 * plugin_guard.sample_rate()
+                let source_frames = (output_frames as f64 * plugin_sample_rate
                     / f64::from(output_sample_rate))
                 .ceil();
                 if !source_frames.is_finite() || source_frames > u64::MAX as f64 {
@@ -1323,12 +1411,13 @@ impl Vst3HostRuntime {
                         "VST3 channel {channel_id} Playlist length is outside the renderable range"
                     ));
                 }
-                prepare_playlist_pattern_render(
+                let render = prepare_playlist_pattern_render(
                     &plugin_guard,
                     &notes,
                     &tempo_map,
                     source_frames as u64,
-                )?
+                )?;
+                (render, latency_frames)
             };
             let (left_pan_gain, right_pan_gain) =
                 channel_pan_gains(pan, render.output_channels == 1, pan_law);
@@ -1343,6 +1432,8 @@ impl Vst3HostRuntime {
                 source_frame: 0,
                 next_event: 0,
                 resampler_finished: false,
+                latency_frames,
+                delay_line: StereoFrameDelay::default(),
                 gain,
                 left_pan_gain,
                 right_pan_gain,
@@ -1360,10 +1451,17 @@ impl Vst3HostRuntime {
             }
             output_frames = (total_output_frames.ceil() as u64).max(1);
         }
+        let stream_latencies = streams
+            .iter()
+            .map(|stream| stream.latency_frames)
+            .collect::<Vec<_>>();
+        let (maximum_latency_frames, _) = plan_pdc_delays(&stream_latencies);
         let mut processor = Vst3PlaylistStreamProcessor {
             streams,
             output_sample_rate,
+            content_frames: output_frames,
             output_frames,
+            maximum_latency_frames,
             notes_scheduled,
             unloaded_plugin_channels: unloaded_plugin_channels.into_iter().collect(),
             started_count: 0,
@@ -2516,6 +2614,35 @@ mod tests {
         let error = validate_parameter_automation_block_density(&automation, 4096, 4097)
             .expect_err("dense block should be rejected");
         assert!(error.contains("parameter changes in one block"));
+    }
+
+    #[test]
+    fn automatic_pdc_delays_each_stream_to_the_longest_reported_latency() {
+        let (maximum, delays) = plan_pdc_delays(&[0, 480, 240]);
+        assert_eq!(maximum, 480);
+        assert_eq!(delays, [480, 0, 240]);
+        assert_eq!(plan_pdc_delays(&[]), (0, Vec::new()));
+    }
+
+    #[test]
+    fn pdc_extends_the_song_tail_and_checks_length_overflow() {
+        assert_eq!(pdc_aligned_output_frames(48_000, 480).unwrap(), 48_480);
+        assert!(pdc_aligned_output_frames(u64::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn plugin_latency_is_converted_to_output_rate_frames() {
+        assert_eq!(
+            plugin_latency_in_output_frames(7, 480, 48_000.0, 44_100)
+                .expect("valid sample rates should convert"),
+            441
+        );
+        assert_eq!(
+            plugin_latency_in_output_frames(7, 1, 48_000.0, 44_100)
+                .expect("fractional frames round up"),
+            1
+        );
+        assert!(plugin_latency_in_output_frames(7, 1, f64::NAN, 44_100).is_err());
     }
 
     #[test]

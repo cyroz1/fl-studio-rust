@@ -27,6 +27,49 @@ const STREAM_PREFILL_FRAMES: usize = 512;
 const TEST_TONE_HZ: f32 = 440.0;
 const TEST_TONE_LEVEL: f32 = 0.12;
 
+/// A bounded stereo ring buffer used to align source timing in the Mixer.
+#[derive(Default)]
+pub(crate) struct StereoFrameDelay {
+    frames: Vec<[f32; 2]>,
+    cursor: usize,
+}
+
+impl StereoFrameDelay {
+    pub(crate) fn new(delay_frames: u64) -> Result<Self, String> {
+        let capacity = usize::try_from(delay_frames)
+            .map_err(|_| "PDC delay is too large for this platform".to_owned())?;
+        let mut frames = Vec::new();
+        frames
+            .try_reserve_exact(capacity)
+            .map_err(|error| format!("could not allocate PDC delay line: {error}"))?;
+        frames.resize(capacity, [0.0; 2]);
+        Ok(Self { frames, cursor: 0 })
+    }
+
+    pub(crate) fn delay_frames(&self) -> u64 {
+        self.frames.len() as u64
+    }
+
+    pub(crate) fn process_interleaved(&mut self, samples: &mut [f32]) -> Result<(), String> {
+        if !samples.len().is_multiple_of(2) {
+            return Err("PDC delay buffer must contain stereo frames".to_owned());
+        }
+        if self.frames.is_empty() {
+            return Ok(());
+        }
+        for frame in samples.chunks_exact_mut(2) {
+            let delayed = self.frames[self.cursor];
+            self.frames[self.cursor] = [frame[0], frame[1]];
+            frame.copy_from_slice(&delayed);
+            self.cursor += 1;
+            if self.cursor == self.frames.len() {
+                self.cursor = 0;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Enable flush-to-zero for floating-point work on the current audio/render thread.
 ///
 /// x86-64 uses MXCSR.FTZ and MXCSR.DAZ; AArch64 uses FPCR.FZ. The floating-point
@@ -2166,9 +2209,36 @@ mod tests {
         AUDIO_COMMAND_QUEUE_CAPACITY, AUDIO_SOURCE_INPUT_MONITOR, AUDIO_SOURCE_PROJECT,
         AUDIO_SOURCE_SILENT, AUDIO_SOURCE_STREAM, AUDIO_SOURCE_TEST_TONE, AudioAccess,
         AudioInputRecording, AudioRingBuffer, AudioSettings, InputRecordingState, ParameterCommand,
-        PlaybackState, TransportCommand, enable_denormal_protection, next_output_frame,
-        sanitize_output_sample, tone_sample, validate_settings,
+        PlaybackState, StereoFrameDelay, TransportCommand, enable_denormal_protection,
+        next_output_frame, sanitize_output_sample, tone_sample, validate_settings,
     };
+
+    #[test]
+    fn stereo_frame_delay_preserves_channels_across_block_boundaries() {
+        let mut delay = StereoFrameDelay::new(2).expect("small delay line should allocate");
+        let mut first = [1.0, -1.0, 2.0, -2.0];
+        delay
+            .process_interleaved(&mut first)
+            .expect("stereo frames should process");
+        assert_eq!(first, [0.0; 4]);
+
+        let mut second = [3.0, -3.0, 4.0, -4.0, 5.0, -5.0];
+        delay
+            .process_interleaved(&mut second)
+            .expect("stereo frames should process");
+        assert_eq!(second, [1.0, -1.0, 2.0, -2.0, 3.0, -3.0]);
+    }
+
+    #[test]
+    fn zero_frame_delay_and_invalid_buffers_are_handled() {
+        let mut delay = StereoFrameDelay::new(0).expect("zero delay needs no allocation");
+        let mut samples = [0.25, -0.5];
+        delay
+            .process_interleaved(&mut samples)
+            .expect("zero delay should pass samples through");
+        assert_eq!(samples, [0.25, -0.5]);
+        assert!(delay.process_interleaved(&mut [0.0]).is_err());
+    }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]

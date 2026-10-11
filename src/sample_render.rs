@@ -978,8 +978,9 @@ pub fn stream_playlist_with_vst3_to_device_from_frame(
 /// stereo WAV. Audio is mixed in bounded blocks and written to a temporary file, so song length
 /// does not determine the in-memory mix size. The recognized Master mute, polarity, and stereo-swap
 /// flags are applied to the final mix. Linear Playlist tempo automation is applied to audio,
-/// Sampler, and VST3 event timing. Insert routing, effects, parameter automation, and plugin delay
-/// compensation are not applied.
+/// Sampler, and VST3 event timing. Automatic PDC aligns supported direct-to-Master sources using
+/// loaded VST3 instrument latency. Insert routing, effects, parameter automation, manual PDC, and
+/// effect/send-chain latency compensation are not applied.
 pub fn render_playlist_with_vst3_to_wav_cancellable(
     document: &FlpDocument,
     project_path: impl AsRef<Path>,
@@ -2138,11 +2139,16 @@ fn stream_prepared_playlist_render(
         render.sampler.pan_law,
     );
     sampler_engine.mixer_transforms_by_channel = Some(&render.sampler.mixer_transforms_by_channel);
+    let mut output = vec![0.0f32; STREAM_BLOCK_FRAMES * 2];
+    let mut sampler_block = vec![0.0f32; STREAM_BLOCK_FRAMES * 2];
+    let direct_source_delay_frames = render.vst3_processor.as_deref().map_or(
+        0,
+        Vst3PlaylistStreamProcessor::pdc_direct_source_delay_frames,
+    );
+    let mut direct_source_delay = crate::audio::StereoFrameDelay::new(direct_source_delay_frames)?;
     if let Some(processor) = render.vst3_processor.as_deref_mut() {
         processor.start_processing()?;
     }
-    let mut output = vec![0.0f32; STREAM_BLOCK_FRAMES * 2];
-    let mut sampler_block = vec![0.0f32; STREAM_BLOCK_FRAMES * 2];
     let mix_result = (|| {
         let mut block_start = 0u64;
         while block_start < frames {
@@ -2181,6 +2187,7 @@ fn stream_prepared_playlist_render(
             for (mixed, sampler_sample) in block.iter_mut().zip(sampler_samples) {
                 *mixed += *sampler_sample;
             }
+            direct_source_delay.process_interleaved(block)?;
             if let Some(processor) = render.vst3_processor.as_deref_mut() {
                 processor.mix_next_block(block)?;
             }
