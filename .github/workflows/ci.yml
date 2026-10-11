@@ -193,9 +193,19 @@ jobs:
               + playlist_track(3, "Bass")
           )
 
+          master_target = 64 << 6
           target = 65 << 6
           parameters = (
-              bytes([0xAA, 0xBB, 0xCC, 0xDD, 192, 0])
+              bytes([0xA1, 0xB2, 0xC3, 0xD4, 192, 0])
+              + struct.pack("<H", master_target)
+              + struct.pack("<i", 12800)
+              + bytes([0xA2, 0xB3, 0xC4, 0xD5, 193, 0])
+              + struct.pack("<H", master_target)
+              + struct.pack("<i", 0)
+              + bytes([0xA3, 0xB4, 0xC5, 0xD6, 194, 0])
+              + struct.pack("<H", master_target)
+              + struct.pack("<i", 0)
+              + bytes([0xAA, 0xBB, 0xCC, 0xDD, 192, 0])
               + struct.pack("<H", target)
               + struct.pack("<i", 12800)
               + bytes([0x11, 0x22, 0x33, 0x44, 193, 0])
