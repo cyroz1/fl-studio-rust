@@ -47,6 +47,150 @@ pub const MP3_BITRATES_KBPS: [u16; 13] =
 const MP3_SAMPLE_RATES: [u32; 3] = [32_000, 44_100, 48_000];
 static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Clone, Copy, Debug)]
+struct TempoSegment {
+    start_tick: u64,
+    start_seconds: f64,
+    tempo_bpm: f64,
+}
+
+/// Maps Playlist ticks to elapsed song time using the project's base tempo and the
+/// supported linear `TEMPO` Automation Clip events used by song MIDI export.
+#[derive(Clone, Debug)]
+pub struct PlaylistTempoMap {
+    ppq: u16,
+    segments: Vec<TempoSegment>,
+}
+
+impl PlaylistTempoMap {
+    /// Build the timing map for one Playlist arrangement.
+    pub fn for_arrangement(document: &FlpDocument, arrangement_id: u16) -> Result<Self, String> {
+        let ppq = document.header().ppq();
+        let base_tempo_bpm = document.metadata().tempo_bpm().unwrap_or(140.0);
+        let arrangement = document
+            .arrangements()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|arrangement| arrangement.id == arrangement_id)
+            .ok_or_else(|| format!("arrangement {arrangement_id} was not found"))?;
+        let events = crate::midi::song_tempo_events(document, &arrangement.clips)
+            .map_err(|error| error.to_string())?;
+        Self::from_tempo_events(ppq, base_tempo_bpm, &events)
+    }
+
+    /// Build a constant-tempo map for a standalone pattern or preview.
+    pub fn constant(ppq: u16, tempo_bpm: f64) -> Result<Self, String> {
+        Self::from_tempo_events(ppq, tempo_bpm, &[])
+    }
+
+    fn from_tempo_events(
+        ppq: u16,
+        base_tempo_bpm: f64,
+        events: &[(u64, f64)],
+    ) -> Result<Self, String> {
+        if ppq == 0 {
+            return Err("project PPQ must be greater than zero".to_owned());
+        }
+        if !base_tempo_bpm.is_finite() || base_tempo_bpm <= 0.0 {
+            return Err("project tempo must be finite and positive".to_owned());
+        }
+
+        let mut sorted_events = events.to_vec();
+        sorted_events.sort_by_key(|(tick, _)| *tick);
+        let mut collapsed_events = Vec::<(u64, f64)>::with_capacity(sorted_events.len());
+        for (tick, tempo_bpm) in sorted_events {
+            if !tempo_bpm.is_finite() || tempo_bpm <= 0.0 {
+                return Err("tempo automation must be finite and positive".to_owned());
+            }
+            if let Some((last_tick, last_tempo)) = collapsed_events.last_mut()
+                && *last_tick == tick
+            {
+                // Match the MIDI event stream's stable ordering: when more than one
+                // event lands on the same tick, the last event takes effect.
+                *last_tempo = tempo_bpm;
+            } else {
+                collapsed_events.push((tick, tempo_bpm));
+            }
+        }
+
+        let mut segments = vec![TempoSegment {
+            start_tick: 0,
+            start_seconds: 0.0,
+            tempo_bpm: base_tempo_bpm,
+        }];
+        for (tick, tempo_bpm) in collapsed_events {
+            if tick == 0 {
+                segments[0].tempo_bpm = tempo_bpm;
+                continue;
+            }
+            let previous = segments.last().expect("tempo map has an initial segment");
+            let elapsed_ticks = tick.saturating_sub(previous.start_tick);
+            let start_seconds = previous.start_seconds
+                + elapsed_ticks as f64 * 60.0 / (f64::from(ppq) * previous.tempo_bpm);
+            if !start_seconds.is_finite() || start_seconds < previous.start_seconds {
+                return Err("tempo automation timeline is outside the renderable range".to_owned());
+            }
+            segments.push(TempoSegment {
+                start_tick: tick,
+                start_seconds,
+                tempo_bpm,
+            });
+        }
+        Ok(Self { ppq, segments })
+    }
+
+    /// Convert an absolute Playlist tick position to a rounded sample-frame position.
+    pub fn frame_at_tick(&self, tick: u64, sample_rate: u32) -> Result<u64, String> {
+        if sample_rate == 0 {
+            return Err("sample rate must be greater than zero".to_owned());
+        }
+        let segment_index = self
+            .segments
+            .partition_point(|segment| segment.start_tick <= tick)
+            .saturating_sub(1);
+        let segment = self.segments[segment_index];
+        let elapsed_ticks = tick.saturating_sub(segment.start_tick);
+        let seconds = segment.start_seconds
+            + elapsed_ticks as f64 * 60.0 / (f64::from(self.ppq) * segment.tempo_bpm);
+        let frames = seconds * f64::from(sample_rate);
+        if !frames.is_finite() || frames < 0.0 || frames > u64::MAX as f64 {
+            return Err("Playlist position is outside the renderable timeline".to_owned());
+        }
+        Ok(frames.round() as u64)
+    }
+
+    /// Convert a rounded song-frame position back to a fractional Playlist tick.
+    pub fn tick_at_frame(&self, frame: u64, sample_rate: u32) -> Option<f64> {
+        if sample_rate == 0 {
+            return None;
+        }
+        let seconds = frame as f64 / f64::from(sample_rate);
+        let segment_index = self
+            .segments
+            .partition_point(|segment| segment.start_seconds <= seconds)
+            .saturating_sub(1);
+        let segment = self.segments[segment_index];
+        let ticks = segment.start_tick as f64
+            + (seconds - segment.start_seconds) * segment.tempo_bpm * f64::from(self.ppq) / 60.0;
+        ticks.is_finite().then_some(ticks.max(0.0))
+    }
+
+    /// Convert a half-open tick range to its rounded frame duration.
+    pub fn frames_between_ticks(
+        &self,
+        start_tick: u64,
+        end_tick: u64,
+        sample_rate: u32,
+    ) -> Result<u64, String> {
+        if end_tick < start_tick {
+            return Err("Playlist time range ends before it starts".to_owned());
+        }
+        let start = self.frame_at_tick(start_tick, sample_rate)?;
+        let end = self.frame_at_tick(end_tick, sample_rate)?;
+        Ok(end.saturating_sub(start))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum PanLaw {
     #[default]
@@ -444,11 +588,11 @@ pub struct PlaylistRenderSummary {
 
 /// Render audio-channel Playlist clips into a WAV using the selected bit depth and channel mode.
 ///
-/// This early render path uses the project's base tempo, clip positions, observed audio source
+/// This early render path uses the project's tempo map, clip positions, observed audio source
 /// offsets, and decoded audio-channel volume/pan. Clips with default `-1` offsets use the full
 /// source file. The raw volume/pan mapping is provisional and has not been compared against
-/// native FL Studio output. Pattern instruments, tempo automation, plug-ins, and Mixer effects
-/// are not rendered.
+/// native FL Studio output. Source pitch and sample playback rate remain unchanged, so tempo-sync
+/// and time-stretch modes, Pattern instruments, plug-ins, and Mixer effects are not rendered.
 pub fn render_audio_clips_to_wav(
     document: &FlpDocument,
     project_path: impl AsRef<Path>,
@@ -637,7 +781,8 @@ pub fn stream_audio_clips_to_device(
 /// Pattern clips are expanded on the worker thread into sample-offset note events. Audio-device
 /// callbacks continue to consume only complete stereo frames from the bounded streaming queue.
 /// The recognized Master mute, polarity, and stereo-swap flags are applied to the final mix.
-/// Insert routing and processing, automation, and time stretching are not included yet.
+/// Linear Playlist `TEMPO` automation updates audio and Sampler timing; VST3 tempo alignment,
+/// parameter automation, Mixer routing and processing, and time stretching remain incomplete.
 pub fn stream_playlist_to_device(
     document: &FlpDocument,
     project_path: impl AsRef<Path>,
@@ -2282,10 +2427,7 @@ fn prepare_audio_clip_render(
     if ppq == 0 {
         return Err("project PPQ must be greater than zero".to_owned());
     }
-    let tempo_bpm = document.metadata().tempo_bpm().unwrap_or(140.0);
-    if !tempo_bpm.is_finite() || tempo_bpm <= 0.0 {
-        return Err("project tempo must be finite and positive".to_owned());
-    }
+    let tempo_map = PlaylistTempoMap::for_arrangement(document, options.arrangement_id)?;
     let pan_law = project_pan_law(document);
     let arrangement = document
         .arrangements()
@@ -2391,7 +2533,15 @@ fn prepare_audio_clip_render(
             "selected Playlist clip {clip_index} does not target an enabled audio channel"
         ));
     }
-    let timeline_frames = ticks_to_frames(max_tick, ppq, tempo_bpm, options.sample_rate)?;
+    let selection_start_tick = u64::from(selection_start_tick);
+    let timeline_end_tick = selection_start_tick
+        .checked_add(max_tick)
+        .ok_or_else(|| "render timeline length overflow".to_owned())?;
+    let timeline_frames = tempo_map.frames_between_ticks(
+        selection_start_tick,
+        timeline_end_tick,
+        options.sample_rate,
+    )?;
     let mut decoded_by_path = HashMap::<PathBuf, DecodedAudio>::new();
     let mut cached_source_bytes = 0usize;
     for (_, _, _, path, _, _, _) in &candidate_clips {
@@ -2427,20 +2577,28 @@ fn prepare_audio_clip_render(
             ));
         }
         let source_bounds = sample_source_bounds(clip, audio, *clip_index)?;
-        let start_tick = audio_clip_render_start_tick(clip.position_ticks, selection_start_tick)?;
-        let start_frame = ticks_to_frames(start_tick, ppq, tempo_bpm, options.sample_rate)?;
+        let absolute_start_tick = u64::from(clip.position_ticks);
+        let absolute_end_tick = absolute_start_tick
+            .checked_add(u64::from(clip.length_ticks))
+            .ok_or_else(|| "render timeline length overflow".to_owned())?;
+        let absolute_start_frame =
+            tempo_map.frame_at_tick(absolute_start_tick, options.sample_rate)?;
+        let selection_start_frame =
+            tempo_map.frame_at_tick(selection_start_tick, options.sample_rate)?;
+        let start_frame = absolute_start_frame
+            .checked_sub(selection_start_frame)
+            .ok_or_else(|| "selected clip precedes its selection start".to_owned())?;
         let source_duration_frames = source_duration_to_frames(
             source_bounds.end - source_bounds.start,
             audio.sample_rate,
             options.sample_rate,
         )?;
-        let duration_frames = audio_clip_duration_frames(
-            source_duration_frames,
-            clip.length_ticks,
-            ppq,
-            tempo_bpm,
+        let timeline_clip_frames = tempo_map.frames_between_ticks(
+            absolute_start_tick,
+            absolute_end_tick,
             options.sample_rate,
         )?;
+        let duration_frames = source_duration_frames.min(timeline_clip_frames);
         let end_frame = start_frame
             .checked_add(duration_frames)
             .ok_or_else(|| "render timeline length overflow".to_owned())?;
@@ -2726,10 +2884,6 @@ fn prepare_sampler_arrangement(
     if ppq == 0 {
         return Err("project PPQ must be greater than zero".to_owned());
     }
-    let tempo_bpm = document.metadata().tempo_bpm().unwrap_or(140.0);
-    if !tempo_bpm.is_finite() || tempo_bpm <= 0.0 {
-        return Err("project tempo must be finite and positive".to_owned());
-    }
     let pan_law = project_pan_law(document);
     let arrangement = document
         .arrangements()
@@ -2737,6 +2891,7 @@ fn prepare_sampler_arrangement(
         .into_iter()
         .find(|arrangement| arrangement.id == options.arrangement_id)
         .ok_or_else(|| format!("arrangement {} was not found", options.arrangement_id))?;
+    let tempo_map = PlaylistTempoMap::for_arrangement(document, options.arrangement_id)?;
     let disabled_track_ids = document
         .playlist_tracks()
         .into_iter()
@@ -2915,11 +3070,12 @@ fn prepare_sampler_arrangement(
                 placed.target_channel_id
             ));
         }
-        let start_frame = ticks_to_frames(placed.start_tick, ppq, tempo_bpm, options.sample_rate)?;
+        let start_frame = tempo_map.frame_at_tick(placed.start_tick, options.sample_rate)?;
         let stop_frame = placed
             .stop_tick
             .map(|stop_tick| {
-                ticks_to_frames(stop_tick, ppq, tempo_bpm, options.sample_rate)
+                tempo_map
+                    .frame_at_tick(stop_tick, options.sample_rate)
                     .map(|frame| frame.max(start_frame.saturating_add(1)))
             })
             .transpose()?;
@@ -3801,18 +3957,6 @@ fn source_duration_to_frames(
     Ok(duration.ceil() as u64)
 }
 
-fn audio_clip_duration_frames(
-    source_duration_frames: u64,
-    clip_length_ticks: u32,
-    ppq: u16,
-    tempo_bpm: f64,
-    sample_rate: u32,
-) -> Result<u64, String> {
-    let clip_duration_frames =
-        ticks_to_frames(u64::from(clip_length_ticks), ppq, tempo_bpm, sample_rate)?;
-    Ok(source_duration_frames.min(clip_duration_frames))
-}
-
 pub(crate) fn channel_gain_pan(volume: Option<u32>, pan: Option<i32>) -> (f32, f32) {
     let gain = volume.unwrap_or(10_000).min(12_800) as f32 / 10_000.0;
     let pan = pan
@@ -4408,15 +4552,24 @@ mod tests {
     }
 
     #[test]
-    fn audio_clip_render_stops_at_the_playlist_clip_end() {
-        assert_eq!(
-            audio_clip_duration_frames(96_000, 192, 96, 120.0, 48_000).unwrap(),
-            48_000
-        );
-        assert_eq!(
-            audio_clip_duration_frames(48_000, 384, 96, 120.0, 48_000).unwrap(),
-            48_000
-        );
+    fn playlist_tempo_map_integrates_tempo_changes_and_inverts_frame_positions() {
+        let map =
+            PlaylistTempoMap::from_tempo_events(96, 120.0, &[(96, 60.0), (192, 120.0)]).unwrap();
+
+        assert_eq!(map.frame_at_tick(0, 48_000).unwrap(), 0);
+        assert_eq!(map.frame_at_tick(96, 48_000).unwrap(), 24_000);
+        assert_eq!(map.frame_at_tick(192, 48_000).unwrap(), 72_000);
+        assert_eq!(map.frame_at_tick(288, 48_000).unwrap(), 96_000);
+        assert_eq!(map.frames_between_ticks(96, 192, 48_000).unwrap(), 48_000);
+        assert!((map.tick_at_frame(48_000, 48_000).unwrap() - 144.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn playlist_tempo_map_uses_last_tempo_event_at_a_shared_tick() {
+        let map =
+            PlaylistTempoMap::from_tempo_events(96, 120.0, &[(96, 60.0), (96, 90.0)]).unwrap();
+
+        assert_eq!(map.frame_at_tick(192, 48_000).unwrap(), 56_000);
     }
 
     #[test]

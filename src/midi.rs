@@ -1004,7 +1004,7 @@ fn inferred_pattern_loop_length(
         .unwrap_or(inferred_length)
 }
 
-fn song_tempo_events(
+pub(crate) fn song_tempo_events(
     document: &FlpDocument,
     clips: &[PlaylistClip],
 ) -> Result<Vec<(u64, f64)>, MidiError> {
