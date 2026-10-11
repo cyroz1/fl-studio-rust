@@ -92,6 +92,8 @@ const DEFAULT_BACKUP_RETENTION: usize = 20;
 const RECENT_PROJECT_LIMIT: usize = 50;
 const UI_SCALE_STEPS: [f32; 7] = [0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4];
 const BROWSER_SEARCH_ROOT_LIMIT: usize = 30;
+const MIDI_RECORDING_OFFSET_MIN_MS: i16 = -200;
+const MIDI_RECORDING_OFFSET_MAX_MS: i16 = 200;
 const MAX_BROWSER_RECURSIVE_SCAN_ENTRIES: usize = 20_000;
 const AUTOSAVE_INTERVALS_MINUTES: [u8; 5] = [0, 1, 5, 10, 15];
 const BACKUP_RETENTION_OPTIONS: [usize; 4] = [5, 10, 20, 50];
@@ -1828,6 +1830,7 @@ struct DawUi {
     midi_activity: Option<(String, Instant)>,
     midi_recording: Option<MidiPatternRecorder>,
     midi_record_snap: PianoRollSnap,
+    midi_recording_offset_ms: i16,
     midi_record_toggle_requested: bool,
     midi_input_refresh_requested: bool,
     midi_input_toggle_requested: bool,
@@ -2086,6 +2089,7 @@ impl DawUi {
         let live_resampling_quality = load_live_resampling_quality();
         let playlist_render_quality = load_playlist_render_quality();
         let read_sample_root_note = load_read_sample_root_note();
+        let midi_recording_offset_ms = load_midi_recording_offset_ms();
         let piano_roll_nudge_notes_with_mouse_wheel =
             load_piano_roll_nudge_notes_with_mouse_wheel();
         let browser_path = initial_project
@@ -2289,6 +2293,7 @@ impl DawUi {
             midi_activity: None,
             midi_recording: None,
             midi_record_snap: PianoRollSnap::None,
+            midi_recording_offset_ms,
             midi_record_toggle_requested: false,
             midi_input_refresh_requested: false,
             midi_input_toggle_requested: false,
@@ -20779,6 +20784,7 @@ impl DawUi {
                 tempo_bpm: self.tempo_bpm,
                 start_tick: recording_start_tick,
                 snap_ticks,
+                timing_offset_ms: self.midi_recording_offset_ms,
                 song_timeline_start,
             },
             recording_started_at,
@@ -21422,6 +21428,28 @@ impl DawUi {
                 .color(MUTED),
             );
         });
+        let recording_offset_changed = ui
+            .add_enabled_ui(self.midi_recording.is_none(), |ui| {
+                egui::Slider::new(
+                    &mut self.midi_recording_offset_ms,
+                    MIDI_RECORDING_OFFSET_MIN_MS..=MIDI_RECORDING_OFFSET_MAX_MS,
+                )
+                .text("MIDI input timing offset")
+                .suffix(" ms")
+            })
+            .inner
+            .changed();
+        if recording_offset_changed
+            && let Err(error) = save_midi_recording_offset_ms(self.midi_recording_offset_ms)
+        {
+            self.status = format!("Could not save MIDI input timing offset: {error}");
+        }
+        ui.label(
+            egui::RichText::new(
+                "Positive values place recorded notes earlier; negative values place them later.",
+            )
+            .color(MUTED),
+        );
         if let Some(connection) = &self.midi_input_connection {
             ui.label(
                 egui::RichText::new(format!("● Connected · {}", connection.device_name))
@@ -23895,6 +23923,12 @@ fn read_sample_root_note_settings_file() -> Option<PathBuf> {
         .map(|directory| directory.join("read-sample-root-note.txt"))
 }
 
+fn midi_recording_offset_settings_file() -> Option<PathBuf> {
+    browser_favorites_file()?
+        .parent()
+        .map(|directory| directory.join("midi-recording-offset-ms.txt"))
+}
+
 fn live_resampling_quality_settings_file() -> Option<PathBuf> {
     browser_favorites_file()?
         .parent()
@@ -23961,6 +23995,33 @@ fn save_read_sample_root_note(enabled: bool) -> Result<(), String> {
     fs::create_dir_all(parent)
         .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
     fs::write(&path, format!("{enabled}\n"))
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
+fn load_midi_recording_offset_ms() -> i16 {
+    midi_recording_offset_settings_file()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|contents| contents.trim().parse::<i16>().ok())
+        .filter(|offset_ms| {
+            (MIDI_RECORDING_OFFSET_MIN_MS..=MIDI_RECORDING_OFFSET_MAX_MS).contains(offset_ms)
+        })
+        .unwrap_or(0)
+}
+
+fn save_midi_recording_offset_ms(offset_ms: i16) -> Result<(), String> {
+    if !(MIDI_RECORDING_OFFSET_MIN_MS..=MIDI_RECORDING_OFFSET_MAX_MS).contains(&offset_ms) {
+        return Err(format!(
+            "unsupported MIDI input timing offset: {offset_ms} ms"
+        ));
+    }
+    let path = midi_recording_offset_settings_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the MIDI recording offset settings path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(&path, format!("{offset_ms}\n"))
         .map_err(|error| format!("could not write {}: {error}", path.display()))
 }
 

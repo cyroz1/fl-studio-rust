@@ -323,6 +323,7 @@ pub struct MidiPatternRecorderSettings {
     pub tempo_bpm: f64,
     pub start_tick: u32,
     pub snap_ticks: Option<u32>,
+    pub timing_offset_ms: i16,
     pub song_timeline_start: Option<(PlaylistTempoMap, f64)>,
 }
 
@@ -334,6 +335,7 @@ pub struct MidiPatternRecorder {
     tempo_bpm: f64,
     start_tick: u32,
     snap_ticks: Option<u32>,
+    timing_offset_ms: i16,
     song_timeline_start: Option<(PlaylistTempoMap, f64)>,
     song_start_frame_micros: Option<u64>,
     started_at: Instant,
@@ -358,6 +360,7 @@ impl MidiPatternRecorder {
             tempo_bpm,
             start_tick,
             snap_ticks,
+            timing_offset_ms,
             song_timeline_start,
         } = settings;
         if ppq == 0 {
@@ -390,6 +393,7 @@ impl MidiPatternRecorder {
             tempo_bpm,
             start_tick,
             snap_ticks,
+            timing_offset_ms,
             song_timeline_start,
             song_start_frame_micros,
             started_at,
@@ -464,7 +468,13 @@ impl MidiPatternRecorder {
         let finish_tick = timestamp_micros
             .map(|timestamp| self.tick_for_message(timestamp, finished_at))
             .unwrap_or_else(|| {
-                self.tick_for_elapsed(finished_at.saturating_duration_since(self.started_at))
+                let elapsed_micros = finished_at
+                    .saturating_duration_since(self.started_at)
+                    .as_micros()
+                    .min(u128::from(u64::MAX)) as u64;
+                self.tick_for_elapsed(Duration::from_micros(
+                    self.corrected_elapsed_micros(elapsed_micros),
+                ))
             })
             .saturating_add(self.start_tick)
             .min(MAX_NOTE_TICK);
@@ -498,8 +508,17 @@ impl MidiPatternRecorder {
         let origin = self
             .timestamp_origin_micros
             .expect("the timestamp origin is set above");
-        let elapsed_micros = timestamp_micros.saturating_sub(origin);
+        let elapsed_micros = self.corrected_elapsed_micros(timestamp_micros.saturating_sub(origin));
         self.tick_for_elapsed(Duration::from_micros(elapsed_micros))
+    }
+
+    fn corrected_elapsed_micros(&self, elapsed_micros: u64) -> u64 {
+        let offset_micros = i64::from(self.timing_offset_ms) * 1_000;
+        if offset_micros >= 0 {
+            elapsed_micros.saturating_sub(offset_micros as u64)
+        } else {
+            elapsed_micros.saturating_add(offset_micros.unsigned_abs())
+        }
     }
 
     fn tick_for_elapsed(&self, elapsed: Duration) -> u32 {
@@ -633,6 +652,7 @@ mod tests {
                 tempo_bpm: 120.0,
                 start_tick: 0,
                 snap_ticks: None,
+                timing_offset_ms: 0,
                 song_timeline_start: None,
             },
             started_at,
@@ -669,6 +689,50 @@ mod tests {
     }
 
     #[test]
+    fn positive_timing_offset_moves_recorded_notes_earlier() {
+        let started_at = Instant::now();
+        let mut recorder = MidiPatternRecorder::new(
+            MidiPatternRecorderSettings {
+                pattern_id: 1,
+                channel_id: 2,
+                project_path: None,
+                ppq: 96,
+                tempo_bpm: 120.0,
+                start_tick: 0,
+                snap_ticks: None,
+                timing_offset_ms: 100,
+                song_timeline_start: None,
+            },
+            started_at,
+        )
+        .expect("valid timing correction should create a recorder");
+
+        recorder.record(ReceivedMidiMessage {
+            timestamp_micros: 1_250_000,
+            received_at: started_at + Duration::from_millis(250),
+            event: MidiInputEvent::NoteOn {
+                channel: 0,
+                key: 60,
+                velocity: 90,
+            },
+        });
+        recorder.record(ReceivedMidiMessage {
+            timestamp_micros: 1_500_000,
+            received_at: started_at + Duration::from_millis(500),
+            event: MidiInputEvent::NoteOff {
+                channel: 0,
+                key: 60,
+                velocity: 0,
+            },
+        });
+
+        let result = recorder.finish(None, started_at + Duration::from_millis(500));
+        assert_eq!(result.notes.len(), 1);
+        assert_eq!(result.notes[0].position, 29);
+        assert_eq!(result.notes[0].length, 48);
+    }
+
+    #[test]
     fn closes_held_notes_when_recording_stops() {
         let started_at = Instant::now();
         let mut recorder = MidiPatternRecorder::new(
@@ -680,6 +744,7 @@ mod tests {
                 tempo_bpm: 120.0,
                 start_tick: 0,
                 snap_ticks: None,
+                timing_offset_ms: 0,
                 song_timeline_start: None,
             },
             started_at,
@@ -711,6 +776,7 @@ mod tests {
                 tempo_bpm: 120.0,
                 start_tick: 0,
                 snap_ticks: Some(24),
+                timing_offset_ms: 0,
                 song_timeline_start: None,
             },
             started_at,
@@ -753,6 +819,7 @@ mod tests {
                     tempo_bpm: 120.0,
                     start_tick: 0,
                     snap_ticks: Some(0),
+                    timing_offset_ms: 0,
                     song_timeline_start: None,
                 },
                 Instant::now(),
@@ -773,6 +840,7 @@ mod tests {
                 tempo_bpm: 120.0,
                 start_tick: 192,
                 snap_ticks: None,
+                timing_offset_ms: 0,
                 song_timeline_start: None,
             },
             started_at,
@@ -815,6 +883,7 @@ mod tests {
                 tempo_bpm: 120.0,
                 start_tick: 24,
                 snap_ticks: None,
+                timing_offset_ms: 0,
                 song_timeline_start: Some((
                     PlaylistTempoMap::constant(96, 120.0).expect("valid constant tempo"),
                     96.0,
