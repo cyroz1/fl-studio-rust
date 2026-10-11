@@ -1646,6 +1646,7 @@ struct DawUi {
     piano_roll_scale_root: u8,
     piano_roll_ghost_channels: bool,
     piano_roll_hidden_ghost_channels: BTreeSet<u16>,
+    piano_roll_editable_ghost_channels: bool,
     piano_roll_color_by_midi_channel: bool,
     piano_roll_paint_mode: bool,
     last_painted_note: Option<(u16, u16, u16, u32)>,
@@ -2014,6 +2015,7 @@ impl DawUi {
             piano_roll_scale_root: 0,
             piano_roll_ghost_channels: true,
             piano_roll_hidden_ghost_channels: BTreeSet::new(),
+            piano_roll_editable_ghost_channels: false,
             piano_roll_color_by_midi_channel: false,
             piano_roll_paint_mode: false,
             last_painted_note: None,
@@ -12487,6 +12489,12 @@ impl DawUi {
                 ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Y));
             let cycle_event_target =
                 ui.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::F));
+            let toggle_editable_ghosts = ui.input_mut(|input| {
+                input.consume_key(
+                    egui::Modifiers::COMMAND | egui::Modifiers::ALT,
+                    egui::Key::V,
+                )
+            });
             if select_all_notes {
                 self.apply_piano_roll_selection_command(PianoRollSelectionCommand::All);
             } else if invert_note_selection {
@@ -12501,6 +12509,14 @@ impl DawUi {
                     .unwrap_or(0);
                 self.piano_roll_event_target =
                     PianoRollEventTarget::ALL[(current + 1) % PianoRollEventTarget::ALL.len()];
+            }
+            if toggle_editable_ghosts {
+                self.piano_roll_editable_ghost_channels = !self.piano_roll_editable_ghost_channels;
+                self.status = if self.piano_roll_editable_ghost_channels {
+                    "Editable Piano roll ghost notes enabled".to_owned()
+                } else {
+                    "Editable Piano roll ghost notes disabled".to_owned()
+                };
             }
             if select_draw {
                 self.piano_roll_paint_mode = false;
@@ -13430,6 +13446,10 @@ impl DawUi {
                         }
                     });
                 ui.checkbox(&mut self.piano_roll_ghost_channels, "Ghost channels");
+                ui.checkbox(
+                    &mut self.piano_roll_editable_ghost_channels,
+                    "Editable ghosts (Ctrl/Cmd+Alt+V)",
+                );
                 ui.menu_button(
                     format!(
                         "Ghost channel visibility ({visible_ghost_count}/{})",
@@ -16321,15 +16341,19 @@ impl DawUi {
                     ),
                     note_rect.right_bottom(),
                 );
-                painter.rect_filled(
-                    resize_handle,
-                    egui::CornerRadius::same(1),
-                    Color32::from_white_alpha(if selected { 100 } else { 45 }),
-                );
+                if !ghost || self.piano_roll_editable_ghost_channels {
+                    painter.rect_filled(
+                        resize_handle,
+                        egui::CornerRadius::same(1),
+                        Color32::from_white_alpha(if selected { 100 } else { 45 }),
+                    );
+                }
                 let response = ui.interact(
                     note_rect,
                     Id::new(("piano-note", pattern.id, note.channel_id, *channel_index)),
-                    if self.piano_roll_zoom_mode {
+                    if self.piano_roll_zoom_mode
+                        || (ghost && !self.piano_roll_editable_ghost_channels)
+                    {
                         Sense::hover()
                     } else {
                         Sense::click_and_drag()

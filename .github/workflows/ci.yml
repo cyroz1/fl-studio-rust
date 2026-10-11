@@ -225,9 +225,30 @@ jobs:
               struct.pack("<I2sBBf", position, b"\xA5\x5A", 2, 0x24, value)
               for position, value in [(0, 0.15), (192, 0.78), (384, 0.36), (576, 0.9)]
           )
+
+          def pattern_note(channel_id, key):
+              return struct.pack(
+                  "<IHHIHH8B",
+                  0,
+                  0x4000,
+                  channel_id,
+                  192,
+                  key,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  64,
+                  100,
+                  0,
+                  0,
+              )
+
+          note_records = pattern_note(0, 60) + pattern_note(1, 64)
           pattern_events = (
-              bytes([0x40, 0, 0, 0x41, 7, 0])
-              + data_event(0xD0, b"")
+              bytes([0x40, 0, 0, 0x40, 1, 0, 0x41, 7, 0])
+              + data_event(0xD0, note_records)
               + data_event(0xDF, controller_records)
           )
           controller_project = (
@@ -308,6 +329,18 @@ jobs:
           sleep 0.5
           ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
             -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/controller-roll.png"
+          xdotool mousemove 400 192 click 1
+          sleep 0.5
+          ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
+            -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/controller-ghost-visibility.png"
+          xdotool key Escape
+          xdotool key ctrl+alt+v
+          sleep 0.5
+          xdotool mousemove 400 192 click 1
+          sleep 0.5
+          ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
+            -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/controller-ghost-editable.png"
+          xdotool key Escape
           xdotool mousemove 455 741 click 1
           sleep 0.3
           xdotool mousemove 440 720 click 1
@@ -327,7 +360,8 @@ jobs:
             exit 1
           fi
           for capture in browser-search-options.png playlist-solo.png playlist-group-solo.png playlist-groups-collapsed.png \
-            mixer.png mixer-muted.png mixer-muted-solo.png mixer-phase-swap.png; do
+            mixer.png mixer-muted.png mixer-muted-solo.png mixer-phase-swap.png controller-ghost-visibility.png \
+            controller-ghost-editable.png; do
             if [[ "$(stat -c%s "$GITHUB_WORKSPACE/dist/gui-preview/$capture")" -lt 10000 ]]; then
               echo "The $capture capture is blank or incomplete."
               cat "$RUNNER_TEMP/mixer-preview.log"
