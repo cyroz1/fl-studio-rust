@@ -330,10 +330,13 @@ jobs:
           ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
             -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/controller-roll.png"
           xdotool mousemove 400 192 click 1
+          sleep 0.3
+          xdotool mousemove 500 315
           sleep 0.5
           ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
             -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/controller-ghost-visibility.png"
           xdotool key Escape
+          xdotool mousemove 900 500 click 1
           xdotool key ctrl+alt+v
           sleep 0.5
           xdotool mousemove 400 192 click 1
