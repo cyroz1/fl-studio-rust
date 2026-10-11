@@ -1357,19 +1357,21 @@ impl PianoRollChordStamp {
         } else {
             &[0, 2, 4]
         };
-        let octave_base = (snapped_root / 12) * 12;
+        let scale_anchor = i32::from(snapped_root) - i32::from(scale_intervals[scale_degree]);
+        let scale_len = scale_intervals.len();
         degrees
             .iter()
             .filter_map(|degree| {
-                let scale_index = scale_degree + degree;
-                let octave_offset = (scale_index / scale_intervals.len()) * 12;
-                octave_base
-                    .checked_add(octave_offset as u16)?
-                    .checked_add(u16::from(
-                        scale_intervals[scale_index % scale_intervals.len()],
-                    ))
+                let scale_index = scale_degree.checked_add(*degree)?;
+                let octave_offset = i32::try_from(scale_index / scale_len).ok()?;
+                let key = scale_anchor
+                    + octave_offset * 12
+                    + i32::from(scale_intervals[scale_index % scale_len]);
+                if !(0..=127).contains(&key) {
+                    return None;
+                }
+                u16::try_from(key).ok()
             })
-            .filter(|key| *key <= 127)
             .collect()
     }
 
@@ -28407,6 +28409,24 @@ mod tests {
             PianoRollChordStamp::TopDownTriad.pitches(0, PianoRollScale::Major, 0),
             Vec::<u16>::new(),
             "the lowest MIDI key cannot fit a chord underneath it",
+        );
+    }
+
+    #[test]
+    fn piano_roll_scale_chord_stamps_follow_non_c_key_roots() {
+        assert_eq!(
+            PianoRollChordStamp::ScaleTriad.pitches(69, PianoRollScale::Major, 2),
+            vec![69, 73, 76],
+            "A is the fifth scale degree in D major",
+        );
+        assert_eq!(
+            PianoRollChordStamp::ScaleSeventh.pitches(69, PianoRollScale::Major, 2),
+            vec![69, 73, 76, 79],
+        );
+        assert_eq!(
+            PianoRollChordStamp::ScaleTriad.pitches(60, PianoRollScale::NaturalMinor, 9),
+            vec![60, 64, 67],
+            "C is the third scale degree in A natural minor",
         );
     }
 
