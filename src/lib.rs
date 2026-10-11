@@ -1770,7 +1770,7 @@ impl MixerInsertSummary {
     }
 }
 
-/// Conservative source-audibility rules for saved Mixer insert mute and solo state.
+/// Conservative direct-route Mixer state for mute, solo, and candidate fader values.
 /// Unknown and context-dependent routes are left untouched.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct MixerRouteAudibility {
@@ -1778,12 +1778,14 @@ pub(crate) struct MixerRouteAudibility {
     disabled_tracks: HashSet<i8>,
     soloed_insert_tracks: HashSet<i8>,
     source_transforms: HashMap<i8, MixerInsertSignalTransform>,
+    master_fader_raw: Option<i32>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct MixerInsertSignalTransform {
     polarity_reversed: bool,
     swap_left_right: bool,
+    fader_volume_raw: Option<i32>,
 }
 
 impl MixerInsertSignalTransform {
@@ -1791,7 +1793,13 @@ impl MixerInsertSignalTransform {
         Self {
             polarity_reversed,
             swap_left_right,
+            fader_volume_raw: None,
         }
+    }
+
+    pub(crate) const fn with_fader_volume_raw(mut self, volume_raw: Option<i32>) -> Self {
+        self.fader_volume_raw = volume_raw;
+        self
     }
 
     pub(crate) fn apply_frame(self, frame: &mut [f32; 2]) {
@@ -1802,20 +1810,35 @@ impl MixerInsertSignalTransform {
             frame[0] = -frame[0];
             frame[1] = -frame[1];
         }
+        if let Some(volume_raw) = self.fader_volume_raw {
+            let gain = mixer_fader_gain(volume_raw);
+            frame[0] *= gain;
+            frame[1] *= gain;
+        }
     }
 }
 
 impl MixerRouteAudibility {
-    pub(crate) fn from_inserts(inserts: impl IntoIterator<Item = MixerInsertSummary>) -> Self {
+    pub(crate) fn from_document(document: &FlpDocument) -> Self {
+        let parameters = document.mixer_parameter_records().unwrap_or_default();
+        Self::from_inserts_with_parameters(document.mixer_inserts(), &parameters)
+    }
+
+    fn from_inserts_with_parameters(
+        inserts: impl IntoIterator<Item = MixerInsertSummary>,
+        parameters: &[MixerParameterRecord],
+    ) -> Self {
         let mut routing = Self::default();
         for insert in inserts {
             let Ok(track) = i8::try_from(insert.ordinal()) else {
                 continue;
             };
             routing.known_tracks.insert(track);
+            let fader_volume_raw = candidate_mixer_fader_volume(parameters, insert.ordinal());
             // Master is the final destination for every normally routed source. Its
-            // saved mute/phase flags are applied to the completed stereo mix instead.
+            // saved flags and candidate fader are applied to the completed mix instead.
             if track == 0 {
+                routing.master_fader_raw = fader_volume_raw;
                 continue;
             }
             if insert.enabled() == Some(false) {
@@ -1827,7 +1850,8 @@ impl MixerRouteAudibility {
             let transform = MixerInsertSignalTransform::new(
                 insert.polarity_reversed() == Some(true),
                 insert.swap_left_right() == Some(true),
-            );
+            )
+            .with_fader_volume_raw(fader_volume_raw);
             if transform != MixerInsertSignalTransform::default() {
                 routing.source_transforms.insert(track, transform);
             }
@@ -1852,14 +1876,38 @@ impl MixerRouteAudibility {
         self.soloed_insert_tracks.is_empty() || self.soloed_insert_tracks.contains(&track)
     }
 
-    /// Returns the supported insert phase/stereo transform for a known source route.
-    /// Master transforms are applied once to the final mix, and unknown routes are unchanged.
+    /// Returns the supported phase, stereo, and candidate fader transform for a known route.
+    /// Master processing is applied once to the final mix, and unknown routes are unchanged.
     pub(crate) fn transform_for_channel(&self, route: Option<i8>) -> MixerInsertSignalTransform {
         route
             .filter(|track| *track > 0 && self.known_tracks.contains(track))
             .and_then(|track| self.source_transforms.get(&track).copied())
             .unwrap_or_default()
     }
+
+    pub(crate) fn master_fader_raw(&self) -> Option<i32> {
+        self.master_fader_raw
+    }
+}
+
+fn candidate_mixer_fader_volume(
+    parameters: &[MixerParameterRecord],
+    insert_ordinal: usize,
+) -> Option<i32> {
+    let mut matches = parameters.iter().filter(|record| {
+        record.kind() == MixerParameterKind::Volume
+            && record.candidate_insert_ordinal() == Some(insert_ordinal)
+            && record.target_scope_raw() == 0
+    });
+    let record = matches.next()?;
+    if matches.next().is_some() || !(0..=16_000).contains(&record.value()) {
+        return None;
+    }
+    Some(record.value())
+}
+
+fn mixer_fader_gain(volume_raw: i32) -> f32 {
+    volume_raw.clamp(0, 16_000) as f32 / 10_000.0
 }
 
 /// Recognized parameter-ID interpretations for Mixer `0xE1` records.
@@ -15245,11 +15293,14 @@ mod tests {
             first_event_index: 0,
             end_event_index: 0,
         };
-        let routing = MixerRouteAudibility::from_inserts([
-            insert(0, (1 << 3) | (1 << 12) | 1 | (1 << 1)),
-            insert(1, (1 << 3) | (1 << 12) | 1 | (1 << 1)),
-            insert(2, 0), // Disabled insert.
-        ]);
+        let routing = MixerRouteAudibility::from_inserts_with_parameters(
+            [
+                insert(0, (1 << 3) | (1 << 12) | 1 | (1 << 1)),
+                insert(1, (1 << 3) | (1 << 12) | 1 | (1 << 1)),
+                insert(2, 0), // Disabled insert.
+            ],
+            &[],
+        );
 
         assert!(!routing.allows_channel(None));
         assert!(routing.allows_channel(Some(1)));
@@ -15267,12 +15318,67 @@ mod tests {
             .apply_frame(&mut master_frame);
         assert_eq!(master_frame, [0.25, -0.5]);
 
-        let master_solo = MixerRouteAudibility::from_inserts([
-            insert(0, (1 << 3) | (1 << 12)),
-            insert(1, 1 << 3),
-        ]);
+        let master_solo = MixerRouteAudibility::from_inserts_with_parameters(
+            [insert(0, (1 << 3) | (1 << 12)), insert(1, 1 << 3)],
+            &[],
+        );
         assert!(master_solo.allows_channel(None));
         assert!(master_solo.allows_channel(Some(1)));
+    }
+
+    #[test]
+    fn mixer_route_audibility_applies_only_unique_zero_scope_fader_candidates() {
+        let insert = |ordinal| MixerInsertSummary {
+            ordinal,
+            input_raw: 0,
+            output_raw: 0,
+            color_raw: 0,
+            icon_raw: None,
+            name: None,
+            flags: Some((1 << 3) | (1 << 12)),
+            flags_event_index: None,
+            first_event_index: 0,
+            end_event_index: 0,
+        };
+        let parameter = |insert_ordinal: u16, scope: u16, value| MixerParameterRecord {
+            event_index: 0,
+            record_index: 0,
+            prefix: [0; 4],
+            parameter_id: 192,
+            reserved: 0,
+            channel_data: ((64 + insert_ordinal) << 6) | (scope << 13),
+            value,
+        };
+        let parameters = [parameter(0, 0, 2_500), parameter(1, 0, 5_000)];
+        let routing = MixerRouteAudibility::from_inserts_with_parameters(
+            [insert(0), insert(1), insert(2)],
+            &parameters,
+        );
+
+        assert_eq!(routing.master_fader_raw(), Some(2_500));
+        let mut insert_frame = [0.5, -1.0];
+        routing
+            .transform_for_channel(Some(1))
+            .apply_frame(&mut insert_frame);
+        assert_eq!(insert_frame, [0.25, -0.5]);
+        let mut unmatched_frame = [0.5, -1.0];
+        routing
+            .transform_for_channel(Some(2))
+            .apply_frame(&mut unmatched_frame);
+        assert_eq!(unmatched_frame, [0.5, -1.0]);
+
+        for invalid in [
+            vec![parameter(1, 0, 5_000), parameter(1, 0, 6_000)],
+            vec![parameter(1, 1, 5_000)],
+            vec![parameter(1, 0, 16_001)],
+        ] {
+            let routing = MixerRouteAudibility::from_inserts_with_parameters([insert(1)], &invalid);
+            let mut frame = [0.5, -1.0];
+            routing
+                .transform_for_channel(Some(1))
+                .apply_frame(&mut frame);
+            assert_eq!(frame, [0.5, -1.0]);
+        }
     }
 
     #[test]

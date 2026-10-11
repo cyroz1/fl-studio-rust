@@ -2072,6 +2072,7 @@ struct MixerMasterOutput {
     enabled: Option<bool>,
     polarity_reversed: Option<bool>,
     swap_left_right: Option<bool>,
+    fader_volume_raw: Option<i32>,
 }
 
 impl MixerMasterOutput {
@@ -2079,10 +2080,12 @@ impl MixerMasterOutput {
         let Some(master) = document.mixer_inserts().into_iter().next() else {
             return Self::default();
         };
+        let routing = MixerRouteAudibility::from_document(document);
         Self {
             enabled: master.enabled(),
             polarity_reversed: master.polarity_reversed(),
             swap_left_right: master.swap_left_right(),
+            fader_volume_raw: routing.master_fader_raw(),
         }
     }
 
@@ -2092,6 +2095,8 @@ impl MixerMasterOutput {
             return;
         }
         let (frames, _) = stereo_samples.as_chunks_mut::<2>();
+        let fader_transform =
+            MixerInsertSignalTransform::default().with_fader_volume_raw(self.fader_volume_raw);
         for frame in frames {
             if self.swap_left_right == Some(true) {
                 frame.swap(0, 1);
@@ -2100,6 +2105,7 @@ impl MixerMasterOutput {
                 frame[0] = -frame[0];
                 frame[1] = -frame[1];
             }
+            fader_transform.apply_frame(frame);
         }
     }
 }
@@ -2501,7 +2507,7 @@ fn prepare_audio_clip_render(
         soloed_track_range: options.soloed_playlist_track_range,
     };
     let channels = document.channels();
-    let mixer_route_audibility = MixerRouteAudibility::from_inserts(document.mixer_inserts());
+    let mixer_route_audibility = MixerRouteAudibility::from_document(document);
     let resolver = SamplePathResolver::new(project_path);
 
     let selected_clip = options
@@ -2959,7 +2965,7 @@ fn prepare_sampler_arrangement(
     };
     let patterns = document.patterns().map_err(|error| error.to_string())?;
     let channels = document.channels();
-    let mixer_route_audibility = MixerRouteAudibility::from_inserts(document.mixer_inserts());
+    let mixer_route_audibility = MixerRouteAudibility::from_document(document);
     let channels_by_id: HashMap<_, _> = channels
         .iter()
         .map(|channel| (channel.id(), channel))
@@ -3268,7 +3274,7 @@ fn prepare_sampler_pattern(
     let pan_law = project_pan_law(document);
     let global_swing_mix_raw = document.metadata().global_swing_mix();
     let channels = document.channels();
-    let mixer_route_audibility = MixerRouteAudibility::from_inserts(document.mixer_inserts());
+    let mixer_route_audibility = MixerRouteAudibility::from_document(document);
     let channels_by_id: HashMap<_, _> = channels
         .iter()
         .map(|channel| (channel.id(), channel))
@@ -4453,9 +4459,22 @@ mod tests {
             enabled: Some(true),
             polarity_reversed: Some(true),
             swap_left_right: Some(true),
+            ..MixerMasterOutput::default()
         }
         .apply(&mut output);
         assert_eq!(output, [0.5, -0.25, 1.0, -0.75]);
+    }
+
+    #[test]
+    fn mixer_master_fader_scales_the_final_bus() {
+        let mut output = [0.25, -0.5, 0.75, -1.0];
+        MixerMasterOutput {
+            enabled: Some(true),
+            fader_volume_raw: Some(5_000),
+            ..MixerMasterOutput::default()
+        }
+        .apply(&mut output);
+        assert_eq!(output, [0.125, -0.25, 0.375, -0.5]);
     }
 
     #[test]

@@ -1183,7 +1183,7 @@ impl Vst3HostRuntime {
             .iter()
             .map(|channel| (channel.id(), channel))
             .collect();
-        let mixer_route_audibility = MixerRouteAudibility::from_inserts(document.mixer_inserts());
+        let mixer_route_audibility = MixerRouteAudibility::from_document(document);
         let channel_router = ChannelNoteRouter::new(channels.clone());
         let mut plugin_channels: BTreeSet<_> = document
             .channel_plugin_states()
