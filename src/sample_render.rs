@@ -83,7 +83,7 @@ impl PlaylistTempoMap {
         Self::from_tempo_events(ppq, tempo_bpm, &[])
     }
 
-    fn from_tempo_events(
+    pub(crate) fn from_tempo_events(
         ppq: u16,
         base_tempo_bpm: f64,
         events: &[(u64, f64)],
@@ -141,8 +141,13 @@ impl PlaylistTempoMap {
 
     /// Convert an absolute Playlist tick position to a rounded sample-frame position.
     pub fn frame_at_tick(&self, tick: u64, sample_rate: u32) -> Result<u64, String> {
-        if sample_rate == 0 {
-            return Err("sample rate must be greater than zero".to_owned());
+        let frames = self.precise_frame_at_tick(tick, f64::from(sample_rate))?;
+        Ok(frames.round() as u64)
+    }
+
+    pub(crate) fn precise_frame_at_tick(&self, tick: u64, sample_rate: f64) -> Result<f64, String> {
+        if !sample_rate.is_finite() || sample_rate <= 0.0 {
+            return Err("sample rate must be finite and positive".to_owned());
         }
         let segment_index = self
             .segments
@@ -156,7 +161,7 @@ impl PlaylistTempoMap {
         if !frames.is_finite() || frames < 0.0 || frames > u64::MAX as f64 {
             return Err("Playlist position is outside the renderable timeline".to_owned());
         }
-        Ok(frames.round() as u64)
+        Ok(frames)
     }
 
     /// Convert a rounded song-frame position back to a fractional Playlist tick.
@@ -781,8 +786,8 @@ pub fn stream_audio_clips_to_device(
 /// Pattern clips are expanded on the worker thread into sample-offset note events. Audio-device
 /// callbacks continue to consume only complete stereo frames from the bounded streaming queue.
 /// The recognized Master mute, polarity, and stereo-swap flags are applied to the final mix.
-/// Linear Playlist `TEMPO` automation updates audio and Sampler timing; VST3 tempo alignment,
-/// parameter automation, Mixer routing and processing, and time stretching remain incomplete.
+/// Linear Playlist `TEMPO` automation updates audio, Sampler, and VST3 note timing; parameter
+/// automation, Mixer routing and processing, and time stretching remain incomplete.
 pub fn stream_playlist_to_device(
     document: &FlpDocument,
     project_path: impl AsRef<Path>,
@@ -923,7 +928,8 @@ pub fn stream_playlist_with_vst3_to_device_from_frame(
 /// Render enabled Playlist audio clips, Sampler Pattern Clips, and mapped VST3 instruments to a
 /// stereo WAV. Audio is mixed in bounded blocks and written to a temporary file, so song length
 /// does not determine the in-memory mix size. The recognized Master mute, polarity, and stereo-swap
-/// flags are applied to the final mix. Insert routing, effects, tempo automation, and plugin delay
+/// flags are applied to the final mix. Linear Playlist tempo automation is applied to audio,
+/// Sampler, and VST3 event timing. Insert routing, effects, parameter automation, and plugin delay
 /// compensation are not applied.
 pub fn render_playlist_with_vst3_to_wav_cancellable(
     document: &FlpDocument,

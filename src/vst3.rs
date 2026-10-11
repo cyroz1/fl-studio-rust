@@ -15,7 +15,7 @@ use std::thread;
 use crate::audio::StreamingAudioWriter;
 use crate::sample_render::{
     AudioFileRenderOptions, PlaylistPatternScheduleOptions, PlaylistRenderOptions,
-    PlaylistTrackFilter, channel_gain_pan, channel_pan_gains, project_pan_law,
+    PlaylistTempoMap, PlaylistTrackFilter, channel_gain_pan, channel_pan_gains, project_pan_law,
     render_stereo_audio_to_file, schedule_playlist_pattern_notes, swing_note_start_tick,
 };
 use crate::{
@@ -1169,10 +1169,6 @@ impl Vst3HostRuntime {
         if ppq == 0 {
             return Err("project PPQ must be greater than zero".to_owned());
         }
-        let tempo_bpm = document.metadata().tempo_bpm().unwrap_or(140.0);
-        if !tempo_bpm.is_finite() || tempo_bpm <= 0.0 {
-            return Err("project tempo must be finite and positive".to_owned());
-        }
         let pan_law = project_pan_law(document);
         let arrangement = document
             .arrangements()
@@ -1180,6 +1176,7 @@ impl Vst3HostRuntime {
             .into_iter()
             .find(|arrangement| arrangement.id == arrangement_id)
             .ok_or_else(|| format!("arrangement {arrangement_id} was not found"))?;
+        let tempo_map = PlaylistTempoMap::for_arrangement(document, arrangement_id)?;
         let patterns = document.patterns().map_err(|error| error.to_string())?;
         let channels = document.channels();
         let channels_by_id: BTreeMap<_, _> = channels
@@ -1263,7 +1260,6 @@ impl Vst3HostRuntime {
                 });
         }
 
-        let ppq = u64::from(ppq);
         let clip_end_tick = arrangement.clips.iter().fold(0u64, |end, clip| {
             end.max(u64::from(clip.position_ticks) + u64::from(clip.length_ticks))
         });
@@ -1274,8 +1270,7 @@ impl Vst3HostRuntime {
             .max()
             .unwrap_or(0);
         let max_tick = clip_end_tick.max(scheduled_note_end_tick);
-        let duration_seconds = max_tick as f64 * 60.0 / (ppq as f64 * tempo_bpm);
-        let base_output_frames = duration_seconds * f64::from(output_sample_rate);
+        let base_output_frames = tempo_map.frame_at_tick(max_tick, output_sample_rate)? as f64;
         let tail_output_frames = tail_seconds * f64::from(output_sample_rate);
         let total_output_frames = base_output_frames + tail_output_frames;
         if !total_output_frames.is_finite() || total_output_frames > u64::MAX as f64 {
@@ -1331,8 +1326,7 @@ impl Vst3HostRuntime {
                 prepare_playlist_pattern_render(
                     &plugin_guard,
                     &notes,
-                    u16::try_from(ppq).map_err(|_| "project PPQ is out of range".to_owned())?,
-                    tempo_bpm,
+                    &tempo_map,
                     source_frames as u64,
                 )?
             };
@@ -1425,16 +1419,9 @@ impl Vst3HostRuntime {
 fn prepare_playlist_pattern_render(
     plugin: &Plugin,
     notes: &[PlaylistMidiNote],
-    ppq: u16,
-    tempo_bpm: f64,
+    tempo_map: &PlaylistTempoMap,
     total_frames: u64,
 ) -> Result<PreparedPatternRender, String> {
-    if ppq == 0 {
-        return Err("project PPQ must be greater than zero".to_owned());
-    }
-    if !tempo_bpm.is_finite() || tempo_bpm <= 0.0 {
-        return Err("project tempo must be finite and positive".to_owned());
-    }
     if notes.is_empty() {
         return Err("VST3 Playlist channel has no notes to render".to_owned());
     }
@@ -1453,7 +1440,8 @@ fn prepare_playlist_pattern_render(
             "VST3 Playlist supports mono or stereo output buses; the instrument has {output_channels} channels"
         ));
     }
-    let (events, note_count) = scheduled_playlist_midi_events(notes, ppq, tempo_bpm, sample_rate)?;
+    let (events, note_count) =
+        scheduled_playlist_midi_events_with_tempo_map(notes, tempo_map, sample_rate)?;
     let last_event_frame = events
         .iter()
         .map(|event| event.frame)
@@ -1477,12 +1465,15 @@ fn scheduled_playlist_midi_events(
     tempo_bpm: f64,
     sample_rate: f64,
 ) -> Result<(Vec<ScheduledMidiEvent>, usize), String> {
-    if ppq == 0 {
-        return Err("project PPQ must be greater than zero".to_owned());
-    }
-    if !tempo_bpm.is_finite() || tempo_bpm <= 0.0 {
-        return Err("project tempo must be finite and positive".to_owned());
-    }
+    let tempo_map = PlaylistTempoMap::constant(ppq, tempo_bpm)?;
+    scheduled_playlist_midi_events_with_tempo_map(notes, &tempo_map, sample_rate)
+}
+
+fn scheduled_playlist_midi_events_with_tempo_map(
+    notes: &[PlaylistMidiNote],
+    tempo_map: &PlaylistTempoMap,
+    sample_rate: f64,
+) -> Result<(Vec<ScheduledMidiEvent>, usize), String> {
     if !sample_rate.is_finite() || sample_rate <= 0.0 {
         return Err("VST3 host sample rate must be finite and positive".to_owned());
     }
@@ -1510,10 +1501,15 @@ fn scheduled_playlist_midi_events(
                 note.midi_channel
             )
         })?;
-        let frame_for_tick =
-            |tick: u64| ((tick as f64 / f64::from(ppq)) * (60.0 / tempo_bpm) * sample_rate).round();
-        let start_frame = frame_for_tick(note.start_tick);
-        let end_frame = frame_for_tick(note.stop_tick.max(note.start_tick.saturating_add(1)));
+        let start_frame = tempo_map
+            .precise_frame_at_tick(note.start_tick, sample_rate)?
+            .round();
+        let end_frame = tempo_map
+            .precise_frame_at_tick(
+                note.stop_tick.max(note.start_tick.saturating_add(1)),
+                sample_rate,
+            )?
+            .round();
         if !start_frame.is_finite()
             || !end_frame.is_finite()
             || start_frame < 0.0
@@ -2847,6 +2843,25 @@ mod tests {
             events[3].event,
             MidiEvent::NoteOff { note: 64, .. }
         ));
+    }
+
+    #[test]
+    fn playlist_vst3_notes_follow_the_shared_tempo_map() {
+        let tempo_map = PlaylistTempoMap::from_tempo_events(480, 120.0, &[(480, 60.0)]).unwrap();
+        let note = PlaylistMidiNote {
+            start_tick: 480,
+            stop_tick: 720,
+            key: 64,
+            velocity: 96,
+            midi_channel: 0,
+        };
+
+        let (events, note_count) =
+            scheduled_playlist_midi_events_with_tempo_map(&[note], &tempo_map, 48_000.0).unwrap();
+
+        assert_eq!(note_count, 1);
+        assert_eq!(events[0].frame, 24_000);
+        assert_eq!(events[1].frame, 48_000);
     }
 
     #[test]
