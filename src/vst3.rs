@@ -200,6 +200,7 @@ struct PlaylistPluginStream {
     left_pan_gain: f32,
     right_pan_gain: f32,
     mixer_transform: MixerInsertSignalTransform,
+    mixer_meter_track: Option<usize>,
 }
 
 /// Prepared VST3 instrument channels for blockwise Playlist Song transport.
@@ -300,6 +301,22 @@ impl Vst3PlaylistStreamProcessor {
     }
 
     pub fn mix_next_block(&mut self, output: &mut [f32]) -> Result<(), String> {
+        self.mix_next_block_with_optional_meter_buses(output, None)
+    }
+
+    pub(crate) fn mix_next_block_with_meter_buses(
+        &mut self,
+        output: &mut [f32],
+        meter_buses: &mut [f32],
+    ) -> Result<(), String> {
+        self.mix_next_block_with_optional_meter_buses(output, Some(meter_buses))
+    }
+
+    fn mix_next_block_with_optional_meter_buses(
+        &mut self,
+        output: &mut [f32],
+        mut meter_buses: Option<&mut [f32]>,
+    ) -> Result<(), String> {
         crate::audio::enable_denormal_protection();
         if !output.len().is_multiple_of(2) {
             return Err("VST3 Playlist mix buffer must contain stereo frames".to_owned());
@@ -312,6 +329,16 @@ impl Vst3PlaylistStreamProcessor {
                 .map_err(|error| format!("could not allocate VST3 Playlist block: {error}"))?;
             stream.render_output_frames(frame_count, &mut plugin_output)?;
             stream.delay_line.process_interleaved(&mut plugin_output)?;
+            if let Some(track) = stream.mixer_meter_track
+                && let Some(meter_buses) = meter_buses.as_deref()
+            {
+                let meter_end = (track + 1)
+                    .checked_mul(output.len())
+                    .ok_or_else(|| "Mixer meter buffer size overflow".to_owned())?;
+                if meter_end > meter_buses.len() {
+                    return Err("Mixer meter buffer is too small for the VST3 route".to_owned());
+                }
+            }
             for (frame_index, frame) in plugin_output.as_chunks::<2>().0.iter().enumerate() {
                 let mut routed_frame = [
                     frame[0] * stream.gain * stream.left_pan_gain,
@@ -320,6 +347,13 @@ impl Vst3PlaylistStreamProcessor {
                 stream.mixer_transform.apply_frame(&mut routed_frame);
                 output[frame_index * 2] += routed_frame[0];
                 output[frame_index * 2 + 1] += routed_frame[1];
+                if let (Some(track), Some(meter_buses)) =
+                    (stream.mixer_meter_track, meter_buses.as_deref_mut())
+                {
+                    let meter_offset = track * output.len() + frame_index * 2;
+                    meter_buses[meter_offset] += routed_frame[0];
+                    meter_buses[meter_offset + 1] += routed_frame[1];
+                }
             }
         }
         Ok(())
@@ -1386,6 +1420,9 @@ impl Vst3HostRuntime {
             let mixer_transform = channel
                 .map(|channel| mixer_route_audibility.transform_for_channel(channel.mixer_track()))
                 .unwrap_or_default();
+            let mixer_meter_track = channel.and_then(|channel| {
+                mixer_route_audibility.direct_meter_track(channel.mixer_track())
+            });
             let (render, latency_frames) = {
                 let plugin_guard = plugin
                     .lock()
@@ -1438,6 +1475,7 @@ impl Vst3HostRuntime {
                 left_pan_gain,
                 right_pan_gain,
                 mixer_transform,
+                mixer_meter_track,
             });
         }
         if streams.is_empty() {

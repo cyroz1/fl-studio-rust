@@ -10,7 +10,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui::{self, Align2, Color32, FontId, Id, PointerButton, Sense, Stroke, Vec2};
 use flp_rebuild::audio::{
-    AudioAccess, AudioDeviceCatalog, AudioEngine, AudioSettings, enumerate_devices,
+    AudioAccess, AudioDeviceCatalog, AudioEngine, AudioSettings, MIXER_TRACK_METER_COUNT,
+    MixerTrackPeakMeters, enumerate_devices,
 };
 use flp_rebuild::media::{
     AudioWaveform, SamplePathResolver, decode_audio_preview, decode_audio_waveform,
@@ -26,7 +27,7 @@ use flp_rebuild::sample_render::{
     render_audio_clips_to_file, render_playlist_with_vst3_to_flac_cancellable,
     render_playlist_with_vst3_to_mp3_cancellable, render_playlist_with_vst3_to_ogg_cancellable,
     render_playlist_with_vst3_to_wav_cancellable, render_sampler_pattern_to_file,
-    stream_playlist_with_vst3_to_device_from_frame, stream_sampler_pattern_to_device,
+    stream_playlist_with_vst3_to_device_from_frame_with_meters, stream_sampler_pattern_to_device,
     write_input_recording_to_wav,
 };
 use flp_rebuild::vst3::{
@@ -1858,6 +1859,8 @@ struct DawUi {
     pattern_time_signature_dialog_open: bool,
     selected_mixer_insert: Option<usize>,
     mixer_master_peak_hold: f32,
+    mixer_insert_peak_holds: [f32; MIXER_TRACK_METER_COUNT],
+    mixer_track_peak_meters: Arc<MixerTrackPeakMeters>,
     mixer_master_peak_updated_at: Instant,
     new_time_marker_position: u32,
     new_time_marker_is_signature: bool,
@@ -2354,6 +2357,8 @@ impl DawUi {
             pattern_time_signature_dialog_open: false,
             selected_mixer_insert: None,
             mixer_master_peak_hold: 0.0,
+            mixer_insert_peak_holds: [0.0; MIXER_TRACK_METER_COUNT],
+            mixer_track_peak_meters: Arc::new(MixerTrackPeakMeters::default()),
             mixer_master_peak_updated_at: Instant::now(),
             new_time_marker_position: 0,
             new_time_marker_is_signature: false,
@@ -5035,6 +5040,9 @@ impl DawUi {
         };
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
+        let worker_mixer_meters = Arc::clone(&self.mixer_track_peak_meters);
+        worker_mixer_meters.clear();
+        self.mixer_insert_peak_holds.fill(0.0);
         let (sender, receiver) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
             .name("project-audio-render".to_owned())
@@ -5042,7 +5050,7 @@ impl DawUi {
                 let result = FlpDocument::parse(&project_bytes)
                     .map_err(|error| error.to_string())
                     .and_then(|document| {
-                        stream_playlist_with_vst3_to_device_from_frame(
+                        stream_playlist_with_vst3_to_device_from_frame_with_meters(
                             &document,
                             &project_path,
                             options,
@@ -5050,6 +5058,7 @@ impl DawUi {
                             &worker_cancelled,
                             vst3_processor,
                             start_frame,
+                            &worker_mixer_meters,
                         )
                     });
                 writer.finish();
@@ -20480,14 +20489,25 @@ impl DawUi {
             .duration_since(self.mixer_master_peak_updated_at)
             .as_secs_f32()
             .min(5.0);
-        self.mixer_master_peak_hold =
-            output_peak.max(self.mixer_master_peak_hold * 10.0_f32.powf(-elapsed));
+        let decay = 10.0_f32.powf(-elapsed);
+        self.mixer_master_peak_hold = output_peak.max(self.mixer_master_peak_hold * decay);
+        for (track, peak_hold) in self.mixer_insert_peak_holds.iter_mut().enumerate().skip(1) {
+            *peak_hold = self
+                .mixer_track_peak_meters
+                .take_peak(track)
+                .max(*peak_hold * decay);
+        }
         self.mixer_master_peak_updated_at = now;
         let meter_active = self.audio_engine.as_ref().is_some_and(|engine| {
             engine.project_playback_active() || engine.browser_preview_active()
         }) || self.audio_test_tone
             || self.audio_monitor_input;
-        if meter_active {
+        if meter_active
+            || self
+                .mixer_insert_peak_holds
+                .iter()
+                .any(|peak| *peak > 0.001)
+        {
             ui.ctx().request_repaint_after(Duration::from_millis(33));
         }
         ui.horizontal_top(|ui| {
@@ -20626,6 +20646,43 @@ impl DawUi {
                                                         GREEN
                                                     };
                                                     ui.small("MASTER PEAK");
+                                                    ui.add(
+                                                        egui::ProgressBar::new(meter_fraction)
+                                                            .desired_width(90.0)
+                                                            .fill(meter_color)
+                                                            .text(if peak_db.is_finite() {
+                                                                format!("{peak_db:.1} dBFS")
+                                                            } else {
+                                                                "−∞ dBFS".to_owned()
+                                                            }),
+                                                    );
+                                                } else {
+                                                    let peak = self
+                                                        .mixer_insert_peak_holds
+                                                        .get(insert.ordinal())
+                                                        .copied()
+                                                        .unwrap_or(0.0);
+                                                    let peak_db = if peak > 0.0 {
+                                                        20.0 * peak.log10()
+                                                    } else {
+                                                        f32::NEG_INFINITY
+                                                    };
+                                                    let meter_fraction = if peak_db.is_finite() {
+                                                        ((peak_db + 60.0) / 60.0)
+                                                            .clamp(0.0, 1.0)
+                                                    } else {
+                                                        0.0
+                                                    };
+                                                    let meter_color = if peak >= 0.891_251 {
+                                                        RED
+                                                    } else if peak >= 0.707_946 {
+                                                        ORANGE
+                                                    } else {
+                                                        GREEN
+                                                    };
+                                                    ui.small("INSERT PEAK").on_hover_text(
+                                                        "Summed supported direct-route signal before Mixer effects. Unknown routes are excluded.",
+                                                    );
                                                     ui.add(
                                                         egui::ProgressBar::new(meter_fraction)
                                                             .desired_width(90.0)

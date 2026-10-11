@@ -27,6 +27,51 @@ const STREAM_PREFILL_FRAMES: usize = 512;
 const TEST_TONE_HZ: f32 = 440.0;
 const TEST_TONE_LEVEL: f32 = 0.12;
 
+/// Number of Mixer tracks that can be named by a channel's signed-byte assignment.
+pub const MIXER_TRACK_METER_COUNT: usize = i8::MAX as usize + 1;
+
+/// Block-peak snapshots for the supported live Playlist Mixer routes.
+///
+/// The render worker publishes the maximum sample for each insert between UI reads. The UI
+/// consumes each value with [`take_peak`](Self::take_peak), keeping the audio thread lock-free.
+pub struct MixerTrackPeakMeters {
+    peaks: [AtomicU32; MIXER_TRACK_METER_COUNT],
+}
+
+impl Default for MixerTrackPeakMeters {
+    fn default() -> Self {
+        Self {
+            peaks: std::array::from_fn(|_| AtomicU32::new(0.0_f32.to_bits())),
+        }
+    }
+}
+
+impl MixerTrackPeakMeters {
+    /// Consume the largest sample peak published for an insert since the previous read.
+    pub fn take_peak(&self, track: usize) -> f32 {
+        self.peaks
+            .get(track)
+            .map(|peak| f32::from_bits(peak.swap(0.0_f32.to_bits(), Ordering::AcqRel)))
+            .unwrap_or(0.0)
+    }
+
+    /// Clear all pending meter peaks before starting a new live stream.
+    pub fn clear(&self) {
+        for peak in &self.peaks {
+            peak.store(0.0_f32.to_bits(), Ordering::Release);
+        }
+    }
+
+    pub(crate) fn publish_peak(&self, track: usize, peak: f32) {
+        if !peak.is_finite() || peak <= 0.0 {
+            return;
+        }
+        if let Some(slot) = self.peaks.get(track) {
+            slot.fetch_max(peak.to_bits(), Ordering::Release);
+        }
+    }
+}
+
 /// A bounded stereo ring buffer used to align source timing in the Mixer.
 #[derive(Default)]
 pub(crate) struct StereoFrameDelay {

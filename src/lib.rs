@@ -1941,6 +1941,15 @@ impl MixerRouteAudibility {
         self.soloed_insert_tracks.is_empty() || self.soloed_insert_tracks.contains(&track)
     }
 
+    /// Returns a visible insert ordinal only when the channel has a recognized direct route.
+    pub(crate) fn direct_meter_track(&self, route: Option<i8>) -> Option<usize> {
+        let track = route.unwrap_or(0);
+        if track < 0 || !self.known_tracks.contains(&track) {
+            return None;
+        }
+        Some(track as usize)
+    }
+
     /// Returns the supported phase, stereo, candidate pan, and fader transform for a route.
     /// Master processing is applied once to the final mix, and unknown routes are unchanged.
     pub(crate) fn transform_for_channel(&self, route: Option<i8>) -> MixerInsertSignalTransform {
@@ -16191,6 +16200,10 @@ mod tests {
         assert!(!routing.allows_channel(Some(2)));
         assert!(routing.allows_channel(Some(-1)));
         assert!(routing.allows_channel(Some(7)));
+        assert_eq!(routing.direct_meter_track(None), Some(0));
+        assert_eq!(routing.direct_meter_track(Some(1)), Some(1));
+        assert_eq!(routing.direct_meter_track(Some(-1)), None);
+        assert_eq!(routing.direct_meter_track(Some(7)), None);
         let mut routed_frame = [0.25, -0.5];
         routing
             .transform_for_channel(Some(1))
