@@ -5457,6 +5457,10 @@ impl DawUi {
                     ("F6", "Channel Rack"),
                     ("F7", "Piano roll"),
                     ("F9", "Mixer"),
+                    (
+                        "Piano roll Delete/Backspace",
+                        "Delete selection or target-channel notes",
+                    ),
                     ("Shift+Arrow", "Nudge selected Piano roll notes"),
                     (
                         "Shift+Ctrl/Cmd+Left/Right",
@@ -13094,6 +13098,10 @@ impl DawUi {
         let mut note_nudge_requested = None;
         let mut note_rotation_requested = None;
         if ui.memory(|memory| memory.focused().is_none()) {
+            delete_selection_requested = ui.input_mut(|input| {
+                input.consume_key(egui::Modifiers::NONE, egui::Key::Delete)
+                    || input.consume_key(egui::Modifiers::NONE, egui::Key::Backspace)
+            });
             open_pattern_time_signature_dialog = ui.input_mut(|input| {
                 input.consume_key(
                     egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
@@ -14260,10 +14268,17 @@ impl DawUi {
                     }
                 });
                 ui.separator();
+                let delete_label = if selected_note_count > 0 {
+                    format!("Delete selected notes ({selected_note_count})  Del")
+                } else {
+                    "Delete target-channel notes  Del".to_owned()
+                };
                 if ui
                     .add_enabled(
-                        selected_note_count > 0,
-                        egui::Button::new(format!("Delete selected notes ({selected_note_count})")),
+                        selected_note_count > 0
+                            || (self.selected_pattern.is_some()
+                                && self.selected_note_channel.is_some()),
+                        egui::Button::new(delete_label),
                     )
                     .clicked()
                 {
@@ -14435,6 +14450,7 @@ impl DawUi {
                 quick_quantize_start_requested = false;
             }
             quantize_selected_requested = false;
+            delete_selection_requested = false;
             discard_note_lengths_requested = false;
             legato_requested = false;
             quick_chop_requested = false;
@@ -14714,24 +14730,43 @@ impl DawUi {
                         .push(*note_index);
                 }
             }
-            let result =
-                selected_by_channel
-                    .into_iter()
-                    .try_for_each(|(channel_id, mut note_indices)| {
-                        note_indices.sort_unstable_by(|left, right| right.cmp(left));
-                        note_indices.into_iter().try_for_each(|note_index| {
-                            updated.delete_pattern_note(pattern_id, channel_id, note_index)
-                        })
-                    });
+            let result = if selected_by_channel.is_empty() {
+                self.selected_note_channel.map_or_else(
+                    || {
+                        Err(FlpError::UnsupportedEdit(
+                            "the Piano roll has no target channel",
+                        ))
+                    },
+                    |channel_id| updated.delete_pattern_notes(pattern_id, channel_id),
+                )
+            } else {
+                selected_by_channel.into_iter().try_fold(
+                    0usize,
+                    |deleted, (channel_id, note_indices)| {
+                        let removed = updated.delete_pattern_note_selection(
+                            pattern_id,
+                            channel_id,
+                            &note_indices,
+                        )?;
+                        deleted.checked_add(removed).ok_or(FlpError::LengthOverflow)
+                    },
+                )
+            };
             match result {
-                Ok(()) => {
-                    self.document = Some(updated);
-                    self.selected_piano_notes.clear();
-                    self.selected_note = None;
-                    self.active_note_drag = None;
-                    self.stop_project_playback();
-                    self.dirty = true;
-                    self.status = format!("Deleted selected notes from pattern {pattern_id}");
+                Ok(deleted) => {
+                    if deleted > 0 {
+                        self.document = Some(updated);
+                        self.selected_piano_notes.clear();
+                        self.selected_note = None;
+                        self.active_note_drag = None;
+                        self.stop_project_playback();
+                        self.dirty = true;
+                    }
+                    self.status = if deleted == 0 {
+                        "No notes to delete in the target channel".to_owned()
+                    } else {
+                        format!("Deleted {deleted} notes from pattern {pattern_id}")
+                    };
                 }
                 Err(error) => {
                     self.status = format!("Could not delete selected notes: {error}");

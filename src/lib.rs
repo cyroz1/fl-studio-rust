@@ -9452,6 +9452,113 @@ impl FlpDocument {
         Ok(imported.len())
     }
 
+    /// Removes all notes from one channel in a Pattern while retaining other channels and events.
+    pub fn delete_pattern_notes(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+    ) -> Result<usize, FlpError> {
+        self.delete_pattern_notes_in_scope(pattern_id, channel_id, None)
+    }
+
+    /// Removes selected channel-local note indices from one Pattern.
+    pub fn delete_pattern_note_selection(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: &[usize],
+    ) -> Result<usize, FlpError> {
+        self.delete_pattern_notes_in_scope(pattern_id, channel_id, Some(note_indices))
+    }
+
+    fn delete_pattern_notes_in_scope(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: Option<&[usize]>,
+    ) -> Result<usize, FlpError> {
+        self.require_unique_channel(channel_id)?;
+        let patterns = self.patterns()?;
+        if !patterns.iter().any(|pattern| pattern.id == pattern_id) {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested pattern does not exist",
+            ));
+        }
+        let selected_indices =
+            note_indices.map(|indices| indices.iter().copied().collect::<HashSet<_>>());
+        let mut channel_note_index = 0usize;
+        let mut removed_count = 0usize;
+        let mut replacements = Vec::new();
+        let mut event_index = 0usize;
+        while event_index < self.events.len() {
+            let marker = &self.events[event_index];
+            if marker.opcode != 0x41 || marker.payload.len() != 2 {
+                event_index += 1;
+                continue;
+            }
+            let marker_id = u16::from_le_bytes([marker.payload[0], marker.payload[1]]);
+            let notes_index = event_index + 1;
+            let Some(notes_event) = self.events.get(notes_index) else {
+                break;
+            };
+            if marker_id != pattern_id || !Self::is_pattern_note_event(notes_event) {
+                event_index += 1;
+                continue;
+            }
+            let (records, remainder) = notes_event.payload.as_chunks::<FLP_NOTE_RECORD_SIZE>();
+            if !remainder.is_empty() {
+                return Err(FlpError::InvalidEvent {
+                    offset: notes_event.file_offset,
+                    detail: "pattern note payload is not a whole number of 24-byte records",
+                });
+            }
+
+            let mut replacement = Vec::with_capacity(notes_event.payload.len());
+            let mut removed_from_event = 0usize;
+            for record in records {
+                let note = PatternNote::decode(record);
+                let remove = if note.channel_id == channel_id {
+                    let remove = selected_indices
+                        .as_ref()
+                        .is_none_or(|indices| indices.contains(&channel_note_index));
+                    channel_note_index += 1;
+                    remove
+                } else {
+                    false
+                };
+                if remove {
+                    removed_from_event += 1;
+                } else {
+                    replacement.extend_from_slice(record);
+                }
+            }
+            if removed_from_event > 0 {
+                removed_count += removed_from_event;
+                replacements.push((notes_index, replacement));
+            }
+            event_index += 2;
+        }
+        if selected_indices
+            .as_ref()
+            .is_some_and(|indices| indices.iter().any(|index| *index >= channel_note_index))
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested pattern, channel, or note index does not exist",
+            ));
+        }
+        if replacements.is_empty() {
+            return Ok(0);
+        }
+
+        let mut updated = self.clone();
+        for (event_index, payload) in replacements {
+            updated.events[event_index].replace_data_payload(payload)?;
+        }
+        updated.refresh_event_offsets()?;
+        *self = updated;
+        Ok(removed_count)
+    }
+
     /// Removes one channel-scoped note and rewrites only its containing score event.
     pub fn delete_pattern_note(
         &mut self,
@@ -18095,6 +18202,65 @@ mod tests {
         let restored = document.patterns().unwrap();
         assert_eq!(restored[0].notes.len(), 2);
         assert_eq!(restored[0].notes[1].position, 0);
+    }
+
+    #[test]
+    fn deleting_selected_or_channel_notes_preserves_other_channels_atomically() {
+        let input = pattern_fixture(
+            &[
+                note_record(0, 0, 48, 60, 100),
+                note_record(12, 1, 24, 48, 80),
+                note_record(24, 0, 36, 64, 90),
+                note_record(36, 1, 12, 52, 70),
+            ],
+            &[0xFF, 1, 0x5A],
+        );
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+
+        assert_eq!(
+            document
+                .delete_pattern_note_selection(7, 0, &[1])
+                .expect("selected note should be deleted"),
+            1
+        );
+        let remaining = document.patterns().unwrap()[0].notes.clone();
+        assert_eq!(
+            remaining
+                .iter()
+                .map(|note| (note.channel_id, note.position))
+                .collect::<Vec<_>>(),
+            [(0, 0), (1, 12), (1, 36)]
+        );
+        assert_eq!(
+            document
+                .delete_pattern_notes(7, 0)
+                .expect("target-channel notes should be deleted"),
+            1
+        );
+        let remaining = document.patterns().unwrap()[0].notes.clone();
+        assert_eq!(
+            remaining
+                .iter()
+                .map(|note| (note.channel_id, note.position))
+                .collect::<Vec<_>>(),
+            [(1, 12), (1, 36)]
+        );
+        let encoded = document
+            .encode_lossless()
+            .expect("edited project should encode");
+        let reparsed = FlpDocument::parse(&encoded).expect("edited project should parse");
+        assert_eq!(reparsed.patterns().unwrap()[0].notes, remaining);
+        assert_eq!(
+            reparsed.events().last().unwrap().wire_bytes(),
+            &[0xFF, 1, 0x5A]
+        );
+
+        let mut invalid = FlpDocument::parse(&input).expect("fixture should parse");
+        let before = invalid
+            .encode_lossless()
+            .expect("original project should encode");
+        assert!(invalid.delete_pattern_note_selection(7, 0, &[2]).is_err());
+        assert_eq!(invalid.encode_lossless().unwrap(), before);
     }
 
     #[test]
