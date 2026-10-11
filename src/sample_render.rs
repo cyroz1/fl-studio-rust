@@ -2661,12 +2661,19 @@ fn stream_prepared_playlist_render(
     let worker_count =
         audio_clip_mix_worker_count(&render.audio.clips, &track_groups, options.sample_rate);
     let worker_clips = audio_clip_groups_for_workers(&track_groups, worker_count);
+    let audio_mix_context = PreparedAudioClipMixContext {
+        clips: &render.audio.clips,
+        decoded_by_path: &render.audio.decoded_by_path,
+        sample_rate: options.sample_rate,
+        resampling_quality: options.resampling_quality,
+        cancelled,
+    };
     let mix_result = std::thread::scope(|scope| {
         let mut parallel_mixer = if worker_count > 1 {
             ParallelAudioClipMixer::new(
                 scope,
                 worker_clips,
-                &render.audio.decoded_by_path,
+                audio_mix_context.decoded_by_path,
                 options.sample_rate,
                 options.resampling_quality,
                 cancelled,
@@ -2695,12 +2702,8 @@ fn stream_prepared_playlist_render(
                     None
                 };
                 mix_prepared_audio_clip_block(
-                    &render.audio.clips,
-                    &render.audio.decoded_by_path,
+                    &audio_mix_context,
                     block_start,
-                    options.sample_rate,
-                    options.resampling_quality,
-                    cancelled,
                     block,
                     meter_buses.as_deref_mut(),
                     parallel_mixer.as_ref(),
@@ -4604,6 +4607,26 @@ struct AudioClipMixWorkerScratch {
     meter_buses: Option<Vec<f32>>,
 }
 
+struct AudioClipMixWorkerTask<'a> {
+    worker_index: usize,
+    worker_count: usize,
+    clips: Vec<&'a PreparedClip>,
+    decoded_by_path: &'a HashMap<PathBuf, DecodedAudio>,
+    sample_rate: u32,
+    resampling_quality: ResamplingQuality,
+    cancelled: &'a AtomicBool,
+    control: Arc<AudioClipMixWorkerControl>,
+    scratch: Arc<Vec<Mutex<AudioClipMixWorkerScratch>>>,
+}
+
+struct PreparedAudioClipMixContext<'a> {
+    clips: &'a [PreparedClip],
+    decoded_by_path: &'a HashMap<PathBuf, DecodedAudio>,
+    sample_rate: u32,
+    resampling_quality: ResamplingQuality,
+    cancelled: &'a AtomicBool,
+}
+
 struct ParallelAudioClipMixer<'scope> {
     control: Arc<AudioClipMixWorkerControl>,
     scratch: Arc<Vec<Mutex<AudioClipMixWorkerScratch>>>,
@@ -4698,7 +4721,7 @@ impl<'scope> ParallelAudioClipMixer<'scope> {
             let worker_result = std::thread::Builder::new()
                 .name(format!("flp-audio-mix-{worker_index}"))
                 .spawn_scoped(scope, move || {
-                    audio_clip_mix_worker(
+                    audio_clip_mix_worker(AudioClipMixWorkerTask {
                         worker_index,
                         worker_count,
                         clips,
@@ -4706,9 +4729,9 @@ impl<'scope> ParallelAudioClipMixer<'scope> {
                         sample_rate,
                         resampling_quality,
                         cancelled,
-                        worker_control,
-                        worker_scratch,
-                    );
+                        control: worker_control,
+                        scratch: worker_scratch,
+                    });
                 });
             match worker_result {
                 Ok(worker) => workers.push(worker),
@@ -4822,17 +4845,18 @@ fn request_audio_clip_mix_shutdown(control: &AudioClipMixWorkerControl) {
     control.task_available.notify_all();
 }
 
-fn audio_clip_mix_worker(
-    worker_index: usize,
-    worker_count: usize,
-    clips: Vec<&PreparedClip>,
-    decoded_by_path: &HashMap<PathBuf, DecodedAudio>,
-    sample_rate: u32,
-    resampling_quality: ResamplingQuality,
-    cancelled: &AtomicBool,
-    control: Arc<AudioClipMixWorkerControl>,
-    scratch: Arc<Vec<Mutex<AudioClipMixWorkerScratch>>>,
-) {
+fn audio_clip_mix_worker(task: AudioClipMixWorkerTask<'_>) {
+    let AudioClipMixWorkerTask {
+        worker_index,
+        worker_count,
+        clips,
+        decoded_by_path,
+        sample_rate,
+        resampling_quality,
+        cancelled,
+        control,
+        scratch,
+    } = task;
     let mut observed_generation = 0;
     loop {
         let (generation, block_start_frame, sample_count) = {
@@ -4919,12 +4943,8 @@ fn audio_clip_mix_worker(
 }
 
 fn mix_prepared_audio_clip_block(
-    clips: &[PreparedClip],
-    decoded_by_path: &HashMap<PathBuf, DecodedAudio>,
+    context: &PreparedAudioClipMixContext<'_>,
     block_start_frame: u64,
-    sample_rate: u32,
-    resampling_quality: ResamplingQuality,
-    cancelled: &AtomicBool,
     stereo: &mut [f32],
     meter_buses: Option<&mut [f32]>,
     parallel_mixer: Option<&ParallelAudioClipMixer<'_>>,
@@ -4934,8 +4954,8 @@ fn mix_prepared_audio_clip_block(
     }
     let mut meter_buses = meter_buses;
     let meter_stride_samples = stereo.len();
-    for clip in clips {
-        let source = decoded_by_path.get(&clip.path).ok_or_else(|| {
+    for clip in context.clips {
+        let source = context.decoded_by_path.get(&clip.path).ok_or_else(|| {
             format!(
                 "prepared audio clip {} has no decoded source",
                 clip.clip_index
@@ -4946,10 +4966,10 @@ fn mix_prepared_audio_clip_block(
             block_start_frame,
             source,
             clip,
-            sample_rate,
-            resampling_quality,
+            context.sample_rate,
+            context.resampling_quality,
             ClipMixMonitor {
-                cancelled: Some(cancelled),
+                cancelled: Some(context.cancelled),
                 meter_buses: meter_buses.as_deref_mut(),
                 meter_stride_samples,
             },
@@ -6382,15 +6402,18 @@ mod tests {
         .collect::<Vec<_>>();
         let decoded_by_path = HashMap::from([(path, source)]);
         let cancelled = AtomicBool::new(false);
+        let audio_mix_context = PreparedAudioClipMixContext {
+            clips: &clips,
+            decoded_by_path: &decoded_by_path,
+            sample_rate: 8,
+            resampling_quality: ResamplingQuality::Linear,
+            cancelled: &cancelled,
+        };
         let mut serial = vec![0.0; 16];
         let mut serial_meters = vec![0.0; MIXER_TRACK_METER_COUNT * 16];
         mix_prepared_audio_clip_block(
-            &clips,
-            &decoded_by_path,
+            &audio_mix_context,
             0,
-            8,
-            ResamplingQuality::Linear,
-            &cancelled,
             &mut serial,
             Some(&mut serial_meters),
             None,
@@ -6414,12 +6437,8 @@ mod tests {
             )
             .expect("two source mixer tracks should start two workers");
             mix_prepared_audio_clip_block(
-                &clips,
-                &decoded_by_path,
+                &audio_mix_context,
                 0,
-                8,
-                ResamplingQuality::Linear,
-                &cancelled,
                 &mut parallel,
                 Some(&mut parallel_meters),
                 Some(&mixer),
