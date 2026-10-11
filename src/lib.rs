@@ -1788,6 +1788,7 @@ pub(crate) struct MixerInsertSignalTransform {
     swap_left_right: bool,
     fader_volume_raw: Option<i32>,
     mixer_pan_raw: Option<i32>,
+    mixer_pan_law_raw: Option<u8>,
 }
 
 impl MixerInsertSignalTransform {
@@ -1797,6 +1798,7 @@ impl MixerInsertSignalTransform {
             swap_left_right,
             fader_volume_raw: None,
             mixer_pan_raw: None,
+            mixer_pan_law_raw: None,
         }
     }
 
@@ -1810,6 +1812,11 @@ impl MixerInsertSignalTransform {
         self
     }
 
+    pub(crate) const fn with_mixer_pan_law_raw(mut self, pan_law_raw: Option<u8>) -> Self {
+        self.mixer_pan_law_raw = pan_law_raw;
+        self
+    }
+
     pub(crate) fn apply_frame(self, frame: &mut [f32; 2]) {
         if self.swap_left_right {
             frame.swap(0, 1);
@@ -1819,7 +1826,7 @@ impl MixerInsertSignalTransform {
             frame[1] = -frame[1];
         }
         if let Some(pan_raw) = self.mixer_pan_raw {
-            apply_mixer_pan(frame, pan_raw);
+            apply_mixer_pan(frame, pan_raw, self.mixer_pan_law_raw);
         }
         if let Some(volume_raw) = self.fader_volume_raw {
             let gain = mixer_fader_gain(volume_raw);
@@ -1832,12 +1839,17 @@ impl MixerInsertSignalTransform {
 impl MixerRouteAudibility {
     pub(crate) fn from_document(document: &FlpDocument) -> Self {
         let parameters = document.mixer_parameter_records().unwrap_or_default();
-        Self::from_inserts_with_parameters(document.mixer_inserts(), &parameters)
+        Self::from_inserts_with_parameters(
+            document.mixer_inserts(),
+            &parameters,
+            document.metadata().pan_law_raw(),
+        )
     }
 
     fn from_inserts_with_parameters(
         inserts: impl IntoIterator<Item = MixerInsertSummary>,
         parameters: &[MixerParameterRecord],
+        pan_law_raw: Option<u8>,
     ) -> Self {
         let mut routing = Self::default();
         for insert in inserts {
@@ -1847,6 +1859,7 @@ impl MixerRouteAudibility {
             routing.known_tracks.insert(track);
             let fader_volume_raw = candidate_mixer_fader_volume(parameters, insert.ordinal());
             let mixer_pan_raw = candidate_mixer_pan(parameters, insert.ordinal());
+            let mixer_pan_law_raw = mixer_pan_raw.and(pan_law_raw);
             // Master is the final destination for every normally routed source. Its
             // saved flags and candidate controls are applied to the completed mix instead.
             if track == 0 {
@@ -1865,7 +1878,8 @@ impl MixerRouteAudibility {
                 insert.swap_left_right() == Some(true),
             )
             .with_fader_volume_raw(fader_volume_raw)
-            .with_mixer_pan_raw(mixer_pan_raw);
+            .with_mixer_pan_raw(mixer_pan_raw)
+            .with_mixer_pan_law_raw(mixer_pan_law_raw);
             if transform != MixerInsertSignalTransform::default() {
                 routing.source_transforms.insert(track, transform);
             }
@@ -1941,7 +1955,7 @@ fn candidate_mixer_pan(parameters: &[MixerParameterRecord], insert_ordinal: usiz
     Some(record.value())
 }
 
-fn apply_mixer_pan(frame: &mut [f32; 2], pan_raw: i32) {
+fn apply_mixer_pan(frame: &mut [f32; 2], pan_raw: i32, pan_law_raw: Option<u8>) {
     let pan = pan_raw.clamp(-6_400, 6_400) as f32 / 6_400.0;
     let left = frame[0];
     let right = frame[1];
@@ -1952,6 +1966,14 @@ fn apply_mixer_pan(frame: &mut [f32; 2], pan_raw: i32) {
     } else {
         frame[0] = left * (1.0 - pan);
         frame[1] = right + left * pan;
+    }
+    if pan_law_raw != Some(2) {
+        // Use the maximum side gain from the existing equal-power mono curve as the
+        // overall Circular compensation for this stereo crossmix; native Mixer coefficients
+        // still need comparison against FL Studio output.
+        let circular_gain = ((1.0 - pan.abs()) * std::f32::consts::FRAC_PI_4).cos();
+        frame[0] *= circular_gain;
+        frame[1] *= circular_gain;
     }
 }
 
@@ -15345,6 +15367,7 @@ mod tests {
                 insert(2, 0), // Disabled insert.
             ],
             &[],
+            None,
         );
 
         assert!(!routing.allows_channel(None));
@@ -15366,6 +15389,7 @@ mod tests {
         let master_solo = MixerRouteAudibility::from_inserts_with_parameters(
             [insert(0, (1 << 3) | (1 << 12)), insert(1, 1 << 3)],
             &[],
+            None,
         );
         assert!(master_solo.allows_channel(None));
         assert!(master_solo.allows_channel(Some(1)));
@@ -15404,6 +15428,7 @@ mod tests {
         let routing = MixerRouteAudibility::from_inserts_with_parameters(
             [insert(0), insert(1), insert(2)],
             &parameters,
+            Some(2),
         );
 
         assert_eq!(routing.master_fader_raw(), Some(2_500));
@@ -15424,7 +15449,8 @@ mod tests {
             vec![parameter(1, 1, 192, 5_000)],
             vec![parameter(1, 0, 192, 16_001)],
         ] {
-            let routing = MixerRouteAudibility::from_inserts_with_parameters([insert(1)], &invalid);
+            let routing =
+                MixerRouteAudibility::from_inserts_with_parameters([insert(1)], &invalid, Some(2));
             let mut frame = [1.0, 2.0];
             routing
                 .transform_for_channel(Some(1))
@@ -15437,13 +15463,31 @@ mod tests {
             vec![parameter(1, 1, 193, -3_200)],
             vec![parameter(1, 0, 193, 6_401)],
         ] {
-            let routing = MixerRouteAudibility::from_inserts_with_parameters([insert(1)], &invalid);
+            let routing =
+                MixerRouteAudibility::from_inserts_with_parameters([insert(1)], &invalid, Some(2));
             let mut frame = [1.0, 2.0];
             routing
                 .transform_for_channel(Some(1))
                 .apply_frame(&mut frame);
             assert_eq!(frame, [1.0, 2.0]);
         }
+    }
+
+    #[test]
+    fn mixer_pan_uses_project_circular_and_triangular_laws() {
+        let mut circular = [1.0, 2.0];
+        apply_mixer_pan(&mut circular, 0, None);
+        let center_gain = std::f32::consts::FRAC_1_SQRT_2;
+        assert!((circular[0] - center_gain).abs() < 1.0e-6);
+        assert!((circular[1] - 2.0 * center_gain).abs() < 1.0e-6);
+
+        let mut triangular = [1.0, 2.0];
+        apply_mixer_pan(&mut triangular, 0, Some(2));
+        assert_eq!(triangular, [1.0, 2.0]);
+
+        let mut hard_left = [1.0, 2.0];
+        apply_mixer_pan(&mut hard_left, -6_400, None);
+        assert_eq!(hard_left, [3.0, 0.0]);
     }
 
     #[test]

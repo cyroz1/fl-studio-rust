@@ -2074,6 +2074,7 @@ struct MixerMasterOutput {
     swap_left_right: Option<bool>,
     fader_volume_raw: Option<i32>,
     mixer_pan_raw: Option<i32>,
+    mixer_pan_law_raw: Option<u8>,
 }
 
 impl MixerMasterOutput {
@@ -2088,6 +2089,7 @@ impl MixerMasterOutput {
             swap_left_right: master.swap_left_right(),
             fader_volume_raw: routing.master_fader_raw(),
             mixer_pan_raw: routing.master_pan_raw(),
+            mixer_pan_law_raw: document.metadata().pan_law_raw(),
         }
     }
 
@@ -2099,6 +2101,7 @@ impl MixerMasterOutput {
         let (frames, _) = stereo_samples.as_chunks_mut::<2>();
         let master_transform = MixerInsertSignalTransform::default()
             .with_mixer_pan_raw(self.mixer_pan_raw)
+            .with_mixer_pan_law_raw(self.mixer_pan_law_raw)
             .with_fader_volume_raw(self.fader_volume_raw);
         for frame in frames {
             if self.swap_left_right == Some(true) {
@@ -4490,6 +4493,30 @@ mod tests {
         }
         .apply(&mut output);
         assert_eq!(output, [0.0, 3.0, 0.0, 7.0]);
+    }
+
+    #[test]
+    fn mixer_master_pan_uses_the_project_pan_law_at_center() {
+        let mut circular = [1.0, 2.0];
+        MixerMasterOutput {
+            enabled: Some(true),
+            mixer_pan_raw: Some(0),
+            ..MixerMasterOutput::default()
+        }
+        .apply(&mut circular);
+        let center_gain = std::f32::consts::FRAC_1_SQRT_2;
+        assert!((circular[0] - center_gain).abs() < 1.0e-6);
+        assert!((circular[1] - 2.0 * center_gain).abs() < 1.0e-6);
+
+        let mut triangular = [1.0, 2.0];
+        MixerMasterOutput {
+            enabled: Some(true),
+            mixer_pan_raw: Some(0),
+            mixer_pan_law_raw: Some(2),
+            ..MixerMasterOutput::default()
+        }
+        .apply(&mut triangular);
+        assert_eq!(triangular, [1.0, 2.0]);
     }
 
     #[test]
