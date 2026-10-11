@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use flp_rebuild::PatternNote;
 use midir::{Ignore, MidiInput, MidiInputConnection as MidirInputConnection};
 
-use crate::sample_render::PlaylistTempoMap;
+use flp_rebuild::sample_render::PlaylistTempoMap;
 
 pub const MIDI_INPUT_QUEUE_CAPACITY: usize = 4_096;
 const MAX_CAPTURED_NOTES: usize = 100_000;
