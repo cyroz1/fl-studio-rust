@@ -5445,7 +5445,11 @@ impl FlpDocument {
             .ok_or(FlpError::UnsupportedEdit(
                 "the requested Mixer routing event does not exist",
             ))?;
-        if !matches!(event.opcode, 0xE7 | 0xEB) {
+        let is_project_routing_event = event.opcode == 0xE7
+            && self.events[..event_index]
+                .iter()
+                .any(|previous| previous.opcode == 0x40);
+        if event.opcode != 0xEB && !is_project_routing_event {
             return Err(FlpError::UnsupportedEdit(
                 "the requested event is not a Mixer routing event",
             ));
@@ -16876,7 +16880,7 @@ mod tests {
     fn mixer_send_summaries_pair_split_project_routing_stream_in_parameter_order() {
         let mut event_stream = Vec::new();
         append_data_event(&mut event_stream, 0xE7, b"Drums\0");
-        event_stream.extend_from_slice(&[0x40, 0, 0x15, 0]);
+        event_stream.extend_from_slice(&[0x40, 0, 0, 0x15, 0]);
         append_data_event(&mut event_stream, 0xE7, &[0]);
         append_data_event(&mut event_stream, 0xE7, &[1, 0]);
         event_stream.extend_from_slice(&[0x62, 0, 0]);
