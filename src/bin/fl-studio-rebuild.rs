@@ -12458,6 +12458,21 @@ impl DawUi {
         let mut ungroup_selected_notes_requested = false;
         let mut quantize_selected_requested = false;
         let mut open_pattern_time_signature_dialog = false;
+        let toggle_editable_ghosts = !ui.ctx().egui_wants_keyboard_input()
+            && ui.input_mut(|input| {
+                input.consume_key(
+                    egui::Modifiers::COMMAND | egui::Modifiers::ALT,
+                    egui::Key::V,
+                )
+            });
+        if toggle_editable_ghosts {
+            self.piano_roll_editable_ghost_channels = !self.piano_roll_editable_ghost_channels;
+            self.status = if self.piano_roll_editable_ghost_channels {
+                "Editable Piano roll ghost notes enabled".to_owned()
+            } else {
+                "Editable Piano roll ghost notes disabled".to_owned()
+            };
+        }
         if ui.memory(|memory| memory.focused().is_none()) {
             open_pattern_time_signature_dialog = ui.input_mut(|input| {
                 input.consume_key(
@@ -12489,12 +12504,6 @@ impl DawUi {
                 ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Y));
             let cycle_event_target =
                 ui.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::F));
-            let toggle_editable_ghosts = ui.input_mut(|input| {
-                input.consume_key(
-                    egui::Modifiers::COMMAND | egui::Modifiers::ALT,
-                    egui::Key::V,
-                )
-            });
             if select_all_notes {
                 self.apply_piano_roll_selection_command(PianoRollSelectionCommand::All);
             } else if invert_note_selection {
@@ -12509,14 +12518,6 @@ impl DawUi {
                     .unwrap_or(0);
                 self.piano_roll_event_target =
                     PianoRollEventTarget::ALL[(current + 1) % PianoRollEventTarget::ALL.len()];
-            }
-            if toggle_editable_ghosts {
-                self.piano_roll_editable_ghost_channels = !self.piano_roll_editable_ghost_channels;
-                self.status = if self.piano_roll_editable_ghost_channels {
-                    "Editable Piano roll ghost notes enabled".to_owned()
-                } else {
-                    "Editable Piano roll ghost notes disabled".to_owned()
-                };
             }
             if select_draw {
                 self.piano_roll_paint_mode = false;
