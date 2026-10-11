@@ -628,10 +628,10 @@ jobs:
           ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
             -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/modern-pattern-clip-before-resize.png"
           xdotool keydown Shift_L
-          xdotool mousemove 666 298
+          xdotool mousemove 656 298
           xdotool mousedown 1
           sleep 0.2
-          xdotool mousemove --sync 707 298
+          xdotool mousemove --sync 697 298
           sleep 0.3
           xdotool mouseup 1
           xdotool keyup Shift_L
