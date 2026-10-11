@@ -12280,10 +12280,11 @@ impl DawUi {
         self.selected_note = self.selected_piano_notes.iter().next_back().copied();
         self.piano_roll_selection_drag = None;
         self.active_note_drag = None;
+        let selected_count = self.selected_piano_notes.len();
         self.status = format!(
-            "Selected {} notes in color group {}",
+            "Selected {selected_count} note{} in color group {}",
+            if selected_count == 1 { "" } else { "s" },
             color_group + 1,
-            self.selected_piano_notes.len()
         );
     }
 
