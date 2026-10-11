@@ -1797,6 +1797,7 @@ struct DawUi {
     audio_waveforms: BTreeMap<PathBuf, Arc<AudioWaveform>>,
     waveform_loads: BTreeMap<PathBuf, PendingWaveformLoad>,
     waveform_errors: BTreeMap<PathBuf, String>,
+    pending_playlist_audio_drops: VecDeque<PendingPlaylistAudioDrop>,
     browser_tab: BrowserTab,
     browser_filter: BrowserFilter,
     browser_path: PathBuf,
@@ -1895,6 +1896,14 @@ struct PendingSamplerStream {
 struct PendingWaveformLoad {
     receiver: Receiver<Result<AudioWaveform, String>>,
     worker: thread::JoinHandle<()>,
+}
+
+struct PendingPlaylistAudioDrop {
+    path: PathBuf,
+    arrangement_id: u16,
+    position_ticks: u32,
+    track_index: u16,
+    project_generation: u64,
 }
 
 struct AudioRecordingSession {
@@ -2239,6 +2248,7 @@ impl DawUi {
             audio_waveforms: BTreeMap::new(),
             waveform_loads: BTreeMap::new(),
             waveform_errors: BTreeMap::new(),
+            pending_playlist_audio_drops: VecDeque::new(),
             browser_tab: BrowserTab::Files,
             browser_filter: BrowserFilter::All,
             browser_path,
@@ -2852,6 +2862,198 @@ impl DawUi {
         if !self.waveform_loads.is_empty() {
             ctx.request_repaint_after(std::time::Duration::from_millis(80));
         }
+    }
+
+    fn queue_playlist_audio_drop(
+        &mut self,
+        path: PathBuf,
+        arrangement_id: u16,
+        position_ticks: u32,
+        track_index: u16,
+        ctx: &egui::Context,
+    ) {
+        let Some(document) = self.document.as_ref() else {
+            self.status = "Open a project before adding audio to the Playlist".to_owned();
+            return;
+        };
+        if !project_has_audio_clip_template(document) {
+            self.status =
+                "Add an Audio Clip to the project first so its FLP record can be reused".to_owned();
+            return;
+        }
+
+        self.pending_playlist_audio_drops
+            .push_back(PendingPlaylistAudioDrop {
+                path: path.clone(),
+                arrangement_id,
+                position_ticks,
+                track_index,
+                project_generation: self.project_generation,
+            });
+        self.request_audio_waveform(&path);
+        self.status = format!("Preparing {} for the Playlist…", path.display());
+        ctx.request_repaint_after(Duration::from_millis(80));
+    }
+
+    fn process_pending_playlist_audio_drops(
+        &mut self,
+        ctx: &egui::Context,
+        history_snapshot_available: bool,
+    ) {
+        loop {
+            let Some((pending_path, pending_project_generation)) = self
+                .pending_playlist_audio_drops
+                .front()
+                .map(|pending| (pending.path.clone(), pending.project_generation))
+            else {
+                break;
+            };
+            if pending_project_generation != self.project_generation {
+                let pending = self
+                    .pending_playlist_audio_drops
+                    .pop_front()
+                    .expect("the pending Playlist drop was checked above");
+                self.status = format!(
+                    "Skipped {} because the active project changed",
+                    pending.path.display()
+                );
+                continue;
+            }
+            if let Some(error) = self.waveform_errors.get(&pending_path).cloned() {
+                let pending = self
+                    .pending_playlist_audio_drops
+                    .pop_front()
+                    .expect("the pending Playlist drop was checked above");
+                self.status = format!(
+                    "Could not add {} to the Playlist: {error}",
+                    pending.path.display()
+                );
+                continue;
+            }
+            if let Some(waveform) = self.audio_waveforms.get(&pending_path).cloned() {
+                let pending = self
+                    .pending_playlist_audio_drops
+                    .pop_front()
+                    .expect("the pending Playlist drop was checked above");
+                self.insert_browser_audio_clip(pending, &waveform, ctx, history_snapshot_available);
+                continue;
+            }
+
+            self.request_audio_waveform(&pending_path);
+            ctx.request_repaint_after(Duration::from_millis(80));
+            break;
+        }
+    }
+
+    fn insert_browser_audio_clip(
+        &mut self,
+        pending: PendingPlaylistAudioDrop,
+        waveform: &AudioWaveform,
+        ctx: &egui::Context,
+        history_snapshot_available: bool,
+    ) {
+        let Some(document) = self.document.as_ref() else {
+            self.status = format!(
+                "Could not add {} because no project is open",
+                pending.path.display()
+            );
+            return;
+        };
+        if !project_has_audio_clip_template(document) {
+            self.status = format!(
+                "Could not add {}: the project has no Audio Clip record to reuse",
+                pending.path.display()
+            );
+            return;
+        }
+        let Some(length_ticks) = audio_recording_length_ticks(
+            waveform.frame_count,
+            waveform.sample_rate,
+            document.header().ppq(),
+            self.tempo_bpm,
+        ) else {
+            self.status = format!(
+                "Could not determine the Playlist length for {}",
+                pending.path.display()
+            );
+            return;
+        };
+        if pending.position_ticks.checked_add(length_ticks).is_none() {
+            self.status = format!(
+                "{} is too long to fit at this Playlist position",
+                pending.path.display()
+            );
+            return;
+        }
+        if !document
+            .arrangements()
+            .is_ok_and(|arrangements| arrangements.iter().any(|a| a.id == pending.arrangement_id))
+        {
+            self.status = format!(
+                "Could not add {} because its Playlist arrangement no longer exists",
+                pending.path.display()
+            );
+            return;
+        }
+        let Ok(undo_snapshot) = document.encode_lossless() else {
+            self.status = "Could not capture undo state before adding the Audio Clip".to_owned();
+            return;
+        };
+
+        let mut updated = document.clone();
+        let sample_path = pending.path.to_string_lossy();
+        let channel_name = pending
+            .path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| "Audio Clip".to_owned());
+        let channel_id = match updated.create_audio_channel(&sample_path, &channel_name) {
+            Ok(channel_id) => channel_id,
+            Err(error) => {
+                self.status = format!(
+                    "Could not create an Audio Clip channel for {}: {error}",
+                    pending.path.display()
+                );
+                return;
+            }
+        };
+        let clip_index = match updated.create_playlist_audio_clip(
+            pending.arrangement_id,
+            channel_id,
+            pending.position_ticks,
+            length_ticks,
+            pending.track_index,
+        ) {
+            Ok(clip_index) => clip_index,
+            Err(error) => {
+                self.status = format!(
+                    "Could not place {} in the Playlist: {error}",
+                    pending.path.display()
+                );
+                return;
+            }
+        };
+
+        self.stop_project_playback();
+        self.document = Some(updated);
+        if !history_snapshot_available {
+            self.remember_undo_snapshot(undo_snapshot);
+        }
+        self.selected_arrangement = Some(pending.arrangement_id);
+        self.selected_clip = Some(clip_index);
+        self.selected_playlist_clips.clear();
+        self.selected_playlist_clips.insert(clip_index);
+        self.playlist_selection_anchor = Some(clip_index);
+        self.dirty = true;
+        self.view = MainView::Playlist;
+        self.refresh_audio_waveform_paths();
+        self.status = format!(
+            "Added {} to Playlist track {}",
+            pending.path.display(),
+            pending.track_index + 1
+        );
+        ctx.request_repaint();
     }
 
     fn load_project_vst3_channels(&mut self) -> Option<String> {
@@ -7843,7 +8045,6 @@ impl DawUi {
         for path in &waveform_paths {
             self.request_audio_waveform(path);
         }
-        self.poll_audio_waveforms(ui.ctx());
 
         let mut create_pattern_clip_requested = false;
         let mut playlist_track_edits_requested = Vec::new();
@@ -7857,6 +8058,7 @@ impl DawUi {
         let mut join_pattern_clip_requested = None;
         let mut merge_pattern_clips_requested = None;
         let mut seek_tick_requested = None;
+        let mut dropped_playlist_audio = None;
         ui.horizontal_wrapped(|ui| {
             ui.label("Arrangement");
             ui.strong(arrangement.name.as_deref().unwrap_or("Arrangement"));
@@ -8360,6 +8562,48 @@ impl DawUi {
                             );
                         }
 
+                        let lane_drop_response = ui.interact(
+                            grid_rect,
+                            Id::new(("playlist-audio-drop", arrangement.id, track_id)),
+                            Sense::hover(),
+                        );
+                        if lane_drop_response
+                            .dnd_hover_payload::<BrowserSampleDrag>()
+                            .is_some()
+                        {
+                            painter.rect_stroke(
+                                grid_rect.shrink(1.0),
+                                0,
+                                Stroke::new(1.5, GREEN),
+                                egui::StrokeKind::Inside,
+                            );
+                            if let Some(pointer) = lane_drop_response.interact_pointer_pos() {
+                                let x = pointer.x.clamp(grid_rect.left(), grid_rect.right());
+                                painter.line_segment(
+                                    [egui::pos2(x, grid_rect.top()), egui::pos2(x, grid_rect.bottom())],
+                                    Stroke::new(2.0, GREEN),
+                                );
+                            }
+                        }
+                        if let Some(sample) =
+                            lane_drop_response.dnd_release_payload::<BrowserSampleDrag>()
+                            && let Some(pointer) = lane_drop_response.interact_pointer_pos()
+                        {
+                            let snap = !ui.input(|input| input.modifiers.alt);
+                            dropped_playlist_audio = Some((
+                                sample.0.clone(),
+                                arrangement.id,
+                                playlist_audio_drop_position_ticks(
+                                    pointer.x,
+                                    grid_rect.left(),
+                                    tick_scale,
+                                    ppq,
+                                    snap,
+                                ),
+                                row,
+                            ));
+                        }
+
                         for (clip_index, clip) in arrangement.clips.iter().enumerate() {
                             if clip.track_index != Some(row) {
                                 continue;
@@ -8451,6 +8695,40 @@ impl DawUi {
                             } else {
                                 response
                             };
+                            if response
+                                .dnd_hover_payload::<BrowserSampleDrag>()
+                                .is_some()
+                            {
+                                if let Some(pointer) = response.interact_pointer_pos() {
+                                    let x = pointer.x.clamp(grid_rect.left(), grid_rect.right());
+                                    painter.line_segment(
+                                        [
+                                            egui::pos2(x, grid_rect.top()),
+                                            egui::pos2(x, grid_rect.bottom()),
+                                        ],
+                                        Stroke::new(2.0, GREEN),
+                                    );
+                                }
+                            }
+                            if dropped_playlist_audio.is_none()
+                                && let Some(sample) =
+                                    response.dnd_release_payload::<BrowserSampleDrag>()
+                                && let Some(pointer) = response.interact_pointer_pos()
+                            {
+                                let snap = !ui.input(|input| input.modifiers.alt);
+                                dropped_playlist_audio = Some((
+                                    sample.0.clone(),
+                                    arrangement.id,
+                                    playlist_audio_drop_position_ticks(
+                                        pointer.x,
+                                        grid_rect.left(),
+                                        tick_scale,
+                                        ppq,
+                                        snap,
+                                    ),
+                                    row,
+                                ));
+                            }
                             if selected || response.hovered() {
                                 clip_painter.line_segment(
                                     [
@@ -8916,6 +9194,16 @@ impl DawUi {
                     });
                 }
             });
+
+        if let Some((path, arrangement_id, position_ticks, track_index)) = dropped_playlist_audio {
+            self.queue_playlist_audio_drop(
+                path,
+                arrangement_id,
+                position_ticks,
+                track_index,
+                ui.ctx(),
+            );
+        }
 
         if let Some(tick) = seek_tick_requested {
             let restart_playback = self.playlist_playback_loaded && self.playing;
@@ -19212,8 +19500,8 @@ impl DawUi {
                 "The project has no recognized Playlist arrangement to record into".to_owned();
             return;
         };
-        if !arrangement_has_audio_clip_template(document, arrangement_id) {
-            self.status = "Add an Audio Clip to this Playlist before recording; its recognized FLP record is used as a safe template".to_owned();
+        if !project_has_audio_clip_template(document) {
+            self.status = "Add an Audio Clip to the project before recording; its recognized FLP record is used as a safe template".to_owned();
             return;
         }
 
@@ -19331,7 +19619,7 @@ impl DawUi {
             .selected_arrangement
             .filter(|id| arrangements.iter().any(|arrangement| arrangement.id == *id))
             .or_else(|| arrangements.first().map(|arrangement| arrangement.id));
-        arrangement_id.is_some_and(|id| arrangement_has_audio_clip_template(document, id))
+        arrangement_id.is_some() && project_has_audio_clip_template(document)
     }
 
     fn poll_audio_recording(&mut self, history_snapshot_available: bool) {
@@ -21099,6 +21387,8 @@ impl eframe::App for DawUi {
         self.recovery_prompt_dialog(ui.ctx());
         self.unsaved_changes_dialog(ui.ctx());
         self.poll_audio_recording(history_snapshot_available);
+        self.poll_audio_waveforms(ui.ctx());
+        self.process_pending_playlist_audio_drops(ui.ctx(), history_snapshot_available);
         self.finish_history_frame(frame_snapshot.take(), pointer_down, history_navigation);
         self.history_snapshot_available_this_frame = false;
     }
@@ -23387,7 +23677,7 @@ fn first_available_playlist_track(
     })
 }
 
-fn arrangement_has_audio_clip_template(document: &FlpDocument, arrangement_id: u16) -> bool {
+fn project_has_audio_clip_template(document: &FlpDocument) -> bool {
     let audio_channel_ids = document
         .channels()
         .into_iter()
@@ -23397,19 +23687,31 @@ fn arrangement_has_audio_clip_template(document: &FlpDocument, arrangement_id: u
     if audio_channel_ids.is_empty() {
         return false;
     }
-    document
-        .arrangements()
-        .ok()
-        .and_then(|arrangements| {
-            arrangements
-                .into_iter()
-                .find(|arrangement| arrangement.id == arrangement_id)
-        })
-        .is_some_and(|arrangement| {
+    document.arrangements().ok().is_some_and(|arrangements| {
+        arrangements.iter().any(|arrangement| {
             arrangement.clips.iter().any(|clip| {
                 matches!(clip.target(), PlaylistClipTarget::Channel { id } if audio_channel_ids.contains(&id))
             })
         })
+    })
+}
+
+fn playlist_audio_drop_position_ticks(
+    pointer_x: f32,
+    grid_left: f32,
+    tick_scale: f32,
+    ppq: u16,
+    snap: bool,
+) -> u32 {
+    let relative_tick = ((pointer_x - grid_left).max(0.0) / tick_scale.max(f32::EPSILON))
+        .round()
+        .clamp(0.0, u32::MAX as f32) as i64;
+    let snap_ticks = if snap {
+        (u32::from(ppq.max(1)) / 4).max(1)
+    } else {
+        1
+    };
+    snap_note_tick(relative_tick, snap_ticks, 0)
 }
 
 fn playlist_measure_at_tick(
@@ -23690,9 +23992,10 @@ mod tests {
         note_from_grid_position, parse_midi_device_selections, piano_roll_color_group_note_ids,
         piano_roll_controller_value_at, piano_roll_controller_value_range,
         piano_roll_note_group_members, piano_roll_note_nudge_edit,
-        piano_roll_random_note_selection, playlist_audio_clip_join_candidates, playlist_bar_ticks,
-        playlist_clip_drag_edit, playlist_clip_local_recording_offset,
-        playlist_clip_split_position, playlist_group_parent_ids, playlist_measure_boundaries,
+        piano_roll_random_note_selection, playlist_audio_clip_join_candidates,
+        playlist_audio_drop_position_ticks, playlist_bar_ticks, playlist_clip_drag_edit,
+        playlist_clip_local_recording_offset, playlist_clip_split_position,
+        playlist_group_parent_ids, playlist_measure_boundaries,
         playlist_pattern_clip_join_candidates, playlist_seek_tick_to_frame,
         playlist_signature_at_tick, playlist_song_position_label, playlist_track_group_range,
         playlist_track_is_hidden, recolor_piano_roll_notes, snap_note_tick,
@@ -23909,6 +24212,22 @@ mod tests {
         assert_eq!(
             audio_recording_length_ticks(48_000, 48_000, 96, f64::NAN),
             None
+        );
+    }
+
+    #[test]
+    fn playlist_audio_drop_position_uses_sixteenth_snap_or_alt_free_placement() {
+        assert_eq!(
+            playlist_audio_drop_position_ticks(21.0, 10.0, 0.1, 96, true),
+            120
+        );
+        assert_eq!(
+            playlist_audio_drop_position_ticks(21.0, 10.0, 0.1, 96, false),
+            110
+        );
+        assert_eq!(
+            playlist_audio_drop_position_ticks(8.0, 10.0, 0.1, 96, false),
+            0
         );
     }
 
