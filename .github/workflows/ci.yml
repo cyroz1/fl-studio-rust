@@ -423,6 +423,34 @@ jobs:
             exit 1
           fi
 
+          xdotool key F6
+          sleep 1
+          xdotool mousemove 287 16 click 1
+          sleep 0.3
+          xdotool mousemove 350 269 click 1
+          sleep 1
+          detached_channel_rack_window=$(xdotool search --onlyvisible --name '^Channel Rack$' | head -n 1 || true)
+          if [[ -z "$detached_channel_rack_window" ]]; then
+            echo "View > Detach Channel Rack did not open its native window."
+            cat "$RUNNER_TEMP/mixer-preview.log"
+            exit 1
+          fi
+          xdotool windowmove "$detached_channel_rack_window" 420 48
+          xdotool windowfocus --sync "$detached_channel_rack_window"
+          sleep 0.5
+          ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
+            -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/channel-rack-detached-window.png"
+          xdotool windowfocus --sync "$mixer_window"
+          xdotool mousemove 287 16 click 1
+          sleep 0.3
+          xdotool mousemove 350 269 click 1
+          sleep 1
+          if xdotool search --onlyvisible --name '^Channel Rack$' >/dev/null 2>&1; then
+            echo "View > Dock Channel Rack did not close the native editor window."
+            cat "$RUNNER_TEMP/mixer-preview.log"
+            exit 1
+          fi
+
           kill "$app_pid" 2>/dev/null || true
           wait "$app_pid" 2>/dev/null || true
           app_pid=""
@@ -808,7 +836,7 @@ jobs:
             modern-pattern-clip-before-resize.png modern-pattern-clip-after-resize.png \
             piano-roll-time-selection.png piano-roll-pitch-selection.png piano-roll-mousewheel-property.png \
             piano-roll-mousewheel-nudge.png controller-event-draw.png controller-event-paint.png \
-            piano-roll-detached-window.png mixer-detached-window.png \
+            piano-roll-detached-window.png mixer-detached-window.png channel-rack-detached-window.png \
             controller-event-draw-alt-bypass.png controller-event-paint-shift-lock.png \
             controller-event-interpolate-selecting.png controller-event-interpolate.png \
             controller-event-spline-selecting.png controller-event-spline.png \
