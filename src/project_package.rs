@@ -14,6 +14,78 @@ use crate::media::SamplePathResolver;
 
 static WORKSPACE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// Copies a sample to a directory under a collision-safe “(Unique)” filename.
+/// Existing files are never overwritten.
+pub fn copy_unique_sample_file(
+    source: &Path,
+    destination_directory: &Path,
+) -> Result<PathBuf, String> {
+    if !source.is_file() {
+        return Err(format!("sample file does not exist: {}", source.display()));
+    }
+    fs::create_dir_all(destination_directory).map_err(|error| {
+        format!(
+            "could not create sample directory {}: {error}",
+            destination_directory.display()
+        )
+    })?;
+
+    let stem = source
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or_else(|| "sample".to_owned());
+    let extension = source
+        .extension()
+        .map(|extension| extension.to_string_lossy().into_owned())
+        .filter(|extension| !extension.is_empty());
+    let mut input = File::open(source)
+        .map_err(|error| format!("could not open sample {}: {error}", source.display()))?;
+
+    for suffix in 1usize.. {
+        let unique_suffix = if suffix == 1 {
+            " (Unique)".to_owned()
+        } else {
+            format!(" (Unique {suffix})")
+        };
+        let filename = match &extension {
+            Some(extension) => format!("{stem}{unique_suffix}.{extension}"),
+            None => format!("{stem}{unique_suffix}"),
+        };
+        let destination = destination_directory.join(filename);
+        let mut output = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&destination)
+        {
+            Ok(output) => output,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "could not create unique sample {}: {error}",
+                    destination.display()
+                ));
+            }
+        };
+
+        let copy_result = io::copy(&mut input, &mut output)
+            .and_then(|_| output.flush())
+            .and_then(|_| output.sync_all());
+        if let Err(error) = copy_result {
+            drop(output);
+            let _ = fs::remove_file(&destination);
+            return Err(format!(
+                "could not copy sample {} to {}: {error}",
+                source.display(),
+                destination.display()
+            ));
+        }
+        return Ok(destination);
+    }
+
+    unreachable!("a unique sample filename is always available")
+}
+
 struct WorkspaceInner {
     root: PathBuf,
     project_relative_path: PathBuf,
@@ -205,6 +277,22 @@ impl ProjectPackageWorkspace {
 
     pub fn sample_project_path(&self) -> &Path {
         &self.0.sample_project_path
+    }
+
+    /// Copies a sample next to the packaged FLP and returns its project-relative path.
+    pub fn copy_unique_sample(&self, source: &Path) -> Result<(PathBuf, String), String> {
+        let project_directory = self
+            .0
+            .project_relative_path
+            .parent()
+            .unwrap_or_else(|| Path::new(""));
+        let sample_directory = self.0.root.join(project_directory).join("Samples");
+        let copied_path = copy_unique_sample_file(source, &sample_directory)?;
+        let filename = copied_path
+            .file_name()
+            .ok_or_else(|| "copied sample has no filename".to_owned())?;
+        let project_relative_path = Path::new("Samples").join(filename);
+        Ok((copied_path, archive_name(&project_relative_path)))
     }
 
     /// Adds resolvable Sampler and audio-channel samples to the package and rewrites their
@@ -700,5 +788,55 @@ mod tests {
             .unwrap();
         assert_eq!(fs::read(first_resolved).unwrap(), b"left sample data");
         assert_eq!(fs::read(second_resolved).unwrap(), b"right sample data");
+    }
+
+    #[test]
+    fn copies_unique_samples_without_overwriting_existing_files() {
+        let temporary = TestDirectory::new();
+        let source = temporary.path().join("kick.wav");
+        let sample_directory = temporary.path().join("Samples");
+        let first_unique = sample_directory.join("kick (Unique).wav");
+        fs::create_dir_all(&sample_directory).unwrap();
+        fs::write(&source, b"source sample").unwrap();
+        fs::write(&first_unique, b"keep this file").unwrap();
+
+        let copied = super::copy_unique_sample_file(&source, &sample_directory).unwrap();
+
+        assert_eq!(copied.file_name().unwrap(), "kick (Unique 2).wav");
+        assert_eq!(fs::read(&first_unique).unwrap(), b"keep this file");
+        assert_eq!(fs::read(copied).unwrap(), b"source sample");
+    }
+
+    #[test]
+    fn package_unique_sample_reference_resolves_after_writing_the_archive() {
+        let temporary = TestDirectory::new();
+        let source_project = temporary.path().join("song.flp");
+        let source_sample = temporary.path().join("source").join("kick.wav");
+        fs::create_dir_all(source_sample.parent().unwrap()).unwrap();
+        fs::write(&source_sample, b"package sample data").unwrap();
+        let project_bytes = sample_project_fixture(&["source/kick.wav"]);
+        let mut document = FlpDocument::parse(&project_bytes).unwrap();
+        let workspace =
+            ProjectPackageWorkspace::single_project("song.flp", &project_bytes, &source_project)
+                .unwrap();
+
+        let (copied_path, sample_reference) = workspace.copy_unique_sample(&source_sample).unwrap();
+        document
+            .set_channel_sample_path(document.channels()[0].id(), &sample_reference)
+            .unwrap();
+        let package_path = temporary.path().join("song.zip");
+        workspace
+            .write_to(&package_path, &document.encode_lossless().unwrap())
+            .unwrap();
+
+        let (opened_workspace, bundled_project) = ProjectPackageWorkspace::open(&package_path)
+            .expect("the package with a unique sample should reopen");
+        let bundled_document = FlpDocument::parse(&bundled_project).unwrap();
+        let resolver = SamplePathResolver::new(opened_workspace.sample_project_path());
+        let resolved = resolver
+            .resolve(bundled_document.channels()[0].sample_path().unwrap())
+            .unwrap();
+        assert_eq!(fs::read(resolved).unwrap(), b"package sample data");
+        assert!(copied_path.is_file());
     }
 }

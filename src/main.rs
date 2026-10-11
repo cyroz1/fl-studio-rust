@@ -7,6 +7,7 @@ use std::process::ExitCode;
 use flp_rebuild::media::{SamplePathResolver, decode_audio_file};
 use flp_rebuild::midi::{MidiChannelMapping, MidiFile};
 use flp_rebuild::plugins::scan_installed_plugins;
+use flp_rebuild::project_package::copy_unique_sample_file;
 use flp_rebuild::sample_render::{
     AudioClipRenderOptions, AudioFileRenderOptions, AudioRenderEncodingOptions, AudioRenderOutput,
     SamplerPatternRenderOptions, render_audio_clips_to_wav, render_sampler_pattern_to_wav,
@@ -790,6 +791,16 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_usize(clip_index, "clip index")?,
             )
         }
+        [command, input, output, arrangement_id, clip_index]
+            if command == "make-audio-clip-unique-as-sample" =>
+        {
+            make_audio_clip_unique_as_sample(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(arrangement_id, "arrangement id")?,
+                parse_usize(clip_index, "clip index")?,
+            )
+        }
         [command, input, output, arrangement_id, left_clip_index, right_clip_index]
             if command == "join-pattern-clips" =>
         {
@@ -956,6 +967,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild split-audio-clip <input.flp> <output.flp> <arrangement-id> <clip-index> <split-position-ticks> <source-length-ms|->\n",
             "  flp-rebuild join-audio-clips <input.flp> <output.flp> <arrangement-id> <left-clip-index> <right-clip-index>\n",
             "  flp-rebuild make-audio-clip-unique <input.flp> <output.flp> <arrangement-id> <clip-index>\n",
+            "  flp-rebuild make-audio-clip-unique-as-sample <input.flp> <output.flp> <arrangement-id> <clip-index>\n",
             "  flp-rebuild join-pattern-clips <input.flp> <output.flp> <arrangement-id> <left-clip-index> <right-clip-index>\n",
             "  flp-rebuild merge-pattern-clips <input.flp> <output.flp> <arrangement-id> <clip-index,clip-index,...>\n",
             "  flp-rebuild slip-audio-clip <input.flp> <output.flp> <arrangement-id> <clip-index> <delta-ms> <sample-length-ms>\n",
@@ -3252,6 +3264,92 @@ fn make_audio_clip_unique(
         output.display()
     );
     Ok(())
+}
+
+fn make_audio_clip_unique_as_sample(
+    input: &Path,
+    output: &Path,
+    arrangement_id: u16,
+    clip_index: usize,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let source_sample_path =
+        playlist_audio_clip_sample_path(&document, arrangement_id, clip_index)?;
+    let source_sample = SamplePathResolver::new(input)
+        .resolve(&source_sample_path)
+        .map_err(|error| format!("could not find the Audio Clip sample: {error}"))?;
+    let channel_id = document
+        .make_playlist_audio_clip_unique(arrangement_id, clip_index)
+        .map_err(|error| error.to_string())?;
+    let output_directory = output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let sample_directory = output_directory.join("Samples");
+    let copied_sample = copy_unique_sample_file(&source_sample, &sample_directory)?;
+    let Some(filename) = copied_sample.file_name().and_then(|name| name.to_str()) else {
+        let _ = fs::remove_file(&copied_sample);
+        return Err("the copied sample filename cannot be stored in the project".to_owned());
+    };
+    let sample_reference = Path::new("Samples")
+        .join(filename)
+        .to_string_lossy()
+        .into_owned();
+    if let Err(error) = document.set_channel_sample_path(channel_id, &sample_reference) {
+        let _ = fs::remove_file(&copied_sample);
+        return Err(error.to_string());
+    }
+    let bytes = match document.encode_lossless() {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let _ = fs::remove_file(&copied_sample);
+            return Err(format!("could not encode {}: {error}", input.display()));
+        }
+    };
+    if let Err(error) = fs::write(output, bytes) {
+        let _ = fs::remove_file(&copied_sample);
+        return Err(format!("could not write {}: {error}", output.display()));
+    }
+    println!(
+        "made arrangement {arrangement_id} Audio Clip {clip_index} unique as channel {channel_id} with sample {} in {}",
+        copied_sample.display(),
+        output.display()
+    );
+    Ok(())
+}
+
+fn playlist_audio_clip_sample_path(
+    document: &FlpDocument,
+    arrangement_id: u16,
+    clip_index: usize,
+) -> Result<String, String> {
+    let arrangement = document
+        .arrangements()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|arrangement| arrangement.id == arrangement_id)
+        .ok_or_else(|| "the requested arrangement does not exist".to_owned())?;
+    let clip = arrangement
+        .clips
+        .get(clip_index)
+        .ok_or_else(|| "the requested Playlist clip does not exist".to_owned())?;
+    let flp_rebuild::PlaylistClipTarget::Channel { id } = clip.target() else {
+        return Err("Make unique as sample applies to Playlist Audio Clips".to_owned());
+    };
+    let channels = document.channels();
+    let mut matching_channels = channels
+        .iter()
+        .filter(|channel| channel.id() == id && channel.kind() == Some(4));
+    let Some(channel) = matching_channels.next() else {
+        return Err("the Playlist Audio Clip channel does not exist".to_owned());
+    };
+    if matching_channels.next().is_some() {
+        return Err(format!("Audio Clip channel ID {id} is ambiguous"));
+    }
+    channel
+        .sample_path()
+        .map(str::to_owned)
+        .ok_or_else(|| "the Audio Clip channel has no sample path".to_owned())
 }
 
 fn join_pattern_clips(

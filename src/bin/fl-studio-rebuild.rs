@@ -17,7 +17,7 @@ use flp_rebuild::media::{
 };
 use flp_rebuild::midi::{MidiChannelMapping, MidiFile};
 use flp_rebuild::plugins::{PluginCandidate, PluginFormat, scan_installed_plugins};
-use flp_rebuild::project_package::ProjectPackageWorkspace;
+use flp_rebuild::project_package::{ProjectPackageWorkspace, copy_unique_sample_file};
 use flp_rebuild::sample_render::{
     AudioClipRenderOptions, AudioClipRenderSummary, AudioFileRenderOptions, AudioRecordingSummary,
     AudioRenderEncodingOptions, AudioRenderOutput, MP3_BITRATES_KBPS, PlaylistRenderOptions,
@@ -2853,6 +2853,91 @@ impl DawUi {
             .as_ref()
             .map(|workspace| workspace.sample_project_path().to_path_buf())
             .or_else(|| self.current_path.clone())
+    }
+
+    fn make_audio_clip_unique_as_sample(
+        &mut self,
+        arrangement_id: u16,
+        clip_index: usize,
+    ) -> Result<u16, String> {
+        let project_path = self.sample_project_path().ok_or_else(|| {
+            "save the project before making an Audio Clip unique as a sample".to_owned()
+        })?;
+        let mut document = self.document.as_ref().cloned().ok_or_else(|| {
+            "open a project before making an Audio Clip unique as a sample".to_owned()
+        })?;
+        let source_sample_path = {
+            let arrangement = document
+                .arrangements()
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .find(|arrangement| arrangement.id == arrangement_id)
+                .ok_or_else(|| "the requested arrangement does not exist".to_owned())?;
+            let clip = arrangement
+                .clips
+                .get(clip_index)
+                .ok_or_else(|| "the requested Playlist clip does not exist".to_owned())?;
+            let flp_rebuild::PlaylistClipTarget::Channel { id } = clip.target() else {
+                return Err("Make unique as sample applies to Playlist Audio Clips".to_owned());
+            };
+            let channel = document
+                .channels()
+                .into_iter()
+                .find(|channel| channel.id() == id && channel.kind() == Some(4))
+                .ok_or_else(|| "the Playlist Audio Clip channel does not exist".to_owned())?;
+            channel
+                .sample_path()
+                .ok_or_else(|| "the Audio Clip channel has no sample path".to_owned())?
+                .to_owned()
+        };
+        let source_sample = SamplePathResolver::new(&project_path)
+            .resolve(&source_sample_path)
+            .map_err(|error| format!("could not find the Audio Clip sample: {error}"))?;
+        let channel_id = document
+            .make_playlist_audio_clip_unique(arrangement_id, clip_index)
+            .map_err(|error| error.to_string())?;
+
+        let (copied_sample, sample_reference) = if let Some(workspace) = &self.package_workspace {
+            workspace.copy_unique_sample(&source_sample)?
+        } else {
+            let project_directory = project_path
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or_else(|| source_sample.parent().unwrap_or_else(|| Path::new(".")));
+            let sample_directory = project_directory.join("Samples");
+            let copied_sample = copy_unique_sample_file(&source_sample, &sample_directory)?;
+            let Some(filename) = copied_sample.file_name().and_then(|name| name.to_str()) else {
+                let _ = fs::remove_file(&copied_sample);
+                return Err("the copied sample filename cannot be stored in the project".to_owned());
+            };
+            (
+                copied_sample,
+                Path::new("Samples")
+                    .join(filename)
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        };
+
+        if let Err(error) = document.set_channel_sample_path(channel_id, &sample_reference) {
+            let _ = fs::remove_file(&copied_sample);
+            return Err(error.to_string());
+        }
+        self.document = Some(document);
+        self.stop_project_playback();
+        self.selected_arrangement = Some(arrangement_id);
+        self.selected_clip = Some(clip_index);
+        self.selected_playlist_clips.clear();
+        self.selected_playlist_clips.insert(clip_index);
+        self.playlist_clip_context_split = None;
+        self.active_playlist_clip_drag = None;
+        self.dirty = true;
+        self.status = format!(
+            "Made Audio Clip {} unique as sample in channel {channel_id}",
+            clip_index + 1
+        );
+        self.refresh_audio_waveform_paths();
+        Ok(channel_id)
     }
 
     fn selected_playlist_audio_clip(&self) -> Option<(u16, usize)> {
@@ -8139,6 +8224,7 @@ impl DawUi {
         let mut cut_clip_requested = None;
         let mut paste_clip_after_requested = None;
         let mut make_audio_clip_unique_requested = None;
+        let mut make_audio_clip_unique_as_sample_requested = None;
         let mut split_clip_requested = None;
         let mut join_clip_requested = None;
         let mut join_pattern_clip_requested = None;
@@ -9010,6 +9096,11 @@ impl DawUi {
                                         make_audio_clip_unique_requested = Some(clip_index);
                                         ui.close();
                                     }
+                                    if ui.button("Make unique as sample").clicked() {
+                                        make_audio_clip_unique_as_sample_requested =
+                                            Some(clip_index);
+                                        ui.close();
+                                    }
                                     let split_button = ui.add_enabled(
                                         can_split_clip,
                                         egui::Button::new("Split audio at cursor"),
@@ -9436,6 +9527,15 @@ impl DawUi {
                     self.status = format!("Could not make Audio Clip unique: {error}");
                 }
                 None => self.status = "Open a project to make an Audio Clip unique".to_owned(),
+            }
+        }
+
+        if let Some(clip_index) = make_audio_clip_unique_as_sample_requested {
+            match self.make_audio_clip_unique_as_sample(arrangement.id, clip_index) {
+                Ok(_) => {}
+                Err(error) => {
+                    self.status = format!("Could not make Audio Clip unique as sample: {error}");
+                }
             }
         }
 
