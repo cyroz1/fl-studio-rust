@@ -19822,16 +19822,12 @@ impl DawUi {
                 Vec2::new(inspector_width, available_height),
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
-                    egui::ScrollArea::vertical()
-                        .id_salt("mixer-track-inspector")
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            ui.strong("Track inspector");
-                            ui.separator();
-                            if let Some(insert) = inserts
-                                .iter()
-                                .find(|insert| Some(insert.ordinal()) == self.selected_mixer_insert)
-                            {
+                    ui.strong("Track inspector");
+                    ui.separator();
+                    if let Some(insert) = inserts
+                        .iter()
+                        .find(|insert| Some(insert.ordinal()) == self.selected_mixer_insert)
+                    {
                         ui.label(if insert.ordinal() == 0 {
                             "Master".to_owned()
                         } else {
@@ -19943,6 +19939,10 @@ impl DawUi {
                             .iter()
                             .filter(|slot| slot.insert_ordinal() == insert.ordinal())
                             .collect::<Vec<_>>();
+                        egui::ScrollArea::vertical()
+                            .id_salt("mixer-effect-slots")
+                            .max_height((available_height - 340.0).max(160.0))
+                            .show(ui, |ui| {
                         if insert_slots.len() == 10 {
                             for slot_index in 0..10 {
                                 let slot = insert_slots
@@ -20001,6 +20001,7 @@ impl DawUi {
                                 .color(MUTED),
                             );
                         }
+                            });
                         ui.collapsing(
                             format!("Project 0xE1 records ({})", parameters.len()),
                             |ui| {
@@ -20054,12 +20055,9 @@ impl DawUi {
                                     });
                             },
                         );
-                            } else {
-                                ui.label(
-                                    egui::RichText::new("Select an insert track").color(MUTED),
-                                );
-                            }
-                        });
+                    } else {
+                        ui.label(egui::RichText::new("Select an insert track").color(MUTED));
+                    }
                 },
             );
         });
