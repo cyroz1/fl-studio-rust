@@ -15668,6 +15668,16 @@ mod tests {
     fn consolidated_audio_clip_keeps_the_render_active_and_mutes_its_source() {
         let mut document = audio_clip_fixture();
         let source_clip_index = 1;
+        document
+            .edit_playlist_clip(
+                3,
+                source_clip_index,
+                PlaylistClipEdit {
+                    muted: Some(false),
+                    ..PlaylistClipEdit::default()
+                },
+            )
+            .expect("the fixture source should start unmuted");
         let source_clip = document.arrangements().unwrap()[0].clips[source_clip_index].clone();
         assert!(!source_clip.muted);
 
