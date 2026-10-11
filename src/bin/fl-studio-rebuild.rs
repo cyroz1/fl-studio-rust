@@ -734,6 +734,12 @@ enum PianoRollSelectionCommand {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TimeSelectionShift {
+    Previous,
+    Next,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StepGraphMode {
     Note,
     Velocity,
@@ -1619,6 +1625,7 @@ struct DawUi {
     selected_note_channel: Option<u16>,
     selected_note: Option<(u16, u16, usize)>,
     selected_piano_notes: BTreeSet<(u16, u16, usize)>,
+    piano_roll_time_selection: Option<(u16, u32, u32)>,
     piano_roll_select_mode: bool,
     piano_roll_selection_drag: Option<PianoRollSelectionDrag>,
     piano_roll_zoom_mode: bool,
@@ -2070,6 +2077,7 @@ impl DawUi {
             selected_note_channel: None,
             selected_note: None,
             selected_piano_notes: BTreeSet::new(),
+            piano_roll_time_selection: None,
             piano_roll_select_mode: false,
             piano_roll_selection_drag: None,
             piano_roll_zoom_mode: false,
@@ -2696,6 +2704,7 @@ impl DawUi {
                 self.selected_time_marker = None;
                 self.selected_note = None;
                 self.selected_piano_notes.clear();
+                self.piano_roll_time_selection = None;
                 self.piano_roll_selection_drag = None;
                 self.active_note_drag = None;
                 self.pending_midi_import = None;
@@ -4264,6 +4273,7 @@ impl DawUi {
         self.selected_automation_point = None;
         self.active_note_drag = None;
         self.selected_piano_notes.clear();
+        self.piano_roll_time_selection = None;
         self.piano_roll_selection_drag = None;
         self.dirty = self
             .document
@@ -12623,6 +12633,45 @@ impl DawUi {
         self.status = status;
     }
 
+    fn select_time_around_piano_roll_selection(&mut self) {
+        let Some(pattern_id) = self.selected_pattern else {
+            self.status = "Open a pattern and select notes first".to_owned();
+            return;
+        };
+        let range = self.document.as_ref().and_then(|document| {
+            let pattern = document
+                .patterns()
+                .ok()?
+                .into_iter()
+                .find(|pattern| pattern.id == pattern_id)?;
+            piano_roll_selection_time_range(&pattern, pattern_id, &self.selected_piano_notes)
+        });
+        if let Some((start, end)) = range {
+            self.piano_roll_time_selection = Some((pattern_id, start, end));
+            self.status = format!("Selected time from {start} to {end} ticks");
+        } else {
+            self.status = "Select notes with a timeline length first".to_owned();
+        }
+    }
+
+    fn shift_piano_roll_time_selection(&mut self, direction: TimeSelectionShift) {
+        let Some((pattern_id, start, end)) = self.piano_roll_time_selection else {
+            self.status = "Select a time range first".to_owned();
+            return;
+        };
+        if self.selected_pattern != Some(pattern_id) {
+            self.status = "Select a time range in this pattern first".to_owned();
+            return;
+        }
+        let width = end.saturating_sub(start);
+        if width == 0 {
+            return;
+        }
+        let (start, end) = piano_roll_shift_time_range(start, end, direction);
+        self.piano_roll_time_selection = Some((pattern_id, start, end));
+        self.status = format!("Selected time from {start} to {end} ticks");
+    }
+
     fn nudge_piano_roll_selection(
         &mut self,
         pattern: &Pattern,
@@ -13160,6 +13209,8 @@ impl DawUi {
                 ui.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::M));
             let select_odd_notes =
                 ui.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::O));
+            let select_time_around_notes =
+                ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter));
             change_note_color_requested =
                 ui.input_mut(|input| input.consume_key(egui::Modifiers::ALT, egui::Key::C));
             let clear_note_selection =
@@ -13189,6 +13240,12 @@ impl DawUi {
                 } else {
                     None
                 }
+            });
+            let select_previous_time = ui.input_mut(|input| {
+                input.consume_key(egui::Modifiers::COMMAND, egui::Key::ArrowLeft)
+            });
+            let select_next_time = ui.input_mut(|input| {
+                input.consume_key(egui::Modifiers::COMMAND, egui::Key::ArrowRight)
             });
             note_nudge_requested = ui.input_mut(|input| {
                 if input.consume_key(egui::Modifiers::COMMAND, egui::Key::ArrowUp) {
@@ -13237,6 +13294,13 @@ impl DawUi {
                 self.apply_piano_roll_selection_command(PianoRollSelectionCommand::RandomMore);
             } else if select_odd_notes {
                 self.apply_piano_roll_selection_command(PianoRollSelectionCommand::Odd);
+            }
+            if select_time_around_notes {
+                self.select_time_around_piano_roll_selection();
+            } else if select_previous_time {
+                self.shift_piano_roll_time_selection(TimeSelectionShift::Previous);
+            } else if select_next_time {
+                self.shift_piano_roll_time_selection(TimeSelectionShift::Next);
             }
             if select_color_group {
                 self.select_piano_roll_color_group();
@@ -13619,6 +13683,39 @@ impl DawUi {
                 }
                 if ui.button("Deselect notes (Ctrl/Cmd+D)").clicked() {
                     self.apply_piano_roll_selection_command(PianoRollSelectionCommand::Clear);
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        selected_note_count > 0,
+                        egui::Button::new("Select time around selection (Ctrl/Cmd+Enter)"),
+                    )
+                    .clicked()
+                {
+                    self.select_time_around_piano_roll_selection();
+                    ui.close();
+                }
+                let time_selection_available = self.piano_roll_time_selection.is_some_and(
+                    |(pattern_id, _, _)| Some(pattern_id) == self.selected_pattern,
+                );
+                if ui
+                    .add_enabled(
+                        time_selection_available,
+                        egui::Button::new("Select previous time (Ctrl/Cmd+Left)"),
+                    )
+                    .clicked()
+                {
+                    self.shift_piano_roll_time_selection(TimeSelectionShift::Previous);
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        time_selection_available,
+                        egui::Button::new("Select next time (Ctrl/Cmd+Right)"),
+                    )
+                    .clicked()
+                {
+                    self.shift_piano_roll_time_selection(TimeSelectionShift::Next);
                     ui.close();
                 }
                 if ui.button("Duplicate to right (Ctrl/Cmd+B)").clicked() {
@@ -17177,6 +17274,11 @@ impl DawUi {
                     .iter()
                     .map(|controller| controller.position),
             )
+            .chain(
+                self.piano_roll_time_selection
+                    .filter(|(selected_pattern, _, _)| *selected_pattern == pattern.id)
+                    .map(|(_, _, end)| end),
+            )
             .max()
             .unwrap_or(ppq as u32 * 16)
             .max(ppq as u32 * 16);
@@ -17643,6 +17745,30 @@ impl DawUi {
                     self.active_note_drag = None;
                 }
                 *channel_index += 1;
+            }
+            if let Some((_, start, end)) = self
+                .piano_roll_time_selection
+                .filter(|(selected_pattern, _, _)| *selected_pattern == pattern.id)
+            {
+                let grid_left = rect.left() + keyboard_width;
+                let selection_rect = egui::Rect::from_min_max(
+                    egui::pos2(grid_left + start as f32 * tick_scale, rect.top()),
+                    egui::pos2(grid_left + end as f32 * tick_scale, rect.bottom()),
+                )
+                .intersect(rect);
+                if selection_rect.width() > 0.0 {
+                    painter.rect_filled(
+                        selection_rect,
+                        0,
+                        Color32::from_rgba_unmultiplied(73, 128, 174, 32),
+                    );
+                    painter.rect_stroke(
+                        selection_rect,
+                        egui::CornerRadius::ZERO,
+                        Stroke::new(1.0, BLUE),
+                        egui::StrokeKind::Inside,
+                    );
+                }
             }
             let modifiers = ui.input(|input| input.modifiers);
             if self.piano_roll_zoom_mode
@@ -22020,6 +22146,39 @@ fn piano_roll_select_component_above_lowest(
     );
 }
 
+fn piano_roll_selection_time_range(
+    pattern: &Pattern,
+    pattern_id: u16,
+    selected_notes: &BTreeSet<(u16, u16, usize)>,
+) -> Option<(u32, u32)> {
+    let mut start = u32::MAX;
+    let mut end = 0_u32;
+    let mut found_note = false;
+    let mut channel_indices = BTreeMap::<u16, usize>::new();
+    for note in &pattern.notes {
+        let note_index = channel_indices.entry(note.channel_id).or_default();
+        if selected_notes.contains(&(pattern_id, note.channel_id, *note_index)) {
+            let note_end = note.position.saturating_add(note.length);
+            if note_end > note.position {
+                start = start.min(note.position);
+                end = end.max(note_end);
+                found_note = true;
+            }
+        }
+        *note_index += 1;
+    }
+    found_note.then_some((start, end))
+}
+
+fn piano_roll_shift_time_range(start: u32, end: u32, direction: TimeSelectionShift) -> (u32, u32) {
+    let width = end.saturating_sub(start);
+    let start = match direction {
+        TimeSelectionShift::Previous => start.saturating_sub(width),
+        TimeSelectionShift::Next => start.saturating_add(width),
+    };
+    (start, start.saturating_add(width))
+}
+
 fn piano_roll_random_note_selection(
     pattern: &Pattern,
     pattern_id: u16,
@@ -24473,14 +24632,15 @@ mod tests {
     use super::{
         ActivePlaylistClipDrag, Arrangement, ChannelDisplayFilter, FlpDocument, Pattern,
         PatternController, PatternNote, PianoRollGrid, PianoRollSnap, PlaylistClip,
-        PlaylistClipDragKind, PlaylistTrack, PluginCandidate, PluginFormat,
+        PlaylistClipDragKind, PlaylistTrack, PluginCandidate, PluginFormat, TimeSelectionShift,
         audio_recording_length_ticks, candidate_matches_vst_identity, candidate_mixer_controls,
         encode_midi_device_selections, first_available_playlist_track, next_piano_roll_note_group,
         note_from_grid_position, parse_midi_device_selections, piano_roll_color_group_note_ids,
         piano_roll_controller_value_at, piano_roll_controller_value_range,
         piano_roll_discard_length_edit, piano_roll_note_group_members, piano_roll_note_nudge_edit,
         piano_roll_odd_note_selection, piano_roll_overlap_note_selection,
-        piano_roll_random_note_selection, playlist_audio_clip_join_candidates,
+        piano_roll_random_note_selection, piano_roll_selection_time_range,
+        piano_roll_shift_time_range, playlist_audio_clip_join_candidates,
         playlist_audio_drop_position_ticks, playlist_bar_ticks, playlist_clip_drag_edit,
         playlist_clip_local_recording_offset, playlist_clip_split_position,
         playlist_group_parent_ids, playlist_measure_boundaries,
@@ -24673,6 +24833,54 @@ mod tests {
         assert_eq!(
             piano_roll_overlap_note_selection(&pattern, 7, 2, true),
             vec![(7, 2, 1), (7, 2, 4)]
+        );
+    }
+
+    #[test]
+    fn piano_roll_time_selection_covers_selected_notes_across_channels() {
+        let note = |position, length, channel_id| PatternNote {
+            position,
+            length,
+            channel_id,
+            ..PatternNote::default()
+        };
+        let pattern = Pattern {
+            id: 7,
+            notes: vec![
+                note(48, 24, 2),
+                note(0, 96, 3),
+                note(96, 48, 2),
+                note(200, 0, 2),
+            ],
+            ..Pattern::default()
+        };
+        let selected = [(7, 2, 0), (7, 3, 0), (7, 2, 1), (7, 2, 2)]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(
+            piano_roll_selection_time_range(&pattern, 7, &selected),
+            Some((0, 144))
+        );
+        assert_eq!(
+            piano_roll_selection_time_range(&pattern, 8, &selected),
+            None
+        );
+    }
+
+    #[test]
+    fn piano_roll_time_selection_moves_by_its_own_width() {
+        assert_eq!(
+            piano_roll_shift_time_range(96, 144, TimeSelectionShift::Previous),
+            (48, 96)
+        );
+        assert_eq!(
+            piano_roll_shift_time_range(96, 144, TimeSelectionShift::Next),
+            (144, 192)
+        );
+        assert_eq!(
+            piano_roll_shift_time_range(24, 72, TimeSelectionShift::Previous),
+            (0, 48)
         );
     }
 
