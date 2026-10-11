@@ -4282,16 +4282,47 @@ impl DawUi {
         let Some(snapshot) = self.pending_history_snapshot.take().or(frame_snapshot) else {
             return;
         };
-        let Some(document) = &self.document else {
-            return;
+        match self.encode_history_snapshot() {
+            Ok(Some(current)) if current != snapshot => self.remember_undo_snapshot(snapshot),
+            Ok(Some(_)) | Ok(None) => {}
+            Err(error) => self.status = format!("Could not capture undo state: {error}"),
+        }
+    }
+
+    fn encode_history_snapshot(&self) -> Result<Option<Vec<u8>>, String> {
+        let Some(mut document) = self.document.clone() else {
+            return Ok(None);
         };
-        match document.encode_lossless() {
-            Ok(current) if current != snapshot => self.remember_undo_snapshot(snapshot),
-            Ok(_) => {}
-            Err(error) => {
-                self.status = format!("Could not capture undo state: {error}");
+        // Host-controlled VST3 parameter edits change the live instance before the
+        // FLP document. Capture that state into the clone so history includes it
+        // without changing the project's saved bytes during ordinary editing.
+        self.capture_loaded_vst3_state(&mut document);
+        document
+            .encode_lossless()
+            .map(Some)
+            .map_err(|error| error.to_string())
+    }
+
+    fn restore_loaded_vst3_state(&mut self) -> Vec<String> {
+        let states = self
+            .document
+            .as_ref()
+            .map(FlpDocument::channel_plugin_states)
+            .unwrap_or_default();
+        let instances = self.channel_vst3_instances.clone();
+        let Some(host) = self.vst3_host.as_mut() else {
+            return Vec::new();
+        };
+        let mut warnings = Vec::new();
+        for state in states {
+            let Some(instance_id) = instances.get(&state.channel_id()).copied() else {
+                continue;
+            };
+            if let Err(error) = host.restore_flp_channel_state(instance_id, &state) {
+                warnings.push(format!("channel {}: {error}", state.channel_id()));
             }
         }
+        warnings
     }
 
     fn undo_document(&mut self) {
@@ -4300,14 +4331,18 @@ impl DawUi {
             self.status = "Nothing to undo".to_owned();
             return;
         };
-        let Some(current) = self
-            .document
-            .as_ref()
-            .and_then(|document| document.encode_lossless().ok())
-        else {
-            self.undo_history.push(snapshot);
-            self.status = "Could not capture the current project for redo".to_owned();
-            return;
+        let current = match self.encode_history_snapshot() {
+            Ok(Some(current)) => current,
+            Ok(None) => {
+                self.undo_history.push(snapshot);
+                self.status = "Could not capture the current project for redo".to_owned();
+                return;
+            }
+            Err(error) => {
+                self.undo_history.push(snapshot);
+                self.status = format!("Could not capture the current project for redo: {error}");
+                return;
+            }
         };
         let restored = match FlpDocument::parse(&snapshot) {
             Ok(document) => document,
@@ -4329,14 +4364,18 @@ impl DawUi {
             self.status = "Nothing to redo".to_owned();
             return;
         };
-        let Some(current) = self
-            .document
-            .as_ref()
-            .and_then(|document| document.encode_lossless().ok())
-        else {
-            self.redo_history.push(snapshot);
-            self.status = "Could not capture the current project for undo".to_owned();
-            return;
+        let current = match self.encode_history_snapshot() {
+            Ok(Some(current)) => current,
+            Ok(None) => {
+                self.redo_history.push(snapshot);
+                self.status = "Could not capture the current project for undo".to_owned();
+                return;
+            }
+            Err(error) => {
+                self.redo_history.push(snapshot);
+                self.status = format!("Could not capture the current project for undo: {error}");
+                return;
+            }
         };
         let restored = match FlpDocument::parse(&snapshot) {
             Ok(document) => document,
@@ -4354,6 +4393,7 @@ impl DawUi {
 
     fn refresh_after_history_navigation(&mut self, action: &str) {
         self.stop_project_playback();
+        let plugin_restore_warnings = self.restore_loaded_vst3_state();
         if let Some(document) = &self.document {
             self.tempo_bpm = document.metadata().tempo_bpm().unwrap_or(140.0);
             self.project_info_title = document.metadata().title().unwrap_or_default().to_owned();
@@ -4434,6 +4474,12 @@ impl DawUi {
             .zip(self.saved_project_hash)
             .is_none_or(|(current, saved)| current != saved);
         self.status = format!("{action} project edit");
+        if !plugin_restore_warnings.is_empty() {
+            self.status.push_str(&format!(
+                " · VST3 state restore issue: {}",
+                plugin_restore_warnings.join("; ")
+            ));
+        }
     }
 
     fn capture_loaded_vst3_state(&self, document: &mut FlpDocument) -> Vec<String> {
@@ -22410,9 +22456,13 @@ impl eframe::App for DawUi {
             && self.pending_history_snapshot.is_none()
             && edit_input_received
         {
-            self.document
-                .as_ref()
-                .and_then(|document| document.encode_lossless().ok())
+            match self.encode_history_snapshot() {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    self.status = format!("Could not capture undo state: {error}");
+                    None
+                }
+            }
         } else {
             None
         };
