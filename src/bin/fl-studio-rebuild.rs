@@ -24,11 +24,11 @@ use flp_rebuild::sample_render::{
     AudioRenderEncodingOptions, AudioRenderOutput, MP3_BITRATES_KBPS, PlaylistRenderOptions,
     PlaylistRenderSummary, PlaylistStreamMonitor, PlaylistTempoMap, ResamplingQuality,
     SamplerPatternRenderOptions, SamplerPatternRenderSummary, WavChannelMode, WavDitherMode,
-    WavSampleFormat, render_audio_clips_to_file, render_playlist_with_vst3_to_flac_cancellable,
-    render_playlist_with_vst3_to_mp3_cancellable, render_playlist_with_vst3_to_ogg_cancellable,
-    render_playlist_with_vst3_to_wav_cancellable, render_sampler_pattern_to_file,
-    stream_playlist_with_vst3_to_device_with_monitor, stream_sampler_pattern_to_device,
-    write_input_recording_to_wav,
+    WavSampleFormat, render_audio_clips_to_file, render_playlist_mixer_stems_with_vst3_cancellable,
+    render_playlist_with_vst3_to_flac_cancellable, render_playlist_with_vst3_to_mp3_cancellable,
+    render_playlist_with_vst3_to_ogg_cancellable, render_playlist_with_vst3_to_wav_cancellable,
+    render_sampler_pattern_to_file, stream_playlist_with_vst3_to_device_with_monitor,
+    stream_sampler_pattern_to_device, write_input_recording_to_wav,
 };
 use flp_rebuild::vst3::{
     MAX_REPORTED_TAIL_SECONDS, Vst3HostRuntime, Vst3PatternRenderOptions, Vst3PatternStreamHandle,
@@ -1995,6 +1995,7 @@ struct DawUi {
     project_settings_time_signature_numerator: u8,
     project_settings_time_signature_denominator: u8,
     playlist_render_options_open: bool,
+    playlist_render_mixer_stems: bool,
     playlist_song_output_format: PlaylistSongOutputFormat,
     playlist_render_format: WavSampleFormat,
     playlist_render_flac_bits_per_sample: u8,
@@ -2026,6 +2027,13 @@ struct PendingSongRender {
     cancelled: Arc<AtomicBool>,
     worker: thread::JoinHandle<()>,
     output_path: PathBuf,
+    kind: PendingSongRenderKind,
+}
+
+#[derive(Clone, Copy)]
+enum PendingSongRenderKind {
+    Mix,
+    MixerStems,
 }
 
 struct PendingSamplerPatternRender {
@@ -2493,6 +2501,7 @@ impl DawUi {
             project_settings_time_signature_numerator: 4,
             project_settings_time_signature_denominator: 4,
             playlist_render_options_open: false,
+            playlist_render_mixer_stems: false,
             playlist_song_output_format: PlaylistSongOutputFormat::Wav,
             playlist_render_format: WavSampleFormat::Float32,
             playlist_render_flac_bits_per_sample: 24,
@@ -4284,40 +4293,50 @@ impl DawUi {
         let mut open = self.playlist_render_options_open;
         let mut start_render = false;
         let mut cancel = false;
-        egui::Window::new("Render Playlist mix")
+        egui::Window::new(if self.playlist_render_mixer_stems {
+            "Render Mixer stems"
+        } else {
+            "Render Playlist mix"
+        })
             .id(Id::new("playlist-render-options-dialog"))
             .open(&mut open)
             .resizable(false)
             .default_width(360.0)
             .show(context, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Output format");
-                    egui::ComboBox::from_id_salt("playlist-song-output-format")
-                        .selected_text(self.playlist_song_output_format.label())
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut self.playlist_song_output_format,
-                                PlaylistSongOutputFormat::Wav,
-                                "WAV",
-                            );
-                            ui.selectable_value(
-                                &mut self.playlist_song_output_format,
-                                PlaylistSongOutputFormat::Flac,
-                                "FLAC",
-                            );
-                            ui.selectable_value(
-                                &mut self.playlist_song_output_format,
-                                PlaylistSongOutputFormat::Ogg,
-                                "OGG",
-                            );
-                            ui.selectable_value(
-                                &mut self.playlist_song_output_format,
-                                PlaylistSongOutputFormat::Mp3,
-                                "MP3",
-                            );
-                        });
-                });
-                match self.playlist_song_output_format {
+                let render_format = if self.playlist_render_mixer_stems {
+                    ui.label("Output format: WAV stems");
+                    PlaylistSongOutputFormat::Wav
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.label("Output format");
+                        egui::ComboBox::from_id_salt("playlist-song-output-format")
+                            .selected_text(self.playlist_song_output_format.label())
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.playlist_song_output_format,
+                                    PlaylistSongOutputFormat::Wav,
+                                    "WAV",
+                                );
+                                ui.selectable_value(
+                                    &mut self.playlist_song_output_format,
+                                    PlaylistSongOutputFormat::Flac,
+                                    "FLAC",
+                                );
+                                ui.selectable_value(
+                                    &mut self.playlist_song_output_format,
+                                    PlaylistSongOutputFormat::Ogg,
+                                    "OGG",
+                                );
+                                ui.selectable_value(
+                                    &mut self.playlist_song_output_format,
+                                    PlaylistSongOutputFormat::Mp3,
+                                    "MP3",
+                                );
+                            });
+                    });
+                    self.playlist_song_output_format
+                };
+                match render_format {
                     PlaylistSongOutputFormat::Wav => {
                         ui.horizontal(|ui| {
                             ui.label("WAV format");
@@ -4464,6 +4483,9 @@ impl DawUi {
                         });
                 });
                 ui.label("Adds this much time after the last clip for instrument releases.");
+                if self.playlist_render_mixer_stems {
+                    ui.label("Exports supported non-Master insert buses before Mixer effects.");
+                }
                 ui.checkbox(
                     &mut self.playlist_render_include_plugin_tails,
                     "Use VST3 instrument tail reports",
@@ -4481,9 +4503,17 @@ impl DawUi {
                     }
                 });
             });
+        let render_mixer_stems = self.playlist_render_mixer_stems;
         self.playlist_render_options_open = open && !start_render && !cancel;
+        if !self.playlist_render_options_open {
+            self.playlist_render_mixer_stems = false;
+        }
         if start_render {
-            self.render_playlist_dialog();
+            if render_mixer_stems {
+                self.render_mixer_stems_dialog();
+            } else {
+                self.render_playlist_dialog();
+            }
         }
     }
 
@@ -5635,6 +5665,20 @@ impl DawUi {
                         )
                         .clicked()
                     {
+                        self.playlist_render_mixer_stems = false;
+                        self.playlist_render_options_open = true;
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.document.is_some()
+                                && self.current_path.is_some()
+                                && self.pending_song_render.is_none(),
+                            egui::Button::new("Render Mixer stems…"),
+                        )
+                        .clicked()
+                    {
+                        self.playlist_render_mixer_stems = true;
                         self.playlist_render_options_open = true;
                         ui.close();
                     }
@@ -17890,6 +17934,7 @@ impl DawUi {
                     cancelled,
                     worker,
                     output_path: output_path.clone(),
+                    kind: PendingSongRenderKind::Mix,
                 });
                 self.status = format!("Rendering Playlist mix to {}…", output_path.display());
             }
@@ -17899,12 +17944,115 @@ impl DawUi {
         }
     }
 
+    fn render_mixer_stems_dialog(&mut self) {
+        let (Some(project_path), Some(document)) =
+            (self.current_path.as_deref(), self.document.as_ref())
+        else {
+            self.status = "Open a project before rendering Mixer stems".to_owned();
+            return;
+        };
+        if self.pending_song_render.is_some() {
+            self.status = "A Playlist or Mixer stem render is already running".to_owned();
+            return;
+        }
+        if self.playing
+            || self.project_playback_loaded
+            || self.pending_audio_render.is_some()
+            || self.pending_vst3_stream.is_some()
+            || self.pending_sampler_stream.is_some()
+        {
+            self.status =
+                "Stop Song playback or pattern preview before rendering Mixer stems".to_owned();
+            return;
+        }
+        let Some(output_directory) = rfd::FileDialog::new()
+            .set_title("Render Mixer insert stems")
+            .pick_folder()
+        else {
+            return;
+        };
+        let options = PlaylistRenderOptions {
+            arrangement_id: self.selected_arrangement.unwrap_or_default(),
+            sample_rate: self.audio_settings.sample_rate,
+            soloed_playlist_track_range: self.soloed_playlist_track_range,
+            read_sample_root_note: self.read_sample_root_note,
+            wav_sample_format: self.playlist_render_format,
+            wav_dither_mode: if self.playlist_render_dither {
+                WavDitherMode::Tpdf
+            } else {
+                WavDitherMode::Off
+            },
+            resampling_quality: self.playlist_render_quality,
+            wav_channel_mode: self.playlist_render_channel_mode,
+            tail_seconds: self.playlist_render_tail_seconds,
+            ..PlaylistRenderOptions::default()
+        };
+        let vst3_processor = self
+            .vst3_host
+            .as_ref()
+            .map(|host| {
+                host.prepare_playlist_stream(
+                    document,
+                    options,
+                    &self.channel_vst3_instances,
+                    self.playlist_render_include_plugin_tails,
+                )
+            })
+            .transpose();
+        let vst3_processor = match vst3_processor {
+            Ok(processor) => processor,
+            Err(error) => {
+                self.status = format!("Could not prepare Playlist VST3 instruments: {error}");
+                return;
+            }
+        };
+        let project_path = self
+            .sample_project_path()
+            .unwrap_or_else(|| project_path.to_path_buf());
+        let document = document.clone();
+        let output_directory_for_worker = output_directory.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name("mixer-stem-render".to_owned())
+            .spawn(move || {
+                let result = render_playlist_mixer_stems_with_vst3_cancellable(
+                    &document,
+                    &project_path,
+                    options,
+                    &output_directory_for_worker,
+                    vst3_processor,
+                    &worker_cancelled,
+                );
+                let _ = sender.send(result);
+            });
+        match worker {
+            Ok(worker) => {
+                self.pending_song_render = Some(PendingSongRender {
+                    receiver,
+                    cancelled,
+                    worker,
+                    output_path: output_directory.clone(),
+                    kind: PendingSongRenderKind::MixerStems,
+                });
+                self.status = format!(
+                    "Rendering pre-effect Mixer insert stems into {}…",
+                    output_directory.display()
+                );
+            }
+            Err(error) => {
+                self.status = format!("Could not start Mixer stem render worker: {error}");
+            }
+        }
+    }
+
     fn poll_song_render(&mut self) {
         let completed = self.pending_song_render.as_ref().and_then(|pending| {
             match pending.receiver.try_recv() {
                 Ok(result) => Some(result),
                 Err(TryRecvError::Disconnected) => {
-                    Some(Err("Playlist render worker stopped unexpectedly".to_owned()))
+                    Some(Err("Song render worker stopped unexpectedly".to_owned()))
                 }
                 Err(TryRecvError::Empty) => None,
             }
@@ -17916,7 +18064,7 @@ impl DawUi {
             return;
         };
         if pending.worker.join().is_err() {
-            self.status = "Playlist render worker panicked".to_owned();
+            self.status = "Song render worker panicked".to_owned();
             return;
         }
         match result {
@@ -17930,22 +18078,38 @@ impl DawUi {
                         *peak_hold = insert_peak.peak().max(*peak_hold);
                     }
                 }
-                self.status = format!(
-                    "Rendered {} audio clips, {} Sampler clips ({} notes), and {} VST3 channels ({} notes) to {} at {} Hz; {} plug-in channels unloaded, {} scaled audio and {} scaled pattern clips skipped. Measured pre-effect peaks for {} Mixer inserts; effects and automation were not rendered",
-                    summary.audio_clips_rendered,
-                    summary.sampler_pattern_clips_rendered,
-                    summary.sampler_notes_rendered,
-                    summary.vst3_plugin_channels_rendered,
-                    summary.vst3_notes_rendered,
-                    pending.output_path.display(),
-                    summary.sample_rate,
-                    summary.vst3_plugin_channels_unloaded,
-                    summary.audio_clips_skipped_unsupported_scale,
-                    summary.pattern_clips_skipped_unsupported_scale,
-                    insert_peaks.len(),
-                );
+                self.status = match pending.kind {
+                    PendingSongRenderKind::Mix => format!(
+                        "Rendered {} audio clips, {} Sampler clips ({} notes), and {} VST3 channels ({} notes) to {} at {} Hz; {} plug-in channels unloaded, {} scaled audio and {} scaled pattern clips skipped. Measured pre-effect peaks for {} Mixer inserts; effects and automation were not rendered",
+                        summary.audio_clips_rendered,
+                        summary.sampler_pattern_clips_rendered,
+                        summary.sampler_notes_rendered,
+                        summary.vst3_plugin_channels_rendered,
+                        summary.vst3_notes_rendered,
+                        pending.output_path.display(),
+                        summary.sample_rate,
+                        summary.vst3_plugin_channels_unloaded,
+                        summary.audio_clips_skipped_unsupported_scale,
+                        summary.pattern_clips_skipped_unsupported_scale,
+                        insert_peaks.len(),
+                    ),
+                    PendingSongRenderKind::MixerStems => format!(
+                        "Rendered supported pre-effect Mixer insert stems into {} at {} Hz; Master, Mixer effects, and automation were not rendered",
+                        pending.output_path.display(),
+                        summary.sample_rate,
+                    ),
+                };
             }
-            Err(error) => self.status = format!("Could not render Playlist mix: {error}"),
+            Err(error) => {
+                self.status = match pending.kind {
+                    PendingSongRenderKind::Mix => {
+                        format!("Could not render Playlist mix: {error}")
+                    }
+                    PendingSongRenderKind::MixerStems => {
+                        format!("Could not render Mixer stems: {error}")
+                    }
+                }
+            }
         }
     }
 

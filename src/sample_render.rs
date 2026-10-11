@@ -1069,7 +1069,7 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
         meters,
         cancelled,
         || writer.is_cancelled(),
-        |block| {
+        |block, _meter_buses| {
             let skipped_frames = frames_to_skip.min((block.len() / 2) as u64) as usize;
             frames_to_skip -= skipped_frames as u64;
             writer.write_stereo_samples(&block[skipped_frames * 2..])
@@ -1341,7 +1341,7 @@ fn render_playlist_with_vst3_cancellable(
                 Some(&mixer_track_meters),
                 cancelled,
                 || false,
-                |block| {
+                |block, _meter_buses| {
                     bytes.clear();
                     append_wav_block_samples_with_dither(
                         block,
@@ -1374,7 +1374,7 @@ fn render_playlist_with_vst3_cancellable(
                 Some(&mixer_track_meters),
                 cancelled,
                 || false,
-                |block| encoder.write_stereo_block(block, options.wav_channel_mode),
+                |block, _meter_buses| encoder.write_stereo_block(block, options.wav_channel_mode),
             )?;
             encoder.finalize(frames)?;
         }
@@ -1397,7 +1397,7 @@ fn render_playlist_with_vst3_cancellable(
                 Some(&mixer_track_meters),
                 cancelled,
                 || false,
-                |block| encoder.write_stereo_block(block),
+                |block, _meter_buses| encoder.write_stereo_block(block),
             )?;
             encoder.finalize()?;
         }
@@ -1420,7 +1420,7 @@ fn render_playlist_with_vst3_cancellable(
                 Some(&mixer_track_meters),
                 cancelled,
                 || false,
-                |block| encoder.write_stereo_block(block),
+                |block, _meter_buses| encoder.write_stereo_block(block),
             )?;
             encoder.finalize()?;
         }
@@ -1428,6 +1428,283 @@ fn render_playlist_with_vst3_cancellable(
     summary.mixer_insert_peaks = Some(take_mixer_insert_peaks(&mixer_track_meters));
     temporary.commit(output_path)?;
     Ok(summary)
+}
+
+/// Render supported non-Master Mixer insert buses to separate WAV files.
+///
+/// The stems use the renderer's pre-effect insert buses, including supported direct routes,
+/// paired sends, insert level/pan transforms, and insert mute/solo state. Only recognized,
+/// enabled inserts routed from a project channel are written. Master output, Mixer effects, parameter
+/// automation, and effect/send-chain PDC are not included.
+pub fn render_playlist_mixer_stems_with_vst3_cancellable(
+    document: &FlpDocument,
+    project_path: impl AsRef<Path>,
+    options: PlaylistRenderOptions,
+    output_directory: impl AsRef<Path>,
+    mut vst3_processor: Option<Vst3PlaylistStreamProcessor>,
+    cancelled: &AtomicBool,
+) -> Result<PlaylistRenderSummary, String> {
+    let project_path = project_path.as_ref();
+    let output_directory = output_directory.as_ref();
+    fs::create_dir_all(output_directory).map_err(|error| {
+        format!(
+            "could not create Mixer stem folder {}: {error}",
+            output_directory.display()
+        )
+    })?;
+    if !output_directory.is_dir() {
+        return Err(format!(
+            "Mixer stem output {} is not a folder",
+            output_directory.display()
+        ));
+    }
+
+    let routing = MixerRouteAudibility::from_document(document);
+    let routed_tracks = document
+        .channels()
+        .into_iter()
+        .flat_map(|channel| {
+            routing
+                .source_route_plan_for_channel(channel.mixer_track())
+                .insert_meter_transforms
+                .into_iter()
+                .map(|(track, _transform)| track)
+        })
+        .collect::<BTreeSet<_>>();
+    let inserts = document
+        .mixer_inserts()
+        .into_iter()
+        .filter(|insert| {
+            insert.ordinal() > 0
+                && insert.enabled() != Some(false)
+                && routed_tracks.contains(&insert.ordinal())
+        })
+        .filter(|insert| insert.ordinal() < MIXER_TRACK_METER_COUNT)
+        .map(|insert| {
+            let track = insert.ordinal();
+            let name = insert.name().unwrap_or("").trim();
+            let sanitized_name = safe_stem_filename_component(name);
+            let label = if sanitized_name.is_empty() {
+                format!("Insert {track:02}")
+            } else {
+                format!("Insert {track:02} - {sanitized_name}")
+            };
+            (track, label)
+        })
+        .collect::<Vec<_>>();
+    if inserts.is_empty() {
+        return Err("project has no enabled, recognized non-Master Mixer inserts to export".into());
+    }
+
+    let master_output = MixerMasterOutput::from_document(document);
+    let audio = prepare_audio_clip_render(
+        document,
+        project_path,
+        AudioClipRenderOptions {
+            arrangement_id: options.arrangement_id,
+            sample_rate: options.sample_rate,
+            wav_sample_format: options.wav_sample_format,
+            wav_dither_mode: options.wav_dither_mode,
+            wav_channel_mode: options.wav_channel_mode,
+            resampling_quality: options.resampling_quality,
+            clip_index: None,
+            start_from_song_start: false,
+            soloed_playlist_track_range: options.soloed_playlist_track_range,
+        },
+        Some(cancelled),
+    )?;
+    let sampler = prepare_sampler_arrangement(document, project_path, options, Some(cancelled))?;
+    if audio.clips.is_empty()
+        && sampler.notes.is_empty()
+        && vst3_processor
+            .as_ref()
+            .is_none_or(|processor| processor.summary().plugin_channels_rendered == 0)
+    {
+        if let Some(processor) = vst3_processor.as_ref() {
+            let unloaded_channels = processor.summary().unloaded_plugin_channels;
+            if !unloaded_channels.is_empty() {
+                let channel_ids = unloaded_channels
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(format!(
+                    "arrangement has VST3 notes on channel(s) {channel_ids}, but no matching plug-in instance is loaded"
+                ));
+            }
+        }
+        return Err(
+            "arrangement contains no supported audio clips, Sampler notes, or loaded VST3 notes in Pattern Clips"
+                .to_owned(),
+        );
+    }
+
+    let mut content_frames = audio.summary.frames.max(sampler.summary.frames);
+    if let Some(processor) = vst3_processor.as_mut() {
+        content_frames = content_frames.max(processor.summary().frames);
+    }
+    let frames = add_render_tail_frames(content_frames, options.sample_rate, options.tail_seconds)?;
+    if let Some(processor) = vst3_processor.as_mut() {
+        processor.extend_to_output_frames(frames)?;
+    }
+    let frames_u32 =
+        u32::try_from(frames).map_err(|_| "render is too long for a RIFF/WAVE file".to_owned())?;
+    let block_align =
+        options.wav_sample_format.bytes_per_sample() * options.wav_channel_mode.channel_count();
+    let data_bytes = frames_u32
+        .checked_mul(u32::from(block_align))
+        .filter(|bytes| *bytes <= u32::MAX - 36)
+        .ok_or_else(|| "rendered WAV size exceeds the RIFF/WAVE limit".to_owned())?;
+
+    let mut outputs = inserts
+        .into_iter()
+        .map(|(track, label)| {
+            let output_path = output_directory.join(format!("{label}.wav"));
+            let mut temporary = TemporaryRenderFile::create(&output_path)?;
+            write_wav_header(
+                temporary
+                    .file
+                    .as_mut()
+                    .expect("temporary render file is open"),
+                options.sample_rate,
+                frames_u32,
+                data_bytes,
+                options.wav_sample_format,
+                options.wav_channel_mode,
+            )?;
+            Ok(MixerStemTemporaryOutput {
+                track,
+                output_path,
+                temporary,
+                peak: 0.0,
+                bytes: Vec::with_capacity(
+                    STREAM_BLOCK_FRAMES
+                        * usize::from(options.wav_channel_mode.channel_count())
+                        * usize::from(options.wav_sample_format.bytes_per_sample()),
+                ),
+                dither_state: (options.wav_dither_mode == WavDitherMode::Tpdf
+                    && options.wav_sample_format == WavSampleFormat::Pcm16)
+                    .then(TpdfDither::new),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    let mut source_paths: std::collections::BTreeSet<PathBuf> =
+        audio.decoded_by_path.keys().cloned().collect();
+    source_paths.extend(sampler.source_paths.iter().cloned());
+    let vst3_summary = vst3_processor.as_ref().map(|processor| processor.summary());
+    let mut summary = PlaylistRenderSummary {
+        frames,
+        sample_rate: options.sample_rate,
+        audio_clips_rendered: audio.summary.clips_rendered,
+        sampler_pattern_clips_rendered: sampler.pattern_clips_rendered,
+        sampler_notes_rendered: sampler.summary.notes_rendered,
+        voices_stolen: 0,
+        source_files: source_paths.len(),
+        audio_clips_skipped_unsupported_scale: audio.summary.clips_skipped_unsupported_scale,
+        pattern_clips_skipped_unsupported_scale: sampler.pattern_clips_skipped_unsupported_scale,
+        notes_skipped_unresolved_sample: sampler.summary.notes_skipped_unresolved_sample,
+        vst3_plugin_channels_rendered: vst3_summary
+            .as_ref()
+            .map_or(0, |summary| summary.plugin_channels_rendered),
+        vst3_notes_rendered: vst3_summary
+            .as_ref()
+            .map_or(0, |summary| summary.notes_scheduled),
+        vst3_plugin_channels_unloaded: vst3_summary
+            .as_ref()
+            .map_or(0, |summary| summary.unloaded_plugin_channels.len()),
+        mixer_insert_peaks: Some(Vec::new()),
+    };
+    let meters = MixerTrackPeakMeters::default();
+    summary.voices_stolen = stream_prepared_playlist_render(
+        PreparedPlaylistBlockMix {
+            audio: &audio,
+            sampler: &sampler,
+            options,
+            frames,
+            master_output,
+            vst3_processor: vst3_processor.as_mut(),
+        },
+        Some(&meters),
+        cancelled,
+        || false,
+        |block, meter_buses| {
+            let meter_buses = meter_buses
+                .ok_or_else(|| "Mixer insert buses were not prepared for stem export".to_owned())?;
+            if !block.len().is_multiple_of(2) {
+                return Err("render block must contain interleaved stereo frames".into());
+            }
+            let samples_per_track = block.len();
+            if meter_buses.len() != MIXER_TRACK_METER_COUNT.saturating_mul(samples_per_track) {
+                return Err("Mixer insert buses do not match the render block".into());
+            }
+            for output in &mut outputs {
+                let start = output.track * samples_per_track;
+                let stem_block = &meter_buses[start..start + samples_per_track];
+                output.peak = stem_block
+                    .iter()
+                    .fold(output.peak, |peak, sample| peak.max(sample.abs()));
+                output.bytes.clear();
+                append_wav_block_samples_with_dither(
+                    stem_block,
+                    options.wav_sample_format,
+                    options.wav_channel_mode,
+                    output.dither_state.as_mut(),
+                    &mut output.bytes,
+                )?;
+                output
+                    .temporary
+                    .file
+                    .as_mut()
+                    .expect("temporary Mixer stem file is open")
+                    .write_all(&output.bytes)
+                    .map_err(|error| {
+                        format!(
+                            "could not write Mixer insert {} stem: {error}",
+                            output.track
+                        )
+                    })?;
+            }
+            Ok(())
+        },
+    )?;
+    summary.mixer_insert_peaks = Some(take_mixer_insert_peaks(&meters));
+    let rendered_stems = outputs.iter().filter(|output| output.peak > 0.0).count();
+    if rendered_stems == 0 {
+        return Err("render contained no non-silent supported Mixer insert buses".into());
+    }
+    for output in outputs {
+        if output.peak > 0.0 {
+            output.temporary.commit(&output.output_path)?;
+        }
+    }
+    Ok(summary)
+}
+
+fn safe_stem_filename_component(value: &str) -> String {
+    let mut safe = String::new();
+    for character in value.chars() {
+        let character = if character.is_control() || "<>:\"/\\|?*".contains(character) {
+            '_'
+        } else {
+            character
+        };
+        if safe.len() + character.len_utf8() > 120 {
+            break;
+        }
+        safe.push(character);
+    }
+    safe.trim_matches(|character: char| character == ' ' || character == '.')
+        .to_owned()
+}
+
+struct MixerStemTemporaryOutput {
+    track: usize,
+    output_path: PathBuf,
+    temporary: TemporaryRenderFile,
+    peak: f32,
+    bytes: Vec<u8>,
+    dither_state: Option<TpdfDither>,
 }
 
 struct StreamingOggWriter<'a> {
@@ -2238,7 +2515,7 @@ fn stream_prepared_playlist_render(
     meters: Option<&MixerTrackPeakMeters>,
     cancelled: &AtomicBool,
     mut stream_cancelled: impl FnMut() -> bool,
-    mut write_block: impl FnMut(&[f32]) -> Result<(), String>,
+    mut write_block: impl FnMut(&[f32], Option<&[f32]>) -> Result<(), String>,
 ) -> Result<usize, String> {
     crate::audio::enable_denormal_protection();
     let frames = render.frames;
@@ -2353,7 +2630,7 @@ fn stream_prepared_playlist_render(
                 }
             }
             render.master_output.apply(block);
-            write_block(block)?;
+            write_block(block, meter_buses.as_deref())?;
             block_start += frame_count as u64;
         }
         Ok::<_, String>(())
@@ -5476,7 +5753,7 @@ mod tests {
             Some(&meters),
             &AtomicBool::new(false),
             || false,
-            |block| {
+            |block, _meter_buses| {
                 rendered.extend_from_slice(block);
                 Ok(())
             },
@@ -6187,6 +6464,17 @@ mod tests {
         assert_eq!(f32::from_le_bytes(bytes[48..52].try_into().unwrap()), -0.5);
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn mixer_stem_filename_components_are_safe_and_bounded() {
+        assert_eq!(
+            safe_stem_filename_component("Lead/Vox: take?"),
+            "Lead_Vox_ take_"
+        );
+        assert_eq!(safe_stem_filename_component("...   "), "");
+        let long_name = "界".repeat(80);
+        assert!(safe_stem_filename_component(&long_name).len() <= 120);
     }
 
     #[test]
