@@ -726,6 +726,8 @@ enum PianoRollSelectionCommand {
     All,
     Invert,
     Clear,
+    RandomOne,
+    RandomMore,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -12168,24 +12170,26 @@ impl DawUi {
 
     fn apply_piano_roll_selection_command(&mut self, command: PianoRollSelectionCommand) {
         let target = self.selected_pattern.zip(self.selected_note_channel);
-        let note_ids = target
-            .and_then(|(pattern_id, channel_id)| {
-                self.document.as_ref().and_then(|document| {
-                    document.patterns().ok().and_then(|patterns| {
-                        patterns
-                            .iter()
-                            .find(|pattern| pattern.id == pattern_id)
-                            .map(|pattern| {
-                                pattern
-                                    .notes
-                                    .iter()
-                                    .filter(|note| note.channel_id == channel_id)
-                                    .enumerate()
-                                    .map(|(note_index, _)| (pattern_id, channel_id, note_index))
-                                    .collect::<Vec<_>>()
-                            })
-                    })
-                })
+        let pattern = target.and_then(|(pattern_id, _)| {
+            self.document.as_ref().and_then(|document| {
+                document
+                    .patterns()
+                    .ok()?
+                    .into_iter()
+                    .find(|pattern| pattern.id == pattern_id)
+            })
+        });
+        let note_ids = pattern
+            .as_ref()
+            .zip(target)
+            .map(|(pattern, (pattern_id, channel_id))| {
+                pattern
+                    .notes
+                    .iter()
+                    .filter(|note| note.channel_id == channel_id)
+                    .enumerate()
+                    .map(|(note_index, _)| (pattern_id, channel_id, note_index))
+                    .collect::<Vec<_>>()
             })
             .unwrap_or_default();
 
@@ -12198,34 +12202,83 @@ impl DawUi {
             .copied()
             .collect::<BTreeSet<_>>();
         self.selected_piano_notes.clear();
-        match command {
-            PianoRollSelectionCommand::All => {
-                self.selected_piano_notes.extend(note_ids);
-            }
-            PianoRollSelectionCommand::Invert => {
-                self.selected_piano_notes.extend(
-                    note_ids
-                        .into_iter()
-                        .filter(|note_id| !previous.contains(note_id)),
-                );
-            }
-            PianoRollSelectionCommand::Clear => {}
-        }
+        let status =
+            match command {
+                PianoRollSelectionCommand::All => {
+                    self.selected_piano_notes.extend(note_ids);
+                    format!("Selected {} notes", self.selected_piano_notes.len())
+                }
+                PianoRollSelectionCommand::Invert => {
+                    self.selected_piano_notes.extend(
+                        note_ids
+                            .into_iter()
+                            .filter(|note_id| !previous.contains(note_id)),
+                    );
+                    format!(
+                        "Inverted selection: {} notes selected",
+                        self.selected_piano_notes.len()
+                    )
+                }
+                PianoRollSelectionCommand::Clear => "Note selection cleared".to_owned(),
+                PianoRollSelectionCommand::RandomOne | PianoRollSelectionCommand::RandomMore => {
+                    let select_more = command == PianoRollSelectionCommand::RandomMore;
+                    let selected = pattern.as_ref().zip(target).and_then(
+                        |(pattern, (pattern_id, channel_id))| {
+                            piano_roll_random_note_selection(
+                                pattern,
+                                pattern_id,
+                                channel_id,
+                                &previous,
+                                select_more,
+                                SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_nanos() as u64,
+                            )
+                        },
+                    );
+                    if let Some(selected) = selected {
+                        self.selected_piano_notes.extend(selected);
+                        if select_more {
+                            format!(
+                                "Added {} random note{} to selection",
+                                self.selected_piano_notes
+                                    .len()
+                                    .saturating_sub(previous.len()),
+                                if self
+                                    .selected_piano_notes
+                                    .len()
+                                    .saturating_sub(previous.len())
+                                    == 1
+                                {
+                                    ""
+                                } else {
+                                    "s"
+                                }
+                            )
+                        } else {
+                            format!(
+                                "Selected {} note{} at random",
+                                self.selected_piano_notes.len(),
+                                if self.selected_piano_notes.len() == 1 {
+                                    ""
+                                } else {
+                                    "s"
+                                }
+                            )
+                        }
+                    } else if select_more {
+                        self.selected_piano_notes.extend(previous.iter().copied());
+                        "No unselected notes are available".to_owned()
+                    } else {
+                        "No notes are available to select".to_owned()
+                    }
+                }
+            };
         self.selected_note = self.selected_piano_notes.iter().next_back().copied();
         self.piano_roll_selection_drag = None;
         self.active_note_drag = None;
-        self.status = match command {
-            PianoRollSelectionCommand::All => {
-                format!("Selected {} notes", self.selected_piano_notes.len())
-            }
-            PianoRollSelectionCommand::Invert => {
-                format!(
-                    "Inverted selection: {} notes selected",
-                    self.selected_piano_notes.len()
-                )
-            }
-            PianoRollSelectionCommand::Clear => "Note selection cleared".to_owned(),
-        };
+        self.status = status;
     }
 
     fn select_piano_roll_color_group(&mut self) {
@@ -12624,6 +12677,10 @@ impl DawUi {
                 ui.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::I));
             let select_color_group =
                 ui.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::C));
+            let select_one_random =
+                ui.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::R));
+            let select_more_random =
+                ui.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::M));
             change_note_color_requested =
                 ui.input_mut(|input| input.consume_key(egui::Modifiers::ALT, egui::Key::C));
             let clear_note_selection =
@@ -12652,6 +12709,10 @@ impl DawUi {
                 self.apply_piano_roll_selection_command(PianoRollSelectionCommand::Invert);
             } else if clear_note_selection {
                 self.apply_piano_roll_selection_command(PianoRollSelectionCommand::Clear);
+            } else if select_one_random {
+                self.apply_piano_roll_selection_command(PianoRollSelectionCommand::RandomOne);
+            } else if select_more_random {
+                self.apply_piano_roll_selection_command(PianoRollSelectionCommand::RandomMore);
             }
             if select_color_group {
                 self.select_piano_roll_color_group();
@@ -12721,6 +12782,22 @@ impl DawUi {
                     .count()
             })
             .unwrap_or(0);
+        let channel_note_count = self
+            .selected_pattern
+            .zip(self.selected_note_channel)
+            .and_then(|(pattern_id, channel_id)| {
+                patterns
+                    .iter()
+                    .find(|pattern| pattern.id == pattern_id)
+                    .map(|pattern| {
+                        pattern
+                            .notes
+                            .iter()
+                            .filter(|note| note.channel_id == channel_id)
+                            .count()
+                    })
+            })
+            .unwrap_or_default();
         let color_group_note_count = self
             .selected_pattern
             .zip(self.selected_note_channel)
@@ -12936,6 +13013,26 @@ impl DawUi {
                     .clicked()
                 {
                     self.select_piano_roll_color_group();
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        channel_note_count > 0,
+                        egui::Button::new("Select at random (Shift+R)"),
+                    )
+                    .clicked()
+                {
+                    self.apply_piano_roll_selection_command(PianoRollSelectionCommand::RandomOne);
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        channel_note_count > selected_quantize_indices.len(),
+                        egui::Button::new("Select more at random (Shift+M)"),
+                    )
+                    .clicked()
+                {
+                    self.apply_piano_roll_selection_command(PianoRollSelectionCommand::RandomMore);
                     ui.close();
                 }
                 if ui.button("Invert selection (Shift+I)").clicked() {
@@ -21017,6 +21114,58 @@ fn piano_roll_note_group_members(
         .collect()
 }
 
+fn piano_roll_random_note_selection(
+    pattern: &Pattern,
+    pattern_id: u16,
+    channel_id: u16,
+    selected: &BTreeSet<(u16, u16, usize)>,
+    select_more: bool,
+    seed: u64,
+) -> Option<BTreeSet<(u16, u16, usize)>> {
+    let mut groups = BTreeMap::<(u16, usize), Vec<(u16, u16, usize)>>::new();
+    for (note_index, note) in pattern
+        .notes
+        .iter()
+        .filter(|note| note.channel_id == channel_id)
+        .enumerate()
+    {
+        let group_key = if note.group == 0 {
+            (0, note_index)
+        } else {
+            (note.group, 0)
+        };
+        groups
+            .entry(group_key)
+            .or_default()
+            .push((pattern_id, channel_id, note_index));
+    }
+
+    let candidates = groups
+        .into_values()
+        .filter(|members| !select_more || members.iter().all(|member| !selected.contains(member)))
+        .collect::<Vec<_>>();
+    let group_index = piano_roll_random_index(candidates.len(), seed)?;
+    let mut result = if select_more {
+        selected.clone()
+    } else {
+        BTreeSet::new()
+    };
+    result.extend(candidates[group_index].iter().copied());
+    Some(result)
+}
+
+fn piano_roll_random_index(length: usize, seed: u64) -> Option<usize> {
+    if length == 0 {
+        return None;
+    }
+
+    let mut value = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^= value >> 31;
+    Some((value % length as u64) as usize)
+}
+
 fn piano_roll_color_group_note_ids(
     pattern: &Pattern,
     pattern_id: u16,
@@ -23375,9 +23524,10 @@ mod tests {
         encode_midi_device_selections, first_available_playlist_track, next_piano_roll_note_group,
         note_from_grid_position, parse_midi_device_selections, piano_roll_color_group_note_ids,
         piano_roll_controller_value_at, piano_roll_controller_value_range,
-        piano_roll_note_group_members, playlist_audio_clip_join_candidates, playlist_bar_ticks,
-        playlist_clip_drag_edit, playlist_clip_local_recording_offset,
-        playlist_clip_split_position, playlist_group_parent_ids, playlist_measure_boundaries,
+        piano_roll_note_group_members, piano_roll_random_note_selection,
+        playlist_audio_clip_join_candidates, playlist_bar_ticks, playlist_clip_drag_edit,
+        playlist_clip_local_recording_offset, playlist_clip_split_position,
+        playlist_group_parent_ids, playlist_measure_boundaries,
         playlist_pattern_clip_join_candidates, playlist_seek_tick_to_frame,
         playlist_signature_at_tick, playlist_song_position_label, playlist_track_group_range,
         playlist_track_is_hidden, recolor_piano_roll_notes, snap_note_tick,
@@ -24293,6 +24443,51 @@ mod tests {
         };
         assert_eq!(next_piano_roll_note_group(&occupied, 2), Some(2));
         assert_eq!(next_piano_roll_note_group(&pattern, 3), Some(1));
+    }
+
+    #[test]
+    fn piano_roll_random_selection_respects_channel_and_note_groups() {
+        let pattern = Pattern {
+            id: 7,
+            notes: vec![
+                PatternNote {
+                    channel_id: 2,
+                    group: 9,
+                    ..PatternNote::default()
+                },
+                PatternNote {
+                    channel_id: 3,
+                    group: 9,
+                    ..PatternNote::default()
+                },
+                PatternNote {
+                    channel_id: 2,
+                    group: 9,
+                    ..PatternNote::default()
+                },
+                PatternNote {
+                    channel_id: 2,
+                    ..PatternNote::default()
+                },
+            ],
+            ..Pattern::default()
+        };
+        let empty = BTreeSet::new();
+        let first = piano_roll_random_note_selection(&pattern, 7, 2, &empty, false, 11)
+            .expect("the target channel has selectable notes");
+        assert!(
+            first == BTreeSet::from([(7, 2, 0), (7, 2, 1)]) || first == BTreeSet::from([(7, 2, 2)])
+        );
+        assert_eq!(
+            piano_roll_random_note_selection(&pattern, 7, 2, &empty, false, 11),
+            Some(first.clone())
+        );
+
+        let more = piano_roll_random_note_selection(&pattern, 7, 2, &first, true, 13)
+            .expect("another target-channel group remains");
+        assert_eq!(more, BTreeSet::from([(7, 2, 0), (7, 2, 1), (7, 2, 2)]));
+        assert!(piano_roll_random_note_selection(&pattern, 7, 2, &more, true, 17).is_none());
+        assert!(piano_roll_random_note_selection(&pattern, 7, 4, &empty, false, 11).is_none());
     }
 
     #[test]
