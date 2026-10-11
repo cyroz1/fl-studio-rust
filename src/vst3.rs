@@ -20,7 +20,7 @@ use crate::sample_render::{
 };
 use crate::{
     ChannelNoteRouter, ChannelPluginState, FlpDocument, MixerInsertSignalTransform,
-    MixerRouteAudibility,
+    MixerRouteAudibility, MixerSourceRouteTransform,
 };
 use vst3_host::audio::AudioBuffers;
 use vst3_host::midi::{MidiChannel, MidiEvent};
@@ -199,7 +199,8 @@ struct PlaylistPluginStream {
     gain: f32,
     left_pan_gain: f32,
     right_pan_gain: f32,
-    mixer_transform: MixerInsertSignalTransform,
+    mixer_transform: MixerSourceRouteTransform,
+    mixer_meter_transform: MixerInsertSignalTransform,
     mixer_meter_track: Option<usize>,
 }
 
@@ -344,6 +345,8 @@ impl Vst3PlaylistStreamProcessor {
                     frame[0] * stream.gain * stream.left_pan_gain,
                     frame[1] * stream.gain * stream.right_pan_gain,
                 ];
+                let mut meter_frame = routed_frame;
+                stream.mixer_meter_transform.apply_frame(&mut meter_frame);
                 stream.mixer_transform.apply_frame(&mut routed_frame);
                 output[frame_index * 2] += routed_frame[0];
                 output[frame_index * 2 + 1] += routed_frame[1];
@@ -351,8 +354,8 @@ impl Vst3PlaylistStreamProcessor {
                     (stream.mixer_meter_track, meter_buses.as_deref_mut())
                 {
                     let meter_offset = track * output.len() + frame_index * 2;
-                    meter_buses[meter_offset] += routed_frame[0];
-                    meter_buses[meter_offset + 1] += routed_frame[1];
+                    meter_buses[meter_offset] += meter_frame[0];
+                    meter_buses[meter_offset + 1] += meter_frame[1];
                 }
             }
         }
@@ -1418,6 +1421,11 @@ impl Vst3HostRuntime {
                 channel.and_then(|channel| channel.pan()),
             );
             let mixer_transform = channel
+                .map(|channel| {
+                    mixer_route_audibility.source_route_transform_for_channel(channel.mixer_track())
+                })
+                .unwrap_or_default();
+            let mixer_meter_transform = channel
                 .map(|channel| mixer_route_audibility.transform_for_channel(channel.mixer_track()))
                 .unwrap_or_default();
             let mixer_meter_track = channel.and_then(|channel| {
@@ -1475,6 +1483,7 @@ impl Vst3HostRuntime {
                 left_pan_gain,
                 right_pan_gain,
                 mixer_transform,
+                mixer_meter_transform,
                 mixer_meter_track,
             });
         }

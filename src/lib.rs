@@ -1861,9 +1861,17 @@ pub(crate) struct MixerRouteAudibility {
     disabled_tracks: HashSet<i8>,
     soloed_insert_tracks: HashSet<i8>,
     source_transforms: HashMap<i8, MixerInsertSignalTransform>,
+    send_routes_by_source: HashMap<i8, Vec<MixerSendRouteEdge>>,
+    complete_send_sources: HashSet<i8>,
     master_fader_raw: Option<i32>,
     master_pan_raw: Option<i32>,
     master_stereo_separation_raw: Option<i32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MixerSendRouteEdge {
+    destination_track: i8,
+    level_raw: i32,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1874,6 +1882,61 @@ pub(crate) struct MixerInsertSignalTransform {
     mixer_pan_raw: Option<i32>,
     stereo_separation_raw: Option<i32>,
     mixer_pan_law_raw: Option<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct MixerSourceRouteTransform {
+    matrix: [f32; 4],
+}
+
+impl Default for MixerSourceRouteTransform {
+    fn default() -> Self {
+        Self {
+            matrix: [1.0, 0.0, 0.0, 1.0],
+        }
+    }
+}
+
+impl MixerSourceRouteTransform {
+    const fn zero() -> Self {
+        Self { matrix: [0.0; 4] }
+    }
+
+    pub(crate) fn from_insert_transform(transform: MixerInsertSignalTransform) -> Self {
+        let mut left_basis = [1.0, 0.0];
+        let mut right_basis = [0.0, 1.0];
+        transform.apply_frame(&mut left_basis);
+        transform.apply_frame(&mut right_basis);
+        Self {
+            matrix: [left_basis[0], right_basis[0], left_basis[1], right_basis[1]],
+        }
+    }
+
+    fn then(self, next: Self) -> Self {
+        let [a, b, c, d] = self.matrix;
+        let [e, f, g, h] = next.matrix;
+        Self {
+            matrix: [e * a + f * c, e * b + f * d, g * a + h * c, g * b + h * d],
+        }
+    }
+
+    fn scaled(self, gain: f32) -> Self {
+        Self {
+            matrix: self.matrix.map(|value| value * gain),
+        }
+    }
+
+    fn add(&mut self, other: Self) {
+        for (value, addition) in self.matrix.iter_mut().zip(other.matrix) {
+            *value += addition;
+        }
+    }
+
+    pub(crate) fn apply_frame(self, frame: &mut [f32; 2]) {
+        let input = *frame;
+        frame[0] = self.matrix[0] * input[0] + self.matrix[1] * input[1];
+        frame[1] = self.matrix[2] * input[0] + self.matrix[3] * input[1];
+    }
 }
 
 impl MixerInsertSignalTransform {
@@ -1933,11 +1996,63 @@ impl MixerInsertSignalTransform {
 impl MixerRouteAudibility {
     pub(crate) fn from_document(document: &FlpDocument) -> Self {
         let parameters = document.mixer_parameter_records().unwrap_or_default();
-        Self::from_inserts_with_parameters(
+        let mut routing = Self::from_inserts_with_parameters(
             document.mixer_inserts(),
             &parameters,
             document.metadata().pan_law_raw(),
-        )
+        );
+        routing.add_send_summaries(document.mixer_send_summaries().unwrap_or_default());
+        routing
+    }
+
+    fn add_send_summaries(&mut self, sends: impl IntoIterator<Item = MixerSendSummary>) {
+        let mut source_validity = HashMap::<i8, bool>::new();
+        for send in sends {
+            let Ok(source_track) = i8::try_from(send.insert_ordinal()) else {
+                continue;
+            };
+            if !self.known_tracks.contains(&source_track) {
+                continue;
+            }
+            let valid = source_validity.entry(source_track).or_insert(true);
+            let Some(enabled) = send.enabled() else {
+                *valid = false;
+                continue;
+            };
+            if !enabled {
+                continue;
+            }
+            let Some(destination_ordinal) = send.route_parameter_id().checked_sub(64) else {
+                *valid = false;
+                continue;
+            };
+            let Ok(destination_track) = i8::try_from(destination_ordinal) else {
+                *valid = false;
+                continue;
+            };
+            if !self.known_tracks.contains(&destination_track)
+                || mixer_send_gain_raw(send.value()).is_none()
+            {
+                *valid = false;
+                continue;
+            }
+            if send.value() > 0 {
+                self.send_routes_by_source
+                    .entry(source_track)
+                    .or_default()
+                    .push(MixerSendRouteEdge {
+                        destination_track,
+                        level_raw: send.value(),
+                    });
+            }
+        }
+        for (source_track, valid) in source_validity {
+            if valid {
+                self.complete_send_sources.insert(source_track);
+            } else {
+                self.send_routes_by_source.remove(&source_track);
+            }
+        }
     }
 
     fn from_inserts_with_parameters(
@@ -1999,7 +2114,38 @@ impl MixerRouteAudibility {
         if self.disabled_tracks.contains(&track) {
             return false;
         }
-        self.soloed_insert_tracks.is_empty() || self.soloed_insert_tracks.contains(&track)
+        if self.soloed_insert_tracks.is_empty() {
+            return true;
+        }
+        if track == 0 {
+            return false;
+        }
+        if self.complete_send_sources.contains(&track) {
+            self.route_can_reach_soloed_insert(track, &mut HashSet::new())
+        } else {
+            self.soloed_insert_tracks.contains(&track)
+        }
+    }
+
+    fn route_can_reach_soloed_insert(&self, track: i8, visited: &mut HashSet<i8>) -> bool {
+        if self.disabled_tracks.contains(&track) || !visited.insert(track) {
+            return false;
+        }
+        if self.soloed_insert_tracks.contains(&track) {
+            visited.remove(&track);
+            return true;
+        }
+        let reaches_solo = self
+            .send_routes_by_source
+            .get(&track)
+            .into_iter()
+            .flatten()
+            .any(|route| {
+                mixer_send_gain_raw(route.level_raw).unwrap_or_default() > 0.0
+                    && self.route_can_reach_soloed_insert(route.destination_track, visited)
+            });
+        visited.remove(&track);
+        reaches_solo
     }
 
     /// Returns a visible insert ordinal only when the channel has a recognized direct route.
@@ -2020,6 +2166,80 @@ impl MixerRouteAudibility {
             .unwrap_or_default()
     }
 
+    /// Returns the pre-Master transform for all supported insert-to-insert send paths.
+    /// The final Master transform remains applied once after sources are summed.
+    pub(crate) fn source_route_transform_for_channel(
+        &self,
+        route: Option<i8>,
+    ) -> MixerSourceRouteTransform {
+        let Some(track) = route.filter(|track| *track > 0 && self.known_tracks.contains(track))
+        else {
+            return MixerSourceRouteTransform::default();
+        };
+        if !self.complete_send_sources.contains(&track) {
+            return MixerSourceRouteTransform::from_insert_transform(
+                self.transform_for_channel(Some(track)),
+            );
+        }
+
+        let mut output = MixerSourceRouteTransform::zero();
+        self.accumulate_send_paths(
+            track,
+            MixerSourceRouteTransform::default(),
+            &mut HashSet::new(),
+            false,
+            &mut output,
+        );
+        output
+    }
+
+    fn accumulate_send_paths(
+        &self,
+        track: i8,
+        path: MixerSourceRouteTransform,
+        visited: &mut HashSet<i8>,
+        reached_solo: bool,
+        output: &mut MixerSourceRouteTransform,
+    ) {
+        if track == 0 {
+            if self.soloed_insert_tracks.is_empty() || reached_solo {
+                output.add(path);
+            }
+            return;
+        }
+        if self.disabled_tracks.contains(&track) || !visited.insert(track) {
+            return;
+        }
+
+        let reached_solo = reached_solo || self.soloed_insert_tracks.contains(&track);
+        let track_transform = self
+            .source_transforms
+            .get(&track)
+            .copied()
+            .unwrap_or_default();
+        let path = path.then(MixerSourceRouteTransform::from_insert_transform(
+            track_transform,
+        ));
+        if self.complete_send_sources.contains(&track) {
+            if let Some(routes) = self.send_routes_by_source.get(&track) {
+                for route in routes {
+                    let gain = mixer_send_gain_raw(route.level_raw).unwrap_or_default();
+                    self.accumulate_send_paths(
+                        route.destination_track,
+                        path.scaled(gain),
+                        visited,
+                        reached_solo,
+                        output,
+                    );
+                }
+            }
+        } else if self.soloed_insert_tracks.is_empty() || reached_solo {
+            // Rows without a complete routing map retain FL Studio's default Master path.
+            output.add(path);
+        }
+        visited.remove(&track);
+    }
+
     pub(crate) fn master_fader_raw(&self) -> Option<i32> {
         self.master_fader_raw
     }
@@ -2031,6 +2251,12 @@ impl MixerRouteAudibility {
     pub(crate) fn master_stereo_separation_raw(&self) -> Option<i32> {
         self.master_stereo_separation_raw
     }
+}
+
+fn mixer_send_gain_raw(value: i32) -> Option<f32> {
+    (0..=16_000)
+        .contains(&value)
+        .then_some(value as f32 / 12_800.0)
 }
 
 fn candidate_mixer_fader_volume(
@@ -13559,12 +13785,13 @@ mod tests {
         ChannelSortOrder, ChannelSummary, ClawMachineOptions, FlpDocument, FlpError, FlpEvent,
         FstPreset, FstPresetKind, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit,
         MixerInsertSummary, MixerParameterKind, MixerParameterRecord, MixerRouteAudibility,
-        PATTERN_NOTE_DEFAULT_FLAGS, PATTERN_NOTE_SLIDE_FLAG, PLAYLIST_CLIP_MUTED_FLAG,
-        PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation, PayloadEncoding,
-        PlaylistClipEdit, PlaylistClipTarget, PlaylistTrackEdit, ProjectInfoEdit,
-        ProjectSettingsEdit, RiffMachineOptions, RiffMachineQuantizeMode, ScaleLevelsOptions,
-        TimeMarkerEdit, apply_mixer_pan, apply_mixer_stereo_separation, midi::MidiChannelMapping,
-        midi::MidiFile, parse_vst_plugin_state_metadata, riff_machine_groove_note_timing,
+        MixerSendSummary, PATTERN_NOTE_DEFAULT_FLAGS, PATTERN_NOTE_SLIDE_FLAG,
+        PLAYLIST_CLIP_MUTED_FLAG, PatternControllerEdit, PatternNote, PatternNoteEdit,
+        PatternNoteRotation, PayloadEncoding, PlaylistClipEdit, PlaylistClipTarget,
+        PlaylistTrackEdit, ProjectInfoEdit, ProjectSettingsEdit, RiffMachineOptions,
+        RiffMachineQuantizeMode, ScaleLevelsOptions, TimeMarkerEdit, apply_mixer_pan,
+        apply_mixer_stereo_separation, midi::MidiChannelMapping, midi::MidiFile,
+        parse_vst_plugin_state_metadata, riff_machine_groove_note_timing,
     };
 
     fn articulate_options(
@@ -16460,6 +16687,67 @@ mod tests {
         );
         assert!(master_solo.allows_channel(None));
         assert!(master_solo.allows_channel(Some(1)));
+    }
+
+    #[test]
+    fn mixer_send_audio_paths_combine_post_fader_routes_and_solo_inputs() {
+        let insert = |ordinal, flags| MixerInsertSummary {
+            ordinal,
+            input_raw: -1,
+            output_raw: -1,
+            color_raw: 0,
+            icon_raw: None,
+            name: None,
+            flags: Some(flags),
+            flags_event_index: None,
+            first_event_index: 0,
+            end_event_index: 0,
+        };
+        let send =
+            |source_track: usize, destination_track: u8, level_raw, enabled| MixerSendSummary {
+                insert_ordinal: source_track,
+                route_parameter_id: 64 + destination_track,
+                value: level_raw,
+                enabled: Some(enabled),
+                routing_flag_location: None,
+                event_index: 0,
+                record_index: 0,
+            };
+        let enabled = 1 << 3;
+        let mut routing = MixerRouteAudibility::from_inserts_with_parameters(
+            [insert(0, enabled), insert(1, enabled), insert(2, enabled)],
+            &[],
+            None,
+        );
+        routing.add_send_summaries([
+            send(1, 0, 12_800, true),
+            send(1, 2, 6_400, true),
+            send(2, 0, 12_800, true),
+        ]);
+
+        let mut frame = [1.0, -0.5];
+        routing
+            .source_route_transform_for_channel(Some(1))
+            .apply_frame(&mut frame);
+        assert_eq!(frame, [1.5, -0.75]);
+
+        let mut solo_routing = MixerRouteAudibility::from_inserts_with_parameters(
+            [
+                insert(0, enabled),
+                insert(1, enabled),
+                insert(2, enabled | (1 << 12)),
+            ],
+            &[],
+            None,
+        );
+        solo_routing.add_send_summaries([send(1, 2, 12_800, true), send(2, 0, 12_800, true)]);
+        assert!(solo_routing.allows_channel(Some(1)));
+        let mut solo_frame = [0.25, 0.5];
+        solo_routing
+            .source_route_transform_for_channel(Some(1))
+            .apply_frame(&mut solo_frame);
+        assert_eq!(solo_frame, [0.25, 0.5]);
+        assert!(!solo_routing.allows_channel(None));
     }
 
     #[test]

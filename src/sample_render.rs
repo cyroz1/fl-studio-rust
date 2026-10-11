@@ -29,7 +29,7 @@ use crate::media::{DecodedAudio, SamplePathResolver, decode_audio_file, wav_samp
 use crate::vst3::Vst3PlaylistStreamProcessor;
 use crate::{
     Arrangement, ChannelNoteRouter, FlpDocument, MixerInsertSignalTransform, MixerRouteAudibility,
-    Pattern, PatternNote, PlaylistClip, PlaylistClipTarget,
+    MixerSourceRouteTransform, Pattern, PatternNote, PlaylistClip, PlaylistClipTarget,
 };
 
 const DEFAULT_SAMPLE_RATE: u32 = 44_100;
@@ -2218,6 +2218,8 @@ fn stream_prepared_playlist_render(
         render.sampler.pan_law,
     );
     sampler_engine.mixer_transforms_by_channel = Some(&render.sampler.mixer_transforms_by_channel);
+    sampler_engine.mixer_meter_transforms_by_channel =
+        Some(&render.sampler.mixer_meter_transforms_by_channel);
     sampler_engine.mixer_meter_tracks_by_channel =
         Some(&render.sampler.mixer_meter_tracks_by_channel);
     let mut output = vec![0.0f32; STREAM_BLOCK_FRAMES * 2];
@@ -2676,6 +2678,7 @@ fn prepare_audio_clip_render(
         PathBuf,
         f32,
         f32,
+        MixerSourceRouteTransform,
         MixerInsertSignalTransform,
         Option<usize>,
     )>::new();
@@ -2728,6 +2731,7 @@ fn prepare_audio_clip_render(
             resolved_path,
             gain,
             pan,
+            mixer_route_audibility.source_route_transform_for_channel(channel.mixer_track()),
             mixer_route_audibility.transform_for_channel(channel.mixer_track()),
             mixer_route_audibility.direct_meter_track(channel.mixer_track()),
         ));
@@ -2750,7 +2754,7 @@ fn prepare_audio_clip_render(
     )?;
     let mut decoded_by_path = HashMap::<PathBuf, DecodedAudio>::new();
     let mut cached_source_bytes = 0usize;
-    for (_, _, _, path, _, _, _, _) in &candidate_clips {
+    for (_, _, _, path, _, _, _, _, _) in &candidate_clips {
         check_cancelled(cancelled)?;
         if decoded_by_path.contains_key(path) {
             continue;
@@ -2771,8 +2775,17 @@ fn prepare_audio_clip_render(
 
     let mut clips = Vec::with_capacity(candidate_clips.len());
     let mut output_frames = timeline_frames;
-    for (clip_index, clip, channel_id, path, gain, pan, mixer_transform, mixer_meter_track) in
-        &candidate_clips
+    for (
+        clip_index,
+        clip,
+        channel_id,
+        path,
+        gain,
+        pan,
+        mixer_transform,
+        mixer_meter_transform,
+        mixer_meter_track,
+    ) in &candidate_clips
     {
         check_cancelled(cancelled)?;
         let audio = decoded_by_path
@@ -2822,6 +2835,7 @@ fn prepare_audio_clip_render(
             pan: *pan,
             pan_law,
             mixer_transform: *mixer_transform,
+            mixer_meter_transform: *mixer_meter_transform,
             mixer_meter_track: *mixer_meter_track,
         });
     }
@@ -3068,7 +3082,8 @@ struct PreparedSamplerArrangement {
     pan_law: PanLaw,
     notes: Vec<ScheduledSamplerNote>,
     sources_by_channel: HashMap<u16, SamplerVoiceSource>,
-    mixer_transforms_by_channel: HashMap<u16, MixerInsertSignalTransform>,
+    mixer_transforms_by_channel: HashMap<u16, MixerSourceRouteTransform>,
+    mixer_meter_transforms_by_channel: HashMap<u16, MixerInsertSignalTransform>,
     mixer_meter_tracks_by_channel: HashMap<u16, Option<usize>>,
     pattern_clips_rendered: usize,
     pattern_clips_skipped_unsupported_scale: usize,
@@ -3169,6 +3184,7 @@ fn prepare_sampler_arrangement(
             notes: Vec::new(),
             sources_by_channel: HashMap::new(),
             mixer_transforms_by_channel: HashMap::new(),
+            mixer_meter_transforms_by_channel: HashMap::new(),
             mixer_meter_tracks_by_channel: HashMap::new(),
             pattern_clips_rendered: 0,
             pattern_clips_skipped_unsupported_scale: schedule.clips_skipped_unsupported_scale,
@@ -3179,7 +3195,8 @@ fn prepare_sampler_arrangement(
     let resolver = SamplePathResolver::new(project_path);
     let mut decoded_by_path = HashMap::<PathBuf, Arc<DecodedAudio>>::new();
     let mut sources_by_channel = HashMap::<u16, SamplerVoiceSource>::new();
-    let mut mixer_transforms_by_channel = HashMap::<u16, MixerInsertSignalTransform>::new();
+    let mut mixer_transforms_by_channel = HashMap::<u16, MixerSourceRouteTransform>::new();
+    let mut mixer_meter_transforms_by_channel = HashMap::<u16, MixerInsertSignalTransform>::new();
     let mut mixer_meter_tracks_by_channel = HashMap::<u16, Option<usize>>::new();
     let mut unresolved_sample_channels = std::collections::BTreeSet::new();
     let mut notes = Vec::with_capacity(sampler_note_count);
@@ -3270,6 +3287,10 @@ fn prepare_sampler_arrangement(
             });
             mixer_transforms_by_channel.insert(
                 placed.target_channel_id,
+                mixer_route_audibility.source_route_transform_for_channel(channel.mixer_track()),
+            );
+            mixer_meter_transforms_by_channel.insert(
+                placed.target_channel_id,
                 mixer_route_audibility.transform_for_channel(channel.mixer_track()),
             );
             mixer_meter_tracks_by_channel.insert(
@@ -3351,6 +3372,7 @@ fn prepare_sampler_arrangement(
         notes,
         sources_by_channel,
         mixer_transforms_by_channel,
+        mixer_meter_transforms_by_channel,
         mixer_meter_tracks_by_channel,
         pattern_clips_rendered: rendered_pattern_clip_indices.len(),
         pattern_clips_skipped_unsupported_scale: schedule.clips_skipped_unsupported_scale,
@@ -3363,7 +3385,7 @@ struct PreparedSamplerPattern {
     pan_law: PanLaw,
     notes: Vec<ScheduledSamplerNote>,
     sources_by_channel: HashMap<u16, SamplerVoiceSource>,
-    mixer_transforms_by_channel: HashMap<u16, MixerInsertSignalTransform>,
+    mixer_transforms_by_channel: HashMap<u16, MixerSourceRouteTransform>,
     master_output: MixerMasterOutput,
     voice_limit: usize,
     resampling_quality: ResamplingQuality,
@@ -3467,7 +3489,7 @@ fn prepare_sampler_pattern(
     let resolver = SamplePathResolver::new(project_path);
     let mut decoded_by_path = HashMap::<PathBuf, Arc<DecodedAudio>>::new();
     let mut sources_by_channel = HashMap::<u16, SamplerVoiceSource>::new();
-    let mut mixer_transforms_by_channel = HashMap::<u16, MixerInsertSignalTransform>::new();
+    let mut mixer_transforms_by_channel = HashMap::<u16, MixerSourceRouteTransform>::new();
     let mut unresolved_sample_channels = std::collections::BTreeSet::new();
     let mut notes = Vec::with_capacity(sampler_note_count);
     let mut skipped_unresolved = 0usize;
@@ -3555,7 +3577,7 @@ fn prepare_sampler_pattern(
             });
             mixer_transforms_by_channel.insert(
                 target_channel_id,
-                mixer_route_audibility.transform_for_channel(channel.mixer_track()),
+                mixer_route_audibility.source_route_transform_for_channel(channel.mixer_track()),
             );
         }
         let Some(source) = sources_by_channel.get(&target_channel_id) else {
@@ -3668,7 +3690,8 @@ fn prepare_sampler_pattern(
 struct SamplerVoiceEngine<'a> {
     sources_by_channel: &'a HashMap<u16, SamplerVoiceSource>,
     notes: &'a [ScheduledSamplerNote],
-    mixer_transforms_by_channel: Option<&'a HashMap<u16, MixerInsertSignalTransform>>,
+    mixer_transforms_by_channel: Option<&'a HashMap<u16, MixerSourceRouteTransform>>,
+    mixer_meter_transforms_by_channel: Option<&'a HashMap<u16, MixerInsertSignalTransform>>,
     mixer_meter_tracks_by_channel: Option<&'a HashMap<u16, Option<usize>>>,
     pan_law: PanLaw,
     next_note: usize,
@@ -3690,7 +3713,8 @@ struct SamplerVoice {
     gain: f32,
     left_gain: f32,
     right_gain: f32,
-    mixer_transform: MixerInsertSignalTransform,
+    mixer_transform: MixerSourceRouteTransform,
+    mixer_meter_transform: MixerInsertSignalTransform,
     mixer_meter_track: Option<usize>,
     release_remaining: Option<usize>,
 }
@@ -3728,6 +3752,7 @@ impl<'a> SamplerVoiceEngine<'a> {
             sources_by_channel,
             notes,
             mixer_transforms_by_channel: None,
+            mixer_meter_transforms_by_channel: None,
             mixer_meter_tracks_by_channel: None,
             pan_law,
             next_note: 0,
@@ -3809,6 +3834,8 @@ impl<'a> SamplerVoiceEngine<'a> {
                     left * gain * voice.left_gain,
                     right * gain * voice.right_gain,
                 ];
+                let mut meter_frame = routed_frame;
+                voice.mixer_meter_transform.apply_frame(&mut meter_frame);
                 voice.mixer_transform.apply_frame(&mut routed_frame);
                 output_frame[0] += routed_frame[0];
                 output_frame[1] += routed_frame[1];
@@ -3816,8 +3843,8 @@ impl<'a> SamplerVoiceEngine<'a> {
                     (voice.mixer_meter_track, meter_buses.as_deref_mut())
                 {
                     let meter_offset = track * meter_stride_samples + offset * 2;
-                    meter_buses[meter_offset] += routed_frame[0];
-                    meter_buses[meter_offset + 1] += routed_frame[1];
+                    meter_buses[meter_offset] += meter_frame[0];
+                    meter_buses[meter_offset + 1] += meter_frame[1];
                 }
                 advance_sampler_voice_position(voice);
                 if let Some(remaining) = voice.release_remaining.as_mut() {
@@ -3878,6 +3905,10 @@ impl<'a> SamplerVoiceEngine<'a> {
             .mixer_transforms_by_channel
             .and_then(|transforms| transforms.get(&note.channel_id).copied())
             .unwrap_or_default();
+        let mixer_meter_transform = self
+            .mixer_meter_transforms_by_channel
+            .and_then(|transforms| transforms.get(&note.channel_id).copied())
+            .unwrap_or_default();
         let mixer_meter_track = self
             .mixer_meter_tracks_by_channel
             .and_then(|tracks| tracks.get(&note.channel_id).copied().flatten());
@@ -3897,6 +3928,7 @@ impl<'a> SamplerVoiceEngine<'a> {
             left_gain,
             right_gain,
             mixer_transform,
+            mixer_meter_transform,
             mixer_meter_track,
             release_remaining: None,
         });
@@ -4124,7 +4156,8 @@ struct PreparedClip {
     gain: f32,
     pan: f32,
     pan_law: PanLaw,
-    mixer_transform: MixerInsertSignalTransform,
+    mixer_transform: MixerSourceRouteTransform,
+    mixer_meter_transform: MixerInsertSignalTransform,
     mixer_meter_track: Option<usize>,
 }
 
@@ -4361,12 +4394,14 @@ fn mix_clip_window_into_stereo_with_quality_and_meter(
             left * clip.gain * left_pan_gain,
             right * clip.gain * right_pan_gain,
         ];
+        let mut meter_frame = frame;
+        clip.mixer_meter_transform.apply_frame(&mut meter_frame);
         clip.mixer_transform.apply_frame(&mut frame);
         mix[output_index] += frame[0];
         mix[output_index + 1] += frame[1];
         if let Some(meter_bus) = meter_bus.as_deref_mut() {
-            meter_bus[output_index] += frame[0];
-            meter_bus[output_index + 1] += frame[1];
+            meter_bus[output_index] += meter_frame[0];
+            meter_bus[output_index + 1] += meter_frame[1];
         }
     }
     Ok(())
@@ -5325,7 +5360,8 @@ mod tests {
                 gain: 0.5,
                 pan: 0.0,
                 pan_law: PanLaw::Circular,
-                mixer_transform: MixerInsertSignalTransform::default(),
+                mixer_transform: MixerSourceRouteTransform::default(),
+                mixer_meter_transform: MixerInsertSignalTransform::default(),
                 mixer_meter_track: Some(1),
             }],
         };
@@ -5365,6 +5401,7 @@ mod tests {
                 },
             )]),
             mixer_transforms_by_channel: HashMap::new(),
+            mixer_meter_transforms_by_channel: HashMap::new(),
             mixer_meter_tracks_by_channel: HashMap::from([(2, Some(1))]),
             pattern_clips_rendered: 1,
             pattern_clips_skipped_unsupported_scale: 0,
@@ -5458,7 +5495,8 @@ mod tests {
             gain: 1.0,
             pan: 0.0,
             pan_law: PanLaw::Circular,
-            mixer_transform: MixerInsertSignalTransform::default(),
+            mixer_transform: MixerSourceRouteTransform::default(),
+            mixer_meter_transform: MixerInsertSignalTransform::default(),
             mixer_meter_track: None,
         };
         let mut mix = vec![0.0; 8];
@@ -5495,7 +5533,10 @@ mod tests {
             gain: 1.0,
             pan: 0.0,
             pan_law: PanLaw::Circular,
-            mixer_transform: MixerInsertSignalTransform::new(true, true),
+            mixer_transform: MixerSourceRouteTransform::from_insert_transform(
+                MixerInsertSignalTransform::new(true, true),
+            ),
+            mixer_meter_transform: MixerInsertSignalTransform::default(),
             mixer_meter_track: None,
         };
         let mut mix = vec![0.0; 2];
@@ -5525,7 +5566,8 @@ mod tests {
             gain: 0.5,
             pan: 0.5,
             pan_law: PanLaw::Circular,
-            mixer_transform: MixerInsertSignalTransform::default(),
+            mixer_transform: MixerSourceRouteTransform::default(),
+            mixer_meter_transform: MixerInsertSignalTransform::default(),
             mixer_meter_track: None,
         };
         let render = PreparedAudioClipRender {
@@ -5660,7 +5702,12 @@ mod tests {
                 ping_pong_loop: false,
             },
         )]);
-        let transforms = HashMap::from([(7, MixerInsertSignalTransform::new(true, false))]);
+        let transforms = HashMap::from([(
+            7,
+            MixerSourceRouteTransform::from_insert_transform(MixerInsertSignalTransform::new(
+                true, false,
+            )),
+        )]);
         let notes = [ScheduledSamplerNote {
             start_frame: 0,
             stop_frame: None,
