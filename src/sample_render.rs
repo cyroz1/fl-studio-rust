@@ -685,6 +685,8 @@ pub struct PlaylistRenderSummary {
     pub vst3_plugin_channels_unloaded: usize,
     /// Whether a non-silent Master stem was written by a Mixer stem render.
     pub mixer_master_stem_rendered: bool,
+    /// Whether a non-silent Current Mixer track stem was written by a Mixer stem render.
+    pub mixer_current_stem_rendered: bool,
     /// Non-zero supported insert peaks from a full-song offline render; `None` for live streams.
     pub mixer_insert_peaks: Option<Vec<MixerInsertPeak>>,
 }
@@ -1056,6 +1058,7 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
             .as_ref()
             .map_or(0, |summary| summary.unloaded_plugin_channels.len()),
         mixer_master_stem_rendered: false,
+        mixer_current_stem_rendered: false,
         mixer_insert_peaks: None,
     };
 
@@ -1298,6 +1301,7 @@ fn render_playlist_with_vst3_cancellable(
             .as_ref()
             .map_or(0, |summary| summary.unloaded_plugin_channels.len()),
         mixer_master_stem_rendered: false,
+        mixer_current_stem_rendered: false,
         mixer_insert_peaks: Some(Vec::new()),
     };
 
@@ -1434,7 +1438,7 @@ fn render_playlist_with_vst3_cancellable(
     Ok(summary)
 }
 
-/// Render supported Mixer insert buses to separate WAV files, optionally including Master.
+/// Render supported Mixer insert buses to separate WAV files, optionally including Master and Current.
 ///
 /// Insert stems use the renderer's pre-effect buses, including supported direct routes, paired
 /// sends, insert level/pan transforms, and insert mute/solo state. Only recognized, enabled
@@ -1447,6 +1451,7 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
     options: PlaylistRenderOptions,
     output_directory: impl AsRef<Path>,
     include_master: bool,
+    include_current_track: Option<usize>,
     mut vst3_processor: Option<Vst3PlaylistStreamProcessor>,
     cancelled: &AtomicBool,
 ) -> Result<PlaylistRenderSummary, String> {
@@ -1495,13 +1500,39 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
             } else {
                 format!("Insert {track:02} - {sanitized_name}")
             };
-            (track, label)
+            MixerStemSpec {
+                track,
+                label,
+                is_master_stem: false,
+                is_current_stem: false,
+            }
         })
         .collect::<Vec<_>>();
     let master_output = MixerMasterOutput::from_document(document);
     let mut stem_specs = inserts;
     if include_master && master_output.enabled != Some(false) {
-        stem_specs.insert(0, (0, "Master".to_owned()));
+        stem_specs.insert(
+            0,
+            MixerStemSpec {
+                track: 0,
+                label: "Master".to_owned(),
+                is_master_stem: true,
+                is_current_stem: false,
+            },
+        );
+    }
+    if let Some(track) = include_current_track {
+        let enabled = if track == 0 {
+            master_output.enabled
+        } else {
+            document
+                .mixer_inserts()
+                .into_iter()
+                .find(|insert| insert.ordinal() == track)
+                .ok_or_else(|| "the selected Current Mixer track is not recognized".to_owned())?
+                .enabled()
+        };
+        stem_specs.push(mixer_current_stem_spec(track, enabled)?);
     }
     if stem_specs.is_empty() {
         return Err("project has no enabled Mixer stems selected for export".into());
@@ -1568,8 +1599,8 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
 
     let mut outputs = stem_specs
         .into_iter()
-        .map(|(track, label)| {
-            let output_path = output_directory.join(format!("{label}.wav"));
+        .map(|spec| {
+            let output_path = output_directory.join(format!("{}.wav", spec.label));
             let mut temporary = TemporaryRenderFile::create(&output_path)?;
             write_wav_header(
                 temporary
@@ -1583,7 +1614,9 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
                 options.wav_channel_mode,
             )?;
             Ok(MixerStemTemporaryOutput {
-                track,
+                track: spec.track,
+                is_master_stem: spec.is_master_stem,
+                is_current_stem: spec.is_current_stem,
                 output_path,
                 temporary,
                 peak: 0.0,
@@ -1624,6 +1657,7 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
             .as_ref()
             .map_or(0, |summary| summary.unloaded_plugin_channels.len()),
         mixer_master_stem_rendered: false,
+        mixer_current_stem_rendered: false,
         mixer_insert_peaks: Some(Vec::new()),
     };
     let meters = MixerTrackPeakMeters::default();
@@ -1674,7 +1708,10 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
     summary.mixer_insert_peaks = Some(take_mixer_insert_peaks(&meters));
     summary.mixer_master_stem_rendered = outputs
         .iter()
-        .any(|output| output.track == 0 && output.peak > 0.0);
+        .any(|output| output.is_master_stem && output.peak > 0.0);
+    summary.mixer_current_stem_rendered = outputs
+        .iter()
+        .any(|output| output.is_current_stem && output.peak > 0.0);
     let rendered_stems = outputs.iter().filter(|output| output.peak > 0.0).count();
     if rendered_stems == 0 {
         return Err("render contained no non-silent selected Mixer stems".into());
@@ -1732,8 +1769,32 @@ fn safe_stem_filename_component(value: &str) -> String {
         .to_owned()
 }
 
+struct MixerStemSpec {
+    track: usize,
+    label: String,
+    is_master_stem: bool,
+    is_current_stem: bool,
+}
+
+fn mixer_current_stem_spec(track: usize, enabled: Option<bool>) -> Result<MixerStemSpec, String> {
+    if track >= MIXER_TRACK_METER_COUNT {
+        return Err("Current Mixer track exceeds the supported insert range".into());
+    }
+    if enabled == Some(false) {
+        return Err("the selected Current Mixer track is muted".into());
+    }
+    Ok(MixerStemSpec {
+        track,
+        label: "Current".to_owned(),
+        is_master_stem: false,
+        is_current_stem: true,
+    })
+}
+
 struct MixerStemTemporaryOutput {
     track: usize,
+    is_master_stem: bool,
+    is_current_stem: bool,
     output_path: PathBuf,
     temporary: TemporaryRenderFile,
     peak: f32,
@@ -6509,6 +6570,17 @@ mod tests {
         assert_eq!(safe_stem_filename_component("...   "), "");
         let long_name = "界".repeat(80);
         assert!(safe_stem_filename_component(&long_name).len() <= 120);
+    }
+
+    #[test]
+    fn current_mixer_stem_targets_the_selected_unmuted_track() {
+        let current = mixer_current_stem_spec(7, Some(true)).unwrap();
+        assert_eq!(current.track, 7);
+        assert_eq!(current.label, "Current");
+        assert!(!current.is_master_stem);
+        assert!(current.is_current_stem);
+        assert!(mixer_current_stem_spec(7, Some(false)).is_err());
+        assert!(mixer_current_stem_spec(MIXER_TRACK_METER_COUNT, None).is_err());
     }
 
     #[test]

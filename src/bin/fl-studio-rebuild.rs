@@ -1998,6 +1998,8 @@ struct DawUi {
     playlist_render_options_open: bool,
     playlist_render_mixer_stems: bool,
     playlist_render_include_master_stem: bool,
+    playlist_render_include_current_stem: bool,
+    playlist_render_current_track: Option<usize>,
     playlist_song_output_format: PlaylistSongOutputFormat,
     playlist_render_format: WavSampleFormat,
     playlist_render_flac_bits_per_sample: u8,
@@ -2517,6 +2519,8 @@ impl DawUi {
             playlist_render_options_open: false,
             playlist_render_mixer_stems: false,
             playlist_render_include_master_stem: true,
+            playlist_render_include_current_stem: false,
+            playlist_render_current_track: None,
             playlist_song_output_format: PlaylistSongOutputFormat::Wav,
             playlist_render_format: WavSampleFormat::Float32,
             playlist_render_flac_bits_per_sample: 24,
@@ -4356,6 +4360,59 @@ impl DawUi {
         if !self.playlist_render_options_open {
             return;
         }
+        let mut current_track_options = Vec::new();
+        if let Some(document) = self.document.as_ref() {
+            let inserts = document.mixer_inserts();
+            if inserts
+                .iter()
+                .find(|insert| insert.ordinal() == 0)
+                .is_none_or(|insert| insert.enabled() != Some(false))
+            {
+                current_track_options.push((0, "Master".to_owned()));
+            }
+            current_track_options.extend(
+                inserts
+                    .into_iter()
+                    .filter(|insert| {
+                        insert.ordinal() > 0
+                            && insert.ordinal() < MIXER_TRACK_METER_COUNT
+                            && insert.enabled() != Some(false)
+                    })
+                    .map(|insert| {
+                        let track = insert.ordinal();
+                        let name = insert
+                            .name()
+                            .filter(|name| !name.trim().is_empty())
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| format!("Insert {track}"));
+                        (track, format!("Insert {track:02} - {name}"))
+                    }),
+            );
+        }
+        let has_current_track = self.playlist_render_current_track.is_some_and(|track| {
+            current_track_options
+                .iter()
+                .any(|(option, _)| *option == track)
+        });
+        if !has_current_track {
+            self.playlist_render_current_track = self
+                .selected_mixer_insert
+                .filter(|track| {
+                    current_track_options
+                        .iter()
+                        .any(|(option, _)| option == track)
+                })
+                .or_else(|| {
+                    current_track_options
+                        .iter()
+                        .find(|(track, _)| *track != 0)
+                        .map(|(track, _)| *track)
+                })
+                .or_else(|| current_track_options.first().map(|(track, _)| *track));
+        }
+        if current_track_options.is_empty() {
+            self.playlist_render_include_current_stem = false;
+        }
         let mut open = self.playlist_render_options_open;
         let mut start_render = false;
         let mut cancel = false;
@@ -4554,8 +4611,41 @@ impl DawUi {
                         &mut self.playlist_render_include_master_stem,
                         "Include Master stem",
                     );
-                    ui.label("Master uses the final supported mix; insert stems are pre-effect.");
-                    ui.label("Mixer effects, automation, and Current-route stems are not included.");
+                    ui.label("Master uses the final supported mix; insert and Current stems are pre-effect.");
+                    ui.add_enabled_ui(!current_track_options.is_empty(), |ui| {
+                        ui.checkbox(
+                            &mut self.playlist_render_include_current_stem,
+                            "Include Current stem",
+                        );
+                    });
+                    if current_track_options.is_empty() {
+                        ui.label("No recognized, unmuted Mixer tracks are available as Current.");
+                    } else if self.playlist_render_include_current_stem {
+                        ui.horizontal(|ui| {
+                            ui.label("Current track");
+                            let selected_text = self
+                                .playlist_render_current_track
+                                .and_then(|track| {
+                                    current_track_options
+                                        .iter()
+                                        .find(|(option, _)| *option == track)
+                                })
+                                .map(|(_, label)| label.as_str())
+                                .unwrap_or("Select a track");
+                            egui::ComboBox::from_id_salt("playlist-render-current-track")
+                                .selected_text(selected_text)
+                                .show_ui(ui, |ui| {
+                                    for (track, label) in &current_track_options {
+                                        ui.selectable_value(
+                                            &mut self.playlist_render_current_track,
+                                            Some(*track),
+                                            label.as_str(),
+                                        );
+                                    }
+                                });
+                        });
+                    }
+                    ui.label("Mixer effects, automation, and route PDC are not included.");
                 }
                 ui.checkbox(
                     &mut self.playlist_render_include_plugin_tails,
@@ -5750,6 +5840,7 @@ impl DawUi {
                         .clicked()
                     {
                         self.playlist_render_mixer_stems = true;
+                        self.playlist_render_current_track = None;
                         self.playlist_render_options_open = true;
                         ui.close();
                     }
@@ -18438,6 +18529,10 @@ impl DawUi {
         let document = document.clone();
         let output_directory_for_worker = output_directory.clone();
         let include_master = self.playlist_render_include_master_stem;
+        let include_current_track = self
+            .playlist_render_include_current_stem
+            .then_some(self.playlist_render_current_track)
+            .flatten();
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
         let (sender, receiver) = mpsc::sync_channel(1);
@@ -18450,6 +18545,7 @@ impl DawUi {
                     options,
                     &output_directory_for_worker,
                     include_master,
+                    include_current_track,
                     vst3_processor,
                     &worker_cancelled,
                 );
@@ -18464,10 +18560,7 @@ impl DawUi {
                     output_path: output_directory.clone(),
                     kind: PendingSongRenderKind::MixerStems,
                 });
-                self.status = format!(
-                    "Rendering pre-effect Mixer insert stems into {}…",
-                    output_directory.display()
-                );
+                self.status = format!("Rendering Mixer stems into {}…", output_directory.display());
             }
             Err(error) => {
                 self.status = format!("Could not start Mixer stem render worker: {error}");
@@ -18522,13 +18615,18 @@ impl DawUi {
                         insert_peaks.len(),
                     ),
                     PendingSongRenderKind::MixerStems => format!(
-                        "Rendered supported Mixer stems into {} at {} Hz; {}. Mixer effects, automation, Current-route stems, and route PDC were not rendered",
+                        "Rendered supported Mixer stems into {} at {} Hz; {}, {}. Mixer effects, automation, and route PDC were not rendered",
                         pending.output_path.display(),
                         summary.sample_rate,
                         if summary.mixer_master_stem_rendered {
                             "Master stem included"
                         } else {
                             "Master stem not written"
+                        },
+                        if summary.mixer_current_stem_rendered {
+                            "Current stem included"
+                        } else {
+                            "Current stem not written"
                         },
                     ),
                 };
