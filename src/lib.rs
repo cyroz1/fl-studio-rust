@@ -12159,10 +12159,10 @@ mod tests {
         ChannelSortOrder, ChannelSummary, ClawMachineOptions, FlpDocument, FlpError, FlpEvent,
         FstPreset, FstPresetKind, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit,
         MixerInsertSummary, MixerParameterKind, MixerRouteAudibility, PATTERN_NOTE_SLIDE_FLAG,
-        PatternControllerEdit, PatternNote, PatternNoteEdit, PayloadEncoding, PlaylistClipEdit,
-        PlaylistClipTarget, PlaylistTrackEdit, ProjectInfoEdit, ProjectSettingsEdit,
-        RiffMachineOptions, RiffMachineQuantizeMode, ScaleLevelsOptions, TimeMarkerEdit,
-        midi::MidiChannelMapping, midi::MidiFile, parse_vst_plugin_state_metadata,
+        PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation, PayloadEncoding,
+        PlaylistClipEdit, PlaylistClipTarget, PlaylistTrackEdit, ProjectInfoEdit,
+        ProjectSettingsEdit, RiffMachineOptions, RiffMachineQuantizeMode, ScaleLevelsOptions,
+        TimeMarkerEdit, midi::MidiChannelMapping, midi::MidiFile, parse_vst_plugin_state_metadata,
         riff_machine_groove_note_timing,
     };
 
