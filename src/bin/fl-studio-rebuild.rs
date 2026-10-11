@@ -1170,6 +1170,7 @@ struct PianoRollTimeSelectionDrag {
     pattern_id: u16,
     start_tick: u32,
     current_tick: u32,
+    additive: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -17349,7 +17350,9 @@ impl DawUi {
                     Id::new(("piano-roll-time-ruler", pattern.id)),
                     Sense::click_and_drag(),
                 )
-                .on_hover_text("Ctrl/Cmd-drag to select a time range");
+                .on_hover_text(
+                    "Ctrl/Cmd-drag to select notes by time range · Shift adds to selection",
+                );
             painter.line_segment(
                 [
                     egui::pos2(ruler_rect.left(), ruler_rect.bottom()),
@@ -17817,6 +17820,7 @@ impl DawUi {
                     pattern_id: pattern.id,
                     start_tick,
                     current_tick: start_tick,
+                    additive: modifiers.shift,
                 });
             }
             if let Some(mut drag) = self
@@ -17839,7 +17843,33 @@ impl DawUi {
                     );
                     self.piano_roll_time_selection = Some((pattern.id, start, end));
                     self.piano_roll_time_selection_drag = None;
-                    self.status = format!("Selected time from {start} to {end} ticks");
+                    let selected_note_ids = self
+                        .selected_note_channel
+                        .map(|channel_id| {
+                            piano_roll_time_range_note_selection(
+                                pattern, pattern.id, channel_id, start, end,
+                            )
+                        })
+                        .unwrap_or_default();
+                    if !drag.additive {
+                        self.selected_piano_notes
+                            .retain(|(selected_pattern, _, _)| *selected_pattern != pattern.id);
+                    }
+                    self.selected_piano_notes.extend(selected_note_ids);
+                    self.selected_note = self
+                        .selected_piano_notes
+                        .iter()
+                        .rev()
+                        .find(|(selected_pattern, _, _)| *selected_pattern == pattern.id)
+                        .copied();
+                    let selected_count = self
+                        .selected_piano_notes
+                        .iter()
+                        .filter(|(selected_pattern, _, _)| *selected_pattern == pattern.id)
+                        .count();
+                    self.status = format!(
+                        "Selected {selected_count} notes in time range from {start} to {end} ticks"
+                    );
                 } else {
                     self.piano_roll_time_selection_drag = Some(drag);
                 }
@@ -22277,6 +22307,44 @@ fn piano_roll_selection_time_range(
     found_note.then_some((start, end))
 }
 
+fn piano_roll_time_range_note_selection(
+    pattern: &Pattern,
+    pattern_id: u16,
+    channel_id: u16,
+    start: u32,
+    end: u32,
+) -> Vec<(u16, u16, usize)> {
+    if end <= start {
+        return Vec::new();
+    }
+
+    let channel_notes = pattern
+        .notes
+        .iter()
+        .filter(|note| note.channel_id == channel_id)
+        .collect::<Vec<_>>();
+    let mut selected_indices = BTreeSet::new();
+    let mut selected_groups = BTreeSet::new();
+    for (note_index, note) in channel_notes.iter().enumerate() {
+        if (start..end).contains(&note.position) {
+            selected_indices.insert(note_index);
+            if note.group != 0 {
+                selected_groups.insert(note.group);
+            }
+        }
+    }
+
+    channel_notes
+        .iter()
+        .enumerate()
+        .filter(|(note_index, note)| {
+            selected_indices.contains(note_index)
+                || (note.group != 0 && selected_groups.contains(&note.group))
+        })
+        .map(|(note_index, _)| (pattern_id, channel_id, note_index))
+        .collect()
+}
+
 fn piano_roll_shift_time_range(start: u32, end: u32, direction: TimeSelectionShift) -> (u32, u32) {
     let width = end.saturating_sub(start);
     let start = match direction {
@@ -24978,6 +25046,35 @@ mod tests {
             piano_roll_overlap_note_selection(&pattern, 7, 2, true),
             vec![(7, 2, 1), (7, 2, 4)]
         );
+    }
+
+    #[test]
+    fn piano_roll_time_range_selects_note_starts_and_includes_their_groups() {
+        let note = |position, channel_id, group| PatternNote {
+            position,
+            length: 192,
+            channel_id,
+            group,
+            ..PatternNote::default()
+        };
+        let pattern = Pattern {
+            id: 7,
+            notes: vec![
+                note(0, 2, 0),
+                note(24, 2, 0),
+                note(96, 2, 8),
+                note(120, 2, 0),
+                note(48, 3, 0),
+                note(240, 2, 8),
+            ],
+            ..Pattern::default()
+        };
+
+        assert_eq!(
+            piano_roll_time_range_note_selection(&pattern, 7, 2, 24, 120),
+            vec![(7, 2, 1), (7, 2, 2), (7, 2, 5)]
+        );
+        assert!(piano_roll_time_range_note_selection(&pattern, 7, 2, 120, 120).is_empty());
     }
 
     #[test]
