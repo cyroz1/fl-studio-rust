@@ -1889,6 +1889,21 @@ pub(crate) struct MixerSourceRouteTransform {
     matrix: [f32; 4],
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct MixerSourceRoutePlan {
+    pub(crate) output_transform: MixerSourceRouteTransform,
+    pub(crate) insert_meter_transforms: Vec<(usize, MixerSourceRouteTransform)>,
+}
+
+impl Default for MixerSourceRoutePlan {
+    fn default() -> Self {
+        Self {
+            output_transform: MixerSourceRouteTransform::default(),
+            insert_meter_transforms: Vec::new(),
+        }
+    }
+}
+
 impl Default for MixerSourceRouteTransform {
     fn default() -> Self {
         Self {
@@ -2148,15 +2163,6 @@ impl MixerRouteAudibility {
         reaches_solo
     }
 
-    /// Returns a visible insert ordinal only when the channel has a recognized direct route.
-    pub(crate) fn direct_meter_track(&self, route: Option<i8>) -> Option<usize> {
-        let track = route.unwrap_or(0);
-        if track < 0 || !self.known_tracks.contains(&track) {
-            return None;
-        }
-        Some(track as usize)
-    }
-
     /// Returns the supported phase, stereo, candidate pan, and fader transform for a route.
     /// Master processing is applied once to the final mix, and unknown routes are unchanged.
     pub(crate) fn transform_for_channel(&self, route: Option<i8>) -> MixerInsertSignalTransform {
@@ -2172,25 +2178,42 @@ impl MixerRouteAudibility {
         &self,
         route: Option<i8>,
     ) -> MixerSourceRouteTransform {
+        self.source_route_plan_for_channel(route).output_transform
+    }
+
+    /// Returns the final pre-Master route plus each insert's summed pre-effect meter path.
+    pub(crate) fn source_route_plan_for_channel(&self, route: Option<i8>) -> MixerSourceRoutePlan {
         let Some(track) = route.filter(|track| *track > 0 && self.known_tracks.contains(track))
         else {
-            return MixerSourceRouteTransform::default();
+            return MixerSourceRoutePlan {
+                output_transform: MixerSourceRouteTransform::default(),
+                insert_meter_transforms: Vec::new(),
+            };
         };
         if !self.complete_send_sources.contains(&track) {
-            return MixerSourceRouteTransform::from_insert_transform(
+            let transform = MixerSourceRouteTransform::from_insert_transform(
                 self.transform_for_channel(Some(track)),
             );
+            return MixerSourceRoutePlan {
+                output_transform: transform,
+                insert_meter_transforms: vec![(track as usize, transform)],
+            };
         }
 
         let mut output = MixerSourceRouteTransform::zero();
+        let mut insert_meter_transforms = BTreeMap::new();
         self.accumulate_send_paths(
             track,
             MixerSourceRouteTransform::default(),
             &mut HashSet::new(),
             false,
             &mut output,
+            &mut insert_meter_transforms,
         );
-        output
+        MixerSourceRoutePlan {
+            output_transform: output,
+            insert_meter_transforms: insert_meter_transforms.into_iter().collect(),
+        }
     }
 
     fn accumulate_send_paths(
@@ -2200,6 +2223,7 @@ impl MixerRouteAudibility {
         visited: &mut HashSet<i8>,
         reached_solo: bool,
         output: &mut MixerSourceRouteTransform,
+        insert_meter_transforms: &mut BTreeMap<usize, MixerSourceRouteTransform>,
     ) {
         if track == 0 {
             if self.soloed_insert_tracks.is_empty() || reached_solo {
@@ -2220,6 +2244,15 @@ impl MixerRouteAudibility {
         let path = path.then(MixerSourceRouteTransform::from_insert_transform(
             track_transform,
         ));
+        if self.soloed_insert_tracks.is_empty()
+            || reached_solo
+            || self.route_can_reach_soloed_insert(track, &mut HashSet::new())
+        {
+            insert_meter_transforms
+                .entry(track as usize)
+                .or_insert_with(MixerSourceRouteTransform::zero)
+                .add(path);
+        }
         if self.complete_send_sources.contains(&track) {
             if let Some(routes) = self.send_routes_by_source.get(&track) {
                 for route in routes {
@@ -2230,6 +2263,7 @@ impl MixerRouteAudibility {
                         visited,
                         reached_solo,
                         output,
+                        insert_meter_transforms,
                     );
                 }
             }
@@ -13785,12 +13819,12 @@ mod tests {
         ChannelSortOrder, ChannelSummary, ClawMachineOptions, FlpDocument, FlpError, FlpEvent,
         FstPreset, FstPresetKind, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit,
         MixerInsertSummary, MixerParameterKind, MixerParameterRecord, MixerRouteAudibility,
-        MixerSendSummary, PATTERN_NOTE_DEFAULT_FLAGS, PATTERN_NOTE_SLIDE_FLAG,
-        PLAYLIST_CLIP_MUTED_FLAG, PatternControllerEdit, PatternNote, PatternNoteEdit,
-        PatternNoteRotation, PayloadEncoding, PlaylistClipEdit, PlaylistClipTarget,
-        PlaylistTrackEdit, ProjectInfoEdit, ProjectSettingsEdit, RiffMachineOptions,
-        RiffMachineQuantizeMode, ScaleLevelsOptions, TimeMarkerEdit, apply_mixer_pan,
-        apply_mixer_stereo_separation, midi::MidiChannelMapping, midi::MidiFile,
+        MixerSendSummary, MixerSourceRouteTransform, PATTERN_NOTE_DEFAULT_FLAGS,
+        PATTERN_NOTE_SLIDE_FLAG, PLAYLIST_CLIP_MUTED_FLAG, PatternControllerEdit, PatternNote,
+        PatternNoteEdit, PatternNoteRotation, PayloadEncoding, PlaylistClipEdit,
+        PlaylistClipTarget, PlaylistTrackEdit, ProjectInfoEdit, ProjectSettingsEdit,
+        RiffMachineOptions, RiffMachineQuantizeMode, ScaleLevelsOptions, TimeMarkerEdit,
+        apply_mixer_pan, apply_mixer_stereo_separation, midi::MidiChannelMapping, midi::MidiFile,
         parse_vst_plugin_state_metadata, riff_machine_groove_note_timing,
     };
 
@@ -16665,10 +16699,6 @@ mod tests {
         assert!(!routing.allows_channel(Some(2)));
         assert!(routing.allows_channel(Some(-1)));
         assert!(routing.allows_channel(Some(7)));
-        assert_eq!(routing.direct_meter_track(None), Some(0));
-        assert_eq!(routing.direct_meter_track(Some(1)), Some(1));
-        assert_eq!(routing.direct_meter_track(Some(-1)), None);
-        assert_eq!(routing.direct_meter_track(Some(7)), None);
         let mut routed_frame = [0.25, -0.5];
         routing
             .transform_for_channel(Some(1))
@@ -16726,10 +16756,16 @@ mod tests {
         ]);
 
         let mut frame = [1.0, -0.5];
-        routing
-            .source_route_transform_for_channel(Some(1))
-            .apply_frame(&mut frame);
+        let route_plan = routing.source_route_plan_for_channel(Some(1));
+        route_plan.output_transform.apply_frame(&mut frame);
         assert_eq!(frame, [1.5, -0.75]);
+        assert_eq!(
+            route_plan.insert_meter_transforms,
+            vec![
+                (1, MixerSourceRouteTransform::default()),
+                (2, MixerSourceRouteTransform::default().scaled(0.5)),
+            ]
+        );
 
         let mut solo_routing = MixerRouteAudibility::from_inserts_with_parameters(
             [

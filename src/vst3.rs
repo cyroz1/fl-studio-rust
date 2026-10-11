@@ -19,8 +19,8 @@ use crate::sample_render::{
     render_stereo_audio_to_file, schedule_playlist_pattern_notes, swing_note_start_tick,
 };
 use crate::{
-    ChannelNoteRouter, ChannelPluginState, FlpDocument, MixerInsertSignalTransform,
-    MixerRouteAudibility, MixerSourceRouteTransform,
+    ChannelNoteRouter, ChannelPluginState, FlpDocument, MixerRouteAudibility,
+    MixerSourceRouteTransform,
 };
 use vst3_host::audio::AudioBuffers;
 use vst3_host::midi::{MidiChannel, MidiEvent};
@@ -200,8 +200,7 @@ struct PlaylistPluginStream {
     left_pan_gain: f32,
     right_pan_gain: f32,
     mixer_transform: MixerSourceRouteTransform,
-    mixer_meter_transform: MixerInsertSignalTransform,
-    mixer_meter_track: Option<usize>,
+    mixer_meter_transforms: Vec<(usize, MixerSourceRouteTransform)>,
 }
 
 /// Prepared VST3 instrument channels for blockwise Playlist Song transport.
@@ -330,14 +329,19 @@ impl Vst3PlaylistStreamProcessor {
                 .map_err(|error| format!("could not allocate VST3 Playlist block: {error}"))?;
             stream.render_output_frames(frame_count, &mut plugin_output)?;
             stream.delay_line.process_interleaved(&mut plugin_output)?;
-            if let Some(track) = stream.mixer_meter_track
-                && let Some(meter_buses) = meter_buses.as_deref()
-            {
-                let meter_end = (track + 1)
-                    .checked_mul(output.len())
-                    .ok_or_else(|| "Mixer meter buffer size overflow".to_owned())?;
-                if meter_end > meter_buses.len() {
-                    return Err("Mixer meter buffer is too small for the VST3 route".to_owned());
+            if let Some(meter_buses) = meter_buses.as_deref() {
+                for (track, _) in &stream.mixer_meter_transforms {
+                    if *track >= crate::audio::MIXER_TRACK_METER_COUNT {
+                        return Err(
+                            "VST3 Mixer meter route exceeds the supported track range".to_owned()
+                        );
+                    }
+                    let meter_end = (*track + 1)
+                        .checked_mul(output.len())
+                        .ok_or_else(|| "Mixer meter buffer size overflow".to_owned())?;
+                    if meter_end > meter_buses.len() {
+                        return Err("Mixer meter buffer is too small for the VST3 route".to_owned());
+                    }
                 }
             }
             for (frame_index, frame) in plugin_output.as_chunks::<2>().0.iter().enumerate() {
@@ -345,17 +349,21 @@ impl Vst3PlaylistStreamProcessor {
                     frame[0] * stream.gain * stream.left_pan_gain,
                     frame[1] * stream.gain * stream.right_pan_gain,
                 ];
-                let mut meter_frame = routed_frame;
-                stream.mixer_meter_transform.apply_frame(&mut meter_frame);
                 stream.mixer_transform.apply_frame(&mut routed_frame);
                 output[frame_index * 2] += routed_frame[0];
                 output[frame_index * 2 + 1] += routed_frame[1];
-                if let (Some(track), Some(meter_buses)) =
-                    (stream.mixer_meter_track, meter_buses.as_deref_mut())
-                {
-                    let meter_offset = track * output.len() + frame_index * 2;
-                    meter_buses[meter_offset] += meter_frame[0];
-                    meter_buses[meter_offset + 1] += meter_frame[1];
+                if let Some(meter_buses) = meter_buses.as_deref_mut() {
+                    let source_frame = [
+                        frame[0] * stream.gain * stream.left_pan_gain,
+                        frame[1] * stream.gain * stream.right_pan_gain,
+                    ];
+                    for (track, transform) in &stream.mixer_meter_transforms {
+                        let mut meter_frame = source_frame;
+                        transform.apply_frame(&mut meter_frame);
+                        let meter_offset = *track * output.len() + frame_index * 2;
+                        meter_buses[meter_offset] += meter_frame[0];
+                        meter_buses[meter_offset + 1] += meter_frame[1];
+                    }
                 }
             }
         }
@@ -1420,17 +1428,13 @@ impl Vst3HostRuntime {
                 channel.and_then(|channel| channel.volume()),
                 channel.and_then(|channel| channel.pan()),
             );
-            let mixer_transform = channel
+            let route_plan = channel
                 .map(|channel| {
-                    mixer_route_audibility.source_route_transform_for_channel(channel.mixer_track())
+                    mixer_route_audibility.source_route_plan_for_channel(channel.mixer_track())
                 })
                 .unwrap_or_default();
-            let mixer_meter_transform = channel
-                .map(|channel| mixer_route_audibility.transform_for_channel(channel.mixer_track()))
-                .unwrap_or_default();
-            let mixer_meter_track = channel.and_then(|channel| {
-                mixer_route_audibility.direct_meter_track(channel.mixer_track())
-            });
+            let mixer_transform = route_plan.output_transform;
+            let mixer_meter_transforms = route_plan.insert_meter_transforms;
             let (render, latency_frames) = {
                 let plugin_guard = plugin
                     .lock()
@@ -1483,8 +1487,7 @@ impl Vst3HostRuntime {
                 left_pan_gain,
                 right_pan_gain,
                 mixer_transform,
-                mixer_meter_transform,
-                mixer_meter_track,
+                mixer_meter_transforms,
             });
         }
         if streams.is_empty() {
