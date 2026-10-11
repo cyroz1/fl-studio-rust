@@ -35,7 +35,7 @@ use flp_rebuild::vst3::{
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, Arrangement, ArticulateOptions, AutomationChannel,
     AutomationPoint, AutomationPointEdit, ChannelGroupSummary, ChannelSortOrder, ChannelSummary,
-    ClawMachineOptions, FlpDocument, FstPreset, FstPresetKind, LimitNoteOptions,
+    ClawMachineOptions, FlpDocument, FlpError, FstPreset, FstPresetKind, LimitNoteOptions,
     LimitSnapDirection, MixerInsertEdit, MixerParameterKind, MixerParameterRecord, Pattern,
     PatternController, PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation,
     PlaylistClip, PlaylistClipClipboard, PlaylistClipEdit, PlaylistClipTarget, PlaylistTrack,
