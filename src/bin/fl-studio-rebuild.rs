@@ -19687,7 +19687,11 @@ impl DawUi {
         ui.horizontal(|ui| {
             ui.strong("Mixer");
             ui.separator();
-            ui.label(format!("{} insert records", inserts.len()));
+            ui.label(format!(
+                "{} recognized track{}",
+                inserts.len(),
+                if inserts.len() == 1 { "" } else { "s" }
+            ));
             ui.separator();
             ui.label(format!("{parameter_count} parameter records"));
         });
@@ -19968,6 +19972,40 @@ impl DawUi {
                                                 }
                                             });
                                         });
+                                }
+                                if inserts.len() == 1 && inserts[0].ordinal() == 0 {
+                                    let empty_width = (bank_width - 132.0).max(180.0);
+                                    let card_width = empty_width.min(430.0);
+                                    ui.allocate_ui_with_layout(
+                                        Vec2::new(
+                                            empty_width,
+                                            (available_height - 42.0).max(180.0),
+                                        ),
+                                        egui::Layout::centered_and_justified(
+                                            egui::Direction::TopDown,
+                                        ),
+                                        |ui| {
+                                            ui.set_max_width(card_width);
+                                            egui::Frame::new()
+                                                .fill(PANEL_DARK)
+                                                .stroke(Stroke::new(1.0, GRID))
+                                                .inner_margin(egui::Margin::same(18))
+                                                .show(ui, |ui| {
+                                                    ui.vertical_centered(|ui| {
+                                                        ui.label(
+                                                            egui::RichText::new("MIXER BANK")
+                                                                .small()
+                                                                .color(MUTED),
+                                                        );
+                                                        ui.add_space(4.0);
+                                                        ui.heading("Master only");
+                                                        ui.label(
+                                                            "No insert tracks are recognized in this project.",
+                                                        );
+                                                    });
+                                                });
+                                        },
+                                    );
                                 }
                             });
                         });
