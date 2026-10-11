@@ -430,12 +430,9 @@ jobs:
             -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/piano-roll-scale-automatic.png"
           xdotool key Escape
           xdotool mousemove 1045 158 click 1
-          sleep 0.2
-          xdotool mousemove 1090 217 click 1
           sleep 0.3
           ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
-            -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/piano-roll-chord-stamp-options.png"
-          xdotool key Escape
+            -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/piano-roll-tools-menu.png"
           xdotool key Escape
           xdotool mousemove 400 260 keydown Control_L
           sleep 0.2
@@ -636,10 +633,10 @@ jobs:
           ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
             -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/modern-pattern-clip-before-resize.png"
           xdotool keydown Shift_L
-          xdotool mousemove 656 298
+          xdotool mousemove 660 298
           xdotool mousedown 1
           sleep 0.2
-          xdotool mousemove --sync 697 298
+          xdotool mousemove --sync 701 298
           sleep 0.3
           xdotool mouseup 1
           xdotool keyup Shift_L
@@ -663,7 +660,7 @@ jobs:
           for capture in browser-search-options.png playlist-solo.png playlist-group-solo.png playlist-groups-collapsed.png \
             mixer.png mixer-effect-slots-scrolled.png mixer-muted.png mixer-muted-solo.png mixer-phase-swap.png controller-ghost-visibility.png \
             controller-ghost-editable.png controller-ghost-editable-shortcut.png controller-color-selection.png \
-            piano-roll-scale-automatic.png piano-roll-chord-stamp-options.png \
+            piano-roll-scale-automatic.png piano-roll-tools-menu.png \
             modern-pattern-clip-before-resize.png modern-pattern-clip-after-resize.png \
             piano-roll-time-selection.png piano-roll-pitch-selection.png piano-roll-mousewheel-property.png \
             piano-roll-mousewheel-nudge.png controller-event-draw.png controller-event-paint.png \
