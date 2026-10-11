@@ -1353,6 +1353,7 @@ struct BrowserSampleDrag(PathBuf);
 #[derive(Clone)]
 struct FstPresetDetails {
     path: PathBuf,
+    preset: FstPreset,
     file_size: usize,
     format: u16,
     kind: FstPresetKind,
@@ -6370,6 +6371,7 @@ impl DawUi {
             .collect::<Vec<_>>();
         self.browser_fst_details = Some(FstPresetDetails {
             path: path.to_path_buf(),
+            preset: preset.clone(),
             file_size: bytes.len(),
             format: document.header().format(),
             kind: preset.kind(),
@@ -6386,6 +6388,107 @@ impl DawUi {
             trailing_byte_count: document.trailing_bytes().len(),
         });
         self.status = format!("Inspected preset {}; state was not applied", path.display());
+    }
+
+    fn apply_fst_preset_to_vst3_channel(
+        &mut self,
+        preset: &FstPreset,
+        target_channel_id: u16,
+        preset_name: &str,
+    ) -> bool {
+        let Some(mut document) = self.document.clone() else {
+            self.status = "Open a project before applying a channel preset".to_owned();
+            return false;
+        };
+        let Some(target_state) = document
+            .channel_plugin_states()
+            .into_iter()
+            .find(|state| state.channel_id() == target_channel_id)
+        else {
+            self.status = format!("Channel {target_channel_id} has no plug-in state to replace");
+            return false;
+        };
+        let Some(preset_state) = preset.matching_vst3_channel_state(&target_state) else {
+            self.status = "This preset has no matching marker-12 VST3 channel state".to_owned();
+            return false;
+        };
+        let Some(instance_id) = self.channel_vst3_instances.get(&target_channel_id).copied() else {
+            self.status = format!("Load the VST3 instrument on Channel {target_channel_id} first");
+            return false;
+        };
+
+        self.backup_before_risky_operation("applying a VST3 channel preset");
+        let restore_result = self
+            .vst3_host
+            .as_mut()
+            .ok_or_else(|| "the VST3 host is not running".to_owned())
+            .and_then(|host| host.restore_flp_channel_state(instance_id, &preset_state));
+        if let Err(error) = restore_result {
+            let rollback_result = self
+                .vst3_host
+                .as_mut()
+                .ok_or_else(|| "the VST3 host is not running".to_owned())
+                .and_then(|host| host.restore_flp_channel_state(instance_id, &target_state));
+            self.status = match rollback_result {
+                Ok(()) => format!("Could not apply preset: {error}"),
+                Err(rollback_error) => format!(
+                    "Could not apply preset: {error}; restoring the original channel state also failed: {rollback_error}"
+                ),
+            };
+            self.last_plugin_action = Some(self.status.clone());
+            return false;
+        }
+
+        let updated_state = match self
+            .vst3_host
+            .as_ref()
+            .ok_or_else(|| "the VST3 host is not running".to_owned())
+            .and_then(|host| host.save_flp_channel_state(instance_id, &target_state))
+        {
+            Ok(state) => state,
+            Err(error) => {
+                let rollback_result = self
+                    .vst3_host
+                    .as_mut()
+                    .ok_or_else(|| "the VST3 host is not running".to_owned())
+                    .and_then(|host| host.restore_flp_channel_state(instance_id, &target_state));
+                self.status = match rollback_result {
+                    Ok(()) => format!(
+                        "Preset state loaded but could not be saved to the project: {error}"
+                    ),
+                    Err(rollback_error) => format!(
+                        "Preset state could not be saved to the project: {error}; restoring the original channel state also failed: {rollback_error}"
+                    ),
+                };
+                self.last_plugin_action = Some(self.status.clone());
+                return false;
+            }
+        };
+        if let Err(error) =
+            document.replace_vst3_channel_state_bytes(target_channel_id, &updated_state)
+        {
+            let rollback_result = self
+                .vst3_host
+                .as_mut()
+                .ok_or_else(|| "the VST3 host is not running".to_owned())
+                .and_then(|host| host.restore_flp_channel_state(instance_id, &target_state));
+            self.status = match rollback_result {
+                Ok(()) => {
+                    format!("Preset state loaded but could not be written to the project: {error}")
+                }
+                Err(rollback_error) => format!(
+                    "Preset state could not be written to the project: {error}; restoring the original channel state also failed: {rollback_error}"
+                ),
+            };
+            self.last_plugin_action = Some(self.status.clone());
+            return false;
+        }
+
+        self.document = Some(document);
+        self.dirty = true;
+        self.status = format!("Applied {preset_name} to VST3 Channel {target_channel_id}");
+        self.last_plugin_action = Some(self.status.clone());
+        true
     }
 
     fn selected_sample_channel(&self) -> Option<(u16, String)> {
@@ -6478,8 +6581,24 @@ impl DawUi {
         let Some(details) = self.browser_fst_details.clone() else {
             return;
         };
+        let target_channel_id = self.selected_note_channel;
+        let target_state = target_channel_id.and_then(|channel_id| {
+            self.document
+                .as_ref()?
+                .channel_plugin_states()
+                .into_iter()
+                .find(|state| state.channel_id() == channel_id)
+        });
+        let matching_state_available = target_state
+            .as_ref()
+            .is_some_and(|target| details.preset.matching_vst3_channel_state(target).is_some());
+        let apply_available = matching_state_available
+            && target_channel_id
+                .is_some_and(|channel_id| self.channel_vst3_instances.contains_key(&channel_id))
+            && self.vst3_host.is_some();
         let mut open = true;
         let mut close = false;
+        let mut apply_requested = false;
         egui::Window::new("FST preset details")
             .id(Id::new("browser-fst-details-dialog"))
             .open(&mut open)
@@ -6539,16 +6658,40 @@ impl DawUi {
                     },
                 );
                 ui.separator();
-                ui.label(
-                    egui::RichText::new(
-                        "This view reads preset metadata. Applying the state to a channel is not implemented yet.",
-                    )
-                    .color(MUTED),
-                );
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            apply_available,
+                            egui::Button::new("Apply to selected Channel"),
+                        )
+                        .on_hover_text(
+                            "Applies a matching marker-12 VST3 channel preset to the selected, loaded Channel",
+                        )
+                        .clicked()
+                    {
+                        apply_requested = true;
+                    }
+                    if !apply_available {
+                        ui.label(
+                            egui::RichText::new(
+                                "Select a loaded VST3 Channel with a matching channel preset.",
+                            )
+                            .color(MUTED),
+                        );
+                    }
+                });
                 if ui.button("Close").clicked() {
                     close = true;
                 }
             });
+        if apply_requested && let Some(channel_id) = target_channel_id {
+            let preset_name = details
+                .path
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .unwrap_or("VST3 preset");
+            close = self.apply_fst_preset_to_vst3_channel(&details.preset, channel_id, preset_name);
+        }
         if !open || close {
             self.browser_fst_details = None;
         }

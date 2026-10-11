@@ -294,6 +294,43 @@ impl FstPreset {
         &self.document
     }
 
+    /// Finds a supported VST3 channel state in a saved channel preset that matches `target`.
+    ///
+    /// Only format-32 channel states using FL's marker-12 VST3 wrapper are accepted. Matching
+    /// the class UID before exposing the state prevents a preset for another instrument from
+    /// being restored into the target channel.
+    pub fn matching_vst3_channel_state(
+        &self,
+        target: &ChannelPluginState,
+    ) -> Option<ChannelPluginState> {
+        if self.kind != FstPresetKind::ChannelState {
+            return None;
+        }
+        let target_metadata = target.vst_metadata()?;
+        if target_metadata.format_marker() != 12
+            || target_metadata.fourcc().is_some()
+            || target.vst_state_bytes().is_none()
+        {
+            return None;
+        }
+        let target_uid = target_metadata.class_uid()?;
+
+        self.document
+            .channel_plugin_states()
+            .into_iter()
+            .find(|state| {
+                let Some(metadata) = state.vst_metadata() else {
+                    return false;
+                };
+                metadata.format_marker() == 12
+                    && metadata.fourcc().is_none()
+                    && state.vst_state_bytes().is_some()
+                    && metadata
+                        .class_uid()
+                        .is_some_and(|uid| uid.eq_ignore_ascii_case(&target_uid))
+            })
+    }
+
     pub fn into_document(self) -> FlpDocument {
         self.document
     }
@@ -15799,6 +15836,70 @@ mod tests {
         append_data_event(&mut event_stream, 0xD4, &[0xD4, 0xA5]);
         append_data_event(&mut event_stream, 0xD5, &payload);
         flp_fixture(&event_stream, &[], &[0xD1, 0xD2])
+    }
+
+    #[test]
+    fn channel_preset_matches_only_the_same_marker_12_vst3_class() {
+        let project_bytes = marker_12_vst3_state_fixture();
+        let target_document =
+            FlpDocument::parse(&project_bytes).expect("target project should parse");
+        let target_state = target_document.channel_plugin_states()[0].clone();
+
+        let mut preset_bytes = project_bytes;
+        preset_bytes[8..10].copy_from_slice(&32_u16.to_le_bytes());
+        let preset = FstPreset::parse(&preset_bytes).expect("channel preset should parse");
+        assert_eq!(preset.kind(), FstPresetKind::ChannelState);
+
+        let matching_state = preset
+            .matching_vst3_channel_state(&target_state)
+            .expect("matching marker-12 VST3 state should be found");
+        assert_eq!(
+            matching_state
+                .vst_metadata()
+                .and_then(VstPluginStateMetadata::class_uid),
+            target_state
+                .vst_metadata()
+                .and_then(VstPluginStateMetadata::class_uid)
+        );
+        assert_eq!(
+            matching_state.vst_state_bytes(),
+            target_state.vst_state_bytes()
+        );
+
+        let mut different_class_state = target_state.clone();
+        different_class_state
+            .vst_metadata
+            .as_mut()
+            .expect("fixture should contain VST metadata")
+            .guid = Some(vec![0; 16]);
+        assert!(
+            preset
+                .matching_vst3_channel_state(&different_class_state)
+                .is_none()
+        );
+
+        let mut unsupported_marker_state = target_state.clone();
+        unsupported_marker_state
+            .vst_metadata
+            .as_mut()
+            .expect("fixture should contain VST metadata")
+            .format_marker = 8;
+        assert!(
+            preset
+                .matching_vst3_channel_state(&unsupported_marker_state)
+                .is_none()
+        );
+
+        let mut wrong_kind_bytes = preset_bytes;
+        wrong_kind_bytes[8..10].copy_from_slice(&49_u16.to_le_bytes());
+        let wrong_kind =
+            FstPreset::parse(&wrong_kind_bytes).expect("VST generator preset should parse");
+        assert_eq!(wrong_kind.kind(), FstPresetKind::VstGeneratorState);
+        assert!(
+            wrong_kind
+                .matching_vst3_channel_state(&target_state)
+                .is_none()
+        );
     }
 
     #[test]
