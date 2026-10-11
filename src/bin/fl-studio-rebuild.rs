@@ -553,14 +553,16 @@ enum DetachedWindowKind {
     ChannelRack,
     PianoRoll,
     Mixer,
+    Plugins,
 }
 
 impl DetachedWindowKind {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::Playlist,
         Self::ChannelRack,
         Self::PianoRoll,
         Self::Mixer,
+        Self::Plugins,
     ];
 
     const fn settings_key(self) -> &'static str {
@@ -569,6 +571,7 @@ impl DetachedWindowKind {
             Self::ChannelRack => "channel_rack",
             Self::PianoRoll => "piano_roll",
             Self::Mixer => "mixer",
+            Self::Plugins => "plugins",
         }
     }
 
@@ -577,6 +580,7 @@ impl DetachedWindowKind {
             Self::Playlist => Vec2::new(800.0, 560.0),
             Self::ChannelRack => Vec2::new(640.0, 480.0),
             Self::PianoRoll | Self::Mixer => Vec2::new(760.0, 480.0),
+            Self::Plugins => Vec2::new(720.0, 480.0),
         }
     }
 }
@@ -611,6 +615,7 @@ struct DetachedWindowPlacements {
     channel_rack: Option<DetachedWindowPlacement>,
     piano_roll: Option<DetachedWindowPlacement>,
     mixer: Option<DetachedWindowPlacement>,
+    plugins: Option<DetachedWindowPlacement>,
 }
 
 impl DetachedWindowPlacements {
@@ -620,6 +625,7 @@ impl DetachedWindowPlacements {
             DetachedWindowKind::ChannelRack => self.channel_rack,
             DetachedWindowKind::PianoRoll => self.piano_roll,
             DetachedWindowKind::Mixer => self.mixer,
+            DetachedWindowKind::Plugins => self.plugins,
         }
     }
 
@@ -629,6 +635,7 @@ impl DetachedWindowPlacements {
             DetachedWindowKind::ChannelRack => self.channel_rack = Some(placement),
             DetachedWindowKind::PianoRoll => self.piano_roll = Some(placement),
             DetachedWindowKind::Mixer => self.mixer = Some(placement),
+            DetachedWindowKind::Plugins => self.plugins = Some(placement),
         }
     }
 }
@@ -2175,6 +2182,7 @@ struct DawUi {
     mixer_window_detached: bool,
     channel_rack_window_detached: bool,
     playlist_window_detached: bool,
+    plugins_window_detached: bool,
     detached_window_placements: DetachedWindowPlacements,
     detached_window_current_placements: DetachedWindowPlacements,
     piano_roll_pending_scroll_offset: Option<Vec2>,
@@ -2704,6 +2712,7 @@ impl DawUi {
             mixer_window_detached: false,
             channel_rack_window_detached: false,
             playlist_window_detached: false,
+            plugins_window_detached: false,
             detached_window_placements,
             detached_window_current_placements: detached_window_placements,
             piano_roll_pending_scroll_offset: None,
@@ -6607,6 +6616,26 @@ impl DawUi {
                         "Playlist opened in a separate window".to_owned()
                     } else {
                         "Playlist returned to the main window".to_owned()
+                    };
+                    ui.close();
+                }
+                if ui
+                    .button(if self.plugins_window_detached {
+                        "Dock Plug-ins"
+                    } else {
+                        "Detach Plug-ins"
+                    })
+                    .clicked()
+                {
+                    if self.plugins_window_detached {
+                        self.persist_detached_window_placements();
+                    }
+                    self.plugins_window_detached = !self.plugins_window_detached;
+                    self.view = MainView::Plugins;
+                    self.status = if self.plugins_window_detached {
+                        "Plug-ins opened in a separate window".to_owned()
+                    } else {
+                        "Plug-ins returned to the main window".to_owned()
                     };
                     ui.close();
                 }
@@ -25407,6 +25436,25 @@ impl eframe::App for DawUi {
                                 });
                             }
                             MainView::Playlist => self.playlist(ui),
+                            MainView::Plugins if self.plugins_window_detached => {
+                                ui.centered_and_justified(|ui| {
+                                    ui.vertical_centered(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "Plug-ins are open in a separate window",
+                                            )
+                                            .size(18.0)
+                                            .color(MUTED),
+                                        );
+                                        ui.add_space(8.0);
+                                        if ui.button("Dock Plug-ins").clicked() {
+                                            self.persist_detached_window_placements();
+                                            self.plugins_window_detached = false;
+                                        }
+                                    });
+                                });
+                            }
+                            MainView::Plugins => self.plugins(ui),
                             MainView::ChannelRack if self.channel_rack_window_detached => {
                                 ui.centered_and_justified(|ui| {
                                     ui.vertical_centered(|ui| {
@@ -25464,7 +25512,6 @@ impl eframe::App for DawUi {
                                 });
                             }
                             MainView::Mixer => self.mixer(ui),
-                            MainView::Plugins => self.plugins(ui),
                             MainView::Audio => self.audio_settings_view(ui),
                             MainView::Automation => self.automation_editor(ui),
                         }
@@ -26016,6 +26063,130 @@ impl eframe::App for DawUi {
                 self.history_snapshot_available_this_frame =
                     frame_snapshot.is_some() || self.pending_history_snapshot.is_some();
                 self.playlist(viewport_ui);
+            });
+        }
+        if self.plugins_window_detached {
+            let viewport_id = egui::ViewportId::from_hash_of("detached-plugins");
+            let viewport = detached_window_viewport_builder(
+                DetachedWindowKind::Plugins,
+                "Plug-ins",
+                Vec2::new(1000.0, 700.0),
+                self.detached_window_placements
+                    .get(DetachedWindowKind::Plugins),
+            );
+            let context = ui.ctx().clone();
+            context.show_viewport_immediate(viewport_id, viewport, |viewport_ui, _class| {
+                let viewport_context = viewport_ui.ctx().clone();
+                self.capture_detached_window_placement(
+                    DetachedWindowKind::Plugins,
+                    &viewport_context,
+                    viewport_ui.max_rect().size(),
+                );
+                if viewport_context.input(|input| input.viewport().close_requested()) {
+                    self.persist_detached_window_placements();
+                    self.plugins_window_detached = false;
+                    return;
+                }
+
+                viewport_context.set_theme(egui::Theme::Dark);
+                viewport_ui.set_style(viewport_context.global_style());
+                *viewport_ui.visuals_mut() = app_visuals();
+                viewport_ui.painter().rect_filled(
+                    viewport_ui.max_rect(),
+                    egui::CornerRadius::ZERO,
+                    APP_BACKGROUND,
+                );
+
+                let child_history_navigation = !viewport_context.egui_wants_keyboard_input()
+                    && viewport_ui.input_mut(|input| {
+                        input.consume_key(
+                            egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                            egui::Key::Z,
+                        ) || input.consume_key(egui::Modifiers::COMMAND, egui::Key::Y)
+                    });
+                let child_undo_requested = !child_history_navigation
+                    && !viewport_context.egui_wants_keyboard_input()
+                    && viewport_ui.input_mut(|input| {
+                        input.consume_key(egui::Modifiers::COMMAND, egui::Key::Z)
+                    });
+                if child_history_navigation {
+                    self.redo_document();
+                    history_navigation = true;
+                } else if child_undo_requested {
+                    self.undo_document();
+                    history_navigation = true;
+                }
+                let child_save_as_requested = !viewport_context.egui_wants_keyboard_input()
+                    && viewport_ui.input_mut(|input| {
+                        input.consume_key(
+                            egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                            egui::Key::S,
+                        )
+                    });
+                let child_save_version_requested = !child_save_as_requested
+                    && !viewport_context.egui_wants_keyboard_input()
+                    && viewport_ui.input_mut(|input| {
+                        input.consume_key(egui::Modifiers::COMMAND, egui::Key::N)
+                    });
+                let child_save_requested = !child_save_as_requested
+                    && !child_save_version_requested
+                    && !viewport_context.egui_wants_keyboard_input()
+                    && viewport_ui.input_mut(|input| {
+                        input.consume_key(egui::Modifiers::COMMAND, egui::Key::S)
+                    });
+                if child_save_as_requested {
+                    self.save_as();
+                } else if child_save_version_requested {
+                    self.save_new_version();
+                } else if child_save_requested {
+                    self.save();
+                }
+                let child_play_pause_requested = !viewport_context.egui_wants_keyboard_input()
+                    && viewport_ui.input_mut(|input| {
+                        input.consume_key(egui::Modifiers::NONE, egui::Key::Space)
+                    });
+                if child_play_pause_requested {
+                    self.toggle_project_playback();
+                }
+
+                let child_pointer_down = viewport_ui.input(|input| {
+                    input.pointer.primary_down()
+                        || input.pointer.button_down(PointerButton::Secondary)
+                });
+                pointer_down |= child_pointer_down;
+                let child_edit_input_received = viewport_ui.input(|input| {
+                    input.pointer.primary_pressed()
+                        || input.pointer.primary_down()
+                        || input.pointer.primary_released()
+                        || input.pointer.button_pressed(PointerButton::Secondary)
+                        || input.pointer.button_down(PointerButton::Secondary)
+                        || input.pointer.button_released(PointerButton::Secondary)
+                        || input.events.iter().any(|event| {
+                            matches!(
+                                event,
+                                egui::Event::Key { pressed: true, .. }
+                                    | egui::Event::Text(_)
+                                    | egui::Event::Paste(_)
+                                    | egui::Event::MouseWheel { .. }
+                            )
+                        })
+                });
+                if !history_navigation
+                    && frame_snapshot.is_none()
+                    && self.pending_history_snapshot.is_none()
+                    && child_edit_input_received
+                {
+                    frame_snapshot = match self.encode_history_snapshot() {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => {
+                            self.status = format!("Could not capture undo state: {error}");
+                            None
+                        }
+                    };
+                }
+                self.history_snapshot_available_this_frame =
+                    frame_snapshot.is_some() || self.pending_history_snapshot.is_some();
+                self.plugins(viewport_ui);
             });
         }
         let history_snapshot_available = self.history_snapshot_available_this_frame
@@ -27036,6 +27207,7 @@ fn load_detached_window_placements() -> DetachedWindowPlacements {
             "channel_rack" => DetachedWindowKind::ChannelRack,
             "piano_roll" => DetachedWindowKind::PianoRoll,
             "mixer" => DetachedWindowKind::Mixer,
+            "plugins" => DetachedWindowKind::Plugins,
             _ => continue,
         };
         let mut values = values.split(',');
