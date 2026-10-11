@@ -2900,14 +2900,11 @@ impl DawUi {
         ctx: &egui::Context,
         history_snapshot_available: bool,
     ) {
-        loop {
-            let Some((pending_path, pending_project_generation)) = self
-                .pending_playlist_audio_drops
-                .front()
-                .map(|pending| (pending.path.clone(), pending.project_generation))
-            else {
-                break;
-            };
+        while let Some((pending_path, pending_project_generation)) = self
+            .pending_playlist_audio_drops
+            .front()
+            .map(|pending| (pending.path.clone(), pending.project_generation))
+        {
             if pending_project_generation != self.project_generation {
                 let pending = self
                     .pending_playlist_audio_drops
@@ -8698,17 +8695,16 @@ impl DawUi {
                             if response
                                 .dnd_hover_payload::<BrowserSampleDrag>()
                                 .is_some()
+                                && let Some(pointer) = response.interact_pointer_pos()
                             {
-                                if let Some(pointer) = response.interact_pointer_pos() {
-                                    let x = pointer.x.clamp(grid_rect.left(), grid_rect.right());
-                                    painter.line_segment(
-                                        [
-                                            egui::pos2(x, grid_rect.top()),
-                                            egui::pos2(x, grid_rect.bottom()),
-                                        ],
-                                        Stroke::new(2.0, GREEN),
-                                    );
-                                }
+                                let x = pointer.x.clamp(grid_rect.left(), grid_rect.right());
+                                painter.line_segment(
+                                    [
+                                        egui::pos2(x, grid_rect.top()),
+                                        egui::pos2(x, grid_rect.bottom()),
+                                    ],
+                                    Stroke::new(2.0, GREEN),
+                                );
                             }
                             if dropped_playlist_audio.is_none()
                                 && let Some(sample) =
