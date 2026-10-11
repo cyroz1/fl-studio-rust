@@ -623,6 +623,7 @@ struct PianoRollControllerStroke {
     stream: (u8, u8),
     tick: u32,
     value: f32,
+    start_value: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -19544,13 +19545,13 @@ impl DawUi {
                 PianoRollControllerTool::Draw,
                 "Draw",
             )
-            .on_hover_text("Draw a snapped raw controller curve");
+            .on_hover_text("Draw snapped points · Alt bypasses snap · Shift locks the value");
             ui.selectable_value(
                 &mut self.piano_roll_controller_tool,
                 PianoRollControllerTool::Paint,
                 "Paint",
             )
-            .on_hover_text("Paint raw points without the current snap setting");
+            .on_hover_text("Paint unsnapped points · Shift locks the value");
             ui.selectable_value(
                 &mut self.piano_roll_controller_tool,
                 PianoRollControllerTool::Interpolate,
@@ -19591,8 +19592,12 @@ impl DawUi {
                 PianoRollControllerTool::Edit => {
                     "Drag to edit · click empty space to duplicate · right-click to delete"
                 }
-                PianoRollControllerTool::Draw => "Drag in the lane to draw · uses current snap",
-                PianoRollControllerTool::Paint => "Drag in the lane to paint · snap is bypassed",
+                PianoRollControllerTool::Draw => {
+                    "Drag to draw · Alt bypasses snap · Shift locks value"
+                }
+                PianoRollControllerTool::Paint => {
+                    "Drag to paint · snap is bypassed · Shift locks value"
+                }
                 PianoRollControllerTool::Interpolate => "Left-drag: linear · right-drag: spline",
                 PianoRollControllerTool::Erase => "Drag to erase selected points",
             });
@@ -19886,7 +19891,13 @@ impl DawUi {
             && !self.piano_roll_zoom_mode
             && !self.piano_roll_playback_mode
         {
-            let primary_down = ui.input(|input| input.pointer.button_down(PointerButton::Primary));
+            let (primary_down, alt_down, shift_down) = ui.input(|input| {
+                (
+                    input.pointer.button_down(PointerButton::Primary),
+                    input.modifiers.alt,
+                    input.modifiers.shift,
+                )
+            });
             let drag_started = plot_response.is_pointer_button_down_on()
                 && primary_down
                 && self.piano_roll_controller_stroke.is_none();
@@ -19907,7 +19918,7 @@ impl DawUi {
                     + geometry.horizontal_scroll)
                     / geometry.tick_scale.max(0.001);
                 let raw_tick = timeline_x.round().clamp(0.0, u32::MAX as f32) as i64;
-                let tick = if controller_tool == PianoRollControllerTool::Draw {
+                let tick = if controller_tool == PianoRollControllerTool::Draw && !alt_down {
                     snap_note_tick(raw_tick, geometry.snap_ticks, 0)
                 } else {
                     raw_tick.clamp(0, i64::from(u32::MAX)) as u32
@@ -19929,6 +19940,7 @@ impl DawUi {
                                 stream,
                                 tick,
                                 value,
+                                start_value: value,
                             });
                         }
                         Err(error) => {
@@ -19949,21 +19961,26 @@ impl DawUi {
                     + geometry.horizontal_scroll)
                     / geometry.tick_scale.max(0.001);
                 let raw_tick = timeline_x.round().clamp(0.0, u32::MAX as f32) as i64;
-                let tick = if controller_tool == PianoRollControllerTool::Draw {
+                let tick = if controller_tool == PianoRollControllerTool::Draw && !alt_down {
                     snap_note_tick(raw_tick, geometry.snap_ticks, 0)
                 } else {
                     raw_tick.clamp(0, i64::from(u32::MAX)) as u32
                 };
                 let normalized =
                     ((plot_rect.bottom() - pointer.y) / plot_rect.height()).clamp(0.0, 1.0);
-                let value = piano_roll_controller_value_at(normalized, minimum, maximum);
+                let pointer_value = piano_roll_controller_value_at(normalized, minimum, maximum);
+                let value = if shift_down {
+                    stroke.start_value
+                } else {
+                    pointer_value
+                };
                 if tick != stroke.tick || value.to_bits() != stroke.value.to_bits() {
                     let points = piano_roll_controller_stroke_points(
                         stroke.tick,
                         stroke.value,
                         tick,
                         value,
-                        if controller_tool == PianoRollControllerTool::Draw {
+                        if controller_tool == PianoRollControllerTool::Draw && !alt_down {
                             geometry.snap_ticks
                         } else {
                             1
@@ -19984,6 +20001,7 @@ impl DawUi {
                                         stream: stroke.stream,
                                         tick,
                                         value,
+                                        start_value: stroke.start_value,
                                     });
                             }
                             Err(error) => {

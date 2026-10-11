@@ -456,6 +456,17 @@ jobs:
           sleep 0.5
           ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
             -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/controller-event-draw.png"
+          xdotool keydown alt
+          xdotool mousemove 520 810
+          xdotool mousedown 1
+          sleep 0.2
+          xdotool mousemove --sync 670 790
+          sleep 0.3
+          xdotool mouseup 1
+          xdotool keyup alt
+          sleep 0.5
+          ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
+            -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/controller-event-draw-alt-bypass.png"
           xdotool mousemove 785 741 click 1
           sleep 0.2
           xdotool mousemove 720 800
@@ -467,6 +478,19 @@ jobs:
           sleep 0.5
           ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
             -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/controller-event-paint.png"
+          xdotool mousemove 785 741 click 1
+          sleep 0.2
+          xdotool mousemove 720 800
+          xdotool keydown shift
+          xdotool mousedown 1
+          sleep 0.2
+          xdotool mousemove --sync 870 830
+          sleep 0.3
+          xdotool mouseup 1
+          xdotool keyup shift
+          sleep 0.5
+          ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
+            -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/controller-event-paint-shift-lock.png"
           xdotool mousemove 875 741 click 1
           sleep 0.2
           xdotool mousemove 400 840
@@ -509,6 +533,7 @@ jobs:
             controller-ghost-editable.png controller-ghost-editable-shortcut.png controller-color-selection.png \
             piano-roll-time-selection.png piano-roll-pitch-selection.png piano-roll-mousewheel-property.png \
             piano-roll-mousewheel-nudge.png controller-event-draw.png controller-event-paint.png \
+            controller-event-draw-alt-bypass.png controller-event-paint-shift-lock.png \
             controller-event-interpolate-selecting.png controller-event-interpolate.png \
             controller-event-spline-selecting.png controller-event-spline.png \
             controller-event-erase-selecting.png controller-event-erase.png; do
