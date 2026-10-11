@@ -3408,6 +3408,94 @@ impl FlpDocument {
         Ok(new_index)
     }
 
+    /// Draws raw Pattern controller points into one existing channel/flags stream.
+    /// Points at existing ticks update that point's value; new ticks copy the first point's
+    /// opaque record fields. All edits are committed together so a drawn stroke is atomic.
+    pub fn draw_pattern_controller_points(
+        &mut self,
+        pattern_id: u16,
+        stream: (u8, u8),
+        points: &[(u32, f32)],
+    ) -> Result<usize, FlpError> {
+        if points.iter().any(|(_, value)| !value.is_finite()) {
+            return Err(FlpError::UnsupportedEdit(
+                "Pattern controller values must be finite",
+            ));
+        }
+        if points.is_empty() {
+            return Ok(0);
+        }
+
+        let pattern = self
+            .patterns()?
+            .into_iter()
+            .find(|pattern| pattern.id == pattern_id)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested Pattern does not exist",
+            ))?;
+        let template_index = pattern
+            .controllers
+            .iter()
+            .position(|controller| (controller.channel, controller.flags) == stream)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested raw Pattern controller stream does not exist",
+            ))?;
+        let (template_event_index, _, template) =
+            self.pattern_controller_record_location(pattern_id, template_index)?;
+
+        let mut existing_by_position = BTreeMap::new();
+        for (index, controller) in pattern.controllers.iter().enumerate() {
+            if (controller.channel, controller.flags) == stream {
+                existing_by_position
+                    .entry(controller.position)
+                    .or_insert(index);
+            }
+        }
+
+        let mut value_updates = BTreeMap::new();
+        let mut additions = Vec::<PatternController>::new();
+        let mut addition_by_position = BTreeMap::<u32, usize>::new();
+        for (position, value) in points {
+            if let Some(index) = existing_by_position.get(position).copied() {
+                let (event_index, record_offset, _) =
+                    self.pattern_controller_record_location(pattern_id, index)?;
+                value_updates.insert((event_index, record_offset + 8), value.to_bits());
+            } else if let Some(index) = addition_by_position.get(position).copied() {
+                additions[index].value_bits = value.to_bits();
+            } else {
+                let mut controller = template;
+                controller.position = *position;
+                controller.value_bits = value.to_bits();
+                addition_by_position.insert(*position, additions.len());
+                additions.push(controller);
+            }
+        }
+
+        let added_count = additions.len();
+        let mut candidate = self.clone();
+        for ((event_index, value_offset), value_bits) in value_updates {
+            write_event_payload_bytes(
+                &mut candidate.events[event_index],
+                value_offset,
+                &value_bits.to_le_bytes(),
+            )?;
+        }
+        if !additions.is_empty() {
+            let mut payload = candidate.events[template_event_index].payload.clone();
+            for controller in additions {
+                payload
+                    .len()
+                    .checked_add(FLP_PATTERN_CONTROLLER_RECORD_SIZE)
+                    .ok_or(FlpError::LengthOverflow)?;
+                payload.extend_from_slice(&controller.encode());
+            }
+            candidate.events[template_event_index].replace_data_payload(payload)?;
+        }
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(added_count)
+    }
+
     /// Removes one raw Pattern controller point by its zero-based Pattern index.
     pub fn delete_pattern_controller(
         &mut self,
@@ -17955,6 +18043,57 @@ mod tests {
                 .wire_bytes(),
             &unknown_event
         );
+    }
+
+    #[test]
+    fn drawing_pattern_controller_points_updates_and_appends_atomically() {
+        let first = pattern_controller_record(120, [0xA5, 0x5A], 3, 0x91, 0.25f32.to_bits());
+        let other_stream = pattern_controller_record(480, [0xD3, 0x4C], 7, 0x2A, 0.5f32.to_bits());
+        let unknown_event = [0xFE, 0x02, 0xAA, 0xBB];
+        let mut controller_payload = first.to_vec();
+        controller_payload.extend_from_slice(&other_stream);
+        let mut controller_event = Vec::new();
+        append_data_event(&mut controller_event, 0xDF, &controller_payload);
+        controller_event.extend_from_slice(&unknown_event);
+        let input = pattern_fixture(&[], &controller_event);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+
+        let added = document
+            .draw_pattern_controller_points(7, (3, 0x91), &[(120, 0.5), (240, 0.25), (240, 0.75)])
+            .expect("the raw stream should accept a painted stroke");
+        assert_eq!(added, 1);
+        let controllers = &document.patterns().unwrap()[0].controllers;
+        assert_eq!(controllers.len(), 3);
+        assert_eq!(controllers[0].position, 120);
+        assert_eq!(controllers[0].reserved, [0xA5, 0x5A]);
+        assert_eq!(controllers[0].value(), 0.5);
+        assert_eq!(controllers[1].encode(), other_stream);
+        assert_eq!(controllers[2].position, 240);
+        assert_eq!(controllers[2].reserved, [0xA5, 0x5A]);
+        assert_eq!(controllers[2].channel, 3);
+        assert_eq!(controllers[2].flags, 0x91);
+        assert_eq!(controllers[2].value(), 0.75);
+
+        let encoded = document.encode_lossless().unwrap();
+        let reparsed = FlpDocument::parse(&encoded).expect("drawn project should parse");
+        assert_eq!(reparsed.patterns().unwrap(), document.patterns().unwrap());
+        assert_eq!(
+            reparsed
+                .events()
+                .iter()
+                .find(|event| event.opcode() == 0xFE)
+                .expect("unknown event should remain")
+                .wire_bytes(),
+            &unknown_event
+        );
+
+        let before_invalid_edit = document.encode_lossless().unwrap();
+        assert!(
+            document
+                .draw_pattern_controller_points(7, (3, 0x91), &[(360, f32::NAN)])
+                .is_err()
+        );
+        assert_eq!(document.encode_lossless().unwrap(), before_invalid_edit);
     }
 
     #[test]

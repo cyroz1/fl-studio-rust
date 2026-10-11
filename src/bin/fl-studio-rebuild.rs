@@ -599,6 +599,22 @@ enum PianoRollEventTarget {
     RawControllers,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum PianoRollControllerTool {
+    #[default]
+    Edit,
+    Draw,
+    Paint,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PianoRollControllerStroke {
+    pattern_id: u16,
+    stream: (u8, u8),
+    tick: u32,
+    value: f32,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PianoRollMouseWheelAction {
     AdjustProperty,
@@ -1733,6 +1749,8 @@ struct DawUi {
     piano_roll_event_editor_open: bool,
     piano_roll_event_target: PianoRollEventTarget,
     piano_roll_controller_stream: Option<(u8, u8)>,
+    piano_roll_controller_tool: PianoRollControllerTool,
+    piano_roll_controller_stroke: Option<PianoRollControllerStroke>,
     piano_roll_scale: PianoRollScale,
     piano_roll_scale_root: u8,
     piano_roll_ghost_channels: bool,
@@ -2226,6 +2244,8 @@ impl DawUi {
             piano_roll_event_editor_open: false,
             piano_roll_event_target: PianoRollEventTarget::Velocity,
             piano_roll_controller_stream: None,
+            piano_roll_controller_tool: PianoRollControllerTool::Edit,
+            piano_roll_controller_stroke: None,
             piano_roll_scale: PianoRollScale::Major,
             piano_roll_scale_root: 0,
             piano_roll_ghost_channels: true,
@@ -19492,6 +19512,24 @@ impl DawUi {
         ui.horizontal_wrapped(|ui| {
             ui.strong("Pattern controller data");
             piano_roll_event_target_selector(ui, &mut self.piano_roll_event_target);
+            ui.selectable_value(
+                &mut self.piano_roll_controller_tool,
+                PianoRollControllerTool::Edit,
+                "Edit",
+            )
+            .on_hover_text("Move individual raw points or click to add one");
+            ui.selectable_value(
+                &mut self.piano_roll_controller_tool,
+                PianoRollControllerTool::Draw,
+                "Draw",
+            )
+            .on_hover_text("Draw a snapped raw controller curve");
+            ui.selectable_value(
+                &mut self.piano_roll_controller_tool,
+                PianoRollControllerTool::Paint,
+                "Paint",
+            )
+            .on_hover_text("Paint raw points without the current snap setting");
             if !streams.is_empty() {
                 let selected_text = self.piano_roll_controller_stream.map_or_else(
                     || "All raw points".to_owned(),
@@ -19514,9 +19552,13 @@ impl DawUi {
                         }
                     });
             }
-            ui.weak(
-                "Drag to edit · click empty space to duplicate · right-click a point to delete",
-            );
+            ui.weak(match self.piano_roll_controller_tool {
+                PianoRollControllerTool::Edit => {
+                    "Drag to edit · click empty space to duplicate · right-click to delete"
+                }
+                PianoRollControllerTool::Draw => "Drag in the lane to draw · uses current snap",
+                PianoRollControllerTool::Paint => "Drag in the lane to paint · snap is bypassed",
+            });
         });
 
         let size = Vec2::new(ui.available_width().max(1.0), 116.0);
@@ -19614,7 +19656,7 @@ impl DawUi {
         let plot_response = ui.interact(
             plot_rect,
             Id::new(("piano-controller-event-plot", pattern.id)),
-            Sense::click(),
+            Sense::click_and_drag(),
         );
         let mut hovered_point = false;
         let mut same_position_count = BTreeMap::<(u32, u8, u8), u8>::new();
@@ -19653,11 +19695,16 @@ impl DawUi {
                 egui::pos2(x - 7.0, point.y.min(baseline) - 5.0),
                 egui::pos2(x + 7.0, point.y.max(baseline) + 5.0),
             );
+            let point_sense = if self.piano_roll_controller_tool == PianoRollControllerTool::Edit {
+                Sense::click_and_drag()
+            } else {
+                Sense::hover()
+            };
             let response = ui
                 .interact(
                     hit_rect,
                     Id::new(("piano-controller-event", pattern.id, controller_index)),
-                    Sense::click_and_drag(),
+                    point_sense,
                 )
                 .on_hover_text(format!(
                     "0xDF point {controller_index}\nPosition: {} ticks\nRaw channel: {}\nRaw flags: 0x{:02X}\nReserved: {:02X} {:02X}\nValue: {:?} (0x{:08X})",
@@ -19674,12 +19721,14 @@ impl DawUi {
                 painter.circle_stroke(point, 5.5, Stroke::new(1.0, TEXT));
             }
             let mut delete_requested = false;
-            response.clone().context_menu(|ui| {
-                if ui.button("Delete raw point").clicked() {
-                    delete_requested = true;
-                    ui.close();
-                }
-            });
+            if self.piano_roll_controller_tool == PianoRollControllerTool::Edit {
+                response.clone().context_menu(|ui| {
+                    if ui.button("Delete raw point").clicked() {
+                        delete_requested = true;
+                        ui.close();
+                    }
+                });
+            }
             if delete_requested {
                 if let Some(document) = &mut self.document {
                     match document.delete_pattern_controller(pattern.id, controller_index) {
@@ -19694,7 +19743,8 @@ impl DawUi {
                 }
                 return;
             }
-            if response.dragged()
+            if self.piano_roll_controller_tool == PianoRollControllerTool::Edit
+                && response.dragged()
                 && let Some(pointer) = response.interact_pointer_pos()
             {
                 let timeline_x = (pointer.x.clamp(plot_rect.left(), plot_rect.right())
@@ -19732,7 +19782,132 @@ impl DawUi {
             }
         }
 
-        if plot_response.clicked()
+        let controller_tool = self.piano_roll_controller_tool;
+        if matches!(
+            controller_tool,
+            PianoRollControllerTool::Draw | PianoRollControllerTool::Paint
+        ) && !self.piano_roll_select_mode
+            && !self.piano_roll_zoom_mode
+            && !self.piano_roll_playback_mode
+        {
+            let primary_down = ui.input(|input| input.pointer.button_down(PointerButton::Primary));
+            let drag_started = plot_response.is_pointer_button_down_on()
+                && primary_down
+                && self.piano_roll_controller_stroke.is_none();
+            if drag_started && let Some(pointer) = plot_response.interact_pointer_pos() {
+                let stream = self.piano_roll_controller_stream.or_else(|| {
+                    (streams.len() == 1)
+                        .then(|| streams.first().copied())
+                        .flatten()
+                });
+                let Some(stream) = stream else {
+                    self.status = "Choose a raw controller stream before drawing".to_owned();
+                    self.piano_roll_controller_stroke = None;
+                    return;
+                };
+                self.piano_roll_controller_stream = Some(stream);
+                let timeline_x = (pointer.x.clamp(plot_rect.left(), plot_rect.right())
+                    - plot_rect.left()
+                    + geometry.horizontal_scroll)
+                    / geometry.tick_scale.max(0.001);
+                let raw_tick = timeline_x.round().clamp(0.0, u32::MAX as f32) as i64;
+                let tick = if controller_tool == PianoRollControllerTool::Draw {
+                    snap_note_tick(raw_tick, geometry.snap_ticks, 0)
+                } else {
+                    raw_tick.clamp(0, i64::from(u32::MAX)) as u32
+                };
+                let normalized =
+                    ((plot_rect.bottom() - pointer.y) / plot_rect.height()).clamp(0.0, 1.0);
+                let value = piano_roll_controller_value_at(normalized, minimum, maximum);
+                if let Some(document) = &mut self.document {
+                    match document.draw_pattern_controller_points(
+                        pattern.id,
+                        stream,
+                        &[(tick, value)],
+                    ) {
+                        Ok(_) => {
+                            self.dirty = true;
+                            self.status = "Drawing raw Pattern controller points".to_owned();
+                            self.piano_roll_controller_stroke = Some(PianoRollControllerStroke {
+                                pattern_id: pattern.id,
+                                stream,
+                                tick,
+                                value,
+                            });
+                        }
+                        Err(error) => {
+                            self.status =
+                                format!("Could not draw Pattern controller points: {error}");
+                            self.piano_roll_controller_stroke = None;
+                        }
+                    }
+                }
+            } else if plot_response.dragged_by(PointerButton::Primary)
+                && let Some(pointer) = plot_response.interact_pointer_pos()
+                && let Some(stroke) = self
+                    .piano_roll_controller_stroke
+                    .filter(|stroke| stroke.pattern_id == pattern.id)
+            {
+                let timeline_x = (pointer.x.clamp(plot_rect.left(), plot_rect.right())
+                    - plot_rect.left()
+                    + geometry.horizontal_scroll)
+                    / geometry.tick_scale.max(0.001);
+                let raw_tick = timeline_x.round().clamp(0.0, u32::MAX as f32) as i64;
+                let tick = if controller_tool == PianoRollControllerTool::Draw {
+                    snap_note_tick(raw_tick, geometry.snap_ticks, 0)
+                } else {
+                    raw_tick.clamp(0, i64::from(u32::MAX)) as u32
+                };
+                let normalized =
+                    ((plot_rect.bottom() - pointer.y) / plot_rect.height()).clamp(0.0, 1.0);
+                let value = piano_roll_controller_value_at(normalized, minimum, maximum);
+                if tick != stroke.tick || value.to_bits() != stroke.value.to_bits() {
+                    let points = piano_roll_controller_stroke_points(
+                        stroke.tick,
+                        stroke.value,
+                        tick,
+                        value,
+                        if controller_tool == PianoRollControllerTool::Draw {
+                            geometry.snap_ticks
+                        } else {
+                            1
+                        },
+                    );
+                    if let Some(document) = &mut self.document {
+                        match document.draw_pattern_controller_points(
+                            pattern.id,
+                            stroke.stream,
+                            &points,
+                        ) {
+                            Ok(_) => {
+                                self.dirty = true;
+                                self.status = "Drawing raw Pattern controller points".to_owned();
+                                self.piano_roll_controller_stroke =
+                                    Some(PianoRollControllerStroke {
+                                        pattern_id: pattern.id,
+                                        stream: stroke.stream,
+                                        tick,
+                                        value,
+                                    });
+                            }
+                            Err(error) => {
+                                self.status =
+                                    format!("Could not draw Pattern controller points: {error}");
+                                self.piano_roll_controller_stroke = None;
+                            }
+                        }
+                    }
+                }
+            }
+            if !primary_down {
+                self.piano_roll_controller_stroke = None;
+            }
+        } else {
+            self.piano_roll_controller_stroke = None;
+        }
+
+        if self.piano_roll_controller_tool == PianoRollControllerTool::Edit
+            && plot_response.clicked()
             && !hovered_point
             && !self.piano_roll_select_mode
             && !self.piano_roll_zoom_mode
@@ -25707,6 +25882,41 @@ fn piano_roll_controller_value_at(normalized: f32, minimum: f64, maximum: f64) -
     value.clamp(-f64::from(f32::MAX), f64::from(f32::MAX)) as f32
 }
 
+fn piano_roll_controller_stroke_points(
+    start_tick: u32,
+    start_value: f32,
+    end_tick: u32,
+    end_value: f32,
+    tick_step: u32,
+) -> Vec<(u32, f32)> {
+    const MAX_STROKE_SAMPLES: u64 = 4096;
+
+    if start_tick == end_tick {
+        return vec![(end_tick, end_value)];
+    }
+    let delta = i64::from(end_tick) - i64::from(start_tick);
+    let distance = delta.unsigned_abs();
+    let tick_step = u64::from(tick_step.max(1))
+        .max(distance.div_ceil(MAX_STROKE_SAMPLES))
+        .min(u64::from(u32::MAX)) as i64;
+    let direction = delta.signum();
+    let mut tick = i64::from(start_tick);
+    let start_value = f64::from(start_value);
+    let end_value = f64::from(end_value);
+    let denominator = delta as f64;
+    let capacity = distance.div_ceil(tick_step as u64).min(MAX_STROKE_SAMPLES) as usize;
+    let mut points = Vec::with_capacity(capacity);
+
+    while tick != i64::from(end_tick) {
+        let remaining = (i64::from(end_tick) - tick).unsigned_abs() as i64;
+        tick += direction * tick_step.min(remaining);
+        let fraction = (tick - i64::from(start_tick)) as f64 / denominator;
+        let value = (start_value + (end_value - start_value) * fraction) as f32;
+        points.push((tick.clamp(0, i64::from(u32::MAX)) as u32, value));
+    }
+    points
+}
+
 fn snap_signed_tick_delta(value: i64, quantum: u32) -> i64 {
     let quantum = u64::from(quantum.max(1));
     let magnitude = value.unsigned_abs();
@@ -26584,9 +26794,10 @@ mod tests {
         TimeSelectionShift, candidate_matches_vst_identity, candidate_mixer_controls,
         encode_midi_device_selections, first_available_playlist_track, next_piano_roll_note_group,
         note_from_grid_position, parse_midi_device_selections, piano_roll_color_group_note_ids,
-        piano_roll_controller_value_at, piano_roll_controller_value_range,
-        piano_roll_discard_length_edit, piano_roll_duplicate_offset, piano_roll_key_at_y,
-        piano_roll_note_group_members, piano_roll_note_nudge_edit, piano_roll_odd_note_selection,
+        piano_roll_controller_stroke_points, piano_roll_controller_value_at,
+        piano_roll_controller_value_range, piano_roll_discard_length_edit,
+        piano_roll_duplicate_offset, piano_roll_key_at_y, piano_roll_note_group_members,
+        piano_roll_note_nudge_edit, piano_roll_odd_note_selection,
         piano_roll_overlap_note_selection, piano_roll_pitch_range_note_selection,
         piano_roll_random_note_selection, piano_roll_selection_time_range,
         piano_roll_shift_time_range, piano_roll_time_range_from_drag,
@@ -27656,6 +27867,22 @@ mod tests {
         assert_eq!(piano_roll_controller_value_at(0.0, 0.0, 1.0), 0.0);
         assert_eq!(piano_roll_controller_value_at(1.0, 0.0, 1.0), 1.0);
         assert!(piano_roll_controller_value_at(0.5, raw_range.0, raw_range.1).is_finite());
+    }
+
+    #[test]
+    fn raw_controller_strokes_interpolate_samples_and_respect_tick_step() {
+        assert_eq!(
+            piano_roll_controller_stroke_points(0, 0.0, 8, 1.0, 4),
+            vec![(4, 0.5), (8, 1.0)]
+        );
+        assert_eq!(
+            piano_roll_controller_stroke_points(8, 1.0, 0, 0.0, 4),
+            vec![(4, 0.5), (0, 0.0)]
+        );
+        assert_eq!(
+            piano_roll_controller_stroke_points(12, 0.25, 12, 0.75, 4),
+            vec![(12, 0.75)]
+        );
     }
 
     #[test]

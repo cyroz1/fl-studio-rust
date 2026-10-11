@@ -445,11 +445,33 @@ jobs:
             cat "$RUNNER_TEMP/controller-preview.log"
             exit 1
           fi
+          xdotool mousemove 720 741 click 1
+          sleep 0.2
+          xdotool mousemove 520 840
+          xdotool mousedown 1
+          sleep 0.2
+          xdotool mousemove --sync 670 800
+          sleep 0.3
+          xdotool mouseup 1
+          sleep 0.5
+          ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
+            -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/controller-event-draw.png"
+          xdotool mousemove 785 741 click 1
+          sleep 0.2
+          xdotool mousemove 720 800
+          xdotool mousedown 1
+          sleep 0.2
+          xdotool mousemove --sync 870 830
+          sleep 0.3
+          xdotool mouseup 1
+          sleep 0.5
+          ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
+            -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/controller-event-paint.png"
           for capture in browser-search-options.png playlist-solo.png playlist-group-solo.png playlist-groups-collapsed.png \
             mixer.png mixer-effect-slots-scrolled.png mixer-muted.png mixer-muted-solo.png mixer-phase-swap.png controller-ghost-visibility.png \
             controller-ghost-editable.png controller-ghost-editable-shortcut.png controller-color-selection.png \
             piano-roll-time-selection.png piano-roll-pitch-selection.png piano-roll-mousewheel-property.png \
-            piano-roll-mousewheel-nudge.png; do
+            piano-roll-mousewheel-nudge.png controller-event-draw.png controller-event-paint.png; do
             if [[ "$(stat -c%s "$GITHUB_WORKSPACE/dist/gui-preview/$capture")" -lt 10000 ]]; then
               echo "The $capture capture is blank or incomplete."
               cat "$RUNNER_TEMP/mixer-preview.log"
