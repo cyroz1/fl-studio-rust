@@ -2018,7 +2018,7 @@ struct PendingAudioRender {
 
 struct PendingAudioClipExport {
     receiver: Receiver<Result<AudioClipRenderSummary, String>>,
-    worker: thread::JoinHandle<()>,
+    worker: Option<thread::JoinHandle<()>>,
     output_path: PathBuf,
     selected_clip_index: Option<usize>,
     start_from_song_start: bool,
@@ -17869,7 +17869,7 @@ impl DawUi {
                 let is_replacement = replacement.is_some();
                 self.pending_audio_clip_export = Some(PendingAudioClipExport {
                     receiver,
-                    worker,
+                    worker: Some(worker),
                     output_path: output_path.clone(),
                     selected_clip_index,
                     start_from_song_start: options.start_from_song_start,
@@ -17921,10 +17921,14 @@ impl DawUi {
         let Some(result) = completed else {
             return;
         };
-        let Some(pending) = self.pending_audio_clip_export.take() else {
+        let Some(mut pending) = self.pending_audio_clip_export.take() else {
             return;
         };
-        if pending.worker.join().is_err() {
+        let Some(worker) = pending.worker.take() else {
+            self.status = "Playlist audio clip render worker handle is missing".to_owned();
+            return;
+        };
+        if worker.join().is_err() {
             self.status = "Playlist audio clip render worker panicked".to_owned();
             return;
         }
