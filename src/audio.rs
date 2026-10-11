@@ -1737,16 +1737,20 @@ fn wasapi_exclusive_output_worker(
         let initial_frames = client
             .get_available_space_in_frames()
             .map_err(|error| error.to_string())? as usize;
-        let initial = render_wasapi_buffer(
+        // Reuse this storage for each later event instead of allocating a
+        // fresh byte buffer on every wake-up.
+        let mut output = Vec::with_capacity(initial_frames.saturating_mul(format_spec.frame_bytes));
+        render_wasapi_buffer(
             initial_frames,
             &format_spec,
             &source,
             &playback,
             &ring,
             &mut phase,
+            &mut output,
         )?;
         render
-            .write_to_device(initial_frames, &initial, None)
+            .write_to_device(initial_frames, &output, None)
             .map_err(|error| error.to_string())?;
         client
             .start_stream()
@@ -1761,16 +1765,17 @@ fn wasapi_exclusive_output_worker(
                         .get_available_space_in_frames()
                         .map_err(|error| error.to_string())?
                         as usize;
-                    let bytes = render_wasapi_buffer(
+                    render_wasapi_buffer(
                         frames,
                         &format_spec,
                         &source,
                         &playback,
                         &ring,
                         &mut phase,
+                        &mut output,
                     )?;
                     render
-                        .write_to_device(frames, &bytes, None)
+                        .write_to_device(frames, &output, None)
                         .map_err(|error| error.to_string())?;
                 }
                 Err(wasapi::WasapiError::EventTimeout) => {}
@@ -2090,9 +2095,10 @@ fn render_wasapi_buffer(
     playback: &PlaybackState,
     ring: &AudioRingBuffer,
     phase: &mut f32,
-) -> Result<Vec<u8>, String> {
+    output: &mut Vec<u8>,
+) -> Result<(), String> {
     playback.apply_pending_commands(source);
-    let mut output = vec![0_u8; frames.saturating_mul(format.frame_bytes)];
+    output.resize(frames.saturating_mul(format.frame_bytes), 0);
     let sample_rate = format.get_sample_rate();
     let playback_samples = playback.samples.load();
     let streaming = playback.streaming.load();
@@ -2117,7 +2123,7 @@ fn render_wasapi_buffer(
             format.encode(sample, channel)?;
         }
     }
-    Ok(output)
+    Ok(())
 }
 
 #[cfg(windows)]
