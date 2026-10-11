@@ -1709,7 +1709,7 @@ pub struct MixerEffectSlotSummary {
     end_event_index: usize,
 }
 
-/// Read-only route-volume parameter and its paired saved routing flag, when available.
+/// Summary of one route-volume parameter and its paired saved routing flag, when available.
 /// The parameter ID and destination mapping remain raw because their visible Mixer-track
 /// numbering has not been confirmed against a controlled native save.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -5268,12 +5268,37 @@ impl FlpDocument {
         Ok(records)
     }
 
-    /// Returns saved Mixer send-level records with their insert-scoped `0xEB` routing flag,
-    /// when that flag is present. Route parameters are paired in event order as in PyFLP;
-    /// parameter IDs and candidate source-track numbering remain unverified mappings.
+    /// Returns saved Mixer send-level records with a paired routing flag when available.
+    /// Newer FLP projects store a project-wide `0xE7` routing byte stream; older projects
+    /// store insert-scoped `0xEB` arrays. Parameter IDs and candidate source-track numbering
+    /// remain unverified mappings.
     pub fn mixer_send_summaries(&self) -> Result<Vec<MixerSendSummary>, FlpError> {
         let inserts = self.mixer_inserts();
         let parameters = self.mixer_parameter_records()?;
+        let first_channel = self
+            .events
+            .iter()
+            .position(|event| event.opcode == 0x40)
+            .unwrap_or(self.events.len());
+        let project_routing_flags = self.events[first_channel..]
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| {
+                event.opcode == 0xE7 && matches!(event.encoding, PayloadEncoding::Data { .. })
+            })
+            .flat_map(|(offset, event)| {
+                let event_index = first_channel + offset;
+                event
+                    .payload
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(move |(flag_index, flag)| (event_index, flag_index, flag != 0))
+            })
+            .collect::<Vec<_>>();
+        let has_project_routing_stream = self.events[first_channel..].iter().any(|event| {
+            event.opcode == 0xE7 && matches!(event.encoding, PayloadEncoding::Data { .. })
+        });
         let mut seen_route_parameters = HashMap::<usize, HashSet<u8>>::new();
         let mut ambiguous_inserts = HashSet::new();
         for record in parameters
@@ -5303,6 +5328,7 @@ impl FlpDocument {
             })
             .collect::<HashMap<_, _>>();
         let mut route_indices_by_insert = HashMap::<usize, usize>::new();
+        let mut project_route_index = 0usize;
         let mut summaries = Vec::new();
 
         for record in parameters
@@ -5312,23 +5338,35 @@ impl FlpDocument {
             let Some(insert_ordinal) = record.candidate_insert_ordinal() else {
                 continue;
             };
-            let route_index = route_indices_by_insert.entry(insert_ordinal).or_default();
-            let (enabled, routing_flag_location) = if ambiguous_inserts.contains(&insert_ordinal) {
-                (None, None)
+            let (enabled, routing_flag_location) = if has_project_routing_stream {
+                let paired_flag = project_routing_flags.get(project_route_index).copied();
+                project_route_index += 1;
+                if ambiguous_inserts.contains(&insert_ordinal) {
+                    (None, None)
+                } else {
+                    paired_flag.map_or((None, None), |(event_index, flag_index, enabled)| {
+                        (Some(enabled), Some((event_index, flag_index)))
+                    })
+                }
             } else {
-                routing_flags_by_insert
+                let route_index = route_indices_by_insert.entry(insert_ordinal).or_default();
+                let paired_flag = routing_flags_by_insert
                     .get(&insert_ordinal)
                     .and_then(Option::as_ref)
                     .and_then(|(event_index, flags)| {
                         flags
                             .get(*route_index)
-                            .map(|flag| (*event_index, *flag != 0))
+                            .map(|flag| (*event_index, *route_index, *flag != 0))
+                    });
+                *route_index += 1;
+                if ambiguous_inserts.contains(&insert_ordinal) {
+                    (None, None)
+                } else {
+                    paired_flag.map_or((None, None), |(event_index, flag_index, enabled)| {
+                        (Some(enabled), Some((event_index, flag_index)))
                     })
-                    .map_or((None, None), |(event_index, enabled)| {
-                        (Some(enabled), Some((event_index, *route_index)))
-                    })
+                }
             };
-            *route_index += 1;
             summaries.push(MixerSendSummary {
                 insert_ordinal,
                 route_parameter_id: record.parameter_id(),
@@ -5394,7 +5432,7 @@ impl FlpDocument {
         Ok(())
     }
 
-    /// Toggles one existing insert-scoped Mixer routing flag without changing other bytes.
+    /// Toggles one existing Mixer routing flag without changing other bytes.
     pub fn set_mixer_routing_flag(
         &mut self,
         event_index: usize,
@@ -5407,9 +5445,9 @@ impl FlpDocument {
             .ok_or(FlpError::UnsupportedEdit(
                 "the requested Mixer routing event does not exist",
             ))?;
-        if event.opcode != 0xEB {
+        if !matches!(event.opcode, 0xE7 | 0xEB) {
             return Err(FlpError::UnsupportedEdit(
-                "the requested event is not an insert routing event",
+                "the requested event is not a Mixer routing event",
             ));
         }
         if !matches!(event.encoding, PayloadEncoding::Data { .. }) {
@@ -16828,6 +16866,80 @@ mod tests {
             .encode_lossless()
             .expect("the changed Mixer route should encode losslessly");
         let round_trip = FlpDocument::parse(&encoded).expect("the changed Mixer route parses");
+        assert_eq!(
+            round_trip.mixer_send_summaries().unwrap()[0].enabled(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn mixer_send_summaries_pair_split_project_routing_stream_in_parameter_order() {
+        let mut event_stream = Vec::new();
+        append_data_event(&mut event_stream, 0xE7, b"Drums\0");
+        event_stream.extend_from_slice(&[0x40, 0, 0x15, 0]);
+        append_data_event(&mut event_stream, 0xE7, &[0]);
+        append_data_event(&mut event_stream, 0xE7, &[1, 0]);
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        for color in [0x001C_1F8Cu32, 0x001D_2792] {
+            event_stream.push(0x9A);
+            event_stream.extend_from_slice(&(-1_i32).to_le_bytes());
+            event_stream.push(0x93);
+            event_stream.extend_from_slice(&(-1_i32).to_le_bytes());
+            event_stream.push(0x95);
+            event_stream.extend_from_slice(&color.to_le_bytes());
+            event_stream.push(0x93);
+            event_stream.extend_from_slice(&(-1_i32).to_le_bytes());
+        }
+
+        let mut parameter_payload = Vec::new();
+        for (source_insert, route_id, value) in [
+            (64_u16, 66_u8, 12_800_i32),
+            (64, 67, 6_400),
+            (65, 66, 9_600),
+        ] {
+            parameter_payload.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+            parameter_payload.push(route_id);
+            parameter_payload.push(0);
+            parameter_payload.extend_from_slice(&(source_insert << 6).to_le_bytes());
+            parameter_payload.extend_from_slice(&value.to_le_bytes());
+        }
+        append_data_event(&mut event_stream, 0xE1, &parameter_payload);
+
+        let mut document = FlpDocument::parse(&flp_fixture(&event_stream, &[], &[]))
+            .expect("the split Mixer routing fixture should parse");
+        let sends = document
+            .mixer_send_summaries()
+            .expect("Mixer parameter records should decode");
+        assert_eq!(sends.len(), 3);
+        assert_eq!(sends[0].insert_ordinal(), 0);
+        assert_eq!(sends[0].enabled(), Some(false));
+        assert_eq!(sends[1].insert_ordinal(), 0);
+        assert_eq!(sends[1].enabled(), Some(true));
+        assert_eq!(sends[2].insert_ordinal(), 1);
+        assert_eq!(sends[2].enabled(), Some(false));
+
+        let first_routing_event = document
+            .events()
+            .iter()
+            .position(|event| event.opcode() == 0xE7 && event.payload() == [0])
+            .expect("the first split routing event should be present");
+        assert_eq!(
+            sends[0].routing_flag_location(),
+            Some((first_routing_event, 0))
+        );
+        document
+            .set_mixer_routing_flag(first_routing_event, 0, true)
+            .expect("the project routing byte should be editable");
+        assert_eq!(document.events()[first_routing_event].payload(), &[1]);
+        assert_eq!(
+            document.mixer_send_summaries().unwrap()[0].enabled(),
+            Some(true)
+        );
+
+        let encoded = document
+            .encode_lossless()
+            .expect("edited project routing should encode losslessly");
+        let round_trip = FlpDocument::parse(&encoded).expect("edited routing should reparse");
         assert_eq!(
             round_trip.mixer_send_summaries().unwrap()[0].enabled(),
             Some(true)
