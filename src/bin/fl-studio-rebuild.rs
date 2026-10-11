@@ -2066,6 +2066,7 @@ struct DawUi {
     last_piano_roll_audition: Option<(u16, u16, usize)>,
     piano_roll_zoom: f32,
     piano_roll_window_detached: bool,
+    mixer_window_detached: bool,
     piano_roll_pending_scroll_offset: Option<Vec2>,
     piano_roll_grid_viewport: Option<egui::Rect>,
     piano_roll_grid_scroll_offset: Vec2,
@@ -2589,6 +2590,7 @@ impl DawUi {
             last_piano_roll_audition: None,
             piano_roll_zoom: 0.10,
             piano_roll_window_detached: false,
+            mixer_window_detached: false,
             piano_roll_pending_scroll_offset: None,
             piano_roll_grid_viewport: None,
             piano_roll_grid_scroll_offset: Vec2::ZERO,
@@ -6382,13 +6384,29 @@ impl DawUi {
                     .clicked()
                 {
                     self.piano_roll_window_detached = !self.piano_roll_window_detached;
-                    if self.piano_roll_window_detached {
-                        self.view = MainView::PianoRoll;
-                        self.status = "Piano roll opened in a separate window".to_owned();
+                    self.view = MainView::PianoRoll;
+                    self.status = if self.piano_roll_window_detached {
+                        "Piano roll opened in a separate window".to_owned()
                     } else {
-                        self.view = MainView::PianoRoll;
-                        self.status = "Piano roll returned to the main window".to_owned();
-                    }
+                        "Piano roll returned to the main window".to_owned()
+                    };
+                    ui.close();
+                }
+                if ui
+                    .button(if self.mixer_window_detached {
+                        "Dock Mixer"
+                    } else {
+                        "Detach Mixer"
+                    })
+                    .clicked()
+                {
+                    self.mixer_window_detached = !self.mixer_window_detached;
+                    self.view = MainView::Mixer;
+                    self.status = if self.mixer_window_detached {
+                        "Mixer opened in a separate window".to_owned()
+                    } else {
+                        "Mixer returned to the main window".to_owned()
+                    };
                     ui.close();
                 }
                 ui.separator();
@@ -25185,6 +25203,23 @@ impl eframe::App for DawUi {
                                 });
                             }
                             MainView::PianoRoll => self.piano_roll(ui),
+                            MainView::Mixer if self.mixer_window_detached => {
+                                ui.centered_and_justified(|ui| {
+                                    ui.vertical_centered(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "Mixer is open in a separate window",
+                                            )
+                                            .size(18.0)
+                                            .color(MUTED),
+                                        );
+                                        ui.add_space(8.0);
+                                        if ui.button("Dock Mixer").clicked() {
+                                            self.mixer_window_detached = false;
+                                        }
+                                    });
+                                });
+                            }
                             MainView::Mixer => self.mixer(ui),
                             MainView::Plugins => self.plugins(ui),
                             MainView::Audio => self.audio_settings_view(ui),
@@ -25358,6 +25393,122 @@ impl eframe::App for DawUi {
                 self.history_snapshot_available_this_frame =
                     frame_snapshot.is_some() || self.pending_history_snapshot.is_some();
                 self.piano_roll(viewport_ui);
+            });
+        }
+        if self.mixer_window_detached {
+            let viewport_id = egui::ViewportId::from_hash_of("detached-mixer");
+            let viewport = egui::ViewportBuilder::default()
+                .with_title("Mixer")
+                .with_inner_size(Vec2::new(1080.0, 640.0))
+                .with_min_inner_size(Vec2::new(760.0, 480.0))
+                .with_resizable(true);
+            let context = ui.ctx().clone();
+            context.show_viewport_immediate(viewport_id, viewport, |viewport_ui, _class| {
+                let viewport_context = viewport_ui.ctx().clone();
+                if viewport_context.input(|input| input.viewport().close_requested()) {
+                    self.mixer_window_detached = false;
+                    return;
+                }
+
+                viewport_context.set_theme(egui::Theme::Dark);
+                viewport_ui.set_style(viewport_context.global_style());
+                *viewport_ui.visuals_mut() = app_visuals();
+                viewport_ui.painter().rect_filled(
+                    viewport_ui.max_rect(),
+                    egui::CornerRadius::ZERO,
+                    APP_BACKGROUND,
+                );
+
+                let child_history_navigation = !viewport_context.egui_wants_keyboard_input()
+                    && viewport_ui.input_mut(|input| {
+                        input.consume_key(
+                            egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                            egui::Key::Z,
+                        ) || input.consume_key(egui::Modifiers::COMMAND, egui::Key::Y)
+                    });
+                let child_undo_requested = !child_history_navigation
+                    && !viewport_context.egui_wants_keyboard_input()
+                    && viewport_ui.input_mut(|input| {
+                        input.consume_key(egui::Modifiers::COMMAND, egui::Key::Z)
+                    });
+                if child_history_navigation {
+                    self.redo_document();
+                    history_navigation = true;
+                } else if child_undo_requested {
+                    self.undo_document();
+                    history_navigation = true;
+                }
+                let child_save_as_requested = !viewport_context.egui_wants_keyboard_input()
+                    && viewport_ui.input_mut(|input| {
+                        input.consume_key(
+                            egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                            egui::Key::S,
+                        )
+                    });
+                let child_save_version_requested = !child_save_as_requested
+                    && !viewport_context.egui_wants_keyboard_input()
+                    && viewport_ui.input_mut(|input| {
+                        input.consume_key(egui::Modifiers::COMMAND, egui::Key::N)
+                    });
+                let child_save_requested = !child_save_as_requested
+                    && !child_save_version_requested
+                    && !viewport_context.egui_wants_keyboard_input()
+                    && viewport_ui.input_mut(|input| {
+                        input.consume_key(egui::Modifiers::COMMAND, egui::Key::S)
+                    });
+                if child_save_as_requested {
+                    self.save_as();
+                } else if child_save_version_requested {
+                    self.save_new_version();
+                } else if child_save_requested {
+                    self.save();
+                }
+                let child_play_pause_requested = !viewport_context.egui_wants_keyboard_input()
+                    && viewport_ui.input_mut(|input| {
+                        input.consume_key(egui::Modifiers::NONE, egui::Key::Space)
+                    });
+                if child_play_pause_requested {
+                    self.toggle_project_playback();
+                }
+
+                let child_pointer_down = viewport_ui.input(|input| {
+                    input.pointer.primary_down()
+                        || input.pointer.button_down(PointerButton::Secondary)
+                });
+                pointer_down |= child_pointer_down;
+                let child_edit_input_received = viewport_ui.input(|input| {
+                    input.pointer.primary_pressed()
+                        || input.pointer.primary_down()
+                        || input.pointer.primary_released()
+                        || input.pointer.button_pressed(PointerButton::Secondary)
+                        || input.pointer.button_down(PointerButton::Secondary)
+                        || input.pointer.button_released(PointerButton::Secondary)
+                        || input.events.iter().any(|event| {
+                            matches!(
+                                event,
+                                egui::Event::Key { pressed: true, .. }
+                                    | egui::Event::Text(_)
+                                    | egui::Event::Paste(_)
+                                    | egui::Event::MouseWheel { .. }
+                            )
+                        })
+                });
+                if !history_navigation
+                    && frame_snapshot.is_none()
+                    && self.pending_history_snapshot.is_none()
+                    && child_edit_input_received
+                {
+                    frame_snapshot = match self.encode_history_snapshot() {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => {
+                            self.status = format!("Could not capture undo state: {error}");
+                            None
+                        }
+                    };
+                }
+                self.history_snapshot_available_this_frame =
+                    frame_snapshot.is_some() || self.pending_history_snapshot.is_some();
+                self.mixer(viewport_ui);
             });
         }
         let history_snapshot_available = self.history_snapshot_available_this_frame
