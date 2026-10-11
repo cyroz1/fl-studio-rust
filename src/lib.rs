@@ -15856,10 +15856,10 @@ mod tests {
         assert_eq!(
             matching_state
                 .vst_metadata()
-                .and_then(VstPluginStateMetadata::class_uid),
+                .and_then(|metadata| metadata.class_uid()),
             target_state
                 .vst_metadata()
-                .and_then(VstPluginStateMetadata::class_uid)
+                .and_then(|metadata| metadata.class_uid())
         );
         assert_eq!(
             matching_state.vst_state_bytes(),
