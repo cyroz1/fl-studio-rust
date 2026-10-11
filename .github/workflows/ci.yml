@@ -467,11 +467,25 @@ jobs:
           sleep 0.5
           ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
             -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/controller-event-paint.png"
+          xdotool mousemove 875 741 click 1
+          sleep 0.2
+          xdotool mousemove 400 840
+          xdotool mousedown 1
+          sleep 0.2
+          xdotool mousemove --sync 610 840
+          sleep 0.3
+          ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
+            -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/controller-event-interpolate-selecting.png"
+          xdotool mouseup 1
+          sleep 0.5
+          ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
+            -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/controller-event-interpolate.png"
           for capture in browser-search-options.png playlist-solo.png playlist-group-solo.png playlist-groups-collapsed.png \
             mixer.png mixer-effect-slots-scrolled.png mixer-muted.png mixer-muted-solo.png mixer-phase-swap.png controller-ghost-visibility.png \
             controller-ghost-editable.png controller-ghost-editable-shortcut.png controller-color-selection.png \
             piano-roll-time-selection.png piano-roll-pitch-selection.png piano-roll-mousewheel-property.png \
-            piano-roll-mousewheel-nudge.png controller-event-draw.png controller-event-paint.png; do
+            piano-roll-mousewheel-nudge.png controller-event-draw.png controller-event-paint.png \
+            controller-event-interpolate-selecting.png controller-event-interpolate.png; do
             if [[ "$(stat -c%s "$GITHUB_WORKSPACE/dist/gui-preview/$capture")" -lt 10000 ]]; then
               echo "The $capture capture is blank or incomplete."
               cat "$RUNNER_TEMP/mixer-preview.log"

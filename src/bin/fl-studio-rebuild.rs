@@ -605,6 +605,7 @@ enum PianoRollControllerTool {
     Edit,
     Draw,
     Paint,
+    Interpolate,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -613,6 +614,14 @@ struct PianoRollControllerStroke {
     stream: (u8, u8),
     tick: u32,
     value: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PianoRollControllerSelectionDrag {
+    pattern_id: u16,
+    stream: (u8, u8),
+    start_tick: u32,
+    current_tick: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1751,6 +1760,7 @@ struct DawUi {
     piano_roll_controller_stream: Option<(u8, u8)>,
     piano_roll_controller_tool: PianoRollControllerTool,
     piano_roll_controller_stroke: Option<PianoRollControllerStroke>,
+    piano_roll_controller_selection: Option<PianoRollControllerSelectionDrag>,
     piano_roll_scale: PianoRollScale,
     piano_roll_scale_root: u8,
     piano_roll_ghost_channels: bool,
@@ -2246,6 +2256,7 @@ impl DawUi {
             piano_roll_controller_stream: None,
             piano_roll_controller_tool: PianoRollControllerTool::Edit,
             piano_roll_controller_stroke: None,
+            piano_roll_controller_selection: None,
             piano_roll_scale: PianoRollScale::Major,
             piano_roll_scale_root: 0,
             piano_roll_ghost_channels: true,
@@ -19530,6 +19541,12 @@ impl DawUi {
                 "Paint",
             )
             .on_hover_text("Paint raw points without the current snap setting");
+            ui.selectable_value(
+                &mut self.piano_roll_controller_tool,
+                PianoRollControllerTool::Interpolate,
+                "Interpolate",
+            )
+            .on_hover_text("Select raw points and linearize their values between the endpoints");
             if !streams.is_empty() {
                 let selected_text = self.piano_roll_controller_stream.map_or_else(
                     || "All raw points".to_owned(),
@@ -19558,6 +19575,9 @@ impl DawUi {
                 }
                 PianoRollControllerTool::Draw => "Drag in the lane to draw · uses current snap",
                 PianoRollControllerTool::Paint => "Drag in the lane to paint · snap is bypassed",
+                PianoRollControllerTool::Interpolate => {
+                    "Drag across three or more points to linearize the range"
+                }
             });
         });
 
@@ -19658,6 +19678,41 @@ impl DawUi {
             Id::new(("piano-controller-event-plot", pattern.id)),
             Sense::click_and_drag(),
         );
+        let active_selection = self
+            .piano_roll_controller_selection
+            .filter(|selection| selection.pattern_id == pattern.id);
+        if let Some(selection) = active_selection {
+            let left_tick = selection.start_tick.min(selection.current_tick);
+            let right_tick = selection.start_tick.max(selection.current_tick);
+            let left_x = (plot_rect.left() + left_tick as f32 * geometry.tick_scale
+                - geometry.horizontal_scroll)
+                .clamp(plot_rect.left(), plot_rect.right());
+            let right_x = (plot_rect.left() + right_tick as f32 * geometry.tick_scale
+                - geometry.horizontal_scroll)
+                .clamp(plot_rect.left(), plot_rect.right());
+            let selection_rect = egui::Rect::from_min_max(
+                egui::pos2(left_x, plot_rect.top()),
+                egui::pos2(
+                    right_x.max(left_x + 1.0).min(plot_rect.right()),
+                    plot_rect.bottom(),
+                ),
+            );
+            painter.rect_filled(selection_rect, 0, BLUE_SELECTION);
+            painter.line_segment(
+                [
+                    egui::pos2(left_x, plot_rect.top()),
+                    egui::pos2(left_x, plot_rect.bottom()),
+                ],
+                Stroke::new(1.0, BLUE),
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(right_x, plot_rect.top()),
+                    egui::pos2(right_x, plot_rect.bottom()),
+                ],
+                Stroke::new(1.0, BLUE),
+            );
+        }
         let mut hovered_point = false;
         let mut same_position_count = BTreeMap::<(u32, u8, u8), u8>::new();
         for (controller_index, controller) in points {
@@ -19683,7 +19738,16 @@ impl DawUi {
                 x,
                 egui::lerp(plot_rect.bottom()..=plot_rect.top(), normalized),
             );
-            let color = if value.is_finite() {
+            let is_interpolate_selected = active_selection.is_some_and(|selection| {
+                controller.channel == selection.stream.0
+                    && controller.flags == selection.stream.1
+                    && (selection.start_tick.min(selection.current_tick)
+                        ..=selection.start_tick.max(selection.current_tick))
+                        .contains(&controller.position)
+            });
+            let color = if is_interpolate_selected {
+                BLUE_TEXT
+            } else if value.is_finite() {
                 MIDI_CHANNEL_COLORS[usize::from(controller.channel) % MIDI_CHANNEL_COLORS.len()]
             } else {
                 ORANGE
@@ -19904,6 +19968,82 @@ impl DawUi {
             }
         } else {
             self.piano_roll_controller_stroke = None;
+        }
+
+        if self.piano_roll_controller_tool == PianoRollControllerTool::Interpolate
+            && !self.piano_roll_select_mode
+            && !self.piano_roll_zoom_mode
+            && !self.piano_roll_playback_mode
+        {
+            let primary_down = ui.input(|input| input.pointer.button_down(PointerButton::Primary));
+            let drag_started = plot_response.is_pointer_button_down_on()
+                && primary_down
+                && self.piano_roll_controller_selection.is_none();
+            if drag_started && let Some(pointer) = plot_response.interact_pointer_pos() {
+                let stream = self.piano_roll_controller_stream.or_else(|| {
+                    (streams.len() == 1)
+                        .then(|| streams.first().copied())
+                        .flatten()
+                });
+                let Some(stream) = stream else {
+                    self.status = "Choose a raw controller stream before interpolating".to_owned();
+                    self.piano_roll_controller_selection = None;
+                    return;
+                };
+                self.piano_roll_controller_stream = Some(stream);
+                let timeline_x = (pointer.x.clamp(plot_rect.left(), plot_rect.right())
+                    - plot_rect.left()
+                    + geometry.horizontal_scroll)
+                    / geometry.tick_scale.max(0.001);
+                let tick = timeline_x.round().clamp(0.0, u32::MAX as f32) as u32;
+                self.piano_roll_controller_selection = Some(PianoRollControllerSelectionDrag {
+                    pattern_id: pattern.id,
+                    stream,
+                    start_tick: tick,
+                    current_tick: tick,
+                });
+            } else if primary_down
+                && let Some(pointer) = plot_response.interact_pointer_pos()
+                && let Some(mut selection) = self
+                    .piano_roll_controller_selection
+                    .filter(|selection| selection.pattern_id == pattern.id)
+            {
+                let timeline_x = (pointer.x.clamp(plot_rect.left(), plot_rect.right())
+                    - plot_rect.left()
+                    + geometry.horizontal_scroll)
+                    / geometry.tick_scale.max(0.001);
+                selection.current_tick = timeline_x.round().clamp(0.0, u32::MAX as f32) as u32;
+                self.piano_roll_controller_selection = Some(selection);
+            } else if !primary_down
+                && let Some(selection) = self.piano_roll_controller_selection.take()
+                && selection.pattern_id == pattern.id
+                && let Some(document) = &mut self.document
+            {
+                match document.linearize_pattern_controller_range(
+                    pattern.id,
+                    selection.stream,
+                    selection.start_tick,
+                    selection.current_tick,
+                ) {
+                    Ok(changed) if changed > 0 => {
+                        self.dirty = true;
+                        self.status = format!("Linearized {changed} raw Pattern controller points");
+                    }
+                    Ok(_) => {
+                        self.status =
+                            "Select at least three distinct points in the chosen raw stream"
+                                .to_owned();
+                    }
+                    Err(error) => {
+                        self.status = format!("Could not interpolate raw Pattern points: {error}");
+                    }
+                }
+            }
+            if !primary_down && self.piano_roll_controller_selection.is_some() {
+                self.piano_roll_controller_selection = None;
+            }
+        } else {
+            self.piano_roll_controller_selection = None;
         }
 
         if self.piano_roll_controller_tool == PianoRollControllerTool::Edit

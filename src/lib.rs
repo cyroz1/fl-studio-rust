@@ -3496,6 +3496,85 @@ impl FlpDocument {
         Ok(added_count)
     }
 
+    /// Makes existing points in a raw Pattern controller range follow a straight line between
+    /// the first and last selected points. Positions and opaque record fields remain unchanged.
+    pub fn linearize_pattern_controller_range(
+        &mut self,
+        pattern_id: u16,
+        stream: (u8, u8),
+        start_tick: u32,
+        end_tick: u32,
+    ) -> Result<usize, FlpError> {
+        let (start_tick, end_tick) = if start_tick <= end_tick {
+            (start_tick, end_tick)
+        } else {
+            (end_tick, start_tick)
+        };
+        let pattern = self
+            .patterns()?
+            .into_iter()
+            .find(|pattern| pattern.id == pattern_id)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested Pattern does not exist",
+            ))?;
+        let mut selected = pattern
+            .controllers
+            .iter()
+            .enumerate()
+            .filter(|(_, controller)| {
+                (controller.channel, controller.flags) == stream
+                    && (start_tick..=end_tick).contains(&controller.position)
+            })
+            .map(|(index, controller)| (index, *controller))
+            .collect::<Vec<_>>();
+        selected.sort_by_key(|(_, controller)| controller.position);
+
+        let Some((_, first)) = selected.first().copied() else {
+            return Ok(0);
+        };
+        let Some((_, last)) = selected.last().copied() else {
+            return Ok(0);
+        };
+        if selected.len() < 3 || first.position == last.position {
+            return Ok(0);
+        }
+        if !first.value().is_finite() || !last.value().is_finite() {
+            return Err(FlpError::UnsupportedEdit(
+                "Pattern controller interpolation needs finite endpoint values",
+            ));
+        }
+
+        let tick_span = f64::from(last.position - first.position);
+        let first_value = f64::from(first.value());
+        let last_value = f64::from(last.value());
+        let mut value_updates = BTreeMap::new();
+        for (index, controller) in selected.iter().skip(1).take(selected.len() - 2) {
+            let fraction = f64::from(controller.position - first.position) / tick_span;
+            let value = (first_value + (last_value - first_value) * fraction) as f32;
+            if controller.value_bits != value.to_bits() {
+                let (event_index, record_offset, _) =
+                    self.pattern_controller_record_location(pattern_id, *index)?;
+                value_updates.insert((event_index, record_offset + 8), value.to_bits());
+            }
+        }
+        let changed_count = value_updates.len();
+        if changed_count == 0 {
+            return Ok(0);
+        }
+
+        let mut candidate = self.clone();
+        for ((event_index, value_offset), value_bits) in value_updates {
+            write_event_payload_bytes(
+                &mut candidate.events[event_index],
+                value_offset,
+                &value_bits.to_le_bytes(),
+            )?;
+        }
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(changed_count)
+    }
+
     /// Removes one raw Pattern controller point by its zero-based Pattern index.
     pub fn delete_pattern_controller(
         &mut self,
@@ -18094,6 +18173,79 @@ mod tests {
                 .is_err()
         );
         assert_eq!(document.encode_lossless().unwrap(), before_invalid_edit);
+    }
+
+    #[test]
+    fn linearize_pattern_controller_range_preserves_opaque_bytes_and_other_streams() {
+        let at_72 = pattern_controller_record(72, [0xA5, 0x5A], 3, 0x91, 0.2f32.to_bits());
+        let other_stream = pattern_controller_record(48, [0xD3, 0x4C], 7, 0x2A, 42.0f32.to_bits());
+        let at_0 = pattern_controller_record(0, [0x31, 0x32], 3, 0x91, 0.0f32.to_bits());
+        let at_48 = pattern_controller_record(48, [0x43, 0x44], 3, 0x91, 0.4f32.to_bits());
+        let at_24 = pattern_controller_record(24, [0x21, 0x22], 3, 0x91, 0.9f32.to_bits());
+        let at_96 = pattern_controller_record(96, [0x95, 0x96], 3, 0x91, 1.0f32.to_bits());
+        let records = [at_72, other_stream, at_0, at_48, at_24, at_96];
+        let mut controller_payload = Vec::new();
+        for record in records {
+            controller_payload.extend_from_slice(&record);
+        }
+        let mut controller_event = Vec::new();
+        append_data_event(&mut controller_event, 0xDF, &controller_payload);
+        let input = pattern_fixture(&[], &controller_event);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+
+        let changed = document
+            .linearize_pattern_controller_range(7, (3, 0x91), 96, 0)
+            .expect("the selected raw stream should be linearized");
+        assert_eq!(changed, 3);
+        let controllers = &document.patterns().unwrap()[0].controllers;
+        assert_eq!(controllers.len(), 6);
+        assert_eq!(controllers[0].position, 72);
+        assert_eq!(controllers[0].value(), 0.75);
+        assert_eq!(controllers[0].reserved, [0xA5, 0x5A]);
+        assert_eq!(controllers[1].encode(), other_stream);
+        assert_eq!(controllers[2].position, 0);
+        assert_eq!(controllers[2].value(), 0.0);
+        assert_eq!(controllers[3].position, 48);
+        assert_eq!(controllers[3].value(), 0.5);
+        assert_eq!(controllers[3].reserved, [0x43, 0x44]);
+        assert_eq!(controllers[4].position, 24);
+        assert_eq!(controllers[4].value(), 0.25);
+        assert_eq!(controllers[4].reserved, [0x21, 0x22]);
+        assert_eq!(controllers[5].position, 96);
+        assert_eq!(controllers[5].value(), 1.0);
+
+        let encoded = document.encode_lossless().unwrap();
+        let reparsed = FlpDocument::parse(&encoded).expect("linearized file should parse");
+        assert_eq!(reparsed.patterns().unwrap(), document.patterns().unwrap());
+        let before_noop = document.encode_lossless().unwrap();
+        assert_eq!(
+            document
+                .linearize_pattern_controller_range(7, (3, 0x91), 24, 48)
+                .unwrap(),
+            0
+        );
+        assert_eq!(document.encode_lossless().unwrap(), before_noop);
+    }
+
+    #[test]
+    fn linearize_pattern_controller_range_rejects_non_finite_endpoint_values() {
+        let first = pattern_controller_record(0, [0xA5, 0x5A], 3, 0x91, f32::NAN.to_bits());
+        let middle = pattern_controller_record(24, [0x31, 0x32], 3, 0x91, 0.5f32.to_bits());
+        let last = pattern_controller_record(48, [0x95, 0x96], 3, 0x91, 1.0f32.to_bits());
+        let mut controller_payload = first.to_vec();
+        controller_payload.extend_from_slice(&middle);
+        controller_payload.extend_from_slice(&last);
+        let mut controller_event = Vec::new();
+        append_data_event(&mut controller_event, 0xDF, &controller_payload);
+        let input = pattern_fixture(&[], &controller_event);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+
+        assert!(
+            document
+                .linearize_pattern_controller_range(7, (3, 0x91), 0, 48)
+                .is_err()
+        );
+        assert_eq!(document.encode_lossless().unwrap(), input);
     }
 
     #[test]
