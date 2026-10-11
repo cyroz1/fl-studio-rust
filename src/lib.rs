@@ -418,8 +418,56 @@ pub struct ChannelSummary {
     sample_path: Option<String>,
     layer_children: Vec<u16>,
     layer_flags: Option<u32>,
+    level_adjustments: Vec<ChannelLevelAdjustments>,
     first_event_index: usize,
     end_event_index: usize,
+}
+
+/// Raw fields decoded from one FLP `0xD5` channel Level Adjusts event.
+///
+/// The stored units and playback effect are not yet interpreted. The complete
+/// event payload remains available unchanged through [`FlpDocument::events`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChannelLevelAdjustments {
+    pan: i32,
+    volume: u32,
+    unknown: u32,
+    mod_x: i32,
+    mod_y: i32,
+}
+
+impl ChannelLevelAdjustments {
+    fn decode(payload: &[u8]) -> Option<Self> {
+        (payload.len() >= 20).then(|| Self {
+            pan: i32::from_le_bytes(payload[0..4].try_into().expect("four-byte pan field")),
+            volume: u32::from_le_bytes(payload[4..8].try_into().expect("four-byte volume field")),
+            unknown: u32::from_le_bytes(
+                payload[8..12].try_into().expect("four-byte unknown field"),
+            ),
+            mod_x: i32::from_le_bytes(payload[12..16].try_into().expect("four-byte Mod X field")),
+            mod_y: i32::from_le_bytes(payload[16..20].try_into().expect("four-byte Mod Y field")),
+        })
+    }
+
+    pub fn pan_raw(&self) -> i32 {
+        self.pan
+    }
+
+    pub fn volume_raw(&self) -> u32 {
+        self.volume
+    }
+
+    pub fn unknown_raw(&self) -> u32 {
+        self.unknown
+    }
+
+    pub fn mod_x_raw(&self) -> i32 {
+        self.mod_x
+    }
+
+    pub fn mod_y_raw(&self) -> i32 {
+        self.mod_y
+    }
 }
 
 /// A named Channel Rack display filter from the project-level `0xE7` events.
@@ -662,6 +710,13 @@ impl ChannelSummary {
     /// Raw FL channel pan value, in the project's 0..=12800 control range.
     pub fn pan(&self) -> Option<i32> {
         self.pan
+    }
+
+    /// Raw fields from each recognized 20-byte core in a channel `0xD5`
+    /// Level Adjusts data event. A channel can contain multiple matching
+    /// events, so callers should not assume there is exactly one.
+    pub fn level_adjustments(&self) -> &[ChannelLevelAdjustments] {
+        &self.level_adjustments
     }
 
     /// Raw per-channel swing mix from the `0x61` word event.
@@ -2210,6 +2265,12 @@ impl FlpDocument {
                             .expect("the key-region high bound has four payload bytes"),
                     );
                     channel.keyboard_key_region = Some((low, high));
+                }
+                0xD5 if matches!(event.encoding, PayloadEncoding::Data { .. }) => {
+                    if let Some(level_adjustments) = ChannelLevelAdjustments::decode(&event.payload)
+                    {
+                        channel.level_adjustments.push(level_adjustments);
+                    }
                 }
                 0x16 if event.encoding == PayloadEncoding::Byte && event.payload.len() == 1 => {
                     channel.mixer_track = Some(event.payload[0] as i8);
@@ -14447,6 +14508,33 @@ mod tests {
         let short_document = FlpDocument::parse(&flp_fixture(&short_event_stream, &[], &[]))
             .expect("short parameters fixture should parse");
         assert_eq!(short_document.channels()[0].keyboard_key_region(), None);
+    }
+
+    #[test]
+    fn decodes_channel_level_adjustments_as_raw_fields_losslessly() {
+        let mut payload = (-320i32).to_le_bytes().to_vec();
+        payload.extend_from_slice(&12_345u32.to_le_bytes());
+        payload.extend_from_slice(&0xA1B2_C3D4u32.to_le_bytes());
+        payload.extend_from_slice(&(-17i32).to_le_bytes());
+        payload.extend_from_slice(&255i32.to_le_bytes());
+        payload.extend_from_slice(&[0xA5, 0x5A]);
+
+        let mut event_stream = vec![0x40, 7, 0, 0x15, 3];
+        append_data_event(&mut event_stream, 0xD5, &payload);
+        append_data_event(&mut event_stream, 0xD5, &payload[..19]);
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        let input = flp_fixture(&event_stream, &[], &[]);
+        let document = FlpDocument::parse(&input).expect("fixture should parse");
+
+        let channel = &document.channels()[0];
+        assert_eq!(channel.level_adjustments().len(), 1);
+        let adjustment = &channel.level_adjustments()[0];
+        assert_eq!(adjustment.pan_raw(), -320);
+        assert_eq!(adjustment.volume_raw(), 12_345);
+        assert_eq!(adjustment.unknown_raw(), 0xA1B2_C3D4);
+        assert_eq!(adjustment.mod_x_raw(), -17);
+        assert_eq!(adjustment.mod_y_raw(), 255);
+        assert_eq!(document.encode_lossless().unwrap(), input);
     }
 
     #[test]

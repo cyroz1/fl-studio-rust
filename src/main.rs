@@ -1777,7 +1777,7 @@ fn list_channels(path: &Path) -> Result<(), String> {
     println!("channels: {}", channels.len());
     for channel in channels {
         println!(
-            "id={} kind={} type={:?} enabled={} color={:?} volume={:?} pan={:?} swing_mix_raw={:?} layer_children={:?} layer_flags={:?} plugin={} name={} sample_path={:?} events={:?}",
+            "id={} kind={} type={:?} enabled={} color={:?} volume={:?} pan={:?} level_adjusts_raw={:?} swing_mix_raw={:?} layer_children={:?} layer_flags={:?} plugin={} name={} sample_path={:?} events={:?}",
             channel.id(),
             channel
                 .kind()
@@ -1789,6 +1789,7 @@ fn list_channels(path: &Path) -> Result<(), String> {
             channel.color(),
             channel.volume(),
             channel.pan(),
+            channel.level_adjustments(),
             channel.swing_mix_raw(),
             channel.layer_child_ids(),
             channel.layer_flags(),
