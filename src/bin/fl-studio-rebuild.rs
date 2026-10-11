@@ -5258,6 +5258,8 @@ impl DawUi {
                     ("F6", "Channel Rack"),
                     ("F7", "Piano roll"),
                     ("F9", "Mixer"),
+                    ("Shift+Arrow", "Nudge selected Piano roll notes"),
+                    ("Ctrl/Cmd+Up/Down", "Transpose Piano roll notes by octave"),
                     ("Alt/Opt+F8", "Browser"),
                     ("Space", "Play / pause"),
                     ("Ctrl/Cmd+S", "Save project"),
@@ -12281,6 +12283,74 @@ impl DawUi {
         self.status = status;
     }
 
+    fn nudge_piano_roll_selection(
+        &mut self,
+        pattern: &Pattern,
+        pattern_id: u16,
+        tick_delta: i64,
+        semitone_delta: i32,
+    ) {
+        let targets = self
+            .selected_piano_notes
+            .iter()
+            .filter(|(selected_pattern, _, _)| *selected_pattern == pattern_id)
+            .filter_map(|(_, channel_id, note_index)| {
+                pattern
+                    .notes
+                    .iter()
+                    .filter(|note| note.channel_id == *channel_id)
+                    .nth(*note_index)
+                    .map(|note| (*channel_id, *note_index, note.clone()))
+            })
+            .filter_map(|(channel_id, note_index, note)| {
+                let edit = piano_roll_note_nudge_edit(&note, tick_delta, semitone_delta);
+                (edit.key.is_some() || edit.position.is_some())
+                    .then_some((channel_id, note_index, edit))
+            })
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            self.status = if self.selected_piano_notes.is_empty() {
+                "Select notes before nudging them".to_owned()
+            } else {
+                "Selected notes cannot move further in that direction".to_owned()
+            };
+            return;
+        }
+
+        let mut updated = self.document.clone();
+        let Some(document) = updated.as_mut() else {
+            self.status = "Open a project before nudging notes".to_owned();
+            return;
+        };
+        let result = targets
+            .iter()
+            .try_for_each(|(channel_id, note_index, edit)| {
+                document.edit_pattern_note(pattern_id, *channel_id, *note_index, edit.clone())
+            });
+        match result {
+            Ok(()) => {
+                self.document = updated;
+                self.stop_project_playback();
+                self.dirty = true;
+                let direction = if tick_delta < 0 {
+                    "left"
+                } else if tick_delta > 0 {
+                    "right"
+                } else if semitone_delta > 0 {
+                    "up"
+                } else {
+                    "down"
+                };
+                self.status = format!(
+                    "Nudged {} selected note{} {direction}",
+                    targets.len(),
+                    if targets.len() == 1 { "" } else { "s" }
+                );
+            }
+            Err(error) => self.status = format!("Could not nudge selected notes: {error}"),
+        }
+    }
+
     fn select_piano_roll_color_group(&mut self) {
         let Some((pattern_id, channel_id)) = self.selected_pattern.zip(self.selected_note_channel)
         else {
@@ -12535,7 +12605,7 @@ impl DawUi {
             empty_view(ui, "Open a project to see its Piano roll");
             return;
         };
-        let patterns = document.patterns().unwrap_or_default();
+        let mut patterns = document.patterns().unwrap_or_default();
         let channels = document.channels();
         let ppq = document.header().ppq().max(1);
         let project_time_signature = document.metadata().time_signature();
@@ -12664,6 +12734,7 @@ impl DawUi {
         let mut change_note_color_requested = false;
         let mut quantize_selected_requested = false;
         let mut open_pattern_time_signature_dialog = false;
+        let mut note_nudge_requested = None;
         if ui.memory(|memory| memory.focused().is_none()) {
             open_pattern_time_signature_dialog = ui.input_mut(|input| {
                 input.consume_key(
@@ -12691,6 +12762,29 @@ impl DawUi {
                 ui.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::G));
             ungroup_selected_notes_requested =
                 ui.input_mut(|input| input.consume_key(egui::Modifiers::ALT, egui::Key::G));
+            note_nudge_requested = ui.input_mut(|input| {
+                if input.consume_key(egui::Modifiers::COMMAND, egui::Key::ArrowUp) {
+                    Some((0, 12))
+                } else if input.consume_key(egui::Modifiers::COMMAND, egui::Key::ArrowDown) {
+                    Some((0, -12))
+                } else if input.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowLeft) {
+                    Some((
+                        -i64::from(self.piano_roll_snap.ticks(ppq, time_signature)),
+                        0,
+                    ))
+                } else if input.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowRight) {
+                    Some((
+                        i64::from(self.piano_roll_snap.ticks(ppq, time_signature)),
+                        0,
+                    ))
+                } else if input.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowUp) {
+                    Some((0, 1))
+                } else if input.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowDown) {
+                    Some((0, -1))
+                } else {
+                    None
+                }
+            });
             let select_draw =
                 ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::P));
             let select_paint =
@@ -12755,6 +12849,15 @@ impl DawUi {
                 self.piano_roll_zoom_mode = false;
                 self.piano_roll_playback_mode = true;
                 self.piano_roll_stamp_mode = false;
+            }
+        }
+        if let Some((tick_delta, semitone_delta)) = note_nudge_requested
+            && let Some(pattern_id) = self.selected_pattern
+            && let Some(pattern) = patterns.iter().find(|pattern| pattern.id == pattern_id)
+        {
+            self.nudge_piano_roll_selection(pattern, pattern_id, tick_delta, semitone_delta);
+            if let Some(document) = self.document.as_ref() {
+                patterns = document.patterns().unwrap_or_default();
             }
         }
         if open_pattern_time_signature_dialog {
@@ -21166,6 +21269,31 @@ fn piano_roll_random_index(length: usize, seed: u64) -> Option<usize> {
     Some((value % length as u64) as usize)
 }
 
+fn piano_roll_note_nudge_edit(
+    note: &PatternNote,
+    tick_delta: i64,
+    semitone_delta: i32,
+) -> PatternNoteEdit {
+    let position = (tick_delta != 0).then(|| {
+        let amount = tick_delta.unsigned_abs().min(u64::from(u32::MAX)) as u32;
+        if tick_delta < 0 {
+            note.position.saturating_sub(amount)
+        } else {
+            note.position.saturating_add(amount)
+        }
+    });
+    let key = (semitone_delta != 0).then(|| {
+        i32::from(note.key)
+            .saturating_add(semitone_delta)
+            .clamp(0, 131) as u16
+    });
+    PatternNoteEdit {
+        position: position.filter(|position| *position != note.position),
+        key: key.filter(|key| *key != note.key),
+        ..PatternNoteEdit::default()
+    }
+}
+
 fn piano_roll_color_group_note_ids(
     pattern: &Pattern,
     pattern_id: u16,
@@ -23524,10 +23652,10 @@ mod tests {
         encode_midi_device_selections, first_available_playlist_track, next_piano_roll_note_group,
         note_from_grid_position, parse_midi_device_selections, piano_roll_color_group_note_ids,
         piano_roll_controller_value_at, piano_roll_controller_value_range,
-        piano_roll_note_group_members, piano_roll_random_note_selection,
-        playlist_audio_clip_join_candidates, playlist_bar_ticks, playlist_clip_drag_edit,
-        playlist_clip_local_recording_offset, playlist_clip_split_position,
-        playlist_group_parent_ids, playlist_measure_boundaries,
+        piano_roll_note_group_members, piano_roll_note_nudge_edit,
+        piano_roll_random_note_selection, playlist_audio_clip_join_candidates, playlist_bar_ticks,
+        playlist_clip_drag_edit, playlist_clip_local_recording_offset,
+        playlist_clip_split_position, playlist_group_parent_ids, playlist_measure_boundaries,
         playlist_pattern_clip_join_candidates, playlist_seek_tick_to_frame,
         playlist_signature_at_tick, playlist_song_position_label, playlist_track_group_range,
         playlist_track_is_hidden, recolor_piano_roll_notes, snap_note_tick,
@@ -24488,6 +24616,35 @@ mod tests {
         assert_eq!(more, BTreeSet::from([(7, 2, 0), (7, 2, 1), (7, 2, 2)]));
         assert!(piano_roll_random_note_selection(&pattern, 7, 2, &more, true, 17).is_none());
         assert!(piano_roll_random_note_selection(&pattern, 7, 4, &empty, false, 11).is_none());
+    }
+
+    #[test]
+    fn piano_roll_note_nudge_respects_grid_distance_and_pitch_bounds() {
+        let note = PatternNote {
+            position: 23,
+            key: 60,
+            ..PatternNote::default()
+        };
+        let moved = piano_roll_note_nudge_edit(&note, 24, 1);
+        assert_eq!(moved.position, Some(47));
+        assert_eq!(moved.key, Some(61));
+
+        let near_start = PatternNote {
+            position: 10,
+            ..note.clone()
+        };
+        let moved_left = piano_roll_note_nudge_edit(&near_start, -24, 0);
+        assert_eq!(moved_left.position, Some(0));
+        assert_eq!(moved_left.key, None);
+
+        let lowest = PatternNote {
+            key: 0,
+            ..note.clone()
+        };
+        assert_eq!(piano_roll_note_nudge_edit(&lowest, 0, -1).key, None);
+
+        let highest = PatternNote { key: 131, ..note };
+        assert_eq!(piano_roll_note_nudge_edit(&highest, 0, 1).key, None);
     }
 
     #[test]
