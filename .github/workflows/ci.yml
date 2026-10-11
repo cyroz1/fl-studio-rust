@@ -150,7 +150,7 @@ jobs:
           kill "$app_pid" 2>/dev/null || true
           wait "$app_pid" 2>/dev/null || true
           app_pid=""
-          python3 - "$RUNNER_TEMP/mixer-preview.flp" "$RUNNER_TEMP/controller-preview.flp" <<'PY'
+          python3 - "$RUNNER_TEMP/mixer-preview.flp" "$RUNNER_TEMP/controller-preview.flp" "$RUNNER_TEMP/pattern-preview.flp" <<'PY'
           import struct
           import sys
           from pathlib import Path
@@ -300,6 +300,24 @@ jobs:
               + pattern_events
           )
           Path(sys.argv[2]).write_bytes(controller_project)
+
+          modern_pattern_record = bytearray(88)
+          struct.pack_into("<IHHIHH", modern_pattern_record, 0, 0, 0x5000, 0x5001, 1536, 499, 0)
+          modern_pattern_record[20:24] = bytes([0x40, 0x64, 0x80, 0x80])
+          struct.pack_into("<II", modern_pattern_record, 24, 0, 1536)
+          modern_pattern_events = (
+              data_event(0xC7, b"26.1.0.0\0")
+              + bytes([0x63, 0, 0])
+              + data_event(0xE9, bytes(modern_pattern_record))
+          )
+          modern_pattern_project = (
+              b"FLhd"
+              + struct.pack("<IHHH", 6, 0, 0, 96)
+              + b"FLdt"
+              + struct.pack("<I", len(modern_pattern_events))
+              + modern_pattern_events
+          )
+          Path(sys.argv[3]).write_bytes(modern_pattern_project)
           PY
 
           mixer_summary=$(cargo run --quiet --release --bin flp-rebuild -- mixer "$RUNNER_TEMP/mixer-preview.flp")
@@ -564,9 +582,58 @@ jobs:
           sleep 0.5
           ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
             -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/controller-event-erase.png"
+
+          kill "$app_pid" 2>/dev/null || true
+          wait "$app_pid" 2>/dev/null || true
+          app_pid=""
+          modern_pattern_summary=$(cargo run --quiet --release --bin flp-rebuild -- playlist "$RUNNER_TEMP/pattern-preview.flp")
+          if ! grep -Fq "clip=0 position=0 length=1536" <<< "$modern_pattern_summary" \
+            || ! grep -Fq "record_size=88 opaque_tail=true" <<< "$modern_pattern_summary"; then
+            echo "The modern Pattern Clip preview fixture did not decode as expected."
+            printf '%s\n' "$modern_pattern_summary"
+            exit 1
+          fi
+          target/release/fl-studio-rebuild "$RUNNER_TEMP/pattern-preview.flp" \
+            > "$RUNNER_TEMP/pattern-preview.log" 2>&1 &
+          app_pid=$!
+          for attempt in $(seq 1 10); do
+            if ! kill -0 "$app_pid" 2>/dev/null; then
+              cat "$RUNNER_TEMP/pattern-preview.log"
+              exit 1
+            fi
+            sleep 1
+          done
+          ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
+            -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/modern-pattern-clip-before-resize.png"
+          xdotool keydown Shift_L
+          xdotool mousemove 664 298
+          xdotool mousedown 1
+          sleep 0.2
+          xdotool mousemove --sync 704 298
+          sleep 0.3
+          xdotool mouseup 1
+          xdotool keyup Shift_L
+          sleep 0.5
+          ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
+            -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/modern-pattern-clip-after-resize.png"
+          xdotool key ctrl+s
+          sleep 1
+          if ! kill -0 "$app_pid" 2>/dev/null; then
+            echo "The app exited while saving the resized modern Pattern Clip."
+            cat "$RUNNER_TEMP/pattern-preview.log"
+            exit 1
+          fi
+          resized_pattern_summary=$(cargo run --quiet --release --bin flp-rebuild -- playlist "$RUNNER_TEMP/pattern-preview.flp")
+          if ! grep -Fq "clip=0 position=0 length=1944" <<< "$resized_pattern_summary"; then
+            echo "Shift-drag did not persist the modern Pattern Clip resize."
+            printf '%s\n' "$resized_pattern_summary"
+            cat "$RUNNER_TEMP/pattern-preview.log"
+            exit 1
+          fi
           for capture in browser-search-options.png playlist-solo.png playlist-group-solo.png playlist-groups-collapsed.png \
             mixer.png mixer-effect-slots-scrolled.png mixer-muted.png mixer-muted-solo.png mixer-phase-swap.png controller-ghost-visibility.png \
             controller-ghost-editable.png controller-ghost-editable-shortcut.png controller-color-selection.png \
+            modern-pattern-clip-before-resize.png modern-pattern-clip-after-resize.png \
             piano-roll-time-selection.png piano-roll-pitch-selection.png piano-roll-mousewheel-property.png \
             piano-roll-mousewheel-nudge.png controller-event-draw.png controller-event-paint.png \
             controller-event-draw-alt-bypass.png controller-event-paint-shift-lock.png \
