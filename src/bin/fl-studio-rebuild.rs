@@ -20747,8 +20747,14 @@ impl DawUi {
             return;
         };
         let playback_arrangement_id = self.selected_arrangement.unwrap_or(0);
-        let recording_start_tick = self
-            .current_playhead_tick()
+        let playhead_tick = self.current_playhead_tick();
+        let recording_started_at = Instant::now();
+        let song_timeline_start = if self.playing && self.playlist_playback_loaded {
+            self.playlist_tempo_map.clone().zip(playhead_tick)
+        } else {
+            None
+        };
+        let recording_start_tick = playhead_tick
             .and_then(|playhead_tick| {
                 let arrangements = document.arrangements().ok()?;
                 let arrangement = arrangements
@@ -20773,8 +20779,9 @@ impl DawUi {
                 tempo_bpm: self.tempo_bpm,
                 start_tick: recording_start_tick,
                 snap_ticks,
+                song_timeline_start,
             },
-            Instant::now(),
+            recording_started_at,
         ) {
             Ok(recorder) => {
                 self.midi_recording = Some(recorder);

@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 use flp_rebuild::PatternNote;
 use midir::{Ignore, MidiInput, MidiInputConnection as MidirInputConnection};
 
+use crate::sample_render::PlaylistTempoMap;
+
 pub const MIDI_INPUT_QUEUE_CAPACITY: usize = 4_096;
 const MAX_CAPTURED_NOTES: usize = 100_000;
 const MAX_NOTE_TICK: u32 = u32::MAX - 1;
@@ -321,6 +323,7 @@ pub struct MidiPatternRecorderSettings {
     pub tempo_bpm: f64,
     pub start_tick: u32,
     pub snap_ticks: Option<u32>,
+    pub song_timeline_start: Option<(PlaylistTempoMap, f64)>,
 }
 
 pub struct MidiPatternRecorder {
@@ -331,6 +334,8 @@ pub struct MidiPatternRecorder {
     tempo_bpm: f64,
     start_tick: u32,
     snap_ticks: Option<u32>,
+    song_timeline_start: Option<(PlaylistTempoMap, f64)>,
+    song_start_frame_micros: Option<u64>,
     started_at: Instant,
     timestamp_origin_micros: Option<u64>,
     active_notes: BTreeMap<(u8, u8), VecDeque<(u32, u8)>>,
@@ -353,6 +358,7 @@ impl MidiPatternRecorder {
             tempo_bpm,
             start_tick,
             snap_ticks,
+            song_timeline_start,
         } = settings;
         if ppq == 0 {
             return Err("MIDI recording requires a non-zero project PPQ value");
@@ -363,6 +369,19 @@ impl MidiPatternRecorder {
         if snap_ticks == Some(0) {
             return Err("MIDI recording snap requires a non-zero tick value");
         }
+        let song_start_frame_micros = match &song_timeline_start {
+            Some((tempo_map, song_start_tick)) => {
+                if !song_start_tick.is_finite() || *song_start_tick < 0.0 {
+                    return Err("MIDI recording Playlist position must be finite and non-negative");
+                }
+                Some(
+                    tempo_map
+                        .frame_at_fractional_tick(*song_start_tick, 1_000_000)
+                        .map_err(|_| "MIDI recording Playlist position is outside the timeline")?,
+                )
+            }
+            None => None,
+        };
         Ok(Self {
             pattern_id,
             channel_id,
@@ -371,6 +390,8 @@ impl MidiPatternRecorder {
             tempo_bpm,
             start_tick,
             snap_ticks,
+            song_timeline_start,
+            song_start_frame_micros,
             started_at,
             timestamp_origin_micros: None,
             active_notes: BTreeMap::new(),
@@ -482,6 +503,20 @@ impl MidiPatternRecorder {
     }
 
     fn tick_for_elapsed(&self, elapsed: Duration) -> u32 {
+        if let (Some((tempo_map, song_start_tick)), Some(song_start_frame_micros)) =
+            (&self.song_timeline_start, self.song_start_frame_micros)
+        {
+            let elapsed_micros = elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
+            let frame_micros = song_start_frame_micros.saturating_add(elapsed_micros);
+            if let Some(song_tick) = tempo_map.tick_at_frame(frame_micros, 1_000_000) {
+                let elapsed_ticks = (song_tick - song_start_tick).max(0.0);
+                if !elapsed_ticks.is_finite() || elapsed_ticks >= f64::from(MAX_NOTE_TICK) {
+                    return MAX_NOTE_TICK;
+                }
+                return elapsed_ticks.round() as u32;
+            }
+            return 0;
+        }
         let ticks = elapsed.as_secs_f64() * self.tempo_bpm * f64::from(self.ppq) / 60.0;
         if !ticks.is_finite() || ticks >= f64::from(MAX_NOTE_TICK) {
             MAX_NOTE_TICK
@@ -598,6 +633,7 @@ mod tests {
                 tempo_bpm: 120.0,
                 start_tick: 0,
                 snap_ticks: None,
+                song_timeline_start: None,
             },
             started_at,
         )
@@ -644,6 +680,7 @@ mod tests {
                 tempo_bpm: 120.0,
                 start_tick: 0,
                 snap_ticks: None,
+                song_timeline_start: None,
             },
             started_at,
         )
@@ -674,6 +711,7 @@ mod tests {
                 tempo_bpm: 120.0,
                 start_tick: 0,
                 snap_ticks: Some(24),
+                song_timeline_start: None,
             },
             started_at,
         )
@@ -715,6 +753,7 @@ mod tests {
                     tempo_bpm: 120.0,
                     start_tick: 0,
                     snap_ticks: Some(0),
+                    song_timeline_start: None,
                 },
                 Instant::now(),
             ),
@@ -734,6 +773,7 @@ mod tests {
                 tempo_bpm: 120.0,
                 start_tick: 192,
                 snap_ticks: None,
+                song_timeline_start: None,
             },
             started_at,
         )
@@ -761,5 +801,51 @@ mod tests {
         assert_eq!(result.notes.len(), 1);
         assert_eq!(result.notes[0].position, 230);
         assert_eq!(result.notes[0].length, 58);
+    }
+
+    #[test]
+    fn records_against_playlist_timeline_while_preserving_pattern_offset() {
+        let started_at = Instant::now();
+        let mut recorder = MidiPatternRecorder::new(
+            MidiPatternRecorderSettings {
+                pattern_id: 1,
+                channel_id: 2,
+                project_path: None,
+                ppq: 96,
+                tempo_bpm: 120.0,
+                start_tick: 24,
+                snap_ticks: None,
+                song_timeline_start: Some((
+                    PlaylistTempoMap::constant(96, 120.0).expect("valid constant tempo"),
+                    96.0,
+                )),
+            },
+            started_at,
+        )
+        .expect("valid Playlist timing should create a recorder");
+
+        recorder.record(ReceivedMidiMessage {
+            timestamp_micros: 1_250_000,
+            received_at: started_at + Duration::from_millis(250),
+            event: MidiInputEvent::NoteOn {
+                channel: 0,
+                key: 60,
+                velocity: 90,
+            },
+        });
+        recorder.record(ReceivedMidiMessage {
+            timestamp_micros: 1_500_000,
+            received_at: started_at + Duration::from_millis(500),
+            event: MidiInputEvent::NoteOff {
+                channel: 0,
+                key: 60,
+                velocity: 0,
+            },
+        });
+
+        let result = recorder.finish(None, started_at + Duration::from_millis(500));
+        assert_eq!(result.notes.len(), 1);
+        assert_eq!(result.notes[0].position, 72);
+        assert_eq!(result.notes[0].length, 48);
     }
 }
