@@ -4640,10 +4640,10 @@ fn audio_clip_mix_worker_count(
     })
 }
 
-fn audio_clip_groups_for_workers(
-    track_groups: &[Vec<&PreparedClip>],
+fn audio_clip_groups_for_workers<'a>(
+    track_groups: &[Vec<&'a PreparedClip>],
     worker_count: usize,
-) -> Vec<Vec<&PreparedClip>> {
+) -> Vec<Vec<&'a PreparedClip>> {
     if worker_count == 0 {
         return Vec::new();
     }
@@ -4860,9 +4860,13 @@ fn audio_clip_mix_worker(
             let mut worker_scratch = scratch[worker_index]
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let stereo = &mut worker_scratch.stereo[..sample_count];
+            let AudioClipMixWorkerScratch {
+                stereo: stereo_buffer,
+                meter_buses: meter_buffer,
+            } = &mut *worker_scratch;
+            let stereo = &mut stereo_buffer[..sample_count];
             stereo.fill(0.0);
-            let mut meter_buses = if let Some(worker_buses) = worker_scratch.meter_buses.as_mut() {
+            let mut meter_buses = if let Some(worker_buses) = meter_buffer.as_mut() {
                 let active_meter_samples = MIXER_TRACK_METER_COUNT * sample_count;
                 let buses = &mut worker_buses[..active_meter_samples];
                 buses.fill(0.0);
