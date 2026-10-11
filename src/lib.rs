@@ -15426,7 +15426,10 @@ mod tests {
             assert_eq!(clip.clip_id, None);
             assert_eq!(clip.scale, None);
             assert!(clip.has_opaque_record_tail());
-            assert!(!clip.uses_full_source_window());
+            assert!(
+                clip.uses_full_source_window(),
+                "modern channel previews retain the full-source assumption until tick conversion is mapped"
+            );
         }
         assert_eq!(
             document.encode_lossless().unwrap(),
