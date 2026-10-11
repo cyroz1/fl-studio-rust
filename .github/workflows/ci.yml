@@ -756,13 +756,30 @@ jobs:
           fi
           preview_dir="dist/macos-unsigned-preview"
           mkdir -p "$preview_dir"
-          ditto "$app_path" "$preview_dir/$(basename "$app_path")"
+          app_name="$(basename "$app_path")"
+          app_executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app_path/Contents/Info.plist")"
+          app_binary_path="$app_name/Contents/MacOS/$app_executable"
+          app_archive="$preview_dir/$app_name.tar.gz"
+          tar -czpf "$app_archive" -C "$(dirname "$app_path")" "$app_name"
+          python3 - "$app_archive" "$app_binary_path" <<'PY'
+          import sys
+          import tarfile
+
+          archive_path, binary_path = sys.argv[1:]
+          with tarfile.open(archive_path, "r:gz") as archive:
+              binary = archive.getmember(binary_path)
+              if not binary.isfile() or binary.mode & 0o111 == 0:
+                  raise SystemExit("macOS preview archive did not preserve the app executable bit")
+          print("Unsigned macOS preview archive preserves the app executable bit")
+          PY
           cat > "$preview_dir/README-FIRST.txt" <<'EOF'
-          This is an unsigned macOS CI preview. Gatekeeper can label it “damaged” because
-          it was downloaded from the internet without a Developer ID signature and notarization.
+          This is an unsigned macOS CI preview. Extract this Actions artifact, then unpack
+          the app archive before opening it. Gatekeeper can label an unsigned, quarantined
+          app “damaged” because it has no Developer ID signature and notarization.
 
           To open the app, open Terminal, change to this folder, then run:
 
+              tar -xzf "FL Studio Rebuild.app.tar.gz"
               xattr -dr com.apple.quarantine "FL Studio Rebuild.app"
               open "FL Studio Rebuild.app"
 

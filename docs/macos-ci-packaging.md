@@ -1,8 +1,9 @@
 # macOS CI packaging
 
-The macOS CI job always runs formatting, Clippy, tests, and a launch smoke check of the packaged app. It uploads a separate `macos-native-gui-preview` artifact with a screenshot of the native startup window. Without signing credentials, it also builds an unsigned `.app`, checks that its executable and `.flp` file association are present, and uploads a short-lived `macos-unsigned-gui-preview` artifact for local UI review. This artifact is not a distributable installer and Gatekeeper may report that the app is “damaged” because it is unsigned and quarantined. Extract the Actions artifact once; `README-FIRST.txt` and the app are together in the extracted folder. To open a preview from this trusted repository, open Terminal, change to that folder, and run:
+The macOS CI job always runs formatting, Clippy, tests, and a launch smoke check of the packaged app. It uploads a separate `macos-native-gui-preview` artifact with a screenshot of the native startup window. Without signing credentials, it also builds an unsigned `.app`, checks that its executable and `.flp` file association are present, and uploads a short-lived `macos-unsigned-gui-preview` artifact for local UI review. The `.app` is inside a tar archive because GitHub Actions ZIP artifacts reset file permissions and can strip the app executable bit ([`actions/upload-artifact` permission behavior](https://github.com/actions/upload-artifact#permission-loss)). CI verifies that the executable bit survives the tar archive. This artifact is not a distributable installer and Gatekeeper may report that the app is “damaged” because it is unsigned and quarantined. Extract the Actions artifact once; `README-FIRST.txt` and the app archive are together in the extracted folder. To open a preview from this trusted repository, open Terminal, change to that folder, and run:
 
 ```sh
+tar -xzf "FL Studio Rebuild.app.tar.gz"
 xattr -dr com.apple.quarantine "FL Studio Rebuild.app"
 open "FL Studio Rebuild.app"
 ```
