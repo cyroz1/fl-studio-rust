@@ -14865,7 +14865,11 @@ impl DawUi {
                     .map(|note| note.position.saturating_add(note.length))
                     .max()
                     .unwrap_or(first_position);
-                let offset = last_end.saturating_sub(first_position).max(1);
+                let time_range = self
+                    .piano_roll_time_selection
+                    .filter(|(selected_pattern, _, _)| *selected_pattern == pattern_id)
+                    .map(|(_, start, end)| (start, end));
+                let offset = piano_roll_duplicate_offset(first_position, last_end, time_range);
                 let duplicates = source_notes
                     .iter()
                     .cloned()
@@ -22307,6 +22311,17 @@ fn piano_roll_time_range_from_drag(
     (start, end)
 }
 
+fn piano_roll_duplicate_offset(
+    first_position: u32,
+    last_end: u32,
+    time_selection: Option<(u32, u32)>,
+) -> u32 {
+    time_selection
+        .map(|(start, end)| end.saturating_sub(start))
+        .filter(|width| *width > 0)
+        .unwrap_or_else(|| last_end.saturating_sub(first_position).max(1))
+}
+
 fn piano_roll_random_note_selection(
     pattern: &Pattern,
     pattern_id: u16,
@@ -24765,10 +24780,11 @@ mod tests {
         encode_midi_device_selections, first_available_playlist_track, next_piano_roll_note_group,
         note_from_grid_position, parse_midi_device_selections, piano_roll_color_group_note_ids,
         piano_roll_controller_value_at, piano_roll_controller_value_range,
-        piano_roll_discard_length_edit, piano_roll_note_group_members, piano_roll_note_nudge_edit,
-        piano_roll_odd_note_selection, piano_roll_overlap_note_selection,
-        piano_roll_random_note_selection, piano_roll_selection_time_range,
-        piano_roll_shift_time_range, piano_roll_time_range_from_drag, piano_roll_time_tick_at_x,
+        piano_roll_discard_length_edit, piano_roll_duplicate_offset, piano_roll_note_group_members,
+        piano_roll_note_nudge_edit, piano_roll_odd_note_selection,
+        piano_roll_overlap_note_selection, piano_roll_random_note_selection,
+        piano_roll_selection_time_range, piano_roll_shift_time_range,
+        piano_roll_time_range_from_drag, piano_roll_time_tick_at_x,
         playlist_audio_clip_join_candidates, playlist_audio_drop_position_ticks,
         playlist_bar_ticks, playlist_clip_drag_edit, playlist_clip_local_recording_offset,
         playlist_clip_split_position, playlist_group_parent_ids, playlist_measure_boundaries,
@@ -25018,6 +25034,13 @@ mod tests {
         assert_eq!(piano_roll_time_tick_at_x(80.0, 100.0, 1.0, 24), 0);
         assert_eq!(piano_roll_time_range_from_drag(64, 0, 24), (0, 72));
         assert_eq!(piano_roll_time_range_from_drag(96, 96, 24), (96, 120));
+    }
+
+    #[test]
+    fn piano_roll_duplicate_uses_time_selection_width_when_present() {
+        assert_eq!(piano_roll_duplicate_offset(24, 96, None), 72);
+        assert_eq!(piano_roll_duplicate_offset(24, 96, Some((0, 192))), 192);
+        assert_eq!(piano_roll_duplicate_offset(24, 96, Some((192, 192))), 72);
     }
 
     #[test]
