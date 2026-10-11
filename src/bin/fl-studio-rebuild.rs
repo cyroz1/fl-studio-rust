@@ -20448,6 +20448,7 @@ impl DawUi {
         let inserts = document.mixer_inserts();
         let effect_slots = document.mixer_effect_slots();
         let parameters = document.mixer_parameter_records().unwrap_or_default();
+        let send_summaries = document.mixer_send_summaries().unwrap_or_default();
         let parameter_count = parameters.len();
         ui.horizontal(|ui| {
             ui.strong("Mixer");
@@ -21041,6 +21042,41 @@ impl DawUi {
                         ui.small(format!("Color raw: 0x{:08X}", insert.color_raw()));
                         ui.small(format!("Icon raw: {:?}", insert.icon_raw()));
                         ui.small(format!("Events: {:?}", insert.event_range()));
+                        let insert_sends = send_summaries
+                            .iter()
+                            .filter(|send| send.insert_ordinal() == insert.ordinal())
+                            .collect::<Vec<_>>();
+                        ui.collapsing(format!("Saved sends ({})", insert_sends.len()), |ui| {
+                            ui.small(
+                                egui::RichText::new(
+                                    "Route IDs and levels are raw; destination numbering is not verified.",
+                                )
+                                .color(MUTED),
+                            );
+                            if insert_sends.is_empty() {
+                                ui.small("No recognized route-level records");
+                            } else {
+                                egui::ScrollArea::vertical()
+                                    .id_salt("mixer-saved-sends")
+                                    .max_height(150.0)
+                                    .show(ui, |ui| {
+                                        for send in insert_sends {
+                                            let route_state = match send.enabled() {
+                                                Some(true) => "On",
+                                                Some(false) => "Off",
+                                                None => "Unpaired",
+                                            };
+                                            ui.horizontal(|ui| {
+                                                ui.small(format!(
+                                                    "Parameter {} · {route_state}",
+                                                    send.route_parameter_id()
+                                                ));
+                                                ui.small(format!("Raw {}", send.value()));
+                                            });
+                                        }
+                                    });
+                            }
+                        });
                         ui.separator();
                         ui.label("Effect slots");
                         egui::ScrollArea::vertical()

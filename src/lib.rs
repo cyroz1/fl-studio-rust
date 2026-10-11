@@ -1709,6 +1709,19 @@ pub struct MixerEffectSlotSummary {
     end_event_index: usize,
 }
 
+/// Read-only route-volume parameter and its paired saved routing flag, when available.
+/// The parameter ID and destination mapping remain raw because their visible Mixer-track
+/// numbering has not been confirmed against a controlled native save.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MixerSendSummary {
+    insert_ordinal: usize,
+    route_parameter_id: u8,
+    value: i32,
+    enabled: Option<bool>,
+    event_index: usize,
+    record_index: usize,
+}
+
 impl MixerEffectSlotSummary {
     /// Zero-based insert containing this effect slot.
     pub fn insert_ordinal(&self) -> usize {
@@ -1738,6 +1751,33 @@ impl MixerEffectSlotSummary {
     /// Events assigned to this slot, excluding its closing marker when present.
     pub fn event_range(&self) -> std::ops::Range<usize> {
         self.first_event_index..self.end_event_index
+    }
+}
+
+impl MixerSendSummary {
+    /// Candidate zero-based source insert matched from the Mixer parameter record.
+    pub fn insert_ordinal(&self) -> usize {
+        self.insert_ordinal
+    }
+
+    /// Raw Mixer parameter ID in the send-level range 64–191.
+    pub fn route_parameter_id(&self) -> u8 {
+        self.route_parameter_id
+    }
+
+    /// Raw signed send-level value.
+    pub fn value(&self) -> i32 {
+        self.value
+    }
+
+    /// Saved on/off state from the corresponding per-insert routing byte, when present.
+    pub fn enabled(&self) -> Option<bool> {
+        self.enabled
+    }
+
+    /// Event and record location of the source route-volume parameter.
+    pub fn parameter_location(&self) -> (usize, usize) {
+        (self.event_index, self.record_index)
     }
 }
 
@@ -5220,6 +5260,72 @@ impl FlpDocument {
             }
         }
         Ok(records)
+    }
+
+    /// Returns saved Mixer send-level records with their insert-scoped `0xEB` routing flag,
+    /// when that flag is present. Route parameters are paired in event order as in PyFLP;
+    /// parameter IDs and candidate source-track numbering remain unverified mappings.
+    pub fn mixer_send_summaries(&self) -> Result<Vec<MixerSendSummary>, FlpError> {
+        let inserts = self.mixer_inserts();
+        let parameters = self.mixer_parameter_records()?;
+        let mut seen_route_parameters = HashMap::<usize, HashSet<u8>>::new();
+        let mut ambiguous_inserts = HashSet::new();
+        for record in parameters
+            .iter()
+            .filter(|record| record.kind() == MixerParameterKind::RouteVolume)
+        {
+            if let Some(insert_ordinal) = record.candidate_insert_ordinal() {
+                let parameter_ids = seen_route_parameters.entry(insert_ordinal).or_default();
+                if !parameter_ids.insert(record.parameter_id()) {
+                    ambiguous_inserts.insert(insert_ordinal);
+                }
+            }
+        }
+        let routing_flags_by_insert = inserts
+            .iter()
+            .map(|insert| {
+                let routing_flags = self.events[insert.event_range()]
+                    .iter()
+                    .find(|event| {
+                        event.opcode == 0xEB
+                            && matches!(event.encoding, PayloadEncoding::Data { .. })
+                    })
+                    .map(|event| event.payload.clone());
+                (insert.ordinal(), routing_flags)
+            })
+            .collect::<HashMap<_, _>>();
+        let mut route_indices_by_insert = HashMap::<usize, usize>::new();
+        let mut summaries = Vec::new();
+
+        for record in parameters
+            .iter()
+            .filter(|record| record.kind() == MixerParameterKind::RouteVolume)
+        {
+            let Some(insert_ordinal) = record.candidate_insert_ordinal() else {
+                continue;
+            };
+            let route_index = route_indices_by_insert.entry(insert_ordinal).or_default();
+            let enabled = if ambiguous_inserts.contains(&insert_ordinal) {
+                None
+            } else {
+                routing_flags_by_insert
+                    .get(&insert_ordinal)
+                    .and_then(Option::as_deref)
+                    .and_then(|flags| flags.get(*route_index))
+                    .map(|flag| *flag != 0)
+            };
+            *route_index += 1;
+            summaries.push(MixerSendSummary {
+                insert_ordinal,
+                route_parameter_id: record.parameter_id(),
+                value: record.value(),
+                enabled,
+                event_index: record.event_index(),
+                record_index: record.record_index(),
+            });
+        }
+
+        Ok(summaries)
     }
 
     /// Changes the signed value in one existing 12-byte Mixer parameter record.
@@ -16591,6 +16697,58 @@ mod tests {
             malformed.mixer_parameter_records(),
             Err(FlpError::InvalidEvent { .. })
         ));
+    }
+
+    #[test]
+    fn mixer_send_summaries_pair_route_levels_with_insert_routing_flags() {
+        let mut event_stream = Vec::new();
+        for color in [0x001C_1F8Cu32, 0x001D_2792] {
+            event_stream.push(0x9A);
+            event_stream.extend_from_slice(&(-1_i32).to_le_bytes());
+            event_stream.push(0x93);
+            event_stream.extend_from_slice(&(-1_i32).to_le_bytes());
+            event_stream.push(0x95);
+            event_stream.extend_from_slice(&color.to_le_bytes());
+            append_data_event(&mut event_stream, 0xE7, &[0x41, 0x42]);
+            let flags = if color == 0x001C_1F8C {
+                &[0, 1][..]
+            } else {
+                &[1][..]
+            };
+            append_data_event(&mut event_stream, 0xEB, flags);
+        }
+
+        let mut parameter_payload = Vec::new();
+        for (source_insert, route_id, value) in [(64_u16, 66_u8, -125), (64, 67, 500)] {
+            parameter_payload.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+            parameter_payload.push(route_id);
+            parameter_payload.push(0);
+            parameter_payload.extend_from_slice(&(source_insert << 6).to_le_bytes());
+            parameter_payload.extend_from_slice(&value.to_le_bytes());
+        }
+        parameter_payload.extend_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+        parameter_payload.push(68);
+        parameter_payload.push(0);
+        parameter_payload.extend_from_slice(&(65_u16 << 6).to_le_bytes());
+        parameter_payload.extend_from_slice(&750_i32.to_le_bytes());
+        append_data_event(&mut event_stream, 0xE1, &parameter_payload);
+
+        let document = FlpDocument::parse(&flp_fixture(&event_stream, &[], &[]))
+            .expect("the Mixer routing fixture should parse");
+        let sends = document
+            .mixer_send_summaries()
+            .expect("recognized Mixer parameter records should decode");
+        assert_eq!(sends.len(), 3);
+        assert_eq!(sends[0].insert_ordinal(), 0);
+        assert_eq!(sends[0].route_parameter_id(), 66);
+        assert_eq!(sends[0].value(), -125);
+        assert_eq!(sends[0].enabled(), Some(false));
+        assert_eq!(sends[1].route_parameter_id(), 67);
+        assert_eq!(sends[1].enabled(), Some(true));
+        assert_eq!(sends[2].insert_ordinal(), 1);
+        assert_eq!(sends[2].route_parameter_id(), 68);
+        assert_eq!(sends[2].enabled(), Some(true));
+        assert!(sends.iter().all(|send| send.parameter_location().0 == 10));
     }
 
     #[test]
