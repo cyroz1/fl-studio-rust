@@ -8981,15 +8981,14 @@ impl DawUi {
                                         }),
                                 _ => None,
                             };
+                            let full_source_length_ms = clip
+                                .uses_full_source_window()
+                                .then_some(sample_length_ms)
+                                .flatten();
                             let source_window_ms = clip
                                 .source_window_milliseconds()
                                 .map(|(start_ms, end_ms)| (start_ms as f32, end_ms as f32))
-                                .or_else(|| {
-                                    clip.uses_full_source_window()
-                                        .then_some(sample_length_ms)
-                                        .flatten()
-                                        .map(|length_ms| (0.0, length_ms))
-                                });
+                                .or_else(|| full_source_length_ms.map(|length_ms| (0.0, length_ms)));
                             let source_window_supported = source_window_ms.is_some();
                             let scale_supported = clip.scale.is_none_or(|scale| {
                                 scale.is_finite() && scale > 0.0 && (scale - 1.0).abs() <= 1e-9

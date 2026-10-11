@@ -13822,7 +13822,7 @@ mod tests {
     #[test]
     fn initializes_unstretched_window_only_for_new_modern_playlist_records() {
         let mut record = [0xA5u8; 88];
-        initialize_new_playlist_clip_length(&mut record, 1440);
+        super::initialize_new_playlist_clip_length(&mut record, 1440);
         assert_eq!(u32::from_le_bytes(record[8..12].try_into().unwrap()), 1440);
         assert_eq!(u32::from_le_bytes(record[24..28].try_into().unwrap()), 0);
         assert_eq!(u32::from_le_bytes(record[28..32].try_into().unwrap()), 1440);
