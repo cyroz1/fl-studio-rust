@@ -3379,6 +3379,71 @@ impl DawUi {
         }
     }
 
+    fn save_channel_state_preset(&mut self, channel_id: u16, channel_name: &str) {
+        let Some(mut document) = self.document.clone() else {
+            self.status = "Open a project before saving a channel preset".to_owned();
+            return;
+        };
+        let safe_name = channel_name
+            .chars()
+            .map(|character| {
+                if character.is_control() || "/\\:*?\"<>|".contains(character) {
+                    '_'
+                } else {
+                    character
+                }
+            })
+            .collect::<String>();
+        let safe_name = safe_name.trim().trim_matches('.');
+        let file_name = if safe_name.is_empty() {
+            format!("Channel {channel_id}.fst")
+        } else {
+            format!("{safe_name}.fst")
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Save channel state preset")
+            .add_filter("FL Studio channel state", &["fst"])
+            .set_file_name(file_name)
+            .save_file()
+        else {
+            return;
+        };
+        let path = if path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("fst"))
+        {
+            path
+        } else {
+            path.with_extension("fst")
+        };
+
+        let plugin_state_warnings = self.capture_loaded_vst3_state(&mut document);
+        let selected_channel_warning = format!("channel {channel_id}: ");
+        if let Some(warning) = plugin_state_warnings
+            .iter()
+            .find(|warning| warning.starts_with(&selected_channel_warning))
+        {
+            self.status = format!("Could not capture live channel state: {warning}");
+            return;
+        }
+        let preset_bytes = match document.encode_channel_state_preset(channel_id) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.status = format!("Could not save channel preset: {error}");
+                return;
+            }
+        };
+        match fs::write(&path, preset_bytes) {
+            Ok(()) => {
+                self.status = format!("Saved channel state preset to {}", path.display());
+            }
+            Err(error) => {
+                self.status = format!("Could not write channel preset {}: {error}", path.display());
+            }
+        }
+    }
+
     fn save_new_version(&mut self) {
         let Some(path) = self.current_path.clone() else {
             self.save_as();
@@ -11068,6 +11133,7 @@ impl DawUi {
         let mut open_empty_group_dialog = false;
         let mut rename_group_dialog = None;
         let mut delete_group = None;
+        let mut save_channel_preset = None;
         let mut channel_enabled_edits = Vec::new();
         let mut channel_zipped_edits = Vec::new();
         let (zip_selected, unzip_all, group_selected, previous_group, next_group) =
@@ -11563,6 +11629,26 @@ impl DawUi {
                                     ui.close();
                                 }
                                 ui.separator();
+                                let preset_supported = !channel
+                                    .layer_child_ids()
+                                    .is_some_and(|child_ids| !child_ids.is_empty());
+                                if ui
+                                    .add_enabled(
+                                        preset_supported,
+                                        egui::Button::new("Save channel state as…"),
+                                    )
+                                    .clicked()
+                                {
+                                    save_channel_preset = Some((
+                                        channel.id(),
+                                        channel.display_name().unwrap_or("Channel").to_owned(),
+                                    ));
+                                    ui.close();
+                                }
+                                if !preset_supported {
+                                    ui.small("Layer channels with children cannot be saved alone");
+                                }
+                                ui.separator();
                                 if zipped {
                                     if ui.button("Unzip channel").clicked() {
                                         channel_zipped_edits.push((channel.id(), false));
@@ -11947,6 +12033,9 @@ impl DawUi {
                 }
             }
         });
+        if let Some((channel_id, channel_name)) = save_channel_preset {
+            self.save_channel_state_preset(channel_id, &channel_name);
+        }
         for (channel_id, path) in dropped_samples {
             self.load_browser_sample_into_channel(channel_id, &path);
         }

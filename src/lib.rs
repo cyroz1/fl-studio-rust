@@ -11710,6 +11710,64 @@ impl FlpDocument {
         counts
     }
 
+    /// Encodes one channel as a format-32 FL Studio channel-state preset.
+    ///
+    /// The selected channel's event bytes and the project's version event are retained. Project
+    /// events, trailing bytes, and sibling channels are omitted. Layer channels with child
+    /// references are rejected because their standalone behavior depends on those siblings.
+    pub fn encode_channel_state_preset(&self, channel_id: u16) -> Result<Vec<u8>, FlpError> {
+        let mut matching_channels = self
+            .channels()
+            .into_iter()
+            .filter(|channel| channel.id() == channel_id);
+        let channel = matching_channels
+            .next()
+            .ok_or(FlpError::ChannelNotFound(channel_id))?;
+        if matching_channels.next().is_some() {
+            return Err(FlpError::AmbiguousChannelId(channel_id));
+        }
+        if channel.channel_type() == Some(ChannelType::Layer)
+            && channel
+                .layer_child_ids()
+                .is_some_and(|child_ids| !child_ids.is_empty())
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "standalone channel presets for Layers with child channels are not supported",
+            ));
+        }
+
+        let channel_range = channel.event_range();
+        let version_event =
+            self.events[..channel_range.start]
+                .iter()
+                .find(|event| match event.opcode {
+                    0xC7 => ascii_version(&event.payload).is_some(),
+                    0xC0 => utf16_banner_version(&event.payload).is_some(),
+                    _ => false,
+                });
+        let mut events = Vec::with_capacity(
+            channel_range
+                .len()
+                .saturating_add(usize::from(version_event.is_some())),
+        );
+        if let Some(version_event) = version_event {
+            events.push(version_event.clone());
+        }
+        events.extend_from_slice(&self.events[channel_range]);
+
+        let mut header = self.header.clone();
+        header.format = 32;
+        let mut preset = Self {
+            header,
+            events,
+            project_version: self.project_version.clone(),
+            metadata: ProjectMetadata::default(),
+            trailing_bytes: Vec::new(),
+        };
+        preset.refresh_event_offsets()?;
+        preset.encode_lossless()
+    }
+
     /// Rebuilds the two-chunk container while keeping each event's original wire bytes.
     pub fn encode_lossless(&self) -> Result<Vec<u8>, FlpError> {
         let header_content_length = MIN_HEADER_CONTENT_LENGTH
@@ -12923,6 +12981,78 @@ mod tests {
                 fixture
             );
         }
+    }
+
+    #[test]
+    fn exports_one_channel_as_a_lossless_format_32_state_preset() {
+        let mut event_stream = Vec::new();
+        append_data_event(&mut event_stream, 0xC7, b"26.0.0\0");
+        append_data_event(&mut event_stream, 0xC2, b"Project title\0");
+        event_stream.extend_from_slice(&[0x40, 1, 0, 0x15, 0]);
+        append_data_event(&mut event_stream, 0xD4, &[0xA1, 0xA2]);
+        append_data_event(&mut event_stream, 0xD5, &[0xB1, 0xB2, 0xB3]);
+        event_stream.extend_from_slice(&[0x40, 2, 0, 0x15, 2]);
+        append_data_event(&mut event_stream, 0xD4, &[0xC1, 0xC2]);
+        append_data_event(&mut event_stream, 0xD5, &[0xD1, 0xD2, 0xD3]);
+        event_stream.extend_from_slice(&[0x40, 3, 0, 0x15, 0, 0x62]);
+        event_stream.extend_from_slice(&[0x50, 1, 0, 0x51, 0]);
+        let source_bytes = flp_fixture(&event_stream, &[0xA5, 0x5A], &[0xDE, 0xAD]);
+        let mut source_bytes = source_bytes;
+        source_bytes[10..12].copy_from_slice(&9_u16.to_le_bytes());
+        let source = FlpDocument::parse(&source_bytes).expect("source project should parse");
+        let expected_channel_events = source.events()[source.channels()[1].event_range()]
+            .iter()
+            .map(|event| event.wire_bytes().to_vec())
+            .collect::<Vec<_>>();
+
+        let preset_bytes = source
+            .encode_channel_state_preset(2)
+            .expect("selected channel should export");
+        let preset = FstPreset::parse(&preset_bytes).expect("exported preset should parse");
+        assert_eq!(preset.kind(), FstPresetKind::ChannelState);
+        assert_eq!(preset.document().header().legacy_channel_count(), 9);
+        assert_eq!(preset.document().header().ppq(), 96);
+        assert_eq!(preset.document().header().extension(), &[0xA5, 0x5A]);
+        assert_eq!(preset.document().project_version(), Some("26.0.0"));
+        assert!(preset.document().trailing_bytes().is_empty());
+        assert_eq!(preset.document().channels().len(), 1);
+        assert_eq!(preset.document().channels()[0].id(), 2);
+        assert_eq!(
+            preset
+                .document()
+                .events()
+                .iter()
+                .filter(|event| event.opcode() != 0xC7)
+                .map(|event| event.wire_bytes().to_vec())
+                .collect::<Vec<_>>(),
+            expected_channel_events
+        );
+        assert_eq!(preset.document().events()[0].opcode(), 0xC7);
+        assert_eq!(
+            preset.document().events().len(),
+            expected_channel_events.len() + 1
+        );
+    }
+
+    #[test]
+    fn channel_state_export_rejects_missing_ambiguous_and_dependent_layer_channels() {
+        let mut event_stream = Vec::new();
+        event_stream.extend_from_slice(&[0x40, 4, 0, 0x15, 5, 0x5E, 5, 0]);
+        event_stream.extend_from_slice(&[0x40, 5, 0, 0x15, 0, 0x40, 5, 0, 0x15, 0]);
+        let document = FlpDocument::parse(&flp_fixture(&event_stream, &[], &[]))
+            .expect("source project should parse");
+        assert!(matches!(
+            document.encode_channel_state_preset(99),
+            Err(FlpError::ChannelNotFound(99))
+        ));
+        assert!(matches!(
+            document.encode_channel_state_preset(4),
+            Err(FlpError::UnsupportedEdit(_))
+        ));
+        assert!(matches!(
+            document.encode_channel_state_preset(5),
+            Err(FlpError::AmbiguousChannelId(5))
+        ));
     }
 
     fn append_data_event(event_stream: &mut Vec<u8>, opcode: u8, payload: &[u8]) {
