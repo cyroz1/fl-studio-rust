@@ -20009,10 +20009,8 @@ impl DawUi {
                     }
                 }
             }
-            if !primary_down {
-                if self.piano_roll_controller_stroke.take().is_some() {
-                    self.status = "Drew raw Pattern controller points".to_owned();
-                }
+            if !primary_down && self.piano_roll_controller_stroke.take().is_some() {
+                self.status = "Drew raw Pattern controller points".to_owned();
             }
         } else {
             self.piano_roll_controller_stroke = None;
