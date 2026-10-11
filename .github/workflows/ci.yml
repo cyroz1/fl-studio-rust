@@ -701,12 +701,86 @@ jobs:
           sleep 0.3
           ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
             -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/modern-pattern-clip-before-resize.png"
+          resize_start_x=$(python3 - "$GITHUB_WORKSPACE/dist/gui-preview/modern-pattern-clip-before-resize.png" <<'PY'
+          import struct
+          import sys
+          import zlib
+          from pathlib import Path
+
+          data = Path(sys.argv[1]).read_bytes()
+          offset = 8
+          compressed = []
+          while offset < len(data):
+              size = int.from_bytes(data[offset : offset + 4], "big")
+              kind = data[offset + 4 : offset + 8]
+              payload = data[offset + 8 : offset + 8 + size]
+              if kind == b"IHDR":
+                  width, height, bit_depth, color_type, _, _, interlace = struct.unpack(
+                      ">IIBBBBB", payload
+                  )
+              elif kind == b"IDAT":
+                  compressed.append(payload)
+              offset += 12 + size
+
+          channels = {2: 3, 6: 4}.get(color_type)
+          if bit_depth != 8 or channels is None or interlace != 0:
+              raise SystemExit("Unsupported PNG format in the Playlist resize capture.")
+          bytes_per_pixel = channels
+          stride = width * bytes_per_pixel
+          pixels = zlib.decompress(b"".join(compressed))
+          previous = bytearray(stride)
+          row_offset = 0
+          purple_x = []
+          for y in range(height):
+              filter_type = pixels[row_offset]
+              row_offset += 1
+              row = bytearray(pixels[row_offset : row_offset + stride])
+              row_offset += stride
+              for index in range(stride):
+                  left = row[index - bytes_per_pixel] if index >= bytes_per_pixel else 0
+                  above = previous[index]
+                  upper_left = (
+                      previous[index - bytes_per_pixel] if index >= bytes_per_pixel else 0
+                  )
+                  if filter_type == 1:
+                      row[index] = (row[index] + left) & 255
+                  elif filter_type == 2:
+                      row[index] = (row[index] + above) & 255
+                  elif filter_type == 3:
+                      row[index] = (row[index] + (left + above) // 2) & 255
+                  elif filter_type == 4:
+                      estimate = left + above - upper_left
+                      distances = (
+                          abs(estimate - left),
+                          abs(estimate - above),
+                          abs(estimate - upper_left),
+                      )
+                      predictor = (
+                          left if distances[0] <= distances[1] and distances[0] <= distances[2]
+                          else above if distances[1] <= distances[2]
+                          else upper_left
+                      )
+                      row[index] = (row[index] + predictor) & 255
+              if 286 <= y <= 310:
+                  for x in range(width):
+                      index = x * bytes_per_pixel
+                      red, green, blue = row[index : index + 3]
+                      if red > 100 and blue > 140 and blue - red > 20 and green < 190:
+                          purple_x.append(x)
+              previous = row
+
+          if not purple_x:
+              raise SystemExit("Could not locate the Pattern Clip in the resize capture.")
+          # Start four pixels inside the detected right edge, within the resize hit zone.
+          print(max(purple_x) - 3)
+          PY
+          )
+          resize_end_x=$((resize_start_x + 41))
           xdotool keydown Shift_L
-          # The visible clip ends near x=669; begin inside its 8 px resize zone.
-          xdotool mousemove --sync 665 298
+          xdotool mousemove --sync "$resize_start_x" 298
           xdotool mousedown 1
           sleep 0.2
-          xdotool mousemove --sync 706 298
+          xdotool mousemove --sync "$resize_end_x" 298
           sleep 0.3
           xdotool mouseup 1
           xdotool keyup Shift_L
