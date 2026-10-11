@@ -11860,13 +11860,18 @@ impl FlpDocument {
             ));
         }
         let insert_range = insert.event_range();
-        let effect_start = slots[0].event_range().start;
-        let closing_index = slots[9].event_range().end;
-        let Some(opening_event) = self.events.get(effect_start) else {
+        let effect_start = slots[0].event_range().find(|&event_index| {
+            let event = &self.events[event_index];
+            event.opcode == 0x62
+                && event.encoding == PayloadEncoding::Word
+                && event.payload.as_slice() == 0_u16.to_le_bytes()
+        });
+        let Some(effect_start) = effect_start else {
             return Err(FlpError::UnsupportedEdit(
                 "the Mixer insert has no recognized first effect-slot boundary",
             ));
         };
+        let closing_index = slots[9].event_range().end;
         let Some(closing_event) = self.events.get(closing_index) else {
             return Err(FlpError::UnsupportedEdit(
                 "the Mixer insert has no recognized final effect-slot boundary",
@@ -11874,9 +11879,6 @@ impl FlpDocument {
         };
         if effect_start < insert_range.start
             || effect_start >= insert_range.end
-            || opening_event.opcode != 0x62
-            || opening_event.encoding != PayloadEncoding::Word
-            || opening_event.payload.as_slice() != 0_u16.to_le_bytes()
             || closing_index < effect_start
             || closing_index >= insert_range.end
             || closing_event.opcode != 0x93
