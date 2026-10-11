@@ -493,7 +493,7 @@ jobs:
             -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/controller-event-spline.png"
           xdotool mousemove 930 741 click 1
           sleep 0.2
-          xdotool mousemove 400 840
+          xdotool mousemove 420 840
           xdotool mousedown 1
           sleep 0.2
           xdotool mousemove --sync 610 840

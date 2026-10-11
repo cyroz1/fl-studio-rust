@@ -19594,7 +19594,7 @@ impl DawUi {
                 PianoRollControllerTool::Draw => "Drag in the lane to draw · uses current snap",
                 PianoRollControllerTool::Paint => "Drag in the lane to paint · snap is bypassed",
                 PianoRollControllerTool::Interpolate => "Left-drag: linear · right-drag: spline",
-                PianoRollControllerTool::Erase => "Drag across points to erase the selected range",
+                PianoRollControllerTool::Erase => "Drag to erase selected points",
             });
         });
 
