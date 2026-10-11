@@ -1,12 +1,12 @@
 //! Offline rendering for Playlist clips that reference FLP audio channels.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use flacenc::bitsink::ByteSink;
@@ -2657,91 +2657,106 @@ fn stream_prepared_playlist_render(
     if let Some(processor) = render.vst3_processor.as_deref_mut() {
         processor.start_processing()?;
     }
-    let mix_result = (|| {
-        let mut block_start = 0u64;
-        while block_start < frames {
-            check_cancelled(Some(cancelled))?;
-            if stream_cancelled() {
-                return Err("Playlist playback was stopped".to_owned());
-            }
-            let frame_count = (frames - block_start).min(STREAM_BLOCK_FRAMES as u64) as usize;
-            let sample_count = frame_count * 2;
-            let block = &mut output[..sample_count];
-            block.fill(0.0);
-            let mut meter_buses = if meters.is_some() {
-                let active_samples = MIXER_TRACK_METER_COUNT * sample_count;
-                let buses = &mut meter_buses[..active_samples];
-                buses.fill(0.0);
-                Some(buses)
-            } else {
-                None
-            };
-            for clip in &render.audio.clips {
-                let source = render
-                    .audio
-                    .decoded_by_path
-                    .get(&clip.path)
-                    .expect("prepared audio clips have decoded sources");
-                mix_clip_window_into_stereo_with_quality_and_meter(
-                    block,
+    let track_groups = audio_clips_grouped_by_mixer_track(&render.audio.clips);
+    let worker_count =
+        audio_clip_mix_worker_count(&render.audio.clips, &track_groups, options.sample_rate);
+    let worker_clips = audio_clip_groups_for_workers(&track_groups, worker_count);
+    let mix_result = std::thread::scope(|scope| {
+        let mut parallel_mixer = if worker_count > 1 {
+            ParallelAudioClipMixer::new(
+                scope,
+                worker_clips,
+                &render.audio.decoded_by_path,
+                options.sample_rate,
+                options.resampling_quality,
+                cancelled,
+                meters.is_some(),
+            )
+        } else {
+            None
+        };
+        let mix_result = (|| {
+            let mut block_start = 0u64;
+            while block_start < frames {
+                check_cancelled(Some(cancelled))?;
+                if stream_cancelled() {
+                    return Err("Playlist playback was stopped".to_owned());
+                }
+                let frame_count = (frames - block_start).min(STREAM_BLOCK_FRAMES as u64) as usize;
+                let sample_count = frame_count * 2;
+                let block = &mut output[..sample_count];
+                block.fill(0.0);
+                let mut meter_buses = if meters.is_some() {
+                    let active_samples = MIXER_TRACK_METER_COUNT * sample_count;
+                    let buses = &mut meter_buses[..active_samples];
+                    buses.fill(0.0);
+                    Some(buses)
+                } else {
+                    None
+                };
+                mix_prepared_audio_clip_block(
+                    &render.audio.clips,
+                    &render.audio.decoded_by_path,
                     block_start,
-                    source,
-                    clip,
                     options.sample_rate,
                     options.resampling_quality,
-                    ClipMixMonitor {
-                        cancelled: Some(cancelled),
-                        meter_buses: meter_buses.as_deref_mut(),
-                        meter_stride_samples: sample_count,
-                    },
-                )
-                .map_err(|error| {
-                    format!(
-                        "could not mix Playlist clip {} from audio channel {}: {error}",
-                        clip.clip_index, clip.channel_id
-                    )
-                })?;
-            }
-            let sampler_samples = &mut sampler_block[..sample_count];
-            if let Some(meter_buses) = meter_buses.as_deref_mut() {
-                sampler_engine.render_block_with_meters(
-                    block_start,
-                    frame_count,
-                    sampler_samples,
-                    Some(meter_buses),
-                    sample_count,
-                );
-            } else {
-                sampler_engine.render_block(block_start, frame_count, sampler_samples);
-            }
-            for (mixed, sampler_sample) in block.iter_mut().zip(sampler_samples) {
-                *mixed += *sampler_sample;
-            }
-            direct_source_delay.process_interleaved(block)?;
-            if let Some(processor) = render.vst3_processor.as_deref_mut() {
+                    cancelled,
+                    block,
+                    meter_buses.as_deref_mut(),
+                    parallel_mixer.as_ref(),
+                )?;
+                let sampler_samples = &mut sampler_block[..sample_count];
                 if let Some(meter_buses) = meter_buses.as_deref_mut() {
-                    processor.mix_next_block_with_meter_buses(block, meter_buses)?;
+                    sampler_engine.render_block_with_meters(
+                        block_start,
+                        frame_count,
+                        sampler_samples,
+                        Some(meter_buses),
+                        sample_count,
+                    );
                 } else {
-                    processor.mix_next_block(block)?;
+                    sampler_engine.render_block(block_start, frame_count, sampler_samples);
                 }
-            }
-            if let (Some(meters), Some(meter_buses)) = (meters, meter_buses.as_deref()) {
-                for (track, track_samples) in meter_buses.chunks_exact(sample_count).enumerate() {
-                    if track == 0 {
-                        continue;
+                for (mixed, sampler_sample) in block.iter_mut().zip(sampler_samples) {
+                    *mixed += *sampler_sample;
+                }
+                direct_source_delay.process_interleaved(block)?;
+                if let Some(processor) = render.vst3_processor.as_deref_mut() {
+                    if let Some(meter_buses) = meter_buses.as_deref_mut() {
+                        processor.mix_next_block_with_meter_buses(block, meter_buses)?;
+                    } else {
+                        processor.mix_next_block(block)?;
                     }
-                    let peak = track_samples
-                        .iter()
-                        .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
-                    meters.publish_peak(track, peak);
                 }
+                if let (Some(meters), Some(meter_buses)) = (meters, meter_buses.as_deref()) {
+                    for (track, track_samples) in meter_buses.chunks_exact(sample_count).enumerate()
+                    {
+                        if track == 0 {
+                            continue;
+                        }
+                        let peak = track_samples
+                            .iter()
+                            .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+                        meters.publish_peak(track, peak);
+                    }
+                }
+                render.master_output.apply(block);
+                write_block(block, meter_buses.as_deref())?;
+                block_start += frame_count as u64;
             }
-            render.master_output.apply(block);
-            write_block(block, meter_buses.as_deref())?;
-            block_start += frame_count as u64;
+            Ok::<_, String>(())
+        })();
+        let worker_result = if let Some(parallel_mixer) = parallel_mixer.as_mut() {
+            parallel_mixer.stop_and_join()
+        } else {
+            Ok(())
+        };
+        match (mix_result, worker_result) {
+            (Err(error), _) => Err(error),
+            (Ok(()), Err(error)) => Err(error),
+            (Ok(()), Ok(())) => Ok(()),
         }
-        Ok::<_, String>(())
-    })();
+    });
     let stop_result = if let Some(processor) = render.vst3_processor.as_deref_mut() {
         processor.stop_processing()
     } else {
@@ -3091,6 +3106,7 @@ fn prepare_audio_clip_render(
         PathBuf,
         f32,
         f32,
+        Option<i8>,
         MixerSourceRoutePlan,
     )>::new();
     for (clip_index, clip) in arrangement.clips.iter().enumerate() {
@@ -3135,6 +3151,7 @@ fn prepare_audio_clip_render(
             format!("could not resolve audio channel {id} for Playlist clip {clip_index}: {error}")
         })?;
         let (gain, pan) = channel_gain_pan(channel.volume(), channel.pan());
+        let mixer_track = channel.mixer_track().filter(|track| *track > 0);
         let mixer_route_plan =
             mixer_route_audibility.source_route_plan_for_channel(channel.mixer_track());
         candidate_clips.push((
@@ -3144,6 +3161,7 @@ fn prepare_audio_clip_render(
             resolved_path,
             gain,
             pan,
+            mixer_track,
             mixer_route_plan,
         ));
     }
@@ -3165,7 +3183,7 @@ fn prepare_audio_clip_render(
     )?;
     let mut decoded_by_path = HashMap::<PathBuf, DecodedAudio>::new();
     let mut cached_source_bytes = 0usize;
-    for (_, _, _, path, _, _, _) in &candidate_clips {
+    for (_, _, _, path, _, _, _, _) in &candidate_clips {
         check_cancelled(cancelled)?;
         if decoded_by_path.contains_key(path) {
             continue;
@@ -3186,7 +3204,9 @@ fn prepare_audio_clip_render(
 
     let mut clips = Vec::with_capacity(candidate_clips.len());
     let mut output_frames = timeline_frames;
-    for (clip_index, clip, channel_id, path, gain, pan, mixer_route_plan) in &candidate_clips {
+    for (clip_index, clip, channel_id, path, gain, pan, mixer_track, mixer_route_plan) in
+        &candidate_clips
+    {
         check_cancelled(cancelled)?;
         let audio = decoded_by_path
             .get(path)
@@ -3227,6 +3247,7 @@ fn prepare_audio_clip_render(
         clips.push(PreparedClip {
             clip_index: *clip_index,
             channel_id: *channel_id,
+            mixer_track: *mixer_track,
             path: path.clone(),
             start_frame,
             source_bounds,
@@ -4539,6 +4560,7 @@ struct SampleBounds {
 struct PreparedClip {
     clip_index: usize,
     channel_id: u16,
+    mixer_track: Option<i8>,
     path: PathBuf,
     start_frame: u64,
     source_bounds: SampleBounds,
@@ -4558,6 +4580,385 @@ struct PreparedAudioClipRender {
 }
 
 const STREAM_BLOCK_FRAMES: usize = 1024;
+const MAX_PARALLEL_AUDIO_MIX_WORKERS: usize = 8;
+const MIN_PARALLEL_AUDIO_MIX_CLIPS: usize = 4;
+const MIN_PARALLEL_AUDIO_MIX_SECONDS: u64 = 2;
+
+struct AudioClipMixWorkerState {
+    generation: u64,
+    block_start_frame: u64,
+    sample_count: usize,
+    completed_workers: usize,
+    worker_errors: Vec<Option<String>>,
+    stopping: bool,
+}
+
+struct AudioClipMixWorkerControl {
+    state: Mutex<AudioClipMixWorkerState>,
+    task_available: Condvar,
+    block_complete: Condvar,
+}
+
+struct AudioClipMixWorkerScratch {
+    stereo: Vec<f32>,
+    meter_buses: Option<Vec<f32>>,
+}
+
+struct ParallelAudioClipMixer<'scope> {
+    control: Arc<AudioClipMixWorkerControl>,
+    scratch: Arc<Vec<Mutex<AudioClipMixWorkerScratch>>>,
+    workers: Vec<std::thread::ScopedJoinHandle<'scope, ()>>,
+}
+
+fn audio_clips_grouped_by_mixer_track(clips: &[PreparedClip]) -> Vec<Vec<&PreparedClip>> {
+    let mut by_track = BTreeMap::<Option<i8>, Vec<&PreparedClip>>::new();
+    for clip in clips {
+        by_track.entry(clip.mixer_track).or_default().push(clip);
+    }
+    by_track.into_values().collect()
+}
+
+fn audio_clip_mix_worker_count(
+    clips: &[PreparedClip],
+    track_groups: &[Vec<&PreparedClip>],
+    sample_rate: u32,
+) -> usize {
+    let total_clip_frames = clips.iter().fold(0_u64, |total, clip| {
+        total.saturating_add(clip.duration_frames)
+    });
+    if clips.len() < MIN_PARALLEL_AUDIO_MIX_CLIPS
+        || track_groups.len() < 2
+        || total_clip_frames < u64::from(sample_rate) * MIN_PARALLEL_AUDIO_MIX_SECONDS
+    {
+        return 1;
+    }
+    std::thread::available_parallelism().map_or(1, |count| {
+        count
+            .get()
+            .min(MAX_PARALLEL_AUDIO_MIX_WORKERS)
+            .min(track_groups.len())
+    })
+}
+
+fn audio_clip_groups_for_workers(
+    track_groups: &[Vec<&PreparedClip>],
+    worker_count: usize,
+) -> Vec<Vec<&PreparedClip>> {
+    if worker_count == 0 {
+        return Vec::new();
+    }
+    let mut workers = (0..worker_count).map(|_| Vec::new()).collect::<Vec<_>>();
+    for (group_index, group) in track_groups.iter().enumerate() {
+        workers[group_index % worker_count].extend(group.iter().copied());
+    }
+    workers
+}
+
+impl<'scope> ParallelAudioClipMixer<'scope> {
+    fn new<'env>(
+        scope: &'scope std::thread::Scope<'scope, 'env>,
+        worker_clips: Vec<Vec<&'scope PreparedClip>>,
+        decoded_by_path: &'scope HashMap<PathBuf, DecodedAudio>,
+        sample_rate: u32,
+        resampling_quality: ResamplingQuality,
+        cancelled: &'scope AtomicBool,
+        include_meters: bool,
+    ) -> Option<Self> {
+        let worker_count = worker_clips.len();
+        if worker_count < 2 {
+            return None;
+        }
+        let control = Arc::new(AudioClipMixWorkerControl {
+            state: Mutex::new(AudioClipMixWorkerState {
+                generation: 0,
+                block_start_frame: 0,
+                sample_count: 0,
+                completed_workers: 0,
+                worker_errors: vec![None; worker_count],
+                stopping: false,
+            }),
+            task_available: Condvar::new(),
+            block_complete: Condvar::new(),
+        });
+        let scratch = Arc::new(
+            (0..worker_count)
+                .map(|_| {
+                    Mutex::new(AudioClipMixWorkerScratch {
+                        stereo: vec![0.0; STREAM_BLOCK_FRAMES * 2],
+                        meter_buses: include_meters
+                            .then(|| vec![0.0; MIXER_TRACK_METER_COUNT * STREAM_BLOCK_FRAMES * 2]),
+                    })
+                })
+                .collect::<Vec<_>>(),
+        );
+        let mut workers = Vec::with_capacity(worker_count);
+        for (worker_index, clips) in worker_clips.into_iter().enumerate() {
+            let worker_control = Arc::clone(&control);
+            let worker_scratch = Arc::clone(&scratch);
+            let worker_result = std::thread::Builder::new()
+                .name(format!("flp-audio-mix-{worker_index}"))
+                .spawn_scoped(scope, move || {
+                    audio_clip_mix_worker(
+                        worker_index,
+                        worker_count,
+                        clips,
+                        decoded_by_path,
+                        sample_rate,
+                        resampling_quality,
+                        cancelled,
+                        worker_control,
+                        worker_scratch,
+                    );
+                });
+            match worker_result {
+                Ok(worker) => workers.push(worker),
+                Err(_) => {
+                    request_audio_clip_mix_shutdown(&control);
+                    for worker in workers {
+                        let _ = worker.join();
+                    }
+                    return None;
+                }
+            }
+        }
+        Some(Self {
+            control,
+            scratch,
+            workers,
+        })
+    }
+
+    fn mix_block(
+        &self,
+        block_start_frame: u64,
+        stereo: &mut [f32],
+        meter_buses: Option<&mut [f32]>,
+    ) -> Result<(), String> {
+        let worker_count = self.scratch.len();
+        {
+            let mut state = self
+                .control
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.block_start_frame = block_start_frame;
+            state.sample_count = stereo.len();
+            state.completed_workers = 0;
+            state.worker_errors.fill(None);
+            state.generation = state.generation.wrapping_add(1);
+        }
+        self.control.task_available.notify_all();
+        let worker_error = {
+            let mut state = self
+                .control
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while state.completed_workers < worker_count {
+                state = self
+                    .control
+                    .block_complete
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            state.worker_errors.iter_mut().find_map(Option::take)
+        };
+        if let Some(error) = worker_error {
+            return Err(error);
+        }
+
+        let mut meter_buses = meter_buses;
+        let sample_count = stereo.len();
+        for worker_scratch in self.scratch.iter() {
+            let worker_scratch = worker_scratch
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (sample, addition) in stereo
+                .iter_mut()
+                .zip(&worker_scratch.stereo[..sample_count])
+            {
+                *sample += addition;
+            }
+            if let (Some(output_buses), Some(worker_buses)) = (
+                meter_buses.as_deref_mut(),
+                worker_scratch.meter_buses.as_deref(),
+            ) {
+                let active_meter_samples = MIXER_TRACK_METER_COUNT * sample_count;
+                for (sample, addition) in output_buses
+                    .iter_mut()
+                    .zip(&worker_buses[..active_meter_samples])
+                {
+                    *sample += addition;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn stop_and_join(&mut self) -> Result<(), String> {
+        request_audio_clip_mix_shutdown(&self.control);
+        for worker in self.workers.drain(..) {
+            if worker.join().is_err() {
+                return Err("Playlist audio mixer worker stopped unexpectedly".to_owned());
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ParallelAudioClipMixer<'_> {
+    fn drop(&mut self) {
+        request_audio_clip_mix_shutdown(&self.control);
+    }
+}
+
+fn request_audio_clip_mix_shutdown(control: &AudioClipMixWorkerControl) {
+    let mut state = control
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.stopping = true;
+    drop(state);
+    control.task_available.notify_all();
+}
+
+fn audio_clip_mix_worker(
+    worker_index: usize,
+    worker_count: usize,
+    clips: Vec<&PreparedClip>,
+    decoded_by_path: &HashMap<PathBuf, DecodedAudio>,
+    sample_rate: u32,
+    resampling_quality: ResamplingQuality,
+    cancelled: &AtomicBool,
+    control: Arc<AudioClipMixWorkerControl>,
+    scratch: Arc<Vec<Mutex<AudioClipMixWorkerScratch>>>,
+) {
+    let mut observed_generation = 0;
+    loop {
+        let (generation, block_start_frame, sample_count) = {
+            let mut state = control
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while !state.stopping && state.generation == observed_generation {
+                state = control
+                    .task_available
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            if state.stopping {
+                return;
+            }
+            observed_generation = state.generation;
+            (
+                state.generation,
+                state.block_start_frame,
+                state.sample_count,
+            )
+        };
+        let worker_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut worker_scratch = scratch[worker_index]
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let stereo = &mut worker_scratch.stereo[..sample_count];
+            stereo.fill(0.0);
+            let mut meter_buses = if let Some(worker_buses) = worker_scratch.meter_buses.as_mut() {
+                let active_meter_samples = MIXER_TRACK_METER_COUNT * sample_count;
+                let buses = &mut worker_buses[..active_meter_samples];
+                buses.fill(0.0);
+                Some(buses)
+            } else {
+                None
+            };
+            for clip in &clips {
+                let source = decoded_by_path.get(&clip.path).ok_or_else(|| {
+                    format!(
+                        "prepared audio clip {} has no decoded source",
+                        clip.clip_index
+                    )
+                })?;
+                mix_clip_window_into_stereo_with_quality_and_meter(
+                    stereo,
+                    block_start_frame,
+                    source,
+                    clip,
+                    sample_rate,
+                    resampling_quality,
+                    ClipMixMonitor {
+                        cancelled: Some(cancelled),
+                        meter_buses: meter_buses.as_deref_mut(),
+                        meter_stride_samples: sample_count,
+                    },
+                )
+                .map_err(|error| {
+                    format!(
+                        "could not mix Playlist clip {} from audio channel {}: {error}",
+                        clip.clip_index, clip.channel_id
+                    )
+                })?;
+            }
+            Ok::<_, String>(())
+        }))
+        .unwrap_or_else(|_| Err("Playlist audio mixer worker panicked".to_owned()));
+        let mut state = control
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.generation == generation {
+            state.worker_errors[worker_index] = worker_result.err();
+            state.completed_workers += 1;
+            if state.completed_workers == worker_count {
+                control.block_complete.notify_one();
+            }
+        }
+    }
+}
+
+fn mix_prepared_audio_clip_block(
+    clips: &[PreparedClip],
+    decoded_by_path: &HashMap<PathBuf, DecodedAudio>,
+    block_start_frame: u64,
+    sample_rate: u32,
+    resampling_quality: ResamplingQuality,
+    cancelled: &AtomicBool,
+    stereo: &mut [f32],
+    meter_buses: Option<&mut [f32]>,
+    parallel_mixer: Option<&ParallelAudioClipMixer<'_>>,
+) -> Result<(), String> {
+    if let Some(parallel_mixer) = parallel_mixer {
+        return parallel_mixer.mix_block(block_start_frame, stereo, meter_buses);
+    }
+    let mut meter_buses = meter_buses;
+    let meter_stride_samples = stereo.len();
+    for clip in clips {
+        let source = decoded_by_path.get(&clip.path).ok_or_else(|| {
+            format!(
+                "prepared audio clip {} has no decoded source",
+                clip.clip_index
+            )
+        })?;
+        mix_clip_window_into_stereo_with_quality_and_meter(
+            stereo,
+            block_start_frame,
+            source,
+            clip,
+            sample_rate,
+            resampling_quality,
+            ClipMixMonitor {
+                cancelled: Some(cancelled),
+                meter_buses: meter_buses.as_deref_mut(),
+                meter_stride_samples,
+            },
+        )
+        .map_err(|error| {
+            format!(
+                "could not mix Playlist clip {} from audio channel {}: {error}",
+                clip.clip_index, clip.channel_id
+            )
+        })?;
+    }
+    Ok(())
+}
 
 fn sample_source_bounds(
     clip: &PlaylistClip,
@@ -5755,6 +6156,7 @@ mod tests {
             clips: vec![PreparedClip {
                 clip_index: 0,
                 channel_id: 4,
+                mixer_track: None,
                 path,
                 start_frame: 0,
                 source_bounds: SampleBounds { start: 0, end: 2 },
@@ -5937,6 +6339,100 @@ mod tests {
     }
 
     #[test]
+    fn parallel_mixer_track_audio_matches_serial_audio_and_meter_buses() {
+        let path = PathBuf::from("parallel-source.wav");
+        let source = DecodedAudio {
+            sample_rate: 8,
+            channels: vec![
+                vec![0.25, -0.5, 0.75, -1.0, 0.5, -0.25, 1.0, -0.75],
+                vec![-0.5, 0.25, -0.75, 0.5, -1.0, 0.75, -0.25, 1.0],
+            ],
+        };
+        let clips = [
+            (0, 1, 0, 0.75),
+            (1, 1, 2, 0.5),
+            (2, 2, 0, 0.25),
+            (3, 2, 4, 0.625),
+        ]
+        .into_iter()
+        .map(|(clip_index, mixer_track, start_frame, gain)| {
+            let transform = MixerSourceRouteTransform::from_insert_transform(
+                MixerInsertSignalTransform::default()
+                    .with_fader_volume_raw(Some(if mixer_track == 1 { 8_000 } else { 6_000 })),
+            );
+            PreparedClip {
+                clip_index,
+                channel_id: u16::try_from(clip_index).unwrap(),
+                mixer_track: Some(mixer_track),
+                path: path.clone(),
+                start_frame,
+                source_bounds: SampleBounds { start: 0, end: 8 },
+                duration_frames: 8,
+                gain,
+                pan: 0.0,
+                pan_law: PanLaw::Circular,
+                mixer_transform: transform,
+                mixer_meter_transforms: vec![(usize::try_from(mixer_track).unwrap(), transform)],
+            }
+        })
+        .collect::<Vec<_>>();
+        let decoded_by_path = HashMap::from([(path, source)]);
+        let cancelled = AtomicBool::new(false);
+        let mut serial = vec![0.0; 16];
+        let mut serial_meters = vec![0.0; MIXER_TRACK_METER_COUNT * 16];
+        mix_prepared_audio_clip_block(
+            &clips,
+            &decoded_by_path,
+            0,
+            8,
+            ResamplingQuality::Linear,
+            &cancelled,
+            &mut serial,
+            Some(&mut serial_meters),
+            None,
+        )
+        .unwrap();
+
+        let track_groups = audio_clips_grouped_by_mixer_track(&clips);
+        assert_eq!(track_groups.len(), 2);
+        let mut parallel = vec![0.0; 16];
+        let mut parallel_meters = vec![0.0; MIXER_TRACK_METER_COUNT * 16];
+        std::thread::scope(|scope| {
+            let worker_clips = audio_clip_groups_for_workers(&track_groups, 2);
+            let mut mixer = ParallelAudioClipMixer::new(
+                scope,
+                worker_clips,
+                &decoded_by_path,
+                8,
+                ResamplingQuality::Linear,
+                &cancelled,
+                true,
+            )
+            .expect("two source mixer tracks should start two workers");
+            mix_prepared_audio_clip_block(
+                &clips,
+                &decoded_by_path,
+                0,
+                8,
+                ResamplingQuality::Linear,
+                &cancelled,
+                &mut parallel,
+                Some(&mut parallel_meters),
+                Some(&mixer),
+            )
+            .unwrap();
+            mixer.stop_and_join().unwrap();
+        });
+
+        for (parallel_sample, serial_sample) in parallel.iter().zip(&serial) {
+            assert!((parallel_sample - serial_sample).abs() < 1.0e-5);
+        }
+        for (parallel_sample, serial_sample) in parallel_meters.iter().zip(&serial_meters) {
+            assert!((parallel_sample - serial_sample).abs() < 1.0e-5);
+        }
+    }
+
+    #[test]
     fn mixes_mono_clips_to_both_stereo_channels_with_resampling() {
         let source = DecodedAudio {
             sample_rate: 2,
@@ -5945,6 +6441,7 @@ mod tests {
         let clip = PreparedClip {
             clip_index: 0,
             channel_id: 0,
+            mixer_track: None,
             path: PathBuf::new(),
             start_frame: 0,
             source_bounds: SampleBounds { start: 0, end: 2 },
@@ -5982,6 +6479,7 @@ mod tests {
         let clip = PreparedClip {
             clip_index: 0,
             channel_id: 1,
+            mixer_track: None,
             path: PathBuf::new(),
             start_frame: 0,
             source_bounds: SampleBounds { start: 0, end: 1 },
@@ -6014,6 +6512,7 @@ mod tests {
         let clip = PreparedClip {
             clip_index: 0,
             channel_id: 3,
+            mixer_track: None,
             path: path.clone(),
             start_frame: 2,
             source_bounds: SampleBounds { start: 0, end: 5 },
