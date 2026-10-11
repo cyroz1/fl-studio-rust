@@ -16719,7 +16719,7 @@ mod tests {
         }
 
         let mut parameter_payload = Vec::new();
-        for (source_insert, route_id, value) in [(64_u16, 66_u8, -125), (64, 67, 500)] {
+        for (source_insert, route_id, value) in [(64_u16, 66_u8, -125_i32), (64, 67, 500_i32)] {
             parameter_payload.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
             parameter_payload.push(route_id);
             parameter_payload.push(0);
