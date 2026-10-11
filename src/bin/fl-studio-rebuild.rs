@@ -12458,21 +12458,6 @@ impl DawUi {
         let mut ungroup_selected_notes_requested = false;
         let mut quantize_selected_requested = false;
         let mut open_pattern_time_signature_dialog = false;
-        let toggle_editable_ghosts = !ui.ctx().egui_wants_keyboard_input()
-            && ui.input_mut(|input| {
-                input.consume_key(
-                    egui::Modifiers::COMMAND | egui::Modifiers::ALT,
-                    egui::Key::V,
-                )
-            });
-        if toggle_editable_ghosts {
-            self.piano_roll_editable_ghost_channels = !self.piano_roll_editable_ghost_channels;
-            self.status = if self.piano_roll_editable_ghost_channels {
-                "Editable Piano roll ghost notes enabled".to_owned()
-            } else {
-                "Editable Piano roll ghost notes disabled".to_owned()
-            };
-        }
         if ui.memory(|memory| memory.focused().is_none()) {
             open_pattern_time_signature_dialog = ui.input_mut(|input| {
                 input.consume_key(
@@ -20168,6 +20153,21 @@ impl eframe::App for DawUi {
         });
         self.history_snapshot_available_this_frame =
             !history_navigation_requested && self.pending_history_snapshot.is_some();
+        let toggle_editable_ghosts_requested = self.view == MainView::PianoRoll
+            && ui.input_mut(|input| {
+                input.consume_key(
+                    egui::Modifiers::COMMAND | egui::Modifiers::ALT,
+                    egui::Key::V,
+                )
+            });
+        if toggle_editable_ghosts_requested {
+            self.piano_roll_editable_ghost_channels = !self.piano_roll_editable_ghost_channels;
+            self.status = if self.piano_roll_editable_ghost_channels {
+                "Editable Piano roll ghost notes enabled".to_owned()
+            } else {
+                "Editable Piano roll ghost notes disabled".to_owned()
+            };
+        }
         if self.view != MainView::Playlist {
             self.active_playlist_clip_drag = None;
         }
