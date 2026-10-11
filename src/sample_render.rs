@@ -2546,6 +2546,9 @@ impl<'a> PlaylistTrackFilter<'a> {
     }
 
     fn clip_is_muted(self, clip: &PlaylistClip) -> bool {
+        if clip.is_muted() {
+            return true;
+        }
         let track_id = clip.playlist_track_id();
         if let Some((first_track, last_track)) = self.soloed_track_range {
             return !track_id
@@ -4274,6 +4277,7 @@ mod tests {
             group: 0,
             unknown_word: 0,
             item_flags: 0,
+            muted: false,
             header_bytes: [0; 4],
             start_offset: -1.0,
             end_offset: -1.0,
@@ -4550,6 +4554,16 @@ mod tests {
         assert!(
             PlaylistTrackFilter::new(&disabled_track_ids, Some((1, 1)))
                 .clip_is_muted(&unassigned_clip)
+        );
+
+        let mut muted_clip = test_pattern_clip(2, 0, 96);
+        muted_clip.muted = true;
+        assert!(
+            PlaylistTrackFilter::new(&BTreeSet::new(), None).clip_is_muted(&muted_clip),
+            "an individually muted clip stays muted even when its Playlist track is soloed"
+        );
+        assert!(
+            PlaylistTrackFilter::new(&BTreeSet::new(), Some((1, 1))).clip_is_muted(&muted_clip)
         );
     }
 
@@ -5447,6 +5461,7 @@ mod tests {
             group: 0,
             unknown_word: 0,
             item_flags: 0,
+            muted: false,
             header_bytes: [0; 4],
             start_offset: -1.0,
             end_offset: -1.0,

@@ -1012,6 +1012,12 @@ pub const PATTERN_NOTE_DEFAULT_FLAGS: u16 = 0x4000;
 /// FL Studio score-note flag for slide notes.
 pub const PATTERN_NOTE_SLIDE_FLAG: u16 = 1 << 3;
 
+/// Candidate Playlist item flag for an individually muted clip.
+///
+/// An independent FLP parser corroborates the bit mapping. Image-Line's manual
+/// documents clip muting but not its binary representation.
+pub const PLAYLIST_CLIP_MUTED_FLAG: u16 = 0x2000;
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PatternNoteEdit {
     pub position: Option<u32>,
@@ -1945,6 +1951,7 @@ pub struct PlaylistClip {
     pub group: u16,
     pub unknown_word: u16,
     pub item_flags: u16,
+    pub muted: bool,
     pub header_bytes: [u8; 4],
     pub start_offset: f32,
     pub end_offset: f32,
@@ -1958,6 +1965,11 @@ pub struct PlaylistClip {
 }
 
 impl PlaylistClip {
+    /// Whether this Playlist clip's individual mute flag is set.
+    pub fn is_muted(&self) -> bool {
+        self.muted
+    }
+
     pub fn playlist_track_id(&self) -> Option<u32> {
         self.track_index
             .and_then(|track_index| u32::from(track_index).checked_add(1))
@@ -2020,6 +2032,7 @@ pub struct PlaylistClipEdit {
     pub raw_track_index: Option<u16>,
     pub group: Option<u16>,
     pub item_flags: Option<u16>,
+    pub muted: Option<bool>,
     pub start_offset: Option<f32>,
     pub end_offset: Option<f32>,
     pub scale: Option<f64>,
@@ -4752,8 +4765,30 @@ impl FlpDocument {
         if let Some(value) = edit.group {
             writes.push((record_start + 14, value.to_le_bytes().to_vec()));
         }
-        if let Some(value) = edit.item_flags {
-            writes.push((record_start + 18, value.to_le_bytes().to_vec()));
+        if edit.item_flags.is_some() || edit.muted.is_some() {
+            let flags_offset = record_start
+                .checked_add(18)
+                .ok_or(FlpError::LengthOverflow)?;
+            let flags_end = flags_offset
+                .checked_add(2)
+                .ok_or(FlpError::LengthOverflow)?;
+            let stored_flags = self.events[event_index]
+                .payload
+                .get(flags_offset..flags_end)
+                .ok_or(FlpError::UnsupportedEdit(
+                    "the Playlist clip flags field is unavailable",
+                ))?;
+            let mut flags = edit
+                .item_flags
+                .unwrap_or_else(|| u16::from_le_bytes([stored_flags[0], stored_flags[1]]));
+            if let Some(muted) = edit.muted {
+                if muted {
+                    flags |= PLAYLIST_CLIP_MUTED_FLAG;
+                } else {
+                    flags &= !PLAYLIST_CLIP_MUTED_FLAG;
+                }
+            }
+            writes.push((flags_offset, flags.to_le_bytes().to_vec()));
         }
         if let Some(value) = edit.start_offset {
             writes.push((record_start + 24, value.to_le_bytes().to_vec()));
@@ -11810,6 +11845,7 @@ fn decode_playlist_clip(
         group: u16_at(14),
         unknown_word: if modern_record { 0 } else { u16_at(16) },
         item_flags: if modern_record { 0 } else { u16_at(18) },
+        muted: u16_at(18) & PLAYLIST_CLIP_MUTED_FLAG != 0,
         header_bytes: if modern_record {
             [0; 4]
         } else {
@@ -12529,11 +12565,12 @@ mod tests {
         ChannelSortOrder, ChannelSummary, ClawMachineOptions, FlpDocument, FlpError, FlpEvent,
         FstPreset, FstPresetKind, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit,
         MixerInsertSummary, MixerParameterKind, MixerRouteAudibility, PATTERN_NOTE_DEFAULT_FLAGS,
-        PATTERN_NOTE_SLIDE_FLAG, PatternControllerEdit, PatternNote, PatternNoteEdit,
-        PatternNoteRotation, PayloadEncoding, PlaylistClipEdit, PlaylistClipTarget,
-        PlaylistTrackEdit, ProjectInfoEdit, ProjectSettingsEdit, RiffMachineOptions,
-        RiffMachineQuantizeMode, ScaleLevelsOptions, TimeMarkerEdit, midi::MidiChannelMapping,
-        midi::MidiFile, parse_vst_plugin_state_metadata, riff_machine_groove_note_timing,
+        PATTERN_NOTE_SLIDE_FLAG, PLAYLIST_CLIP_MUTED_FLAG, PatternControllerEdit, PatternNote,
+        PatternNoteEdit, PatternNoteRotation, PayloadEncoding, PlaylistClipEdit,
+        PlaylistClipTarget, PlaylistTrackEdit, ProjectInfoEdit, ProjectSettingsEdit,
+        RiffMachineOptions, RiffMachineQuantizeMode, ScaleLevelsOptions, TimeMarkerEdit,
+        midi::MidiChannelMapping, midi::MidiFile, parse_vst_plugin_state_metadata,
+        riff_machine_groove_note_timing,
     };
 
     fn articulate_options(
@@ -13757,6 +13794,9 @@ mod tests {
             record[8..12].copy_from_slice(&960u32.to_le_bytes());
             record[12..14].copy_from_slice(&471u16.to_le_bytes());
             record[14..16].copy_from_slice(&0x1234u16.to_le_bytes());
+            if index == 1 {
+                record[18..20].copy_from_slice(&PLAYLIST_CLIP_MUTED_FLAG.to_le_bytes());
+            }
             original_tails.push(record[16..].to_vec());
             payload.extend_from_slice(&record);
         }
@@ -13772,6 +13812,8 @@ mod tests {
             .arrangements()
             .expect("structure should select the 88-byte record layout");
         assert_eq!(clips[0].clips.len(), 10);
+        assert!(!clips[0].clips[0].is_muted());
+        assert!(clips[0].clips[1].is_muted());
         for (clip, expected_tail) in clips[0].clips.iter().zip(&original_tails) {
             assert_eq!(clip.record_size, 88);
             assert_eq!(&clip.reserved, expected_tail);
@@ -13799,6 +13841,19 @@ mod tests {
                 )
                 .is_err()
         );
+        assert!(
+            document
+                .edit_playlist_clip(
+                    0,
+                    0,
+                    PlaylistClipEdit {
+                        item_flags: Some(PLAYLIST_CLIP_MUTED_FLAG),
+                        ..PlaylistClipEdit::default()
+                    },
+                )
+                .is_err(),
+            "raw flags remain unavailable while the modern record tail is opaque"
+        );
         assert_eq!(document.encode_lossless().unwrap(), before_rejected_edit);
 
         document
@@ -13811,12 +13866,47 @@ mod tests {
                 },
             )
             .expect("the known record header should remain editable");
+        document
+            .edit_playlist_clip(
+                0,
+                0,
+                PlaylistClipEdit {
+                    muted: Some(true),
+                    ..PlaylistClipEdit::default()
+                },
+            )
+            .expect("the candidate mute bit should be editable without decoding the tail");
         let changed = document
             .arrangements()
             .expect("the edited project should decode");
         assert_eq!(changed[0].clips[0].position_ticks, 1920);
-        assert_eq!(changed[0].clips[0].reserved, original_tails[0]);
+        assert!(changed[0].clips[0].is_muted());
+        assert!(changed[0].clips[1].is_muted());
+        let mut expected_muted_tail = original_tails[0].clone();
+        let old_flags = u16::from_le_bytes([expected_muted_tail[2], expected_muted_tail[3]]);
+        expected_muted_tail[2..4]
+            .copy_from_slice(&(old_flags | PLAYLIST_CLIP_MUTED_FLAG).to_le_bytes());
+        assert_eq!(changed[0].clips[0].reserved, expected_muted_tail);
         assert_eq!(changed[0].clips[1].reserved, original_tails[1]);
+
+        document
+            .edit_playlist_clip(
+                0,
+                1,
+                PlaylistClipEdit {
+                    muted: Some(false),
+                    ..PlaylistClipEdit::default()
+                },
+            )
+            .expect("the mute bit should be clearable");
+        let unmuted = document.arrangements().unwrap();
+        assert!(!unmuted[0].clips[1].is_muted());
+        let original_flags = u16::from_le_bytes([original_tails[1][2], original_tails[1][3]]);
+        let cleared_flags = u16::from_le_bytes([
+            unmuted[0].clips[1].reserved[2],
+            unmuted[0].clips[1].reserved[3],
+        ]);
+        assert_eq!(cleared_flags, original_flags & !PLAYLIST_CLIP_MUTED_FLAG);
     }
 
     #[test]

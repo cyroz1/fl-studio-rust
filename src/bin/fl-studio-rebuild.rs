@@ -8223,6 +8223,7 @@ impl DawUi {
         let mut playlist_track_edits_requested = Vec::new();
         let mut solo_playlist_track_requested = None;
         let mut delete_clip_requested = None;
+        let mut muted_clip_requested = None;
         let mut copy_clip_requested = None;
         let mut cut_clip_requested = None;
         let mut paste_clip_after_requested = None;
@@ -8803,7 +8804,8 @@ impl DawUi {
                                 }
                             };
                             let mut clip_painter = painter.clone();
-                            if track_muted {
+                            let clip_muted = clip.is_muted();
+                            if track_muted || clip_muted {
                                 clip_painter.multiply_opacity(0.4);
                             }
                             let selected = self.selected_arrangement == Some(arrangement.id)
@@ -8853,6 +8855,15 @@ impl DawUi {
                                     Align2::LEFT_TOP,
                                     name,
                                     FontId::proportional(10.0),
+                                    Color32::WHITE,
+                                );
+                            }
+                            if clip_muted && width > 20.0 {
+                                clip_painter.text(
+                                    egui::pos2(clip_rect.right() - 4.0, clip_rect.top() + 2.0),
+                                    Align2::RIGHT_TOP,
+                                    "M",
+                                    FontId::proportional(8.0),
                                     Color32::WHITE,
                                 );
                             }
@@ -9073,6 +9084,18 @@ impl DawUi {
                             };
                             let response = response.on_hover_text(drag_hint);
                             response.context_menu(|ui| {
+                                if ui
+                                    .button(if clip.is_muted() {
+                                        "Unmute clip"
+                                    } else {
+                                        "Mute clip"
+                                    })
+                                    .clicked()
+                                {
+                                    muted_clip_requested = Some((clip_index, !clip.is_muted()));
+                                    ui.close();
+                                }
+                                ui.separator();
                                 if ui.button("Copy clip").clicked() {
                                     copy_clip_requested = Some(clip_index);
                                     ui.close();
@@ -9502,6 +9525,34 @@ impl DawUi {
                 playlist_clip_list_changed = true;
             } else {
                 self.status = "Could not delete the selected Playlist clip".to_owned();
+            }
+        }
+
+        if let Some((clip_index, muted)) = muted_clip_requested {
+            let result = self.document.as_mut().map(|document| {
+                document.edit_playlist_clip(
+                    arrangement.id,
+                    clip_index,
+                    PlaylistClipEdit {
+                        muted: Some(muted),
+                        ..PlaylistClipEdit::default()
+                    },
+                )
+            });
+            match result {
+                Some(Ok(())) => {
+                    self.stop_project_playback();
+                    self.dirty = true;
+                    self.status = format!(
+                        "{} Playlist clip {}",
+                        if muted { "Muted" } else { "Unmuted" },
+                        clip_index + 1
+                    );
+                }
+                Some(Err(error)) => {
+                    self.status = format!("Could not change Playlist clip mute state: {error}");
+                }
+                None => self.status = "Open a project to mute Playlist clips".to_owned(),
             }
         }
 
@@ -10085,6 +10136,7 @@ impl DawUi {
         let mut raw_track_index = clip.raw_track_index;
         let mut group = clip.group;
         let mut item_flags = clip.item_flags;
+        let mut muted = clip.is_muted();
         let has_opaque_tail = clip.has_opaque_record_tail();
         let mut start_offset = clip.start_offset;
         let mut end_offset = clip.end_offset;
@@ -10095,6 +10147,7 @@ impl DawUi {
         let mut raw_track_index_changed = false;
         let mut group_changed = false;
         let mut item_flags_changed = false;
+        let mut muted_changed = false;
         let mut start_offset_changed = false;
         let mut end_offset_changed = false;
         let mut scale_changed = false;
@@ -10119,6 +10172,7 @@ impl DawUi {
             }
         });
         ui.collapsing("Clip data fields", |ui| {
+            muted_changed = ui.checkbox(&mut muted, "Muted").changed();
             ui.horizontal_wrapped(|ui| {
                 item_index_changed = ui
                     .add(
@@ -10191,6 +10245,7 @@ impl DawUi {
             || raw_track_index_changed
             || group_changed
             || item_flags_changed
+            || muted_changed
             || start_offset_changed
             || end_offset_changed
             || scale_changed
@@ -10202,6 +10257,7 @@ impl DawUi {
                 raw_track_index: raw_track_index_changed.then_some(raw_track_index),
                 group: group_changed.then_some(group),
                 item_flags: item_flags_changed.then_some(item_flags),
+                muted: muted_changed.then_some(muted),
                 start_offset: start_offset_changed.then_some(start_offset),
                 end_offset: end_offset_changed.then_some(end_offset),
                 scale: scale_changed.then_some(scale),

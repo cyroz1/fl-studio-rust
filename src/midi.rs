@@ -396,7 +396,7 @@ impl MidiFile {
         let mut exported_note_count = 0usize;
 
         for clip in &arrangement.clips {
-            if clip.track_index.is_none() || clip.length_ticks == 0 {
+            if clip.is_muted() || clip.track_index.is_none() || clip.length_ticks == 0 {
                 continue;
             }
             let clip_end = u64::from(clip.position_ticks)
@@ -1016,7 +1016,7 @@ fn song_tempo_events(
     let mut events = Vec::new();
 
     for clip in clips {
-        if clip.track_index.is_none() || clip.length_ticks == 0 {
+        if clip.is_muted() || clip.track_index.is_none() || clip.length_ticks == 0 {
             continue;
         }
         let PlaylistClipTarget::Channel { id } = clip.target() else {

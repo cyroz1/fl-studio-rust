@@ -715,6 +715,17 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u32(length, "clip length")?,
             )
         }
+        [command, input, output, arrangement_id, clip_index, muted]
+            if command == "set-clip-muted" =>
+        {
+            set_clip_muted(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(arrangement_id, "arrangement id")?,
+                parse_usize(clip_index, "clip index")?,
+                parse_bool(muted, "clip mute state")?,
+            )
+        }
         [command, input, output, track_id, enabled, grouped] if command == "edit-playlist-track" => {
             edit_playlist_track(
                 Path::new(input),
@@ -961,6 +972,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild delete-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index>\n",
             "  flp-rebuild import-midi <input.flp> <input.mid> <output.flp> <track> <pattern-id> <channel-id>\n",
             "  flp-rebuild edit-clip <input.flp> <output.flp> <arrangement-id> <clip-index> <position> <length>\n",
+            "  flp-rebuild set-clip-muted <input.flp> <output.flp> <arrangement-id> <clip-index> <muted:0|1>\n",
             "  flp-rebuild edit-playlist-track <input.flp> <output.flp> <track-id> <enabled:0|1|-> <grouped:0|1|->\n",
             "  flp-rebuild edit-clip-properties <input.flp> <output.flp> <arrangement-id> <clip-index> <item-index-raw|-> <track-index-raw|-> <group-raw|-> <flags-raw|-> <start-offset|-> <end-offset|-> <scale|->\n",
             "  flp-rebuild duplicate-clip <input.flp> <output.flp> <arrangement-id> <clip-index> <position|-> <track-index-raw|->\n",
@@ -2220,7 +2232,7 @@ fn list_playlist(path: &Path, start: usize, count: usize) -> Result<(), String> 
                 flp_rebuild::PlaylistClipTarget::Pattern { .. } => "(pattern)",
             };
             println!(
-                "  clip={} position={} length={} track={} track_name={:?} raw_track={} target={:?} target_name={:?} group={} flags=0x{:04X} offsets={:.6}..{:.6} scale={:?} clip_id={} record_size={} opaque_tail={}",
+                "  clip={} position={} length={} track={} track_name={:?} raw_track={} target={:?} target_name={:?} group={} muted={} flags=0x{:04X} offsets={:.6}..{:.6} scale={:?} clip_id={} record_size={} opaque_tail={}",
                 index,
                 clip.position_ticks,
                 clip.length_ticks,
@@ -2234,6 +2246,7 @@ fn list_playlist(path: &Path, start: usize, count: usize) -> Result<(), String> 
                 target,
                 target_name,
                 clip.group,
+                clip.is_muted(),
                 clip.item_flags,
                 clip.start_offset,
                 clip.end_offset,
@@ -3122,6 +3135,36 @@ fn edit_clip(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "wrote arrangement {arrangement_id} clip {clip_index} with position {position} and length {length} to {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn set_clip_muted(
+    input: &Path,
+    output: &Path,
+    arrangement_id: u16,
+    clip_index: usize,
+    muted: bool,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .edit_playlist_clip(
+            arrangement_id,
+            clip_index,
+            PlaylistClipEdit {
+                muted: Some(muted),
+                ..PlaylistClipEdit::default()
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "set arrangement {arrangement_id} clip {clip_index} muted={muted} in {}",
         output.display()
     );
     Ok(())
