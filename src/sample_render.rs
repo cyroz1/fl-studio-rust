@@ -110,6 +110,14 @@ impl AudioRenderOutput {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AudioBufferEncodingSettings {
+    sample_rate: u32,
+    wav_sample_format: WavSampleFormat,
+    wav_dither_mode: WavDitherMode,
+    wav_channel_mode: WavChannelMode,
+}
+
 impl Default for AudioClipRenderOptions {
     fn default() -> Self {
         Self {
@@ -451,10 +459,12 @@ pub fn render_audio_clips_to_file(
         output_path,
         &mix,
         summary.frames,
-        options.sample_rate,
-        options.wav_sample_format,
-        options.wav_dither_mode,
-        options.wav_channel_mode,
+        AudioBufferEncodingSettings {
+            sample_rate: options.sample_rate,
+            wav_sample_format: options.wav_sample_format,
+            wav_dither_mode: options.wav_dither_mode,
+            wav_channel_mode: options.wav_channel_mode,
+        },
         output_format,
     )?;
     Ok(summary)
@@ -1824,10 +1834,12 @@ pub fn render_sampler_pattern_to_file(
         output_path,
         &mix,
         summary.frames,
-        options.sample_rate,
-        options.wav_sample_format,
-        options.wav_dither_mode,
-        options.wav_channel_mode,
+        AudioBufferEncodingSettings {
+            sample_rate: options.sample_rate,
+            wav_sample_format: options.wav_sample_format,
+            wav_dither_mode: options.wav_dither_mode,
+            wav_channel_mode: options.wav_channel_mode,
+        },
         output_format,
     )?;
     Ok(summary)
@@ -3880,10 +3892,7 @@ fn write_audio_buffer_to_file(
     output_path: &Path,
     samples: &[f32],
     frames: u64,
-    sample_rate: u32,
-    wav_sample_format: WavSampleFormat,
-    wav_dither_mode: WavDitherMode,
-    wav_channel_mode: WavChannelMode,
+    settings: AudioBufferEncodingSettings,
     output_format: AudioRenderOutput,
 ) -> Result<(), String> {
     let expected_samples = usize::try_from(frames)
@@ -3897,11 +3906,11 @@ fn write_audio_buffer_to_file(
         return write_stereo_wav_from_buffer(
             output_path,
             samples,
-            sample_rate,
+            settings.sample_rate,
             frames,
-            wav_sample_format,
-            wav_dither_mode,
-            wav_channel_mode,
+            settings.wav_sample_format,
+            settings.wav_dither_mode,
+            settings.wav_channel_mode,
         );
     }
 
@@ -3923,7 +3932,7 @@ fn write_audio_buffer_to_file(
             if !MP3_BITRATES_KBPS.contains(&bitrate_kbps) {
                 return Err(format!("unsupported MP3 bitrate: {bitrate_kbps} kbps"));
             }
-            if !MP3_SAMPLE_RATES.contains(&sample_rate) {
+            if !MP3_SAMPLE_RATES.contains(&settings.sample_rate) {
                 return Err(
                     "MP3 output supports sample rates of 32000, 44100, or 48000 Hz".to_owned(),
                 );
@@ -3940,24 +3949,36 @@ fn write_audio_buffer_to_file(
         match output_format {
             AudioRenderOutput::Wav => unreachable!(),
             AudioRenderOutput::Flac { bits_per_sample } => {
-                let mut encoder =
-                    StreamingFlacWriter::new(file, sample_rate, wav_channel_mode, bits_per_sample)?;
+                let mut encoder = StreamingFlacWriter::new(
+                    file,
+                    settings.sample_rate,
+                    settings.wav_channel_mode,
+                    bits_per_sample,
+                )?;
                 for block in samples.chunks(STREAM_BLOCK_FRAMES * 2) {
-                    encoder.write_stereo_block(block, wav_channel_mode)?;
+                    encoder.write_stereo_block(block, settings.wav_channel_mode)?;
                 }
                 encoder.finalize(frames)?;
             }
             AudioRenderOutput::Ogg { bitrate_kbps } => {
-                let mut encoder =
-                    StreamingOggWriter::new(file, sample_rate, wav_channel_mode, bitrate_kbps)?;
+                let mut encoder = StreamingOggWriter::new(
+                    file,
+                    settings.sample_rate,
+                    settings.wav_channel_mode,
+                    bitrate_kbps,
+                )?;
                 for block in samples.chunks(STREAM_BLOCK_FRAMES * 2) {
                     encoder.write_stereo_block(block)?;
                 }
                 encoder.finalize()?;
             }
             AudioRenderOutput::Mp3 { bitrate_kbps } => {
-                let mut encoder =
-                    StreamingMp3Writer::new(file, sample_rate, wav_channel_mode, bitrate_kbps)?;
+                let mut encoder = StreamingMp3Writer::new(
+                    file,
+                    settings.sample_rate,
+                    settings.wav_channel_mode,
+                    bitrate_kbps,
+                )?;
                 for block in samples.chunks(STREAM_BLOCK_FRAMES * 2) {
                     encoder.write_stereo_block(block)?;
                 }
@@ -5591,10 +5612,12 @@ mod tests {
                 &output,
                 &samples,
                 frames as u64,
-                48_000,
-                WavSampleFormat::Pcm16,
-                WavDitherMode::Off,
-                WavChannelMode::MonoMerged,
+                AudioBufferEncodingSettings {
+                    sample_rate: 48_000,
+                    wav_sample_format: WavSampleFormat::Pcm16,
+                    wav_dither_mode: WavDitherMode::Off,
+                    wav_channel_mode: WavChannelMode::MonoMerged,
+                },
                 output_format,
             )
             .unwrap();
