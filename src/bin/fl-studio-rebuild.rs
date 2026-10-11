@@ -59,17 +59,18 @@ use midi_output::{
     midi_song_position_pointer_message, pattern_preview_messages,
 };
 
-const APP_BACKGROUND: Color32 = Color32::from_rgb(29, 29, 29);
-const PANEL: Color32 = Color32::from_rgb(43, 43, 43);
-const PANEL_DARK: Color32 = Color32::from_rgb(35, 35, 35);
-const PANEL_LIGHT: Color32 = Color32::from_rgb(54, 54, 54);
-const GRID: Color32 = Color32::from_rgb(65, 65, 65);
-const BORDER: Color32 = Color32::from_rgb(76, 76, 76);
-const TEXT: Color32 = Color32::from_rgb(245, 245, 245);
-const MUTED: Color32 = Color32::from_rgb(200, 200, 200);
+const APP_BACKGROUND: Color32 = Color32::from_rgb(27, 27, 27);
+const PANEL: Color32 = Color32::from_rgb(44, 44, 44);
+const PANEL_DARK: Color32 = Color32::from_rgb(34, 34, 34);
+const PANEL_LIGHT: Color32 = Color32::from_rgb(57, 57, 57);
+const GRID: Color32 = Color32::from_rgb(50, 50, 50);
+const BORDER: Color32 = Color32::from_rgb(68, 68, 68);
+const TEXT: Color32 = Color32::from_rgb(242, 242, 242);
+const MUTED: Color32 = Color32::from_rgb(175, 175, 175);
 const GREEN: Color32 = Color32::from_rgb(14, 175, 98);
-const BLUE: Color32 = Color32::from_rgb(38, 128, 235);
-const BLUE_SELECTION: Color32 = Color32::from_rgb(24, 62, 104);
+const BLUE: Color32 = Color32::from_rgb(59, 99, 251);
+const BLUE_TEXT: Color32 = Color32::from_rgb(86, 129, 255);
+const BLUE_SELECTION: Color32 = Color32::from_rgb(14, 23, 63);
 const PURPLE: Color32 = Color32::from_rgb(150, 93, 181);
 const ORANGE: Color32 = Color32::from_rgb(195, 129, 61);
 const RED: Color32 = Color32::from_rgb(252, 67, 46);
@@ -181,7 +182,7 @@ fn app_visuals() -> egui::Visuals {
     visuals.code_bg_color = PANEL_DARK;
     visuals.override_text_color = Some(TEXT);
     visuals.weak_text_color = Some(MUTED);
-    visuals.hyperlink_color = BLUE;
+    visuals.hyperlink_color = BLUE_TEXT;
     visuals.selection.bg_fill = BLUE_SELECTION;
     visuals.selection.stroke = Stroke::new(1.0, BLUE);
     visuals.window_corner_radius = egui::CornerRadius::same(4);
