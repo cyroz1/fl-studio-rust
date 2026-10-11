@@ -77,6 +77,7 @@ const RED: Color32 = Color32::from_rgb(252, 67, 46);
 const MENU_BAR_HEIGHT: f32 = 32.0;
 const TRANSPORT_BAR_HEIGHT: f32 = 46.0;
 const STATUS_BAR_HEIGHT: f32 = 27.0;
+const PIANO_ROLL_RULER_HEIGHT: f32 = 20.0;
 const MIN_WINDOW_INNER_WIDTH: f32 = 960.0;
 const MIN_WINDOW_INNER_HEIGHT: f32 = 640.0;
 const DEFAULT_BROWSER_COLUMN_WIDTH: f32 = 280.0;
@@ -1165,6 +1166,13 @@ struct PianoRollZoomDrag {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+struct PianoRollTimeSelectionDrag {
+    pattern_id: u16,
+    start_tick: u32,
+    current_tick: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct StepGraphRamp {
     pattern_id: u16,
     channel_id: u16,
@@ -1626,6 +1634,7 @@ struct DawUi {
     selected_note: Option<(u16, u16, usize)>,
     selected_piano_notes: BTreeSet<(u16, u16, usize)>,
     piano_roll_time_selection: Option<(u16, u32, u32)>,
+    piano_roll_time_selection_drag: Option<PianoRollTimeSelectionDrag>,
     piano_roll_select_mode: bool,
     piano_roll_selection_drag: Option<PianoRollSelectionDrag>,
     piano_roll_zoom_mode: bool,
@@ -2078,6 +2087,7 @@ impl DawUi {
             selected_note: None,
             selected_piano_notes: BTreeSet::new(),
             piano_roll_time_selection: None,
+            piano_roll_time_selection_drag: None,
             piano_roll_select_mode: false,
             piano_roll_selection_drag: None,
             piano_roll_zoom_mode: false,
@@ -2705,6 +2715,7 @@ impl DawUi {
                 self.selected_note = None;
                 self.selected_piano_notes.clear();
                 self.piano_roll_time_selection = None;
+                self.piano_roll_time_selection_drag = None;
                 self.piano_roll_selection_drag = None;
                 self.active_note_drag = None;
                 self.pending_midi_import = None;
@@ -4274,6 +4285,7 @@ impl DawUi {
         self.active_note_drag = None;
         self.selected_piano_notes.clear();
         self.piano_roll_time_selection = None;
+        self.piano_roll_time_selection_drag = None;
         self.piano_roll_selection_drag = None;
         self.dirty = self
             .document
@@ -17236,6 +17248,12 @@ impl DawUi {
         let key_high = 83u16;
         let key_height = 13.0;
         let keyboard_width = 68.0;
+        if self
+            .piano_roll_time_selection_drag
+            .is_some_and(|drag| drag.pattern_id != pattern.id)
+        {
+            self.piano_roll_time_selection_drag = None;
+        }
         if let (Some(viewport), Some(pointer)) = (
             self.piano_roll_grid_viewport,
             ui.input(|input| input.pointer.hover_pos()),
@@ -17296,10 +17314,21 @@ impl DawUi {
             scroll_area = scroll_area.scroll_offset(offset);
         }
         let scroll_output = scroll_area.show(ui, |ui| {
-            let size = Vec2::new(keyboard_width + grid_width, grid_height);
+            let size = Vec2::new(
+                keyboard_width + grid_width,
+                PIANO_ROLL_RULER_HEIGHT + grid_height,
+            );
             let (rect, grid_response) = ui.allocate_exact_size(size, Sense::click_and_drag());
+            let ruler_rect = egui::Rect::from_min_max(
+                rect.min,
+                egui::pos2(rect.right(), rect.top() + PIANO_ROLL_RULER_HEIGHT),
+            );
+            let grid_rect = egui::Rect::from_min_max(
+                egui::pos2(rect.left(), ruler_rect.bottom()),
+                rect.right_bottom(),
+            );
             let grid_geometry = PianoRollGrid {
-                rect,
+                rect: grid_rect,
                 keyboard_width,
                 tick_scale,
                 key_height,
@@ -17310,6 +17339,20 @@ impl DawUi {
             };
             let painter = ui.painter_at(rect);
             painter.rect_filled(rect, 0, PANEL_DARK);
+            let ruler_response = ui
+                .interact(
+                    ruler_rect,
+                    Id::new(("piano-roll-time-ruler", pattern.id)),
+                    Sense::click_and_drag(),
+                )
+                .on_hover_text("Ctrl/Cmd-drag to select a time range");
+            painter.line_segment(
+                [
+                    egui::pos2(ruler_rect.left(), ruler_rect.bottom()),
+                    egui::pos2(ruler_rect.right(), ruler_rect.bottom()),
+                ],
+                Stroke::new(1.0, GRID),
+            );
             if self.piano_roll_scale != PianoRollScale::None {
                 for key in key_low..=key_high {
                     if !self
@@ -17319,7 +17362,7 @@ impl DawUi {
                         continue;
                     }
                     let row = key_high - key;
-                    let y = rect.top() + f32::from(row) * key_height;
+                    let y = grid_rect.top() + f32::from(row) * key_height;
                     let scale_row = egui::Rect::from_min_size(
                         egui::pos2(rect.left() + keyboard_width, y),
                         Vec2::new(grid_width, key_height),
@@ -17363,14 +17406,17 @@ impl DawUi {
             let draw_bar_line = |tick: u32, color: Color32| {
                 let x = rect.left() + keyboard_width + tick as f32 * tick_scale;
                 painter.line_segment(
-                    [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                    [
+                        egui::pos2(x, grid_rect.top()),
+                        egui::pos2(x, grid_rect.bottom()),
+                    ],
                     Stroke::new(1.0, color),
                 );
             };
             draw_bar_line(0, if signature_index > 0 { BLUE } else { GRID });
             if signature_index > 0 {
                 painter.text(
-                    egui::pos2(rect.left() + keyboard_width + 4.0, rect.top() + 8.0),
+                    egui::pos2(rect.left() + keyboard_width + 4.0, ruler_rect.center().y),
                     Align2::LEFT_CENTER,
                     format!("{numerator}/{denominator}"),
                     FontId::proportional(9.0),
@@ -17415,7 +17461,7 @@ impl DawUi {
                 painter.text(
                     egui::pos2(
                         rect.left() + keyboard_width + position as f32 * tick_scale + 4.0,
-                        rect.top() + 8.0,
+                        ruler_rect.center().y,
                     ),
                     Align2::LEFT_CENTER,
                     format!("{numerator}/{denominator}"),
@@ -17426,7 +17472,7 @@ impl DawUi {
             }
             for key in key_low..=key_high {
                 let row = key_high - key;
-                let y = rect.top() + f32::from(row) * key_height;
+                let y = grid_rect.top() + f32::from(row) * key_height;
                 let keyboard_rect = egui::Rect::from_min_size(
                     egui::pos2(rect.left(), y),
                     Vec2::new(keyboard_width, key_height),
@@ -17453,7 +17499,10 @@ impl DawUi {
                     },
                 );
                 painter.line_segment(
-                    [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+                    [
+                        egui::pos2(grid_rect.left(), y),
+                        egui::pos2(grid_rect.right(), y),
+                    ],
                     Stroke::new(1.0, GRID),
                 );
             }
@@ -17464,8 +17513,9 @@ impl DawUi {
             for note in &pattern.notes {
                 let channel_index = per_channel.entry(note.channel_id).or_default();
                 let left = rect.left() + keyboard_width + note.position as f32 * tick_scale;
-                let y =
-                    rect.top() + f32::from(key_high.saturating_sub(note.key)) * key_height + 1.0;
+                let y = grid_rect.top()
+                    + f32::from(key_high.saturating_sub(note.key)) * key_height
+                    + 1.0;
                 let note_rect = egui::Rect::from_min_size(
                     egui::pos2(left, y),
                     Vec2::new((note.length as f32 * tick_scale).max(4.0), key_height - 2.0),
@@ -17746,10 +17796,62 @@ impl DawUi {
                 }
                 *channel_index += 1;
             }
-            if let Some((_, start, end)) = self
-                .piano_roll_time_selection
-                .filter(|(selected_pattern, _, _)| *selected_pattern == pattern.id)
+            if ruler_response.drag_started_by(PointerButton::Primary)
+                && ui.input(|input| input.modifiers.command)
+                && !self.piano_roll_zoom_mode
+                && let Some(pointer) = ruler_response
+                    .interact_pointer_pos()
+                    .or_else(|| ui.input(|input| input.pointer.press_origin()))
             {
+                let start_tick = piano_roll_time_tick_at_x(
+                    pointer.x,
+                    grid_rect.left() + keyboard_width,
+                    tick_scale,
+                    snap_ticks,
+                );
+                self.piano_roll_time_selection_drag = Some(PianoRollTimeSelectionDrag {
+                    pattern_id: pattern.id,
+                    start_tick,
+                    current_tick: start_tick,
+                });
+            }
+            if let Some(mut drag) = self
+                .piano_roll_time_selection_drag
+                .filter(|drag| drag.pattern_id == pattern.id)
+            {
+                if let Some(pointer) = ui.input(|input| input.pointer.interact_pos()) {
+                    drag.current_tick = piano_roll_time_tick_at_x(
+                        pointer.x,
+                        grid_rect.left() + keyboard_width,
+                        tick_scale,
+                        snap_ticks,
+                    );
+                }
+                if ruler_response.drag_stopped_by(PointerButton::Primary) {
+                    let (start, end) = piano_roll_time_range_from_drag(
+                        drag.start_tick,
+                        drag.current_tick,
+                        snap_ticks,
+                    );
+                    self.piano_roll_time_selection = Some((pattern.id, start, end));
+                    self.piano_roll_time_selection_drag = None;
+                    self.status = format!("Selected time from {start} to {end} ticks");
+                } else {
+                    self.piano_roll_time_selection_drag = Some(drag);
+                }
+            }
+            let time_selection_range = self
+                .piano_roll_time_selection_drag
+                .filter(|drag| drag.pattern_id == pattern.id)
+                .map(|drag| {
+                    piano_roll_time_range_from_drag(drag.start_tick, drag.current_tick, snap_ticks)
+                })
+                .or_else(|| {
+                    self.piano_roll_time_selection
+                        .filter(|(selected_pattern, _, _)| *selected_pattern == pattern.id)
+                        .map(|(_, start, end)| (start, end))
+                });
+            if let Some((start, end)) = time_selection_range {
                 let grid_left = rect.left() + keyboard_width;
                 let selection_rect = egui::Rect::from_min_max(
                     egui::pos2(grid_left + start as f32 * tick_scale, rect.top()),
@@ -17778,8 +17880,8 @@ impl DawUi {
                     .or_else(|| grid_response.interact_pointer_pos())
             {
                 let grid_body = egui::Rect::from_min_max(
-                    egui::pos2(rect.left() + keyboard_width, rect.top()),
-                    rect.right_bottom(),
+                    egui::pos2(grid_rect.left() + keyboard_width, grid_rect.top()),
+                    grid_rect.right_bottom(),
                 );
                 if grid_body.contains(origin) {
                     self.piano_roll_zoom_drag = Some(PianoRollZoomDrag {
@@ -17794,8 +17896,8 @@ impl DawUi {
                 .filter(|drag| drag.pattern_id == pattern.id)
             {
                 let grid_body = egui::Rect::from_min_max(
-                    egui::pos2(rect.left() + keyboard_width, rect.top()),
-                    rect.right_bottom(),
+                    egui::pos2(grid_rect.left() + keyboard_width, grid_rect.top()),
+                    grid_rect.right_bottom(),
                 );
                 if let Some(pointer) = grid_response
                     .interact_pointer_pos()
@@ -17839,7 +17941,8 @@ impl DawUi {
             if self.piano_roll_zoom_mode
                 && grid_response.clicked_by(PointerButton::Primary)
                 && let Some(pointer) = grid_response.interact_pointer_pos()
-                && pointer.x >= rect.left() + keyboard_width
+                && grid_rect.contains(pointer)
+                && pointer.x >= grid_rect.left() + keyboard_width
                 && !note_rects
                     .iter()
                     .any(|note_rect| note_rect.contains(pointer))
@@ -17858,8 +17961,8 @@ impl DawUi {
                 && let Some(channel_id) = self.selected_note_channel
             {
                 let grid_body = egui::Rect::from_min_max(
-                    egui::pos2(rect.left() + keyboard_width, rect.top()),
-                    rect.right_bottom(),
+                    egui::pos2(grid_rect.left() + keyboard_width, grid_rect.top()),
+                    grid_rect.right_bottom(),
                 );
                 if grid_body.contains(origin) {
                     let additive = modifiers.shift;
@@ -17881,8 +17984,8 @@ impl DawUi {
                 .filter(|selection| selection.pattern_id == pattern.id)
             {
                 let grid_body = egui::Rect::from_min_max(
-                    egui::pos2(rect.left() + keyboard_width, rect.top()),
-                    rect.right_bottom(),
+                    egui::pos2(grid_rect.left() + keyboard_width, grid_rect.top()),
+                    grid_rect.right_bottom(),
                 );
                 if let Some(pointer) = grid_response
                     .interact_pointer_pos()
@@ -22179,6 +22282,31 @@ fn piano_roll_shift_time_range(start: u32, end: u32, direction: TimeSelectionShi
     (start, start.saturating_add(width))
 }
 
+fn piano_roll_time_tick_at_x(
+    pointer_x: f32,
+    grid_left: f32,
+    tick_scale: f32,
+    snap_ticks: u32,
+) -> u32 {
+    let tick = ((pointer_x - grid_left).max(0.0) / tick_scale.max(f32::EPSILON))
+        .round()
+        .clamp(0.0, u32::MAX as f32) as i64;
+    snap_note_tick(tick, snap_ticks, 0)
+}
+
+fn piano_roll_time_range_from_drag(
+    start_tick: u32,
+    current_tick: u32,
+    snap_ticks: u32,
+) -> (u32, u32) {
+    let first_tick = start_tick.min(current_tick);
+    let last_tick = start_tick.max(current_tick);
+    let start = snap_note_tick(i64::from(first_tick), snap_ticks, 0);
+    let end = snap_note_tick(i64::from(last_tick), snap_ticks, start)
+        .max(start.saturating_add(snap_ticks.max(1)));
+    (start, end)
+}
+
 fn piano_roll_random_note_selection(
     pattern: &Pattern,
     pattern_id: u16,
@@ -24640,10 +24768,10 @@ mod tests {
         piano_roll_discard_length_edit, piano_roll_note_group_members, piano_roll_note_nudge_edit,
         piano_roll_odd_note_selection, piano_roll_overlap_note_selection,
         piano_roll_random_note_selection, piano_roll_selection_time_range,
-        piano_roll_shift_time_range, playlist_audio_clip_join_candidates,
-        playlist_audio_drop_position_ticks, playlist_bar_ticks, playlist_clip_drag_edit,
-        playlist_clip_local_recording_offset, playlist_clip_split_position,
-        playlist_group_parent_ids, playlist_measure_boundaries,
+        piano_roll_shift_time_range, piano_roll_time_range_from_drag, piano_roll_time_tick_at_x,
+        playlist_audio_clip_join_candidates, playlist_audio_drop_position_ticks,
+        playlist_bar_ticks, playlist_clip_drag_edit, playlist_clip_local_recording_offset,
+        playlist_clip_split_position, playlist_group_parent_ids, playlist_measure_boundaries,
         playlist_pattern_clip_join_candidates, playlist_seek_tick_to_frame,
         playlist_signature_at_tick, playlist_song_position_label, playlist_track_group_range,
         playlist_track_is_hidden, recolor_piano_roll_notes, snap_note_tick,
@@ -24882,6 +25010,14 @@ mod tests {
             piano_roll_shift_time_range(24, 72, TimeSelectionShift::Previous),
             (0, 48)
         );
+    }
+
+    #[test]
+    fn piano_roll_time_ruler_drag_snaps_to_grid_and_keeps_a_positive_range() {
+        assert_eq!(piano_roll_time_tick_at_x(150.0, 100.0, 1.0, 24), 48);
+        assert_eq!(piano_roll_time_tick_at_x(80.0, 100.0, 1.0, 24), 0);
+        assert_eq!(piano_roll_time_range_from_drag(64, 0, 24), (0, 72));
+        assert_eq!(piano_roll_time_range_from_drag(96, 96, 24), (96, 120));
     }
 
     #[test]
