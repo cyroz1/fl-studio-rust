@@ -19,10 +19,11 @@ use flp_rebuild::midi::{MidiChannelMapping, MidiFile};
 use flp_rebuild::plugins::{PluginCandidate, PluginFormat, scan_installed_plugins};
 use flp_rebuild::project_package::ProjectPackageWorkspace;
 use flp_rebuild::sample_render::{
-    AudioClipRenderOptions, AudioClipRenderSummary, AudioRecordingSummary, AudioRenderOutput,
-    MP3_BITRATES_KBPS, PlaylistRenderOptions, PlaylistRenderSummary, ResamplingQuality,
-    SamplerPatternRenderOptions, SamplerPatternRenderSummary, WavChannelMode, WavDitherMode,
-    WavSampleFormat, render_audio_clips_to_file, render_playlist_with_vst3_to_flac_cancellable,
+    AudioClipRenderOptions, AudioClipRenderSummary, AudioFileRenderOptions, AudioRecordingSummary,
+    AudioRenderEncodingOptions, AudioRenderOutput, MP3_BITRATES_KBPS, PlaylistRenderOptions,
+    PlaylistRenderSummary, ResamplingQuality, SamplerPatternRenderOptions,
+    SamplerPatternRenderSummary, WavChannelMode, WavDitherMode, WavSampleFormat,
+    render_audio_clips_to_file, render_playlist_with_vst3_to_flac_cancellable,
     render_playlist_with_vst3_to_mp3_cancellable, render_playlist_with_vst3_to_ogg_cancellable,
     render_playlist_with_vst3_to_wav_cancellable, render_sampler_pattern_to_file,
     stream_playlist_with_vst3_to_device_from_frame, stream_sampler_pattern_to_device,
@@ -13446,7 +13447,7 @@ impl DawUi {
                 if ui
                     .add_enabled(
                         has_loaded_instrument && self.selected_pattern.is_some(),
-                        egui::Button::new("Render WAV…"),
+                        egui::Button::new("Render pattern audio…"),
                     )
                     .clicked()
                 {
@@ -14754,13 +14755,28 @@ impl DawUi {
         let tempo_bpm = document.metadata().tempo_bpm().unwrap_or(self.tempo_bpm);
         let global_swing_mix_raw = document.metadata().global_swing_mix();
         let channel_swing_mix_raw = project_channel_swing_mix_raw(document, channel_id);
-        let Some(path) = rfd::FileDialog::new()
-            .set_title("Render selected pattern channel")
-            .set_file_name(format!("Pattern_{pattern_id}_Channel_{channel_id}.wav"))
-            .add_filter("WAV audio", &["wav"])
-            .save_file()
-        else {
+        let selected_format = self.playlist_song_output_format;
+        let output_format = self.audio_render_output();
+        let Some(path) = add_audio_render_file_filter(
+            rfd::FileDialog::new()
+                .set_title("Render selected pattern channel")
+                .set_file_name(format!(
+                    "Pattern_{pattern_id}_Channel_{channel_id}.{}",
+                    selected_format.extension()
+                )),
+            selected_format,
+        )
+        .save_file() else {
             return;
+        };
+        let encoding_options = AudioRenderEncodingOptions {
+            wav_sample_format: self.playlist_render_format,
+            wav_dither_mode: if self.playlist_render_dither {
+                WavDitherMode::Tpdf
+            } else {
+                WavDitherMode::Off
+            },
+            wav_channel_mode: self.playlist_render_channel_mode,
         };
 
         let result = self
@@ -14768,7 +14784,7 @@ impl DawUi {
             .as_ref()
             .ok_or_else(|| "VST3 host is not initialized".to_owned())
             .and_then(|host| {
-                host.render_pattern_channel_to_wav(
+                host.render_pattern_channel_to_file(
                     instance_id,
                     &notes,
                     Vst3PatternRenderOptions {
@@ -14780,6 +14796,10 @@ impl DawUi {
                         channel_swing_mix_raw,
                     },
                     &path,
+                    AudioFileRenderOptions {
+                        output_format,
+                        encoding: encoding_options,
+                    },
                 )
             });
         match result {

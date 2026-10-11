@@ -8,8 +8,8 @@ use flp_rebuild::media::{SamplePathResolver, decode_audio_file};
 use flp_rebuild::midi::{MidiChannelMapping, MidiFile};
 use flp_rebuild::plugins::scan_installed_plugins;
 use flp_rebuild::sample_render::{
-    AudioClipRenderOptions, SamplerPatternRenderOptions, render_audio_clips_to_wav,
-    render_sampler_pattern_to_wav,
+    AudioClipRenderOptions, AudioFileRenderOptions, AudioRenderEncodingOptions, AudioRenderOutput,
+    SamplerPatternRenderOptions, render_audio_clips_to_wav, render_sampler_pattern_to_wav,
 };
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions};
 use flp_rebuild::{
@@ -867,7 +867,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild midi-events <file.mid> <track> [start] [count]\n",
             "  flp-rebuild scan <directory>\n",
             "  flp-rebuild plugin-scan\n",
-            "  flp-rebuild render-pattern-vst3 <project.flp> <pattern-id> <channel-id> <plugin.vst3> <output.wav> [tail-seconds]\n",
+            "  flp-rebuild render-pattern-vst3 <project.flp> <pattern-id> <channel-id> <plugin.vst3> <output.{wav|flac|ogg|mp3}> [tail-seconds]\n",
             "  flp-rebuild channels <file.flp>\n",
             "  flp-rebuild mixer <file.flp>\n",
             "  flp-rebuild automation <file.flp>\n",
@@ -1172,7 +1172,21 @@ fn render_pattern_vst3(
         .map_or(128, |channel| channel.swing_mix());
     let mut host = Vst3HostRuntime::new(48_000.0, 512)?;
     let plugin = host.load(bundle_path, class_uid.as_deref())?;
-    let summary = host.render_pattern_channel_to_wav(
+    let output_extension = output_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    let output_format = match output_extension.as_str() {
+        "wav" => AudioRenderOutput::Wav,
+        "flac" => AudioRenderOutput::Flac {
+            bits_per_sample: 24,
+        },
+        "ogg" => AudioRenderOutput::Ogg { bitrate_kbps: 192 },
+        "mp3" => AudioRenderOutput::Mp3 { bitrate_kbps: 192 },
+        _ => return Err("VST3 pattern output must use .wav, .flac, .ogg, or .mp3".to_owned()),
+    };
+    let summary = host.render_pattern_channel_to_file(
         plugin.id,
         &pattern.notes,
         Vst3PatternRenderOptions {
@@ -1184,6 +1198,10 @@ fn render_pattern_vst3(
             channel_swing_mix_raw,
         },
         output_path,
+        AudioFileRenderOptions {
+            output_format,
+            encoding: AudioRenderEncodingOptions::default(),
+        },
     )?;
     println!(
         "rendered pattern {} channel {} through {} to {}: {} notes, {:.2} seconds, {} Hz, {} channels",

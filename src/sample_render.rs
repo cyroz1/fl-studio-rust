@@ -96,6 +96,29 @@ pub enum AudioRenderOutput {
     Mp3 { bitrate_kbps: u16 },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AudioRenderEncodingOptions {
+    pub wav_sample_format: WavSampleFormat,
+    pub wav_dither_mode: WavDitherMode,
+    pub wav_channel_mode: WavChannelMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AudioFileRenderOptions {
+    pub output_format: AudioRenderOutput,
+    pub encoding: AudioRenderEncodingOptions,
+}
+
+impl Default for AudioRenderEncodingOptions {
+    fn default() -> Self {
+        Self {
+            wav_sample_format: WavSampleFormat::Float32,
+            wav_dither_mode: WavDitherMode::Off,
+            wav_channel_mode: WavChannelMode::Stereo,
+        }
+    }
+}
+
 /// Backwards-compatible name retained for callers of the audio-clip renderer.
 pub type AudioClipRenderOutput = AudioRenderOutput;
 
@@ -113,9 +136,7 @@ impl AudioRenderOutput {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct AudioBufferEncodingSettings {
     sample_rate: u32,
-    wav_sample_format: WavSampleFormat,
-    wav_dither_mode: WavDitherMode,
-    wav_channel_mode: WavChannelMode,
+    options: AudioRenderEncodingOptions,
 }
 
 impl Default for AudioClipRenderOptions {
@@ -461,9 +482,11 @@ pub fn render_audio_clips_to_file(
         summary.frames,
         AudioBufferEncodingSettings {
             sample_rate: options.sample_rate,
-            wav_sample_format: options.wav_sample_format,
-            wav_dither_mode: options.wav_dither_mode,
-            wav_channel_mode: options.wav_channel_mode,
+            options: AudioRenderEncodingOptions {
+                wav_sample_format: options.wav_sample_format,
+                wav_dither_mode: options.wav_dither_mode,
+                wav_channel_mode: options.wav_channel_mode,
+            },
         },
         output_format,
     )?;
@@ -1466,6 +1489,178 @@ impl<'a> StreamingFlacWriter<'a> {
     }
 }
 
+struct StreamingWavWriter<'a> {
+    file: &'a mut File,
+    sample_format: WavSampleFormat,
+    dither_state: Option<TpdfDither>,
+    channel_mode: WavChannelMode,
+    expected_frames: u64,
+    frames_written: u64,
+    bytes: Vec<u8>,
+}
+
+impl<'a> StreamingWavWriter<'a> {
+    fn new(
+        file: &'a mut File,
+        sample_rate: u32,
+        expected_frames: u64,
+        options: AudioRenderEncodingOptions,
+    ) -> Result<Self, String> {
+        let frames = u32::try_from(expected_frames)
+            .map_err(|_| "render is too long for a RIFF/WAVE file".to_owned())?;
+        let data_bytes = frames
+            .checked_mul(u32::from(options.wav_channel_mode.channel_count()))
+            .and_then(|samples| {
+                samples.checked_mul(u32::from(options.wav_sample_format.bytes_per_sample()))
+            })
+            .filter(|bytes| *bytes <= u32::MAX - 36)
+            .ok_or_else(|| "rendered WAV size exceeds the RIFF/WAVE limit".to_owned())?;
+        write_wav_header(
+            file,
+            sample_rate,
+            frames,
+            data_bytes,
+            options.wav_sample_format,
+            options.wav_channel_mode,
+        )?;
+
+        Ok(Self {
+            file,
+            sample_format: options.wav_sample_format,
+            dither_state: (options.wav_dither_mode == WavDitherMode::Tpdf
+                && options.wav_sample_format == WavSampleFormat::Pcm16)
+                .then(TpdfDither::new),
+            channel_mode: options.wav_channel_mode,
+            expected_frames,
+            frames_written: 0,
+            bytes: Vec::with_capacity(
+                STREAM_BLOCK_FRAMES
+                    * usize::from(options.wav_channel_mode.channel_count())
+                    * usize::from(options.wav_sample_format.bytes_per_sample()),
+            ),
+        })
+    }
+
+    fn write_stereo_block(&mut self, stereo_block: &[f32]) -> Result<(), String> {
+        if !stereo_block.len().is_multiple_of(2) {
+            return Err("render block must contain interleaved stereo frames".to_owned());
+        }
+        let frames = u64::try_from(stereo_block.len() / 2)
+            .map_err(|_| "rendered WAV frame count exceeds this platform".to_owned())?;
+        self.frames_written = self
+            .frames_written
+            .checked_add(frames)
+            .filter(|written| *written <= self.expected_frames)
+            .ok_or_else(|| "rendered WAV contains more frames than its header".to_owned())?;
+        self.bytes.clear();
+        append_wav_block_samples_with_dither(
+            stereo_block,
+            self.sample_format,
+            self.channel_mode,
+            self.dither_state.as_mut(),
+            &mut self.bytes,
+        )?;
+        self.file
+            .write_all(&self.bytes)
+            .map_err(|error| format!("could not write rendered WAV audio data: {error}"))
+    }
+
+    fn finalize(self) -> Result<(), String> {
+        if self.frames_written != self.expected_frames {
+            return Err("WAV encoder frame count does not match rendered audio".to_owned());
+        }
+        Ok(())
+    }
+}
+
+enum AudioFileStreamEncoder<'a> {
+    Wav(StreamingWavWriter<'a>),
+    Flac(StreamingFlacWriter<'a>),
+    Ogg(StreamingOggWriter<'a>),
+    Mp3(StreamingMp3Writer<'a>),
+}
+
+impl<'a> AudioFileStreamEncoder<'a> {
+    fn new(
+        file: &'a mut File,
+        sample_rate: u32,
+        expected_frames: u64,
+        options: AudioRenderEncodingOptions,
+        output_format: AudioRenderOutput,
+    ) -> Result<Self, String> {
+        if expected_frames == 0 {
+            return Err("rendered audio contains no frames".to_owned());
+        }
+        match output_format {
+            AudioRenderOutput::Wav => Ok(Self::Wav(StreamingWavWriter::new(
+                file,
+                sample_rate,
+                expected_frames,
+                options,
+            )?)),
+            AudioRenderOutput::Flac { bits_per_sample } => {
+                Ok(Self::Flac(StreamingFlacWriter::new(
+                    file,
+                    sample_rate,
+                    options.wav_channel_mode,
+                    bits_per_sample,
+                )?))
+            }
+            AudioRenderOutput::Ogg { bitrate_kbps } => {
+                if !(OGG_MIN_BITRATE_KBPS..=OGG_MAX_BITRATE_KBPS).contains(&bitrate_kbps) {
+                    return Err(format!(
+                        "Ogg Vorbis bitrate must be between {OGG_MIN_BITRATE_KBPS} and {OGG_MAX_BITRATE_KBPS} kbps"
+                    ));
+                }
+                Ok(Self::Ogg(StreamingOggWriter::new(
+                    file,
+                    sample_rate,
+                    options.wav_channel_mode,
+                    bitrate_kbps,
+                )?))
+            }
+            AudioRenderOutput::Mp3 { bitrate_kbps } => {
+                if !MP3_BITRATES_KBPS.contains(&bitrate_kbps) {
+                    return Err(format!("unsupported MP3 bitrate: {bitrate_kbps} kbps"));
+                }
+                if !MP3_SAMPLE_RATES.contains(&sample_rate) {
+                    return Err(
+                        "MP3 output supports sample rates of 32000, 44100, or 48000 Hz".to_owned(),
+                    );
+                }
+                Ok(Self::Mp3(StreamingMp3Writer::new(
+                    file,
+                    sample_rate,
+                    options.wav_channel_mode,
+                    bitrate_kbps,
+                )?))
+            }
+        }
+    }
+
+    fn write_stereo_block(
+        &mut self,
+        block: &[f32],
+        channel_mode: WavChannelMode,
+    ) -> Result<(), String> {
+        match self {
+            Self::Wav(writer) => writer.write_stereo_block(block),
+            Self::Flac(writer) => writer.write_stereo_block(block, channel_mode),
+            Self::Ogg(writer) => writer.write_stereo_block(block),
+            Self::Mp3(writer) => writer.write_stereo_block(block),
+        }
+    }
+
+    fn finalize(self, expected_frames: u64) -> Result<(), String> {
+        match self {
+            Self::Wav(writer) => writer.finalize(),
+            Self::Flac(writer) => writer.finalize(expected_frames),
+            Self::Ogg(writer) => writer.finalize(),
+            Self::Mp3(writer) => writer.finalize(),
+        }
+    }
+}
+
 fn write_flac_stream_header(file: &mut File, stream: &Stream) -> Result<(), String> {
     let mut sink = ByteSink::new();
     stream
@@ -1836,9 +2031,11 @@ pub fn render_sampler_pattern_to_file(
         summary.frames,
         AudioBufferEncodingSettings {
             sample_rate: options.sample_rate,
-            wav_sample_format: options.wav_sample_format,
-            wav_dither_mode: options.wav_dither_mode,
-            wav_channel_mode: options.wav_channel_mode,
+            options: AudioRenderEncodingOptions {
+                wav_sample_format: options.wav_sample_format,
+                wav_dither_mode: options.wav_dither_mode,
+                wav_channel_mode: options.wav_channel_mode,
+            },
         },
         output_format,
     )?;
@@ -3895,98 +4092,79 @@ fn write_audio_buffer_to_file(
     settings: AudioBufferEncodingSettings,
     output_format: AudioRenderOutput,
 ) -> Result<(), String> {
-    let expected_samples = usize::try_from(frames)
-        .ok()
-        .and_then(|frames| frames.checked_mul(2))
-        .ok_or_else(|| "rendered audio sample count overflow".to_owned())?;
-    if samples.len() != expected_samples {
-        return Err("rendered audio buffer does not match its frame count".to_owned());
-    }
-    if output_format == AudioRenderOutput::Wav {
-        return write_stereo_wav_from_buffer(
-            output_path,
-            samples,
-            settings.sample_rate,
-            frames,
-            settings.wav_sample_format,
-            settings.wav_dither_mode,
-            settings.wav_channel_mode,
-        );
-    }
+    render_stereo_audio_to_file(
+        output_path,
+        frames,
+        settings.sample_rate,
+        AudioRenderEncodingOptions {
+            wav_sample_format: settings.options.wav_sample_format,
+            wav_dither_mode: settings.options.wav_dither_mode,
+            wav_channel_mode: settings.options.wav_channel_mode,
+        },
+        output_format,
+        |write_block| {
+            for block in samples.chunks(STREAM_BLOCK_FRAMES * 2) {
+                write_block(block)?;
+            }
+            Ok(())
+        },
+    )
+}
 
-    match output_format {
-        AudioRenderOutput::Wav => unreachable!(),
-        AudioRenderOutput::Flac { bits_per_sample } => {
-            if !matches!(bits_per_sample, 16 | 24) {
-                return Err("FLAC output supports 16- or 24-bit samples".to_owned());
-            }
-        }
-        AudioRenderOutput::Ogg { bitrate_kbps } => {
-            if !(OGG_MIN_BITRATE_KBPS..=OGG_MAX_BITRATE_KBPS).contains(&bitrate_kbps) {
-                return Err(format!(
-                    "Ogg Vorbis bitrate must be between {OGG_MIN_BITRATE_KBPS} and {OGG_MAX_BITRATE_KBPS} kbps"
-                ));
-            }
-        }
-        AudioRenderOutput::Mp3 { bitrate_kbps } => {
-            if !MP3_BITRATES_KBPS.contains(&bitrate_kbps) {
-                return Err(format!("unsupported MP3 bitrate: {bitrate_kbps} kbps"));
-            }
-            if !MP3_SAMPLE_RATES.contains(&settings.sample_rate) {
-                return Err(
-                    "MP3 output supports sample rates of 32000, 44100, or 48000 Hz".to_owned(),
-                );
-            }
-        }
-    }
-
-    let mut temporary = TemporaryRenderFile::create(output_path)?;
+pub(crate) fn render_stereo_audio_to_file<T>(
+    output_path: &Path,
+    expected_frames: u64,
+    sample_rate: u32,
+    options: AudioRenderEncodingOptions,
+    output_format: AudioRenderOutput,
+    render: impl FnOnce(&mut dyn FnMut(&[f32]) -> Result<(), String>) -> Result<T, String>,
+) -> Result<T, String> {
+    if !output_path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case(output_format.extension()))
     {
+        return Err(format!(
+            "render output must use the .{} extension",
+            output_format.extension()
+        ));
+    }
+    let mut temporary = TemporaryRenderFile::create(output_path)?;
+    let result = {
         let file = temporary
             .file
             .as_mut()
             .expect("temporary render file is open");
-        match output_format {
-            AudioRenderOutput::Wav => unreachable!(),
-            AudioRenderOutput::Flac { bits_per_sample } => {
-                let mut encoder = StreamingFlacWriter::new(
-                    file,
-                    settings.sample_rate,
-                    settings.wav_channel_mode,
-                    bits_per_sample,
-                )?;
-                for block in samples.chunks(STREAM_BLOCK_FRAMES * 2) {
-                    encoder.write_stereo_block(block, settings.wav_channel_mode)?;
+        let mut encoder = AudioFileStreamEncoder::new(
+            file,
+            sample_rate,
+            expected_frames,
+            options,
+            output_format,
+        )?;
+        let mut frames_written = 0_u64;
+        let result = {
+            let mut write_block = |block: &[f32]| {
+                if !block.len().is_multiple_of(2) {
+                    return Err("render block must contain interleaved stereo frames".to_owned());
                 }
-                encoder.finalize(frames)?;
-            }
-            AudioRenderOutput::Ogg { bitrate_kbps } => {
-                let mut encoder = StreamingOggWriter::new(
-                    file,
-                    settings.sample_rate,
-                    settings.wav_channel_mode,
-                    bitrate_kbps,
-                )?;
-                for block in samples.chunks(STREAM_BLOCK_FRAMES * 2) {
-                    encoder.write_stereo_block(block)?;
-                }
-                encoder.finalize()?;
-            }
-            AudioRenderOutput::Mp3 { bitrate_kbps } => {
-                let mut encoder = StreamingMp3Writer::new(
-                    file,
-                    settings.sample_rate,
-                    settings.wav_channel_mode,
-                    bitrate_kbps,
-                )?;
-                for block in samples.chunks(STREAM_BLOCK_FRAMES * 2) {
-                    encoder.write_stereo_block(block)?;
-                }
-                encoder.finalize()?;
-            }
+                let block_frames = u64::try_from(block.len() / 2)
+                    .map_err(|_| "render frame count exceeds this platform".to_owned())?;
+                frames_written = frames_written
+                    .checked_add(block_frames)
+                    .filter(|written| *written <= expected_frames)
+                    .ok_or_else(|| "render produced more frames than expected".to_owned())?;
+                encoder.write_stereo_block(block, options.wav_channel_mode)
+            };
+            render(&mut write_block)?
+        };
+        if frames_written != expected_frames {
+            return Err("audio encoder frame count does not match rendered audio".to_owned());
         }
-    }
-    temporary.commit(output_path)
+        encoder.finalize(expected_frames)?;
+        result
+    };
+    temporary.commit(output_path)?;
+    Ok(result)
 }
 
 struct TemporaryRenderFile {
@@ -5614,9 +5792,11 @@ mod tests {
                 frames as u64,
                 AudioBufferEncodingSettings {
                     sample_rate: 48_000,
-                    wav_sample_format: WavSampleFormat::Pcm16,
-                    wav_dither_mode: WavDitherMode::Off,
-                    wav_channel_mode: WavChannelMode::MonoMerged,
+                    options: AudioRenderEncodingOptions {
+                        wav_sample_format: WavSampleFormat::Pcm16,
+                        wav_dither_mode: WavDitherMode::Off,
+                        wav_channel_mode: WavChannelMode::MonoMerged,
+                    },
                 },
                 output_format,
             )

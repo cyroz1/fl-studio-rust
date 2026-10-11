@@ -14,8 +14,9 @@ use std::thread;
 
 use crate::audio::StreamingAudioWriter;
 use crate::sample_render::{
-    PlaylistPatternScheduleOptions, PlaylistRenderOptions, PlaylistTrackFilter, channel_gain_pan,
-    channel_pan_gains, project_pan_law, schedule_playlist_pattern_notes, swing_note_start_tick,
+    AudioFileRenderOptions, PlaylistPatternScheduleOptions, PlaylistRenderOptions,
+    PlaylistTrackFilter, channel_gain_pan, channel_pan_gains, project_pan_law,
+    render_stereo_audio_to_file, schedule_playlist_pattern_notes, swing_note_start_tick,
 };
 use crate::{
     ChannelNoteRouter, ChannelPluginState, FlpDocument, MixerInsertSignalTransform,
@@ -964,6 +965,83 @@ impl Vst3HostRuntime {
             output_channels: render.output_channels,
             notes_rendered: render.note_count,
         })
+    }
+
+    /// Render a pattern channel with the selected audio file encoding and explicit VST3 automation.
+    ///
+    /// WAV, FLAC, Ogg Vorbis, and MP3 are streamed to a temporary output before the final file is
+    /// replaced. The shared channel mode and WAV depth/dither settings apply to the encoded output.
+    /// VST3 output buses must be mono or stereo; mono is duplicated to stereo before channel-mode
+    /// encoding. This does not restore FLP plug-in state, apply Mixer routing/effects, or expand
+    /// Playlist clips.
+    pub fn render_pattern_channel_to_file(
+        &self,
+        id: u64,
+        notes: &[PatternNote],
+        options: Vst3PatternRenderOptions,
+        path: impl AsRef<Path>,
+        file_options: AudioFileRenderOptions,
+    ) -> Result<Vst3RenderSummary, String> {
+        self.render_pattern_channel_to_file_with_automation(
+            id,
+            notes,
+            options,
+            &[],
+            path,
+            file_options,
+        )
+    }
+
+    /// Render a pattern channel with explicit VST3 parameter automation into an encoded audio file.
+    pub fn render_pattern_channel_to_file_with_automation(
+        &self,
+        id: u64,
+        notes: &[PatternNote],
+        options: Vst3PatternRenderOptions,
+        parameter_automation: &[Vst3ParameterAutomation],
+        path: impl AsRef<Path>,
+        file_options: AudioFileRenderOptions,
+    ) -> Result<Vst3RenderSummary, String> {
+        let plugin = self.plugin(id)?;
+        let mut plugin = plugin
+            .lock()
+            .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
+        let render =
+            prepare_pattern_render_with_automation(&plugin, notes, options, parameter_automation)?;
+        if !(1..=2).contains(&render.output_channels) {
+            return Err(format!(
+                "VST3 file rendering supports mono or stereo output buses; this instrument has {} channels",
+                render.output_channels
+            ));
+        }
+
+        render_stereo_audio_to_file(
+            path.as_ref(),
+            render.total_frames,
+            render.sample_rate_u32,
+            file_options.encoding,
+            file_options.output_format,
+            |write_block| {
+                let mut stereo_block = Vec::with_capacity(render.block_size * 2);
+                process_pattern_render(&mut plugin, &render, |interleaved| {
+                    if render.output_channels == 1 {
+                        stereo_block.clear();
+                        for sample in interleaved {
+                            stereo_block.extend_from_slice(&[*sample, *sample]);
+                        }
+                        write_block(&stereo_block)
+                    } else {
+                        write_block(interleaved)
+                    }
+                })?;
+                Ok(Vst3RenderSummary {
+                    frames: render.total_frames,
+                    sample_rate: render.sample_rate_u32,
+                    output_channels: render.output_channels,
+                    notes_rendered: render.note_count,
+                })
+            },
+        )
     }
 
     /// Render one pattern channel through an installed VST3 into interleaved stereo samples.
