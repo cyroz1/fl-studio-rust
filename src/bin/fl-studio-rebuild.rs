@@ -20864,6 +20864,7 @@ impl DawUi {
         let ActiveMidiRecording {
             recorder,
             playlist_clip_placement,
+            ..
         } = recording;
         let result = recorder.finish(stop_timestamp_micros, finished_at);
         if result.notes.is_empty() {
