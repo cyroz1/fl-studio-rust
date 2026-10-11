@@ -603,13 +603,24 @@ jobs:
             fi
             sleep 1
           done
+          pattern_window=$(xdotool search --onlyvisible --name '^FL Studio Rebuild$' | head -n 1 || true)
+          if [[ -z "$pattern_window" ]]; then
+            echo "Could not find the modern Pattern Clip preview window."
+            cat "$RUNNER_TEMP/pattern-preview.log"
+            exit 1
+          fi
+          xdotool windowfocus --sync "$pattern_window"
+          xdotool key F5
+          sleep 1
+          xdotool mousemove 570 298 click 1
+          sleep 0.3
           ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
             -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/modern-pattern-clip-before-resize.png"
           xdotool keydown Shift_L
-          xdotool mousemove 664 298
+          xdotool mousemove 666 298
           xdotool mousedown 1
           sleep 0.2
-          xdotool mousemove --sync 704 298
+          xdotool mousemove --sync 707 298
           sleep 0.3
           xdotool mouseup 1
           xdotool keyup Shift_L
@@ -651,7 +662,7 @@ jobs:
             bash "$RUNNER_TEMP/capture-ui.sh"
 
       - name: Upload Linux GUI preview
-        if: runner.os == 'Linux'
+        if: always() && runner.os == 'Linux'
         uses: actions/upload-artifact@v4
         with:
           name: linux-gui-preview
