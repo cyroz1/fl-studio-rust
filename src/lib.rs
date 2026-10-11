@@ -12994,8 +12994,7 @@ mod tests {
         event_stream.extend_from_slice(&[0x40, 2, 0, 0x15, 2]);
         append_data_event(&mut event_stream, 0xD4, &[0xC1, 0xC2]);
         append_data_event(&mut event_stream, 0xD5, &[0xD1, 0xD2, 0xD3]);
-        event_stream.extend_from_slice(&[0x40, 3, 0, 0x15, 0, 0x62]);
-        event_stream.extend_from_slice(&[0x50, 1, 0, 0x51, 0]);
+        event_stream.extend_from_slice(&[0x40, 3, 0, 0x15, 0]);
         let source_bytes = flp_fixture(&event_stream, &[0xA5, 0x5A], &[0xDE, 0xAD]);
         let mut source_bytes = source_bytes;
         source_bytes[10..12].copy_from_slice(&9_u16.to_le_bytes());
@@ -13037,7 +13036,7 @@ mod tests {
     #[test]
     fn channel_state_export_rejects_missing_ambiguous_and_dependent_layer_channels() {
         let mut event_stream = Vec::new();
-        event_stream.extend_from_slice(&[0x40, 4, 0, 0x15, 5, 0x5E, 5, 0]);
+        event_stream.extend_from_slice(&[0x40, 4, 0, 0x15, 3, 0x5E, 5, 0]);
         event_stream.extend_from_slice(&[0x40, 5, 0, 0x15, 0, 0x40, 5, 0, 0x15, 0]);
         let document = FlpDocument::parse(&flp_fixture(&event_stream, &[], &[]))
             .expect("source project should parse");
