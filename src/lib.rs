@@ -1889,19 +1889,10 @@ pub(crate) struct MixerSourceRouteTransform {
     matrix: [f32; 4],
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct MixerSourceRoutePlan {
     pub(crate) output_transform: MixerSourceRouteTransform,
     pub(crate) insert_meter_transforms: Vec<(usize, MixerSourceRouteTransform)>,
-}
-
-impl Default for MixerSourceRoutePlan {
-    fn default() -> Self {
-        Self {
-            output_transform: MixerSourceRouteTransform::default(),
-            insert_meter_transforms: Vec::new(),
-        }
-    }
 }
 
 impl Default for MixerSourceRouteTransform {
