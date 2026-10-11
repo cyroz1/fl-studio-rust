@@ -1645,6 +1645,7 @@ struct DawUi {
     piano_roll_scale: PianoRollScale,
     piano_roll_scale_root: u8,
     piano_roll_ghost_channels: bool,
+    piano_roll_hidden_ghost_channels: BTreeSet<u16>,
     piano_roll_color_by_midi_channel: bool,
     piano_roll_paint_mode: bool,
     last_painted_note: Option<(u16, u16, u16, u32)>,
@@ -2012,6 +2013,7 @@ impl DawUi {
             piano_roll_scale: PianoRollScale::Major,
             piano_roll_scale_root: 0,
             piano_roll_ghost_channels: true,
+            piano_roll_hidden_ghost_channels: BTreeSet::new(),
             piano_roll_color_by_midi_channel: false,
             piano_roll_paint_mode: false,
             last_painted_note: None,
@@ -2538,6 +2540,7 @@ impl DawUi {
             Ok((package_workspace, document)) => {
                 self.stop_project_playback();
                 self.project_generation = self.project_generation.wrapping_add(1);
+                self.piano_roll_hidden_ghost_channels.clear();
                 self.soloed_playlist_track_range = None;
                 self.collapsed_playlist_groups.clear();
                 self.clear_history();
@@ -12380,6 +12383,37 @@ impl DawUi {
                     .unwrap_or_else(|| format!("Channel {}", channel.id()))
             })
             .unwrap_or_else(|| "No channel".to_owned());
+        let ghost_channel_options: Vec<(u16, String)> = self
+            .selected_pattern
+            .and_then(|pattern_id| patterns.iter().find(|pattern| pattern.id == pattern_id))
+            .map(|pattern| {
+                pattern
+                    .notes
+                    .iter()
+                    .map(|note| note.channel_id)
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .filter(|channel_id| Some(*channel_id) != self.selected_note_channel)
+                    .map(|channel_id| {
+                        let label = channels
+                            .iter()
+                            .find(|channel| channel.id() == channel_id)
+                            .and_then(|channel| {
+                                channel
+                                    .display_name()
+                                    .or(channel.plugin_identifier())
+                                    .map(str::to_owned)
+                            })
+                            .unwrap_or_else(|| format!("Channel {channel_id}"));
+                        (channel_id, label)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let visible_ghost_count = ghost_channel_options
+            .iter()
+            .filter(|(channel_id, _)| !self.piano_roll_hidden_ghost_channels.contains(channel_id))
+            .count();
         let sampler_channel_ids: BTreeSet<_> = channels
             .iter()
             .filter(|channel| channel.kind() == Some(0) && channel.enabled() != Some(false))
@@ -13396,6 +13430,42 @@ impl DawUi {
                         }
                     });
                 ui.checkbox(&mut self.piano_roll_ghost_channels, "Ghost channels");
+                ui.menu_button(
+                    format!(
+                        "Ghost channel visibility ({visible_ghost_count}/{})",
+                        ghost_channel_options.len()
+                    ),
+                    |ui| {
+                        if ghost_channel_options.is_empty() {
+                            ui.weak("No other note channels in this pattern.");
+                            return;
+                        }
+                        if ui.button("Show all").clicked() {
+                            self.piano_roll_hidden_ghost_channels.clear();
+                            ui.close();
+                        }
+                        if ui.button("Hide all").clicked() {
+                            self.piano_roll_hidden_ghost_channels.extend(
+                                ghost_channel_options
+                                    .iter()
+                                    .map(|(channel_id, _)| *channel_id),
+                            );
+                            ui.close();
+                        }
+                        ui.separator();
+                        for (channel_id, label) in &ghost_channel_options {
+                            let mut visible =
+                                !self.piano_roll_hidden_ghost_channels.contains(channel_id);
+                            if ui.checkbox(&mut visible, label).changed() {
+                                if visible {
+                                    self.piano_roll_hidden_ghost_channels.remove(channel_id);
+                                } else {
+                                    self.piano_roll_hidden_ghost_channels.insert(*channel_id);
+                                }
+                            }
+                        }
+                    },
+                );
                 ui.checkbox(
                     &mut self.piano_roll_color_by_midi_channel,
                     "Color by MIDI channel",
@@ -16199,13 +16269,18 @@ impl DawUi {
                     egui::pos2(left, y),
                     Vec2::new((note.length as f32 * tick_scale).max(4.0), key_height - 2.0),
                 );
-                note_rects.push(note_rect);
-                note_selection_rects.push((note.channel_id, *channel_index, note_rect));
                 let ghost = self.selected_note_channel != Some(note.channel_id);
-                if ghost && !self.piano_roll_ghost_channels {
+                if ghost
+                    && (!self.piano_roll_ghost_channels
+                        || self
+                            .piano_roll_hidden_ghost_channels
+                            .contains(&note.channel_id))
+                {
                     *channel_index += 1;
                     continue;
                 }
+                note_rects.push(note_rect);
+                note_selection_rects.push((note.channel_id, *channel_index, note_rect));
                 let selected = self.selected_piano_notes.contains(&(
                     pattern.id,
                     note.channel_id,
