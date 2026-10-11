@@ -12231,19 +12231,11 @@ impl DawUi {
     fn select_piano_roll_color_group(&mut self) {
         let Some((pattern_id, channel_id)) = self.selected_pattern.zip(self.selected_note_channel)
         else {
-            self.status = "Select a note before selecting its color group".to_owned();
+            self.status = "Select a Pattern and channel before selecting a color group".to_owned();
             return;
         };
-        let Some(selected_note_index) = self.selected_piano_notes.iter().find_map(
-            |(selected_pattern, selected_channel, note_index)| {
-                (*selected_pattern == pattern_id && *selected_channel == channel_id)
-                    .then_some(*note_index)
-            },
-        ) else {
-            self.status = "Select a note before selecting its color group".to_owned();
-            return;
-        };
-        let Some((color_group, note_ids)) = self
+        let color_group = self.piano_roll_note_color_group & 0x0f;
+        let Some(note_ids) = self
             .document
             .as_ref()
             .and_then(|document| document.patterns().ok())
@@ -12251,28 +12243,21 @@ impl DawUi {
                 patterns
                     .iter()
                     .find(|pattern| pattern.id == pattern_id)
-                    .and_then(|pattern| {
-                        let channel_notes = pattern
-                            .notes
-                            .iter()
-                            .filter(|note| note.channel_id == channel_id)
-                            .collect::<Vec<_>>();
-                        let color_group = channel_notes
-                            .get(selected_note_index)
-                            .map(|note| note.midi_channel & 0x0f)?;
-                        Some((
+                    .map(|pattern| {
+                        piano_roll_color_group_note_ids(
+                            pattern,
+                            pattern_id,
+                            channel_id,
                             color_group,
-                            channel_notes
-                                .iter()
-                                .enumerate()
-                                .filter(|(_, note)| note.midi_channel & 0x0f == color_group)
-                                .map(|(note_index, _)| (pattern_id, channel_id, note_index))
-                                .collect::<Vec<_>>(),
-                        ))
+                        )
                     })
             })
         else {
-            self.status = "The selected note's color group has no matching notes".to_owned();
+            self.status = "Could not read notes in the selected color group".to_owned();
+            return;
+        };
+        if note_ids.is_empty() {
+            self.status = format!("No notes use color group {}", color_group + 1);
             return;
         };
         self.selected_piano_notes.clear();
@@ -12736,6 +12721,24 @@ impl DawUi {
                     .count()
             })
             .unwrap_or(0);
+        let color_group_note_count = self
+            .selected_pattern
+            .zip(self.selected_note_channel)
+            .and_then(|(pattern_id, channel_id)| {
+                patterns
+                    .iter()
+                    .find(|pattern| pattern.id == pattern_id)
+                    .map(|pattern| {
+                        piano_roll_color_group_note_ids(
+                            pattern,
+                            pattern_id,
+                            channel_id,
+                            self.piano_roll_note_color_group,
+                        )
+                        .len()
+                    })
+            })
+            .unwrap_or_default();
         let color_change_available = self
             .selected_pattern
             .zip(self.selected_note_channel)
@@ -12927,7 +12930,7 @@ impl DawUi {
                 }
                 if ui
                     .add_enabled(
-                        selected_note_count > 0,
+                        color_group_note_count > 0,
                         egui::Button::new("Select same color group (Shift+C)"),
                     )
                     .clicked()
@@ -21014,6 +21017,23 @@ fn piano_roll_note_group_members(
         .collect()
 }
 
+fn piano_roll_color_group_note_ids(
+    pattern: &Pattern,
+    pattern_id: u16,
+    channel_id: u16,
+    color_group: u8,
+) -> Vec<(u16, u16, usize)> {
+    let color_group = color_group & 0x0f;
+    pattern
+        .notes
+        .iter()
+        .filter(|note| note.channel_id == channel_id)
+        .enumerate()
+        .filter(|(_, note)| note.midi_channel & 0x0f == color_group)
+        .map(|(note_index, _)| (pattern_id, channel_id, note_index))
+        .collect()
+}
+
 fn toggle_piano_roll_note_group_selection(
     selected: &mut BTreeSet<(u16, u16, usize)>,
     members: &[(u16, u16, usize)],
@@ -23353,11 +23373,11 @@ mod tests {
         PlaylistClipDragKind, PlaylistTrack, PluginCandidate, PluginFormat,
         audio_recording_length_ticks, candidate_matches_vst_identity, candidate_mixer_controls,
         encode_midi_device_selections, first_available_playlist_track, next_piano_roll_note_group,
-        note_from_grid_position, parse_midi_device_selections, piano_roll_controller_value_at,
-        piano_roll_controller_value_range, piano_roll_note_group_members,
-        playlist_audio_clip_join_candidates, playlist_bar_ticks, playlist_clip_drag_edit,
-        playlist_clip_local_recording_offset, playlist_clip_split_position,
-        playlist_group_parent_ids, playlist_measure_boundaries,
+        note_from_grid_position, parse_midi_device_selections, piano_roll_color_group_note_ids,
+        piano_roll_controller_value_at, piano_roll_controller_value_range,
+        piano_roll_note_group_members, playlist_audio_clip_join_candidates, playlist_bar_ticks,
+        playlist_clip_drag_edit, playlist_clip_local_recording_offset,
+        playlist_clip_split_position, playlist_group_parent_ids, playlist_measure_boundaries,
         playlist_pattern_clip_join_candidates, playlist_seek_tick_to_frame,
         playlist_signature_at_tick, playlist_song_position_label, playlist_track_group_range,
         playlist_track_is_hidden, recolor_piano_roll_notes, snap_note_tick,
@@ -23473,6 +23493,20 @@ mod tests {
         assert_eq!(notes[0].midi_channel, 0xA6);
         assert_eq!(notes[1].midi_channel, 0xB6);
         assert_eq!(notes[2].midi_channel, 0xC5);
+    }
+
+    #[test]
+    fn piano_roll_select_by_color_uses_the_picker_and_active_channel() {
+        let pattern = piano_roll_color_fixture().patterns().unwrap().remove(0);
+        assert_eq!(
+            piano_roll_color_group_note_ids(&pattern, 7, 0, 3),
+            vec![(7, 0, 0)]
+        );
+        assert_eq!(
+            piano_roll_color_group_note_ids(&pattern, 7, 0, 4),
+            vec![(7, 0, 1)]
+        );
+        assert!(piano_roll_color_group_note_ids(&pattern, 7, 0, 5).is_empty());
     }
 
     #[test]
