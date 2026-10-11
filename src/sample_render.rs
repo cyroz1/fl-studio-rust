@@ -683,6 +683,8 @@ pub struct PlaylistRenderSummary {
     pub vst3_plugin_channels_rendered: usize,
     pub vst3_notes_rendered: usize,
     pub vst3_plugin_channels_unloaded: usize,
+    /// Whether a non-silent Master stem was written by a Mixer stem render.
+    pub mixer_master_stem_rendered: bool,
     /// Non-zero supported insert peaks from a full-song offline render; `None` for live streams.
     pub mixer_insert_peaks: Option<Vec<MixerInsertPeak>>,
 }
@@ -1053,6 +1055,7 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
         vst3_plugin_channels_unloaded: vst3_summary
             .as_ref()
             .map_or(0, |summary| summary.unloaded_plugin_channels.len()),
+        mixer_master_stem_rendered: false,
         mixer_insert_peaks: None,
     };
 
@@ -1294,6 +1297,7 @@ fn render_playlist_with_vst3_cancellable(
         vst3_plugin_channels_unloaded: vst3_summary
             .as_ref()
             .map_or(0, |summary| summary.unloaded_plugin_channels.len()),
+        mixer_master_stem_rendered: false,
         mixer_insert_peaks: Some(Vec::new()),
     };
 
@@ -1430,17 +1434,19 @@ fn render_playlist_with_vst3_cancellable(
     Ok(summary)
 }
 
-/// Render supported non-Master Mixer insert buses to separate WAV files.
+/// Render supported Mixer insert buses to separate WAV files, optionally including Master.
 ///
-/// The stems use the renderer's pre-effect insert buses, including supported direct routes,
-/// paired sends, insert level/pan transforms, and insert mute/solo state. Only recognized,
-/// enabled inserts routed from a project channel are written. Master output, Mixer effects, parameter
-/// automation, and effect/send-chain PDC are not included.
+/// Insert stems use the renderer's pre-effect buses, including supported direct routes, paired
+/// sends, insert level/pan transforms, and insert mute/solo state. Only recognized, enabled
+/// inserts routed from a project channel are written. The optional Master stem uses the final
+/// supported mix after Master controls. Mixer effects, parameter automation, and effect/send-chain
+/// PDC are not included.
 pub fn render_playlist_mixer_stems_with_vst3_cancellable(
     document: &FlpDocument,
     project_path: impl AsRef<Path>,
     options: PlaylistRenderOptions,
     output_directory: impl AsRef<Path>,
+    include_master: bool,
     mut vst3_processor: Option<Vst3PlaylistStreamProcessor>,
     cancelled: &AtomicBool,
 ) -> Result<PlaylistRenderSummary, String> {
@@ -1492,11 +1498,15 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
             (track, label)
         })
         .collect::<Vec<_>>();
-    if inserts.is_empty() {
-        return Err("project has no enabled, recognized non-Master Mixer inserts to export".into());
+    let master_output = MixerMasterOutput::from_document(document);
+    let mut stem_specs = inserts;
+    if include_master && master_output.enabled != Some(false) {
+        stem_specs.insert(0, (0, "Master".to_owned()));
+    }
+    if stem_specs.is_empty() {
+        return Err("project has no enabled Mixer stems selected for export".into());
     }
 
-    let master_output = MixerMasterOutput::from_document(document);
     let audio = prepare_audio_clip_render(
         document,
         project_path,
@@ -1556,7 +1566,7 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
         .filter(|bytes| *bytes <= u32::MAX - 36)
         .ok_or_else(|| "rendered WAV size exceeds the RIFF/WAVE limit".to_owned())?;
 
-    let mut outputs = inserts
+    let mut outputs = stem_specs
         .into_iter()
         .map(|(track, label)| {
             let output_path = output_directory.join(format!("{label}.wav"));
@@ -1613,6 +1623,7 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
         vst3_plugin_channels_unloaded: vst3_summary
             .as_ref()
             .map_or(0, |summary| summary.unloaded_plugin_channels.len()),
+        mixer_master_stem_rendered: false,
         mixer_insert_peaks: Some(Vec::new()),
     };
     let meters = MixerTrackPeakMeters::default();
@@ -1631,16 +1642,8 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
         |block, meter_buses| {
             let meter_buses = meter_buses
                 .ok_or_else(|| "Mixer insert buses were not prepared for stem export".to_owned())?;
-            if !block.len().is_multiple_of(2) {
-                return Err("render block must contain interleaved stereo frames".into());
-            }
-            let samples_per_track = block.len();
-            if meter_buses.len() != MIXER_TRACK_METER_COUNT.saturating_mul(samples_per_track) {
-                return Err("Mixer insert buses do not match the render block".into());
-            }
             for output in &mut outputs {
-                let start = output.track * samples_per_track;
-                let stem_block = &meter_buses[start..start + samples_per_track];
+                let stem_block = mixer_stem_block(output.track, block, meter_buses)?;
                 output.peak = stem_block
                     .iter()
                     .fold(output.peak, |peak, sample| peak.max(sample.abs()));
@@ -1669,9 +1672,12 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
         },
     )?;
     summary.mixer_insert_peaks = Some(take_mixer_insert_peaks(&meters));
+    summary.mixer_master_stem_rendered = outputs
+        .iter()
+        .any(|output| output.track == 0 && output.peak > 0.0);
     let rendered_stems = outputs.iter().filter(|output| output.peak > 0.0).count();
     if rendered_stems == 0 {
-        return Err("render contained no non-silent supported Mixer insert buses".into());
+        return Err("render contained no non-silent selected Mixer stems".into());
     }
     for output in outputs {
         if output.peak > 0.0 {
@@ -1679,6 +1685,34 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
         }
     }
     Ok(summary)
+}
+
+fn mixer_stem_block<'a>(
+    track: usize,
+    master_block: &'a [f32],
+    insert_meter_buses: &'a [f32],
+) -> Result<&'a [f32], String> {
+    if !master_block.len().is_multiple_of(2) {
+        return Err("render block must contain interleaved stereo frames".into());
+    }
+    if track == 0 {
+        return Ok(master_block);
+    }
+    let samples_per_track = master_block.len();
+    if track >= MIXER_TRACK_METER_COUNT {
+        return Err("Mixer stem track exceeds the supported insert range".into());
+    }
+    if insert_meter_buses.len() != MIXER_TRACK_METER_COUNT.saturating_mul(samples_per_track) {
+        return Err("Mixer insert buses do not match the render block".into());
+    }
+    let start = track
+        .checked_mul(samples_per_track)
+        .ok_or_else(|| "Mixer stem offset overflow".to_owned())?;
+    let end = start
+        .checked_add(samples_per_track)
+        .filter(|end| *end <= insert_meter_buses.len())
+        .ok_or_else(|| "Mixer stem block exceeds the insert meter buses".to_owned())?;
+    Ok(&insert_meter_buses[start..end])
 }
 
 fn safe_stem_filename_component(value: &str) -> String {
@@ -6475,6 +6509,23 @@ mod tests {
         assert_eq!(safe_stem_filename_component("...   "), "");
         let long_name = "界".repeat(80);
         assert!(safe_stem_filename_component(&long_name).len() <= 120);
+    }
+
+    #[test]
+    fn mixer_stem_block_reads_master_mix_and_insert_meter_bus() {
+        let master = [0.25_f32, -0.25, 0.5, -0.5];
+        let mut insert_buses = vec![0.0_f32; MIXER_TRACK_METER_COUNT * master.len()];
+        insert_buses[master.len()..2 * master.len()].copy_from_slice(&[0.125, -0.125, 0.75, -0.75]);
+
+        assert_eq!(
+            mixer_stem_block(0, &master, &insert_buses).unwrap(),
+            master.as_slice()
+        );
+        assert_eq!(
+            mixer_stem_block(1, &master, &insert_buses).unwrap(),
+            &[0.125, -0.125, 0.75, -0.75][..]
+        );
+        assert!(mixer_stem_block(MIXER_TRACK_METER_COUNT, &master, &insert_buses).is_err());
     }
 
     #[test]

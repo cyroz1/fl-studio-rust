@@ -1996,6 +1996,7 @@ struct DawUi {
     project_settings_time_signature_denominator: u8,
     playlist_render_options_open: bool,
     playlist_render_mixer_stems: bool,
+    playlist_render_include_master_stem: bool,
     playlist_song_output_format: PlaylistSongOutputFormat,
     playlist_render_format: WavSampleFormat,
     playlist_render_flac_bits_per_sample: u8,
@@ -2502,6 +2503,7 @@ impl DawUi {
             project_settings_time_signature_denominator: 4,
             playlist_render_options_open: false,
             playlist_render_mixer_stems: false,
+            playlist_render_include_master_stem: true,
             playlist_song_output_format: PlaylistSongOutputFormat::Wav,
             playlist_render_format: WavSampleFormat::Float32,
             playlist_render_flac_bits_per_sample: 24,
@@ -4484,7 +4486,12 @@ impl DawUi {
                 });
                 ui.label("Adds this much time after the last clip for instrument releases.");
                 if self.playlist_render_mixer_stems {
-                    ui.label("Exports supported non-Master insert buses before Mixer effects.");
+                    ui.checkbox(
+                        &mut self.playlist_render_include_master_stem,
+                        "Include Master stem",
+                    );
+                    ui.label("Master uses the final supported mix; insert stems are pre-effect.");
+                    ui.label("Mixer effects, automation, and Current-route stems are not included.");
                 }
                 ui.checkbox(
                     &mut self.playlist_render_include_plugin_tails,
@@ -18011,6 +18018,7 @@ impl DawUi {
             .unwrap_or_else(|| project_path.to_path_buf());
         let document = document.clone();
         let output_directory_for_worker = output_directory.clone();
+        let include_master = self.playlist_render_include_master_stem;
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
         let (sender, receiver) = mpsc::sync_channel(1);
@@ -18022,6 +18030,7 @@ impl DawUi {
                     &project_path,
                     options,
                     &output_directory_for_worker,
+                    include_master,
                     vst3_processor,
                     &worker_cancelled,
                 );
@@ -18094,9 +18103,14 @@ impl DawUi {
                         insert_peaks.len(),
                     ),
                     PendingSongRenderKind::MixerStems => format!(
-                        "Rendered supported pre-effect Mixer insert stems into {} at {} Hz; Master, Mixer effects, and automation were not rendered",
+                        "Rendered supported Mixer stems into {} at {} Hz; {}. Mixer effects, automation, Current-route stems, and route PDC were not rendered",
                         pending.output_path.display(),
                         summary.sample_rate,
+                        if summary.mixer_master_stem_rendered {
+                            "Master stem included"
+                        } else {
+                            "Master stem not written"
+                        },
                     ),
                 };
             }
