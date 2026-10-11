@@ -148,6 +148,7 @@ struct PlaybackState {
     browser_preview_cursor_frames: AtomicU64,
     browser_preview_active: AtomicBool,
     browser_preview_gain: AtomicU32,
+    output_peak: AtomicU32,
 }
 
 struct AudioCommandQueue {
@@ -389,6 +390,7 @@ impl PlaybackState {
             browser_preview_cursor_frames: AtomicU64::new(0),
             browser_preview_active: AtomicBool::new(false),
             browser_preview_gain: AtomicU32::new(1.0_f32.to_bits()),
+            output_peak: AtomicU32::new(0.0_f32.to_bits()),
         }
     }
 
@@ -801,6 +803,11 @@ impl AudioEngine {
     pub fn input_level_db(&self) -> f32 {
         let peak = self.input_peak().max(0.000_001);
         20.0 * peak.log10()
+    }
+
+    /// Peak level of the latest output-device buffer, normalized to 0.0–1.0.
+    pub fn output_peak(&self) -> f32 {
+        f32::from_bits(self.playback.output_peak.load(Ordering::Acquire)).clamp(0.0, 1.0)
     }
 
     pub fn input_active(&self) -> bool {
@@ -1304,6 +1311,7 @@ where
                 let playback_samples = playback_for_callback.samples.load();
                 let streaming = playback_for_callback.streaming.load();
                 let browser_preview_samples = playback_for_callback.browser_preview_samples.load();
+                let mut output_peak = 0.0_f32;
                 for frame in output.chunks_mut(channels) {
                     let [left, right] = next_output_frame_with_browser_preview(AudioFrameInputs {
                         source: &source,
@@ -1318,14 +1326,18 @@ where
                         phase: &mut phase,
                     });
                     for (channel, destination) in frame.iter_mut().enumerate() {
-                        let sample = match channel {
+                        let sample = sanitize_output_sample(match channel {
                             0 => left,
                             1 => right,
                             _ => 0.0,
-                        };
-                        *destination = T::from_sample(sample.clamp(-1.0, 1.0));
+                        });
+                        output_peak = output_peak.max(sample.abs());
+                        *destination = T::from_sample(sample);
                     }
                 }
+                playback_for_callback
+                    .output_peak
+                    .store(output_peak.to_bits(), Ordering::Release);
             },
             move |stream_error| set_error(&error, stream_error.to_string()),
             Some(Duration::from_secs(5)),
@@ -1563,6 +1575,14 @@ fn next_output_frame_with_browser_preview(inputs: AudioFrameInputs<'_>) -> [f32;
         (project[0] + preview[0]).clamp(-1.0, 1.0),
         (project[1] + preview[1]).clamp(-1.0, 1.0),
     ]
+}
+
+fn sanitize_output_sample(sample: f32) -> f32 {
+    if sample.is_finite() {
+        sample.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    }
 }
 
 fn tone_sample(phase: f32, sample_rate: f32) -> (f32, f32) {
@@ -2103,6 +2123,7 @@ fn render_wasapi_buffer(
     let playback_samples = playback.samples.load();
     let streaming = playback.streaming.load();
     let browser_preview_samples = playback.browser_preview_samples.load();
+    let mut output_peak = 0.0_f32;
     for frame in output.chunks_exact_mut(format.frame_bytes) {
         let stereo = next_output_frame_with_browser_preview(AudioFrameInputs {
             source,
@@ -2115,14 +2136,18 @@ fn render_wasapi_buffer(
             phase,
         });
         for (channel_index, channel) in frame.chunks_exact_mut(format.sample_bytes).enumerate() {
-            let sample = match channel_index {
+            let sample = sanitize_output_sample(match channel_index {
                 0 => stereo[0],
                 1 => stereo[1],
                 _ => 0.0,
-            };
+            });
+            output_peak = output_peak.max(sample.abs());
             format.encode(sample, channel)?;
         }
     }
+    playback
+        .output_peak
+        .store(output_peak.to_bits(), Ordering::Release);
     Ok(())
 }
 
@@ -2142,7 +2167,7 @@ mod tests {
         AUDIO_SOURCE_SILENT, AUDIO_SOURCE_STREAM, AUDIO_SOURCE_TEST_TONE, AudioAccess,
         AudioInputRecording, AudioRingBuffer, AudioSettings, InputRecordingState, ParameterCommand,
         PlaybackState, TransportCommand, enable_denormal_protection, next_output_frame,
-        tone_sample, validate_settings,
+        sanitize_output_sample, tone_sample, validate_settings,
     };
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -2181,6 +2206,14 @@ mod tests {
             );
             assert_ne!(enabled & (1 << 24), 0);
         }
+    }
+
+    #[test]
+    fn output_samples_are_finite_and_clamped_for_the_master_meter() {
+        assert_eq!(sanitize_output_sample(0.75), 0.75);
+        assert_eq!(sanitize_output_sample(-1.5), -1.0);
+        assert_eq!(sanitize_output_sample(1.5), 1.0);
+        assert_eq!(sanitize_output_sample(f32::NAN), 0.0);
     }
 
     #[test]

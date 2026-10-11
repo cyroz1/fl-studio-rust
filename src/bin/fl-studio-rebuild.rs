@@ -1792,6 +1792,8 @@ struct DawUi {
     selected_pattern_time_signature_pattern: Option<u16>,
     pattern_time_signature_dialog_open: bool,
     selected_mixer_insert: Option<usize>,
+    mixer_master_peak_hold: f32,
+    mixer_master_peak_updated_at: Instant,
     new_time_marker_position: u32,
     new_time_marker_is_signature: bool,
     new_time_marker_numerator: u8,
@@ -2283,6 +2285,8 @@ impl DawUi {
             selected_pattern_time_signature_pattern: None,
             pattern_time_signature_dialog_open: false,
             selected_mixer_insert: None,
+            mixer_master_peak_hold: 0.0,
+            mixer_master_peak_updated_at: Instant::now(),
             new_time_marker_position: 0,
             new_time_marker_is_signature: false,
             new_time_marker_numerator: 4,
@@ -19716,6 +19720,25 @@ impl DawUi {
         let inspector_width = 238.0_f32.min((ui.available_width() * 0.3).max(190.0));
         let bank_width = (ui.available_width() - inspector_width - 10.0).max(180.0);
         let fader_height = (available_height - 248.0).clamp(120.0, 400.0);
+        let output_peak = self
+            .audio_engine
+            .as_ref()
+            .map_or(0.0, AudioEngine::output_peak);
+        let now = Instant::now();
+        let elapsed = now
+            .duration_since(self.mixer_master_peak_updated_at)
+            .as_secs_f32()
+            .min(5.0);
+        self.mixer_master_peak_hold =
+            output_peak.max(self.mixer_master_peak_hold * 10.0_f32.powf(-elapsed));
+        self.mixer_master_peak_updated_at = now;
+        let meter_active = self.audio_engine.as_ref().is_some_and(|engine| {
+            engine.project_playback_active() || engine.browser_preview_active()
+        }) || self.audio_test_tone
+            || self.audio_monitor_input;
+        if meter_active {
+            ui.ctx().request_repaint_after(Duration::from_millis(33));
+        }
         ui.horizontal_top(|ui| {
             ui.allocate_ui_with_layout(
                 Vec2::new(bank_width, available_height),
@@ -19832,6 +19855,37 @@ impl DawUi {
                                                 ui.add_space(8.0);
                                                 ui.small("OUTPUT");
                                                 ui.monospace(insert.output_raw().to_string());
+                                                if insert.ordinal() == 0 {
+                                                    let peak = self.mixer_master_peak_hold;
+                                                    let peak_db = if peak > 0.0 {
+                                                        20.0 * peak.log10()
+                                                    } else {
+                                                        f32::NEG_INFINITY
+                                                    };
+                                                    let meter_fraction = if peak_db.is_finite() {
+                                                        ((peak_db + 60.0) / 60.0).clamp(0.0, 1.0)
+                                                    } else {
+                                                        0.0
+                                                    };
+                                                    let meter_color = if peak >= 0.891_251 {
+                                                        RED
+                                                    } else if peak >= 0.707_946 {
+                                                        ORANGE
+                                                    } else {
+                                                        GREEN
+                                                    };
+                                                    ui.small("MASTER PEAK");
+                                                    ui.add(
+                                                        egui::ProgressBar::new(meter_fraction)
+                                                            .desired_width(90.0)
+                                                            .fill(meter_color)
+                                                            .text(if peak_db.is_finite() {
+                                                                format!("{peak_db:.1} dBFS")
+                                                            } else {
+                                                                "−∞ dBFS".to_owned()
+                                                            }),
+                                                    );
+                                                }
                                                 ui.separator();
                                                 if let Some((volume_record, pan_record)) =
                                                     candidate_mixer_controls(
