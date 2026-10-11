@@ -15665,6 +15665,68 @@ mod tests {
     }
 
     #[test]
+    fn consolidated_audio_clip_keeps_the_render_active_and_mutes_its_source() {
+        let mut document = audio_clip_fixture();
+        let source_clip_index = 1;
+        let source_clip = document.arrangements().unwrap()[0].clips[source_clip_index].clone();
+        assert!(!source_clip.muted);
+
+        let channel_id = document
+            .create_audio_channel("/renders/consolidated.wav", "Consolidated")
+            .expect("the rendered sample should get an Audio Clip channel");
+        let rendered_clip_index = document
+            .create_playlist_audio_clip(3, channel_id, 3_840, 1_920, 4)
+            .expect("the rendered sample should be placed in the Playlist");
+        document
+            .edit_playlist_clip(
+                3,
+                rendered_clip_index,
+                PlaylistClipEdit {
+                    muted: Some(false),
+                    ..PlaylistClipEdit::default()
+                },
+            )
+            .expect("the replacement clip should remain active");
+        document
+            .edit_playlist_clip(
+                3,
+                source_clip_index,
+                PlaylistClipEdit {
+                    muted: Some(true),
+                    ..PlaylistClipEdit::default()
+                },
+            )
+            .expect("the source clip should be muted");
+
+        let arrangements = document.arrangements().unwrap();
+        let arrangement = &arrangements[0];
+        assert!(arrangement.clips[source_clip_index].muted);
+        let rendered_clip = &arrangement.clips[rendered_clip_index];
+        assert!(!rendered_clip.muted);
+        assert_eq!(rendered_clip.position_ticks, 3_840);
+        assert_eq!(rendered_clip.length_ticks, 1_920);
+        assert_eq!(rendered_clip.track_index, Some(4));
+        assert_eq!(
+            rendered_clip.target(),
+            PlaylistClipTarget::Channel { id: channel_id }
+        );
+        assert_eq!(
+            document.channels().last().unwrap().sample_path(),
+            Some("/renders/consolidated.wav")
+        );
+
+        let encoded = document
+            .encode_lossless()
+            .expect("the consolidated project should encode");
+        let reparsed = FlpDocument::parse(&encoded).expect("the consolidated project should parse");
+        let reparsed_arrangements = reparsed.arrangements().unwrap();
+        let reparsed_arrangement = &reparsed_arrangements[0];
+        assert!(reparsed_arrangement.clips[source_clip_index].muted);
+        assert!(!reparsed_arrangement.clips[rendered_clip_index].muted);
+        assert_eq!(reparsed_arrangement.clips, arrangement.clips);
+    }
+
+    #[test]
     fn makes_one_playlist_audio_clip_unique_without_rewriting_its_source_or_other_clips() {
         let mut document = audio_clip_fixture();
         let source_channel = document.channels()[0].clone();

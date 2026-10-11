@@ -44,6 +44,7 @@ use flp_rebuild::{
     RiffMachineOptions, RiffMachineQuantizeMode, ScaleLevelsOptions, TimeMarker, TimeMarkerEdit,
     VstPluginStateMetadata,
 };
+use md5::{Digest, Md5};
 
 mod midi_input;
 mod midi_output;
@@ -2021,6 +2022,18 @@ struct PendingAudioClipExport {
     output_path: PathBuf,
     selected_clip_index: Option<usize>,
     start_from_song_start: bool,
+    replacement: Option<PendingAudioClipReplacement>,
+}
+
+struct PendingAudioClipReplacement {
+    arrangement_id: u16,
+    source_clip_index: usize,
+    source_channel_id: u16,
+    source_position_ticks: u32,
+    source_track_index: u16,
+    project_generation: u64,
+    project_path: PathBuf,
+    project_fingerprint: [u8; 16],
 }
 
 struct PendingSongRender {
@@ -3100,6 +3113,57 @@ impl DawUi {
                 channel.id() == id && channel.kind() == Some(4) && channel.enabled() != Some(false)
             })
             .then_some((arrangement_id, clip_index))
+    }
+
+    fn audio_clip_replacement_details(
+        &self,
+        arrangement_id: u16,
+        clip_index: usize,
+    ) -> Result<PendingAudioClipReplacement, String> {
+        let document = self
+            .document
+            .as_ref()
+            .ok_or_else(|| "Open a project before consolidating an Audio Clip".to_owned())?;
+        let arrangement = document
+            .arrangements()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|arrangement| arrangement.id == arrangement_id)
+            .ok_or_else(|| "The selected Playlist arrangement no longer exists".to_owned())?;
+        let clip = arrangement
+            .clips
+            .get(clip_index)
+            .ok_or_else(|| "The selected Playlist clip no longer exists".to_owned())?;
+        if clip.muted {
+            return Err("Unmute the selected Audio Clip before consolidating it".to_owned());
+        }
+        let Some(track_index) = clip.track_index else {
+            return Err("The selected Audio Clip has no recognized Playlist track".to_owned());
+        };
+        let PlaylistClipTarget::Channel {
+            id: source_channel_id,
+        } = clip.target()
+        else {
+            return Err("Consolidate selected Audio Clip applies to Audio Clips".to_owned());
+        };
+        let project_path = self
+            .sample_project_path()
+            .ok_or_else(|| "Save the project before consolidating an Audio Clip".to_owned())?;
+        let project_bytes = document
+            .encode_lossless()
+            .map_err(|error| format!("Could not fingerprint the current project: {error}"))?;
+        let project_fingerprint: [u8; 16] = Md5::digest(&project_bytes).into();
+
+        Ok(PendingAudioClipReplacement {
+            arrangement_id,
+            source_clip_index: clip_index,
+            source_channel_id,
+            source_position_ticks: clip.position_ticks,
+            source_track_index: track_index,
+            project_generation: self.project_generation,
+            project_path,
+            project_fingerprint,
+        })
     }
 
     fn request_audio_waveform(&mut self, path: &Path) {
@@ -5709,14 +5773,33 @@ impl DawUi {
                             .add_enabled(can_render, egui::Button::new("From clip start…"))
                             .clicked()
                         {
-                            self.render_selected_audio_clip_dialog(false);
+                            self.render_selected_audio_clip_dialog(false, false);
                             ui.close();
                         }
                         if ui
                             .add_enabled(can_render, egui::Button::new("From song start…"))
                             .clicked()
                         {
-                            self.render_selected_audio_clip_dialog(true);
+                            self.render_selected_audio_clip_dialog(true, false);
+                            ui.close();
+                        }
+                    });
+                    ui.menu_button("Consolidate selected Audio Clip…", |ui| {
+                        let can_consolidate = self.selected_playlist_audio_clip().is_some()
+                            && self.sample_project_path().is_some()
+                            && self.pending_audio_clip_export.is_none();
+                        if ui
+                            .add_enabled(can_consolidate, egui::Button::new("From clip start…"))
+                            .clicked()
+                        {
+                            self.render_selected_audio_clip_dialog(false, true);
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(can_consolidate, egui::Button::new("From song start…"))
+                            .clicked()
+                        {
+                            self.render_selected_audio_clip_dialog(true, true);
                             ui.close();
                         }
                     });
@@ -8746,6 +8829,7 @@ impl DawUi {
         let mut paste_clip_after_requested = None;
         let mut make_audio_clip_unique_requested = None;
         let mut make_audio_clip_unique_as_sample_requested = None;
+        let mut consolidate_audio_clip_requested = None;
         let mut split_clip_requested = None;
         let mut join_clip_requested = None;
         let mut join_pattern_clip_requested = None;
@@ -9709,6 +9793,34 @@ impl DawUi {
                                             Some(clip_index);
                                         ui.close();
                                     }
+                                    ui.menu_button("Consolidate audio…", |ui| {
+                                        let can_consolidate =
+                                            self.selected_playlist_audio_clip().is_some()
+                                                && self.sample_project_path().is_some()
+                                                && self.pending_audio_clip_export.is_none();
+                                        if ui
+                                            .add_enabled(
+                                                can_consolidate,
+                                                egui::Button::new("From clip start…"),
+                                            )
+                                            .clicked()
+                                        {
+                                            consolidate_audio_clip_requested =
+                                                Some((clip_index, false));
+                                            ui.close();
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                can_consolidate,
+                                                egui::Button::new("From song start…"),
+                                            )
+                                            .clicked()
+                                        {
+                                            consolidate_audio_clip_requested =
+                                                Some((clip_index, true));
+                                            ui.close();
+                                        }
+                                    });
                                     let split_button = ui.add_enabled(
                                         can_split_clip,
                                         egui::Button::new("Split audio at cursor"),
@@ -10201,6 +10313,14 @@ impl DawUi {
                     self.status = format!("Could not make Audio Clip unique as sample: {error}");
                 }
             }
+        }
+
+        if let Some((clip_index, start_from_song_start)) = consolidate_audio_clip_requested {
+            self.selected_arrangement = Some(arrangement.id);
+            self.selected_clip = Some(clip_index);
+            self.selected_playlist_clips.clear();
+            self.selected_playlist_clips.insert(clip_index);
+            self.render_selected_audio_clip_dialog(start_from_song_start, true);
         }
 
         if let Some((clip_index, split_position_ticks, full_source_length_ms)) =
@@ -17610,10 +17730,14 @@ impl DawUi {
             ..AudioClipRenderOptions::default()
         };
         let output = self.audio_render_output();
-        self.start_audio_clip_export(options, output_path, output);
+        self.start_audio_clip_export(options, output_path, output, None);
     }
 
-    fn render_selected_audio_clip_dialog(&mut self, start_from_song_start: bool) {
+    fn render_selected_audio_clip_dialog(
+        &mut self,
+        start_from_song_start: bool,
+        replace_source: bool,
+    ) {
         let Some((arrangement_id, clip_index)) = self.selected_playlist_audio_clip() else {
             self.status = "Select an enabled audio-channel clip in the Playlist first".to_owned();
             return;
@@ -17631,21 +17755,37 @@ impl DawUi {
             .map(|stem| stem.to_string_lossy().into_owned())
             .unwrap_or_else(|| "FL_Studio_Project".to_owned());
         let output_format = self.playlist_song_output_format;
+        let replacement = if replace_source {
+            match self.audio_clip_replacement_details(arrangement_id, clip_index) {
+                Ok(replacement) => Some(replacement),
+                Err(error) => {
+                    self.status = error;
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         let Some(output_path) = add_audio_render_file_filter(
             rfd::FileDialog::new()
-                .set_title(if start_from_song_start {
+                .set_title(if replace_source && start_from_song_start {
+                    "Consolidate selected Playlist audio clip from song start"
+                } else if replace_source {
+                    "Consolidate selected Playlist audio clip from clip start"
+                } else if start_from_song_start {
                     "Render selected Playlist audio clip from song start"
                 } else {
                     "Render selected Playlist audio clip from clip start"
                 })
                 .set_file_name(format!(
-                    "{project_stem}_clip_{}_{}.{}",
+                    "{project_stem}_clip_{}_{}{}.{}",
                     clip_index + 1,
                     if start_from_song_start {
                         "song_start"
                     } else {
                         "clip_start"
                     },
+                    if replace_source { "_consolidated" } else { "" },
                     output_format.extension()
                 )),
             output_format,
@@ -17669,7 +17809,7 @@ impl DawUi {
             soloed_playlist_track_range: self.soloed_playlist_track_range,
         };
         let output = self.audio_render_output();
-        self.start_audio_clip_export(options, output_path, output);
+        self.start_audio_clip_export(options, output_path, output, replacement);
     }
 
     fn audio_render_output(&self) -> AudioRenderOutput {
@@ -17692,6 +17832,7 @@ impl DawUi {
         options: AudioClipRenderOptions,
         output_path: PathBuf,
         output_format: AudioRenderOutput,
+        replacement: Option<PendingAudioClipReplacement>,
     ) {
         let Some(project_path) = self.sample_project_path() else {
             self.status = "Save the project before rendering its audio clips".to_owned();
@@ -17725,14 +17866,26 @@ impl DawUi {
         match worker {
             Ok(worker) => {
                 let selected_clip_index = options.clip_index;
+                let is_replacement = replacement.is_some();
                 self.pending_audio_clip_export = Some(PendingAudioClipExport {
                     receiver,
                     worker,
                     output_path: output_path.clone(),
                     selected_clip_index,
                     start_from_song_start: options.start_from_song_start,
+                    replacement,
                 });
                 self.status = match selected_clip_index {
+                    Some(clip_index) if is_replacement => format!(
+                        "Consolidating selected Playlist audio clip {} from {} to {}…",
+                        clip_index + 1,
+                        if options.start_from_song_start {
+                            "song start"
+                        } else {
+                            "clip start"
+                        },
+                        output_path.display()
+                    ),
                     Some(clip_index) => format!(
                         "Rendering selected Playlist audio clip {} from {} to {}…",
                         clip_index + 1,
@@ -17755,7 +17908,7 @@ impl DawUi {
         }
     }
 
-    fn poll_audio_clip_export(&mut self) {
+    fn poll_audio_clip_export(&mut self, history_snapshot_available: bool) {
         let completed = self.pending_audio_clip_export.as_ref().and_then(|pending| {
             match pending.receiver.try_recv() {
                 Ok(result) => Some(result),
@@ -17777,6 +17930,15 @@ impl DawUi {
         }
         match result {
             Ok(summary) => {
+                if let Some(replacement) = pending.replacement.as_ref() {
+                    self.finish_audio_clip_replacement(
+                        &pending,
+                        &summary,
+                        replacement,
+                        history_snapshot_available,
+                    );
+                    return;
+                }
                 self.status = match pending.selected_clip_index {
                     Some(clip_index) => format!(
                         "Rendered selected Playlist audio clip {} from {} to {} at {} Hz",
@@ -17802,6 +17964,259 @@ impl DawUi {
                 self.status = format!("Could not render Playlist audio clips: {error}");
             }
         }
+    }
+
+    fn finish_audio_clip_replacement(
+        &mut self,
+        pending: &PendingAudioClipExport,
+        summary: &AudioClipRenderSummary,
+        replacement: &PendingAudioClipReplacement,
+        history_snapshot_available: bool,
+    ) {
+        let Some(project_path) = self.sample_project_path() else {
+            self.status = format!(
+                "Rendered {}, but could not add it because no project is open",
+                pending.output_path.display()
+            );
+            return;
+        };
+        let Some(document) = self.document.as_ref() else {
+            self.status = format!(
+                "Rendered {}, but could not add it because no project is open",
+                pending.output_path.display()
+            );
+            return;
+        };
+        let current_bytes = match document.encode_lossless() {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.status = format!(
+                    "Rendered {}, but could not verify the project before replacement: {error}",
+                    pending.output_path.display()
+                );
+                return;
+            }
+        };
+        let current_fingerprint: [u8; 16] = Md5::digest(&current_bytes).into();
+        if replacement.project_generation != self.project_generation
+            || project_path != replacement.project_path
+            || current_fingerprint != replacement.project_fingerprint
+        {
+            self.status = format!(
+                "Rendered {}, but did not consolidate the clip because the project changed while rendering",
+                pending.output_path.display()
+            );
+            return;
+        }
+        drop(current_bytes);
+        if summary.frames == 0 || summary.sample_rate == 0 {
+            self.status = format!(
+                "Rendered {}, but it contains no audio frames to place in the Playlist",
+                pending.output_path.display()
+            );
+            return;
+        }
+
+        let arrangement = match document.arrangements().map(|arrangements| {
+            arrangements
+                .into_iter()
+                .find(|arrangement| arrangement.id == replacement.arrangement_id)
+        }) {
+            Ok(Some(arrangement)) => arrangement,
+            Ok(None) => {
+                self.status = format!(
+                    "Rendered {}, but its Playlist arrangement no longer exists",
+                    pending.output_path.display()
+                );
+                return;
+            }
+            Err(error) => {
+                self.status = format!(
+                    "Rendered {}, but could not decode its Playlist: {error}",
+                    pending.output_path.display()
+                );
+                return;
+            }
+        };
+        let Some(source_clip) = arrangement.clips.get(replacement.source_clip_index) else {
+            self.status = format!(
+                "Rendered {}, but its source clip no longer exists",
+                pending.output_path.display()
+            );
+            return;
+        };
+        if source_clip.target()
+            != (PlaylistClipTarget::Channel {
+                id: replacement.source_channel_id,
+            })
+            || source_clip.position_ticks != replacement.source_position_ticks
+            || source_clip.track_index != Some(replacement.source_track_index)
+            || source_clip.muted
+        {
+            self.status = format!(
+                "Rendered {}, but its source clip changed before replacement",
+                pending.output_path.display()
+            );
+            return;
+        }
+
+        let position_ticks = if pending.start_from_song_start {
+            0
+        } else {
+            replacement.source_position_ticks
+        };
+        let tempo_map =
+            match PlaylistTempoMap::for_arrangement(document, replacement.arrangement_id) {
+                Ok(tempo_map) => tempo_map,
+                Err(error) => {
+                    self.status = format!(
+                        "Rendered {}, but could not determine its Playlist tempo map: {error}",
+                        pending.output_path.display()
+                    );
+                    return;
+                }
+            };
+        let length_ticks = match tempo_map
+            .ticks_for_audio_frames(
+                u64::from(position_ticks),
+                summary.frames,
+                summary.sample_rate,
+            )
+            .and_then(|ticks| {
+                u32::try_from(ticks)
+                    .map_err(|_| "rendered audio is too long for this Playlist".to_owned())
+            }) {
+            Ok(length_ticks) if length_ticks > 0 => length_ticks,
+            Ok(_) => {
+                self.status = format!(
+                    "Rendered {}, but its duration is shorter than one Playlist tick",
+                    pending.output_path.display()
+                );
+                return;
+            }
+            Err(error) => {
+                self.status = format!(
+                    "Rendered {}, but could not determine its Playlist length: {error}",
+                    pending.output_path.display()
+                );
+                return;
+            }
+        };
+        if position_ticks.checked_add(length_ticks).is_none() {
+            self.status = format!(
+                "Rendered {}, but it is too long to fit at this Playlist position",
+                pending.output_path.display()
+            );
+            return;
+        }
+
+        let undo_snapshot = match self.encode_history_snapshot() {
+            Ok(Some(snapshot)) if snapshot.len() <= HISTORY_LIMIT_BYTES => {
+                (!history_snapshot_available).then_some(snapshot)
+            }
+            Ok(Some(_)) => {
+                self.status = "Undo snapshot exceeds the 64 MiB history limit".to_owned();
+                return;
+            }
+            Ok(None) => {
+                self.status = "Could not capture undo state before consolidation".to_owned();
+                return;
+            }
+            Err(error) => {
+                self.status = format!("Could not capture undo state before consolidation: {error}");
+                return;
+            }
+        };
+
+        let mut updated = document.clone();
+        let sample_path = pending.output_path.to_string_lossy();
+        let channel_name = pending
+            .output_path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| "Consolidated Audio".to_owned());
+        let channel_id = match updated.create_audio_channel(&sample_path, &channel_name) {
+            Ok(channel_id) => channel_id,
+            Err(error) => {
+                self.status = format!(
+                    "Rendered {}, but could not create its Audio Clip channel: {error}",
+                    pending.output_path.display()
+                );
+                return;
+            }
+        };
+        let new_clip_index = match updated.create_playlist_audio_clip(
+            replacement.arrangement_id,
+            channel_id,
+            position_ticks,
+            length_ticks,
+            replacement.source_track_index,
+        ) {
+            Ok(clip_index) => clip_index,
+            Err(error) => {
+                self.status = format!(
+                    "Rendered {}, but could not place it in the Playlist: {error}",
+                    pending.output_path.display()
+                );
+                return;
+            }
+        };
+        if let Err(error) = updated.edit_playlist_clip(
+            replacement.arrangement_id,
+            new_clip_index,
+            PlaylistClipEdit {
+                muted: Some(false),
+                ..PlaylistClipEdit::default()
+            },
+        ) {
+            self.status = format!(
+                "Rendered {}, but could not unmute the new Audio Clip: {error}",
+                pending.output_path.display()
+            );
+            return;
+        }
+        if let Err(error) = updated.edit_playlist_clip(
+            replacement.arrangement_id,
+            replacement.source_clip_index,
+            PlaylistClipEdit {
+                muted: Some(true),
+                ..PlaylistClipEdit::default()
+            },
+        ) {
+            self.status = format!(
+                "Rendered {}, but could not mute its source Audio Clip: {error}",
+                pending.output_path.display()
+            );
+            return;
+        }
+
+        self.stop_project_playback();
+        self.document = Some(updated);
+        if let Some(snapshot) = undo_snapshot {
+            self.remember_undo_snapshot(snapshot);
+        }
+        self.selected_arrangement = Some(replacement.arrangement_id);
+        self.selected_clip = Some(new_clip_index);
+        self.selected_playlist_clips.clear();
+        self.selected_playlist_clips.insert(new_clip_index);
+        self.playlist_selection_anchor = Some(new_clip_index);
+        self.playlist_clip_context_split = None;
+        self.active_playlist_clip_drag = None;
+        self.dirty = true;
+        self.view = MainView::Playlist;
+        self.refresh_audio_waveform_paths();
+        self.status = format!(
+            "Consolidated selected Playlist Audio Clip {} from {} to {} at {} Hz; source muted",
+            replacement.source_clip_index + 1,
+            if pending.start_from_song_start {
+                "song start"
+            } else {
+                "clip start"
+            },
+            pending.output_path.display(),
+            summary.sample_rate
+        );
     }
 
     fn render_playlist_dialog(&mut self) {
@@ -24053,7 +24468,7 @@ impl eframe::App for DawUi {
         if delete_playlist_clip_requested {
             self.delete_selected_playlist_clip();
         }
-        self.poll_audio_clip_export();
+        self.poll_audio_clip_export(self.history_snapshot_available_this_frame);
         self.poll_project_audio_render();
         self.poll_song_render();
         self.poll_sampler_pattern_render();
