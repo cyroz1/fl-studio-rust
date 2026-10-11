@@ -6995,6 +6995,116 @@ impl FlpDocument {
         self.chop_pattern_notes_in_scope(pattern_id, channel_id, Some(note_indices), divisions)
     }
 
+    /// Splits channel notes longer than `snap_ticks` into snap-sized segments.
+    /// Any final partial segment keeps its remaining length.
+    pub fn quick_chop_pattern_notes(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        snap_ticks: u32,
+    ) -> Result<usize, FlpError> {
+        self.quick_chop_pattern_notes_in_scope(pattern_id, channel_id, None, snap_ticks)
+    }
+
+    /// Splits only the supplied channel-local notes into snap-sized segments.
+    pub fn quick_chop_pattern_note_selection(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: &[usize],
+        snap_ticks: u32,
+    ) -> Result<usize, FlpError> {
+        self.quick_chop_pattern_notes_in_scope(
+            pattern_id,
+            channel_id,
+            Some(note_indices),
+            snap_ticks,
+        )
+    }
+
+    fn quick_chop_pattern_notes_in_scope(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: Option<&[usize]>,
+        snap_ticks: u32,
+    ) -> Result<usize, FlpError> {
+        if snap_ticks == 0 {
+            return Err(FlpError::UnsupportedEdit(
+                "quick chop snap must be at least one tick",
+            ));
+        }
+        let patterns = self.patterns()?;
+        let pattern = patterns
+            .iter()
+            .find(|pattern| pattern.id == pattern_id)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested pattern does not exist",
+            ))?;
+        let selected_indices =
+            note_indices.map(|indices| indices.iter().copied().collect::<HashSet<_>>());
+        let max_additions = MAX_MERGED_PATTERN_NOTES.saturating_sub(pattern.notes.len());
+        let mut first_lengths = Vec::new();
+        let mut additions = Vec::new();
+        for (note_index, note) in pattern
+            .notes
+            .iter()
+            .filter(|note| note.channel_id == channel_id)
+            .enumerate()
+            .filter(|(note_index, _)| note_index_in_scope(*note_index, selected_indices.as_ref()))
+        {
+            if note.length <= snap_ticks {
+                continue;
+            }
+            let segment_count = (note.length - 1) / snap_ticks + 1;
+            let required_additions =
+                usize::try_from(segment_count - 1).map_err(|_| FlpError::LengthOverflow)?;
+            if additions
+                .len()
+                .checked_add(required_additions)
+                .is_none_or(|total| total > max_additions)
+            {
+                return Err(FlpError::UnsupportedEdit(
+                    "quick chop would exceed the supported pattern note limit",
+                ));
+            }
+
+            first_lengths.push((note_index, snap_ticks));
+            for segment in 1..segment_count {
+                let offset = snap_ticks
+                    .checked_mul(segment)
+                    .ok_or(FlpError::LengthOverflow)?;
+                let position = note
+                    .position
+                    .checked_add(offset)
+                    .ok_or(FlpError::LengthOverflow)?;
+                let mut chopped = note.clone();
+                chopped.position = position;
+                chopped.length = (note.length - offset).min(snap_ticks);
+                additions.push(chopped);
+            }
+        }
+        if additions.is_empty() {
+            return Ok(0);
+        }
+
+        let mut updated = self.clone();
+        for (note_index, length) in &first_lengths {
+            updated.edit_pattern_note(
+                pattern_id,
+                channel_id,
+                *note_index,
+                PatternNoteEdit {
+                    length: Some(*length),
+                    ..PatternNoteEdit::default()
+                },
+            )?;
+        }
+        updated.add_pattern_notes(pattern_id, &additions)?;
+        *self = updated;
+        Ok(additions.len())
+    }
+
     fn chop_pattern_notes_in_scope(
         &mut self,
         pattern_id: u16,
@@ -17334,6 +17444,79 @@ mod tests {
                 .unwrap()
                 .wire_bytes(),
             &[0xFF, 1, 0x5A]
+        );
+    }
+
+    #[test]
+    fn quick_chop_splits_channel_notes_at_snap_ticks_and_keeps_the_remainder() {
+        let long_note = note_record(3, 0, 10, 60, 100);
+        let snap_length_note = note_record(24, 0, 4, 64, 90);
+        let other_channel = note_record(48, 1, 9, 48, 80);
+        let input = pattern_fixture(
+            &[long_note, snap_length_note, other_channel],
+            &[0xFF, 1, 0x5A],
+        );
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+
+        let created = document
+            .quick_chop_pattern_notes(7, 0, 4)
+            .expect("quick chop should succeed");
+
+        assert_eq!(created, 2);
+        let notes = document.patterns().unwrap()[0].notes.clone();
+        assert_eq!(notes.len(), 5);
+        assert_eq!((notes[0].position, notes[0].length), (3, 4));
+        assert_eq!((notes[1].position, notes[1].length), (24, 4));
+        assert_eq!((notes[2].position, notes[2].length), (48, 9));
+        assert_eq!((notes[3].position, notes[3].length), (7, 4));
+        assert_eq!((notes[4].position, notes[4].length), (11, 2));
+        assert_eq!(notes[3].key, notes[0].key);
+        assert_eq!(notes[3].velocity, notes[0].velocity);
+        assert_eq!(notes[4].key, notes[0].key);
+        let encoded = document
+            .encode_lossless()
+            .expect("edited project should encode");
+        let reparsed = FlpDocument::parse(&encoded).expect("edited project should parse");
+        assert_eq!(reparsed.patterns().unwrap()[0].notes, notes);
+        assert_eq!(
+            reparsed.events().last().unwrap().wire_bytes(),
+            &[0xFF, 1, 0x5A]
+        );
+    }
+
+    #[test]
+    fn quick_chop_selection_and_validation_are_scoped_and_atomic() {
+        let first_note = note_record(0, 0, 8, 60, 100);
+        let selected_note = note_record(24, 0, 10, 64, 90);
+        let other_channel = note_record(48, 1, 12, 48, 80);
+        let input = pattern_fixture(&[first_note, selected_note, other_channel], &[0xFF, 0]);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+
+        assert_eq!(
+            document
+                .quick_chop_pattern_note_selection(7, 0, &[1], 4)
+                .expect("selected note should chop"),
+            2
+        );
+        let notes = document.patterns().unwrap()[0].notes.clone();
+        assert_eq!((notes[0].position, notes[0].length), (0, 8));
+        assert_eq!((notes[1].position, notes[1].length), (24, 4));
+        assert_eq!((notes[2].position, notes[2].length), (48, 12));
+        assert_eq!((notes[3].position, notes[3].length), (28, 4));
+        assert_eq!((notes[4].position, notes[4].length), (32, 2));
+
+        let oversized = note_record(0, 0, u32::MAX, 60, 100);
+        let mut guarded = FlpDocument::parse(&pattern_fixture(&[oversized], &[0xFF, 0]))
+            .expect("large-note fixture should parse");
+        let before = guarded
+            .encode_lossless()
+            .expect("original project should encode");
+        assert!(guarded.quick_chop_pattern_notes(7, 0, 0).is_err());
+        assert!(guarded.quick_chop_pattern_notes(7, 0, 1).is_err());
+        assert_eq!(
+            guarded.encode_lossless().unwrap(),
+            before,
+            "invalid or oversized chops should leave the project unchanged"
         );
     }
 

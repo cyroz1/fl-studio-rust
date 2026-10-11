@@ -5464,6 +5464,7 @@ impl DawUi {
                         "Discard selected note lengths to snap",
                     ),
                     ("Piano roll Ctrl/Cmd+L", "Quick Legato"),
+                    ("Piano roll Ctrl/Cmd+U", "Quick Chop to current snap"),
                     ("Piano roll Ctrl/Cmd+G", "Glue selected notes"),
                     ("Piano roll Shift+Q", "Quick quantize note starts"),
                     ("Alt/Opt+F8", "Browser"),
@@ -13062,6 +13063,7 @@ impl DawUi {
         let mut sampler_preview_requested = false;
         let mut quantize_requested = false;
         let mut legato_requested = false;
+        let mut quick_chop_requested = false;
         let mut chop_requested = false;
         let mut glue_requested = false;
         let mut flip_requested = false;
@@ -13115,6 +13117,8 @@ impl DawUi {
                 ui.input_mut(|input| input.consume_key(egui::Modifiers::ALT, egui::Key::G));
             legato_requested =
                 ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::L));
+            quick_chop_requested =
+                ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::U));
             glue_requested =
                 ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::G));
             quick_quantize_start_requested =
@@ -13666,6 +13670,19 @@ impl DawUi {
                         .clicked()
                     {
                         legato_requested = true;
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            edit_scope_available && self.piano_roll_snap != PianoRollSnap::None,
+                            egui::Button::new(format!("Quick Chop {edit_target}  Ctrl/Cmd+U")),
+                        )
+                        .on_hover_text(
+                            "Split notes longer than the current snap into snap-sized notes",
+                        )
+                        .clicked()
+                    {
+                        quick_chop_requested = true;
                         ui.close();
                     }
                     if ui
@@ -14926,6 +14943,48 @@ impl DawUi {
                     );
                 }
                 Err(error) => self.status = format!("Could not chop notes: {error}"),
+            }
+        }
+        if quick_chop_requested {
+            if self.piano_roll_snap == PianoRollSnap::None {
+                self.status = "Choose a snap value before quick chopping notes".to_owned();
+            } else if self.piano_roll_edit_scope == PianoRollEditScope::Selection
+                && selected_quantize_indices.is_empty()
+            {
+                self.status = "Select notes before quick chopping".to_owned();
+            } else if let (Some(pattern_id), Some(channel_id)) =
+                (self.selected_pattern, self.selected_note_channel)
+            {
+                let snap_ticks = self.piano_roll_snap.ticks(ppq, time_signature);
+                let result = self
+                    .document
+                    .as_mut()
+                    .ok_or_else(|| "no project is open".to_owned())
+                    .and_then(|document| {
+                        let result = if edit_selection_only {
+                            document.quick_chop_pattern_note_selection(
+                                pattern_id,
+                                channel_id,
+                                &selected_quantize_indices,
+                                snap_ticks,
+                            )
+                        } else {
+                            document.quick_chop_pattern_notes(pattern_id, channel_id, snap_ticks)
+                        };
+                        result.map_err(|error| error.to_string())
+                    });
+                match result {
+                    Ok(created) => {
+                        if created > 0 {
+                            self.stop_project_playback();
+                            self.dirty = true;
+                        }
+                        self.status = format!(
+                            "Quick Chop created {created} notes in pattern {pattern_id}, {edit_scope_description}"
+                        );
+                    }
+                    Err(error) => self.status = format!("Could not Quick Chop notes: {error}"),
+                }
             }
         }
         if glue_requested
