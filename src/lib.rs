@@ -3710,7 +3710,8 @@ impl FlpDocument {
                             detail: "pattern controller payload is not a whole number of 12-byte records",
                         });
                     }
-                    if controller_index < next_controller_index.saturating_add(records.len()) {
+                    let next_controller_end = next_controller_index.saturating_add(records.len());
+                    if (next_controller_index..next_controller_end).contains(&controller_index) {
                         let record_index = controller_index - next_controller_index;
                         target = Some((
                             event_index,
