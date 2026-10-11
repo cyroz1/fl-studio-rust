@@ -3505,6 +3505,29 @@ impl FlpDocument {
         start_tick: u32,
         end_tick: u32,
     ) -> Result<usize, FlpError> {
+        self.interpolate_pattern_controller_range(pattern_id, stream, start_tick, end_tick, false)
+    }
+
+    /// Applies a cubic smoothstep spline between the endpoint values of an existing raw Pattern
+    /// controller range. Positions and opaque record fields remain unchanged.
+    pub fn spline_pattern_controller_range(
+        &mut self,
+        pattern_id: u16,
+        stream: (u8, u8),
+        start_tick: u32,
+        end_tick: u32,
+    ) -> Result<usize, FlpError> {
+        self.interpolate_pattern_controller_range(pattern_id, stream, start_tick, end_tick, true)
+    }
+
+    fn interpolate_pattern_controller_range(
+        &mut self,
+        pattern_id: u16,
+        stream: (u8, u8),
+        start_tick: u32,
+        end_tick: u32,
+        spline: bool,
+    ) -> Result<usize, FlpError> {
         let (start_tick, end_tick) = if start_tick <= end_tick {
             (start_tick, end_tick)
         } else {
@@ -3550,6 +3573,11 @@ impl FlpDocument {
         let mut value_updates = BTreeMap::new();
         for (index, controller) in selected.iter().skip(1).take(selected.len() - 2) {
             let fraction = f64::from(controller.position - first.position) / tick_span;
+            let fraction = if spline {
+                fraction * fraction * (3.0 - 2.0 * fraction)
+            } else {
+                fraction
+            };
             let value = (first_value + (last_value - first_value) * fraction) as f32;
             if controller.value_bits != value.to_bits() {
                 let (event_index, record_offset, _) =
@@ -18246,6 +18274,45 @@ mod tests {
                 .is_err()
         );
         assert_eq!(document.encode_lossless().unwrap(), input);
+    }
+
+    #[test]
+    fn spline_pattern_controller_range_uses_smoothstep_and_preserves_raw_fields() {
+        let at_72 = pattern_controller_record(72, [0x95, 0x96], 3, 0x91, 0.1f32.to_bits());
+        let at_0 = pattern_controller_record(0, [0xA5, 0x5A], 3, 0x91, 0.0f32.to_bits());
+        let at_24 = pattern_controller_record(24, [0x21, 0x22], 3, 0x91, 0.9f32.to_bits());
+        let at_96 = pattern_controller_record(96, [0x31, 0x32], 3, 0x91, 1.0f32.to_bits());
+        let records = [at_72, at_0, at_24, at_96];
+        let mut controller_payload = Vec::new();
+        for record in records {
+            controller_payload.extend_from_slice(&record);
+        }
+        let mut controller_event = Vec::new();
+        append_data_event(&mut controller_event, 0xDF, &controller_payload);
+        let input = pattern_fixture(&[], &controller_event);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+
+        assert_eq!(
+            document
+                .spline_pattern_controller_range(7, (3, 0x91), 0, 96)
+                .expect("the selected raw stream should use spline interpolation"),
+            2
+        );
+        let controllers = &document.patterns().unwrap()[0].controllers;
+        assert_eq!(controllers[0].position, 72);
+        assert_eq!(controllers[0].value(), 0.84375);
+        assert_eq!(controllers[0].reserved, [0x95, 0x96]);
+        assert_eq!(controllers[1].position, 0);
+        assert_eq!(controllers[1].value(), 0.0);
+        assert_eq!(controllers[2].position, 24);
+        assert_eq!(controllers[2].value(), 0.15625);
+        assert_eq!(controllers[2].reserved, [0x21, 0x22]);
+        assert_eq!(controllers[3].position, 96);
+        assert_eq!(controllers[3].value(), 1.0);
+
+        let encoded = document.encode_lossless().unwrap();
+        let reparsed = FlpDocument::parse(&encoded).expect("spline-edited file should parse");
+        assert_eq!(reparsed.patterns().unwrap(), document.patterns().unwrap());
     }
 
     #[test]

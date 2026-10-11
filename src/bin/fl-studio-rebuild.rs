@@ -622,6 +622,7 @@ struct PianoRollControllerSelectionDrag {
     stream: (u8, u8),
     start_tick: u32,
     current_tick: u32,
+    spline: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -19546,7 +19547,9 @@ impl DawUi {
                 PianoRollControllerTool::Interpolate,
                 "Interpolate",
             )
-            .on_hover_text("Select raw points and linearize their values between the endpoints");
+            .on_hover_text(
+                "Left-drag for linear interpolation; right-drag for spline interpolation",
+            );
             if !streams.is_empty() {
                 let selected_text = self.piano_roll_controller_stream.map_or_else(
                     || "All raw points".to_owned(),
@@ -19575,9 +19578,7 @@ impl DawUi {
                 }
                 PianoRollControllerTool::Draw => "Drag in the lane to draw · uses current snap",
                 PianoRollControllerTool::Paint => "Drag in the lane to paint · snap is bypassed",
-                PianoRollControllerTool::Interpolate => {
-                    "Drag across three or more points to linearize the range"
-                }
+                PianoRollControllerTool::Interpolate => "Left-drag: linear · right-drag: spline",
             });
         });
 
@@ -19975,9 +19976,15 @@ impl DawUi {
             && !self.piano_roll_zoom_mode
             && !self.piano_roll_playback_mode
         {
-            let primary_down = ui.input(|input| input.pointer.button_down(PointerButton::Primary));
+            let (primary_down, secondary_down) = ui.input(|input| {
+                (
+                    input.pointer.button_down(PointerButton::Primary),
+                    input.pointer.button_down(PointerButton::Secondary),
+                )
+            });
+            let any_button_down = primary_down || secondary_down;
             let drag_started = plot_response.is_pointer_button_down_on()
-                && primary_down
+                && any_button_down
                 && self.piano_roll_controller_selection.is_none();
             if drag_started && let Some(pointer) = plot_response.interact_pointer_pos() {
                 let stream = self.piano_roll_controller_stream.or_else(|| {
@@ -20001,8 +20008,9 @@ impl DawUi {
                     stream,
                     start_tick: tick,
                     current_tick: tick,
+                    spline: secondary_down,
                 });
-            } else if primary_down
+            } else if any_button_down
                 && let Some(pointer) = plot_response.interact_pointer_pos()
                 && let Some(mut selection) = self
                     .piano_roll_controller_selection
@@ -20014,20 +20022,34 @@ impl DawUi {
                     / geometry.tick_scale.max(0.001);
                 selection.current_tick = timeline_x.round().clamp(0.0, u32::MAX as f32) as u32;
                 self.piano_roll_controller_selection = Some(selection);
-            } else if !primary_down
+            } else if !any_button_down
                 && let Some(selection) = self.piano_roll_controller_selection.take()
                 && selection.pattern_id == pattern.id
                 && let Some(document) = &mut self.document
             {
-                match document.linearize_pattern_controller_range(
-                    pattern.id,
-                    selection.stream,
-                    selection.start_tick,
-                    selection.current_tick,
-                ) {
+                let interpolation_result = if selection.spline {
+                    document.spline_pattern_controller_range(
+                        pattern.id,
+                        selection.stream,
+                        selection.start_tick,
+                        selection.current_tick,
+                    )
+                } else {
+                    document.linearize_pattern_controller_range(
+                        pattern.id,
+                        selection.stream,
+                        selection.start_tick,
+                        selection.current_tick,
+                    )
+                };
+                match interpolation_result {
                     Ok(changed) if changed > 0 => {
                         self.dirty = true;
-                        self.status = format!("Linearized {changed} raw Pattern controller points");
+                        self.status = if selection.spline {
+                            format!("Spline-interpolated {changed} raw Pattern controller points")
+                        } else {
+                            format!("Linearized {changed} raw Pattern controller points")
+                        };
                     }
                     Ok(_) => {
                         self.status =
@@ -20039,7 +20061,7 @@ impl DawUi {
                     }
                 }
             }
-            if !primary_down && self.piano_roll_controller_selection.is_some() {
+            if !any_button_down && self.piano_roll_controller_selection.is_some() {
                 self.piano_roll_controller_selection = None;
             }
         } else {
