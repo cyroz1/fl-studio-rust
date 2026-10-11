@@ -647,6 +647,23 @@ impl PianoRollEventTarget {
     }
 }
 
+fn piano_roll_mouse_wheel_property_delta(
+    scroll_delta_y: f32,
+    fine: bool,
+    remainder: &mut f32,
+) -> i16 {
+    const POINTS_PER_NOTCH: f32 = 50.0;
+    if !scroll_delta_y.is_finite() {
+        return 0;
+    }
+    *remainder += scroll_delta_y;
+    let notches = (*remainder / POINTS_PER_NOTCH).trunc() as i16;
+    *remainder -= f32::from(notches) * POINTS_PER_NOTCH;
+    notches
+        .saturating_neg()
+        .saturating_mul(if fine { 1 } else { 4 })
+}
+
 fn piano_roll_event_target_selector(ui: &mut egui::Ui, target: &mut PianoRollEventTarget) {
     egui::ComboBox::from_id_salt("piano-roll-event-target")
         .selected_text(format!("Target: {}", target.label()))
@@ -1670,6 +1687,9 @@ struct DawUi {
     step_graph_reset: Option<StepGraphReset>,
     active_note_drag: Option<ActiveNoteDrag>,
     piano_roll_snap: PianoRollSnap,
+    piano_roll_mouse_wheel_remainder: f32,
+    piano_roll_mouse_wheel_active: bool,
+    piano_roll_mouse_wheel_fine: bool,
     piano_roll_edit_scope: PianoRollEditScope,
     piano_roll_event_editor_open: bool,
     piano_roll_event_target: PianoRollEventTarget,
@@ -2124,6 +2144,9 @@ impl DawUi {
             step_graph_reset: None,
             active_note_drag: None,
             piano_roll_snap: PianoRollSnap::QuarterBeat,
+            piano_roll_mouse_wheel_remainder: 0.0,
+            piano_roll_mouse_wheel_active: false,
+            piano_roll_mouse_wheel_fine: false,
             piano_roll_edit_scope: PianoRollEditScope::Automatic,
             piano_roll_event_editor_open: false,
             piano_roll_event_target: PianoRollEventTarget::Velocity,
@@ -17328,6 +17351,53 @@ impl DawUi {
         let grid_height = f32::from(key_high - key_low + 1) * key_height;
         let mut notes_to_add = Vec::new();
         let pending_scroll_offset = self.piano_roll_pending_scroll_offset.take();
+        let active_event_target = self.piano_roll_event_target;
+        let (
+            vertical_wheel_event,
+            alt_wheel_event,
+            fine_wheel_event,
+            smooth_scroll_delta_y,
+            wheel_is_scrolling,
+        ) = ui.input(|input| {
+            let mut vertical_wheel_event = false;
+            let mut alt_wheel_event = false;
+            let mut fine_wheel_event = false;
+            for event in &input.raw.events {
+                if let egui::Event::MouseWheel {
+                    delta, modifiers, ..
+                } = event
+                    && delta.y != 0.0
+                {
+                    vertical_wheel_event = true;
+                    if modifiers.alt {
+                        alt_wheel_event = true;
+                        fine_wheel_event = modifiers.ctrl;
+                    }
+                }
+            }
+            (
+                vertical_wheel_event,
+                alt_wheel_event,
+                fine_wheel_event,
+                input.smooth_scroll_delta.y,
+                input.is_scrolling(),
+            )
+        });
+        if vertical_wheel_event {
+            self.piano_roll_mouse_wheel_active =
+                alt_wheel_event && active_event_target != PianoRollEventTarget::RawControllers;
+            self.piano_roll_mouse_wheel_fine = fine_wheel_event;
+            if !self.piano_roll_mouse_wheel_active {
+                self.piano_roll_mouse_wheel_remainder = 0.0;
+            }
+        } else if !wheel_is_scrolling {
+            self.piano_roll_mouse_wheel_active = false;
+            self.piano_roll_mouse_wheel_remainder = 0.0;
+        }
+        if active_event_target == PianoRollEventTarget::RawControllers {
+            self.piano_roll_mouse_wheel_active = false;
+            self.piano_roll_mouse_wheel_remainder = 0.0;
+        }
         let mut scroll_area = egui::ScrollArea::both()
             .id_salt("piano-roll-grid")
             .auto_shrink([false, false]);
@@ -17337,7 +17407,10 @@ impl DawUi {
         if let Some(offset) = pending_scroll_offset {
             scroll_area = scroll_area.scroll_offset(offset);
         }
+        let mut note_property_wheel_target_hovered = false;
+        let mut note_property_wheel_consumed = false;
         let scroll_output = scroll_area.show(ui, |ui| {
+            let scroll_modifiers = ui.input(|input| input.modifiers);
             let size = Vec2::new(
                 keyboard_width + grid_width,
                 PIANO_ROLL_RULER_HEIGHT + grid_height,
@@ -17738,9 +17811,89 @@ impl DawUi {
                     } else {
                         Sense::click_and_drag()
                     },
+                )
+                .on_hover_text(
+                    "Alt/Option + mouse wheel adjusts the active note property; Ctrl+Alt/Option is finer",
                 );
                 let note_id = (pattern.id, note.channel_id, *channel_index);
-                let modifiers = ui.input(|input| input.modifiers);
+                let modifiers = scroll_modifiers;
+                let wheel_target_hovered = response.hovered()
+                    && !self.piano_roll_zoom_mode
+                    && !self.piano_roll_playback_mode
+                    && (!ghost || self.piano_roll_editable_ghost_channels)
+                    && self.piano_roll_mouse_wheel_active;
+                note_property_wheel_target_hovered |= wheel_target_hovered;
+                if !note_property_wheel_consumed && wheel_target_hovered {
+                    note_property_wheel_consumed = true;
+                    if smooth_scroll_delta_y != 0.0 {
+                        ui.input_mut(|input| input.smooth_scroll_delta = Vec2::ZERO);
+                    }
+                    let property_delta = piano_roll_mouse_wheel_property_delta(
+                        smooth_scroll_delta_y,
+                        self.piano_roll_mouse_wheel_fine,
+                        &mut self.piano_roll_mouse_wheel_remainder,
+                    );
+                    if property_delta != 0 {
+                        let target_note_indices = if self.selected_piano_notes.contains(&note_id) {
+                            self.selected_piano_notes
+                                .iter()
+                                .filter_map(|(selected_pattern, selected_channel, note_index)| {
+                                    (*selected_pattern == pattern.id
+                                        && *selected_channel == note.channel_id)
+                                    .then_some(*note_index)
+                                })
+                                .collect::<BTreeSet<_>>()
+                        } else {
+                            BTreeSet::from([*channel_index])
+                        };
+                        let maximum = active_event_target.maximum();
+                        let channel_values = pattern
+                            .notes
+                            .iter()
+                            .filter(|candidate| candidate.channel_id == note.channel_id)
+                            .map(|candidate| active_event_target.value(candidate).min(maximum))
+                            .collect::<Vec<_>>();
+                        let mut updated_document = self.document.clone();
+                        if let Some(document) = updated_document.as_mut() {
+                            let mut changed_count = 0usize;
+                            let result = target_note_indices.iter().try_for_each(|note_index| {
+                                let Some(value) = channel_values.get(*note_index).copied() else {
+                                    return Ok(());
+                                };
+                                let next_value = (i32::from(value) + i32::from(property_delta))
+                                    .clamp(0, i32::from(maximum))
+                                    as u16;
+                                if next_value == value {
+                                    return Ok(());
+                                }
+                                changed_count += 1;
+                                document.edit_pattern_note(
+                                    pattern.id,
+                                    note.channel_id,
+                                    *note_index,
+                                    active_event_target.edit(next_value),
+                                )
+                            });
+                            match result {
+                                Ok(()) if changed_count > 0 => {
+                                    self.document = updated_document;
+                                    self.dirty = true;
+                                    let noun = if changed_count == 1 { "note" } else { "notes" };
+                                    self.status = format!(
+                                        "Adjusted {} for {changed_count} {noun}",
+                                        active_event_target.label().to_lowercase()
+                                    );
+                                }
+                                Ok(()) => {}
+                                Err(error) => {
+                                    self.status = format!(
+                                        "Could not adjust note property: {error}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
                 let audition_gesture = response.clicked()
                     || (ui.input(|input| input.pointer.primary_down()) && response.hovered());
                 if self.piano_roll_playback_mode
@@ -18287,6 +18440,9 @@ impl DawUi {
                 notes_to_add.push(note);
             }
         });
+        if !note_property_wheel_target_hovered {
+            self.piano_roll_mouse_wheel_remainder = 0.0;
+        }
         self.piano_roll_grid_viewport = Some(scroll_output.inner_rect);
         self.piano_roll_grid_scroll_offset = scroll_output.state.offset;
         if self.piano_roll_event_editor_open {
@@ -18371,7 +18527,9 @@ impl DawUi {
         ui.horizontal_wrapped(|ui| {
             ui.strong("Events");
             piano_roll_event_target_selector(ui, &mut self.piano_roll_event_target);
-            ui.label("Drag stems to change note properties · Shift+F cycles targets");
+            ui.label(
+                "Drag stems or Alt/Option+wheel over a note · Ctrl+Alt/Option is finer · Shift+F cycles targets",
+            );
         });
         let size = Vec2::new(ui.available_width().max(1.0), 102.0);
         let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
