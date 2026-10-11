@@ -1989,6 +1989,17 @@ struct ActiveMidiRecording {
     playlist_clip_placement: Option<MidiPlaylistClipPlacement>,
 }
 
+impl ActiveMidiRecording {
+    fn record(&mut self, message: ReceivedMidiMessage) {
+        if let Some(fixed_velocity) = self.fixed_velocity {
+            self.recorder
+                .record_with_velocity_override(message, Some(fixed_velocity));
+        } else {
+            self.recorder.record(message);
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct MidiPlaylistClipPlacement {
     arrangement_id: u16,
@@ -20980,9 +20991,7 @@ impl DawUi {
             if !matches!(message.event, MidiInputEvent::Transport(_))
                 && let Some(recording) = self.midi_recording.as_mut()
             {
-                recording
-                    .recorder
-                    .record_with_velocity_override(message, recording.fixed_velocity);
+                recording.record(message);
             }
         }
         self.stop_midi_recording(
@@ -21054,9 +21063,7 @@ impl DawUi {
             if let MidiInputEvent::Transport(command) = message.event {
                 self.handle_midi_transport(command, message, history_snapshot_available);
             } else if let Some(recording) = self.midi_recording.as_mut() {
-                recording
-                    .recorder
-                    .record_with_velocity_override(message, recording.fixed_velocity);
+                recording.record(message);
             }
         }
         let dropped = self.midi_dropped_messages.load(Ordering::Relaxed);
