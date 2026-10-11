@@ -17820,7 +17820,7 @@ impl DawUi {
                     pattern_id: pattern.id,
                     start_tick,
                     current_tick: start_tick,
-                    additive: modifiers.shift,
+                    additive: ui.input(|input| input.modifiers.shift),
                 });
             }
             if let Some(mut drag) = self
@@ -24852,10 +24852,11 @@ mod tests {
         piano_roll_note_nudge_edit, piano_roll_odd_note_selection,
         piano_roll_overlap_note_selection, piano_roll_random_note_selection,
         piano_roll_selection_time_range, piano_roll_shift_time_range,
-        piano_roll_time_range_from_drag, piano_roll_time_tick_at_x,
-        playlist_audio_clip_join_candidates, playlist_audio_drop_position_ticks,
-        playlist_bar_ticks, playlist_clip_drag_edit, playlist_clip_local_recording_offset,
-        playlist_clip_split_position, playlist_group_parent_ids, playlist_measure_boundaries,
+        piano_roll_time_range_from_drag, piano_roll_time_range_note_selection,
+        piano_roll_time_tick_at_x, playlist_audio_clip_join_candidates,
+        playlist_audio_drop_position_ticks, playlist_bar_ticks, playlist_clip_drag_edit,
+        playlist_clip_local_recording_offset, playlist_clip_split_position,
+        playlist_group_parent_ids, playlist_measure_boundaries,
         playlist_pattern_clip_join_candidates, playlist_seek_tick_to_frame,
         playlist_signature_at_tick, playlist_song_position_label, playlist_track_group_range,
         playlist_track_is_hidden, recolor_piano_roll_notes, snap_note_tick,
