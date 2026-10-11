@@ -9783,7 +9783,7 @@ impl DawUi {
                                 && !tempo_automation_overlaps;
                             let drag_hint = if self.playlist_mute_tool_active {
                                 "Mute tool selected: click to mute or unmute this clip. Press T or select Mute to return to move mode."
-                            } else if clip.has_opaque_record_tail() {
+                            } else if !clip.can_resize_timeline_length() {
                                 "Drag to move. Resizing and source-window editing are unavailable for this FL Studio clip format."
                             } else if self.playlist_slip_tool_active && is_audio_clip {
                                 if can_slip_clip {
@@ -9791,6 +9791,8 @@ impl DawUi {
                                 } else {
                                     slip_unavailable_reason
                                 }
+                            } else if clip.has_opaque_record_tail() {
+                                "Drag to move. Shift-drag the right edge to resize this Pattern Clip; its full source window will be kept in sync."
                             } else {
                                 "Drag to move. Shift-drag the right edge to resize. Hold Alt to ignore the 1/16 grid."
                             };
@@ -10028,7 +10030,8 @@ impl DawUi {
                             {
                                 let resize_requested = ui.input(|input| input.modifiers.shift)
                                     && pointer.x >= clip_rect.right() - 8.0;
-                                let resize = resize_requested && !clip.has_opaque_record_tail();
+                                let resize =
+                                    resize_requested && clip.can_resize_timeline_length();
                                 self.selected_arrangement = Some(arrangement.id);
                                 self.selected_clip = Some(clip_index);
                                 self.selected_playlist_clips.clear();
@@ -10971,7 +10974,7 @@ impl DawUi {
             ui.label("Length");
             length_changed = ui
                 .add_enabled(
-                    !clip.has_opaque_record_tail(),
+                    clip.can_resize_timeline_length(),
                     egui::DragValue::new(&mut length).speed(1.0),
                 )
                 .changed();
@@ -11044,7 +11047,10 @@ impl DawUi {
                 });
             }
             if has_opaque_tail {
-                ui.label("The clip data tail is preserved; source, fade, and gain fields are not decoded yet");
+                if let Some((start, end)) = clip.source_window_ticks() {
+                    ui.label(format!("Source cut window: {start}–{end} ticks (decoded)"));
+                }
+                ui.label("Other clip data is preserved; audio fades, gain, and stretch scale are not decoded yet");
             }
         });
         let mut clip_edit_succeeded = true;

@@ -2501,6 +2501,7 @@ pub struct PlaylistClip {
     pub header_bytes: [u8; 4],
     pub start_offset: f32,
     pub end_offset: f32,
+    pub source_window_ticks: Option<(u32, u32)>,
     pub clip_id: Option<u32>,
     pub reserved: Vec<u8>,
     pub scale: Option<f64>,
@@ -2534,8 +2535,8 @@ impl PlaylistClip {
     }
 
     /// Returns a decoded legacy source window in milliseconds. The 88-byte
-    /// record tail is opaque and its source window is not decoded. A
-    /// `-1..-1` legacy window means the full source and returns `None` here.
+    /// record stores its source window as ticks instead. A `-1..-1` legacy
+    /// window means the full source and returns `None` here.
     pub fn source_window_milliseconds(&self) -> Option<(f64, f64)> {
         if self.start_offset.is_finite()
             && self.end_offset.is_finite()
@@ -2547,12 +2548,35 @@ impl PlaylistClip {
         None
     }
 
-    pub fn uses_full_source_window(&self) -> bool {
-        self.record_size == 88 || (self.start_offset == -1.0 && self.end_offset == -1.0)
+    /// Returns the FL Studio 2026 source cut window for an 88-byte record, in ticks.
+    pub fn source_window_ticks(&self) -> Option<(u32, u32)> {
+        self.source_window_ticks
     }
 
-    /// The 88-byte Playlist record tail is preserved verbatim because its
-    /// fields are not yet mapped well enough to edit safely.
+    pub fn uses_full_source_window(&self) -> bool {
+        if self.record_size == 88 {
+            return match self.target() {
+                PlaylistClipTarget::Pattern { .. } => {
+                    self.source_window_ticks == Some((0, self.length_ticks))
+                }
+                PlaylistClipTarget::Channel { .. } => true,
+            };
+        }
+        self.start_offset == -1.0 && self.end_offset == -1.0
+    }
+
+    /// Whether this clip's timeline length can be changed using decoded fields.
+    pub fn can_resize_timeline_length(&self) -> bool {
+        if !self.has_opaque_record_tail() {
+            return true;
+        }
+        matches!(self.target(), PlaylistClipTarget::Pattern { .. })
+            && self.source_window_ticks == Some((0, self.length_ticks))
+    }
+
+    /// The 88-byte Playlist record tail is preserved verbatim except for the
+    /// decoded tick source window and candidate mute flag; other fields remain
+    /// opaque.
     pub fn has_opaque_record_tail(&self) -> bool {
         self.record_size == 88
     }
@@ -5785,12 +5809,19 @@ impl FlpDocument {
             writes.push((record_start + 6, value.to_le_bytes().to_vec()));
         }
         if let Some(value) = edit.length_ticks {
-            if clip.has_opaque_record_tail() {
+            if !clip.can_resize_timeline_length()
+                || edit
+                    .item_index
+                    .is_some_and(|item_index| item_index < clip.pattern_base)
+            {
                 return Err(FlpError::UnsupportedEdit(
-                    "resizing this Playlist record version requires decoding its opaque tail",
+                    "this Playlist clip does not have a recognized full source window for resizing",
                 ));
             }
             writes.push((record_start + 8, value.to_le_bytes().to_vec()));
+            if record_size == 88 {
+                writes.push((record_start + 28, value.to_le_bytes().to_vec()));
+            }
         }
         if let Some(value) = edit.raw_track_index {
             writes.push((record_start + 12, value.to_le_bytes().to_vec()));
@@ -13053,6 +13084,7 @@ fn decode_playlist_clip(
     let f32_at = |offset: usize| f32::from_le_bytes(record[offset..offset + 4].try_into().unwrap());
     let record_size = record.len();
     let modern_record = record_size == 88;
+    let source_window_ticks = modern_record.then(|| (u32_at(24), u32_at(28)));
     let clip_id = playlist_record_has_clip_id(record_size).then(|| u32_at(32));
     let reserved = match record_size {
         88 => record[16..88].to_vec(),
@@ -13085,6 +13117,7 @@ fn decode_playlist_clip(
         },
         start_offset: if modern_record { -1.0 } else { f32_at(24) },
         end_offset: if modern_record { -1.0 } else { f32_at(28) },
+        source_window_ticks,
         clip_id,
         reserved,
         scale,
@@ -15393,7 +15426,7 @@ mod tests {
             assert_eq!(clip.clip_id, None);
             assert_eq!(clip.scale, None);
             assert!(clip.has_opaque_record_tail());
-            assert!(clip.uses_full_source_window());
+            assert!(!clip.uses_full_source_window());
         }
         assert_eq!(
             document.encode_lossless().unwrap(),
@@ -15480,6 +15513,72 @@ mod tests {
             unmuted[0].clips[1].reserved[3],
         ]);
         assert_eq!(cleared_flags, original_flags & !PLAYLIST_CLIP_MUTED_FLAG);
+    }
+
+    #[test]
+    fn resizing_full_window_modern_pattern_updates_its_tick_window() {
+        let mut payload = Vec::new();
+        let mut tails = Vec::new();
+        for (index, window_start) in [0u32, 120].into_iter().enumerate() {
+            let mut record = [0xA5u8; 88];
+            record[0..4].copy_from_slice(&(index as u32 * 960).to_le_bytes());
+            record[4..6].copy_from_slice(&0x5000u16.to_le_bytes());
+            record[6..8].copy_from_slice(&0x5001u16.to_le_bytes());
+            record[8..12].copy_from_slice(&960u32.to_le_bytes());
+            record[12..14].copy_from_slice(&471u16.to_le_bytes());
+            record[14..16].copy_from_slice(&0u16.to_le_bytes());
+            record[24..28].copy_from_slice(&window_start.to_le_bytes());
+            record[28..32].copy_from_slice(&960u32.to_le_bytes());
+            tails.push(record[16..].to_vec());
+            payload.extend_from_slice(&record);
+        }
+
+        let mut event_stream = Vec::new();
+        append_data_event(&mut event_stream, 0xC7, b"26.1.0.0\0");
+        event_stream.extend_from_slice(&[0x63, 0, 0]);
+        append_data_event(&mut event_stream, 0xE9, &payload);
+        let mut document = FlpDocument::parse(&flp_fixture(&event_stream, &[], &[]))
+            .expect("the synthetic FL 2026 project should parse");
+        let initial_arrangements = document.arrangements().unwrap();
+        let arrangement = &initial_arrangements[0];
+        assert_eq!(arrangement.clips[0].source_window_ticks(), Some((0, 960)));
+        assert!(arrangement.clips[0].uses_full_source_window());
+        assert!(arrangement.clips[0].can_resize_timeline_length());
+        assert_eq!(arrangement.clips[1].source_window_ticks(), Some((120, 960)));
+        assert!(!arrangement.clips[1].can_resize_timeline_length());
+
+        document
+            .edit_playlist_clip(
+                0,
+                0,
+                PlaylistClipEdit {
+                    length_ticks: Some(1440),
+                    ..PlaylistClipEdit::default()
+                },
+            )
+            .expect("a full-window Pattern Clip should resize with its source window");
+        let clips = document.arrangements().unwrap();
+        assert_eq!(clips[0].clips[0].length_ticks, 1440);
+        assert_eq!(clips[0].clips[0].source_window_ticks(), Some((0, 1440)));
+        assert!(clips[0].clips[0].uses_full_source_window());
+        assert_eq!(&clips[0].clips[0].reserved[..12], &tails[0][..12]);
+        assert_eq!(&clips[0].clips[0].reserved[16..], &tails[0][16..]);
+
+        let before_rejected_edit = document.encode_lossless().unwrap();
+        assert!(
+            document
+                .edit_playlist_clip(
+                    0,
+                    1,
+                    PlaylistClipEdit {
+                        length_ticks: Some(480),
+                        ..PlaylistClipEdit::default()
+                    },
+                )
+                .is_err(),
+            "a non-full source window must not be changed by timeline resizing"
+        );
+        assert_eq!(document.encode_lossless().unwrap(), before_rejected_edit);
     }
 
     #[test]
