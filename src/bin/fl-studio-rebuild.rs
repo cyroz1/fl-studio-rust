@@ -571,6 +571,12 @@ enum PianoRollEventTarget {
     RawControllers,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PianoRollMouseWheelAction {
+    AdjustProperty,
+    NudgePosition,
+}
+
 impl PianoRollEventTarget {
     const ALL: [Self; 7] = [
         Self::Velocity,
@@ -647,11 +653,7 @@ impl PianoRollEventTarget {
     }
 }
 
-fn piano_roll_mouse_wheel_property_delta(
-    scroll_delta_y: f32,
-    fine: bool,
-    remainder: &mut f32,
-) -> i16 {
+fn piano_roll_mouse_wheel_step_delta(scroll_delta_y: f32, fine: bool, remainder: &mut f32) -> i16 {
     const POINTS_PER_NOTCH: f32 = 50.0;
     if !scroll_delta_y.is_finite() {
         return 0;
@@ -1688,8 +1690,9 @@ struct DawUi {
     active_note_drag: Option<ActiveNoteDrag>,
     piano_roll_snap: PianoRollSnap,
     piano_roll_mouse_wheel_remainder: f32,
-    piano_roll_mouse_wheel_active: bool,
+    piano_roll_mouse_wheel_action: Option<PianoRollMouseWheelAction>,
     piano_roll_mouse_wheel_fine: bool,
+    piano_roll_nudge_notes_with_mouse_wheel: bool,
     piano_roll_edit_scope: PianoRollEditScope,
     piano_roll_event_editor_open: bool,
     piano_roll_event_target: PianoRollEventTarget,
@@ -2076,6 +2079,8 @@ impl DawUi {
         let live_resampling_quality = load_live_resampling_quality();
         let playlist_render_quality = load_playlist_render_quality();
         let read_sample_root_note = load_read_sample_root_note();
+        let piano_roll_nudge_notes_with_mouse_wheel =
+            load_piano_roll_nudge_notes_with_mouse_wheel();
         let browser_path = initial_project
             .as_deref()
             .and_then(Path::parent)
@@ -2145,8 +2150,9 @@ impl DawUi {
             active_note_drag: None,
             piano_roll_snap: PianoRollSnap::QuarterBeat,
             piano_roll_mouse_wheel_remainder: 0.0,
-            piano_roll_mouse_wheel_active: false,
+            piano_roll_mouse_wheel_action: None,
             piano_roll_mouse_wheel_fine: false,
+            piano_roll_nudge_notes_with_mouse_wheel,
             piano_roll_edit_scope: PianoRollEditScope::Automatic,
             piano_roll_event_editor_open: false,
             piano_roll_event_target: PianoRollEventTarget::Velocity,
@@ -12789,6 +12795,87 @@ impl DawUi {
         }
     }
 
+    fn apply_piano_roll_mouse_wheel_note_edits(
+        &mut self,
+        pattern: &Pattern,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: &BTreeSet<usize>,
+        ppq: u16,
+        step_delta: i16,
+        action: PianoRollMouseWheelAction,
+    ) {
+        let event_target = self.piano_roll_event_target;
+        let channel_notes = pattern
+            .notes
+            .iter()
+            .filter(|note| note.channel_id == channel_id)
+            .collect::<Vec<_>>();
+        let targets = note_indices
+            .iter()
+            .filter_map(|note_index| {
+                let note = channel_notes.get(*note_index)?;
+                let edit = match action {
+                    PianoRollMouseWheelAction::AdjustProperty => {
+                        let maximum = event_target.maximum();
+                        let current = event_target.value(note).min(maximum);
+                        let next = (i32::from(current) + i32::from(step_delta))
+                            .clamp(0, i32::from(maximum)) as u16;
+                        (next != current).then(|| event_target.edit(next))
+                    }
+                    PianoRollMouseWheelAction::NudgePosition => {
+                        let ppq_scaled_delta = i64::from(step_delta) * i64::from(ppq.max(1)) / 96;
+                        let tick_delta = if ppq_scaled_delta == 0 {
+                            i64::from(step_delta.signum())
+                        } else {
+                            ppq_scaled_delta
+                        };
+                        let edit = piano_roll_note_nudge_edit(note, tick_delta, 0);
+                        edit.position.is_some().then_some(edit)
+                    }
+                }?;
+                Some((*note_index, edit))
+            })
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            return;
+        }
+
+        let mut updated_document = self.document.clone();
+        let Some(document) = updated_document.as_mut() else {
+            return;
+        };
+        let result = targets.iter().try_for_each(|(note_index, edit)| {
+            document.edit_pattern_note(pattern_id, channel_id, *note_index, edit.clone())
+        });
+        match result {
+            Ok(()) => {
+                self.document = updated_document;
+                if action == PianoRollMouseWheelAction::NudgePosition {
+                    self.stop_project_playback();
+                }
+                self.dirty = true;
+                let noun = if targets.len() == 1 { "note" } else { "notes" };
+                match action {
+                    PianoRollMouseWheelAction::AdjustProperty => {
+                        self.status = format!(
+                            "Adjusted {} for {} {noun}",
+                            event_target.label().to_lowercase(),
+                            targets.len()
+                        );
+                    }
+                    PianoRollMouseWheelAction::NudgePosition => {
+                        let direction = if step_delta < 0 { "left" } else { "right" };
+                        self.status = format!("Nudged {} {noun} {direction}", targets.len());
+                    }
+                }
+            }
+            Err(error) => {
+                self.status = format!("Could not edit Piano roll notes: {error}");
+            }
+        }
+    }
+
     fn discard_piano_roll_selection_lengths(
         &mut self,
         pattern: &Pattern,
@@ -13650,6 +13737,22 @@ impl DawUi {
                 }
             });
             ui.menu_button("Edit", |ui| {
+                if ui
+                    .checkbox(
+                        &mut self.piano_roll_nudge_notes_with_mouse_wheel,
+                        "Nudge notes with mouse wheel",
+                    )
+                    .on_hover_text(
+                        "When enabled, Shift+wheel nudges notes; otherwise use Shift+Alt/Option+wheel",
+                    )
+                    .changed()
+                    && let Err(error) = save_piano_roll_nudge_notes_with_mouse_wheel(
+                        self.piano_roll_nudge_notes_with_mouse_wheel,
+                    )
+                {
+                    self.status = format!("Could not save Piano roll mouse-wheel setting: {error}");
+                }
+                ui.separator();
                 if ui
                     .add_enabled(
                         color_change_available,
@@ -17354,13 +17457,13 @@ impl DawUi {
         let active_event_target = self.piano_roll_event_target;
         let (
             vertical_wheel_event,
-            alt_wheel_event,
+            wheel_action,
             fine_wheel_event,
             smooth_scroll_delta_y,
             wheel_is_scrolling,
         ) = ui.input(|input| {
             let mut vertical_wheel_event = false;
-            let mut alt_wheel_event = false;
+            let mut wheel_action = None;
             let mut fine_wheel_event = false;
             for event in &input.raw.events {
                 if let egui::Event::MouseWheel {
@@ -17369,33 +17472,42 @@ impl DawUi {
                     && delta.y != 0.0
                 {
                     vertical_wheel_event = true;
-                    if modifiers.alt {
-                        alt_wheel_event = true;
-                        fine_wheel_event = modifiers.ctrl;
-                    }
+                    wheel_action = if modifiers.shift
+                        && (modifiers.alt || self.piano_roll_nudge_notes_with_mouse_wheel)
+                    {
+                        Some(PianoRollMouseWheelAction::NudgePosition)
+                    } else if modifiers.alt
+                        && active_event_target != PianoRollEventTarget::RawControllers
+                    {
+                        Some(PianoRollMouseWheelAction::AdjustProperty)
+                    } else {
+                        None
+                    };
+                    fine_wheel_event = modifiers.ctrl;
                 }
             }
             (
                 vertical_wheel_event,
-                alt_wheel_event,
+                wheel_action,
                 fine_wheel_event,
                 input.smooth_scroll_delta.y,
                 input.is_scrolling(),
             )
         });
         if vertical_wheel_event {
-            self.piano_roll_mouse_wheel_active =
-                alt_wheel_event && active_event_target != PianoRollEventTarget::RawControllers;
+            self.piano_roll_mouse_wheel_action = wheel_action;
             self.piano_roll_mouse_wheel_fine = fine_wheel_event;
-            if !self.piano_roll_mouse_wheel_active {
+            if wheel_action.is_none() {
                 self.piano_roll_mouse_wheel_remainder = 0.0;
             }
         } else if !wheel_is_scrolling {
-            self.piano_roll_mouse_wheel_active = false;
+            self.piano_roll_mouse_wheel_action = None;
             self.piano_roll_mouse_wheel_remainder = 0.0;
         }
-        if active_event_target == PianoRollEventTarget::RawControllers {
-            self.piano_roll_mouse_wheel_active = false;
+        if self.piano_roll_mouse_wheel_action == Some(PianoRollMouseWheelAction::AdjustProperty)
+            && active_event_target == PianoRollEventTarget::RawControllers
+        {
+            self.piano_roll_mouse_wheel_action = None;
             self.piano_roll_mouse_wheel_remainder = 0.0;
         }
         let mut scroll_area = egui::ScrollArea::both()
@@ -17407,8 +17519,8 @@ impl DawUi {
         if let Some(offset) = pending_scroll_offset {
             scroll_area = scroll_area.scroll_offset(offset);
         }
-        let mut note_property_wheel_target_hovered = false;
-        let mut note_property_wheel_consumed = false;
+        let mut mouse_wheel_target_hovered = false;
+        let mut mouse_wheel_consumed = false;
         let scroll_output = scroll_area.show(ui, |ui| {
             let scroll_modifiers = ui.input(|input| input.modifiers);
             let size = Vec2::new(
@@ -17813,7 +17925,7 @@ impl DawUi {
                     },
                 )
                 .on_hover_text(
-                    "Alt/Option + mouse wheel adjusts the active note property; Ctrl+Alt/Option is finer",
+                    "Alt/Option+wheel adjusts the active property (Ctrl is finer) · Shift+Alt/Option+wheel nudges timing; Edit can enable Shift-only",
                 );
                 let note_id = (pattern.id, note.channel_id, *channel_index);
                 let modifiers = scroll_modifiers;
@@ -17821,19 +17933,21 @@ impl DawUi {
                     && !self.piano_roll_zoom_mode
                     && !self.piano_roll_playback_mode
                     && (!ghost || self.piano_roll_editable_ghost_channels)
-                    && self.piano_roll_mouse_wheel_active;
-                note_property_wheel_target_hovered |= wheel_target_hovered;
-                if !note_property_wheel_consumed && wheel_target_hovered {
-                    note_property_wheel_consumed = true;
+                    && self.piano_roll_mouse_wheel_action.is_some();
+                mouse_wheel_target_hovered |= wheel_target_hovered;
+                if !mouse_wheel_consumed && wheel_target_hovered {
+                    mouse_wheel_consumed = true;
                     if smooth_scroll_delta_y != 0.0 {
                         ui.input_mut(|input| input.smooth_scroll_delta = Vec2::ZERO);
                     }
-                    let property_delta = piano_roll_mouse_wheel_property_delta(
+                    let step_delta = piano_roll_mouse_wheel_step_delta(
                         smooth_scroll_delta_y,
                         self.piano_roll_mouse_wheel_fine,
                         &mut self.piano_roll_mouse_wheel_remainder,
                     );
-                    if property_delta != 0 {
+                    if step_delta != 0
+                        && let Some(action) = self.piano_roll_mouse_wheel_action
+                    {
                         let target_note_indices = if self.selected_piano_notes.contains(&note_id) {
                             self.selected_piano_notes
                                 .iter()
@@ -17846,52 +17960,15 @@ impl DawUi {
                         } else {
                             BTreeSet::from([*channel_index])
                         };
-                        let maximum = active_event_target.maximum();
-                        let channel_values = pattern
-                            .notes
-                            .iter()
-                            .filter(|candidate| candidate.channel_id == note.channel_id)
-                            .map(|candidate| active_event_target.value(candidate).min(maximum))
-                            .collect::<Vec<_>>();
-                        let mut updated_document = self.document.clone();
-                        if let Some(document) = updated_document.as_mut() {
-                            let mut changed_count = 0usize;
-                            let result = target_note_indices.iter().try_for_each(|note_index| {
-                                let Some(value) = channel_values.get(*note_index).copied() else {
-                                    return Ok(());
-                                };
-                                let next_value = (i32::from(value) + i32::from(property_delta))
-                                    .clamp(0, i32::from(maximum))
-                                    as u16;
-                                if next_value == value {
-                                    return Ok(());
-                                }
-                                changed_count += 1;
-                                document.edit_pattern_note(
-                                    pattern.id,
-                                    note.channel_id,
-                                    *note_index,
-                                    active_event_target.edit(next_value),
-                                )
-                            });
-                            match result {
-                                Ok(()) if changed_count > 0 => {
-                                    self.document = updated_document;
-                                    self.dirty = true;
-                                    let noun = if changed_count == 1 { "note" } else { "notes" };
-                                    self.status = format!(
-                                        "Adjusted {} for {changed_count} {noun}",
-                                        active_event_target.label().to_lowercase()
-                                    );
-                                }
-                                Ok(()) => {}
-                                Err(error) => {
-                                    self.status = format!(
-                                        "Could not adjust note property: {error}"
-                                    );
-                                }
-                            }
-                        }
+                        self.apply_piano_roll_mouse_wheel_note_edits(
+                            pattern,
+                            pattern.id,
+                            note.channel_id,
+                            &target_note_indices,
+                            ppq,
+                            step_delta,
+                            action,
+                        );
                     }
                 }
                 let audition_gesture = response.clicked()
@@ -18440,8 +18517,9 @@ impl DawUi {
                 notes_to_add.push(note);
             }
         });
-        if !note_property_wheel_target_hovered {
+        if !mouse_wheel_target_hovered {
             self.piano_roll_mouse_wheel_remainder = 0.0;
+            self.piano_roll_mouse_wheel_action = None;
         }
         self.piano_roll_grid_viewport = Some(scroll_output.inner_rect);
         self.piano_roll_grid_scroll_offset = scroll_output.state.offset;
@@ -23214,6 +23292,31 @@ fn ui_scale_settings_file() -> Option<PathBuf> {
     browser_favorites_file()?
         .parent()
         .map(|directory| directory.join("ui-scale.txt"))
+}
+
+fn piano_roll_mouse_wheel_nudge_settings_file() -> Option<PathBuf> {
+    browser_favorites_file()?
+        .parent()
+        .map(|directory| directory.join("piano-roll-mouse-wheel-nudge.txt"))
+}
+
+fn load_piano_roll_nudge_notes_with_mouse_wheel() -> bool {
+    piano_roll_mouse_wheel_nudge_settings_file()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|contents| contents.trim().parse::<bool>().ok())
+        .unwrap_or(false)
+}
+
+fn save_piano_roll_nudge_notes_with_mouse_wheel(enabled: bool) -> Result<(), String> {
+    let path = piano_roll_mouse_wheel_nudge_settings_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the Piano roll mouse-wheel setting path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(&path, format!("{enabled}\n"))
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
 }
 
 fn browser_column_width_settings_file() -> Option<PathBuf> {
