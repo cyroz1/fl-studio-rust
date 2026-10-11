@@ -145,6 +145,29 @@ impl PlaylistTempoMap {
         Ok(frames.round() as u64)
     }
 
+    /// Convert a fractional Playlist tick position to a rounded sample-frame position.
+    pub fn frame_at_fractional_tick(&self, tick: f64, sample_rate: u32) -> Result<u64, String> {
+        if !tick.is_finite() || tick < 0.0 {
+            return Err("Playlist position must be finite and non-negative".to_owned());
+        }
+        if sample_rate == 0 {
+            return Err("sample rate must be finite and positive".to_owned());
+        }
+        let segment_index = self
+            .segments
+            .partition_point(|segment| segment.start_tick as f64 <= tick)
+            .saturating_sub(1);
+        let segment = self.segments[segment_index];
+        let elapsed_ticks = tick - segment.start_tick as f64;
+        let seconds = segment.start_seconds
+            + elapsed_ticks * 60.0 / (f64::from(self.ppq) * segment.tempo_bpm);
+        let frames = seconds * f64::from(sample_rate);
+        if !frames.is_finite() || frames < 0.0 || frames > u64::MAX as f64 {
+            return Err("Playlist position is outside the renderable timeline".to_owned());
+        }
+        Ok(frames.round() as u64)
+    }
+
     pub(crate) fn precise_frame_at_tick(&self, tick: u64, sample_rate: f64) -> Result<f64, String> {
         if !sample_rate.is_finite() || sample_rate <= 0.0 {
             return Err("sample rate must be finite and positive".to_owned());
@@ -4594,6 +4617,17 @@ mod tests {
         assert_eq!(map.frame_at_tick(288, 48_000).unwrap(), 96_000);
         assert_eq!(map.frames_between_ticks(96, 192, 48_000).unwrap(), 48_000);
         assert!((map.tick_at_frame(48_000, 48_000).unwrap() - 144.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn playlist_tempo_map_converts_fractional_ticks_across_tempo_changes() {
+        let map = PlaylistTempoMap::from_tempo_events(96, 120.0, &[(96, 60.0)]).unwrap();
+
+        assert_eq!(map.frame_at_fractional_tick(4.0, 48_000), Ok(1_000));
+        assert_eq!(map.frame_at_fractional_tick(96.0, 48_000), Ok(24_000));
+        assert_eq!(map.frame_at_fractional_tick(100.0, 48_000), Ok(26_000));
+        assert!(map.frame_at_fractional_tick(f64::NAN, 48_000).is_err());
+        assert!(map.frame_at_fractional_tick(4.0, 0).is_err());
     }
 
     #[test]
