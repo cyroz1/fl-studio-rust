@@ -451,6 +451,34 @@ jobs:
             exit 1
           fi
 
+          xdotool key F5
+          sleep 1
+          xdotool mousemove 287 16 click 1
+          sleep 0.3
+          xdotool mousemove 350 294 click 1
+          sleep 1
+          detached_playlist_window=$(xdotool search --onlyvisible --name '^Playlist$' | head -n 1 || true)
+          if [[ -z "$detached_playlist_window" ]]; then
+            echo "View > Detach Playlist did not open its native window."
+            cat "$RUNNER_TEMP/mixer-preview.log"
+            exit 1
+          fi
+          xdotool windowmove "$detached_playlist_window" 420 48
+          xdotool windowfocus --sync "$detached_playlist_window"
+          sleep 0.5
+          ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
+            -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/playlist-detached-window.png"
+          xdotool windowfocus --sync "$mixer_window"
+          xdotool mousemove 287 16 click 1
+          sleep 0.3
+          xdotool mousemove 350 294 click 1
+          sleep 1
+          if xdotool search --onlyvisible --name '^Playlist$' >/dev/null 2>&1; then
+            echo "View > Dock Playlist did not close the native editor window."
+            cat "$RUNNER_TEMP/mixer-preview.log"
+            exit 1
+          fi
+
           kill "$app_pid" 2>/dev/null || true
           wait "$app_pid" 2>/dev/null || true
           app_pid=""
@@ -837,6 +865,7 @@ jobs:
             piano-roll-time-selection.png piano-roll-pitch-selection.png piano-roll-mousewheel-property.png \
             piano-roll-mousewheel-nudge.png controller-event-draw.png controller-event-paint.png \
             piano-roll-detached-window.png mixer-detached-window.png channel-rack-detached-window.png \
+            playlist-detached-window.png \
             controller-event-draw-alt-bypass.png controller-event-paint-shift-lock.png \
             controller-event-interpolate-selecting.png controller-event-interpolate.png \
             controller-event-spline-selecting.png controller-event-spline.png \
