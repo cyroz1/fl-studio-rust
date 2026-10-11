@@ -5260,13 +5260,16 @@ impl DawUi {
                     ("F9", "Mixer"),
                     ("Shift+Arrow", "Nudge selected Piano roll notes"),
                     ("Ctrl/Cmd+Up/Down", "Transpose Piano roll notes by octave"),
+                    ("Piano roll Ctrl/Cmd+L", "Quick Legato"),
+                    ("Piano roll Ctrl/Cmd+G", "Glue selected notes"),
+                    ("Piano roll Shift+Q", "Quick quantize note starts"),
                     ("Alt/Opt+F8", "Browser"),
                     ("Space", "Play / pause"),
                     ("Ctrl/Cmd+S", "Save project"),
                     ("Ctrl/Cmd+C", "Copy selected Playlist clip"),
                     ("Ctrl/Cmd+X", "Cut selected Playlist clip"),
                     ("Ctrl/Cmd+V", "Paste Playlist clip after selection"),
-                    ("Ctrl/Cmd+G", "Merge selected Pattern Clips"),
+                    ("Playlist Ctrl/Cmd+G", "Merge selected Pattern Clips"),
                     ("Ctrl/Cmd+Z", "Undo"),
                     ("Ctrl/Cmd+Shift+Z", "Redo"),
                 ] {
@@ -12733,6 +12736,7 @@ impl DawUi {
         let mut ungroup_selected_notes_requested = false;
         let mut change_note_color_requested = false;
         let mut quantize_selected_requested = false;
+        let mut quick_quantize_start_requested = false;
         let mut open_pattern_time_signature_dialog = false;
         let mut note_nudge_requested = None;
         if ui.memory(|memory| memory.focused().is_none()) {
@@ -12762,6 +12766,12 @@ impl DawUi {
                 ui.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::G));
             ungroup_selected_notes_requested =
                 ui.input_mut(|input| input.consume_key(egui::Modifiers::ALT, egui::Key::G));
+            legato_requested =
+                ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::L));
+            glue_requested =
+                ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::G));
+            quick_quantize_start_requested =
+                ui.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::Q));
             note_nudge_requested = ui.input_mut(|input| {
                 if input.consume_key(egui::Modifiers::COMMAND, egui::Key::ArrowUp) {
                     Some((0, 12))
@@ -12876,6 +12886,21 @@ impl DawUi {
                 .collect::<Vec<_>>(),
             _ => Vec::new(),
         };
+        if quick_quantize_start_requested {
+            if self.piano_roll_snap == PianoRollSnap::None {
+                self.status = "Choose a snap value before quick quantizing notes".to_owned();
+            } else if self.piano_roll_edit_scope == PianoRollEditScope::Selection
+                && selected_quantize_indices.is_empty()
+            {
+                self.status = "Select notes before quick quantizing".to_owned();
+            } else if !selected_quantize_indices.is_empty()
+                && self.piano_roll_edit_scope != PianoRollEditScope::Channel
+            {
+                quantize_selected_requested = true;
+            } else {
+                quantize_requested = true;
+            }
+        }
         let selected_note_count = self
             .selected_pattern
             .map(|pattern_id| {
@@ -13993,6 +14018,11 @@ impl DawUi {
         if selection_pattern_before_toolbar != self.selected_pattern
             || selection_channel_before_toolbar != self.selected_note_channel
         {
+            if quick_quantize_start_requested {
+                quantize_requested = false;
+                quantize_selected_requested = false;
+                quick_quantize_start_requested = false;
+            }
             quantize_selected_requested = false;
             legato_requested = false;
             chop_requested = false;
@@ -14412,8 +14442,16 @@ impl DawUi {
                 (self.selected_pattern, self.selected_note_channel)
         {
             let grid_ticks = self.piano_roll_snap.ticks(ppq, time_signature);
-            let strength = f64::from(self.quantize_strength_percent) / 100.0;
-            let swing = f64::from(self.quantize_swing_percent) / 100.0;
+            let strength = if quick_quantize_start_requested {
+                1.0
+            } else {
+                f64::from(self.quantize_strength_percent) / 100.0
+            };
+            let swing = if quick_quantize_start_requested {
+                0.0
+            } else {
+                f64::from(self.quantize_swing_percent) / 100.0
+            };
             let result = self
                 .document
                 .as_mut()
