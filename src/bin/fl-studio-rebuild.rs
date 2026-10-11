@@ -2906,7 +2906,10 @@ impl DawUi {
                 .unwrap_or_else(|| source_sample.parent().unwrap_or_else(|| Path::new(".")));
             let sample_directory = project_directory.join("Samples");
             let copied_sample = copy_unique_sample_file(&source_sample, &sample_directory)?;
-            let Some(filename) = copied_sample.file_name().and_then(|name| name.to_str()) else {
+            let Some(filename) = copied_sample
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+            else {
                 let _ = fs::remove_file(&copied_sample);
                 return Err("the copied sample filename cannot be stored in the project".to_owned());
             };
