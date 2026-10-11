@@ -24657,7 +24657,7 @@ mod tests {
             notes: vec![
                 note(0, 96, 48, 2, 0),
                 note(24, 48, 60, 2, 7),
-                note(24, 48, 72, 2, 0),
+                note(24, 48, 48, 2, 0),
                 note(96, 24, 55, 2, 0),
                 note(24, 48, 90, 3, 0),
                 note(200, 24, 64, 2, 7),
@@ -24672,7 +24672,7 @@ mod tests {
         );
         assert_eq!(
             piano_roll_overlap_note_selection(&pattern, 7, 2, true),
-            vec![(7, 2, 2), (7, 2, 4)]
+            vec![(7, 2, 1), (7, 2, 4)]
         );
     }
 
