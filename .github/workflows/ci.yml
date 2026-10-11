@@ -321,7 +321,7 @@ jobs:
             fi
             sleep 1
           done
-          controller_window=$(xdotool search --onlyvisible --name 'controller-preview.flp' | head -n 1 || true)
+          controller_window=$(xdotool search --onlyvisible --name '^FL Studio Rebuild$' | head -n 1 || true)
           if [[ -z "$controller_window" ]]; then
             echo "Could not find the controller preview window for keyboard interaction checks."
             cat "$RUNNER_TEMP/controller-preview.log"
