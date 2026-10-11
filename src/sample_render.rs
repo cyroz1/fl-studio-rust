@@ -625,6 +625,31 @@ impl Default for PlaylistRenderOptions {
     }
 }
 
+/// Optional live Playlist meter output and seek position for device streaming.
+#[derive(Clone, Copy)]
+pub struct PlaylistStreamMonitor<'a> {
+    start_frame: u64,
+    meters: Option<&'a MixerTrackPeakMeters>,
+}
+
+impl<'a> PlaylistStreamMonitor<'a> {
+    /// Stream from a frame without publishing per-insert meter data.
+    pub const fn from_frame(start_frame: u64) -> Self {
+        Self {
+            start_frame,
+            meters: None,
+        }
+    }
+
+    /// Stream from a frame and publish peaks for recognized direct insert routes.
+    pub const fn with_meters(start_frame: u64, meters: &'a MixerTrackPeakMeters) -> Self {
+        Self {
+            start_frame,
+            meters: Some(meters),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlaylistRenderSummary {
     pub frames: u64,
@@ -887,21 +912,19 @@ pub fn stream_playlist_with_vst3_to_device_from_frame(
         writer,
         cancelled,
         vst3_processor,
-        start_frame,
-        None,
+        PlaylistStreamMonitor::from_frame(start_frame),
     )
 }
 
-/// Stream a Playlist and publish peak snapshots for supported direct Mixer insert routes.
-pub fn stream_playlist_with_vst3_to_device_from_frame_with_meters(
+/// Stream a Playlist from a seek position and publish supported direct-route insert peaks.
+pub fn stream_playlist_with_vst3_to_device_with_monitor(
     document: &FlpDocument,
     project_path: impl AsRef<Path>,
     options: PlaylistRenderOptions,
     writer: &StreamingAudioWriter,
     cancelled: &AtomicBool,
     vst3_processor: Option<Vst3PlaylistStreamProcessor>,
-    start_frame: u64,
-    meters: &MixerTrackPeakMeters,
+    monitor: PlaylistStreamMonitor<'_>,
 ) -> Result<PlaylistRenderSummary, String> {
     stream_playlist_with_vst3_to_device_from_frame_inner(
         document,
@@ -910,8 +933,7 @@ pub fn stream_playlist_with_vst3_to_device_from_frame_with_meters(
         writer,
         cancelled,
         vst3_processor,
-        start_frame,
-        Some(meters),
+        monitor,
     )
 }
 
@@ -922,9 +944,10 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
     writer: &StreamingAudioWriter,
     cancelled: &AtomicBool,
     mut vst3_processor: Option<Vst3PlaylistStreamProcessor>,
-    start_frame: u64,
-    meters: Option<&MixerTrackPeakMeters>,
+    monitor: PlaylistStreamMonitor<'_>,
 ) -> Result<PlaylistRenderSummary, String> {
+    let start_frame = monitor.start_frame;
+    let meters = monitor.meters;
     let project_path = project_path.as_ref();
     let master_output = MixerMasterOutput::from_document(document);
     let audio = prepare_audio_clip_render(
@@ -2249,8 +2272,10 @@ fn stream_prepared_playlist_render(
                     clip,
                     options.sample_rate,
                     options.resampling_quality,
-                    Some(cancelled),
-                    meter_bus,
+                    ClipMixMonitor {
+                        cancelled: Some(cancelled),
+                        meter_bus,
+                    },
                 )
                 .map_err(|error| {
                     format!(
@@ -4235,9 +4260,16 @@ fn mix_clip_window_into_stereo_with_quality(
         clip,
         output_rate,
         resampling_quality,
-        cancelled,
-        None,
+        ClipMixMonitor {
+            cancelled,
+            meter_bus: None,
+        },
     )
+}
+
+struct ClipMixMonitor<'a> {
+    cancelled: Option<&'a AtomicBool>,
+    meter_bus: Option<&'a mut [f32]>,
 }
 
 fn mix_clip_window_into_stereo_with_quality_and_meter(
@@ -4247,9 +4279,12 @@ fn mix_clip_window_into_stereo_with_quality_and_meter(
     clip: &PreparedClip,
     output_rate: u32,
     resampling_quality: ResamplingQuality,
-    cancelled: Option<&AtomicBool>,
-    mut meter_bus: Option<&mut [f32]>,
+    monitor: ClipMixMonitor<'_>,
 ) -> Result<(), String> {
+    let ClipMixMonitor {
+        cancelled,
+        mut meter_bus,
+    } = monitor;
     if source.channels.is_empty() || source.channels.len() > 2 {
         return Err("source must have one or two channels".to_owned());
     }

@@ -22,12 +22,12 @@ use flp_rebuild::project_package::{ProjectPackageWorkspace, copy_unique_sample_f
 use flp_rebuild::sample_render::{
     AudioClipRenderOptions, AudioClipRenderSummary, AudioFileRenderOptions, AudioRecordingSummary,
     AudioRenderEncodingOptions, AudioRenderOutput, MP3_BITRATES_KBPS, PlaylistRenderOptions,
-    PlaylistRenderSummary, PlaylistTempoMap, ResamplingQuality, SamplerPatternRenderOptions,
-    SamplerPatternRenderSummary, WavChannelMode, WavDitherMode, WavSampleFormat,
-    render_audio_clips_to_file, render_playlist_with_vst3_to_flac_cancellable,
+    PlaylistRenderSummary, PlaylistStreamMonitor, PlaylistTempoMap, ResamplingQuality,
+    SamplerPatternRenderOptions, SamplerPatternRenderSummary, WavChannelMode, WavDitherMode,
+    WavSampleFormat, render_audio_clips_to_file, render_playlist_with_vst3_to_flac_cancellable,
     render_playlist_with_vst3_to_mp3_cancellable, render_playlist_with_vst3_to_ogg_cancellable,
     render_playlist_with_vst3_to_wav_cancellable, render_sampler_pattern_to_file,
-    stream_playlist_with_vst3_to_device_from_frame_with_meters, stream_sampler_pattern_to_device,
+    stream_playlist_with_vst3_to_device_with_monitor, stream_sampler_pattern_to_device,
     write_input_recording_to_wav,
 };
 use flp_rebuild::vst3::{
@@ -5050,15 +5050,14 @@ impl DawUi {
                 let result = FlpDocument::parse(&project_bytes)
                     .map_err(|error| error.to_string())
                     .and_then(|document| {
-                        stream_playlist_with_vst3_to_device_from_frame_with_meters(
+                        stream_playlist_with_vst3_to_device_with_monitor(
                             &document,
                             &project_path,
                             options,
                             &writer,
                             &worker_cancelled,
                             vst3_processor,
-                            start_frame,
-                            &worker_mixer_meters,
+                            PlaylistStreamMonitor::with_meters(start_frame, &worker_mixer_meters),
                         )
                     });
                 writer.finish();
