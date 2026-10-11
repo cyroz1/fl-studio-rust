@@ -21430,12 +21430,14 @@ impl DawUi {
         });
         let recording_offset_changed = ui
             .add_enabled_ui(self.midi_recording.is_none(), |ui| {
-                egui::Slider::new(
-                    &mut self.midi_recording_offset_ms,
-                    MIDI_RECORDING_OFFSET_MIN_MS..=MIDI_RECORDING_OFFSET_MAX_MS,
+                ui.add(
+                    egui::Slider::new(
+                        &mut self.midi_recording_offset_ms,
+                        MIDI_RECORDING_OFFSET_MIN_MS..=MIDI_RECORDING_OFFSET_MAX_MS,
+                    )
+                    .text("MIDI input timing offset")
+                    .suffix(" ms"),
                 )
-                .text("MIDI input timing offset")
-                .suffix(" ms")
             })
             .inner
             .changed();
