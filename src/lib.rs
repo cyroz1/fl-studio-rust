@@ -1817,6 +1817,7 @@ pub(crate) struct MixerRouteAudibility {
     source_transforms: HashMap<i8, MixerInsertSignalTransform>,
     master_fader_raw: Option<i32>,
     master_pan_raw: Option<i32>,
+    master_stereo_separation_raw: Option<i32>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1825,6 +1826,7 @@ pub(crate) struct MixerInsertSignalTransform {
     swap_left_right: bool,
     fader_volume_raw: Option<i32>,
     mixer_pan_raw: Option<i32>,
+    stereo_separation_raw: Option<i32>,
     mixer_pan_law_raw: Option<u8>,
 }
 
@@ -1835,6 +1837,7 @@ impl MixerInsertSignalTransform {
             swap_left_right,
             fader_volume_raw: None,
             mixer_pan_raw: None,
+            stereo_separation_raw: None,
             mixer_pan_law_raw: None,
         }
     }
@@ -1846,6 +1849,11 @@ impl MixerInsertSignalTransform {
 
     pub(crate) const fn with_mixer_pan_raw(mut self, pan_raw: Option<i32>) -> Self {
         self.mixer_pan_raw = pan_raw;
+        self
+    }
+
+    pub(crate) const fn with_stereo_separation_raw(mut self, separation_raw: Option<i32>) -> Self {
+        self.stereo_separation_raw = separation_raw;
         self
     }
 
@@ -1861,6 +1869,9 @@ impl MixerInsertSignalTransform {
         if self.polarity_reversed {
             frame[0] = -frame[0];
             frame[1] = -frame[1];
+        }
+        if let Some(separation_raw) = self.stereo_separation_raw {
+            apply_mixer_stereo_separation(frame, separation_raw);
         }
         if let Some(pan_raw) = self.mixer_pan_raw {
             apply_mixer_pan(frame, pan_raw, self.mixer_pan_law_raw);
@@ -1896,12 +1907,15 @@ impl MixerRouteAudibility {
             routing.known_tracks.insert(track);
             let fader_volume_raw = candidate_mixer_fader_volume(parameters, insert.ordinal());
             let mixer_pan_raw = candidate_mixer_pan(parameters, insert.ordinal());
+            let stereo_separation_raw =
+                candidate_mixer_stereo_separation(parameters, insert.ordinal());
             let mixer_pan_law_raw = mixer_pan_raw.and(pan_law_raw);
             // Master is the final destination for every normally routed source. Its
             // saved flags and candidate controls are applied to the completed mix instead.
             if track == 0 {
                 routing.master_fader_raw = fader_volume_raw;
                 routing.master_pan_raw = mixer_pan_raw;
+                routing.master_stereo_separation_raw = stereo_separation_raw;
                 continue;
             }
             if insert.enabled() == Some(false) {
@@ -1916,6 +1930,7 @@ impl MixerRouteAudibility {
             )
             .with_fader_volume_raw(fader_volume_raw)
             .with_mixer_pan_raw(mixer_pan_raw)
+            .with_stereo_separation_raw(stereo_separation_raw)
             .with_mixer_pan_law_raw(mixer_pan_law_raw);
             if transform != MixerInsertSignalTransform::default() {
                 routing.source_transforms.insert(track, transform);
@@ -1966,6 +1981,10 @@ impl MixerRouteAudibility {
     pub(crate) fn master_pan_raw(&self) -> Option<i32> {
         self.master_pan_raw
     }
+
+    pub(crate) fn master_stereo_separation_raw(&self) -> Option<i32> {
+        self.master_stereo_separation_raw
+    }
 }
 
 fn candidate_mixer_fader_volume(
@@ -1999,6 +2018,30 @@ fn candidate_mixer_pan(parameters: &[MixerParameterRecord], insert_ordinal: usiz
         return None;
     }
     Some(record.value())
+}
+
+fn candidate_mixer_stereo_separation(
+    parameters: &[MixerParameterRecord],
+    insert_ordinal: usize,
+) -> Option<i32> {
+    let mut matches = parameters.iter().filter(|record| {
+        record.kind() == MixerParameterKind::StereoSeparation
+            && record.candidate_insert_ordinal() == Some(insert_ordinal)
+            && record.target_scope_raw() == 0
+    });
+    let record = matches.next()?;
+    if matches.next().is_some() || !(-64..=64).contains(&record.value()) {
+        return None;
+    }
+    Some(record.value())
+}
+
+fn apply_mixer_stereo_separation(frame: &mut [f32; 2], separation_raw: i32) {
+    let mid = (frame[0] + frame[1]) * 0.5;
+    let side = (frame[0] - frame[1]) * 0.5;
+    let side_gain = 1.0 - separation_raw.clamp(-64, 64) as f32 / 64.0;
+    frame[0] = mid + side * side_gain;
+    frame[1] = mid - side * side_gain;
 }
 
 fn apply_mixer_pan(frame: &mut [f32; 2], pan_raw: i32, pan_law_raw: Option<u8>) {
@@ -16300,6 +16343,90 @@ mod tests {
                 .apply_frame(&mut frame);
             assert_eq!(frame, [1.0, 2.0]);
         }
+    }
+
+    #[test]
+    fn mixer_stereo_separation_uses_unique_candidate_records() {
+        let insert = |ordinal| MixerInsertSummary {
+            ordinal,
+            input_raw: 0,
+            output_raw: 0,
+            color_raw: 0,
+            icon_raw: None,
+            name: None,
+            flags: Some(1 << 3),
+            flags_event_index: None,
+            first_event_index: 0,
+            end_event_index: 0,
+        };
+        let parameter = |insert_ordinal: u16, scope: u16, value| MixerParameterRecord {
+            event_index: 0,
+            record_index: 0,
+            prefix: [0; 4],
+            parameter_id: 194,
+            reserved: 0,
+            channel_data: ((64 + insert_ordinal) << 6) | (scope << 13),
+            value,
+        };
+        let routing = MixerRouteAudibility::from_inserts_with_parameters(
+            [insert(0), insert(1)],
+            &[parameter(0, 0, -64), parameter(1, 0, 64)],
+            None,
+        );
+        assert_eq!(routing.master_stereo_separation_raw(), Some(-64));
+        let mut mono_insert = [1.0, -1.0];
+        routing
+            .transform_for_channel(Some(1))
+            .apply_frame(&mut mono_insert);
+        assert_eq!(mono_insert, [0.0, 0.0]);
+
+        let ambiguous = MixerRouteAudibility::from_inserts_with_parameters(
+            [insert(1)],
+            &[parameter(1, 0, 64), parameter(1, 0, -64)],
+            None,
+        );
+        let mut unchanged = [1.0, -1.0];
+        ambiguous
+            .transform_for_channel(Some(1))
+            .apply_frame(&mut unchanged);
+        assert_eq!(unchanged, [1.0, -1.0]);
+
+        let scoped = MixerRouteAudibility::from_inserts_with_parameters(
+            [insert(1)],
+            &[parameter(1, 1, 64)],
+            None,
+        );
+        let mut unchanged = [1.0, -1.0];
+        scoped
+            .transform_for_channel(Some(1))
+            .apply_frame(&mut unchanged);
+        assert_eq!(unchanged, [1.0, -1.0]);
+
+        let out_of_range = MixerRouteAudibility::from_inserts_with_parameters(
+            [insert(1)],
+            &[parameter(1, 0, 65)],
+            None,
+        );
+        let mut unchanged = [1.0, -1.0];
+        out_of_range
+            .transform_for_channel(Some(1))
+            .apply_frame(&mut unchanged);
+        assert_eq!(unchanged, [1.0, -1.0]);
+    }
+
+    #[test]
+    fn mixer_stereo_separation_preserves_mid_and_adjusts_side() {
+        let mut unchanged = [0.75, 0.25];
+        apply_mixer_stereo_separation(&mut unchanged, 0);
+        assert_eq!(unchanged, [0.75, 0.25]);
+
+        let mut mono = [0.75, 0.25];
+        apply_mixer_stereo_separation(&mut mono, 64);
+        assert_eq!(mono, [0.5, 0.5]);
+
+        let mut widened = [0.75, 0.25];
+        apply_mixer_stereo_separation(&mut widened, -64);
+        assert_eq!(widened, [1.0, 0.0]);
     }
 
     #[test]

@@ -302,6 +302,18 @@ fn candidate_mixer_controls(
     ))
 }
 
+fn candidate_mixer_stereo_separation(
+    parameters: &[MixerParameterRecord],
+    insert_ordinal: usize,
+) -> Option<&MixerParameterRecord> {
+    let record = unique_candidate_mixer_parameter(
+        parameters,
+        insert_ordinal,
+        MixerParameterKind::StereoSeparation,
+    )?;
+    (-64..=64).contains(&record.value()).then_some(record)
+}
+
 fn project_hash(document: &FlpDocument) -> Option<u64> {
     let bytes = document.encode_lossless().ok()?;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -20694,74 +20706,122 @@ impl DawUi {
                                                     );
                                                 }
                                                 ui.separator();
-                                                if let Some((volume_record, pan_record)) =
-                                                    candidate_mixer_controls(
+                                                let track_controls = candidate_mixer_controls(
+                                                    &parameters,
+                                                    insert.ordinal(),
+                                                );
+                                                let stereo_separation_record =
+                                                    candidate_mixer_stereo_separation(
                                                         &parameters,
                                                         insert.ordinal(),
-                                                    )
+                                                    );
+                                                if track_controls.is_some()
+                                                    || stereo_separation_record.is_some()
                                                 {
                                                     ui.small("CANDIDATE CONTROLS")
                                                         .on_hover_text(
-                                                            "Matched by the observed 0xE1 target = 64 + insert ordinal convention. Values edit the source records directly.",
+                                                            "Matched unique zero-scope 0xE1 parameter records by the candidate 64 + insert ordinal target. Values edit the source records directly.",
                                                         );
-                                                    ui.small("PAN");
-                                                    let mut pan_value = pan_record.value();
-                                                    if (-6400..=6400).contains(&pan_value) {
-                                                        if ui
-                                                            .add_sized(
-                                                                [90.0, 18.0],
-                                                                egui::Slider::new(
-                                                                    &mut pan_value,
-                                                                    -6400..=6400,
+                                                    if let Some((volume_record, pan_record)) =
+                                                        track_controls
+                                                    {
+                                                        ui.small("PAN");
+                                                        let mut pan_value = pan_record.value();
+                                                        if (-6400..=6400).contains(&pan_value) {
+                                                            if ui
+                                                                .add_sized(
+                                                                    [90.0, 18.0],
+                                                                    egui::Slider::new(
+                                                                        &mut pan_value,
+                                                                        -6400..=6400,
+                                                                    )
+                                                                    .show_value(false)
+                                                                    .step_by(1.0),
                                                                 )
-                                                                .show_value(false)
-                                                                .step_by(1.0),
-                                                            )
-                                                            .changed()
-                                                        {
-                                                            parameter_edits.push((
-                                                                pan_record.event_index(),
-                                                                pan_record.record_index(),
-                                                                pan_value,
-                                                            ));
-                                                        }
-                                                        let pan_label = if pan_value == 0 {
-                                                            "C".to_owned()
-                                                        } else if pan_value < 0 {
-                                                            format!("L {}%", -pan_value * 100 / 6400)
+                                                                .changed()
+                                                            {
+                                                                parameter_edits.push((
+                                                                    pan_record.event_index(),
+                                                                    pan_record.record_index(),
+                                                                    pan_value,
+                                                                ));
+                                                            }
+                                                            let pan_label = if pan_value == 0 {
+                                                                "C".to_owned()
+                                                            } else if pan_value < 0 {
+                                                                format!(
+                                                                    "L {}%",
+                                                                    -pan_value * 100 / 6400
+                                                                )
+                                                            } else {
+                                                                format!(
+                                                                    "R {}%",
+                                                                    pan_value * 100 / 6400
+                                                                )
+                                                            };
+                                                            ui.small(pan_label);
                                                         } else {
-                                                            format!("R {}%", pan_value * 100 / 6400)
-                                                        };
-                                                        ui.small(pan_label);
-                                                    } else {
-                                                        ui.small(format!("PAN raw {}", pan_value));
-                                                    }
-                                                    ui.add_space(5.0);
-                                                    ui.small("LEVEL · RAW");
-                                                    let mut volume_value = volume_record.value();
-                                                    if (0..=16_000).contains(&volume_value) {
-                                                        if ui
-                                                            .add_sized(
-                                                                [28.0, fader_height],
-                                                                egui::Slider::new(
-                                                                    &mut volume_value,
-                                                                    0..=16_000,
-                                                                )
-                                                                .vertical()
-                                                                .show_value(false)
-                                                                .step_by(1.0),
-                                                            )
-                                                            .changed()
-                                                        {
-                                                            parameter_edits.push((
-                                                                volume_record.event_index(),
-                                                                volume_record.record_index(),
-                                                                volume_value,
-                                                            ));
+                                                            ui.small(format!("PAN raw {pan_value}"));
                                                         }
-                                                        ui.small(volume_value.to_string());
+                                                        ui.add_space(5.0);
+                                                        ui.small("LEVEL · RAW");
+                                                        let mut volume_value = volume_record.value();
+                                                        if (0..=16_000).contains(&volume_value) {
+                                                            if ui
+                                                                .add_sized(
+                                                                    [28.0, fader_height],
+                                                                    egui::Slider::new(
+                                                                        &mut volume_value,
+                                                                        0..=16_000,
+                                                                    )
+                                                                    .vertical()
+                                                                    .show_value(false)
+                                                                    .step_by(1.0),
+                                                                )
+                                                                .changed()
+                                                            {
+                                                                parameter_edits.push((
+                                                                    volume_record.event_index(),
+                                                                    volume_record.record_index(),
+                                                                    volume_value,
+                                                                ));
+                                                            }
+                                                            ui.small(volume_value.to_string());
+                                                        } else {
+                                                            ui.small(format!("raw {volume_value}"));
+                                                        }
                                                     } else {
-                                                        ui.small(format!("raw {}", volume_value));
+                                                        ui.small("LEVEL / PAN · NOT MAPPED")
+                                                            .on_hover_text("No unique supported zero-scope volume and pan pair was found for this insert.");
+                                                    }
+                                                    if let Some(record) = stereo_separation_record {
+                                                        ui.add_space(5.0);
+                                                        ui.small("STEREO · RAW");
+                                                        let mut separation_value = record.value();
+                                                        if (-64..=64).contains(&separation_value) {
+                                                            if ui
+                                                                .add_sized(
+                                                                    [90.0, 18.0],
+                                                                    egui::Slider::new(
+                                                                        &mut separation_value,
+                                                                        -64..=64,
+                                                                    )
+                                                                    .show_value(false)
+                                                                    .step_by(1.0),
+                                                                )
+                                                                .on_hover_text("−64 widens the stereo image, 0 leaves it unchanged, and +64 sums the signal to mono.")
+                                                                .changed()
+                                                            {
+                                                                parameter_edits.push((
+                                                                    record.event_index(),
+                                                                    record.record_index(),
+                                                                    separation_value,
+                                                                ));
+                                                            }
+                                                            ui.small(separation_value.to_string());
+                                                        } else {
+                                                            ui.small(format!("raw {separation_value}"));
+                                                        }
                                                     }
                                                 } else {
                                                     ui.centered_and_justified(|ui| {
@@ -27452,6 +27512,38 @@ mod tests {
             .mixer_parameter_records()
             .expect("Mixer parameter records should decode");
         assert!(candidate_mixer_controls(&parameters, 0).is_none());
+    }
+
+    #[test]
+    fn mixer_stereo_separation_control_requires_unique_zero_scope_record() {
+        let target = 64_u16 << 6;
+        let document = mixer_parameter_fixture(&[(194, target, 32)]);
+        let parameters = document
+            .mixer_parameter_records()
+            .expect("Mixer parameter records should decode");
+        assert_eq!(
+            candidate_mixer_stereo_separation(&parameters, 0).map(|r| r.value()),
+            Some(32)
+        );
+        assert!(candidate_mixer_stereo_separation(&parameters, 1).is_none());
+
+        let duplicate = mixer_parameter_fixture(&[(194, target, 32), (194, target, -32)]);
+        let parameters = duplicate
+            .mixer_parameter_records()
+            .expect("Mixer parameter records should decode");
+        assert!(candidate_mixer_stereo_separation(&parameters, 0).is_none());
+
+        let scoped = mixer_parameter_fixture(&[(194, target | (1 << 13), 32)]);
+        let parameters = scoped
+            .mixer_parameter_records()
+            .expect("Mixer parameter records should decode");
+        assert!(candidate_mixer_stereo_separation(&parameters, 0).is_none());
+
+        let out_of_range = mixer_parameter_fixture(&[(194, target, 65)]);
+        let parameters = out_of_range
+            .mixer_parameter_records()
+            .expect("Mixer parameter records should decode");
+        assert!(candidate_mixer_stereo_separation(&parameters, 0).is_none());
     }
 
     #[test]

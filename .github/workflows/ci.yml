@@ -201,6 +201,9 @@ jobs:
               + bytes([0x11, 0x22, 0x33, 0x44, 193, 0])
               + struct.pack("<H", target)
               + struct.pack("<i", 0)
+              + bytes([0x55, 0x66, 0x77, 0x88, 194, 0])
+              + struct.pack("<H", target)
+              + struct.pack("<i", -16)
           )
           event_stream = (
               arrangement_meter_markers

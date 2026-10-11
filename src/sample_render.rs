@@ -2150,6 +2150,7 @@ struct MixerMasterOutput {
     swap_left_right: Option<bool>,
     fader_volume_raw: Option<i32>,
     mixer_pan_raw: Option<i32>,
+    stereo_separation_raw: Option<i32>,
     mixer_pan_law_raw: Option<u8>,
 }
 
@@ -2165,6 +2166,7 @@ impl MixerMasterOutput {
             swap_left_right: master.swap_left_right(),
             fader_volume_raw: routing.master_fader_raw(),
             mixer_pan_raw: routing.master_pan_raw(),
+            stereo_separation_raw: routing.master_stereo_separation_raw(),
             mixer_pan_law_raw: document.metadata().pan_law_raw(),
         }
     }
@@ -2176,6 +2178,7 @@ impl MixerMasterOutput {
         }
         let (frames, _) = stereo_samples.as_chunks_mut::<2>();
         let master_transform = MixerInsertSignalTransform::default()
+            .with_stereo_separation_raw(self.stereo_separation_raw)
             .with_mixer_pan_raw(self.mixer_pan_raw)
             .with_mixer_pan_law_raw(self.mixer_pan_law_raw)
             .with_fader_volume_raw(self.fader_volume_raw);
@@ -4708,6 +4711,27 @@ mod tests {
         }
         .apply(&mut output);
         assert_eq!(output, [0.0, 3.0, 0.0, 7.0]);
+    }
+
+    #[test]
+    fn mixer_master_stereo_separation_changes_the_final_bus_width() {
+        let mut mono = [1.0, -1.0];
+        MixerMasterOutput {
+            enabled: Some(true),
+            stereo_separation_raw: Some(64),
+            ..MixerMasterOutput::default()
+        }
+        .apply(&mut mono);
+        assert_eq!(mono, [0.0, 0.0]);
+
+        let mut widened = [1.0, -1.0];
+        MixerMasterOutput {
+            enabled: Some(true),
+            stereo_separation_raw: Some(-64),
+            ..MixerMasterOutput::default()
+        }
+        .apply(&mut widened);
+        assert_eq!(widened, [2.0, -2.0]);
     }
 
     #[test]
