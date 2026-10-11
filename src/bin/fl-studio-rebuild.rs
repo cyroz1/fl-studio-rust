@@ -19592,12 +19592,8 @@ impl DawUi {
                 PianoRollControllerTool::Edit => {
                     "Drag to edit · click empty space to duplicate · right-click to delete"
                 }
-                PianoRollControllerTool::Draw => {
-                    "Drag to draw · Alt bypasses snap · Shift locks value"
-                }
-                PianoRollControllerTool::Paint => {
-                    "Drag to paint · snap is bypassed · Shift locks value"
-                }
+                PianoRollControllerTool::Draw => "Alt bypass snap · Shift lock value",
+                PianoRollControllerTool::Paint => "Shift locks value",
                 PianoRollControllerTool::Interpolate => "Left-drag: linear · right-drag: spline",
                 PianoRollControllerTool::Erase => "Drag to erase selected points",
             });
@@ -20014,7 +20010,9 @@ impl DawUi {
                 }
             }
             if !primary_down {
-                self.piano_roll_controller_stroke = None;
+                if self.piano_roll_controller_stroke.take().is_some() {
+                    self.status = "Drew raw Pattern controller points".to_owned();
+                }
             }
         } else {
             self.piano_roll_controller_stroke = None;
