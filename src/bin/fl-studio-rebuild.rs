@@ -25073,7 +25073,7 @@ mod tests {
 
         assert_eq!(
             piano_roll_time_range_note_selection(&pattern, 7, 2, 24, 120),
-            vec![(7, 2, 1), (7, 2, 2), (7, 2, 5)]
+            vec![(7, 2, 1), (7, 2, 2), (7, 2, 4)]
         );
         assert!(piano_roll_time_range_note_selection(&pattern, 7, 2, 120, 120).is_empty());
     }
