@@ -64,6 +64,7 @@ flp-rebuild set-global-swing <input.flp> <output.flp> <percent-0..100>
 flp-rebuild rename-channel <input.flp> <output.flp> <channel-id> <name>
 flp-rebuild set-channel-color <input.flp> <output.flp> <channel-id> <RRGGBB>
 flp-rebuild set-channel-levels <input.flp> <output.flp> <channel-id> <volume-0..12800> <pan-0..12800>
+flp-rebuild edit-channel-level-adjustments <input.flp> <output.flp> <channel-id> <event-index> <pan-raw|-> <volume-raw|-> <mod-x-raw|-> <mod-y-raw|->
 flp-rebuild set-channel-swing <input.flp> <output.flp> <channel-id> <percent-0..100>
 flp-rebuild set-layer-children <input.flp> <output.flp> <layer-channel-id> <child-ids-comma-separated|->
 flp-rebuild set-layer-flags <input.flp> <output.flp> <layer-channel-id> <random:0|1|-> <crossfade:0|1|->

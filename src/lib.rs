@@ -436,6 +436,17 @@ pub struct ChannelLevelAdjustments {
     mod_y: i32,
 }
 
+/// Raw fields that can be changed on one existing channel `0xD5` Level Adjusts event.
+/// Fields set to `None` remain unchanged; the unknown field and trailing payload bytes are
+/// always preserved.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ChannelLevelAdjustmentsEdit {
+    pub pan_raw: Option<i32>,
+    pub volume_raw: Option<u32>,
+    pub mod_x_raw: Option<i32>,
+    pub mod_y_raw: Option<i32>,
+}
+
 impl ChannelLevelAdjustments {
     fn decode(payload: &[u8]) -> Option<Self> {
         (payload.len() >= 20).then(|| Self {
@@ -9652,6 +9663,86 @@ impl FlpDocument {
         Ok(())
     }
 
+    /// Edits established raw fields in one channel's existing `0xD5` Level Adjusts event.
+    ///
+    /// `event_index` is the global FLP event index, available from `channel-events` and
+    /// `events`. The channel ID must be unique and the selected event must belong to that
+    /// channel. The unknown dword and any bytes after the 20-byte recognized core are retained.
+    pub fn edit_channel_level_adjustments(
+        &mut self,
+        channel_id: u16,
+        event_index: usize,
+        edit: ChannelLevelAdjustmentsEdit,
+    ) -> Result<(), FlpError> {
+        self.require_unique_channel(channel_id)?;
+        let channel = self
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id() == channel_id)
+            .expect("the unique channel was checked above");
+        if !channel.event_range().contains(&event_index) {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested Level Adjusts event does not belong to the selected channel",
+            ));
+        }
+        if edit.pan_raw.is_none()
+            && edit.volume_raw.is_none()
+            && edit.mod_x_raw.is_none()
+            && edit.mod_y_raw.is_none()
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "at least one raw channel Level Adjusts field must be provided",
+            ));
+        }
+
+        let event = self
+            .events
+            .get(event_index)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested Level Adjusts event does not exist",
+            ))?;
+        if event.opcode != 0xD5 {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested event is not a channel Level Adjusts event",
+            ));
+        }
+        if !matches!(event.encoding, PayloadEncoding::Data { .. }) || event.payload.len() < 20 {
+            return Err(FlpError::UnsupportedEdit(
+                "the channel Level Adjusts event is not a length-prefixed event with a complete 20-byte core",
+            ));
+        }
+        if channel.plugin_identifier().is_some()
+            || channel
+                .event_range()
+                .any(|index| self.events[index].opcode == 0xD4)
+            || parse_vst_plugin_state_metadata(&event.payload).is_some()
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel contains plug-in data that cannot be distinguished safely from Level Adjusts fields",
+            ));
+        }
+
+        let mut payload = event.payload.clone();
+        if let Some(pan) = edit.pan_raw {
+            payload[..4].copy_from_slice(&pan.to_le_bytes());
+        }
+        if let Some(volume) = edit.volume_raw {
+            payload[4..8].copy_from_slice(&volume.to_le_bytes());
+        }
+        if let Some(mod_x) = edit.mod_x_raw {
+            payload[12..16].copy_from_slice(&mod_x.to_le_bytes());
+        }
+        if let Some(mod_y) = edit.mod_y_raw {
+            payload[16..20].copy_from_slice(&mod_y.to_le_bytes());
+        }
+
+        let mut candidate = self.clone();
+        candidate.events[event_index].replace_data_payload(payload)?;
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
     /// Replaces the referenced channel IDs for an existing Layer channel.
     ///
     /// The IDs are stored as repeated two-byte `0x5E` word events. All other
@@ -14535,6 +14626,188 @@ mod tests {
         assert_eq!(adjustment.mod_x_raw(), -17);
         assert_eq!(adjustment.mod_y_raw(), 255);
         assert_eq!(document.encode_lossless().unwrap(), input);
+    }
+
+    #[test]
+    fn edits_one_channel_level_adjustment_event_and_preserves_unknown_bytes() {
+        let make_payload =
+            |pan: i32, volume: u32, unknown: u32, mod_x: i32, mod_y: i32, tail: &[u8]| {
+                let mut payload = pan.to_le_bytes().to_vec();
+                payload.extend_from_slice(&volume.to_le_bytes());
+                payload.extend_from_slice(&unknown.to_le_bytes());
+                payload.extend_from_slice(&mod_x.to_le_bytes());
+                payload.extend_from_slice(&mod_y.to_le_bytes());
+                payload.extend_from_slice(tail);
+                payload
+            };
+        let first_payload = make_payload(-10, 20, 0xA1B2_C3D4, 30, 40, &[0xA5; 110]);
+        let second_payload = make_payload(100, 200, 0x1020_3040, 300, 400, &[0x5A; 110]);
+        let mut event_stream = vec![0x40, 9, 0, 0x15, 3];
+        append_data_event(&mut event_stream, 0xD5, &first_payload);
+        append_data_event(&mut event_stream, 0xD5, &second_payload);
+        append_data_event(&mut event_stream, 0xE8, &[0x11, 0x22, 0x33]);
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+
+        let input = flp_fixture(&event_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+        let channel = &document.channels()[0];
+        let adjustment_events = channel
+            .event_range()
+            .filter(|index| document.events()[*index].opcode() == 0xD5)
+            .collect::<Vec<_>>();
+        assert_eq!(adjustment_events.len(), 2);
+        let first_event_index = adjustment_events[0];
+        let second_event_index = adjustment_events[1];
+        let first_wire = document.events()[first_event_index].wire_bytes().to_vec();
+        let unrelated_event_index = channel
+            .event_range()
+            .find(|index| document.events()[*index].opcode() == 0xE8)
+            .expect("fixture should contain another channel event");
+        let unrelated_wire = document.events()[unrelated_event_index]
+            .wire_bytes()
+            .to_vec();
+        let mut expected_second_wire = document.events()[second_event_index].wire_bytes().to_vec();
+        expected_second_wire[3..7].copy_from_slice(&(-1_234_i32).to_le_bytes());
+        expected_second_wire[7..11].copy_from_slice(&98_765_u32.to_le_bytes());
+        expected_second_wire[15..19].copy_from_slice(&(-321_i32).to_le_bytes());
+
+        document
+            .edit_channel_level_adjustments(
+                9,
+                second_event_index,
+                ChannelLevelAdjustmentsEdit {
+                    pan_raw: Some(-1_234),
+                    volume_raw: Some(98_765),
+                    mod_x_raw: Some(-321),
+                    mod_y_raw: None,
+                },
+            )
+            .expect("the selected event fields should be editable");
+
+        assert_eq!(
+            document.events()[first_event_index].wire_bytes(),
+            first_wire
+        );
+        assert_eq!(
+            document.events()[second_event_index].wire_bytes(),
+            expected_second_wire
+        );
+        assert_eq!(
+            &document.events()[second_event_index].wire_bytes()[1..3],
+            &[0x82, 0x01],
+            "the original two-byte data length prefix should remain intact"
+        );
+        assert_eq!(
+            document.events()[unrelated_event_index].wire_bytes(),
+            unrelated_wire
+        );
+
+        expected_second_wire[19..23].copy_from_slice(&(-777_i32).to_le_bytes());
+        document
+            .edit_channel_level_adjustments(
+                9,
+                second_event_index,
+                ChannelLevelAdjustmentsEdit {
+                    mod_y_raw: Some(-777),
+                    ..ChannelLevelAdjustmentsEdit::default()
+                },
+            )
+            .expect("Mod Y should be editable independently");
+        assert_eq!(
+            document.events()[second_event_index].wire_bytes(),
+            expected_second_wire
+        );
+
+        let adjustments = document.channels()[0].level_adjustments().to_vec();
+        assert_eq!(adjustments.len(), 2);
+        assert_eq!(adjustments[0].pan_raw(), -10);
+        assert_eq!(adjustments[1].pan_raw(), -1_234);
+        assert_eq!(adjustments[1].volume_raw(), 98_765);
+        assert_eq!(adjustments[1].unknown_raw(), 0x1020_3040);
+        assert_eq!(adjustments[1].mod_x_raw(), -321);
+        assert_eq!(adjustments[1].mod_y_raw(), -777);
+
+        let encoded = document
+            .encode_lossless()
+            .expect("the edited project should encode");
+        let reparsed = FlpDocument::parse(&encoded).expect("the edited project should parse");
+        assert_eq!(
+            reparsed.channels()[0].level_adjustments().to_vec(),
+            adjustments
+        );
+    }
+
+    #[test]
+    fn channel_level_adjustment_edit_rejects_invalid_targets_without_mutation() {
+        let mut event_stream = vec![0x40, 9, 0, 0x15, 3];
+        let mut complete_payload = vec![0x11; 20];
+        complete_payload.extend_from_slice(&[0xA5, 0x5A]);
+        append_data_event(&mut event_stream, 0xD5, &complete_payload);
+        append_data_event(&mut event_stream, 0xE8, &[0x33]);
+        event_stream.extend_from_slice(&[0x40, 10, 0, 0x15, 3]);
+        append_data_event(&mut event_stream, 0xD5, &[0x22; 19]);
+        event_stream.extend_from_slice(&[0x40, 11, 0, 0x15, 3]);
+        append_data_event(&mut event_stream, 0xD4, &[0xD4]);
+        append_data_event(&mut event_stream, 0xD5, &complete_payload);
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        let mut document = FlpDocument::parse(&flp_fixture(&event_stream, &[], &[]))
+            .expect("fixture should parse");
+        let channels = document.channels();
+        let first_event_index = channels[0]
+            .event_range()
+            .find(|index| document.events()[*index].opcode() == 0xD5)
+            .expect("first channel should have a Level Adjusts event");
+        let other_event_index = channels[0]
+            .event_range()
+            .find(|index| document.events()[*index].opcode() == 0xE8)
+            .expect("first channel should have another event");
+        let truncated_event_index = channels[1]
+            .event_range()
+            .find(|index| document.events()[*index].opcode() == 0xD5)
+            .expect("second channel should have a truncated Level Adjusts event");
+        let plugin_event_index = channels[2]
+            .event_range()
+            .find(|index| document.events()[*index].opcode() == 0xD5)
+            .expect("third channel should have plug-in data");
+        let before = document.encode_lossless().expect("document should encode");
+        let edit = ChannelLevelAdjustmentsEdit {
+            volume_raw: Some(123),
+            ..ChannelLevelAdjustmentsEdit::default()
+        };
+
+        assert!(matches!(
+            document.edit_channel_level_adjustments(
+                9,
+                first_event_index,
+                ChannelLevelAdjustmentsEdit::default()
+            ),
+            Err(FlpError::UnsupportedEdit(_))
+        ));
+        assert!(matches!(
+            document.edit_channel_level_adjustments(9, other_event_index, edit),
+            Err(FlpError::UnsupportedEdit(_))
+        ));
+        assert!(matches!(
+            document.edit_channel_level_adjustments(9, truncated_event_index, edit),
+            Err(FlpError::UnsupportedEdit(_))
+        ));
+        assert!(matches!(
+            document.edit_channel_level_adjustments(10, truncated_event_index, edit),
+            Err(FlpError::UnsupportedEdit(_))
+        ));
+        assert!(matches!(
+            document.edit_channel_level_adjustments(11, plugin_event_index, edit),
+            Err(FlpError::UnsupportedEdit(_))
+        ));
+        assert!(matches!(
+            document.edit_channel_level_adjustments(999, first_event_index, edit),
+            Err(FlpError::ChannelNotFound(999))
+        ));
+        assert_eq!(
+            document.encode_lossless().expect("document should encode"),
+            before,
+            "failed edits must leave the project unchanged"
+        );
     }
 
     #[test]

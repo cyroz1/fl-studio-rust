@@ -13,9 +13,9 @@ use flp_rebuild::sample_render::{
 };
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions};
 use flp_rebuild::{
-    ArpeggioDirection, ArpeggioOptions, AutomationPointEdit, FlpDocument, FstPreset,
-    PatternControllerEdit, PatternNote, PatternNoteEdit, PlaylistClipEdit, PlaylistTrackEdit,
-    ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions, TimeMarkerEdit,
+    ArpeggioDirection, ArpeggioOptions, AutomationPointEdit, ChannelLevelAdjustmentsEdit,
+    FlpDocument, FstPreset, PatternControllerEdit, PatternNote, PatternNoteEdit, PlaylistClipEdit,
+    PlaylistTrackEdit, ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions, TimeMarkerEdit,
 };
 
 fn main() -> ExitCode {
@@ -394,6 +394,22 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u32(volume, "channel volume")?,
                 i32::try_from(parse_u32(pan, "channel pan")?)
                     .map_err(|_| "channel pan must be between 0 and 12800".to_owned())?,
+            )
+        }
+        [command, input, output, channel_id, event_index, pan, volume, mod_x, mod_y]
+            if command == "edit-channel-level-adjustments" =>
+        {
+            edit_channel_level_adjustments(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(channel_id, "channel id")?,
+                parse_usize(event_index, "event index")?,
+                ChannelLevelAdjustmentsEdit {
+                    pan_raw: parse_optional_i32(pan, "raw channel pan")?,
+                    volume_raw: parse_optional_u32(volume, "raw channel volume")?,
+                    mod_x_raw: parse_optional_i32(mod_x, "raw channel Mod X")?,
+                    mod_y_raw: parse_optional_i32(mod_y, "raw channel Mod Y")?,
+                },
             )
         }
         [command, input, output, channel_id, percent] if command == "set-channel-swing" => {
@@ -899,6 +915,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild rename-channel <input.flp> <output.flp> <channel-id> <name>\n",
             "  flp-rebuild set-channel-color <input.flp> <output.flp> <channel-id> <RRGGBB>\n",
             "  flp-rebuild set-channel-levels <input.flp> <output.flp> <channel-id> <volume-0..12800> <pan-0..12800>\n",
+            "  flp-rebuild edit-channel-level-adjustments <input.flp> <output.flp> <channel-id> <event-index> <pan-raw|-> <volume-raw|-> <mod-x-raw|-> <mod-y-raw|->\n",
             "  flp-rebuild set-channel-swing <input.flp> <output.flp> <channel-id> <percent-0..100>\n",
             "  flp-rebuild set-layer-children <input.flp> <output.flp> <layer-channel-id> <child-ids-comma-separated|->\n",
             "  flp-rebuild set-layer-flags <input.flp> <output.flp> <layer-channel-id> <random:0|1|-> <crossfade:0|1|->\n",
@@ -1058,6 +1075,17 @@ fn parse_optional_u32(value: &str, description: &str) -> Result<Option<u32>, Str
         Ok(None)
     } else {
         parse_u32(value, description).map(Some)
+    }
+}
+
+fn parse_optional_i32(value: &str, description: &str) -> Result<Option<i32>, String> {
+    if value == "-" {
+        Ok(None)
+    } else {
+        value
+            .parse::<i32>()
+            .map(Some)
+            .map_err(|_| format!("{description} must be a signed 32-bit integer or -"))
     }
 }
 
@@ -2406,6 +2434,29 @@ fn set_channel_levels(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "set channel {channel_id} volume to {volume} and pan to {pan} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn edit_channel_level_adjustments(
+    input: &Path,
+    output: &Path,
+    channel_id: u16,
+    event_index: usize,
+    edit: ChannelLevelAdjustmentsEdit,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .edit_channel_level_adjustments(channel_id, event_index, edit)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "edited channel {channel_id} Level Adjusts event {event_index} in {}",
         output.display()
     );
     Ok(())
