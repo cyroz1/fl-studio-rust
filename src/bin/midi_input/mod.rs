@@ -415,6 +415,14 @@ impl MidiPatternRecorder {
     }
 
     pub fn record(&mut self, message: ReceivedMidiMessage) {
+        self.record_with_velocity_override(message, None);
+    }
+
+    pub fn record_with_velocity_override(
+        &mut self,
+        message: ReceivedMidiMessage,
+        fixed_velocity: Option<u8>,
+    ) {
         if message.received_at < self.started_at {
             return;
         }
@@ -437,7 +445,7 @@ impl MidiPatternRecorder {
                 self.active_notes
                     .entry((channel, key))
                     .or_default()
-                    .push_back((tick, velocity));
+                    .push_back((tick, fixed_velocity.unwrap_or(velocity).min(127)));
             }
             MidiInputEvent::NoteOff { channel, key, .. } => {
                 let event_key = (channel, key);
@@ -686,6 +694,51 @@ mod tests {
         assert_eq!(result.notes[0].key, 60);
         assert_eq!(result.notes[0].midi_channel, 9);
         assert_eq!(result.notes[0].velocity, 101);
+    }
+
+    #[test]
+    fn fixed_velocity_override_replaces_incoming_note_on_velocity() {
+        let started_at = Instant::now();
+        let mut recorder = MidiPatternRecorder::new(
+            MidiPatternRecorderSettings {
+                pattern_id: 1,
+                channel_id: 2,
+                project_path: None,
+                ppq: 96,
+                tempo_bpm: 120.0,
+                start_tick: 0,
+                snap_ticks: None,
+                timing_offset_ms: 0,
+                song_timeline_start: None,
+            },
+            started_at,
+        )
+        .expect("valid project timing should create a recorder");
+        recorder.record_with_velocity_override(
+            ReceivedMidiMessage {
+                timestamp_micros: 1_000_000,
+                received_at: started_at + Duration::from_millis(200),
+                event: MidiInputEvent::NoteOn {
+                    channel: 0,
+                    key: 60,
+                    velocity: 17,
+                },
+            },
+            Some(100),
+        );
+        recorder.record(ReceivedMidiMessage {
+            timestamp_micros: 1_300_000,
+            received_at: started_at + Duration::from_millis(500),
+            event: MidiInputEvent::NoteOff {
+                channel: 0,
+                key: 60,
+                velocity: 0,
+            },
+        });
+
+        let result = recorder.finish(Some(1_300_000), started_at + Duration::from_millis(500));
+        assert_eq!(result.notes.len(), 1);
+        assert_eq!(result.notes[0].velocity, 100);
     }
 
     #[test]

@@ -94,6 +94,7 @@ const UI_SCALE_STEPS: [f32; 7] = [0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4];
 const BROWSER_SEARCH_ROOT_LIMIT: usize = 30;
 const MIDI_RECORDING_OFFSET_MIN_MS: i16 = -200;
 const MIDI_RECORDING_OFFSET_MAX_MS: i16 = 200;
+const MIDI_FIXED_RECORDING_VELOCITY: u8 = 100;
 const MAX_BROWSER_RECURSIVE_SCAN_ENTRIES: usize = 20_000;
 const AUTOSAVE_INTERVALS_MINUTES: [u8; 5] = [0, 1, 5, 10, 15];
 const BACKUP_RETENTION_OPTIONS: [usize; 4] = [5, 10, 20, 50];
@@ -1831,6 +1832,7 @@ struct DawUi {
     midi_recording: Option<ActiveMidiRecording>,
     midi_record_snap: PianoRollSnap,
     midi_recording_offset_ms: i16,
+    midi_record_fixed_velocity: bool,
     midi_record_toggle_requested: bool,
     midi_input_refresh_requested: bool,
     midi_input_toggle_requested: bool,
@@ -1983,6 +1985,7 @@ struct AudioRecordingSession {
 
 struct ActiveMidiRecording {
     recorder: MidiPatternRecorder,
+    fixed_velocity: Option<u8>,
     playlist_clip_placement: Option<MidiPlaylistClipPlacement>,
 }
 
@@ -2091,8 +2094,12 @@ impl DawUi {
             Ok(devices) => (devices, None),
             Err(error) => (Vec::new(), Some(error)),
         };
-        let (midi_selected_input_id, midi_selected_output_id, midi_output_send_clock) =
-            load_midi_device_selections();
+        let (
+            midi_selected_input_id,
+            midi_selected_output_id,
+            midi_output_send_clock,
+            midi_record_fixed_velocity,
+        ) = load_midi_device_selections();
         let mut audio_settings = AudioSettings::default();
         if let Some(rate) = audio_catalog.default_sample_rate {
             audio_settings.sample_rate = rate;
@@ -2305,6 +2312,7 @@ impl DawUi {
             midi_recording: None,
             midi_record_snap: PianoRollSnap::None,
             midi_recording_offset_ms,
+            midi_record_fixed_velocity,
             midi_record_toggle_requested: false,
             midi_input_refresh_requested: false,
             midi_input_toggle_requested: false,
@@ -20231,6 +20239,7 @@ impl DawUi {
             self.midi_selected_input_id.as_deref(),
             self.midi_selected_output_id.as_deref(),
             self.midi_output_send_clock,
+            self.midi_record_fixed_velocity,
         ) {
             self.status = format!("Could not save MIDI device selections: {error}");
         }
@@ -20820,6 +20829,9 @@ impl DawUi {
             Ok(recorder) => {
                 self.midi_recording = Some(ActiveMidiRecording {
                     recorder,
+                    fixed_velocity: self
+                        .midi_record_fixed_velocity
+                        .then_some(MIDI_FIXED_RECORDING_VELOCITY),
                     playlist_clip_placement,
                 });
                 let channel_name = channels
@@ -20967,7 +20979,9 @@ impl DawUi {
             if !matches!(message.event, MidiInputEvent::Transport(_))
                 && let Some(recording) = self.midi_recording.as_mut()
             {
-                recording.recorder.record(message);
+                recording
+                    .recorder
+                    .record_with_velocity_override(message, recording.fixed_velocity);
             }
         }
         self.stop_midi_recording(
@@ -21039,7 +21053,9 @@ impl DawUi {
             if let MidiInputEvent::Transport(command) = message.event {
                 self.handle_midi_transport(command, message, history_snapshot_available);
             } else if let Some(recording) = self.midi_recording.as_mut() {
-                recording.recorder.record(message);
+                recording
+                    .recorder
+                    .record_with_velocity_override(message, recording.fixed_velocity);
             }
         }
         let dropped = self.midi_dropped_messages.load(Ordering::Relaxed);
@@ -21517,6 +21533,21 @@ impl DawUi {
             && let Err(error) = save_midi_recording_offset_ms(self.midi_recording_offset_ms)
         {
             self.status = format!("Could not save MIDI input timing offset: {error}");
+        }
+        let fixed_velocity_changed = ui
+            .add_enabled_ui(self.midi_recording.is_none(), |ui| {
+                ui.checkbox(
+                    &mut self.midi_record_fixed_velocity,
+                    format!("Use fixed note velocity {MIDI_FIXED_RECORDING_VELOCITY}"),
+                )
+                .on_hover_text(
+                    "Ignore incoming note-on velocities and record every MIDI note at velocity 100.",
+                )
+            })
+            .inner
+            .changed();
+        if fixed_velocity_changed {
+            self.persist_midi_device_selections();
         }
         ui.label(
             egui::RichText::new(
@@ -23812,12 +23843,12 @@ fn midi_device_selections_file() -> Option<PathBuf> {
         .map(|directory| directory.join("midi-device-selections.txt"))
 }
 
-fn load_midi_device_selections() -> (Option<String>, Option<String>, bool) {
+fn load_midi_device_selections() -> (Option<String>, Option<String>, bool, bool) {
     let Some(path) = midi_device_selections_file() else {
-        return (None, None, false);
+        return (None, None, false, false);
     };
     let Ok(contents) = fs::read_to_string(path) else {
-        return (None, None, false);
+        return (None, None, false, false);
     };
     parse_midi_device_selections(&contents)
 }
@@ -23826,6 +23857,7 @@ fn save_midi_device_selections(
     input_id: Option<&str>,
     output_id: Option<&str>,
     send_clock: bool,
+    fixed_velocity: bool,
 ) -> Result<(), String> {
     let path = midi_device_selections_file()
         .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
@@ -23836,7 +23868,7 @@ fn save_midi_device_selections(
         .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
     fs::write(
         &path,
-        encode_midi_device_selections(input_id, output_id, send_clock),
+        encode_midi_device_selections(input_id, output_id, send_clock, fixed_velocity),
     )
     .map_err(|error| format!("could not write {}: {error}", path.display()))
 }
@@ -23845,19 +23877,22 @@ fn encode_midi_device_selections(
     input_id: Option<&str>,
     output_id: Option<&str>,
     send_clock: bool,
+    fixed_velocity: bool,
 ) -> String {
     format!(
-        "input={}\noutput={}\nclock={}\n",
+        "input={}\noutput={}\nclock={}\nfixed_velocity={}\n",
         encode_midi_device_id(input_id.unwrap_or_default()),
         encode_midi_device_id(output_id.unwrap_or_default()),
-        u8::from(send_clock)
+        u8::from(send_clock),
+        u8::from(fixed_velocity)
     )
 }
 
-fn parse_midi_device_selections(contents: &str) -> (Option<String>, Option<String>, bool) {
+fn parse_midi_device_selections(contents: &str) -> (Option<String>, Option<String>, bool, bool) {
     let mut input_id = None;
     let mut output_id = None;
     let mut send_clock = false;
+    let mut fixed_velocity = false;
     for line in contents.lines() {
         if let Some(encoded_id) = line.strip_prefix("input=") {
             input_id = decode_midi_device_id(encoded_id);
@@ -23865,9 +23900,11 @@ fn parse_midi_device_selections(contents: &str) -> (Option<String>, Option<Strin
             output_id = decode_midi_device_id(encoded_id);
         } else if let Some(enabled) = line.strip_prefix("clock=") {
             send_clock = enabled == "1";
+        } else if let Some(enabled) = line.strip_prefix("fixed_velocity=") {
+            fixed_velocity = enabled == "1";
         }
     }
-    (input_id, output_id, send_clock)
+    (input_id, output_id, send_clock, fixed_velocity)
 }
 
 fn encode_midi_device_id(id: &str) -> String {
@@ -26429,11 +26466,16 @@ mod tests {
     fn midi_device_selections_round_trip_opaque_port_ids() {
         let input_id = "alsa:card=Keyboard\tport\n雪";
         let output_id = "CoreMIDI:0123456789ABCDEF";
-        let encoded = encode_midi_device_selections(Some(input_id), Some(output_id), true);
+        let encoded = encode_midi_device_selections(Some(input_id), Some(output_id), true, true);
 
         assert_eq!(
             parse_midi_device_selections(&encoded),
-            (Some(input_id.to_owned()), Some(output_id.to_owned()), true)
+            (
+                Some(input_id.to_owned()),
+                Some(output_id.to_owned()),
+                true,
+                true
+            )
         );
     }
 
@@ -26441,7 +26483,7 @@ mod tests {
     fn midi_device_selections_skip_malformed_or_unknown_entries() {
         assert_eq!(
             parse_midi_device_selections("input=0\noutput=xyz\nclock=invalid\nother=01\n"),
-            (None, None, false)
+            (None, None, false, false)
         );
     }
 
