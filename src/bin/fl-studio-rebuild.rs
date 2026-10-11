@@ -20486,6 +20486,7 @@ impl DawUi {
         let mut rename_edits = Vec::new();
         let mut flag_edits = Vec::new();
         let mut parameter_edits = Vec::new();
+        let mut send_flag_edits = Vec::new();
         let mut load_insert_state = None;
         let mut save_insert_state = None;
         let available_height = ui.available_height();
@@ -21061,18 +21062,46 @@ impl DawUi {
                                     .max_height(150.0)
                                     .show(ui, |ui| {
                                         for send in insert_sends {
-                                            let route_state = match send.enabled() {
-                                                Some(true) => "On",
-                                                Some(false) => "Off",
-                                                None => "Unpaired",
-                                            };
                                             ui.horizontal(|ui| {
                                                 ui.small(format!(
-                                                    "Parameter {} · {route_state}",
+                                                    "Parameter {}",
                                                     send.route_parameter_id()
                                                 ));
-                                                ui.small(format!("Raw {}", send.value()));
+                                                if let Some(mut enabled) = send.enabled() {
+                                                    if ui.checkbox(&mut enabled, "On").changed()
+                                                        && let Some((event_index, flag_index)) =
+                                                            send.routing_flag_location()
+                                                    {
+                                                        send_flag_edits.push((
+                                                            event_index,
+                                                            flag_index,
+                                                            enabled,
+                                                        ));
+                                                    }
+                                                } else {
+                                                    ui.small(
+                                                        egui::RichText::new("Unpaired")
+                                                            .color(MUTED),
+                                                    );
+                                                }
                                             });
+                                            let (event_index, record_index) =
+                                                send.parameter_location();
+                                            let mut value = send.value();
+                                            if ui
+                                                .add(
+                                                    egui::DragValue::new(&mut value)
+                                                        .prefix("Raw level ")
+                                                        .speed(1.0),
+                                                )
+                                                .changed()
+                                            {
+                                                parameter_edits.push((
+                                                    event_index,
+                                                    record_index,
+                                                    value,
+                                                ));
+                                            }
                                         }
                                     });
                             }
@@ -21260,6 +21289,22 @@ impl DawUi {
                     }
                     Err(error) => {
                         self.status = format!("Could not edit Mixer parameter: {error}");
+                    }
+                }
+            }
+        }
+        if !send_flag_edits.is_empty()
+            && let Some(document) = self.document.as_mut()
+        {
+            for (event_index, flag_index, enabled) in send_flag_edits {
+                match document.set_mixer_routing_flag(event_index, flag_index, enabled) {
+                    Ok(()) => {
+                        self.dirty = true;
+                        self.status =
+                            format!("Updated Mixer routing event {event_index}, flag {flag_index}");
+                    }
+                    Err(error) => {
+                        self.status = format!("Could not edit Mixer routing flag: {error}");
                     }
                 }
             }

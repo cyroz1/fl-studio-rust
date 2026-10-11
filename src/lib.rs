@@ -1718,6 +1718,7 @@ pub struct MixerSendSummary {
     route_parameter_id: u8,
     value: i32,
     enabled: Option<bool>,
+    routing_flag_location: Option<(usize, usize)>,
     event_index: usize,
     record_index: usize,
 }
@@ -1773,6 +1774,11 @@ impl MixerSendSummary {
     /// Saved on/off state from the corresponding per-insert routing byte, when present.
     pub fn enabled(&self) -> Option<bool> {
         self.enabled
+    }
+
+    /// Event and payload-byte location for an unambiguous saved routing flag.
+    pub fn routing_flag_location(&self) -> Option<(usize, usize)> {
+        self.routing_flag_location
     }
 
     /// Event and record location of the source route-volume parameter.
@@ -5284,13 +5290,15 @@ impl FlpDocument {
         let routing_flags_by_insert = inserts
             .iter()
             .map(|insert| {
-                let routing_flags = self.events[insert.event_range()]
+                let insert_range = insert.event_range();
+                let routing_flags = self.events[insert_range.clone()]
                     .iter()
-                    .find(|event| {
+                    .enumerate()
+                    .find(|(_, event)| {
                         event.opcode == 0xEB
                             && matches!(event.encoding, PayloadEncoding::Data { .. })
                     })
-                    .map(|event| event.payload.clone());
+                    .map(|(offset, event)| (insert_range.start + offset, event.payload.clone()));
                 (insert.ordinal(), routing_flags)
             })
             .collect::<HashMap<_, _>>();
@@ -5305,14 +5313,20 @@ impl FlpDocument {
                 continue;
             };
             let route_index = route_indices_by_insert.entry(insert_ordinal).or_default();
-            let enabled = if ambiguous_inserts.contains(&insert_ordinal) {
-                None
+            let (enabled, routing_flag_location) = if ambiguous_inserts.contains(&insert_ordinal) {
+                (None, None)
             } else {
                 routing_flags_by_insert
                     .get(&insert_ordinal)
-                    .and_then(Option::as_deref)
-                    .and_then(|flags| flags.get(*route_index))
-                    .map(|flag| *flag != 0)
+                    .and_then(Option::as_ref)
+                    .and_then(|(event_index, flags)| {
+                        flags
+                            .get(*route_index)
+                            .map(|flag| (*event_index, *flag != 0))
+                    })
+                    .map_or((None, None), |(event_index, enabled)| {
+                        (Some(enabled), Some((event_index, *route_index)))
+                    })
             };
             *route_index += 1;
             summaries.push(MixerSendSummary {
@@ -5320,6 +5334,7 @@ impl FlpDocument {
                 route_parameter_id: record.parameter_id(),
                 value: record.value(),
                 enabled,
+                routing_flag_location,
                 event_index: record.event_index(),
                 record_index: record.record_index(),
             });
@@ -5375,6 +5390,38 @@ impl FlpDocument {
         let mut payload = event.payload.clone();
         payload[value_start..value_end].copy_from_slice(&value.to_le_bytes());
         self.events[event_index].replace_data_payload(payload)?;
+        self.refresh_event_offsets()?;
+        Ok(())
+    }
+
+    /// Toggles one existing insert-scoped Mixer routing flag without changing other bytes.
+    pub fn set_mixer_routing_flag(
+        &mut self,
+        event_index: usize,
+        routing_flag_index: usize,
+        enabled: bool,
+    ) -> Result<(), FlpError> {
+        let event = self
+            .events
+            .get(event_index)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested Mixer routing event does not exist",
+            ))?;
+        if event.opcode != 0xEB {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested event is not an insert routing event",
+            ));
+        }
+        if !matches!(event.encoding, PayloadEncoding::Data { .. }) {
+            return Err(FlpError::UnsupportedEdit(
+                "the Mixer routing event is not a length-prefixed data event",
+            ));
+        }
+        write_event_payload_bytes(
+            &mut self.events[event_index],
+            routing_flag_index,
+            &[u8::from(enabled)],
+        )?;
         self.refresh_event_offsets()?;
         Ok(())
     }
@@ -16733,7 +16780,7 @@ mod tests {
         parameter_payload.extend_from_slice(&750_i32.to_le_bytes());
         append_data_event(&mut event_stream, 0xE1, &parameter_payload);
 
-        let document = FlpDocument::parse(&flp_fixture(&event_stream, &[], &[]))
+        let mut document = FlpDocument::parse(&flp_fixture(&event_stream, &[], &[]))
             .expect("the Mixer routing fixture should parse");
         let sends = document
             .mixer_send_summaries()
@@ -16743,12 +16790,48 @@ mod tests {
         assert_eq!(sends[0].route_parameter_id(), 66);
         assert_eq!(sends[0].value(), -125);
         assert_eq!(sends[0].enabled(), Some(false));
+        assert_eq!(sends[0].routing_flag_location(), Some((4, 0)));
         assert_eq!(sends[1].route_parameter_id(), 67);
         assert_eq!(sends[1].enabled(), Some(true));
+        assert_eq!(sends[1].routing_flag_location(), Some((4, 1)));
         assert_eq!(sends[2].insert_ordinal(), 1);
         assert_eq!(sends[2].route_parameter_id(), 68);
         assert_eq!(sends[2].enabled(), Some(true));
+        assert_eq!(sends[2].routing_flag_location(), Some((9, 0)));
         assert!(sends.iter().all(|send| send.parameter_location().0 == 10));
+
+        let display_group_bytes = document.events()[3].wire_bytes().to_vec();
+        document
+            .set_mixer_routing_flag(4, 0, true)
+            .expect("a paired routing flag should be editable");
+        assert_eq!(document.events()[3].wire_bytes(), display_group_bytes);
+        assert_eq!(document.events()[4].payload(), &[1_u8, 1]);
+        assert_eq!(
+            document.mixer_send_summaries().unwrap()[0].enabled(),
+            Some(true)
+        );
+
+        let before_invalid_edit = document.events()[3].wire_bytes().to_vec();
+        let before_invalid_route = document.events()[4].wire_bytes().to_vec();
+        assert!(matches!(
+            document.set_mixer_routing_flag(3, 0, false),
+            Err(FlpError::UnsupportedEdit(_))
+        ));
+        assert!(matches!(
+            document.set_mixer_routing_flag(4, 2, false),
+            Err(FlpError::InvalidEvent { .. })
+        ));
+        assert_eq!(document.events()[3].wire_bytes(), before_invalid_edit);
+        assert_eq!(document.events()[4].wire_bytes(), before_invalid_route);
+
+        let encoded = document
+            .encode_lossless()
+            .expect("the changed Mixer route should encode losslessly");
+        let round_trip = FlpDocument::parse(&encoded).expect("the changed Mixer route parses");
+        assert_eq!(
+            round_trip.mixer_send_summaries().unwrap()[0].enabled(),
+            Some(true)
+        );
     }
 
     #[test]
