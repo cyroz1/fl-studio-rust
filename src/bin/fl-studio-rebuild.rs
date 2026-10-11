@@ -1828,7 +1828,7 @@ struct DawUi {
     midi_dropped_messages: Arc<AtomicU64>,
     midi_reported_dropped_messages: u64,
     midi_activity: Option<(String, Instant)>,
-    midi_recording: Option<MidiPatternRecorder>,
+    midi_recording: Option<ActiveMidiRecording>,
     midi_record_snap: PianoRollSnap,
     midi_recording_offset_ms: i16,
     midi_record_toggle_requested: bool,
@@ -1979,6 +1979,17 @@ struct AudioRecordingSession {
     tempo_map: PlaylistTempoMap,
     project_generation: u64,
     capture_active: bool,
+}
+
+struct ActiveMidiRecording {
+    recorder: MidiPatternRecorder,
+    playlist_clip_placement: Option<MidiPlaylistClipPlacement>,
+}
+
+#[derive(Clone, Copy)]
+struct MidiPlaylistClipPlacement {
+    arrangement_id: u16,
+    start_tick: u32,
 }
 
 fn recolor_piano_roll_notes(
@@ -20759,16 +20770,32 @@ impl DawUi {
         } else {
             None
         };
+        let arrangements = document.arrangements().unwrap_or_default();
+        let playback_arrangement = arrangements
+            .iter()
+            .find(|arrangement| arrangement.id == playback_arrangement_id)
+            .or_else(|| arrangements.first());
         let recording_start_tick = playhead_tick
             .and_then(|playhead_tick| {
-                let arrangements = document.arrangements().ok()?;
-                let arrangement = arrangements
-                    .iter()
-                    .find(|arrangement| arrangement.id == playback_arrangement_id)
-                    .or_else(|| arrangements.first())?;
+                let arrangement = playback_arrangement?;
                 playlist_pattern_recording_offset(playhead_tick, pattern_id, &arrangement.clips)
             })
             .unwrap_or(0);
+        let playlist_clip_placement = song_timeline_start
+            .as_ref()
+            .and_then(|_| playhead_tick)
+            .and_then(|playhead_tick| {
+                let arrangement = playback_arrangement?;
+                let start_tick = playlist_pattern_recording_placement_tick(
+                    playhead_tick,
+                    pattern_id,
+                    &arrangement.clips,
+                )?;
+                Some(MidiPlaylistClipPlacement {
+                    arrangement_id: arrangement.id,
+                    start_tick,
+                })
+            });
         let snap_ticks = (self.midi_record_snap != PianoRollSnap::None).then(|| {
             self.midi_record_snap.ticks(
                 document.header().ppq(),
@@ -20790,14 +20817,22 @@ impl DawUi {
             recording_started_at,
         ) {
             Ok(recorder) => {
-                self.midi_recording = Some(recorder);
+                self.midi_recording = Some(ActiveMidiRecording {
+                    recorder,
+                    playlist_clip_placement,
+                });
                 let channel_name = channels
                     .iter()
                     .find(|channel| channel.id() == channel_id)
                     .and_then(ChannelSummary::display_name)
                     .unwrap_or("Channel");
                 self.status = format!(
-                    "Recording MIDI to Pattern {pattern_id} from tick {recording_start_tick} · {channel_name}; press Record to finish"
+                    "Recording MIDI to Pattern {pattern_id} from tick {recording_start_tick} · {channel_name}{}; press Record to finish",
+                    if playlist_clip_placement.is_some() {
+                        " · Playlist clip will be added at the start position"
+                    } else {
+                        ""
+                    }
                 );
             }
             Err(error) => self.status = error.to_owned(),
@@ -20810,9 +20845,13 @@ impl DawUi {
         finished_at: Instant,
         history_snapshot_available: bool,
     ) {
-        let Some(recorder) = self.midi_recording.take() else {
+        let Some(recording) = self.midi_recording.take() else {
             return;
         };
+        let ActiveMidiRecording {
+            recorder,
+            playlist_clip_placement,
+        } = recording;
         let result = recorder.finish(stop_timestamp_micros, finished_at);
         if result.notes.is_empty() {
             self.status = if result.overflowed {
@@ -20848,6 +20887,13 @@ impl DawUi {
         let mut updated = document.clone();
         match updated.add_pattern_notes(result.pattern_id, &result.notes) {
             Ok(()) => {
+                let playlist_clip_result = playlist_clip_placement.map(|placement| {
+                    create_recorded_pattern_playlist_clip(
+                        &mut updated,
+                        result.pattern_id,
+                        placement,
+                    )
+                });
                 self.document = Some(updated);
                 if let Some(snapshot) = undo_snapshot {
                     self.remember_undo_snapshot(snapshot);
@@ -20855,7 +20901,7 @@ impl DawUi {
                 self.selected_pattern = Some(result.pattern_id);
                 self.selected_note_channel = Some(result.channel_id);
                 self.dirty = true;
-                self.status = if result.overflowed {
+                let mut status = if result.overflowed {
                     format!(
                         "Recorded {} MIDI note(s); the capture limit was reached and later notes were ignored",
                         result.notes.len()
@@ -20867,6 +20913,31 @@ impl DawUi {
                         result.pattern_id
                     )
                 };
+                if let Some(placement_result) = playlist_clip_result {
+                    match placement_result {
+                        Ok((clip_index, track_index)) => {
+                            let placement = playlist_clip_placement
+                                .expect("a placed clip has placement metadata");
+                            self.selected_arrangement = Some(placement.arrangement_id);
+                            self.selected_clip = Some(clip_index);
+                            self.selected_playlist_clips.clear();
+                            self.selected_playlist_clips.insert(clip_index);
+                            self.playlist_selection_anchor = Some(clip_index);
+                            self.view = MainView::Playlist;
+                            status.push_str(&format!(
+                                " · Playlist clip added on track {} at tick {}",
+                                track_index + 1,
+                                placement.start_tick
+                            ));
+                        }
+                        Err(error) => {
+                            status.push_str(&format!(
+                                " · notes saved; Playlist clip not added: {error}"
+                            ));
+                        }
+                    }
+                }
+                self.status = status;
             }
             Err(error) => {
                 self.status = format!("Could not add recorded MIDI notes: {error}");
@@ -20893,9 +20964,9 @@ impl DawUi {
             };
             self.midi_activity = Some((describe_event(message.event), message.received_at));
             if !matches!(message.event, MidiInputEvent::Transport(_))
-                && let Some(recorder) = self.midi_recording.as_mut()
+                && let Some(recording) = self.midi_recording.as_mut()
             {
-                recorder.record(message);
+                recording.recorder.record(message);
             }
         }
         self.stop_midi_recording(
@@ -20966,8 +21037,8 @@ impl DawUi {
             self.midi_activity = Some((describe_event(message.event), message.received_at));
             if let MidiInputEvent::Transport(command) = message.event {
                 self.handle_midi_transport(command, message, history_snapshot_available);
-            } else if let Some(recorder) = self.midi_recording.as_mut() {
-                recorder.record(message);
+            } else if let Some(recording) = self.midi_recording.as_mut() {
+                recording.recorder.record(message);
             }
         }
         let dropped = self.midi_dropped_messages.load(Ordering::Relaxed);
@@ -21484,8 +21555,8 @@ impl DawUi {
             ui.label(
                 egui::RichText::new(format!(
                     "● Recording to Pattern {} · Channel {} · press Record again to finish",
-                    recorder.pattern_id(),
-                    recorder.channel_id()
+                    recorder.recorder.pattern_id(),
+                    recorder.recorder.channel_id()
                 ))
                 .color(RED),
             );
@@ -25875,6 +25946,100 @@ fn playlist_pattern_recording_offset(
         .map(|(_, local_tick)| local_tick)
 }
 
+fn playlist_pattern_recording_placement_tick(
+    playhead_tick: f64,
+    pattern_id: u16,
+    clips: &[PlaylistClip],
+) -> Option<u32> {
+    let matching_clip_is_active = clips.iter().any(|clip| {
+        clip.track_index.is_some()
+            && clip.length_ticks > 0
+            && matches!(clip.target(), PlaylistClipTarget::Pattern { id } if id == pattern_id)
+            && playlist_clip_local_recording_offset(
+                playhead_tick,
+                clip.position_ticks,
+                clip.length_ticks,
+            )
+            .is_some()
+    });
+    if matching_clip_is_active
+        || !playhead_tick.is_finite()
+        || playhead_tick < 0.0
+        || playhead_tick > f64::from(u32::MAX)
+    {
+        return None;
+    }
+    Some(playhead_tick.round() as u32)
+}
+
+fn create_recorded_pattern_playlist_clip(
+    document: &mut FlpDocument,
+    pattern_id: u16,
+    placement: MidiPlaylistClipPlacement,
+) -> Result<(usize, u16), String> {
+    let pattern = document
+        .patterns()
+        .map_err(|error| format!("Could not inspect the recorded Pattern: {error}"))?
+        .into_iter()
+        .find(|pattern| pattern.id == pattern_id)
+        .ok_or_else(|| format!("Recorded Pattern {pattern_id} no longer exists"))?;
+    let arrangement = document
+        .arrangements()
+        .map_err(|error| format!("Could not inspect the Playlist: {error}"))?
+        .into_iter()
+        .find(|arrangement| arrangement.id == placement.arrangement_id)
+        .ok_or_else(|| "The recording arrangement no longer exists".to_owned())?;
+    let signature_changes = document
+        .time_markers()
+        .map_err(|error| format!("Could not inspect Playlist time signatures: {error}"))?
+        .into_iter()
+        .filter(|(arrangement_id, marker)| {
+            *arrangement_id == placement.arrangement_id && marker.is_signature()
+        })
+        .filter_map(|(_, marker)| {
+            Some((
+                marker.position_ticks(),
+                marker.numerator()?,
+                marker.denominator()?,
+            ))
+        })
+        .collect::<Vec<_>>();
+    let signature = playlist_signature_at_tick(
+        document.metadata().time_signature(),
+        &signature_changes,
+        placement.start_tick,
+    );
+    let bar_length = playlist_bar_ticks(document.header().ppq(), signature);
+    let pattern_length = pattern.length_ticks.unwrap_or_default().max(
+        pattern
+            .notes
+            .iter()
+            .map(|note| note.position.saturating_add(note.length))
+            .max()
+            .unwrap_or_default(),
+    );
+    let length_ticks = u32::try_from(pattern_length.max(bar_length).max(1))
+        .map_err(|_| "Recorded Pattern is too long for a Playlist clip".to_owned())?;
+    if placement.start_tick.checked_add(length_ticks).is_none() {
+        return Err("The recorded Pattern extends beyond the Playlist timeline".to_owned());
+    }
+    let track_index =
+        first_available_playlist_track(&arrangement, placement.start_tick, length_ticks)
+            .ok_or_else(|| {
+                "No free Playlist track is available at the recording position".to_owned()
+            })?;
+    let clip_index = document
+        .create_playlist_pattern_clip(
+            placement.arrangement_id,
+            pattern_id,
+            placement.start_tick,
+            length_ticks,
+            track_index,
+        )
+        .map_err(|error| format!("Could not create a Playlist Pattern Clip: {error}"))?;
+    Ok((clip_index, track_index))
+}
+
 fn playlist_clip_local_recording_offset(
     playhead_tick: f64,
     clip_position_ticks: u32,
@@ -25916,10 +26081,10 @@ mod tests {
         playlist_audio_clip_join_candidates, playlist_audio_drop_position_ticks,
         playlist_bar_ticks, playlist_clip_drag_edit, playlist_clip_local_recording_offset,
         playlist_clip_split_position, playlist_group_parent_ids, playlist_measure_boundaries,
-        playlist_pattern_clip_join_candidates, playlist_seek_tick_to_frame,
-        playlist_signature_at_tick, playlist_song_position_label, playlist_track_group_range,
-        playlist_track_is_hidden, recolor_piano_roll_notes, snap_note_tick,
-        toggle_piano_roll_note_group_selection, update_channel_rack_selection,
+        playlist_pattern_clip_join_candidates, playlist_pattern_recording_placement_tick,
+        playlist_seek_tick_to_frame, playlist_signature_at_tick, playlist_song_position_label,
+        playlist_track_group_range, playlist_track_is_hidden, recolor_piano_roll_notes,
+        snap_note_tick, toggle_piano_roll_note_group_selection, update_channel_rack_selection,
         update_layer_child_selection, update_piano_roll_box_selection,
     };
 
@@ -26347,6 +26512,33 @@ mod tests {
         assert_eq!(playlist_clip_local_recording_offset(99.0, 100, 200), None);
         assert_eq!(
             playlist_clip_local_recording_offset(f64::NAN, 100, 200),
+            None
+        );
+    }
+
+    #[test]
+    fn midi_song_recording_places_a_clip_only_when_no_matching_clip_is_active() {
+        let arrangement = playlist_track_arrangement_fixture(&[(100, 200, 499)]);
+        assert_eq!(
+            playlist_pattern_recording_placement_tick(150.0, 7, &arrangement.clips),
+            None
+        );
+        let mut scaled_clips = arrangement.clips.clone();
+        scaled_clips[0].scale = Some(0.5);
+        assert_eq!(
+            playlist_pattern_recording_placement_tick(150.0, 7, &scaled_clips),
+            None
+        );
+        assert_eq!(
+            playlist_pattern_recording_placement_tick(150.0, 8, &arrangement.clips),
+            Some(150)
+        );
+        assert_eq!(
+            playlist_pattern_recording_placement_tick(150.4, 7, &[]),
+            Some(150)
+        );
+        assert_eq!(
+            playlist_pattern_recording_placement_tick(f64::NAN, 7, &[]),
             None
         );
     }
