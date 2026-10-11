@@ -19575,6 +19575,7 @@ impl DawUi {
             return;
         };
         let inserts = document.mixer_inserts();
+        let effect_slots = document.mixer_effect_slots();
         let parameters = document.mixer_parameter_records().unwrap_or_default();
         let parameter_count = parameters.len();
         ui.horizontal(|ui| {
@@ -19934,16 +19935,66 @@ impl DawUi {
                         ui.small(format!("Events: {:?}", insert.event_range()));
                         ui.separator();
                         ui.label("Effect slots");
-                        ui.label(
-                            egui::RichText::new("Slot contents are preserved but not decoded yet.")
+                        let insert_slots = effect_slots
+                            .iter()
+                            .filter(|slot| slot.insert_ordinal() == insert.ordinal())
+                            .collect::<Vec<_>>();
+                        if insert_slots.len() == 10 {
+                            for slot_index in 0..10 {
+                                let slot = insert_slots
+                                    .iter()
+                                    .find(|slot| usize::from(slot.slot_index()) == slot_index)
+                                    .expect("a complete Mixer slot layout has all ten slots");
+                                let plugin_name = slot
+                                    .display_name()
+                                    .or_else(|| slot.plugin_identifier())
+                                    .unwrap_or(if slot.state_event_count() == 0 {
+                                        "Empty"
+                                    } else {
+                                        "Unknown effect"
+                                    });
+                                let saved_state = match slot.state_event_count() {
+                                    0 => "No saved state".to_owned(),
+                                    1 => "1 saved state record".to_owned(),
+                                    count => format!("{count} saved state records"),
+                                };
+                                let width = ui.available_width();
+                                let response = egui::Frame::new()
+                                    .fill(PANEL_DARK)
+                                    .stroke(Stroke::new(1.0, GRID))
+                                    .inner_margin(6.0)
+                                    .show(ui, |ui| {
+                                        ui.set_min_width(width - 14.0);
+                                        ui.horizontal(|ui| {
+                                            ui.monospace(format!("{:02}", slot_index + 1));
+                                            ui.vertical(|ui| {
+                                                ui.label(plugin_name);
+                                                ui.small(
+                                                    egui::RichText::new(&saved_state)
+                                                        .color(MUTED),
+                                                );
+                                            });
+                                        });
+                                    });
+                                response.response.on_hover_text(format!(
+                                    "{} · {} · {} preserved slot events",
+                                    slot.display_name().unwrap_or("No display name"),
+                                    slot.plugin_identifier().unwrap_or("No plug-in identifier"),
+                                    slot.event_range().len()
+                                ));
+                            }
+                            ui.small(
+                                egui::RichText::new(
+                                    "Saved plug-in state is shown as metadata; loading and processing are not available yet.",
+                                )
                                 .color(MUTED),
-                        );
-                        for slot in 1..=10 {
-                            let width = ui.available_width();
-                            ui.add_enabled(
-                                false,
-                                egui::Button::new(format!("{slot:02}   State opaque"))
-                                    .min_size(Vec2::new(width, 22.0)),
+                            );
+                        } else {
+                            ui.label(
+                                egui::RichText::new(
+                                    "The effect-slot layout is not recognized for this project version. Saved data remains preserved.",
+                                )
+                                .color(MUTED),
                             );
                         }
                         ui.collapsing(
