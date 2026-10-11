@@ -2065,6 +2065,7 @@ struct DawUi {
     piano_roll_chord_stamp: PianoRollChordStamp,
     last_piano_roll_audition: Option<(u16, u16, usize)>,
     piano_roll_zoom: f32,
+    piano_roll_window_detached: bool,
     piano_roll_pending_scroll_offset: Option<Vec2>,
     piano_roll_grid_viewport: Option<egui::Rect>,
     piano_roll_grid_scroll_offset: Vec2,
@@ -2587,6 +2588,7 @@ impl DawUi {
             piano_roll_chord_stamp: PianoRollChordStamp::Major,
             last_piano_roll_audition: None,
             piano_roll_zoom: 0.10,
+            piano_roll_window_detached: false,
             piano_roll_pending_scroll_offset: None,
             piano_roll_grid_viewport: None,
             piano_roll_grid_scroll_offset: Vec2::ZERO,
@@ -6369,6 +6371,25 @@ impl DawUi {
                     {
                         ui.close();
                     }
+                }
+                ui.separator();
+                if ui
+                    .button(if self.piano_roll_window_detached {
+                        "Dock Piano roll"
+                    } else {
+                        "Detach Piano roll"
+                    })
+                    .clicked()
+                {
+                    self.piano_roll_window_detached = !self.piano_roll_window_detached;
+                    if self.piano_roll_window_detached {
+                        self.view = MainView::PianoRoll;
+                        self.status = "Piano roll opened in a separate window".to_owned();
+                    } else {
+                        self.view = MainView::PianoRoll;
+                        self.status = "Piano roll returned to the main window".to_owned();
+                    }
+                    ui.close();
                 }
                 ui.separator();
                 if ui
@@ -24753,7 +24774,8 @@ impl eframe::App for DawUi {
         });
         self.history_snapshot_available_this_frame =
             !history_navigation_requested && self.pending_history_snapshot.is_some();
-        let toggle_editable_ghosts_requested = self.view == MainView::PianoRoll
+        let toggle_editable_ghosts_requested = (self.view == MainView::PianoRoll
+            || self.piano_roll_window_detached)
             && ui.input_mut(|input| {
                 input.consume_key(
                     egui::Modifiers::COMMAND | egui::Modifiers::ALT,
@@ -24881,8 +24903,8 @@ impl eframe::App for DawUi {
         } else if redo_requested {
             self.redo_document();
         }
-        let history_navigation = undo_requested || redo_requested;
-        let pointer_down = ui.input(|input| {
+        let mut history_navigation = undo_requested || redo_requested;
+        let mut pointer_down = ui.input(|input| {
             input.pointer.primary_down() || input.pointer.button_down(PointerButton::Secondary)
         });
         let edit_input_received = ui.input(|input| {
@@ -24898,6 +24920,7 @@ impl eframe::App for DawUi {
                         egui::Event::Key { pressed: true, .. }
                             | egui::Event::Text(_)
                             | egui::Event::Paste(_)
+                            | egui::Event::MouseWheel { .. }
                     )
                 })
         });
@@ -25144,6 +25167,23 @@ impl eframe::App for DawUi {
                         match self.view {
                             MainView::Playlist => self.playlist(ui),
                             MainView::ChannelRack => self.channel_rack(ui),
+                            MainView::PianoRoll if self.piano_roll_window_detached => {
+                                ui.centered_and_justified(|ui| {
+                                    ui.vertical_centered(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "Piano roll is open in a separate window",
+                                            )
+                                            .size(18.0)
+                                            .color(MUTED),
+                                        );
+                                        ui.add_space(8.0);
+                                        if ui.button("Dock Piano roll").clicked() {
+                                            self.piano_roll_window_detached = false;
+                                        }
+                                    });
+                                });
+                            }
                             MainView::PianoRoll => self.piano_roll(ui),
                             MainView::Mixer => self.mixer(ui),
                             MainView::Plugins => self.plugins(ui),
@@ -25188,6 +25228,138 @@ impl eframe::App for DawUi {
                 },
             );
         });
+        if self.piano_roll_window_detached {
+            let viewport_id = egui::ViewportId::from_hash_of("detached-piano-roll");
+            let viewport = egui::ViewportBuilder::default()
+                .with_title("Piano roll")
+                .with_inner_size(Vec2::new(1120.0, 720.0))
+                .with_min_inner_size(Vec2::new(760.0, 480.0))
+                .with_resizable(true);
+            let context = ui.ctx().clone();
+            context.show_viewport_immediate(viewport_id, viewport, |viewport_ui, _class| {
+                let viewport_context = viewport_ui.ctx().clone();
+                if viewport_context.input(|input| input.viewport().close_requested()) {
+                    self.piano_roll_window_detached = false;
+                    return;
+                }
+
+                viewport_context.set_theme(egui::Theme::Dark);
+                viewport_ui.set_style(viewport_context.global_style());
+                *viewport_ui.visuals_mut() = app_visuals();
+                viewport_ui.painter().rect_filled(
+                    viewport_ui.max_rect(),
+                    egui::CornerRadius::ZERO,
+                    APP_BACKGROUND,
+                );
+
+                let child_history_navigation = !viewport_context.egui_wants_keyboard_input()
+                    && viewport_ui.input_mut(|input| {
+                        input.consume_key(
+                            egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                            egui::Key::Z,
+                        ) || input.consume_key(egui::Modifiers::COMMAND, egui::Key::Y)
+                    });
+                let child_undo_requested = !child_history_navigation
+                    && !viewport_context.egui_wants_keyboard_input()
+                    && viewport_ui.input_mut(|input| {
+                        input.consume_key(egui::Modifiers::COMMAND, egui::Key::Z)
+                    });
+                if child_history_navigation {
+                    self.redo_document();
+                    history_navigation = true;
+                } else if child_undo_requested {
+                    self.undo_document();
+                    history_navigation = true;
+                }
+                let child_save_as_requested = !viewport_context.egui_wants_keyboard_input()
+                    && viewport_ui.input_mut(|input| {
+                        input.consume_key(
+                            egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                            egui::Key::S,
+                        )
+                    });
+                let child_save_version_requested = !child_save_as_requested
+                    && !viewport_context.egui_wants_keyboard_input()
+                    && viewport_ui.input_mut(|input| {
+                        input.consume_key(egui::Modifiers::COMMAND, egui::Key::N)
+                    });
+                let child_save_requested = !child_save_as_requested
+                    && !child_save_version_requested
+                    && !viewport_context.egui_wants_keyboard_input()
+                    && viewport_ui.input_mut(|input| {
+                        input.consume_key(egui::Modifiers::COMMAND, egui::Key::S)
+                    });
+                if child_save_as_requested {
+                    self.save_as();
+                } else if child_save_version_requested {
+                    self.save_new_version();
+                } else if child_save_requested {
+                    self.save();
+                }
+                let child_play_pause_requested = !viewport_context.egui_wants_keyboard_input()
+                    && viewport_ui.input_mut(|input| {
+                        input.consume_key(egui::Modifiers::NONE, egui::Key::Space)
+                    });
+                if child_play_pause_requested {
+                    self.toggle_project_playback();
+                }
+                let child_toggle_editable_ghosts = !viewport_context.egui_wants_keyboard_input()
+                    && viewport_ui.input_mut(|input| {
+                        input.consume_key(
+                            egui::Modifiers::COMMAND | egui::Modifiers::ALT,
+                            egui::Key::V,
+                        )
+                    });
+                if child_toggle_editable_ghosts {
+                    self.piano_roll_editable_ghost_channels =
+                        !self.piano_roll_editable_ghost_channels;
+                    self.status = if self.piano_roll_editable_ghost_channels {
+                        "Editable Piano roll ghost notes enabled".to_owned()
+                    } else {
+                        "Editable Piano roll ghost notes disabled".to_owned()
+                    };
+                }
+
+                let child_pointer_down = viewport_ui.input(|input| {
+                    input.pointer.primary_down()
+                        || input.pointer.button_down(PointerButton::Secondary)
+                });
+                pointer_down |= child_pointer_down;
+                let child_edit_input_received = viewport_ui.input(|input| {
+                    input.pointer.primary_pressed()
+                        || input.pointer.primary_down()
+                        || input.pointer.primary_released()
+                        || input.pointer.button_pressed(PointerButton::Secondary)
+                        || input.pointer.button_down(PointerButton::Secondary)
+                        || input.pointer.button_released(PointerButton::Secondary)
+                        || input.events.iter().any(|event| {
+                            matches!(
+                                event,
+                                egui::Event::Key { pressed: true, .. }
+                                    | egui::Event::Text(_)
+                                    | egui::Event::Paste(_)
+                                    | egui::Event::MouseWheel { .. }
+                            )
+                        })
+                });
+                if !history_navigation
+                    && frame_snapshot.is_none()
+                    && self.pending_history_snapshot.is_none()
+                    && child_edit_input_received
+                {
+                    frame_snapshot = match self.encode_history_snapshot() {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => {
+                            self.status = format!("Could not capture undo state: {error}");
+                            None
+                        }
+                    };
+                }
+                self.history_snapshot_available_this_frame =
+                    frame_snapshot.is_some() || self.pending_history_snapshot.is_some();
+                self.piano_roll(viewport_ui);
+            });
+        }
         let history_snapshot_available = self.history_snapshot_available_this_frame
             || frame_snapshot.is_some()
             || self.pending_history_snapshot.is_some();
