@@ -38,9 +38,9 @@ use flp_rebuild::{
     ClawMachineOptions, FlpDocument, FlpError, FstPreset, FstPresetKind, LimitNoteOptions,
     LimitSnapDirection, MixerInsertEdit, MixerParameterKind, MixerParameterRecord, Pattern,
     PatternController, PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation,
-    PlaylistClip, PlaylistClipClipboard, PlaylistClipEdit, PlaylistClipTarget, PlaylistTrack,
-    PlaylistTrackEdit, ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions, RiffMachineOptions,
-    RiffMachineQuantizeMode, ScaleLevelsOptions, TimeMarker, TimeMarkerEdit,
+    PayloadEncoding, PlaylistClip, PlaylistClipClipboard, PlaylistClipEdit, PlaylistClipTarget,
+    PlaylistTrack, PlaylistTrackEdit, ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions,
+    RiffMachineOptions, RiffMachineQuantizeMode, ScaleLevelsOptions, TimeMarker, TimeMarkerEdit,
     VstPluginStateMetadata,
 };
 
@@ -74,6 +74,31 @@ const BLUE_SELECTION: Color32 = Color32::from_rgb(14, 23, 63);
 const PURPLE: Color32 = Color32::from_rgb(150, 93, 181);
 const ORANGE: Color32 = Color32::from_rgb(195, 129, 61);
 const RED: Color32 = Color32::from_rgb(252, 67, 46);
+
+fn state_preset_file_stem(name: &str, fallback: &str) -> String {
+    let safe_name = name
+        .chars()
+        .map(|character| {
+            if character.is_control() || "/\\:*?\"<>|".contains(character) {
+                '_'
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    let stem = safe_name.trim().trim_matches('.');
+    let stem = if stem.to_ascii_lowercase().ends_with(".fst") {
+        &stem[..stem.len() - 4]
+    } else {
+        stem
+    };
+    if stem.is_empty() {
+        fallback.to_owned()
+    } else {
+        stem.to_owned()
+    }
+}
+
 const MENU_BAR_HEIGHT: f32 = 32.0;
 const TRANSPORT_BAR_HEIGHT: f32 = 46.0;
 const STATUS_BAR_HEIGHT: f32 = 27.0;
@@ -3384,38 +3409,10 @@ impl DawUi {
             self.status = "Open a project before saving a channel preset".to_owned();
             return;
         };
-        let safe_name = channel_name
-            .chars()
-            .map(|character| {
-                if character.is_control() || "/\\:*?\"<>|".contains(character) {
-                    '_'
-                } else {
-                    character
-                }
-            })
-            .collect::<String>();
-        let safe_name = safe_name.trim().trim_matches('.');
-        let file_name = if safe_name.is_empty() {
-            format!("Channel {channel_id}.fst")
-        } else {
-            format!("{safe_name}.fst")
-        };
-        let Some(path) = rfd::FileDialog::new()
-            .set_title("Save channel state preset")
-            .add_filter("FL Studio channel state", &["fst"])
-            .set_file_name(file_name)
-            .save_file()
+        let file_name = state_preset_file_stem(channel_name, &format!("Channel {channel_id}"));
+        let Some(path) = self.choose_state_preset_path("Save channel state preset", &file_name)
         else {
             return;
-        };
-        let path = if path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("fst"))
-        {
-            path
-        } else {
-            path.with_extension("fst")
         };
 
         let plugin_state_warnings = self.capture_loaded_vst3_state(&mut document);
@@ -3434,12 +3431,60 @@ impl DawUi {
                 return;
             }
         };
+        self.write_state_preset_file(path, preset_bytes, "channel");
+    }
+
+    fn save_mixer_insert_state_preset(&mut self, insert_ordinal: usize, insert_name: &str) {
+        let Some(document) = self.document.as_ref() else {
+            self.status = "Open a project before saving a Mixer state".to_owned();
+            return;
+        };
+        let fallback_name = if insert_ordinal == 0 {
+            "Master".to_owned()
+        } else {
+            format!("Insert {insert_ordinal}")
+        };
+        let file_name = state_preset_file_stem(insert_name, &fallback_name);
+        let Some(path) = self.choose_state_preset_path("Save Mixer state preset", &file_name)
+        else {
+            return;
+        };
+        let preset_bytes = match document.encode_mixer_insert_state_preset(insert_ordinal) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.status = format!("Could not save Mixer state preset: {error}");
+                return;
+            }
+        };
+        self.write_state_preset_file(path, preset_bytes, "Mixer state");
+    }
+
+    fn choose_state_preset_path(&self, title: &str, file_name: &str) -> Option<PathBuf> {
+        let path = rfd::FileDialog::new()
+            .set_title(title)
+            .add_filter("FL Studio state preset", &["fst"])
+            .set_file_name(format!("{file_name}.fst"))
+            .save_file()?;
+        Some(
+            if path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("fst"))
+            {
+                path
+            } else {
+                path.with_extension("fst")
+            },
+        )
+    }
+
+    fn write_state_preset_file(&mut self, path: PathBuf, preset_bytes: Vec<u8>, state_name: &str) {
         match fs::write(&path, preset_bytes) {
             Ok(()) => {
-                self.status = format!("Saved channel state preset to {}", path.display());
+                self.status = format!("Saved {state_name} preset to {}", path.display());
             }
             Err(error) => {
-                self.status = format!("Could not write channel preset {}: {error}", path.display());
+                self.status = format!("Could not write preset {}: {error}", path.display());
             }
         }
     }
@@ -19952,6 +19997,7 @@ impl DawUi {
         let mut rename_edits = Vec::new();
         let mut flag_edits = Vec::new();
         let mut parameter_edits = Vec::new();
+        let mut save_insert_state = None;
         let available_height = ui.available_height();
         let inspector_width = 238.0_f32.min((ui.available_width() * 0.3).max(190.0));
         let bank_width = (ui.available_width() - inspector_width - 10.0).max(180.0);
@@ -20266,6 +20312,45 @@ impl DawUi {
                         {
                             rename_edits.push((insert.ordinal(), name));
                         }
+                        let insert_slots = effect_slots
+                            .iter()
+                            .filter(|slot| slot.insert_ordinal() == insert.ordinal())
+                            .collect::<Vec<_>>();
+                        let has_final_slot_boundary = insert_slots.get(9).is_some_and(|slot| {
+                            let closing_index = slot.event_range().end;
+                            let insert_range = insert.event_range();
+                            insert_range.start <= closing_index
+                                && closing_index < insert_range.end
+                                && document.events().get(closing_index).is_some_and(|event| {
+                                    event.opcode() == 0x93
+                                        && event.encoding() == &PayloadEncoding::Dword
+                                        && event.payload().len() == 4
+                                })
+                        });
+                        let complete_effect_slots = insert_slots.len() == 10
+                            && insert_slots.iter().enumerate().all(|(expected, slot)| {
+                                usize::from(slot.slot_index()) == expected
+                            })
+                            && has_final_slot_boundary;
+                        if ui
+                            .add_enabled(
+                                complete_effect_slots,
+                                egui::Button::new("Save Mixer state as…"),
+                            )
+                            .on_hover_text(
+                                "Export this insert and its ten effect-slot records as a .fst preset",
+                            )
+                            .clicked()
+                        {
+                            let default_name = insert.name().map(str::to_owned).unwrap_or_else(|| {
+                                if insert.ordinal() == 0 {
+                                    "Master".to_owned()
+                                } else {
+                                    format!("Insert {}", insert.ordinal())
+                                }
+                            });
+                            save_insert_state = Some((insert.ordinal(), default_name));
+                        }
                         ui.add_space(6.0);
                         ui.label("Track state");
                         if let Some(enabled) = insert.enabled() {
@@ -20361,10 +20446,6 @@ impl DawUi {
                         ui.small(format!("Events: {:?}", insert.event_range()));
                         ui.separator();
                         ui.label("Effect slots");
-                        let insert_slots = effect_slots
-                            .iter()
-                            .filter(|slot| slot.insert_ordinal() == insert.ordinal())
-                            .collect::<Vec<_>>();
                         egui::ScrollArea::vertical()
                             .id_salt("mixer-effect-slots")
                             .max_height((available_height - 340.0).max(160.0))
@@ -20488,6 +20569,9 @@ impl DawUi {
             );
         });
 
+        if let Some((insert_ordinal, insert_name)) = save_insert_state {
+            self.save_mixer_insert_state_preset(insert_ordinal, &insert_name);
+        }
         if !rename_edits.is_empty()
             && let Some(document) = self.document.as_mut()
         {

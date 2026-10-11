@@ -11737,14 +11737,7 @@ impl FlpDocument {
         }
 
         let channel_range = channel.event_range();
-        let version_event =
-            self.events[..channel_range.start]
-                .iter()
-                .find(|event| match event.opcode {
-                    0xC7 => ascii_version(&event.payload).is_some(),
-                    0xC0 => utf16_banner_version(&event.payload).is_some(),
-                    _ => false,
-                });
+        let version_event = self.version_event_before(channel_range.start);
         let mut events = Vec::with_capacity(
             channel_range
                 .len()
@@ -11766,6 +11759,87 @@ impl FlpDocument {
         };
         preset.refresh_event_offsets()?;
         preset.encode_lossless()
+    }
+
+    /// Encodes one Mixer insert and its recognized ten-slot effect chain as a format-64 preset.
+    ///
+    /// The insert event bytes and project-version event are retained. Project events, trailing
+    /// bytes, and sibling inserts are omitted. Export requires a complete observed effect-slot
+    /// boundary sequence so the insert's end can be identified without guessing.
+    pub fn encode_mixer_insert_state_preset(
+        &self,
+        insert_ordinal: usize,
+    ) -> Result<Vec<u8>, FlpError> {
+        let insert = self
+            .mixer_inserts()
+            .into_iter()
+            .find(|insert| insert.ordinal() == insert_ordinal)
+            .ok_or(FlpError::MixerInsertNotFound(insert_ordinal))?;
+        let slots = self
+            .mixer_effect_slots()
+            .into_iter()
+            .filter(|slot| slot.insert_ordinal() == insert_ordinal)
+            .collect::<Vec<_>>();
+        if slots.len() != 10
+            || slots
+                .iter()
+                .enumerate()
+                .any(|(expected, slot)| usize::from(slot.slot_index()) != expected)
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "Mixer state export requires a complete ten-slot boundary sequence",
+            ));
+        }
+        let closing_index = slots[9].event_range().end;
+        let insert_range = insert.event_range();
+        let Some(closing_event) = self.events.get(closing_index) else {
+            return Err(FlpError::UnsupportedEdit(
+                "the Mixer insert has no recognized final effect-slot boundary",
+            ));
+        };
+        if closing_index < insert_range.start
+            || closing_index >= insert_range.end
+            || closing_event.opcode != 0x93
+            || closing_event.encoding != PayloadEncoding::Dword
+            || closing_event.payload.len() != 4
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "the Mixer insert has no recognized final effect-slot boundary",
+            ));
+        }
+        let event_range = insert_range.start..closing_index + 1;
+        let version_event = self.version_event_before(event_range.start);
+        let mut events = Vec::with_capacity(
+            event_range
+                .len()
+                .saturating_add(usize::from(version_event.is_some())),
+        );
+        if let Some(version_event) = version_event {
+            events.push(version_event.clone());
+        }
+        events.extend_from_slice(&self.events[event_range]);
+
+        let mut header = self.header.clone();
+        header.format = 64;
+        let mut preset = Self {
+            header,
+            events,
+            project_version: self.project_version.clone(),
+            metadata: ProjectMetadata::default(),
+            trailing_bytes: Vec::new(),
+        };
+        preset.refresh_event_offsets()?;
+        preset.encode_lossless()
+    }
+
+    fn version_event_before(&self, event_index: usize) -> Option<&FlpEvent> {
+        self.events[..event_index]
+            .iter()
+            .find(|event| match event.opcode {
+                0xC7 => ascii_version(&event.payload).is_some(),
+                0xC0 => utf16_banner_version(&event.payload).is_some(),
+                _ => false,
+            })
     }
 
     /// Rebuilds the two-chunk container while keeping each event's original wire bytes.
@@ -11873,6 +11947,7 @@ pub enum FlpError {
     UnsupportedEdit(&'static str),
     ChannelNotFound(u16),
     AmbiguousChannelId(u16),
+    MixerInsertNotFound(usize),
 }
 
 impl fmt::Display for FlpError {
@@ -11916,6 +11991,10 @@ impl fmt::Display for FlpError {
             Self::AmbiguousChannelId(channel_id) => write!(
                 formatter,
                 "cannot edit FLP field: channel id {channel_id} is not unique"
+            ),
+            Self::MixerInsertNotFound(insert_ordinal) => write!(
+                formatter,
+                "cannot edit FLP field: Mixer insert {insert_ordinal} was not found"
             ),
         }
     }
@@ -13051,6 +13130,108 @@ mod tests {
         assert!(matches!(
             document.encode_channel_state_preset(5),
             Err(FlpError::AmbiguousChannelId(5))
+        ));
+    }
+
+    fn append_complete_mixer_insert_state(
+        event_stream: &mut Vec<u8>,
+        input: i32,
+        output: i32,
+        color: u32,
+        name: &str,
+    ) {
+        event_stream.push(0x9A);
+        event_stream.extend_from_slice(&input.to_le_bytes());
+        event_stream.push(0x93);
+        event_stream.extend_from_slice(&output.to_le_bytes());
+        event_stream.push(0x95);
+        event_stream.extend_from_slice(&color.to_le_bytes());
+        let name = name
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        append_data_event(event_stream, 0xCC, &name);
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        append_data_event(event_stream, 0xD5, &[0xA1, 0xB2, 0xC3]);
+        for slot_index in 1_u16..10 {
+            event_stream.push(0x62);
+            event_stream.extend_from_slice(&slot_index.to_le_bytes());
+        }
+        event_stream.push(0x93);
+        event_stream.extend_from_slice(&output.to_le_bytes());
+    }
+
+    #[test]
+    fn exports_one_complete_mixer_insert_as_a_lossless_format_64_state_preset() {
+        let mut event_stream = Vec::new();
+        append_data_event(&mut event_stream, 0xC7, b"26.0.0\0");
+        append_data_event(&mut event_stream, 0xC2, b"Project title\0");
+        append_complete_mixer_insert_state(&mut event_stream, -1, 0, 0x001C_1F8C, "KICK");
+        append_complete_mixer_insert_state(&mut event_stream, -1, -1, 0x001D_2792, "TOMS");
+        append_data_event(&mut event_stream, 0xC2, b"Trailing project event\0");
+        let mut source_bytes = flp_fixture(&event_stream, &[0xA5, 0x5A], &[0xDE, 0xAD]);
+        source_bytes[10..12].copy_from_slice(&9_u16.to_le_bytes());
+        let source = FlpDocument::parse(&source_bytes).expect("source project should parse");
+        let target_range = source.mixer_inserts()[1].event_range();
+        let closing_index = source
+            .mixer_effect_slots()
+            .into_iter()
+            .find(|slot| slot.insert_ordinal() == 1 && slot.slot_index() == 9)
+            .expect("the selected insert should have slot nine")
+            .event_range()
+            .end;
+        let expected_insert_events = source.events()[target_range.start..=closing_index]
+            .iter()
+            .map(|event| event.wire_bytes().to_vec())
+            .collect::<Vec<_>>();
+
+        let preset_bytes = source
+            .encode_mixer_insert_state_preset(1)
+            .expect("selected Mixer insert should export");
+        let preset = FstPreset::parse(&preset_bytes).expect("exported preset should parse");
+        assert_eq!(preset.kind(), FstPresetKind::MixerInsertState);
+        assert_eq!(preset.document().header().legacy_channel_count(), 9);
+        assert_eq!(preset.document().header().ppq(), 96);
+        assert_eq!(preset.document().header().extension(), &[0xA5, 0x5A]);
+        assert_eq!(preset.document().project_version(), Some("26.0.0"));
+        assert!(preset.document().trailing_bytes().is_empty());
+        assert_eq!(preset.document().mixer_inserts().len(), 1);
+        assert_eq!(preset.document().mixer_inserts()[0].name(), Some("TOMS"));
+        assert_eq!(preset.document().mixer_effect_slots().len(), 10);
+        assert_eq!(
+            preset
+                .document()
+                .events()
+                .iter()
+                .filter(|event| event.opcode() != 0xC7)
+                .map(|event| event.wire_bytes().to_vec())
+                .collect::<Vec<_>>(),
+            expected_insert_events
+        );
+        assert_eq!(preset.document().events()[0].opcode(), 0xC7);
+    }
+
+    #[test]
+    fn mixer_state_export_requires_an_existing_insert_and_complete_slot_boundaries() {
+        let empty =
+            FlpDocument::parse(&flp_fixture(&[], &[], &[])).expect("empty source should parse");
+        assert!(matches!(
+            empty.encode_mixer_insert_state_preset(0),
+            Err(FlpError::MixerInsertNotFound(0))
+        ));
+
+        let mut event_stream = Vec::new();
+        event_stream.extend_from_slice(&[0x9A]);
+        event_stream.extend_from_slice(&(-1_i32).to_le_bytes());
+        event_stream.push(0x93);
+        event_stream.extend_from_slice(&(-1_i32).to_le_bytes());
+        event_stream.push(0x95);
+        event_stream.extend_from_slice(&0_u32.to_le_bytes());
+        let incomplete = FlpDocument::parse(&flp_fixture(&event_stream, &[], &[]))
+            .expect("incomplete insert should parse losslessly");
+        assert!(matches!(
+            incomplete.encode_mixer_insert_state_preset(0),
+            Err(FlpError::UnsupportedEdit(_))
         ));
     }
 
