@@ -1459,6 +1459,7 @@ fn prepare_playlist_pattern_render(
     })
 }
 
+#[cfg(test)]
 fn scheduled_playlist_midi_events(
     notes: &[PlaylistMidiNote],
     ppq: u16,

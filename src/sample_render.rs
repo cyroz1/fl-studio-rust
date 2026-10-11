@@ -157,7 +157,7 @@ impl PlaylistTempoMap {
         let elapsed_ticks = tick.saturating_sub(segment.start_tick);
         let seconds = segment.start_seconds
             + elapsed_ticks as f64 * 60.0 / (f64::from(self.ppq) * segment.tempo_bpm);
-        let frames = seconds * f64::from(sample_rate);
+        let frames = seconds * sample_rate;
         if !frames.is_finite() || frames < 0.0 || frames > u64::MAX as f64 {
             return Err("Playlist position is outside the renderable timeline".to_owned());
         }
