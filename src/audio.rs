@@ -12,6 +12,7 @@ use std::time::Duration;
 use arc_swap::ArcSwapOption;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat, Stream, StreamConfig, SupportedStreamConfig};
+use crossbeam_queue::ArrayQueue;
 
 const AUDIO_SOURCE_SILENT: u8 = 0;
 const AUDIO_SOURCE_TEST_TONE: u8 = 1;
@@ -21,6 +22,7 @@ const AUDIO_SOURCE_STREAM: u8 = 4;
 const AUDIO_RING_CAPACITY: usize = 65_536;
 const INPUT_RECORDING_BUFFER_FRAMES: usize = 65_536;
 const AUDIO_ERROR_HISTORY_LIMIT: usize = 16;
+const AUDIO_COMMAND_QUEUE_CAPACITY: usize = 128;
 const STREAM_PREFILL_FRAMES: usize = 512;
 const TEST_TONE_HZ: f32 = 440.0;
 const TEST_TONE_LEVEL: f32 = 0.12;
@@ -137,6 +139,7 @@ impl Default for AudioSettings {
 }
 
 struct PlaybackState {
+    commands: AudioCommandQueue,
     samples: ArcSwapOption<Vec<f32>>,
     streaming: ArcSwapOption<StreamingPlayback>,
     cursor_frames: AtomicU64,
@@ -145,6 +148,21 @@ struct PlaybackState {
     browser_preview_cursor_frames: AtomicU64,
     browser_preview_active: AtomicBool,
     browser_preview_gain: AtomicU32,
+}
+
+struct AudioCommandQueue {
+    transport: ArrayQueue<TransportCommand>,
+    parameters: ArrayQueue<ParameterCommand>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum TransportCommand {
+    SetOutputSource(u8),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ParameterCommand {
+    SetBrowserPreviewGain(u32),
 }
 
 struct StreamingPlayback {
@@ -359,6 +377,10 @@ impl AudioInputRecording {
 impl PlaybackState {
     fn new() -> Self {
         Self {
+            commands: AudioCommandQueue {
+                transport: ArrayQueue::new(AUDIO_COMMAND_QUEUE_CAPACITY),
+                parameters: ArrayQueue::new(AUDIO_COMMAND_QUEUE_CAPACITY),
+            },
             samples: ArcSwapOption::empty(),
             streaming: ArcSwapOption::empty(),
             cursor_frames: AtomicU64::new(0),
@@ -367,6 +389,38 @@ impl PlaybackState {
             browser_preview_cursor_frames: AtomicU64::new(0),
             browser_preview_active: AtomicBool::new(false),
             browser_preview_gain: AtomicU32::new(1.0_f32.to_bits()),
+        }
+    }
+
+    fn enqueue_transport_command(&self, command: TransportCommand) {
+        // This lane carries only complete transport state, so replacing old
+        // commands preserves the newest requested source.
+        let _ = self.commands.transport.force_push(command);
+    }
+
+    fn enqueue_parameter_command(&self, command: ParameterCommand) {
+        // Parameter updates use their own lane so a burst of one kind cannot
+        // discard the latest value from the other kind.
+        let _ = self.commands.parameters.force_push(command);
+    }
+
+    fn apply_pending_commands(&self, source: &AtomicU8) {
+        for _ in 0..AUDIO_COMMAND_QUEUE_CAPACITY {
+            let Some(TransportCommand::SetOutputSource(next_source)) =
+                self.commands.transport.pop()
+            else {
+                break;
+            };
+            source.store(next_source, Ordering::Release);
+        }
+        for _ in 0..AUDIO_COMMAND_QUEUE_CAPACITY {
+            let Some(ParameterCommand::SetBrowserPreviewGain(gain_bits)) =
+                self.commands.parameters.pop()
+            else {
+                break;
+            };
+            self.browser_preview_gain
+                .store(gain_bits, Ordering::Release);
         }
     }
 
@@ -571,6 +625,7 @@ pub fn enumerate_devices() -> AudioDeviceCatalog {
 /// test tone, or monitor that input.
 pub struct AudioEngine {
     source: Arc<AtomicU8>,
+    requested_source: AtomicU8,
     playback: Arc<PlaybackState>,
     sample_rate: u32,
     input_peak: Arc<AtomicU32>,
@@ -599,14 +654,11 @@ impl AudioEngine {
         if enabled {
             self.playback.pause();
         }
-        self.source.store(
-            if enabled {
-                AUDIO_SOURCE_TEST_TONE
-            } else {
-                AUDIO_SOURCE_SILENT
-            },
-            Ordering::Release,
-        );
+        self.request_output_source(if enabled {
+            AUDIO_SOURCE_TEST_TONE
+        } else {
+            AUDIO_SOURCE_SILENT
+        });
     }
 
     pub fn set_input_monitor(&self, enabled: bool) -> Result<(), String> {
@@ -618,14 +670,11 @@ impl AudioEngine {
         if enabled {
             self.playback.pause();
         }
-        self.source.store(
-            if enabled {
-                AUDIO_SOURCE_INPUT_MONITOR
-            } else {
-                AUDIO_SOURCE_SILENT
-            },
-            Ordering::Release,
-        );
+        self.request_output_source(if enabled {
+            AUDIO_SOURCE_INPUT_MONITOR
+        } else {
+            AUDIO_SOURCE_SILENT
+        });
         Ok(())
     }
 
@@ -638,7 +687,7 @@ impl AudioEngine {
             return Err("Rendered project audio must contain stereo sample frames".into());
         }
         self.playback.start(samples);
-        self.source.store(AUDIO_SOURCE_PROJECT, Ordering::Release);
+        self.request_output_source(AUDIO_SOURCE_PROJECT);
         Ok(())
     }
 
@@ -669,9 +718,14 @@ impl AudioEngine {
         } else {
             1.0
         };
-        self.playback
-            .browser_preview_gain
-            .store(gain.to_bits(), Ordering::Release);
+        if self.output_active {
+            self.playback
+                .enqueue_parameter_command(ParameterCommand::SetBrowserPreviewGain(gain.to_bits()));
+        } else {
+            self.playback
+                .browser_preview_gain
+                .store(gain.to_bits(), Ordering::Release);
+        }
     }
 
     /// Begin consuming interleaved stereo samples from a bounded producer ring.
@@ -694,7 +748,7 @@ impl AudioEngine {
             return Err("Start an output device before streaming audio".into());
         }
         let writer = self.playback.start_streaming(start_frame);
-        self.source.store(AUDIO_SOURCE_STREAM, Ordering::Release);
+        self.request_output_source(AUDIO_SOURCE_STREAM);
         Ok(writer)
     }
 
@@ -708,14 +762,11 @@ impl AudioEngine {
             return Err("Start an output device before resuming project playback".into());
         }
         self.playback.resume()?;
-        self.source.store(
-            if self.playback.is_streaming() {
-                AUDIO_SOURCE_STREAM
-            } else {
-                AUDIO_SOURCE_PROJECT
-            },
-            Ordering::Release,
-        );
+        self.request_output_source(if self.playback.is_streaming() {
+            AUDIO_SOURCE_STREAM
+        } else {
+            AUDIO_SOURCE_PROJECT
+        });
         Ok(())
     }
 
@@ -812,13 +863,21 @@ impl AudioEngine {
     }
 
     fn stop_playback_source(&self) {
-        for playback_source in [AUDIO_SOURCE_PROJECT, AUDIO_SOURCE_STREAM] {
-            let _ = self.source.compare_exchange(
-                playback_source,
-                AUDIO_SOURCE_SILENT,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
+        if matches!(
+            self.requested_source.load(Ordering::Acquire),
+            AUDIO_SOURCE_PROJECT | AUDIO_SOURCE_STREAM
+        ) {
+            self.request_output_source(AUDIO_SOURCE_SILENT);
+        }
+    }
+
+    fn request_output_source(&self, source: u8) {
+        self.requested_source.store(source, Ordering::Release);
+        if self.output_active {
+            self.playback
+                .enqueue_transport_command(TransportCommand::SetOutputSource(source));
+        } else {
+            self.source.store(source, Ordering::Release);
         }
     }
 
@@ -883,6 +942,7 @@ impl AudioEngine {
 
         Ok(Self {
             source,
+            requested_source: AtomicU8::new(AUDIO_SOURCE_SILENT),
             playback,
             sample_rate: settings.sample_rate,
             input_peak,
@@ -1036,6 +1096,7 @@ impl AudioEngine {
                 || cpal::default_host().default_input_device().is_some());
         Ok(Self {
             source,
+            requested_source: AtomicU8::new(AUDIO_SOURCE_SILENT),
             playback,
             sample_rate: settings.sample_rate,
             input_peak,
@@ -1239,6 +1300,7 @@ where
             config,
             move |output, _| {
                 enable_denormal_protection();
+                playback_for_callback.apply_pending_commands(&source);
                 let playback_samples = playback_for_callback.samples.load();
                 let streaming = playback_for_callback.streaming.load();
                 let browser_preview_samples = playback_for_callback.browser_preview_samples.load();
@@ -2029,6 +2091,7 @@ fn render_wasapi_buffer(
     ring: &AudioRingBuffer,
     phase: &mut f32,
 ) -> Result<Vec<u8>, String> {
+    playback.apply_pending_commands(source);
     let mut output = vec![0_u8; frames.saturating_mul(format.frame_bytes)];
     let sample_rate = format.get_sample_rate();
     let playback_samples = playback.samples.load();
@@ -2069,9 +2132,11 @@ mod tests {
     use std::sync::atomic::{AtomicU8, Ordering};
 
     use super::{
-        AUDIO_SOURCE_PROJECT, AUDIO_SOURCE_STREAM, AudioAccess, AudioInputRecording,
-        AudioRingBuffer, AudioSettings, InputRecordingState, PlaybackState,
-        enable_denormal_protection, next_output_frame, tone_sample, validate_settings,
+        AUDIO_COMMAND_QUEUE_CAPACITY, AUDIO_SOURCE_INPUT_MONITOR, AUDIO_SOURCE_PROJECT,
+        AUDIO_SOURCE_SILENT, AUDIO_SOURCE_STREAM, AUDIO_SOURCE_TEST_TONE, AudioAccess,
+        AudioInputRecording, AudioRingBuffer, AudioSettings, InputRecordingState, ParameterCommand,
+        PlaybackState, TransportCommand, enable_denormal_protection, next_output_frame,
+        tone_sample, validate_settings,
     };
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -2132,6 +2197,63 @@ mod tests {
             ..AudioSettings::default()
         };
         assert!(validate_settings(&settings).is_err());
+    }
+
+    #[test]
+    fn ui_audio_commands_are_applied_by_the_callback_and_keep_latest_values() {
+        let playback = PlaybackState::new();
+        let source = AtomicU8::new(AUDIO_SOURCE_SILENT);
+        let initial_gain = playback.browser_preview_gain.load(Ordering::Acquire);
+
+        playback
+            .enqueue_transport_command(TransportCommand::SetOutputSource(AUDIO_SOURCE_TEST_TONE));
+        playback
+            .enqueue_parameter_command(ParameterCommand::SetBrowserPreviewGain(0.25_f32.to_bits()));
+        playback.enqueue_transport_command(TransportCommand::SetOutputSource(
+            AUDIO_SOURCE_INPUT_MONITOR,
+        ));
+        playback
+            .enqueue_parameter_command(ParameterCommand::SetBrowserPreviewGain(0.75_f32.to_bits()));
+
+        assert_eq!(source.load(Ordering::Acquire), AUDIO_SOURCE_SILENT);
+        assert_eq!(
+            playback.browser_preview_gain.load(Ordering::Acquire),
+            initial_gain
+        );
+
+        playback.apply_pending_commands(&source);
+
+        assert_eq!(source.load(Ordering::Acquire), AUDIO_SOURCE_INPUT_MONITOR);
+        assert_eq!(
+            f32::from_bits(playback.browser_preview_gain.load(Ordering::Acquire)),
+            0.75
+        );
+    }
+
+    #[test]
+    fn full_audio_command_queue_retains_the_newest_transport_state() {
+        let playback = PlaybackState::new();
+        let source = AtomicU8::new(AUDIO_SOURCE_SILENT);
+        let command_count = AUDIO_COMMAND_QUEUE_CAPACITY + 17;
+
+        for index in 0..command_count {
+            let source = if index.is_multiple_of(2) {
+                AUDIO_SOURCE_TEST_TONE
+            } else {
+                AUDIO_SOURCE_INPUT_MONITOR
+            };
+            playback.enqueue_transport_command(TransportCommand::SetOutputSource(source));
+        }
+        playback.apply_pending_commands(&source);
+
+        assert_eq!(
+            source.load(Ordering::Acquire),
+            if (command_count - 1).is_multiple_of(2) {
+                AUDIO_SOURCE_TEST_TONE
+            } else {
+                AUDIO_SOURCE_INPUT_MONITOR
+            }
+        );
     }
 
     #[test]

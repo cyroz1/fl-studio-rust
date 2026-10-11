@@ -7,6 +7,7 @@ license = "MIT"
 
 [dependencies]
 arc-swap = "1.7.1"
+crossbeam-queue = "0.3.14"
 cpal = "0.18.2"
 eframe = { version = "0.36.2", default-features = false, features = ["accesskit", "default_fonts", "links", "wayland", "wgpu", "x11"] }
 flacenc = { version = "0.5.1", default-features = false }

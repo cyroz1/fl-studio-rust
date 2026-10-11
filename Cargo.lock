@@ -1290,6 +1290,7 @@ name = "flp-rebuild"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "crossbeam-queue",
  "cpal",
  "eframe",
  "flacenc",
