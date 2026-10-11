@@ -20781,21 +20781,22 @@ impl DawUi {
                 playlist_pattern_recording_offset(playhead_tick, pattern_id, &arrangement.clips)
             })
             .unwrap_or(0);
-        let playlist_clip_placement = song_timeline_start
-            .as_ref()
-            .and_then(|_| playhead_tick)
-            .and_then(|playhead_tick| {
-                let arrangement = playback_arrangement?;
-                let start_tick = playlist_pattern_recording_placement_tick(
-                    playhead_tick,
-                    pattern_id,
-                    &arrangement.clips,
-                )?;
-                Some(MidiPlaylistClipPlacement {
-                    arrangement_id: arrangement.id,
-                    start_tick,
-                })
-            });
+        let playlist_clip_placement =
+            song_timeline_start
+                .as_ref()
+                .and(playhead_tick)
+                .and_then(|playhead_tick| {
+                    let arrangement = playback_arrangement?;
+                    let start_tick = playlist_pattern_recording_placement_tick(
+                        playhead_tick,
+                        pattern_id,
+                        &arrangement.clips,
+                    )?;
+                    Some(MidiPlaylistClipPlacement {
+                        arrangement_id: arrangement.id,
+                        start_tick,
+                    })
+                });
         let snap_ticks = (self.midi_record_snap != PianoRollSnap::None).then(|| {
             self.midi_record_snap.ticks(
                 document.header().ppq(),
