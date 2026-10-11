@@ -148,6 +148,10 @@ jobs:
           sleep 1
           ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
             -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/audio-settings.png"
+          xdotool mousemove 1100 700 click --repeat 8 --delay 40 5
+          sleep 0.5
+          ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
+            -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/audio-settings-scrolled.png"
 
           kill "$app_pid" 2>/dev/null || true
           wait "$app_pid" 2>/dev/null || true
@@ -587,6 +591,10 @@ jobs:
           sleep 0.5
           ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
             -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/audio-detached-window.png"
+          xdotool mousemove 900 700 click --repeat 8 --delay 40 5
+          sleep 0.5
+          ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
+            -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/audio-detached-scrolled.png"
           xdotool windowfocus --sync "$mixer_window"
           xdotool mousemove 287 16 click 1
           sleep 0.3
@@ -1003,7 +1011,8 @@ jobs:
             cat "$RUNNER_TEMP/pattern-preview.log"
             exit 1
           fi
-          for capture in browser-search-options.png playlist-solo.png playlist-group-solo.png playlist-groups-collapsed.png \
+          for capture in browser-search-options.png audio-settings-scrolled.png audio-detached-scrolled.png \
+            playlist-solo.png playlist-group-solo.png playlist-groups-collapsed.png \
             mixer.png mixer-effect-slots-scrolled.png mixer-muted.png mixer-muted-solo.png mixer-phase-swap.png controller-ghost-visibility.png \
             controller-ghost-editable.png controller-ghost-editable-shortcut.png controller-color-selection.png \
             piano-roll-scale-automatic.png piano-roll-tools-menu.png piano-roll-chord-stamp-toolbar.png piano-roll-chord-stamps.png \

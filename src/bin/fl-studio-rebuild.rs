@@ -3149,7 +3149,7 @@ impl DawUi {
             frame_snapshot.is_some() || self.pending_history_snapshot.is_some();
         match kind {
             DetachedWindowKind::Plugins => self.plugins(ui),
-            DetachedWindowKind::Audio => self.audio_settings_view(ui),
+            DetachedWindowKind::Audio => self.scrollable_audio_settings_view(ui),
             DetachedWindowKind::Automation => self.automation_editor(ui),
             _ => {}
         }
@@ -24039,6 +24039,13 @@ impl DawUi {
         };
     }
 
+    fn scrollable_audio_settings_view(&mut self, ui: &mut egui::Ui) {
+        let _ = egui::ScrollArea::vertical()
+            .id_salt("audio-settings-scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| self.audio_settings_view(ui));
+    }
+
     fn audio_settings_view(&mut self, ui: &mut egui::Ui) {
         let mut start_requested = false;
         let mut stop_requested = false;
@@ -25645,7 +25652,7 @@ impl eframe::App for DawUi {
                                     });
                                 });
                             }
-                            MainView::Audio => self.audio_settings_view(ui),
+                            MainView::Audio => self.scrollable_audio_settings_view(ui),
                             MainView::Automation if self.automation_window_detached => {
                                 ui.centered_and_justified(|ui| {
                                     ui.vertical_centered(|ui| {
