@@ -527,7 +527,7 @@ jobs:
           print("Unsigned macOS app bundle and .flp association are valid")
           PY
 
-      - name: Archive unsigned macOS GUI preview
+      - name: Prepare unsigned macOS GUI preview
         if: runner.os == 'macOS' && steps.macos-signing.outputs.configured == 'false'
         shell: bash
         run: |
@@ -543,7 +543,7 @@ jobs:
           This is an unsigned macOS CI preview. Gatekeeper can label it “damaged” because
           it was downloaded from the internet without a Developer ID signature and notarization.
 
-          To open this preview, open Terminal, change to this folder, then run:
+          To open the app, open Terminal, change to this folder, then run:
 
               xattr -dr com.apple.quarantine "FL Studio Rebuild.app"
               open "FL Studio Rebuild.app"
@@ -551,8 +551,6 @@ jobs:
           A signed and notarized disk image is produced only when the repository's Apple
           Developer ID and notarization secrets are configured.
           EOF
-          ditto -c -k --sequesterRsrc --keepParent \
-            "$preview_dir" dist/fl-studio-rebuild-macos-unsigned-preview.zip
 
       - name: Verify macOS signature and notarization
         if: runner.os == 'macOS' && steps.macos-signing.outputs.configured == 'true'
@@ -636,7 +634,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: macos-unsigned-gui-preview
-          path: dist/fl-studio-rebuild-macos-unsigned-preview.zip
+          path: dist/macos-unsigned-preview
           if-no-files-found: error
           retention-days: 14
 
