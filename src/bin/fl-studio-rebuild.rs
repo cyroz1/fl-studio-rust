@@ -728,6 +728,7 @@ enum PianoRollSelectionCommand {
     Clear,
     RandomOne,
     RandomMore,
+    Odd,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -12503,6 +12504,22 @@ impl DawUi {
             })
             .copied()
             .collect::<BTreeSet<_>>();
+        let main_grid_ticks = self
+            .document
+            .as_ref()
+            .map(|document| (u32::from(document.header().ppq()) / 4).max(1))
+            .unwrap_or(24);
+        let odd_note_ids = if command == PianoRollSelectionCommand::Odd {
+            pattern
+                .as_ref()
+                .zip(target)
+                .map(|(pattern, (pattern_id, channel_id))| {
+                    piano_roll_odd_note_selection(pattern, pattern_id, channel_id, main_grid_ticks)
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         self.selected_piano_notes.clear();
         let status =
             match command {
@@ -12522,6 +12539,13 @@ impl DawUi {
                     )
                 }
                 PianoRollSelectionCommand::Clear => "Note selection cleared".to_owned(),
+                PianoRollSelectionCommand::Odd => {
+                    self.selected_piano_notes.extend(odd_note_ids);
+                    format!(
+                        "Selected {} notes off the main beat grid",
+                        self.selected_piano_notes.len()
+                    )
+                }
                 PianoRollSelectionCommand::RandomOne | PianoRollSelectionCommand::RandomMore => {
                     let select_more = command == PianoRollSelectionCommand::RandomMore;
                     let selected = pattern.as_ref().zip(target).and_then(
@@ -13118,6 +13142,8 @@ impl DawUi {
                 ui.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::R));
             let select_more_random =
                 ui.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::M));
+            let select_odd_notes =
+                ui.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::O));
             change_note_color_requested =
                 ui.input_mut(|input| input.consume_key(egui::Modifiers::ALT, egui::Key::C));
             let clear_note_selection =
@@ -13193,6 +13219,8 @@ impl DawUi {
                 self.apply_piano_roll_selection_command(PianoRollSelectionCommand::RandomOne);
             } else if select_more_random {
                 self.apply_piano_roll_selection_command(PianoRollSelectionCommand::RandomMore);
+            } else if select_odd_notes {
+                self.apply_piano_roll_selection_command(PianoRollSelectionCommand::Odd);
             }
             if select_color_group {
                 self.select_piano_roll_color_group();
@@ -13507,6 +13535,16 @@ impl DawUi {
             ui.menu_button("Selection", |ui| {
                 if ui.button("Select all notes (Ctrl/Cmd+A)").clicked() {
                     self.apply_piano_roll_selection_command(PianoRollSelectionCommand::All);
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        channel_note_count > 0,
+                        egui::Button::new("Select odd notes (Shift+O)"),
+                    )
+                    .clicked()
+                {
+                    self.apply_piano_roll_selection_command(PianoRollSelectionCommand::Odd);
                     ui.close();
                 }
                 if ui
@@ -21805,6 +21843,47 @@ fn piano_roll_note_group_members(
         .collect()
 }
 
+fn piano_roll_odd_note_selection(
+    pattern: &Pattern,
+    pattern_id: u16,
+    channel_id: u16,
+    main_grid_ticks: u32,
+) -> Vec<(u16, u16, usize)> {
+    let main_grid_ticks = main_grid_ticks.max(1);
+    let mut off_grid_groups = BTreeSet::<(u16, usize)>::new();
+    for (note_index, note) in pattern
+        .notes
+        .iter()
+        .filter(|note| note.channel_id == channel_id)
+        .enumerate()
+    {
+        if note.position % main_grid_ticks != 0 {
+            let group_key = if note.group == 0 {
+                (0, note_index)
+            } else {
+                (note.group, 0)
+            };
+            off_grid_groups.insert(group_key);
+        }
+    }
+
+    pattern
+        .notes
+        .iter()
+        .filter(|note| note.channel_id == channel_id)
+        .enumerate()
+        .filter(|(note_index, note)| {
+            let group_key = if note.group == 0 {
+                (0, *note_index)
+            } else {
+                (note.group, 0)
+            };
+            off_grid_groups.contains(&group_key)
+        })
+        .map(|(note_index, _)| (pattern_id, channel_id, note_index))
+        .collect()
+}
+
 fn piano_roll_random_note_selection(
     pattern: &Pattern,
     pattern_id: u16,
@@ -24264,10 +24343,10 @@ mod tests {
         note_from_grid_position, parse_midi_device_selections, piano_roll_color_group_note_ids,
         piano_roll_controller_value_at, piano_roll_controller_value_range,
         piano_roll_discard_length_edit, piano_roll_note_group_members, piano_roll_note_nudge_edit,
-        piano_roll_random_note_selection, playlist_audio_clip_join_candidates,
-        playlist_audio_drop_position_ticks, playlist_bar_ticks, playlist_clip_drag_edit,
-        playlist_clip_local_recording_offset, playlist_clip_split_position,
-        playlist_group_parent_ids, playlist_measure_boundaries,
+        piano_roll_odd_note_selection, piano_roll_random_note_selection,
+        playlist_audio_clip_join_candidates, playlist_audio_drop_position_ticks,
+        playlist_bar_ticks, playlist_clip_drag_edit, playlist_clip_local_recording_offset,
+        playlist_clip_split_position, playlist_group_parent_ids, playlist_measure_boundaries,
         playlist_pattern_clip_join_candidates, playlist_seek_tick_to_frame,
         playlist_signature_at_tick, playlist_song_position_label, playlist_track_group_range,
         playlist_track_is_hidden, recolor_piano_roll_notes, snap_note_tick,
@@ -24397,6 +24476,33 @@ mod tests {
             vec![(7, 0, 1)]
         );
         assert!(piano_roll_color_group_note_ids(&pattern, 7, 0, 5).is_empty());
+    }
+
+    #[test]
+    fn piano_roll_select_odd_uses_the_main_grid_and_keeps_note_groups_together() {
+        let note = |position, channel_id, group| PatternNote {
+            position,
+            channel_id,
+            group,
+            ..PatternNote::default()
+        };
+        let pattern = Pattern {
+            id: 7,
+            notes: vec![
+                note(0, 2, 0),
+                note(25, 2, 0),
+                note(48, 2, 9),
+                note(49, 2, 9),
+                note(25, 3, 0),
+            ],
+            ..Pattern::default()
+        };
+
+        assert_eq!(
+            piano_roll_odd_note_selection(&pattern, 7, 2, 24),
+            vec![(7, 2, 1), (7, 2, 2), (7, 2, 3)]
+        );
+        assert!(piano_roll_odd_note_selection(&pattern, 7, 2, 0).is_empty());
     }
 
     #[test]
