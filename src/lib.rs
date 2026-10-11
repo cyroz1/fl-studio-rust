@@ -3624,6 +3624,63 @@ impl FlpDocument {
         Ok(())
     }
 
+    /// Removes points in one raw Pattern controller stream and inclusive tick range.
+    /// Records from other streams and unrelated event bytes remain unchanged.
+    pub fn delete_pattern_controller_range(
+        &mut self,
+        pattern_id: u16,
+        stream: (u8, u8),
+        start_tick: u32,
+        end_tick: u32,
+    ) -> Result<usize, FlpError> {
+        let (start_tick, end_tick) = if start_tick <= end_tick {
+            (start_tick, end_tick)
+        } else {
+            (end_tick, start_tick)
+        };
+        let pattern = self
+            .patterns()?
+            .into_iter()
+            .find(|pattern| pattern.id == pattern_id)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested Pattern does not exist",
+            ))?;
+        let mut offsets_by_event = BTreeMap::<usize, Vec<usize>>::new();
+        for (controller_index, controller) in pattern.controllers.iter().enumerate() {
+            if (controller.channel, controller.flags) == stream
+                && (start_tick..=end_tick).contains(&controller.position)
+            {
+                let (event_index, record_offset, _) =
+                    self.pattern_controller_record_location(pattern_id, controller_index)?;
+                offsets_by_event
+                    .entry(event_index)
+                    .or_default()
+                    .push(record_offset);
+            }
+        }
+        let removed_count = offsets_by_event.values().map(Vec::len).sum::<usize>();
+        if removed_count == 0 {
+            return Ok(0);
+        }
+
+        let mut candidate = self.clone();
+        for (event_index, mut record_offsets) in offsets_by_event.into_iter().rev() {
+            record_offsets.sort_unstable();
+            let mut payload = candidate.events[event_index].payload.clone();
+            for record_offset in record_offsets.into_iter().rev() {
+                payload.drain(record_offset..record_offset + FLP_PATTERN_CONTROLLER_RECORD_SIZE);
+            }
+            if payload.is_empty() {
+                candidate.events.remove(event_index);
+            } else {
+                candidate.events[event_index].replace_data_payload(payload)?;
+            }
+        }
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(removed_count)
+    }
+
     fn pattern_controller_record_location(
         &self,
         pattern_id: u16,
@@ -18313,6 +18370,86 @@ mod tests {
         let encoded = document.encode_lossless().unwrap();
         let reparsed = FlpDocument::parse(&encoded).expect("spline-edited file should parse");
         assert_eq!(reparsed.patterns().unwrap(), document.patterns().unwrap());
+    }
+
+    #[test]
+    fn delete_pattern_controller_range_removes_only_matching_stream_records() {
+        let target_0 = pattern_controller_record(0, [0xA0, 0xA1], 3, 0x91, 0.0f32.to_bits());
+        let other_24 = pattern_controller_record(24, [0xB0, 0xB1], 7, 0x2A, 0.25f32.to_bits());
+        let target_24 = pattern_controller_record(24, [0xA2, 0xA3], 3, 0x91, 0.2f32.to_bits());
+        let target_48 = pattern_controller_record(48, [0xA4, 0xA5], 3, 0x91, 0.4f32.to_bits());
+        let other_48 = pattern_controller_record(48, [0xB2, 0xB3], 7, 0x2A, 0.5f32.to_bits());
+        let target_72 = pattern_controller_record(72, [0xA6, 0xA7], 3, 0x91, 0.6f32.to_bits());
+        let mut controller_event = Vec::new();
+        let mut first_payload = target_0.to_vec();
+        first_payload.extend_from_slice(&other_24);
+        first_payload.extend_from_slice(&target_24);
+        append_data_event(&mut controller_event, 0xDF, &first_payload);
+        let mut second_payload = target_48.to_vec();
+        second_payload.extend_from_slice(&other_48);
+        second_payload.extend_from_slice(&target_72);
+        append_data_event(&mut controller_event, 0xDF, &second_payload);
+        let unknown_event = [0xFE, 0x02, 0xCA, 0xFE];
+        controller_event.extend_from_slice(&unknown_event);
+        let input = pattern_fixture(&[], &controller_event);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+
+        assert_eq!(
+            document
+                .delete_pattern_controller_range(7, (3, 0x91), 48, 24)
+                .expect("the selected raw stream range should be erased"),
+            2
+        );
+        let controllers = &document.patterns().unwrap()[0].controllers;
+        assert_eq!(controllers.len(), 4);
+        assert_eq!(controllers[0].encode(), target_0);
+        assert_eq!(controllers[1].encode(), other_24);
+        assert_eq!(controllers[2].encode(), other_48);
+        assert_eq!(controllers[3].encode(), target_72);
+        assert_eq!(
+            document
+                .events()
+                .iter()
+                .find(|event| event.opcode() == 0xFE)
+                .expect("unknown event should remain")
+                .wire_bytes(),
+            &unknown_event
+        );
+        let encoded = document.encode_lossless().unwrap();
+        let reparsed = FlpDocument::parse(&encoded).expect("erased file should parse");
+        assert_eq!(reparsed.patterns().unwrap(), document.patterns().unwrap());
+
+        let mut all_stream_payload = target_24.to_vec();
+        all_stream_payload.extend_from_slice(&target_48);
+        let mut all_stream_event = Vec::new();
+        append_data_event(&mut all_stream_event, 0xDF, &all_stream_payload);
+        all_stream_event.extend_from_slice(&unknown_event);
+        let all_stream_input = pattern_fixture(&[], &all_stream_event);
+        let mut all_stream_document =
+            FlpDocument::parse(&all_stream_input).expect("single stream fixture should parse");
+        assert_eq!(
+            all_stream_document
+                .delete_pattern_controller_range(7, (3, 0x91), 0, u32::MAX)
+                .expect("the selected stream should be erased"),
+            2
+        );
+        assert!(
+            all_stream_document.patterns().unwrap()[0]
+                .controllers
+                .is_empty()
+        );
+        assert!(
+            all_stream_document
+                .events()
+                .iter()
+                .all(|event| event.opcode() != 0xDF)
+        );
+        assert!(
+            all_stream_document
+                .events()
+                .iter()
+                .any(|event| event.opcode() == 0xFE)
+        );
     }
 
     #[test]

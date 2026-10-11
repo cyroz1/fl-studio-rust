@@ -71,6 +71,7 @@ const GREEN: Color32 = Color32::from_rgb(14, 175, 98);
 const BLUE: Color32 = Color32::from_rgb(59, 99, 251);
 const BLUE_TEXT: Color32 = Color32::from_rgb(86, 129, 255);
 const BLUE_SELECTION: Color32 = Color32::from_rgb(14, 23, 63);
+const RED_SELECTION: Color32 = Color32::from_rgb(62, 22, 20);
 const PURPLE: Color32 = Color32::from_rgb(150, 93, 181);
 const ORANGE: Color32 = Color32::from_rgb(195, 129, 61);
 const RED: Color32 = Color32::from_rgb(252, 67, 46);
@@ -606,6 +607,14 @@ enum PianoRollControllerTool {
     Draw,
     Paint,
     Interpolate,
+    Erase,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PianoRollControllerRangeOperation {
+    Linear,
+    Spline,
+    Erase,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -622,7 +631,7 @@ struct PianoRollControllerSelectionDrag {
     stream: (u8, u8),
     start_tick: u32,
     current_tick: u32,
-    spline: bool,
+    operation: PianoRollControllerRangeOperation,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -19550,6 +19559,12 @@ impl DawUi {
             .on_hover_text(
                 "Left-drag for linear interpolation; right-drag for spline interpolation",
             );
+            ui.selectable_value(
+                &mut self.piano_roll_controller_tool,
+                PianoRollControllerTool::Erase,
+                "Erase",
+            )
+            .on_hover_text("Drag across the selected raw stream to erase its points");
             if !streams.is_empty() {
                 let selected_text = self.piano_roll_controller_stream.map_or_else(
                     || "All raw points".to_owned(),
@@ -19579,6 +19594,7 @@ impl DawUi {
                 PianoRollControllerTool::Draw => "Drag in the lane to draw · uses current snap",
                 PianoRollControllerTool::Paint => "Drag in the lane to paint · snap is bypassed",
                 PianoRollControllerTool::Interpolate => "Left-drag: linear · right-drag: spline",
+                PianoRollControllerTool::Erase => "Drag across points to erase the selected range",
             });
         });
 
@@ -19698,20 +19714,29 @@ impl DawUi {
                     plot_rect.bottom(),
                 ),
             );
-            painter.rect_filled(selection_rect, 0, BLUE_SELECTION);
+            let is_erase_selection = active_selection.is_some_and(|selection| {
+                selection.operation == PianoRollControllerRangeOperation::Erase
+            });
+            let selection_color = if is_erase_selection {
+                RED_SELECTION
+            } else {
+                BLUE_SELECTION
+            };
+            let edge_color = if is_erase_selection { RED } else { BLUE };
+            painter.rect_filled(selection_rect, 0, selection_color);
             painter.line_segment(
                 [
                     egui::pos2(left_x, plot_rect.top()),
                     egui::pos2(left_x, plot_rect.bottom()),
                 ],
-                Stroke::new(1.0, BLUE),
+                Stroke::new(1.0, edge_color),
             );
             painter.line_segment(
                 [
                     egui::pos2(right_x, plot_rect.top()),
                     egui::pos2(right_x, plot_rect.bottom()),
                 ],
-                Stroke::new(1.0, BLUE),
+                Stroke::new(1.0, edge_color),
             );
         }
         let mut hovered_point = false;
@@ -19739,15 +19764,21 @@ impl DawUi {
                 x,
                 egui::lerp(plot_rect.bottom()..=plot_rect.top(), normalized),
             );
-            let is_interpolate_selected = active_selection.is_some_and(|selection| {
+            let is_range_selected = active_selection.is_some_and(|selection| {
                 controller.channel == selection.stream.0
                     && controller.flags == selection.stream.1
                     && (selection.start_tick.min(selection.current_tick)
                         ..=selection.start_tick.max(selection.current_tick))
                         .contains(&controller.position)
             });
-            let color = if is_interpolate_selected {
-                BLUE_TEXT
+            let color = if is_range_selected {
+                if active_selection.is_some_and(|selection| {
+                    selection.operation == PianoRollControllerRangeOperation::Erase
+                }) {
+                    RED
+                } else {
+                    BLUE_TEXT
+                }
             } else if value.is_finite() {
                 MIDI_CHANNEL_COLORS[usize::from(controller.channel) % MIDI_CHANNEL_COLORS.len()]
             } else {
@@ -19971,8 +20002,10 @@ impl DawUi {
             self.piano_roll_controller_stroke = None;
         }
 
-        if self.piano_roll_controller_tool == PianoRollControllerTool::Interpolate
-            && !self.piano_roll_select_mode
+        if matches!(
+            self.piano_roll_controller_tool,
+            PianoRollControllerTool::Interpolate | PianoRollControllerTool::Erase
+        ) && !self.piano_roll_select_mode
             && !self.piano_roll_zoom_mode
             && !self.piano_roll_playback_mode
         {
@@ -19982,9 +20015,21 @@ impl DawUi {
                     input.pointer.button_down(PointerButton::Secondary),
                 )
             });
-            let any_button_down = primary_down || secondary_down;
+            let active_operation = self
+                .piano_roll_controller_selection
+                .filter(|selection| selection.pattern_id == pattern.id)
+                .map(|selection| selection.operation);
+            let selection_button_down = match active_operation {
+                Some(PianoRollControllerRangeOperation::Spline) => secondary_down,
+                Some(PianoRollControllerRangeOperation::Linear)
+                | Some(PianoRollControllerRangeOperation::Erase) => primary_down,
+                None if self.piano_roll_controller_tool == PianoRollControllerTool::Erase => {
+                    primary_down
+                }
+                None => primary_down || secondary_down,
+            };
             let drag_started = plot_response.is_pointer_button_down_on()
-                && any_button_down
+                && selection_button_down
                 && self.piano_roll_controller_selection.is_none();
             if drag_started && let Some(pointer) = plot_response.interact_pointer_pos() {
                 let stream = self.piano_roll_controller_stream.or_else(|| {
@@ -19993,7 +20038,8 @@ impl DawUi {
                         .flatten()
                 });
                 let Some(stream) = stream else {
-                    self.status = "Choose a raw controller stream before interpolating".to_owned();
+                    self.status =
+                        "Choose a raw controller stream before editing its range".to_owned();
                     self.piano_roll_controller_selection = None;
                     return;
                 };
@@ -20003,14 +20049,22 @@ impl DawUi {
                     + geometry.horizontal_scroll)
                     / geometry.tick_scale.max(0.001);
                 let tick = timeline_x.round().clamp(0.0, u32::MAX as f32) as u32;
+                let operation = if self.piano_roll_controller_tool == PianoRollControllerTool::Erase
+                {
+                    PianoRollControllerRangeOperation::Erase
+                } else if secondary_down {
+                    PianoRollControllerRangeOperation::Spline
+                } else {
+                    PianoRollControllerRangeOperation::Linear
+                };
                 self.piano_roll_controller_selection = Some(PianoRollControllerSelectionDrag {
                     pattern_id: pattern.id,
                     stream,
                     start_tick: tick,
                     current_tick: tick,
-                    spline: secondary_down,
+                    operation,
                 });
-            } else if any_button_down
+            } else if selection_button_down
                 && let Some(pointer) = plot_response.interact_pointer_pos()
                 && let Some(mut selection) = self
                     .piano_roll_controller_selection
@@ -20022,34 +20076,53 @@ impl DawUi {
                     / geometry.tick_scale.max(0.001);
                 selection.current_tick = timeline_x.round().clamp(0.0, u32::MAX as f32) as u32;
                 self.piano_roll_controller_selection = Some(selection);
-            } else if !any_button_down
+            } else if !selection_button_down
                 && let Some(selection) = self.piano_roll_controller_selection.take()
                 && selection.pattern_id == pattern.id
                 && let Some(document) = &mut self.document
             {
-                let interpolation_result = if selection.spline {
-                    document.spline_pattern_controller_range(
-                        pattern.id,
-                        selection.stream,
-                        selection.start_tick,
-                        selection.current_tick,
-                    )
-                } else {
-                    document.linearize_pattern_controller_range(
-                        pattern.id,
-                        selection.stream,
-                        selection.start_tick,
-                        selection.current_tick,
-                    )
+                let range_result = match selection.operation {
+                    PianoRollControllerRangeOperation::Linear => document
+                        .linearize_pattern_controller_range(
+                            pattern.id,
+                            selection.stream,
+                            selection.start_tick,
+                            selection.current_tick,
+                        ),
+                    PianoRollControllerRangeOperation::Spline => document
+                        .spline_pattern_controller_range(
+                            pattern.id,
+                            selection.stream,
+                            selection.start_tick,
+                            selection.current_tick,
+                        ),
+                    PianoRollControllerRangeOperation::Erase => document
+                        .delete_pattern_controller_range(
+                            pattern.id,
+                            selection.stream,
+                            selection.start_tick,
+                            selection.current_tick,
+                        ),
                 };
-                match interpolation_result {
+                match range_result {
                     Ok(changed) if changed > 0 => {
                         self.dirty = true;
-                        self.status = if selection.spline {
-                            format!("Spline-interpolated {changed} raw Pattern controller points")
-                        } else {
-                            format!("Linearized {changed} raw Pattern controller points")
+                        self.status = match selection.operation {
+                            PianoRollControllerRangeOperation::Linear => {
+                                format!("Linearized {changed} raw Pattern controller points")
+                            }
+                            PianoRollControllerRangeOperation::Spline => {
+                                format!(
+                                    "Spline-interpolated {changed} raw Pattern controller points"
+                                )
+                            }
+                            PianoRollControllerRangeOperation::Erase => {
+                                format!("Erased {changed} raw Pattern controller points")
+                            }
                         };
+                    }
+                    Ok(_) if selection.operation == PianoRollControllerRangeOperation::Erase => {
+                        self.status = "No raw controller points in the selected range".to_owned();
                     }
                     Ok(_) => {
                         self.status =
@@ -20057,11 +20130,12 @@ impl DawUi {
                                 .to_owned();
                     }
                     Err(error) => {
-                        self.status = format!("Could not interpolate raw Pattern points: {error}");
+                        self.status =
+                            format!("Could not edit raw Pattern controller points: {error}");
                     }
                 }
             }
-            if !any_button_down && self.piano_roll_controller_selection.is_some() {
+            if !selection_button_down && self.piano_roll_controller_selection.is_some() {
                 self.piano_roll_controller_selection = None;
             }
         } else {
