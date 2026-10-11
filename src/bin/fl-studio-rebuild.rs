@@ -729,6 +729,8 @@ enum PianoRollSelectionCommand {
     RandomOne,
     RandomMore,
     Odd,
+    Overlapping,
+    Stacked,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -12509,17 +12511,22 @@ impl DawUi {
             .as_ref()
             .map(|document| (u32::from(document.header().ppq()) / 4).max(1))
             .unwrap_or(24);
-        let odd_note_ids = if command == PianoRollSelectionCommand::Odd {
-            pattern
-                .as_ref()
-                .zip(target)
-                .map(|(pattern, (pattern_id, channel_id))| {
+        let special_note_ids = pattern
+            .as_ref()
+            .zip(target)
+            .map(|(pattern, (pattern_id, channel_id))| match command {
+                PianoRollSelectionCommand::Odd => {
                     piano_roll_odd_note_selection(pattern, pattern_id, channel_id, main_grid_ticks)
-                })
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+                }
+                PianoRollSelectionCommand::Overlapping => {
+                    piano_roll_overlap_note_selection(pattern, pattern_id, channel_id, false)
+                }
+                PianoRollSelectionCommand::Stacked => {
+                    piano_roll_overlap_note_selection(pattern, pattern_id, channel_id, true)
+                }
+                _ => Vec::new(),
+            })
+            .unwrap_or_default();
         self.selected_piano_notes.clear();
         let status =
             match command {
@@ -12540,11 +12547,20 @@ impl DawUi {
                 }
                 PianoRollSelectionCommand::Clear => "Note selection cleared".to_owned(),
                 PianoRollSelectionCommand::Odd => {
-                    self.selected_piano_notes.extend(odd_note_ids);
+                    self.selected_piano_notes.extend(special_note_ids);
                     format!(
                         "Selected {} notes off the main beat grid",
                         self.selected_piano_notes.len()
                     )
+                }
+                PianoRollSelectionCommand::Overlapping | PianoRollSelectionCommand::Stacked => {
+                    self.selected_piano_notes.extend(special_note_ids);
+                    let label = if command == PianoRollSelectionCommand::Overlapping {
+                        "overlapping"
+                    } else {
+                        "stacked"
+                    };
+                    format!("Selected {} {label} notes", self.selected_piano_notes.len())
                 }
                 PianoRollSelectionCommand::RandomOne | PianoRollSelectionCommand::RandomMore => {
                     let select_more = command == PianoRollSelectionCommand::RandomMore;
@@ -13545,6 +13561,26 @@ impl DawUi {
                     .clicked()
                 {
                     self.apply_piano_roll_selection_command(PianoRollSelectionCommand::Odd);
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        channel_note_count > 1,
+                        egui::Button::new("Select overlapping notes"),
+                    )
+                    .clicked()
+                {
+                    self.apply_piano_roll_selection_command(PianoRollSelectionCommand::Overlapping);
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        channel_note_count > 1,
+                        egui::Button::new("Select stacked notes"),
+                    )
+                    .clicked()
+                {
+                    self.apply_piano_roll_selection_command(PianoRollSelectionCommand::Stacked);
                     ui.close();
                 }
                 if ui
@@ -21884,6 +21920,106 @@ fn piano_roll_odd_note_selection(
         .collect()
 }
 
+fn piano_roll_overlap_note_selection(
+    pattern: &Pattern,
+    pattern_id: u16,
+    channel_id: u16,
+    stacked_only: bool,
+) -> Vec<(u16, u16, usize)> {
+    let channel_notes = pattern
+        .notes
+        .iter()
+        .filter(|note| note.channel_id == channel_id)
+        .enumerate();
+    let mut selected_indices = BTreeSet::new();
+
+    if stacked_only {
+        let mut notes_by_span = BTreeMap::<(u32, u32), Vec<(usize, u16)>>::new();
+        for (note_index, note) in channel_notes {
+            if note.length > 0 {
+                notes_by_span
+                    .entry((note.position, note.length))
+                    .or_default()
+                    .push((note_index, note.key));
+            }
+        }
+        for notes in notes_by_span.values() {
+            piano_roll_select_component_above_lowest(notes, &mut selected_indices);
+        }
+    } else {
+        let mut intervals = pattern
+            .notes
+            .iter()
+            .filter(|note| note.channel_id == channel_id)
+            .enumerate()
+            .filter_map(|(note_index, note)| {
+                (note.length > 0).then_some((
+                    u64::from(note.position),
+                    u64::from(note.position) + u64::from(note.length),
+                    note_index,
+                    note.key,
+                ))
+            })
+            .collect::<Vec<_>>();
+        intervals.sort_by_key(|(start, end, note_index, _)| (*start, *end, *note_index));
+
+        let mut component = Vec::new();
+        let mut component_end = 0_u64;
+        for (start, end, note_index, key) in intervals {
+            if !component.is_empty() && start >= component_end {
+                piano_roll_select_component_above_lowest(&component, &mut selected_indices);
+                component.clear();
+            }
+            if component.is_empty() {
+                component_end = end;
+            } else {
+                component_end = component_end.max(end);
+            }
+            component.push((note_index, key));
+        }
+        piano_roll_select_component_above_lowest(&component, &mut selected_indices);
+    }
+
+    let selected_groups = pattern
+        .notes
+        .iter()
+        .filter(|note| note.channel_id == channel_id)
+        .enumerate()
+        .filter(|(note_index, _)| selected_indices.contains(note_index))
+        .map(|(_, note)| note.group)
+        .filter(|group| *group != 0)
+        .collect::<BTreeSet<_>>();
+
+    pattern
+        .notes
+        .iter()
+        .filter(|note| note.channel_id == channel_id)
+        .enumerate()
+        .filter(|(note_index, note)| {
+            selected_indices.contains(note_index)
+                || (note.group != 0 && selected_groups.contains(&note.group))
+        })
+        .map(|(note_index, _)| (pattern_id, channel_id, note_index))
+        .collect()
+}
+
+fn piano_roll_select_component_above_lowest(
+    notes: &[(usize, u16)],
+    selected_indices: &mut BTreeSet<usize>,
+) {
+    let Some((lowest_index, _)) = notes
+        .iter()
+        .min_by_key(|(note_index, key)| (*key, *note_index))
+    else {
+        return;
+    };
+    selected_indices.extend(
+        notes
+            .iter()
+            .filter_map(|(note_index, _)| (note_index != lowest_index).then_some(*note_index)),
+    );
+}
+
 fn piano_roll_random_note_selection(
     pattern: &Pattern,
     pattern_id: u16,
@@ -24343,10 +24479,11 @@ mod tests {
         note_from_grid_position, parse_midi_device_selections, piano_roll_color_group_note_ids,
         piano_roll_controller_value_at, piano_roll_controller_value_range,
         piano_roll_discard_length_edit, piano_roll_note_group_members, piano_roll_note_nudge_edit,
-        piano_roll_odd_note_selection, piano_roll_random_note_selection,
-        playlist_audio_clip_join_candidates, playlist_audio_drop_position_ticks,
-        playlist_bar_ticks, playlist_clip_drag_edit, playlist_clip_local_recording_offset,
-        playlist_clip_split_position, playlist_group_parent_ids, playlist_measure_boundaries,
+        piano_roll_odd_note_selection, piano_roll_overlap_note_selection,
+        piano_roll_random_note_selection, playlist_audio_clip_join_candidates,
+        playlist_audio_drop_position_ticks, playlist_bar_ticks, playlist_clip_drag_edit,
+        playlist_clip_local_recording_offset, playlist_clip_split_position,
+        playlist_group_parent_ids, playlist_measure_boundaries,
         playlist_pattern_clip_join_candidates, playlist_seek_tick_to_frame,
         playlist_signature_at_tick, playlist_song_position_label, playlist_track_group_range,
         playlist_track_is_hidden, recolor_piano_roll_notes, snap_note_tick,
@@ -24503,6 +24640,40 @@ mod tests {
             vec![(7, 2, 1), (7, 2, 2), (7, 2, 3)]
         );
         assert!(piano_roll_odd_note_selection(&pattern, 7, 2, 0).is_empty());
+    }
+
+    #[test]
+    fn piano_roll_overlap_selection_is_channel_scoped_and_keeps_groups_together() {
+        let note = |position, length, key, channel_id, group| PatternNote {
+            position,
+            length,
+            key,
+            channel_id,
+            group,
+            ..PatternNote::default()
+        };
+        let pattern = Pattern {
+            id: 7,
+            notes: vec![
+                note(0, 96, 48, 2, 0),
+                note(24, 48, 60, 2, 7),
+                note(24, 48, 72, 2, 0),
+                note(96, 24, 55, 2, 0),
+                note(24, 48, 90, 3, 0),
+                note(200, 24, 64, 2, 7),
+                note(240, 0, 100, 2, 0),
+            ],
+            ..Pattern::default()
+        };
+
+        assert_eq!(
+            piano_roll_overlap_note_selection(&pattern, 7, 2, false),
+            vec![(7, 2, 1), (7, 2, 2), (7, 2, 4)]
+        );
+        assert_eq!(
+            piano_roll_overlap_note_selection(&pattern, 7, 2, true),
+            vec![(7, 2, 2), (7, 2, 4)]
+        );
     }
 
     #[test]
