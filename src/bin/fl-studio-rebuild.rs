@@ -577,6 +577,13 @@ enum PianoRollMouseWheelAction {
     NudgePosition,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PianoRollMouseWheelEdit {
+    action: PianoRollMouseWheelAction,
+    ppq: u16,
+    step_delta: i16,
+}
+
 impl PianoRollEventTarget {
     const ALL: [Self; 7] = [
         Self::Velocity,
@@ -12801,9 +12808,7 @@ impl DawUi {
         pattern_id: u16,
         channel_id: u16,
         note_indices: &BTreeSet<usize>,
-        ppq: u16,
-        step_delta: i16,
-        action: PianoRollMouseWheelAction,
+        wheel_edit: PianoRollMouseWheelEdit,
     ) {
         let event_target = self.piano_roll_event_target;
         let channel_notes = pattern
@@ -12815,18 +12820,20 @@ impl DawUi {
             .iter()
             .filter_map(|note_index| {
                 let note = channel_notes.get(*note_index)?;
-                let edit = match action {
+                let edit = match wheel_edit.action {
                     PianoRollMouseWheelAction::AdjustProperty => {
                         let maximum = event_target.maximum();
                         let current = event_target.value(note).min(maximum);
-                        let next = (i32::from(current) + i32::from(step_delta))
+                        let next = (i32::from(current) + i32::from(wheel_edit.step_delta))
                             .clamp(0, i32::from(maximum)) as u16;
                         (next != current).then(|| event_target.edit(next))
                     }
                     PianoRollMouseWheelAction::NudgePosition => {
-                        let ppq_scaled_delta = i64::from(step_delta) * i64::from(ppq.max(1)) / 96;
+                        let ppq_scaled_delta = i64::from(wheel_edit.step_delta)
+                            * i64::from(wheel_edit.ppq.max(1))
+                            / 96;
                         let tick_delta = if ppq_scaled_delta == 0 {
-                            i64::from(step_delta.signum())
+                            i64::from(wheel_edit.step_delta.signum())
                         } else {
                             ppq_scaled_delta
                         };
@@ -12851,12 +12858,12 @@ impl DawUi {
         match result {
             Ok(()) => {
                 self.document = updated_document;
-                if action == PianoRollMouseWheelAction::NudgePosition {
+                if wheel_edit.action == PianoRollMouseWheelAction::NudgePosition {
                     self.stop_project_playback();
                 }
                 self.dirty = true;
                 let noun = if targets.len() == 1 { "note" } else { "notes" };
-                match action {
+                match wheel_edit.action {
                     PianoRollMouseWheelAction::AdjustProperty => {
                         self.status = format!(
                             "Adjusted {} for {} {noun}",
@@ -12865,7 +12872,11 @@ impl DawUi {
                         );
                     }
                     PianoRollMouseWheelAction::NudgePosition => {
-                        let direction = if step_delta < 0 { "left" } else { "right" };
+                        let direction = if wheel_edit.step_delta < 0 {
+                            "left"
+                        } else {
+                            "right"
+                        };
                         self.status = format!("Nudged {} {noun} {direction}", targets.len());
                     }
                 }
@@ -17965,9 +17976,11 @@ impl DawUi {
                             pattern.id,
                             note.channel_id,
                             &target_note_indices,
-                            ppq,
-                            step_delta,
-                            action,
+                            PianoRollMouseWheelEdit {
+                                action,
+                                ppq,
+                                step_delta,
+                            },
                         );
                     }
                 }
