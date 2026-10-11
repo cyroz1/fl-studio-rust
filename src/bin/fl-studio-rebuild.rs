@@ -3459,6 +3459,49 @@ impl DawUi {
         self.write_state_preset_file(path, preset_bytes, "Mixer state");
     }
 
+    fn load_mixer_insert_state_preset(&mut self, insert_ordinal: usize) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Load Mixer state preset")
+            .add_filter("FL Studio Mixer state", &["fst"])
+            .pick_file()
+        else {
+            return;
+        };
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.status = format!(
+                    "Could not read Mixer state preset {}: {error}",
+                    path.display()
+                );
+                return;
+            }
+        };
+        let preset = match FstPreset::parse(&bytes) {
+            Ok(preset) => preset,
+            Err(error) => {
+                self.status = format!("Could not parse Mixer state preset: {error}");
+                return;
+            }
+        };
+        let Some(document) = self.document.as_mut() else {
+            self.status = "Open a project before loading a Mixer state".to_owned();
+            return;
+        };
+        match document.apply_mixer_insert_state_preset(insert_ordinal, &preset) {
+            Ok(event_count) => {
+                self.dirty = true;
+                self.status = format!(
+                    "Loaded {event_count} Mixer effect-state events into insert {insert_ordinal} from {}",
+                    path.display()
+                );
+            }
+            Err(error) => {
+                self.status = format!("Could not load Mixer state preset: {error}");
+            }
+        }
+    }
+
     fn choose_state_preset_path(&self, title: &str, file_name: &str) -> Option<PathBuf> {
         let path = rfd::FileDialog::new()
             .set_title(title)
@@ -19997,6 +20040,7 @@ impl DawUi {
         let mut rename_edits = Vec::new();
         let mut flag_edits = Vec::new();
         let mut parameter_edits = Vec::new();
+        let mut load_insert_state = None;
         let mut save_insert_state = None;
         let available_height = ui.available_height();
         let inspector_width = 238.0_f32.min((ui.available_width() * 0.3).max(190.0));
@@ -20316,7 +20360,7 @@ impl DawUi {
                             .iter()
                             .filter(|slot| slot.insert_ordinal() == insert.ordinal())
                             .collect::<Vec<_>>();
-                        let has_final_slot_boundary = insert_slots.get(9).is_some_and(|slot| {
+                        let final_slot_boundary_is_present = insert_slots.get(9).is_some_and(|slot| {
                             let closing_index = slot.event_range().end;
                             let insert_range = insert.event_range();
                             insert_range.start <= closing_index
@@ -20331,7 +20375,19 @@ impl DawUi {
                             && insert_slots.iter().enumerate().all(|(expected, slot)| {
                                 usize::from(slot.slot_index()) == expected
                             })
-                            && has_final_slot_boundary;
+                            && final_slot_boundary_is_present;
+                        if ui
+                            .add_enabled(
+                                complete_effect_slots,
+                                egui::Button::new("Load Mixer state…"),
+                            )
+                            .on_hover_text(
+                                "Replace this insert's ten saved effect-slot records from a Mixer .fst preset",
+                            )
+                            .clicked()
+                        {
+                            load_insert_state = Some(insert.ordinal());
+                        }
                         if ui
                             .add_enabled(
                                 complete_effect_slots,
@@ -20496,7 +20552,7 @@ impl DawUi {
                             }
                             ui.small(
                                 egui::RichText::new(
-                                    "Saved plug-in state is shown as metadata; loading and processing are not available yet.",
+                                    "State events are preserved and can be transferred from a Mixer preset; plug-ins are not hosted or processed in this view.",
                                 )
                                 .color(MUTED),
                             );
@@ -20569,6 +20625,9 @@ impl DawUi {
             );
         });
 
+        if let Some(insert_ordinal) = load_insert_state {
+            self.load_mixer_insert_state_preset(insert_ordinal);
+        }
         if let Some((insert_ordinal, insert_name)) = save_insert_state {
             self.save_mixer_insert_state_preset(insert_ordinal, &insert_name);
         }
