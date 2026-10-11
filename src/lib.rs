@@ -1659,7 +1659,7 @@ pub struct MixerInsertSummary {
     end_event_index: usize,
 }
 
-/// Read-only description of one Mixer effect slot bounded by its `0x62` close event.
+/// Read-only description of one Mixer effect slot bounded by its closing marker.
 /// The original events and plug-in payload stay lossless in [`FlpDocument::events`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MixerEffectSlotSummary {
@@ -1678,7 +1678,7 @@ impl MixerEffectSlotSummary {
         self.insert_ordinal
     }
 
-    /// Zero-based slot number carried by the `0x62` close event.
+    /// Zero-based effect-slot index in the insert.
     pub fn slot_index(&self) -> u16 {
         self.slot_index
     }
@@ -1698,7 +1698,7 @@ impl MixerEffectSlotSummary {
         self.state_event_count
     }
 
-    /// Events assigned to this slot, excluding its `0x62` close event.
+    /// Events assigned to this slot, excluding its closing marker when present.
     pub fn event_range(&self) -> std::ops::Range<usize> {
         self.first_event_index..self.end_event_index
     }
@@ -4507,32 +4507,21 @@ impl FlpDocument {
     }
 
     /// Reads the ten Mixer effect slots for inserts whose `0x62` boundaries appear in
-    /// zero-through-nine order. A complete boundary set is required so an unrelated legacy
-    /// `0x62` marker cannot be mistaken for an FX slot. Plug-in state remains opaque and lossless.
+    /// zero-through-nine order. The first boundary precedes slot zero's data; boundaries one
+    /// through nine close slots zero through eight, and the following `0x93` closes slot nine
+    /// when present. A complete boundary set is required so an unrelated legacy `0x62` marker
+    /// cannot be mistaken for an FX slot. Plug-in state remains opaque and lossless.
     pub fn mixer_effect_slots(&self) -> Vec<MixerEffectSlotSummary> {
         let mut slots = Vec::new();
         for insert in self.mixer_inserts() {
             let first_slot_event = insert.first_event_index + 3;
-            let mut next_slot_index = 0_u16;
+            let mut next_boundary_index = 0_u16;
             let mut slot_start = first_slot_event;
             let mut insert_slots = Vec::new();
+            let mut first_boundary_seen = false;
 
-            for boundary_index in first_slot_event..insert.end_event_index {
-                let boundary = &self.events[boundary_index];
-                if boundary.opcode != 0x62
-                    || boundary.encoding != PayloadEncoding::Word
-                    || boundary.payload.len() != 2
-                {
-                    continue;
-                }
-
-                let slot_index = u16::from_le_bytes([boundary.payload[0], boundary.payload[1]]);
-                if slot_index != next_slot_index {
-                    insert_slots.clear();
-                    break;
-                }
-
-                let slot_events = &self.events[slot_start..boundary_index];
+            let summarize_slot = |slot_index, start, end| {
+                let slot_events = &self.events[start..end];
                 let plugin_identifier = unique_project_string_in_events(
                     slot_events,
                     0xC9,
@@ -4547,23 +4536,55 @@ impl FlpDocument {
                     .iter()
                     .filter(|event| event.opcode == 0xD5)
                     .count();
-                insert_slots.push(MixerEffectSlotSummary {
+                MixerEffectSlotSummary {
                     insert_ordinal: insert.ordinal,
                     slot_index,
                     plugin_identifier,
                     display_name,
                     state_event_count,
-                    first_event_index: slot_start,
-                    end_event_index: boundary_index,
-                });
+                    first_event_index: start,
+                    end_event_index: end,
+                }
+            };
+
+            for boundary_index in first_slot_event..insert.end_event_index {
+                let boundary = &self.events[boundary_index];
+                if boundary.opcode != 0x62
+                    || boundary.encoding != PayloadEncoding::Word
+                    || boundary.payload.len() != 2
+                {
+                    continue;
+                }
+
+                let slot_index = u16::from_le_bytes([boundary.payload[0], boundary.payload[1]]);
+                if slot_index != next_boundary_index {
+                    insert_slots.clear();
+                    break;
+                }
+
+                if !first_boundary_seen {
+                    first_boundary_seen = true;
+                    next_boundary_index += 1;
+                    continue;
+                }
+
+                insert_slots.push(summarize_slot(slot_index - 1, slot_start, boundary_index));
                 slot_start = boundary_index + 1;
-                next_slot_index += 1;
-                if next_slot_index == 10 {
+                next_boundary_index += 1;
+                if next_boundary_index == 10 {
                     break;
                 }
             }
 
-            if next_slot_index == 10 {
+            if next_boundary_index == 10 {
+                let last_slot_end = (slot_start..insert.end_event_index)
+                    .find(|&event_index| {
+                        self.events[event_index].opcode == 0x93
+                            && self.events[event_index].encoding == PayloadEncoding::Dword
+                            && self.events[event_index].payload.len() == 4
+                    })
+                    .unwrap_or(insert.end_event_index);
+                insert_slots.push(summarize_slot(9, slot_start, last_slot_end));
                 slots.extend(insert_slots);
             }
         }
@@ -15078,13 +15099,18 @@ mod tests {
         event_stream.extend_from_slice(&(-1_i32).to_le_bytes());
         event_stream.push(0x95);
         event_stream.extend_from_slice(&0_u32.to_le_bytes());
+        event_stream.push(0x62);
+        event_stream.extend_from_slice(&0_u16.to_le_bytes());
         append_data_event(&mut event_stream, 0xC9, b"Fruity Parametric EQ 2\0");
         append_data_event(&mut event_stream, 0xCB, b"Drum EQ\0");
         append_data_event(&mut event_stream, 0xD5, &[0xA1, 0xB2, 0xC3]);
-        for slot_index in 0_u16..10 {
+        for slot_index in 1_u16..10 {
             event_stream.push(0x62);
             event_stream.extend_from_slice(&slot_index.to_le_bytes());
         }
+        event_stream.push(0x93);
+        event_stream.extend_from_slice(&(-1_i32).to_le_bytes());
+        append_data_event(&mut event_stream, 0xC9, b"outside the insert\0");
 
         let original = flp_fixture(&event_stream, &[], &[]);
         let document = FlpDocument::parse(&original).expect("the fixture should parse");
@@ -15096,11 +15122,14 @@ mod tests {
         assert_eq!(slots[0].plugin_identifier(), Some("Fruity Parametric EQ 2"));
         assert_eq!(slots[0].display_name(), Some("Drum EQ"));
         assert_eq!(slots[0].state_event_count(), 1);
-        assert_eq!(slots[0].event_range(), 3..6);
+        assert_eq!(slots[0].event_range(), 3..7);
         assert_eq!(slots[1].slot_index(), 1);
         assert_eq!(slots[1].plugin_identifier(), None);
         assert_eq!(slots[1].display_name(), None);
         assert_eq!(slots[1].state_event_count(), 0);
+        assert_eq!(slots[9].slot_index(), 9);
+        assert_eq!(slots[9].plugin_identifier(), None);
+        assert_eq!(slots[9].event_range(), 16..16);
         assert_eq!(
             document
                 .encode_lossless()
