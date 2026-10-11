@@ -8981,23 +8981,15 @@ impl DawUi {
                                         }),
                                 _ => None,
                             };
-                            let full_source_length_ms =
-                                (clip.start_offset == -1.0 && clip.end_offset == -1.0)
-                                    .then_some(sample_length_ms)
-                                    .flatten();
-                            let source_window_ms = if clip.start_offset == -1.0
-                                && clip.end_offset == -1.0
-                            {
-                                full_source_length_ms.map(|length_ms| (0.0, length_ms))
-                            } else if clip.start_offset.is_finite()
-                                && clip.end_offset.is_finite()
-                                && clip.start_offset >= 0.0
-                                && clip.end_offset > clip.start_offset
-                            {
-                                Some((clip.start_offset, clip.end_offset))
-                            } else {
-                                None
-                            };
+                            let source_window_ms = clip
+                                .source_window_milliseconds()
+                                .map(|(start_ms, end_ms)| (start_ms as f32, end_ms as f32))
+                                .or_else(|| {
+                                    clip.uses_full_source_window()
+                                        .then_some(sample_length_ms)
+                                        .flatten()
+                                        .map(|length_ms| (0.0, length_ms))
+                                });
                             let source_window_supported = source_window_ms.is_some();
                             let scale_supported = clip.scale.is_none_or(|scale| {
                                 scale.is_finite() && scale > 0.0 && (scale - 1.0).abs() <= 1e-9
@@ -9034,12 +9026,15 @@ impl DawUi {
                                 });
                             let tempo_supported = self.tempo_bpm.is_finite() && self.tempo_bpm > 0.0;
                             let can_slip_clip = is_audio_clip
+                                && !clip.has_opaque_record_tail()
                                 && source_window_can_slip
                                 && scale_supported
                                 && !tempo_automation_overlaps_clip
                                 && tempo_supported;
                             let slip_unavailable_reason = if !is_audio_clip {
                                 "Slip applies to Audio Clips"
+                            } else if clip.has_opaque_record_tail() {
+                                "Slip editing for this FL Studio clip format is not available yet"
                             } else if sample_length_ms.is_none() {
                                 "Wait for the source waveform to load so its duration is known"
                             } else if source_window_ms.is_none() {
@@ -9061,11 +9056,14 @@ impl DawUi {
                                 "This clip uses the entire sample and has no room to slip"
                             };
                             let can_split_clip = is_audio_clip
+                                && !clip.has_opaque_record_tail()
                                 && context_split_position.is_some()
                                 && source_window_supported
                                 && scale_supported
                                 && !tempo_automation_overlaps;
-                            let drag_hint = if self.playlist_slip_tool_active && is_audio_clip {
+                            let drag_hint = if clip.has_opaque_record_tail() {
+                                "Drag to move. Resizing and source-window editing are unavailable for this FL Studio clip format."
+                            } else if self.playlist_slip_tool_active && is_audio_clip {
                                 if can_slip_clip {
                                     "Slip tool selected: drag inside to slide the sample source. Hold Alt to ignore the 1/16 grid."
                                 } else {
@@ -9110,6 +9108,8 @@ impl DawUi {
                                     );
                                     let split_hint = if context_split_position.is_none() {
                                         "Right-click inside the clip, away from its edges"
+                                    } else if clip.has_opaque_record_tail() {
+                                        "Splitting this FL Studio clip format is not available yet"
                                     } else if !source_window_supported {
                                         "Wait for the waveform to load so the sample duration is known"
                                     } else if !scale_supported {
@@ -9157,8 +9157,19 @@ impl DawUi {
                                     if let Some(selected_indices) = self
                                         .selected_playlist_pattern_clip_indices(arrangement.id)
                                         && ui
-                                            .button(
-                                                "Merge selected Pattern Clips  Ctrl/Cmd+G",
+                                            .add_enabled(
+                                                selected_indices.iter().all(|selected_index| {
+                                                    arrangement
+                                                        .clips
+                                                        .get(*selected_index)
+                                                        .is_some_and(|clip| !clip.has_opaque_record_tail())
+                                                }),
+                                                egui::Button::new(
+                                                    "Merge selected Pattern Clips  Ctrl/Cmd+G",
+                                                ),
+                                            )
+                                            .on_disabled_hover_text(
+                                                "Merging this FL Studio clip format is not available yet",
                                             )
                                             .clicked()
                                     {
@@ -9203,8 +9214,9 @@ impl DawUi {
                                     .input(|input| input.pointer.press_origin())
                                     .or_else(|| response.interact_pointer_pos())
                             {
-                                let resize = ui.input(|input| input.modifiers.shift)
+                                let resize_requested = ui.input(|input| input.modifiers.shift)
                                     && pointer.x >= clip_rect.right() - 8.0;
+                                let resize = resize_requested && !clip.has_opaque_record_tail();
                                 self.selected_arrangement = Some(arrangement.id);
                                 self.selected_clip = Some(clip_index);
                                 self.selected_playlist_clips.clear();
@@ -9212,7 +9224,9 @@ impl DawUi {
                                 self.playlist_selection_anchor = Some(clip_index);
                                 let slip_requested =
                                     self.playlist_slip_tool_active && is_audio_clip && !resize;
-                                if slip_requested && !can_slip_clip {
+                                if resize_requested && !resize {
+                                    self.status = "Resizing this FL Studio clip format is not available yet".to_owned();
+                                } else if slip_requested && !can_slip_clip {
                                     self.status = slip_unavailable_reason.to_owned();
                                 } else {
                                     let (start_source_start_ms, start_source_end_ms) =
@@ -10072,6 +10086,7 @@ impl DawUi {
         let mut raw_track_index = clip.raw_track_index;
         let mut group = clip.group;
         let mut item_flags = clip.item_flags;
+        let has_opaque_tail = clip.has_opaque_record_tail();
         let mut start_offset = clip.start_offset;
         let mut end_offset = clip.end_offset;
         let mut scale = clip.scale.unwrap_or(1.0);
@@ -10094,7 +10109,10 @@ impl DawUi {
                 .changed();
             ui.label("Length");
             length_changed = ui
-                .add(egui::DragValue::new(&mut length).speed(1.0))
+                .add_enabled(
+                    !clip.has_opaque_record_tail(),
+                    egui::DragValue::new(&mut length).speed(1.0),
+                )
                 .changed();
             duplicate_requested = ui.button("Duplicate after").clicked();
             if ui.button("Deselect").clicked() {
@@ -10124,41 +10142,48 @@ impl DawUi {
                             .speed(0.1),
                     )
                     .changed();
-                item_flags_changed = ui
-                    .add(
-                        egui::DragValue::new(&mut item_flags)
-                            .prefix("Flags raw ")
-                            .speed(0.1),
-                    )
-                    .changed();
-            });
-            ui.horizontal_wrapped(|ui| {
-                start_offset_changed = ui
-                    .add(
-                        egui::DragValue::new(&mut start_offset)
-                            .prefix("Start offset ")
-                            .speed(0.001),
-                    )
-                    .changed();
-                end_offset_changed = ui
-                    .add(
-                        egui::DragValue::new(&mut end_offset)
-                            .prefix("End offset ")
-                            .speed(0.001),
-                    )
-                    .changed();
-                if clip.scale.is_some() {
-                    scale_changed = ui
+                if !has_opaque_tail {
+                    item_flags_changed = ui
                         .add(
-                            egui::DragValue::new(&mut scale)
-                                .prefix("Scale ")
+                            egui::DragValue::new(&mut item_flags)
+                                .prefix("Flags raw ")
+                                .speed(0.1),
+                        )
+                        .changed();
+                }
+            });
+            if !has_opaque_tail {
+                ui.horizontal_wrapped(|ui| {
+                    start_offset_changed = ui
+                        .add(
+                            egui::DragValue::new(&mut start_offset)
+                                .prefix("Start offset ")
                                 .speed(0.001),
                         )
                         .changed();
-                } else {
-                    ui.label("Scale unavailable in this record layout");
-                }
-            });
+                    end_offset_changed = ui
+                        .add(
+                            egui::DragValue::new(&mut end_offset)
+                                .prefix("End offset ")
+                                .speed(0.001),
+                        )
+                        .changed();
+                    if clip.scale.is_some() {
+                        scale_changed = ui
+                            .add(
+                                egui::DragValue::new(&mut scale)
+                                    .prefix("Scale ")
+                                    .speed(0.001),
+                            )
+                            .changed();
+                    } else {
+                        ui.label("Scale unavailable in this record layout");
+                    }
+                });
+            }
+            if has_opaque_tail {
+                ui.label("The clip data tail is preserved; source, fade, and gain fields are not decoded yet");
+            }
         });
         let mut clip_edit_succeeded = true;
         if position_changed
@@ -24430,16 +24455,16 @@ fn draw_audio_clip_waveform(
         return;
     }
     let full_frame_count = waveform.frame_count;
-    let to_frame = |milliseconds: f32| -> Option<u64> {
-        let frame = f64::from(milliseconds) * f64::from(waveform.sample_rate) / 1000.0;
+    let to_frame = |milliseconds: f64| -> Option<u64> {
+        let frame = milliseconds * f64::from(waveform.sample_rate) / 1000.0;
         (frame.is_finite() && frame >= 0.0 && frame <= u64::MAX as f64)
             .then_some(frame.round() as u64)
     };
-    let source_window = if clip.start_offset == -1.0 && clip.end_offset == -1.0 {
+    let source_window = if clip.uses_full_source_window() {
         Some((0, full_frame_count))
     } else {
-        to_frame(clip.start_offset)
-            .zip(to_frame(clip.end_offset))
+        clip.source_window_milliseconds()
+            .and_then(|(start_ms, end_ms)| to_frame(start_ms).zip(to_frame(end_ms)))
             .map(|(start, end)| (start.min(full_frame_count), end.min(full_frame_count)))
             .filter(|(start, end)| start < end)
     };
@@ -24667,6 +24692,9 @@ fn playlist_audio_clip_joinable(
     right: &PlaylistClip,
     channel_kinds: &BTreeMap<u16, Option<u8>>,
 ) -> bool {
+    if left.has_opaque_record_tail() || right.has_opaque_record_tail() {
+        return false;
+    }
     let (
         PlaylistClipTarget::Channel {
             id: left_channel_id,
@@ -24788,6 +24816,9 @@ fn playlist_pattern_clip_joinable(
     right: &PlaylistClip,
     patterns: &[Pattern],
 ) -> bool {
+    if left.has_opaque_record_tail() || right.has_opaque_record_tail() {
+        return false;
+    }
     let (
         flp_rebuild::PlaylistClipTarget::Pattern {
             id: left_pattern_id,

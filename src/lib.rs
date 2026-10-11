@@ -14,7 +14,7 @@ const FLDT: &[u8; 4] = b"FLdt";
 const MIN_HEADER_CONTENT_LENGTH: usize = 6;
 const FLP_NOTE_RECORD_SIZE: usize = 24;
 const FLP_PATTERN_CONTROLLER_RECORD_SIZE: usize = 12;
-const FLP_PLAYLIST_RECORD_SIZES: [usize; 3] = [80, 60, 32];
+const FLP_PLAYLIST_RECORD_SIZES: [usize; 4] = [88, 80, 60, 32];
 const MAX_MERGED_PATTERN_NOTES: usize = 2_000_000;
 const FLP_AUTOMATION_COUNT_OFFSET: usize = 17;
 const FLP_AUTOMATION_POINTS_OFFSET: usize = 21;
@@ -1973,6 +1973,30 @@ impl PlaylistClip {
                 id: self.item_index,
             }
         }
+    }
+
+    /// Returns a decoded legacy source window in milliseconds. The 88-byte
+    /// record tail is opaque and its source window is not decoded. A
+    /// `-1..-1` legacy window means the full source and returns `None` here.
+    pub fn source_window_milliseconds(&self) -> Option<(f64, f64)> {
+        if self.start_offset.is_finite()
+            && self.end_offset.is_finite()
+            && self.start_offset >= 0.0
+            && self.end_offset > self.start_offset
+        {
+            return Some((f64::from(self.start_offset), f64::from(self.end_offset)));
+        }
+        None
+    }
+
+    pub fn uses_full_source_window(&self) -> bool {
+        self.record_size == 88 || (self.start_offset == -1.0 && self.end_offset == -1.0)
+    }
+
+    /// The 88-byte Playlist record tail is preserved verbatim because its
+    /// fields are not yet mapped well enough to edit safely.
+    pub fn has_opaque_record_tail(&self) -> bool {
+        self.record_size == 88
     }
 }
 
@@ -4691,7 +4715,17 @@ impl FlpDocument {
         let event_index = clip.source_event_index;
         let record_size = clip.record_size;
 
-        if edit.scale.is_some() && record_size < 80 {
+        if clip.has_opaque_record_tail()
+            && (edit.item_flags.is_some()
+                || edit.start_offset.is_some()
+                || edit.end_offset.is_some()
+                || edit.scale.is_some())
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "this Playlist record version keeps clip flags, source offsets, and scale in opaque fields",
+            ));
+        }
+        if edit.scale.is_some() && record_size != 80 {
             return Err(FlpError::UnsupportedEdit(
                 "this playlist clip record has no established scale field",
             ));
@@ -4705,6 +4739,11 @@ impl FlpDocument {
             writes.push((record_start + 6, value.to_le_bytes().to_vec()));
         }
         if let Some(value) = edit.length_ticks {
+            if clip.has_opaque_record_tail() {
+                return Err(FlpError::UnsupportedEdit(
+                    "resizing this Playlist record version requires decoding its opaque tail",
+                ));
+            }
             writes.push((record_start + 8, value.to_le_bytes().to_vec()));
         }
         if let Some(value) = edit.raw_track_index {
@@ -4975,7 +5014,7 @@ impl FlpDocument {
             }
             let mut record = event.payload[record_start..record_end].to_vec();
             record[6..8].copy_from_slice(&item_index.to_le_bytes());
-            record[8..12].copy_from_slice(&length_ticks.to_le_bytes());
+            initialize_new_playlist_clip_length(&mut record, length_ticks);
             let clipboard = PlaylistClipClipboard { raw_record: record };
             return self.paste_playlist_clip(
                 arrangement_id,
@@ -5018,9 +5057,9 @@ impl FlpDocument {
         let mut record = event.payload[record_start..record_end].to_vec();
         record[0..4].copy_from_slice(&position_ticks.to_le_bytes());
         record[6..8].copy_from_slice(&item_index.to_le_bytes());
-        record[8..12].copy_from_slice(&length_ticks.to_le_bytes());
+        initialize_new_playlist_clip_length(&mut record, length_ticks);
         record[12..14].copy_from_slice(&raw_track_index.to_le_bytes());
-        if record_size >= 60 {
+        if playlist_record_has_clip_id(record_size) {
             record[32..36]
                 .copy_from_slice(&next_playlist_clip_id(arrangement, None)?.to_le_bytes());
         }
@@ -5158,7 +5197,7 @@ impl FlpDocument {
                 }
                 let mut record = event.payload[record_start..record_end].to_vec();
                 record[6..8].copy_from_slice(&channel_id.to_le_bytes());
-                record[8..12].copy_from_slice(&length_ticks.to_le_bytes());
+                initialize_new_playlist_clip_length(&mut record, length_ticks);
                 record
             };
 
@@ -5372,7 +5411,7 @@ impl FlpDocument {
         let mut record = clipboard.raw_record.clone();
         record[0..4].copy_from_slice(&position_ticks.to_le_bytes());
         record[12..14].copy_from_slice(&raw_track_index.to_le_bytes());
-        if record_size >= 60 {
+        if playlist_record_has_clip_id(record_size) {
             let preferred_id = u32::from_le_bytes(record[32..36].try_into().unwrap());
             record[32..36].copy_from_slice(
                 &next_playlist_clip_id(arrangement, Some(preferred_id))?.to_le_bytes(),
@@ -5482,7 +5521,7 @@ impl FlpDocument {
         if let Some(raw_track_index) = raw_track_index {
             duplicate[12..14].copy_from_slice(&raw_track_index.to_le_bytes());
         }
-        if record_size >= 60 {
+        if playlist_record_has_clip_id(record_size) {
             duplicate[32..36]
                 .copy_from_slice(&next_playlist_clip_id(arrangement, None)?.to_le_bytes());
         }
@@ -5541,6 +5580,11 @@ impl FlpDocument {
         if matching_channels.next().is_some() || channel.kind() != Some(4) {
             return Err(FlpError::UnsupportedEdit(
                 "the Playlist clip does not target one unambiguous Audio Clip channel",
+            ));
+        }
+        if clip.has_opaque_record_tail() {
+            return Err(FlpError::UnsupportedEdit(
+                "splitting this Playlist record version requires decoding its opaque tail",
             ));
         }
 
@@ -5666,7 +5710,7 @@ impl FlpDocument {
         right_record[8..12].copy_from_slice(&right_length.to_le_bytes());
         right_record[24..28].copy_from_slice(&split_source_ms.to_le_bytes());
         right_record[28..32].copy_from_slice(&source_end_ms.to_le_bytes());
-        if record_size >= 60 {
+        if playlist_record_has_clip_id(record_size) {
             right_record[32..36]
                 .copy_from_slice(&next_playlist_clip_id(arrangement, None)?.to_le_bytes());
         }
@@ -5764,6 +5808,11 @@ impl FlpDocument {
         {
             return Err(FlpError::UnsupportedEdit(
                 "joined Audio Clips must use the same Playlist record event and layout",
+            ));
+        }
+        if left_clip.has_opaque_record_tail() || right_clip.has_opaque_record_tail() {
+            return Err(FlpError::UnsupportedEdit(
+                "joining this Playlist record version requires decoding its opaque tail",
             ));
         }
         if left_clip.pattern_base != right_clip.pattern_base
@@ -5974,6 +6023,11 @@ impl FlpDocument {
         {
             return Err(FlpError::UnsupportedEdit(
                 "joined Pattern Clips must use the same Playlist record event and layout",
+            ));
+        }
+        if left_clip.has_opaque_record_tail() || right_clip.has_opaque_record_tail() {
+            return Err(FlpError::UnsupportedEdit(
+                "joining this Playlist record version requires decoding its opaque tail",
             ));
         }
         if left_clip.pattern_base != right_clip.pattern_base
@@ -6278,6 +6332,11 @@ impl FlpDocument {
                     "only Playlist Pattern Clips can be merged",
                 ));
             }
+            if clip.has_opaque_record_tail() {
+                return Err(FlpError::UnsupportedEdit(
+                    "merging Pattern Clips with this Playlist record version requires decoding its opaque tail",
+                ));
+            }
             if clip.track_index.is_none() {
                 return Err(FlpError::UnsupportedEdit(
                     "a selected Pattern Clip has an unsupported Playlist track index",
@@ -6563,6 +6622,11 @@ impl FlpDocument {
         {
             return Err(FlpError::UnsupportedEdit(
                 "Playlist Audio Clips with a non-default or invalid scale cannot be slip-edited",
+            ));
+        }
+        if clip.has_opaque_record_tail() {
+            return Err(FlpError::UnsupportedEdit(
+                "slipping this Playlist record version requires decoding its opaque tail",
             ));
         }
         let (source_start_ms, source_end_ms) =
@@ -11493,7 +11557,9 @@ fn playlist_clip_record_size(
         .and_then(|version| version.split('.').next())
         .and_then(|major| major.parse::<u32>().ok())
         .map(|major| {
-            if major >= 25 {
+            if major >= 26 {
+                88
+            } else if major >= 25 {
                 80
             } else if major >= 21 {
                 60
@@ -11550,13 +11616,19 @@ fn playlist_clip_layout_score(payload: &[u8], record_size: usize) -> (f64, f64) 
     let records = payload.chunks_exact(record_size);
     let record_count = records.len();
     let mut headers = HashMap::<[u8; 4], usize>::new();
+    let mut pattern_bases = 0usize;
     let mut valid_tracks = 0usize;
     let mut nonzero_lengths = 0usize;
     for record in records {
-        let header: [u8; 4] = record[20..24]
-            .try_into()
-            .expect("supported Playlist records include the common 32-byte prefix");
-        *headers.entry(header).or_default() += 1;
+        if u16::from_le_bytes([record[4], record[5]]) == 0x5000 {
+            pattern_bases += 1;
+        }
+        if record_size != 88 {
+            let header: [u8; 4] = record[20..24]
+                .try_into()
+                .expect("legacy Playlist records include the common 24-byte prefix");
+            *headers.entry(header).or_default() += 1;
+        }
         if u16::from_le_bytes([record[12], record[13]]) <= 499 {
             valid_tracks += 1;
         }
@@ -11567,13 +11639,32 @@ fn playlist_clip_layout_score(payload: &[u8], record_size: usize) -> (f64, f64) 
     if record_count == 0 {
         return (0.0, 0.0);
     }
-    let header_ratio = headers.values().copied().max().unwrap_or(0) as f64 / record_count as f64;
+    let pattern_base_ratio = pattern_bases as f64 / record_count as f64;
+    let header_ratio = if record_size == 88 {
+        0.0
+    } else {
+        headers.values().copied().max().unwrap_or(0) as f64 / record_count as f64
+    };
     let track_ratio = valid_tracks as f64 / record_count as f64;
     let length_ratio = nonzero_lengths as f64 / record_count as f64;
     (
-        header_ratio * 4.0 + track_ratio * 2.0 + length_ratio * 2.0,
-        header_ratio,
+        pattern_base_ratio * 8.0 + header_ratio * 2.0 + track_ratio + length_ratio,
+        pattern_base_ratio,
     )
+}
+
+fn playlist_record_has_clip_id(record_size: usize) -> bool {
+    matches!(record_size, 60 | 80)
+}
+
+/// Initializes the duration fields for a newly created clip copied from a
+/// template. Existing record tails must remain untouched.
+fn initialize_new_playlist_clip_length(record: &mut [u8], length_ticks: u32) {
+    record[8..12].copy_from_slice(&length_ticks.to_le_bytes());
+    if record.len() == 88 {
+        record[24..28].copy_from_slice(&0u32.to_le_bytes());
+        record[28..32].copy_from_slice(&length_ticks.to_le_bytes());
+    }
 }
 
 fn decode_automation_points(event: &FlpEvent) -> Result<Vec<AutomationPoint>, FlpError> {
@@ -11694,14 +11785,16 @@ fn decode_playlist_clip(
     };
     let f32_at = |offset: usize| f32::from_le_bytes(record[offset..offset + 4].try_into().unwrap());
     let record_size = record.len();
-    let clip_id = (record_size >= 60).then(|| u32_at(32));
+    let modern_record = record_size == 88;
+    let clip_id = playlist_record_has_clip_id(record_size).then(|| u32_at(32));
     let reserved = match record_size {
+        88 => record[16..88].to_vec(),
         80 => record[36..64].to_vec(),
         60 => record[36..60].to_vec(),
         _ => Vec::new(),
     };
-    let scale = (record_size >= 80).then(|| f64::from_le_bytes(record[64..72].try_into().unwrap()));
-    let trailing_bytes = if record_size >= 80 {
+    let scale = (record_size == 80).then(|| f64::from_le_bytes(record[64..72].try_into().unwrap()));
+    let trailing_bytes = if record_size == 80 {
         record[72..80].to_vec()
     } else {
         Vec::new()
@@ -11715,11 +11808,15 @@ fn decode_playlist_clip(
         raw_track_index: u16_at(12),
         track_index: 499u16.checked_sub(u16_at(12)),
         group: u16_at(14),
-        unknown_word: u16_at(16),
-        item_flags: u16_at(18),
-        header_bytes: [record[20], record[21], record[22], record[23]],
-        start_offset: f32_at(24),
-        end_offset: f32_at(28),
+        unknown_word: if modern_record { 0 } else { u16_at(16) },
+        item_flags: if modern_record { 0 } else { u16_at(18) },
+        header_bytes: if modern_record {
+            [0; 4]
+        } else {
+            [record[20], record[21], record[22], record[23]]
+        },
+        start_offset: if modern_record { -1.0 } else { f32_at(24) },
+        end_offset: if modern_record { -1.0 } else { f32_at(28) },
         clip_id,
         reserved,
         scale,
@@ -13643,6 +13740,93 @@ mod tests {
                 .iter()
                 .all(|clip| clip.record_size == 80)
         );
+    }
+
+    #[test]
+    fn modern_playlist_records_preserve_the_opaque_tail_and_reject_unsafe_edits() {
+        let mut payload = Vec::new();
+        let mut original_tails = Vec::new();
+        for index in 0..10u32 {
+            let mut record = [0xA0u8; 88];
+            for (offset, byte) in record[16..].iter_mut().enumerate() {
+                *byte = (offset as u8).wrapping_add(index as u8 * 17);
+            }
+            record[0..4].copy_from_slice(&(index * 960).to_le_bytes());
+            record[4..6].copy_from_slice(&0x5000u16.to_le_bytes());
+            record[6..8].copy_from_slice(&5u16.to_le_bytes());
+            record[8..12].copy_from_slice(&960u32.to_le_bytes());
+            record[12..14].copy_from_slice(&471u16.to_le_bytes());
+            record[14..16].copy_from_slice(&0x1234u16.to_le_bytes());
+            original_tails.push(record[16..].to_vec());
+            payload.extend_from_slice(&record);
+        }
+
+        let mut event_stream = Vec::new();
+        append_data_event(&mut event_stream, 0xC7, b"24.2.99.4720\0");
+        event_stream.extend_from_slice(&[0x63, 0, 0]);
+        append_data_event(&mut event_stream, 0xE9, &payload);
+        let original_file = flp_fixture(&event_stream, &[], &[]);
+        let mut document =
+            FlpDocument::parse(&original_file).expect("the synthetic project should parse");
+        let clips = document
+            .arrangements()
+            .expect("structure should select the 88-byte record layout");
+        assert_eq!(clips[0].clips.len(), 10);
+        for (clip, expected_tail) in clips[0].clips.iter().zip(&original_tails) {
+            assert_eq!(clip.record_size, 88);
+            assert_eq!(&clip.reserved, expected_tail);
+            assert_eq!(clip.clip_id, None);
+            assert_eq!(clip.scale, None);
+            assert!(clip.has_opaque_record_tail());
+            assert!(clip.uses_full_source_window());
+        }
+        assert_eq!(
+            document.encode_lossless().unwrap(),
+            original_file,
+            "88-byte Playlist records should decode and encode byte-for-byte"
+        );
+
+        let before_rejected_edit = document.encode_lossless().unwrap();
+        assert!(
+            document
+                .edit_playlist_clip(
+                    0,
+                    0,
+                    PlaylistClipEdit {
+                        length_ticks: Some(480),
+                        ..PlaylistClipEdit::default()
+                    },
+                )
+                .is_err()
+        );
+        assert_eq!(document.encode_lossless().unwrap(), before_rejected_edit);
+
+        document
+            .edit_playlist_clip(
+                0,
+                0,
+                PlaylistClipEdit {
+                    position_ticks: Some(1920),
+                    ..PlaylistClipEdit::default()
+                },
+            )
+            .expect("the known record header should remain editable");
+        let changed = document
+            .arrangements()
+            .expect("the edited project should decode");
+        assert_eq!(changed[0].clips[0].position_ticks, 1920);
+        assert_eq!(changed[0].clips[0].reserved, original_tails[0]);
+        assert_eq!(changed[0].clips[1].reserved, original_tails[1]);
+    }
+
+    #[test]
+    fn initializes_unstretched_window_only_for_new_modern_playlist_records() {
+        let mut record = [0xA5u8; 88];
+        initialize_new_playlist_clip_length(&mut record, 1440);
+        assert_eq!(u32::from_le_bytes(record[8..12].try_into().unwrap()), 1440);
+        assert_eq!(u32::from_le_bytes(record[24..28].try_into().unwrap()), 0);
+        assert_eq!(u32::from_le_bytes(record[28..32].try_into().unwrap()), 1440);
+        assert!(record[32..].iter().all(|byte| *byte == 0xA5));
     }
 
     #[test]

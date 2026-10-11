@@ -3741,7 +3741,7 @@ fn sample_source_bounds(
     clip_index: usize,
 ) -> Result<SampleBounds, String> {
     let frames = audio.frame_count();
-    if clip.start_offset == -1.0 && clip.end_offset == -1.0 {
+    if clip.uses_full_source_window() {
         if frames == 0 {
             return Err(format!("Playlist clip {clip_index} references empty audio"));
         }
@@ -3750,18 +3750,13 @@ fn sample_source_bounds(
             end: frames,
         });
     }
-    if !clip.start_offset.is_finite()
-        || !clip.end_offset.is_finite()
-        || clip.start_offset < 0.0
-        || clip.end_offset <= clip.start_offset
-    {
+    let Some((start_ms, end_ms)) = clip.source_window_milliseconds() else {
         return Err(format!(
-            "Playlist clip {clip_index} has unsupported audio source offsets {}..{} ms",
-            clip.start_offset, clip.end_offset
+            "Playlist clip {clip_index} has an unsupported audio source window"
         ));
-    }
-    let to_frame = |milliseconds: f32| -> Result<usize, String> {
-        let frame = f64::from(milliseconds) * f64::from(audio.sample_rate) / 1000.0;
+    };
+    let to_frame = |milliseconds: f64| -> Result<usize, String> {
+        let frame = milliseconds * f64::from(audio.sample_rate) / 1000.0;
         if !frame.is_finite() || frame < 0.0 || frame > usize::MAX as f64 {
             return Err(format!(
                 "Playlist clip {clip_index} audio offset is out of range"
@@ -3769,12 +3764,12 @@ fn sample_source_bounds(
         }
         Ok(frame.round() as usize)
     };
-    let start = to_frame(clip.start_offset)?.min(frames);
-    let end = to_frame(clip.end_offset)?.min(frames);
+    let start = to_frame(start_ms)?.min(frames);
+    let end = to_frame(end_ms)?.min(frames);
     if start >= end {
         return Err(format!(
             "Playlist clip {clip_index} source window {}..{} ms is outside its sample",
-            clip.start_offset, clip.end_offset
+            start_ms, end_ms
         ));
     }
     Ok(SampleBounds { start, end })

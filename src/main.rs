@@ -2220,7 +2220,7 @@ fn list_playlist(path: &Path, start: usize, count: usize) -> Result<(), String> 
                 flp_rebuild::PlaylistClipTarget::Pattern { .. } => "(pattern)",
             };
             println!(
-                "  clip={} position={} length={} track={} track_name={:?} raw_track={} target={:?} target_name={:?} group={} flags=0x{:04X} offsets={:.6}..{:.6} scale={:?} clip_id={} record_size={}",
+                "  clip={} position={} length={} track={} track_name={:?} raw_track={} target={:?} target_name={:?} group={} flags=0x{:04X} offsets={:.6}..{:.6} scale={:?} clip_id={} record_size={} opaque_tail={}",
                 index,
                 clip.position_ticks,
                 clip.length_ticks,
@@ -2241,6 +2241,7 @@ fn list_playlist(path: &Path, start: usize, count: usize) -> Result<(), String> 
                 clip.clip_id
                     .map_or_else(|| "none".to_owned(), |id| id.to_string()),
                 clip.record_size,
+                clip.has_opaque_record_tail(),
             );
         }
     }
