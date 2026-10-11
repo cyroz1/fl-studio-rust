@@ -3041,6 +3041,36 @@ impl DawUi {
         }
     }
 
+    fn dock_all_and_reset_detached_window_positions(&mut self) {
+        self.piano_roll_window_detached = false;
+        self.mixer_window_detached = false;
+        self.channel_rack_window_detached = false;
+        self.playlist_window_detached = false;
+        self.plugins_window_detached = false;
+        self.audio_window_detached = false;
+        self.automation_window_detached = false;
+
+        let mut placements = self.detached_window_placements;
+        for kind in DetachedWindowKind::ALL {
+            if let Some(mut placement) = self
+                .detached_window_current_placements
+                .get(kind)
+                .or_else(|| placements.get(kind))
+            {
+                placement.position = None;
+                placements.set(kind, placement);
+            }
+        }
+        self.detached_window_placements = placements;
+        self.detached_window_current_placements = placements;
+        self.status = match save_detached_window_placements(placements) {
+            Ok(()) => "All detached views docked; saved window positions reset".to_owned(),
+            Err(error) => {
+                format!("Detached views docked, but window positions could not be reset: {error}")
+            }
+        };
+    }
+
     fn show_detached_auxiliary_view(
         &mut self,
         kind: DetachedWindowKind,
@@ -6817,6 +6847,11 @@ impl DawUi {
                     .clicked()
                 {
                     self.set_browser_visibility(!self.browser_visible);
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("Dock all and reset window positions").clicked() {
+                    self.dock_all_and_reset_detached_window_positions();
                     ui.close();
                 }
             });
