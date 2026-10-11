@@ -9103,9 +9103,57 @@ impl DawUi {
                             } else {
                                 "Drag to move. Shift-drag the right edge to resize. Hold Alt to ignore the 1/16 grid."
                             };
+                            let mute_selection_indices = if self.selected_arrangement
+                                == Some(arrangement.id)
+                                && self.selected_playlist_clips.contains(&clip_index)
+                            {
+                                self.selected_playlist_clips
+                                    .iter()
+                                    .copied()
+                                    .collect::<Vec<_>>()
+                            } else {
+                                vec![clip_index]
+                            };
+                            let mute_selection_states = mute_selection_indices
+                                .iter()
+                                .filter_map(|index| {
+                                    arrangement
+                                        .clips
+                                        .get(*index)
+                                        .map(|clip| (*index, clip.is_muted()))
+                                })
+                                .collect::<Vec<_>>();
                             let response = response.on_hover_text(drag_hint);
                             response.context_menu(|ui| {
-                                if ui
+                                if mute_selection_states.len() > 1 {
+                                    if ui.button("Mute all selected clips").clicked() {
+                                        muted_clip_requested = Some(
+                                            mute_selection_states
+                                                .iter()
+                                                .map(|(index, _)| (*index, true))
+                                                .collect(),
+                                        );
+                                        ui.close();
+                                    }
+                                    if ui.button("Unmute all selected clips").clicked() {
+                                        muted_clip_requested = Some(
+                                            mute_selection_states
+                                                .iter()
+                                                .map(|(index, _)| (*index, false))
+                                                .collect(),
+                                        );
+                                        ui.close();
+                                    }
+                                    if ui.button("Flip selected mute states").clicked() {
+                                        muted_clip_requested = Some(
+                                            mute_selection_states
+                                                .iter()
+                                                .map(|(index, muted)| (*index, !*muted))
+                                                .collect(),
+                                        );
+                                        ui.close();
+                                    }
+                                } else if ui
                                     .button(if clip.is_muted() {
                                         "Unmute clip"
                                     } else {
@@ -9113,7 +9161,8 @@ impl DawUi {
                                     })
                                     .clicked()
                                 {
-                                    muted_clip_requested = Some((clip_index, !clip.is_muted()));
+                                    muted_clip_requested =
+                                        Some(vec![(clip_index, !clip.is_muted())]);
                                     ui.close();
                                 }
                                 ui.separator();
@@ -9388,7 +9437,8 @@ impl DawUi {
                             }
                             if response.clicked() {
                                 if self.playlist_mute_tool_active {
-                                    muted_clip_requested = Some((clip_index, !clip.is_muted()));
+                                    muted_clip_requested =
+                                        Some(vec![(clip_index, !clip.is_muted())]);
                                 } else {
                                     let modifiers = ui.input(|input| input.modifiers);
                                     self.set_playlist_clip_selection(
@@ -9554,26 +9604,32 @@ impl DawUi {
             }
         }
 
-        if let Some((clip_index, muted)) = muted_clip_requested {
+        if let Some(clip_edits) = muted_clip_requested {
             let result = self.document.as_mut().map(|document| {
-                document.edit_playlist_clip(
-                    arrangement.id,
-                    clip_index,
-                    PlaylistClipEdit {
-                        muted: Some(muted),
-                        ..PlaylistClipEdit::default()
-                    },
-                )
+                clip_edits.iter().try_for_each(|(clip_index, muted)| {
+                    document.edit_playlist_clip(
+                        arrangement.id,
+                        *clip_index,
+                        PlaylistClipEdit {
+                            muted: Some(*muted),
+                            ..PlaylistClipEdit::default()
+                        },
+                    )
+                })
             });
             match result {
                 Some(Ok(())) => {
                     self.stop_project_playback();
                     self.dirty = true;
-                    self.status = format!(
-                        "{} Playlist clip {}",
-                        if muted { "Muted" } else { "Unmuted" },
-                        clip_index + 1
-                    );
+                    self.status = if clip_edits.len() == 1 {
+                        format!(
+                            "{} Playlist clip {}",
+                            if clip_edits[0].1 { "Muted" } else { "Unmuted" },
+                            clip_edits[0].0 + 1
+                        )
+                    } else {
+                        format!("Updated mute state for {} Playlist clips", clip_edits.len())
+                    };
                 }
                 Some(Err(error)) => {
                     self.status = format!("Could not change Playlist clip mute state: {error}");
