@@ -574,11 +574,19 @@ jobs:
           xdotool windowfocus --sync "$mixer_window"
           xdotool mousemove 287 16 click 1
           sleep 0.3
+          ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
+            -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/audio-detach-menu.png"
           xdotool mousemove 350 344 click 1
           sleep 1
           detached_audio_window=$(xdotool search --onlyvisible --name '^Audio$' | head -n 1 || true)
           if [[ -z "$detached_audio_window" ]]; then
             echo "View > Detach Audio settings did not open its native window."
+            ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
+              -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/audio-detach-failure.png" || true
+            while IFS= read -r window_id; do
+              printf 'Visible X11 window %s: ' "$window_id"
+              xdotool getwindowname "$window_id" 2>/dev/null || true
+            done < <(xdotool search --onlyvisible --name '.*' || true)
             cat "$RUNNER_TEMP/mixer-preview-restored.log"
             exit 1
           fi
