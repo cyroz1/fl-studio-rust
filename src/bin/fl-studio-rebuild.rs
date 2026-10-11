@@ -17806,9 +17806,9 @@ impl DawUi {
             if ruler_response.drag_started_by(PointerButton::Primary)
                 && ui.input(|input| input.modifiers.command)
                 && !self.piano_roll_zoom_mode
-                && let Some(pointer) = ruler_response
-                    .interact_pointer_pos()
-                    .or_else(|| ui.input(|input| input.pointer.press_origin()))
+                && let Some(pointer) = ui
+                    .input(|input| input.pointer.press_origin())
+                    .or_else(|| ruler_response.interact_pointer_pos())
             {
                 let start_tick = piano_roll_time_tick_at_x(
                     pointer.x,
