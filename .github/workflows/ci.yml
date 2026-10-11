@@ -352,6 +352,17 @@ jobs:
           sleep 0.5
           ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
             -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/piano-roll-time-selection.png"
+          xdotool mousemove 350 578 keydown Control_L
+          sleep 0.2
+          xdotool mousedown 1
+          sleep 0.2
+          xdotool mousemove 350 526
+          sleep 0.2
+          xdotool mouseup 1
+          xdotool keyup Control_L
+          sleep 0.5
+          ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
+            -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/piano-roll-pitch-selection.png"
           xdotool mousemove 400 192 click 1
           sleep 0.3
           xdotool mousemove 500 315
@@ -406,7 +417,7 @@ jobs:
           for capture in browser-search-options.png playlist-solo.png playlist-group-solo.png playlist-groups-collapsed.png \
             mixer.png mixer-muted.png mixer-muted-solo.png mixer-phase-swap.png controller-ghost-visibility.png \
             controller-ghost-editable.png controller-ghost-editable-shortcut.png controller-color-selection.png \
-            piano-roll-time-selection.png; do
+            piano-roll-time-selection.png piano-roll-pitch-selection.png; do
             if [[ "$(stat -c%s "$GITHUB_WORKSPACE/dist/gui-preview/$capture")" -lt 10000 ]]; then
               echo "The $capture capture is blank or incomplete."
               cat "$RUNNER_TEMP/mixer-preview.log"

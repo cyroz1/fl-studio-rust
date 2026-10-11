@@ -1174,6 +1174,15 @@ struct PianoRollTimeSelectionDrag {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+struct PianoRollPitchSelectionDrag {
+    pattern_id: u16,
+    channel_id: u16,
+    start_key: u16,
+    current_key: u16,
+    additive: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct StepGraphRamp {
     pattern_id: u16,
     channel_id: u16,
@@ -1636,6 +1645,7 @@ struct DawUi {
     selected_piano_notes: BTreeSet<(u16, u16, usize)>,
     piano_roll_time_selection: Option<(u16, u32, u32)>,
     piano_roll_time_selection_drag: Option<PianoRollTimeSelectionDrag>,
+    piano_roll_pitch_selection_drag: Option<PianoRollPitchSelectionDrag>,
     piano_roll_select_mode: bool,
     piano_roll_selection_drag: Option<PianoRollSelectionDrag>,
     piano_roll_zoom_mode: bool,
@@ -2089,6 +2099,7 @@ impl DawUi {
             selected_piano_notes: BTreeSet::new(),
             piano_roll_time_selection: None,
             piano_roll_time_selection_drag: None,
+            piano_roll_pitch_selection_drag: None,
             piano_roll_select_mode: false,
             piano_roll_selection_drag: None,
             piano_roll_zoom_mode: false,
@@ -2717,6 +2728,7 @@ impl DawUi {
                 self.selected_piano_notes.clear();
                 self.piano_roll_time_selection = None;
                 self.piano_roll_time_selection_drag = None;
+                self.piano_roll_pitch_selection_drag = None;
                 self.piano_roll_selection_drag = None;
                 self.active_note_drag = None;
                 self.pending_midi_import = None;
@@ -4287,6 +4299,7 @@ impl DawUi {
         self.selected_piano_notes.clear();
         self.piano_roll_time_selection = None;
         self.piano_roll_time_selection_drag = None;
+        self.piano_roll_pitch_selection_drag = None;
         self.piano_roll_selection_drag = None;
         self.dirty = self
             .document
@@ -14625,6 +14638,7 @@ impl DawUi {
             self.selected_piano_notes.clear();
             self.selected_note = None;
             self.piano_roll_selection_drag = None;
+            self.piano_roll_pitch_selection_drag = None;
         }
         if selection_pattern_before_toolbar != self.selected_pattern
             || selection_channel_before_toolbar != self.selected_note_channel
@@ -17259,6 +17273,11 @@ impl DawUi {
         {
             self.piano_roll_time_selection_drag = None;
         }
+        if self.piano_roll_pitch_selection_drag.is_some_and(|drag| {
+            drag.pattern_id != pattern.id || Some(drag.channel_id) != self.selected_note_channel
+        }) {
+            self.piano_roll_pitch_selection_drag = None;
+        }
         if let (Some(viewport), Some(pointer)) = (
             self.piano_roll_grid_viewport,
             ui.input(|input| input.pointer.hover_pos()),
@@ -17352,6 +17371,19 @@ impl DawUi {
                 )
                 .on_hover_text(
                     "Ctrl/Cmd-drag to select notes by time range · Shift adds to selection",
+                );
+            let keyboard_area_rect = egui::Rect::from_min_max(
+                egui::pos2(rect.left(), grid_rect.top()),
+                egui::pos2(rect.left() + keyboard_width, grid_rect.bottom()),
+            );
+            let keyboard_response = ui
+                .interact(
+                    keyboard_area_rect,
+                    Id::new(("piano-roll-pitch-keyboard", pattern.id)),
+                    Sense::click_and_drag(),
+                )
+                .on_hover_text(
+                    "Ctrl/Cmd-click or drag vertically to select pitches · Shift adds to selection",
                 );
             painter.line_segment(
                 [
@@ -17511,6 +17543,116 @@ impl DawUi {
                         egui::pos2(grid_rect.right(), y),
                     ],
                     Stroke::new(1.0, GRID),
+                );
+            }
+
+            let mut pitch_range_selection = None;
+            if keyboard_response.clicked_by(PointerButton::Primary)
+                && ui.input(|input| input.modifiers.command)
+                && !self.piano_roll_zoom_mode
+                && let Some(pointer) = keyboard_response.interact_pointer_pos()
+            {
+                let key =
+                    piano_roll_key_at_y(pointer.y, grid_rect.top(), key_height, key_low, key_high);
+                pitch_range_selection = Some((key, key, ui.input(|input| input.modifiers.shift)));
+            }
+            if keyboard_response.drag_started_by(PointerButton::Primary)
+                && ui.input(|input| input.modifiers.command)
+                && !self.piano_roll_zoom_mode
+                && let Some(channel_id) = self.selected_note_channel
+                && let Some(origin) = ui
+                    .input(|input| input.pointer.press_origin())
+                    .or_else(|| keyboard_response.interact_pointer_pos())
+            {
+                let key =
+                    piano_roll_key_at_y(origin.y, grid_rect.top(), key_height, key_low, key_high);
+                self.piano_roll_pitch_selection_drag = Some(PianoRollPitchSelectionDrag {
+                    pattern_id: pattern.id,
+                    channel_id,
+                    start_key: key,
+                    current_key: key,
+                    additive: ui.input(|input| input.modifiers.shift),
+                });
+            }
+            if let Some(mut drag) = self
+                .piano_roll_pitch_selection_drag
+                .filter(|drag| drag.pattern_id == pattern.id)
+            {
+                if let Some(pointer) = ui.input(|input| input.pointer.interact_pos()) {
+                    drag.current_key = piano_roll_key_at_y(
+                        pointer.y,
+                        grid_rect.top(),
+                        key_height,
+                        key_low,
+                        key_high,
+                    );
+                }
+                if keyboard_response.drag_stopped_by(PointerButton::Primary) {
+                    pitch_range_selection = Some((
+                        drag.start_key.min(drag.current_key),
+                        drag.start_key.max(drag.current_key),
+                        drag.additive,
+                    ));
+                    self.piano_roll_pitch_selection_drag = None;
+                } else {
+                    self.piano_roll_pitch_selection_drag = Some(drag);
+                }
+            }
+            if let Some((low_key, high_key, additive)) = pitch_range_selection {
+                let selected_note_ids = self
+                    .selected_note_channel
+                    .map(|channel_id| {
+                        piano_roll_pitch_range_note_selection(
+                            pattern, pattern.id, channel_id, low_key, high_key,
+                        )
+                    })
+                    .unwrap_or_default();
+                if !additive {
+                    self.selected_piano_notes
+                        .retain(|(selected_pattern, _, _)| *selected_pattern != pattern.id);
+                }
+                self.selected_piano_notes.extend(selected_note_ids);
+                self.selected_note = self
+                    .selected_piano_notes
+                    .iter()
+                    .rev()
+                    .find(|(selected_pattern, _, _)| *selected_pattern == pattern.id)
+                    .copied();
+                let selected_count = self
+                    .selected_piano_notes
+                    .iter()
+                    .filter(|(selected_pattern, _, _)| *selected_pattern == pattern.id)
+                    .count();
+                let range_label = if low_key == high_key {
+                    note_name(low_key)
+                } else {
+                    format!("{}–{}", note_name(low_key), note_name(high_key))
+                };
+                self.status = format!("Selected {selected_count} notes on {range_label}");
+            }
+            if let Some(drag) = self
+                .piano_roll_pitch_selection_drag
+                .filter(|drag| drag.pattern_id == pattern.id)
+            {
+                let low_key = drag.start_key.min(drag.current_key);
+                let high_key = drag.start_key.max(drag.current_key);
+                let top = grid_rect.top() + f32::from(key_high - high_key) * key_height;
+                let bottom = grid_rect.top() + f32::from(key_high - low_key + 1) * key_height;
+                let selection_rect = egui::Rect::from_min_max(
+                    egui::pos2(rect.left(), top),
+                    egui::pos2(rect.right(), bottom),
+                )
+                .intersect(rect);
+                painter.rect_filled(
+                    selection_rect,
+                    0,
+                    Color32::from_rgba_unmultiplied(73, 128, 174, 32),
+                );
+                painter.rect_stroke(
+                    selection_rect,
+                    egui::CornerRadius::ZERO,
+                    Stroke::new(1.0, BLUE),
+                    egui::StrokeKind::Inside,
                 );
             }
 
@@ -18167,6 +18309,7 @@ impl DawUi {
         if !ui.input(|input| input.pointer.primary_down()) {
             self.active_note_drag = None;
             self.piano_roll_selection_drag = None;
+            self.piano_roll_pitch_selection_drag = None;
             self.piano_roll_zoom_drag = None;
         }
         if !notes_to_add.is_empty() {
@@ -22345,6 +22488,55 @@ fn piano_roll_time_range_note_selection(
         .collect()
 }
 
+fn piano_roll_pitch_range_note_selection(
+    pattern: &Pattern,
+    pattern_id: u16,
+    channel_id: u16,
+    first_key: u16,
+    last_key: u16,
+) -> Vec<(u16, u16, usize)> {
+    let low_key = first_key.min(last_key);
+    let high_key = first_key.max(last_key);
+    let channel_notes = pattern
+        .notes
+        .iter()
+        .filter(|note| note.channel_id == channel_id)
+        .collect::<Vec<_>>();
+    let mut selected_indices = BTreeSet::new();
+    let mut selected_groups = BTreeSet::new();
+    for (note_index, note) in channel_notes.iter().enumerate() {
+        if (low_key..=high_key).contains(&note.key) {
+            selected_indices.insert(note_index);
+            if note.group != 0 {
+                selected_groups.insert(note.group);
+            }
+        }
+    }
+
+    channel_notes
+        .iter()
+        .enumerate()
+        .filter(|(note_index, note)| {
+            selected_indices.contains(note_index)
+                || (note.group != 0 && selected_groups.contains(&note.group))
+        })
+        .map(|(note_index, _)| (pattern_id, channel_id, note_index))
+        .collect()
+}
+
+fn piano_roll_key_at_y(
+    pointer_y: f32,
+    grid_top: f32,
+    key_height: f32,
+    key_low: u16,
+    key_high: u16,
+) -> u16 {
+    let row = ((pointer_y - grid_top).max(0.0) / key_height.max(f32::EPSILON))
+        .floor()
+        .clamp(0.0, f32::from(key_high.saturating_sub(key_low))) as u16;
+    key_high.saturating_sub(row)
+}
+
 fn piano_roll_shift_time_range(start: u32, end: u32, direction: TimeSelectionShift) -> (u32, u32) {
     let width = end.saturating_sub(start);
     let start = match direction {
@@ -24848,15 +25040,15 @@ mod tests {
         encode_midi_device_selections, first_available_playlist_track, next_piano_roll_note_group,
         note_from_grid_position, parse_midi_device_selections, piano_roll_color_group_note_ids,
         piano_roll_controller_value_at, piano_roll_controller_value_range,
-        piano_roll_discard_length_edit, piano_roll_duplicate_offset, piano_roll_note_group_members,
-        piano_roll_note_nudge_edit, piano_roll_odd_note_selection,
-        piano_roll_overlap_note_selection, piano_roll_random_note_selection,
-        piano_roll_selection_time_range, piano_roll_shift_time_range,
-        piano_roll_time_range_from_drag, piano_roll_time_range_note_selection,
-        piano_roll_time_tick_at_x, playlist_audio_clip_join_candidates,
-        playlist_audio_drop_position_ticks, playlist_bar_ticks, playlist_clip_drag_edit,
-        playlist_clip_local_recording_offset, playlist_clip_split_position,
-        playlist_group_parent_ids, playlist_measure_boundaries,
+        piano_roll_discard_length_edit, piano_roll_duplicate_offset, piano_roll_key_at_y,
+        piano_roll_note_group_members, piano_roll_note_nudge_edit, piano_roll_odd_note_selection,
+        piano_roll_overlap_note_selection, piano_roll_pitch_range_note_selection,
+        piano_roll_random_note_selection, piano_roll_selection_time_range,
+        piano_roll_shift_time_range, piano_roll_time_range_from_drag,
+        piano_roll_time_range_note_selection, piano_roll_time_tick_at_x,
+        playlist_audio_clip_join_candidates, playlist_audio_drop_position_ticks,
+        playlist_bar_ticks, playlist_clip_drag_edit, playlist_clip_local_recording_offset,
+        playlist_clip_split_position, playlist_group_parent_ids, playlist_measure_boundaries,
         playlist_pattern_clip_join_candidates, playlist_seek_tick_to_frame,
         playlist_signature_at_tick, playlist_song_position_label, playlist_track_group_range,
         playlist_track_is_hidden, recolor_piano_roll_notes, snap_note_tick,
@@ -25076,6 +25268,35 @@ mod tests {
             vec![(7, 2, 1), (7, 2, 2), (7, 2, 4)]
         );
         assert!(piano_roll_time_range_note_selection(&pattern, 7, 2, 120, 120).is_empty());
+    }
+
+    #[test]
+    fn piano_roll_pitch_range_selection_is_inclusive_channel_scoped_and_group_aware() {
+        let note = |key, channel_id, group| PatternNote {
+            key,
+            channel_id,
+            group,
+            ..PatternNote::default()
+        };
+        let pattern = Pattern {
+            id: 7,
+            notes: vec![
+                note(60, 2, 0),
+                note(64, 2, 8),
+                note(72, 2, 0),
+                note(68, 2, 8),
+                note(62, 3, 0),
+            ],
+            ..Pattern::default()
+        };
+
+        assert_eq!(
+            piano_roll_pitch_range_note_selection(&pattern, 7, 2, 64, 60),
+            vec![(7, 2, 0), (7, 2, 1), (7, 2, 3)]
+        );
+        assert_eq!(piano_roll_key_at_y(10.0, 10.0, 13.0, 36, 83), 83);
+        assert_eq!(piano_roll_key_at_y(311.0, 10.0, 13.0, 36, 83), 60);
+        assert_eq!(piano_roll_key_at_y(2_000.0, 10.0, 13.0, 36, 83), 36);
     }
 
     #[test]
