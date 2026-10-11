@@ -433,8 +433,11 @@ jobs:
           sleep 0.3
           ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
             -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/piano-roll-tools-menu.png"
-          xdotool mousemove 1088 212 click 1
-          sleep 0.3
+          # Move into the open menu before opening its nested chord selector.
+          xdotool mousemove 1045 176
+          sleep 0.2
+          xdotool mousemove 1142 212 click 1
+          sleep 0.5
           ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
             -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/piano-roll-chord-stamps.png"
           xdotool key Escape
