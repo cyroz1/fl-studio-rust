@@ -1780,6 +1780,7 @@ struct DawUi {
     playlist_clip_context_split: Option<(u16, usize, u32)>,
     playlist_clip_clipboard: Option<PlaylistClipClipboard>,
     playlist_slip_tool_active: bool,
+    playlist_mute_tool_active: bool,
     soloed_playlist_track_range: Option<(u32, u32)>,
     collapsed_playlist_groups: BTreeSet<(u16, u32)>,
     active_playlist_clip_drag: Option<ActivePlaylistClipDrag>,
@@ -2240,6 +2241,7 @@ impl DawUi {
             playlist_clip_context_split: None,
             playlist_clip_clipboard: None,
             playlist_slip_tool_active: false,
+            playlist_mute_tool_active: false,
             soloed_playlist_track_range: None,
             collapsed_playlist_groups: BTreeSet::new(),
             active_playlist_clip_drag: None,
@@ -8283,8 +8285,25 @@ impl DawUi {
                 );
             if slip_tool.clicked() {
                 self.playlist_slip_tool_active = !self.playlist_slip_tool_active;
+                if self.playlist_slip_tool_active {
+                    self.playlist_mute_tool_active = false;
+                }
                 self.status = if self.playlist_slip_tool_active {
                     "Slip tool selected; drag inside an Audio Clip".to_owned()
+                } else {
+                    "Playlist move tool selected".to_owned()
+                };
+            }
+            let mute_tool = ui
+                .selectable_label(self.playlist_mute_tool_active, "Mute (T)")
+                .on_hover_text("Click Playlist clips to mute or unmute them.");
+            if mute_tool.clicked() {
+                self.playlist_mute_tool_active = !self.playlist_mute_tool_active;
+                if self.playlist_mute_tool_active {
+                    self.playlist_slip_tool_active = false;
+                }
+                self.status = if self.playlist_mute_tool_active {
+                    "Mute tool selected; click clips to toggle mute".to_owned()
                 } else {
                     "Playlist move tool selected".to_owned()
                 };
@@ -9071,7 +9090,9 @@ impl DawUi {
                                 && source_window_supported
                                 && scale_supported
                                 && !tempo_automation_overlaps;
-                            let drag_hint = if clip.has_opaque_record_tail() {
+                            let drag_hint = if self.playlist_mute_tool_active {
+                                "Mute tool selected: click to mute or unmute this clip. Press T or select Mute to return to move mode."
+                            } else if clip.has_opaque_record_tail() {
                                 "Drag to move. Resizing and source-window editing are unavailable for this FL Studio clip format."
                             } else if self.playlist_slip_tool_active && is_audio_clip {
                                 if can_slip_clip {
@@ -9231,6 +9252,7 @@ impl DawUi {
                                 }
                             });
                             if response.drag_started_by(PointerButton::Primary)
+                                && !self.playlist_mute_tool_active
                                 && self.active_playlist_clip_drag.is_none()
                                 && let Some(pointer) = ui
                                     .input(|input| input.pointer.press_origin())
@@ -9365,19 +9387,23 @@ impl DawUi {
                                 self.active_playlist_clip_drag = None;
                             }
                             if response.clicked() {
-                                let modifiers = ui.input(|input| input.modifiers);
-                                self.set_playlist_clip_selection(
-                                    arrangement.id,
-                                    clip_index,
-                                    arrangement.clips.len(),
-                                    modifiers,
-                                );
-                                let selected_count = self.selected_playlist_clips.len();
-                                self.status = if selected_count > 1 {
-                                    format!("Selected {selected_count} Playlist clips")
+                                if self.playlist_mute_tool_active {
+                                    muted_clip_requested = Some((clip_index, !clip.is_muted()));
                                 } else {
-                                    format!("Selected Playlist clip {}", clip_index + 1)
-                                };
+                                    let modifiers = ui.input(|input| input.modifiers);
+                                    self.set_playlist_clip_selection(
+                                        arrangement.id,
+                                        clip_index,
+                                        arrangement.clips.len(),
+                                        modifiers,
+                                    );
+                                    let selected_count = self.selected_playlist_clips.len();
+                                    self.status = if selected_count > 1 {
+                                        format!("Selected {selected_count} Playlist clips")
+                                    } else {
+                                        format!("Selected Playlist clip {}", clip_index + 1)
+                                    };
+                                }
                             }
                         }
                         for (marker_index, marker) in arrangement.time_markers.iter().enumerate() {
@@ -22155,8 +22181,25 @@ impl eframe::App for DawUi {
             && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::S));
         if toggle_slip_tool_requested {
             self.playlist_slip_tool_active = !self.playlist_slip_tool_active;
+            if self.playlist_slip_tool_active {
+                self.playlist_mute_tool_active = false;
+            }
             self.status = if self.playlist_slip_tool_active {
                 "Slip tool selected; drag inside an Audio Clip".to_owned()
+            } else {
+                "Playlist move tool selected".to_owned()
+            };
+        }
+        let toggle_mute_tool_requested = self.view == MainView::Playlist
+            && !ui.ctx().egui_wants_keyboard_input()
+            && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::T));
+        if toggle_mute_tool_requested {
+            self.playlist_mute_tool_active = !self.playlist_mute_tool_active;
+            if self.playlist_mute_tool_active {
+                self.playlist_slip_tool_active = false;
+            }
+            self.status = if self.playlist_mute_tool_active {
+                "Mute tool selected; click clips to toggle mute".to_owned()
             } else {
                 "Playlist move tool selected".to_owned()
             };
