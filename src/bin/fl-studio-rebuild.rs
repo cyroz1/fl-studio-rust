@@ -21,10 +21,11 @@ use flp_rebuild::plugins::{PluginCandidate, PluginFormat, scan_installed_plugins
 use flp_rebuild::project_package::{ProjectPackageWorkspace, copy_unique_sample_file};
 use flp_rebuild::sample_render::{
     AudioClipRenderOptions, AudioClipRenderSummary, AudioFileRenderOptions, AudioRecordingSummary,
-    AudioRenderEncodingOptions, AudioRenderOutput, MP3_BITRATES_KBPS, PlaylistRenderOptions,
-    PlaylistRenderSummary, PlaylistStreamMonitor, PlaylistTempoMap, ResamplingQuality,
-    SamplerPatternRenderOptions, SamplerPatternRenderSummary, WavChannelMode, WavDitherMode,
-    WavSampleFormat, render_audio_clips_to_file, render_playlist_mixer_stems_with_vst3_cancellable,
+    AudioRenderEncodingOptions, AudioRenderOutput, MP3_BITRATES_KBPS, MixerStemRenderOptions,
+    PlaylistRenderOptions, PlaylistRenderSummary, PlaylistStreamMonitor, PlaylistTempoMap,
+    ResamplingQuality, SamplerPatternRenderOptions, SamplerPatternRenderSummary, WavChannelMode,
+    WavDitherMode, WavSampleFormat, render_audio_clips_to_file,
+    render_playlist_mixer_stems_with_vst3_cancellable,
     render_playlist_with_vst3_to_flac_cancellable, render_playlist_with_vst3_to_mp3_cancellable,
     render_playlist_with_vst3_to_ogg_cancellable, render_playlist_with_vst3_to_wav_cancellable,
     render_sampler_pattern_to_file, stream_playlist_with_vst3_to_device_with_monitor,
@@ -18528,11 +18529,13 @@ impl DawUi {
             .unwrap_or_else(|| project_path.to_path_buf());
         let document = document.clone();
         let output_directory_for_worker = output_directory.clone();
-        let include_master = self.playlist_render_include_master_stem;
-        let include_current_track = self
-            .playlist_render_include_current_stem
-            .then_some(self.playlist_render_current_track)
-            .flatten();
+        let stem_options = MixerStemRenderOptions {
+            include_master: self.playlist_render_include_master_stem,
+            current_track: self
+                .playlist_render_include_current_stem
+                .then_some(self.playlist_render_current_track)
+                .flatten(),
+        };
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
         let (sender, receiver) = mpsc::sync_channel(1);
@@ -18544,8 +18547,7 @@ impl DawUi {
                     &project_path,
                     options,
                     &output_directory_for_worker,
-                    include_master,
-                    include_current_track,
+                    stem_options,
                     vst3_processor,
                     &worker_cancelled,
                 );

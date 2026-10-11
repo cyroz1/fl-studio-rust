@@ -691,6 +691,15 @@ pub struct PlaylistRenderSummary {
     pub mixer_insert_peaks: Option<Vec<MixerInsertPeak>>,
 }
 
+/// Which optional buses to write when rendering supported Mixer stems.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MixerStemRenderOptions {
+    /// Whether to write the final supported mix as `Master.wav`.
+    pub include_master: bool,
+    /// Selected Mixer track ordinal to write as `Current.wav`.
+    pub current_track: Option<usize>,
+}
+
 fn take_mixer_insert_peaks(meters: &MixerTrackPeakMeters) -> Vec<MixerInsertPeak> {
     (1..MIXER_TRACK_METER_COUNT)
         .filter_map(|track| {
@@ -1450,13 +1459,16 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
     project_path: impl AsRef<Path>,
     options: PlaylistRenderOptions,
     output_directory: impl AsRef<Path>,
-    include_master: bool,
-    include_current_track: Option<usize>,
+    stem_options: MixerStemRenderOptions,
     mut vst3_processor: Option<Vst3PlaylistStreamProcessor>,
     cancelled: &AtomicBool,
 ) -> Result<PlaylistRenderSummary, String> {
     let project_path = project_path.as_ref();
     let output_directory = output_directory.as_ref();
+    let MixerStemRenderOptions {
+        include_master,
+        current_track,
+    } = stem_options;
     fs::create_dir_all(output_directory).map_err(|error| {
         format!(
             "could not create Mixer stem folder {}: {error}",
@@ -1521,7 +1533,7 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
             },
         );
     }
-    if let Some(track) = include_current_track {
+    if let Some(track) = current_track {
         let enabled = if track == 0 {
             master_output.enabled
         } else {
