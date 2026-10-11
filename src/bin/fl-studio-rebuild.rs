@@ -432,6 +432,10 @@ fn candidate_matches_vst_identity(
 }
 
 fn detect_chord_name(notes: &[PatternNote], channel_id: u16, position: u32) -> String {
+    let onset_notes = notes
+        .iter()
+        .filter(|note| note.channel_id == channel_id && note.position == position)
+        .collect::<Vec<_>>();
     let pitch_classes = notes
         .iter()
         .filter(|note| note.channel_id == channel_id && note.position == position)
@@ -440,30 +444,61 @@ fn detect_chord_name(notes: &[PatternNote], channel_id: u16, position: u32) -> S
     if pitch_classes.len() < 2 {
         return "No chord".to_owned();
     }
+    let bass_pitch_class = onset_notes
+        .iter()
+        .min_by_key(|note| note.key)
+        .map(|note| (note.key % 12) as u8)
+        .expect("a chord pitch class has at least one note");
 
     const QUALITIES: &[(&str, &[u8])] = &[
-        ("major", &[0, 4, 7]),
-        ("minor", &[0, 3, 7]),
+        ("maj13", &[0, 2, 4, 5, 7, 9, 11]),
+        ("13", &[0, 2, 4, 5, 7, 9, 10]),
+        ("m13", &[0, 2, 3, 5, 7, 9, 10]),
+        ("maj11", &[0, 2, 4, 5, 7, 11]),
+        ("11", &[0, 2, 4, 5, 7, 10]),
+        ("m11", &[0, 2, 3, 5, 7, 10]),
+        ("maj9", &[0, 2, 4, 7, 11]),
+        ("9", &[0, 2, 4, 7, 10]),
+        ("m9", &[0, 2, 3, 7, 10]),
+        ("6/9", &[0, 2, 4, 7, 9]),
+        ("m(maj7)", &[0, 3, 7, 11]),
+        ("m7♭5", &[0, 3, 6, 10]),
+        ("dim7", &[0, 3, 6, 9]),
+        ("maj7", &[0, 4, 7, 11]),
+        ("m7", &[0, 3, 7, 10]),
+        ("7", &[0, 4, 7, 10]),
+        ("m6", &[0, 3, 7, 9]),
+        ("6", &[0, 4, 7, 9]),
+        ("madd9", &[0, 2, 3, 7]),
+        ("add9", &[0, 2, 4, 7]),
         ("diminished", &[0, 3, 6]),
         ("augmented", &[0, 4, 8]),
         ("sus2", &[0, 2, 7]),
         ("sus4", &[0, 5, 7]),
-        ("7", &[0, 4, 7, 10]),
-        ("maj7", &[0, 4, 7, 11]),
-        ("m7", &[0, 3, 7, 10]),
-        ("m7♭5", &[0, 3, 6, 10]),
-        ("dim7", &[0, 3, 6, 9]),
+        ("major", &[0, 4, 7]),
+        ("minor", &[0, 3, 7]),
         ("5", &[0, 7]),
     ];
-    for root in &pitch_classes {
+    let roots = std::iter::once(bass_pitch_class).chain(
+        pitch_classes
+            .iter()
+            .copied()
+            .filter(|root| *root != bass_pitch_class),
+    );
+    for root in roots {
         let mut intervals = pitch_classes
             .iter()
-            .map(|pitch| (*pitch + 12 - *root) % 12)
+            .map(|pitch| (*pitch + 12 - root) % 12)
             .collect::<Vec<_>>();
         intervals.sort_unstable();
         for (quality, expected) in QUALITIES {
             if intervals == *expected {
-                return format!("{} {quality}", PITCH_CLASSES[usize::from(*root)]);
+                let inversion = if bass_pitch_class == root {
+                    String::new()
+                } else {
+                    format!("/{}", PITCH_CLASSES[usize::from(bass_pitch_class)])
+                };
+                return format!("{} {quality}{inversion}", PITCH_CLASSES[usize::from(root)]);
             }
         }
     }
@@ -28130,7 +28165,7 @@ mod tests {
         FlpDocument, Pattern, PatternController, PatternNote, PianoRollGrid, PianoRollScale,
         PianoRollSnap, PlaylistClip, PlaylistClipDragKind, PlaylistTempoMap, PlaylistTrack,
         PluginCandidate, PluginFormat, TimeSelectionShift, candidate_matches_vst_identity,
-        candidate_mixer_controls, candidate_mixer_stereo_separation,
+        candidate_mixer_controls, candidate_mixer_stereo_separation, detect_chord_name,
         detect_piano_roll_channel_scale, detect_piano_roll_scale, encode_midi_device_selections,
         first_available_playlist_track, next_piano_roll_note_group, note_from_grid_position,
         parse_midi_device_selections, piano_roll_color_group_note_ids,
@@ -28236,6 +28271,31 @@ mod tests {
         bytes.extend_from_slice(&(event_stream.len() as u32).to_le_bytes());
         bytes.extend_from_slice(&event_stream);
         FlpDocument::parse(&bytes).expect("Piano roll color fixture should parse")
+    }
+
+    #[test]
+    fn piano_roll_chord_detection_names_inversions_and_common_extensions() {
+        let note = |key, channel_id| PatternNote {
+            position: 96,
+            channel_id,
+            key,
+            ..PatternNote::default()
+        };
+        let first_inversion = vec![note(52, 2), note(60, 2), note(67, 2), note(36, 3)];
+        let major_ninth = vec![
+            note(60, 2),
+            note(64, 2),
+            note(67, 2),
+            note(71, 2),
+            note(74, 2),
+        ];
+        let c_sixth = vec![note(60, 2), note(64, 2), note(67, 2), note(69, 2)];
+        let a_minor_seventh = vec![note(57, 2), note(60, 2), note(64, 2), note(67, 2)];
+
+        assert_eq!(detect_chord_name(&first_inversion, 2, 96), "C major/E");
+        assert_eq!(detect_chord_name(&major_ninth, 2, 96), "C maj9");
+        assert_eq!(detect_chord_name(&c_sixth, 2, 96), "C 6");
+        assert_eq!(detect_chord_name(&a_minor_seventh, 2, 96), "A m7");
     }
 
     #[test]
