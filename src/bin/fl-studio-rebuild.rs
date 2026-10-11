@@ -1264,6 +1264,23 @@ enum PianoRollChordStamp {
     Dominant7,
     Major7,
     Minor7,
+    Major6,
+    Minor6,
+    Add9,
+    MinorAdd9,
+    Diminished7,
+    HalfDiminished7,
+    MinorMajor7,
+    Dominant7Flat5,
+    Dominant7Sharp5,
+    Dominant7Flat9,
+    Dominant7Sharp9,
+    Dominant9,
+    Major9,
+    Minor9,
+    Dominant11,
+    Minor11,
+    Dominant13,
     ScaleTriad,
     ScaleSeventh,
     TopDownTriad,
@@ -1271,7 +1288,7 @@ enum PianoRollChordStamp {
 }
 
 impl PianoRollChordStamp {
-    const ALL: [Self; 14] = [
+    const ALL: [Self; 31] = [
         Self::Major,
         Self::Minor,
         Self::Diminished,
@@ -1282,6 +1299,23 @@ impl PianoRollChordStamp {
         Self::Dominant7,
         Self::Major7,
         Self::Minor7,
+        Self::Major6,
+        Self::Minor6,
+        Self::Add9,
+        Self::MinorAdd9,
+        Self::Diminished7,
+        Self::HalfDiminished7,
+        Self::MinorMajor7,
+        Self::Dominant7Flat5,
+        Self::Dominant7Sharp5,
+        Self::Dominant7Flat9,
+        Self::Dominant7Sharp9,
+        Self::Dominant9,
+        Self::Major9,
+        Self::Minor9,
+        Self::Dominant11,
+        Self::Minor11,
+        Self::Dominant13,
         Self::ScaleTriad,
         Self::ScaleSeventh,
         Self::TopDownTriad,
@@ -1300,6 +1334,23 @@ impl PianoRollChordStamp {
             Self::Dominant7 => "Dominant 7",
             Self::Major7 => "Major 7",
             Self::Minor7 => "Minor 7",
+            Self::Major6 => "Major 6",
+            Self::Minor6 => "Minor 6",
+            Self::Add9 => "Add 9",
+            Self::MinorAdd9 => "Minor add 9",
+            Self::Diminished7 => "Diminished 7",
+            Self::HalfDiminished7 => "Half-diminished 7",
+            Self::MinorMajor7 => "Minor-major 7",
+            Self::Dominant7Flat5 => "Dominant 7 flat 5",
+            Self::Dominant7Sharp5 => "Dominant 7 sharp 5",
+            Self::Dominant7Flat9 => "Dominant 7 flat 9",
+            Self::Dominant7Sharp9 => "Dominant 7 sharp 9",
+            Self::Dominant9 => "Dominant 9",
+            Self::Major9 => "Major 9",
+            Self::Minor9 => "Minor 9",
+            Self::Dominant11 => "Dominant 11",
+            Self::Minor11 => "Minor 11",
+            Self::Dominant13 => "Dominant 13",
             Self::ScaleTriad => "Scale triad",
             Self::ScaleSeventh => "Scale seventh",
             Self::TopDownTriad => "Top-down triad",
@@ -1322,6 +1373,23 @@ impl PianoRollChordStamp {
             Self::Dominant7 => &[0, 4, 7, 10],
             Self::Major7 => &[0, 4, 7, 11],
             Self::Minor7 => &[0, 3, 7, 10],
+            Self::Major6 => &[0, 4, 7, 9],
+            Self::Minor6 => &[0, 3, 7, 9],
+            Self::Add9 => &[0, 4, 7, 14],
+            Self::MinorAdd9 => &[0, 3, 7, 14],
+            Self::Diminished7 => &[0, 3, 6, 9],
+            Self::HalfDiminished7 => &[0, 3, 6, 10],
+            Self::MinorMajor7 => &[0, 3, 7, 11],
+            Self::Dominant7Flat5 => &[0, 4, 6, 10],
+            Self::Dominant7Sharp5 => &[0, 4, 8, 10],
+            Self::Dominant7Flat9 => &[0, 4, 7, 10, 13],
+            Self::Dominant7Sharp9 => &[0, 4, 7, 10, 15],
+            Self::Dominant9 => &[0, 4, 7, 10, 14],
+            Self::Major9 => &[0, 4, 7, 11, 14],
+            Self::Minor9 => &[0, 3, 7, 10, 14],
+            Self::Dominant11 => &[0, 4, 7, 10, 14, 17],
+            Self::Minor11 => &[0, 3, 7, 10, 14, 17],
+            Self::Dominant13 => &[0, 4, 7, 10, 14, 17, 21],
             Self::ScaleTriad | Self::ScaleSeventh => &[],
             Self::TopDownTriad | Self::TopDownSeventh => unreachable!(),
         };
@@ -15017,12 +15085,22 @@ impl DawUi {
                 egui::ComboBox::from_id_salt("piano-roll-chord-stamp")
                     .selected_text(format!("Chord: {}", self.piano_roll_chord_stamp.label()))
                     .show_ui(ui, |ui| {
-                        for stamp in PianoRollChordStamp::ALL {
-                            ui.selectable_value(
-                                &mut self.piano_roll_chord_stamp,
-                                stamp,
-                                stamp.label(),
-                            );
+                        let all_stamps = PianoRollChordStamp::ALL;
+                        for (heading, stamps) in [
+                            ("Basic", &all_stamps[..10]),
+                            ("Advanced", &all_stamps[10..27]),
+                            ("Scale-derived", &all_stamps[27..29]),
+                            ("Top-down", &all_stamps[29..]),
+                        ] {
+                            ui.weak(heading);
+                            for &stamp in stamps {
+                                ui.selectable_value(
+                                    &mut self.piano_roll_chord_stamp,
+                                    stamp,
+                                    stamp.label(),
+                                );
+                            }
+                            ui.separator();
                         }
                     });
                 if self.piano_roll_stamp_mode {
@@ -28384,6 +28462,50 @@ mod tests {
         assert_eq!(detect_chord_name(&major_ninth, 2, 96), "C maj9");
         assert_eq!(detect_chord_name(&c_sixth, 2, 96), "C 6");
         assert_eq!(detect_chord_name(&a_minor_seventh, 2, 96), "A m7");
+    }
+
+    #[test]
+    fn piano_roll_advanced_chord_stamps_use_their_chromatic_intervals() {
+        let cases = [
+            (PianoRollChordStamp::Major6, vec![60, 64, 67, 69]),
+            (PianoRollChordStamp::Minor6, vec![60, 63, 67, 69]),
+            (PianoRollChordStamp::Add9, vec![60, 64, 67, 74]),
+            (PianoRollChordStamp::MinorAdd9, vec![60, 63, 67, 74]),
+            (PianoRollChordStamp::Diminished7, vec![60, 63, 66, 69]),
+            (PianoRollChordStamp::HalfDiminished7, vec![60, 63, 66, 70]),
+            (PianoRollChordStamp::MinorMajor7, vec![60, 63, 67, 71]),
+            (PianoRollChordStamp::Dominant7Flat5, vec![60, 64, 66, 70]),
+            (PianoRollChordStamp::Dominant7Sharp5, vec![60, 64, 68, 70]),
+            (
+                PianoRollChordStamp::Dominant7Flat9,
+                vec![60, 64, 67, 70, 73],
+            ),
+            (
+                PianoRollChordStamp::Dominant7Sharp9,
+                vec![60, 64, 67, 70, 75],
+            ),
+            (PianoRollChordStamp::Dominant9, vec![60, 64, 67, 70, 74]),
+            (PianoRollChordStamp::Major9, vec![60, 64, 67, 71, 74]),
+            (PianoRollChordStamp::Minor9, vec![60, 63, 67, 70, 74]),
+            (
+                PianoRollChordStamp::Dominant11,
+                vec![60, 64, 67, 70, 74, 77],
+            ),
+            (PianoRollChordStamp::Minor11, vec![60, 63, 67, 70, 74, 77]),
+            (
+                PianoRollChordStamp::Dominant13,
+                vec![60, 64, 67, 70, 74, 77, 81],
+            ),
+        ];
+
+        for (stamp, expected) in cases {
+            assert_eq!(
+                stamp.pitches(60, PianoRollScale::None, 0),
+                expected,
+                "{}",
+                stamp.label(),
+            );
+        }
     }
 
     #[test]
