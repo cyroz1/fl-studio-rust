@@ -21,7 +21,7 @@ use flp_rebuild::project_package::{ProjectPackageWorkspace, copy_unique_sample_f
 use flp_rebuild::sample_render::{
     AudioClipRenderOptions, AudioClipRenderSummary, AudioFileRenderOptions, AudioRecordingSummary,
     AudioRenderEncodingOptions, AudioRenderOutput, MP3_BITRATES_KBPS, PlaylistRenderOptions,
-    PlaylistRenderSummary, ResamplingQuality, SamplerPatternRenderOptions,
+    PlaylistRenderSummary, PlaylistTempoMap, ResamplingQuality, SamplerPatternRenderOptions,
     SamplerPatternRenderSummary, WavChannelMode, WavDitherMode, WavSampleFormat,
     render_audio_clips_to_file, render_playlist_with_vst3_to_flac_cancellable,
     render_playlist_with_vst3_to_mp3_cancellable, render_playlist_with_vst3_to_ogg_cancellable,
@@ -1662,6 +1662,7 @@ struct DawUi {
     project_playback_loaded: bool,
     playlist_playback_loaded: bool,
     playlist_seek_tick: u32,
+    playlist_tempo_map: Option<PlaylistTempoMap>,
     tempo_bpm: f64,
     selected_pattern: Option<u16>,
     channel_display_filter: ChannelDisplayFilter,
@@ -2123,6 +2124,7 @@ impl DawUi {
             project_playback_loaded: false,
             playlist_playback_loaded: false,
             playlist_seek_tick: 0,
+            playlist_tempo_map: None,
             tempo_bpm: 140.0,
             selected_pattern: None,
             channel_display_filter: ChannelDisplayFilter::All,
@@ -4734,6 +4736,16 @@ impl DawUi {
             read_sample_root_note: self.read_sample_root_note,
             ..PlaylistRenderOptions::default()
         };
+        let playlist_tempo_map = match PlaylistTempoMap::for_arrangement(
+            self.document.as_ref().expect("project was checked above"),
+            options.arrangement_id,
+        ) {
+            Ok(tempo_map) => tempo_map,
+            Err(error) => {
+                self.status = format!("Could not prepare Playlist tempo map: {error}");
+                return;
+            }
+        };
         let vst3_processor = self
             .vst3_host
             .as_ref()
@@ -4753,16 +4765,17 @@ impl DawUi {
                 return;
             }
         };
-        let start_frame = playlist_seek_tick_to_frame(
+        let start_frame = match playlist_seek_tick_to_frame(
             self.playlist_seek_tick,
-            self.document
-                .as_ref()
-                .expect("project was checked above")
-                .header()
-                .ppq(),
-            self.tempo_bpm,
+            &playlist_tempo_map,
             sample_rate,
-        );
+        ) {
+            Ok(frame) => frame,
+            Err(error) => {
+                self.status = format!("Could not map Playlist seek position: {error}");
+                return;
+            }
+        };
         let writer = match engine.begin_streaming_playback_from_frame(start_frame) {
             Ok(writer) => writer,
             Err(error) => {
@@ -4797,6 +4810,7 @@ impl DawUi {
                 self.playing = true;
                 self.project_playback_loaded = true;
                 self.playlist_playback_loaded = true;
+                self.playlist_tempo_map = Some(playlist_tempo_map);
                 self.pending_audio_render = Some(PendingAudioRender {
                     receiver,
                     cancelled,
@@ -4998,6 +5012,7 @@ impl DawUi {
         self.project_playback_loaded = false;
         self.playlist_playback_loaded = false;
         self.playlist_seek_tick = 0;
+        self.playlist_tempo_map = None;
     }
 
     fn reap_vst3_workers(&mut self) {
@@ -5719,22 +5734,13 @@ impl DawUi {
     }
 
     fn current_playhead_tick(&self) -> Option<f64> {
-        if !self.tempo_bpm.is_finite() || self.tempo_bpm <= 0.0 {
-            return None;
-        }
-        let document = self.document.as_ref()?;
         if !self.playlist_playback_loaded {
             return (self.playlist_seek_tick > 0).then_some(f64::from(self.playlist_seek_tick));
         }
+        let tempo_map = self.playlist_tempo_map.as_ref()?;
         let engine = self.audio_engine.as_ref()?;
-        let sample_rate = engine.sample_rate();
-        if sample_rate == 0 {
-            return None;
-        }
         let frames = engine.project_playback_position_frames();
-        let ticks = frames as f64 * self.tempo_bpm * f64::from(document.header().ppq().max(1))
-            / (60.0 * f64::from(sample_rate));
-        ticks.is_finite().then_some(ticks)
+        tempo_map.tick_at_frame(frames, engine.sample_rate())
     }
 
     fn song_position_label(&self) -> String {
@@ -22571,9 +22577,14 @@ impl eframe::App for DawUi {
                 .as_ref()
                 .is_some_and(|engine| !engine.project_playback_active())
         {
+            self.playlist_seek_tick = self
+                .current_playhead_tick()
+                .map(|tick| tick.round().clamp(0.0, f64::from(u32::MAX)) as u32)
+                .unwrap_or(self.playlist_seek_tick);
             self.playing = false;
             self.project_playback_loaded = false;
             self.playlist_playback_loaded = false;
+            self.playlist_tempo_map = None;
             self.status = "Project playback reached the end".to_owned();
             self.stop_midi_clock();
         }
@@ -25379,17 +25390,12 @@ fn playlist_track_is_hidden(
             .is_some_and(|(parent_id, _)| collapsed_group_ids.contains(&parent_id))
 }
 
-fn playlist_seek_tick_to_frame(tick: u32, ppq: u16, tempo_bpm: f64, sample_rate: u32) -> u64 {
-    if !tempo_bpm.is_finite() || tempo_bpm <= 0.0 || sample_rate == 0 {
-        return 0;
-    }
-    let frames =
-        f64::from(tick) * 60.0 * f64::from(sample_rate) / (tempo_bpm * f64::from(ppq.max(1)));
-    if frames.is_finite() && frames > 0.0 {
-        frames.round() as u64
-    } else {
-        0
-    }
+fn playlist_seek_tick_to_frame(
+    tick: u32,
+    tempo_map: &PlaylistTempoMap,
+    sample_rate: u32,
+) -> Result<u64, String> {
+    tempo_map.frame_at_tick(u64::from(tick), sample_rate)
 }
 
 fn audio_recording_length_ticks(
@@ -26525,14 +26531,13 @@ mod tests {
 
     #[test]
     fn playlist_seek_tick_converts_to_song_frames() {
-        assert_eq!(playlist_seek_tick_to_frame(384, 96, 120.0, 48_000), 96_000);
-        assert_eq!(playlist_seek_tick_to_frame(0, 96, 120.0, 48_000), 0);
+        let tempo_map = PlaylistTempoMap::constant(96, 120.0).unwrap();
         assert_eq!(
-            playlist_seek_tick_to_frame(384, 0, 120.0, 48_000),
-            9_216_000
+            playlist_seek_tick_to_frame(384, &tempo_map, 48_000),
+            Ok(96_000)
         );
-        assert_eq!(playlist_seek_tick_to_frame(384, 96, 0.0, 48_000), 0);
-        assert_eq!(playlist_seek_tick_to_frame(384, 96, 120.0, 0), 0);
+        assert_eq!(playlist_seek_tick_to_frame(0, &tempo_map, 48_000), Ok(0));
+        assert!(playlist_seek_tick_to_frame(384, &tempo_map, 0).is_err());
     }
 
     #[test]
