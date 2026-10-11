@@ -418,6 +418,17 @@ jobs:
           sleep 0.5
           ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
             -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/controller-roll.png"
+          xdotool mousemove 400 192 click 1
+          sleep 0.3
+          xdotool mousemove 450 223 click 1
+          sleep 0.3
+          xdotool key Escape
+          sleep 0.3
+          xdotool mousemove 400 192 click 1
+          sleep 0.5
+          ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
+            -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/piano-roll-scale-automatic.png"
+          xdotool key Escape
           xdotool mousemove 400 260 keydown Control_L
           sleep 0.2
           xdotool mousedown 1
@@ -450,7 +461,7 @@ jobs:
             -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/piano-roll-mousewheel-nudge.png"
           xdotool mousemove 400 192 click 1
           sleep 0.3
-          xdotool mousemove 500 315
+          xdotool mousemove 500 361
           sleep 0.5
           ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
             -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/controller-ghost-visibility.png"
@@ -644,6 +655,7 @@ jobs:
           for capture in browser-search-options.png playlist-solo.png playlist-group-solo.png playlist-groups-collapsed.png \
             mixer.png mixer-effect-slots-scrolled.png mixer-muted.png mixer-muted-solo.png mixer-phase-swap.png controller-ghost-visibility.png \
             controller-ghost-editable.png controller-ghost-editable-shortcut.png controller-color-selection.png \
+            piano-roll-scale-automatic.png \
             modern-pattern-clip-before-resize.png modern-pattern-clip-after-resize.png \
             piano-roll-time-selection.png piano-roll-pitch-selection.png piano-roll-mousewheel-property.png \
             piano-roll-mousewheel-nudge.png controller-event-draw.png controller-event-paint.png \

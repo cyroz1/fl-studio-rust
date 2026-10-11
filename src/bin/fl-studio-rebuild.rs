@@ -1096,6 +1096,128 @@ impl PianoRollScale {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DetectedPianoRollScale {
+    root: u8,
+    scale: PianoRollScale,
+}
+
+fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
+    if pitches.len() < 3 {
+        return None;
+    }
+
+    let mut pitch_counts = [0usize; 12];
+    for pitch in pitches {
+        pitch_counts[usize::from(*pitch % 12)] += 1;
+    }
+    let distinct_pitch_classes = pitch_counts.iter().filter(|count| **count > 0).count();
+    if distinct_pitch_classes < 3 {
+        return None;
+    }
+
+    let first_pitch_class = usize::from(pitches[0] % 12);
+    let last_pitch_class = usize::from(*pitches.last()? % 12);
+    let scales = [
+        PianoRollScale::Major,
+        PianoRollScale::NaturalMinor,
+        PianoRollScale::HarmonicMinor,
+        PianoRollScale::MajorPentatonic,
+        PianoRollScale::MinorPentatonic,
+    ];
+    let mut best: Option<((usize, usize, usize, i8), DetectedPianoRollScale)> = None;
+
+    for scale in scales {
+        if matches!(
+            scale,
+            PianoRollScale::MajorPentatonic | PianoRollScale::MinorPentatonic
+        ) && distinct_pitch_classes < 5
+        {
+            continue;
+        }
+        for root in 0..12u8 {
+            let matched_notes = pitches
+                .iter()
+                .filter(|pitch| scale.contains(**pitch, root))
+                .count();
+            let matched_pitch_classes = pitch_counts
+                .iter()
+                .enumerate()
+                .filter(|(pitch_class, count)| {
+                    **count > 0 && scale.contains(*pitch_class as u16, root)
+                })
+                .count();
+            let scale_completeness = matched_pitch_classes * 100 / scale.intervals().len();
+            let tonic_evidence = pitch_counts[usize::from(root)] * 4
+                + (if first_pitch_class == usize::from(root) {
+                    12
+                } else {
+                    0
+                })
+                + (if last_pitch_class == usize::from(root) {
+                    6
+                } else {
+                    0
+                });
+            let scale_preference = match scale {
+                PianoRollScale::Major => 3,
+                PianoRollScale::NaturalMinor => 2,
+                PianoRollScale::HarmonicMinor => 1,
+                PianoRollScale::MajorPentatonic => 0,
+                PianoRollScale::MinorPentatonic => -1,
+                PianoRollScale::None => unreachable!("None is not a detection candidate"),
+            };
+            let candidate = DetectedPianoRollScale { root, scale };
+            let score = (
+                matched_notes,
+                scale_completeness,
+                tonic_evidence,
+                scale_preference,
+            );
+            if best.is_none_or(|(best_score, _)| score > best_score) {
+                best = Some((score, candidate));
+            }
+        }
+    }
+
+    best.map(|(_, detected)| detected)
+}
+
+fn detect_piano_roll_channel_scale(
+    pattern: &Pattern,
+    pattern_id: u16,
+    channel_id: u16,
+    selected_notes: &BTreeSet<(u16, u16, usize)>,
+) -> Option<DetectedPianoRollScale> {
+    let mut channel_notes = Vec::new();
+    let mut channel_index = 0usize;
+    for (event_index, note) in pattern.notes.iter().enumerate() {
+        if note.channel_id != channel_id {
+            continue;
+        }
+        channel_notes.push((channel_index, event_index, note.position, note.key));
+        channel_index += 1;
+    }
+
+    let selection_exists = channel_notes.iter().any(|(note_index, _, _, _)| {
+        selected_notes.contains(&(pattern_id, channel_id, *note_index))
+    });
+    let mut pitches = channel_notes
+        .into_iter()
+        .filter(|(note_index, _, _, _)| {
+            !selection_exists || selected_notes.contains(&(pattern_id, channel_id, *note_index))
+        })
+        .map(|(_, event_index, position, key)| (position, event_index, key))
+        .collect::<Vec<_>>();
+    pitches.sort_by_key(|(position, event_index, _)| (*position, *event_index));
+    detect_piano_roll_scale(
+        &pitches
+            .into_iter()
+            .map(|(_, _, key)| key)
+            .collect::<Vec<_>>(),
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PianoRollChordStamp {
     Major,
     Minor,
@@ -1789,6 +1911,7 @@ struct DawUi {
     piano_roll_controller_selection: Option<PianoRollControllerSelectionDrag>,
     piano_roll_scale: PianoRollScale,
     piano_roll_scale_root: u8,
+    piano_roll_auto_scale_highlighting: bool,
     piano_roll_ghost_channels: bool,
     piano_roll_hidden_ghost_channels: BTreeSet<u16>,
     piano_roll_editable_ghost_channels: bool,
@@ -2310,6 +2433,7 @@ impl DawUi {
             piano_roll_controller_selection: None,
             piano_roll_scale: PianoRollScale::Major,
             piano_roll_scale_root: 0,
+            piano_roll_auto_scale_highlighting: false,
             piano_roll_ghost_channels: true,
             piano_roll_hidden_ghost_channels: BTreeSet::new(),
             piano_roll_editable_ghost_channels: false,
@@ -14308,6 +14432,22 @@ impl DawUi {
                     .unwrap_or_else(|| format!("Channel {}", channel.id()))
             })
             .unwrap_or_else(|| "No channel".to_owned());
+        let detected_scale_for_menu = self
+            .selected_pattern
+            .zip(self.selected_note_channel)
+            .and_then(|(pattern_id, channel_id)| {
+                patterns
+                    .iter()
+                    .find(|pattern| pattern.id == pattern_id)
+                    .and_then(|pattern| {
+                        detect_piano_roll_channel_scale(
+                            pattern,
+                            pattern_id,
+                            channel_id,
+                            &self.selected_piano_notes,
+                        )
+                    })
+            });
         let ghost_channel_options: Vec<(u16, String)> = self
             .selected_pattern
             .and_then(|pattern_id| patterns.iter().find(|pattern| pattern.id == pattern_id))
@@ -15679,6 +15819,22 @@ impl DawUi {
                 }
             });
             ui.menu_button("View", |ui| {
+                ui.checkbox(
+                    &mut self.piano_roll_auto_scale_highlighting,
+                    "Automatic scale highlighting",
+                );
+                if self.piano_roll_auto_scale_highlighting {
+                    if let Some(detected) = detected_scale_for_menu {
+                        ui.small(format!(
+                            "Detected: {} {}",
+                            PITCH_CLASSES[usize::from(detected.root)],
+                            detected.scale.label()
+                        ));
+                    } else {
+                        ui.small("Add at least 3 notes across 3 pitches to detect a scale.");
+                    }
+                    ui.separator();
+                }
                 egui::ComboBox::from_id_salt("piano-roll-scale-root")
                     .selected_text(format!(
                         "Key: {}",
@@ -17200,7 +17356,31 @@ impl DawUi {
             .and_then(|marker| marker.numerator().zip(marker.denominator()))
             .or(project_time_signature);
         let snap_ticks = self.piano_roll_snap.ticks(ppq, time_signature);
-        self.draw_notes(ui, &pattern, ppq, snap_ticks, project_time_signature);
+        let scale_highlight = if self.piano_roll_auto_scale_highlighting {
+            self.selected_note_channel.and_then(|channel_id| {
+                detect_piano_roll_channel_scale(
+                    &pattern,
+                    pattern.id,
+                    channel_id,
+                    &self.selected_piano_notes,
+                )
+            })
+        } else if self.piano_roll_scale == PianoRollScale::None {
+            None
+        } else {
+            Some(DetectedPianoRollScale {
+                root: self.piano_roll_scale_root,
+                scale: self.piano_roll_scale,
+            })
+        };
+        self.draw_notes(
+            ui,
+            &pattern,
+            ppq,
+            snap_ticks,
+            project_time_signature,
+            scale_highlight,
+        );
         let editor_pattern = self
             .document
             .as_ref()
@@ -18897,6 +19077,7 @@ impl DawUi {
         ppq: u16,
         snap_ticks: u32,
         project_time_signature: Option<(u8, u8)>,
+        scale_highlight: Option<DetectedPianoRollScale>,
     ) {
         let key_low = 36u16;
         let key_high = 83u16;
@@ -19086,12 +19267,9 @@ impl DawUi {
                 ],
                 Stroke::new(1.0, GRID),
             );
-            if self.piano_roll_scale != PianoRollScale::None {
+            if let Some(scale_highlight) = scale_highlight {
                 for key in key_low..=key_high {
-                    if !self
-                        .piano_roll_scale
-                        .contains(key, self.piano_roll_scale_root)
-                    {
+                    if !scale_highlight.scale.contains(key, scale_highlight.root) {
                         continue;
                     }
                     let row = key_high - key;
@@ -19100,7 +19278,7 @@ impl DawUi {
                         egui::pos2(rect.left() + keyboard_width, y),
                         Vec2::new(grid_width, key_height),
                     );
-                    let is_root = key % 12 == u16::from(self.piano_roll_scale_root);
+                    let is_root = key % 12 == u16::from(scale_highlight.root);
                     painter.rect_filled(
                         scale_row,
                         0,
@@ -27948,11 +28126,12 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        ActivePlaylistClipDrag, Arrangement, ChannelDisplayFilter, FlpDocument, Pattern,
-        PatternController, PatternNote, PianoRollGrid, PianoRollSnap, PlaylistClip,
-        PlaylistClipDragKind, PlaylistTempoMap, PlaylistTrack, PluginCandidate, PluginFormat,
-        TimeSelectionShift, candidate_matches_vst_identity, candidate_mixer_controls,
-        candidate_mixer_stereo_separation, encode_midi_device_selections,
+        ActivePlaylistClipDrag, Arrangement, ChannelDisplayFilter, DetectedPianoRollScale,
+        FlpDocument, Pattern, PatternController, PatternNote, PianoRollGrid, PianoRollScale,
+        PianoRollSnap, PlaylistClip, PlaylistClipDragKind, PlaylistTempoMap, PlaylistTrack,
+        PluginCandidate, PluginFormat, TimeSelectionShift, candidate_matches_vst_identity,
+        candidate_mixer_controls, candidate_mixer_stereo_separation,
+        detect_piano_roll_channel_scale, detect_piano_roll_scale, encode_midi_device_selections,
         first_available_playlist_track, next_piano_roll_note_group, note_from_grid_position,
         parse_midi_device_selections, piano_roll_color_group_note_ids,
         piano_roll_controller_stroke_points, piano_roll_controller_value_at,
@@ -28057,6 +28236,87 @@ mod tests {
         bytes.extend_from_slice(&(event_stream.len() as u32).to_le_bytes());
         bytes.extend_from_slice(&event_stream);
         FlpDocument::parse(&bytes).expect("Piano roll color fixture should parse")
+    }
+
+    #[test]
+    fn automatic_scale_detection_uses_scale_fit_and_tonic_context() {
+        assert_eq!(
+            detect_piano_roll_scale(&[60, 62, 64, 65, 67, 69, 71, 72]),
+            Some(DetectedPianoRollScale {
+                root: 0,
+                scale: PianoRollScale::Major,
+            })
+        );
+        assert_eq!(
+            detect_piano_roll_scale(&[57, 59, 60, 62, 64, 65, 67, 69]),
+            Some(DetectedPianoRollScale {
+                root: 9,
+                scale: PianoRollScale::NaturalMinor,
+            })
+        );
+        assert_eq!(
+            detect_piano_roll_scale(&[57, 59, 60, 62, 64, 65, 68, 69]),
+            Some(DetectedPianoRollScale {
+                root: 9,
+                scale: PianoRollScale::HarmonicMinor,
+            })
+        );
+        assert_eq!(
+            detect_piano_roll_scale(&[60, 62, 64, 67, 69, 72]),
+            Some(DetectedPianoRollScale {
+                root: 0,
+                scale: PianoRollScale::MajorPentatonic,
+            })
+        );
+    }
+
+    #[test]
+    fn automatic_scale_detection_waits_for_three_notes_in_distinct_pitch_classes() {
+        assert_eq!(detect_piano_roll_scale(&[60, 62]), None);
+        assert_eq!(detect_piano_roll_scale(&[60, 60, 64, 64]), None);
+    }
+
+    #[test]
+    fn automatic_scale_detection_uses_selected_notes_or_the_target_channel_score() {
+        let note = |position, channel_id, key| PatternNote {
+            position,
+            channel_id,
+            key,
+            ..PatternNote::default()
+        };
+        let pattern = Pattern {
+            id: 7,
+            name: None,
+            length_ticks: None,
+            notes: vec![
+                note(0, 0, 60),
+                note(48, 1, 61),
+                note(96, 0, 64),
+                note(192, 0, 67),
+                note(288, 0, 57),
+                note(384, 0, 60),
+                note(480, 0, 64),
+                note(576, 0, 69),
+            ],
+            controllers: Vec::new(),
+            time_markers: Vec::new(),
+        };
+        let selected = BTreeSet::from([(7, 0, 3), (7, 0, 4), (7, 0, 5), (7, 0, 6)]);
+
+        assert_eq!(
+            detect_piano_roll_channel_scale(&pattern, 7, 0, &selected),
+            Some(DetectedPianoRollScale {
+                root: 9,
+                scale: PianoRollScale::NaturalMinor,
+            })
+        );
+        assert_eq!(
+            detect_piano_roll_channel_scale(&pattern, 7, 0, &BTreeSet::new()),
+            Some(DetectedPianoRollScale {
+                root: 0,
+                scale: PianoRollScale::Major,
+            })
+        );
     }
 
     #[test]
