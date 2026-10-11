@@ -547,6 +547,112 @@ enum MainView {
     Automation,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum DetachedWindowKind {
+    Playlist,
+    ChannelRack,
+    PianoRoll,
+    Mixer,
+}
+
+impl DetachedWindowKind {
+    const ALL: [Self; 4] = [
+        Self::Playlist,
+        Self::ChannelRack,
+        Self::PianoRoll,
+        Self::Mixer,
+    ];
+
+    const fn settings_key(self) -> &'static str {
+        match self {
+            Self::Playlist => "playlist",
+            Self::ChannelRack => "channel_rack",
+            Self::PianoRoll => "piano_roll",
+            Self::Mixer => "mixer",
+        }
+    }
+
+    const fn minimum_size(self) -> Vec2 {
+        match self {
+            Self::Playlist => Vec2::new(800.0, 560.0),
+            Self::ChannelRack => Vec2::new(640.0, 480.0),
+            Self::PianoRoll | Self::Mixer => Vec2::new(760.0, 480.0),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DetachedWindowPlacement {
+    position: Option<egui::Pos2>,
+    inner_size: Vec2,
+}
+
+impl DetachedWindowPlacement {
+    fn is_valid(self, kind: DetachedWindowKind) -> bool {
+        let minimum = kind.minimum_size();
+        self.inner_size.x.is_finite()
+            && self.inner_size.y.is_finite()
+            && self.inner_size.x >= minimum.x
+            && self.inner_size.y >= minimum.y
+            && self.inner_size.x <= 16_384.0
+            && self.inner_size.y <= 16_384.0
+            && self.position.is_none_or(|position| {
+                position.x.is_finite()
+                    && position.y.is_finite()
+                    && position.x.abs() <= 100_000.0
+                    && position.y.abs() <= 100_000.0
+            })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DetachedWindowPlacements {
+    playlist: Option<DetachedWindowPlacement>,
+    channel_rack: Option<DetachedWindowPlacement>,
+    piano_roll: Option<DetachedWindowPlacement>,
+    mixer: Option<DetachedWindowPlacement>,
+}
+
+impl DetachedWindowPlacements {
+    fn get(self, kind: DetachedWindowKind) -> Option<DetachedWindowPlacement> {
+        match kind {
+            DetachedWindowKind::Playlist => self.playlist,
+            DetachedWindowKind::ChannelRack => self.channel_rack,
+            DetachedWindowKind::PianoRoll => self.piano_roll,
+            DetachedWindowKind::Mixer => self.mixer,
+        }
+    }
+
+    fn set(&mut self, kind: DetachedWindowKind, placement: DetachedWindowPlacement) {
+        match kind {
+            DetachedWindowKind::Playlist => self.playlist = Some(placement),
+            DetachedWindowKind::ChannelRack => self.channel_rack = Some(placement),
+            DetachedWindowKind::PianoRoll => self.piano_roll = Some(placement),
+            DetachedWindowKind::Mixer => self.mixer = Some(placement),
+        }
+    }
+}
+
+fn detached_window_viewport_builder(
+    kind: DetachedWindowKind,
+    title: &'static str,
+    default_size: Vec2,
+    placement: Option<DetachedWindowPlacement>,
+) -> egui::ViewportBuilder {
+    let mut builder = egui::ViewportBuilder::default()
+        .with_title(title)
+        .with_inner_size(default_size)
+        .with_min_inner_size(kind.minimum_size())
+        .with_resizable(true);
+    if let Some(placement) = placement {
+        builder = builder.with_inner_size(placement.inner_size);
+        if let Some(position) = placement.position {
+            builder = builder.with_position(position);
+        }
+    }
+    builder
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum ChannelDisplayFilter {
     #[default]
@@ -2069,6 +2175,8 @@ struct DawUi {
     mixer_window_detached: bool,
     channel_rack_window_detached: bool,
     playlist_window_detached: bool,
+    detached_window_placements: DetachedWindowPlacements,
+    detached_window_current_placements: DetachedWindowPlacements,
     piano_roll_pending_scroll_offset: Option<Vec2>,
     piano_roll_grid_viewport: Option<egui::Rect>,
     piano_roll_grid_scroll_offset: Vec2,
@@ -2532,6 +2640,7 @@ impl DawUi {
         }
         let live_resampling_quality = load_live_resampling_quality();
         let playlist_render_quality = load_playlist_render_quality();
+        let detached_window_placements = load_detached_window_placements();
         let read_sample_root_note = load_read_sample_root_note();
         let midi_recording_offset_ms = load_midi_recording_offset_ms();
         let piano_roll_nudge_notes_with_mouse_wheel =
@@ -2595,6 +2704,8 @@ impl DawUi {
             mixer_window_detached: false,
             channel_rack_window_detached: false,
             playlist_window_detached: false,
+            detached_window_placements,
+            detached_window_current_placements: detached_window_placements,
             piano_roll_pending_scroll_offset: None,
             piano_roll_grid_viewport: None,
             piano_roll_grid_scroll_offset: Vec2::ZERO,
@@ -2861,6 +2972,46 @@ impl DawUi {
             app.recovery_prompt = Some(prompt);
         }
         app
+    }
+
+    fn capture_detached_window_placement(
+        &mut self,
+        kind: DetachedWindowKind,
+        context: &egui::Context,
+        inner_size: Vec2,
+    ) {
+        let viewport = context.input(|input| input.viewport().clone());
+        let position = if cfg!(target_os = "macos") {
+            viewport.inner_rect.map(|rect| rect.min)
+        } else {
+            viewport
+                .outer_rect
+                .or(viewport.inner_rect)
+                .map(|rect| rect.min)
+        }
+        .or_else(|| {
+            self.detached_window_placements
+                .get(kind)
+                .and_then(|placement| placement.position)
+        });
+        let placement = DetachedWindowPlacement {
+            position,
+            inner_size,
+        };
+        if placement.is_valid(kind) {
+            self.detached_window_current_placements.set(kind, placement);
+        }
+    }
+
+    fn persist_detached_window_placements(&mut self) {
+        for kind in DetachedWindowKind::ALL {
+            if let Some(placement) = self.detached_window_current_placements.get(kind) {
+                self.detached_window_placements.set(kind, placement);
+            }
+        }
+        if let Err(error) = save_detached_window_placements(self.detached_window_placements) {
+            self.status = format!("Could not save detached window layout: {error}");
+        }
     }
 
     fn open_dialog(&mut self) {
@@ -6387,6 +6538,9 @@ impl DawUi {
                     })
                     .clicked()
                 {
+                    if self.piano_roll_window_detached {
+                        self.persist_detached_window_placements();
+                    }
                     self.piano_roll_window_detached = !self.piano_roll_window_detached;
                     self.view = MainView::PianoRoll;
                     self.status = if self.piano_roll_window_detached {
@@ -6404,6 +6558,9 @@ impl DawUi {
                     })
                     .clicked()
                 {
+                    if self.mixer_window_detached {
+                        self.persist_detached_window_placements();
+                    }
                     self.mixer_window_detached = !self.mixer_window_detached;
                     self.view = MainView::Mixer;
                     self.status = if self.mixer_window_detached {
@@ -6421,6 +6578,9 @@ impl DawUi {
                     })
                     .clicked()
                 {
+                    if self.channel_rack_window_detached {
+                        self.persist_detached_window_placements();
+                    }
                     self.channel_rack_window_detached = !self.channel_rack_window_detached;
                     self.view = MainView::ChannelRack;
                     self.status = if self.channel_rack_window_detached {
@@ -6438,6 +6598,9 @@ impl DawUi {
                     })
                     .clicked()
                 {
+                    if self.playlist_window_detached {
+                        self.persist_detached_window_placements();
+                    }
                     self.playlist_window_detached = !self.playlist_window_detached;
                     self.view = MainView::Playlist;
                     self.status = if self.playlist_window_detached {
@@ -24814,6 +24977,10 @@ impl DawUi {
 }
 
 impl eframe::App for DawUi {
+    fn on_exit(&mut self) {
+        self.persist_detached_window_placements();
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // Reassert the app theme before building child Uis. Some native
         // window backends report a system appearance after startup.
@@ -25233,6 +25400,7 @@ impl eframe::App for DawUi {
                                         );
                                         ui.add_space(8.0);
                                         if ui.button("Dock Playlist").clicked() {
+                                            self.persist_detached_window_placements();
                                             self.playlist_window_detached = false;
                                         }
                                     });
@@ -25251,6 +25419,7 @@ impl eframe::App for DawUi {
                                         );
                                         ui.add_space(8.0);
                                         if ui.button("Dock Channel Rack").clicked() {
+                                            self.persist_detached_window_placements();
                                             self.channel_rack_window_detached = false;
                                         }
                                     });
@@ -25269,6 +25438,7 @@ impl eframe::App for DawUi {
                                         );
                                         ui.add_space(8.0);
                                         if ui.button("Dock Piano roll").clicked() {
+                                            self.persist_detached_window_placements();
                                             self.piano_roll_window_detached = false;
                                         }
                                     });
@@ -25287,6 +25457,7 @@ impl eframe::App for DawUi {
                                         );
                                         ui.add_space(8.0);
                                         if ui.button("Dock Mixer").clicked() {
+                                            self.persist_detached_window_placements();
                                             self.mixer_window_detached = false;
                                         }
                                     });
@@ -25337,15 +25508,23 @@ impl eframe::App for DawUi {
         });
         if self.piano_roll_window_detached {
             let viewport_id = egui::ViewportId::from_hash_of("detached-piano-roll");
-            let viewport = egui::ViewportBuilder::default()
-                .with_title("Piano roll")
-                .with_inner_size(Vec2::new(1120.0, 720.0))
-                .with_min_inner_size(Vec2::new(760.0, 480.0))
-                .with_resizable(true);
+            let viewport = detached_window_viewport_builder(
+                DetachedWindowKind::PianoRoll,
+                "Piano roll",
+                Vec2::new(1120.0, 720.0),
+                self.detached_window_placements
+                    .get(DetachedWindowKind::PianoRoll),
+            );
             let context = ui.ctx().clone();
             context.show_viewport_immediate(viewport_id, viewport, |viewport_ui, _class| {
                 let viewport_context = viewport_ui.ctx().clone();
+                self.capture_detached_window_placement(
+                    DetachedWindowKind::PianoRoll,
+                    &viewport_context,
+                    viewport_ui.max_rect().size(),
+                );
                 if viewport_context.input(|input| input.viewport().close_requested()) {
+                    self.persist_detached_window_placements();
                     self.piano_roll_window_detached = false;
                     return;
                 }
@@ -25469,15 +25648,23 @@ impl eframe::App for DawUi {
         }
         if self.mixer_window_detached {
             let viewport_id = egui::ViewportId::from_hash_of("detached-mixer");
-            let viewport = egui::ViewportBuilder::default()
-                .with_title("Mixer")
-                .with_inner_size(Vec2::new(1080.0, 640.0))
-                .with_min_inner_size(Vec2::new(760.0, 480.0))
-                .with_resizable(true);
+            let viewport = detached_window_viewport_builder(
+                DetachedWindowKind::Mixer,
+                "Mixer",
+                Vec2::new(1080.0, 640.0),
+                self.detached_window_placements
+                    .get(DetachedWindowKind::Mixer),
+            );
             let context = ui.ctx().clone();
             context.show_viewport_immediate(viewport_id, viewport, |viewport_ui, _class| {
                 let viewport_context = viewport_ui.ctx().clone();
+                self.capture_detached_window_placement(
+                    DetachedWindowKind::Mixer,
+                    &viewport_context,
+                    viewport_ui.max_rect().size(),
+                );
                 if viewport_context.input(|input| input.viewport().close_requested()) {
+                    self.persist_detached_window_placements();
                     self.mixer_window_detached = false;
                     return;
                 }
@@ -25585,15 +25772,23 @@ impl eframe::App for DawUi {
         }
         if self.channel_rack_window_detached {
             let viewport_id = egui::ViewportId::from_hash_of("detached-channel-rack");
-            let viewport = egui::ViewportBuilder::default()
-                .with_title("Channel Rack")
-                .with_inner_size(Vec2::new(980.0, 640.0))
-                .with_min_inner_size(Vec2::new(640.0, 480.0))
-                .with_resizable(true);
+            let viewport = detached_window_viewport_builder(
+                DetachedWindowKind::ChannelRack,
+                "Channel Rack",
+                Vec2::new(980.0, 640.0),
+                self.detached_window_placements
+                    .get(DetachedWindowKind::ChannelRack),
+            );
             let context = ui.ctx().clone();
             context.show_viewport_immediate(viewport_id, viewport, |viewport_ui, _class| {
                 let viewport_context = viewport_ui.ctx().clone();
+                self.capture_detached_window_placement(
+                    DetachedWindowKind::ChannelRack,
+                    &viewport_context,
+                    viewport_ui.max_rect().size(),
+                );
                 if viewport_context.input(|input| input.viewport().close_requested()) {
+                    self.persist_detached_window_placements();
                     self.channel_rack_window_detached = false;
                     return;
                 }
@@ -25701,15 +25896,23 @@ impl eframe::App for DawUi {
         }
         if self.playlist_window_detached {
             let viewport_id = egui::ViewportId::from_hash_of("detached-playlist");
-            let viewport = egui::ViewportBuilder::default()
-                .with_title("Playlist")
-                .with_inner_size(Vec2::new(1280.0, 760.0))
-                .with_min_inner_size(Vec2::new(800.0, 560.0))
-                .with_resizable(true);
+            let viewport = detached_window_viewport_builder(
+                DetachedWindowKind::Playlist,
+                "Playlist",
+                Vec2::new(1280.0, 760.0),
+                self.detached_window_placements
+                    .get(DetachedWindowKind::Playlist),
+            );
             let context = ui.ctx().clone();
             context.show_viewport_immediate(viewport_id, viewport, |viewport_ui, _class| {
                 let viewport_context = viewport_ui.ctx().clone();
+                self.capture_detached_window_placement(
+                    DetachedWindowKind::Playlist,
+                    &viewport_context,
+                    viewport_ui.max_rect().size(),
+                );
                 if viewport_context.input(|input| input.viewport().close_requested()) {
+                    self.persist_detached_window_placements();
                     self.playlist_window_detached = false;
                     return;
                 }
@@ -26808,6 +27011,96 @@ fn ui_scale_settings_file() -> Option<PathBuf> {
     browser_favorites_file()?
         .parent()
         .map(|directory| directory.join("ui-scale.txt"))
+}
+
+fn detached_window_placements_settings_file() -> Option<PathBuf> {
+    browser_favorites_file()?
+        .parent()
+        .map(|directory| directory.join("detached-window-placements.txt"))
+}
+
+fn load_detached_window_placements() -> DetachedWindowPlacements {
+    let Some(path) = detached_window_placements_settings_file() else {
+        return DetachedWindowPlacements::default();
+    };
+    let Ok(contents) = fs::read_to_string(path) else {
+        return DetachedWindowPlacements::default();
+    };
+    let mut placements = DetachedWindowPlacements::default();
+    for line in contents.lines() {
+        let Some((key, values)) = line.split_once('=') else {
+            continue;
+        };
+        let kind = match key {
+            "playlist" => DetachedWindowKind::Playlist,
+            "channel_rack" => DetachedWindowKind::ChannelRack,
+            "piano_roll" => DetachedWindowKind::PianoRoll,
+            "mixer" => DetachedWindowKind::Mixer,
+            _ => continue,
+        };
+        let mut values = values.split(',');
+        let (Some(x), Some(y), Some(width), Some(height)) =
+            (values.next(), values.next(), values.next(), values.next())
+        else {
+            continue;
+        };
+        if values.next().is_some() {
+            continue;
+        }
+        let parse_coordinate = |value: &str| {
+            if value == "-" {
+                None
+            } else {
+                value
+                    .parse::<f32>()
+                    .ok()
+                    .filter(|number| number.is_finite())
+            }
+        };
+        let placement = DetachedWindowPlacement {
+            position: parse_coordinate(x)
+                .zip(parse_coordinate(y))
+                .map(|(x, y)| egui::pos2(x, y)),
+            inner_size: Vec2::new(
+                width.parse::<f32>().unwrap_or_default(),
+                height.parse::<f32>().unwrap_or_default(),
+            ),
+        };
+        if placement.is_valid(kind) {
+            placements.set(kind, placement);
+        }
+    }
+    placements
+}
+
+fn save_detached_window_placements(placements: DetachedWindowPlacements) -> Result<(), String> {
+    let path = detached_window_placements_settings_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path.parent().ok_or_else(|| {
+        "the detached window placement settings path has no parent folder".to_owned()
+    })?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    let contents = DetachedWindowKind::ALL
+        .into_iter()
+        .filter_map(|kind| {
+            placements.get(kind).map(|placement| {
+                let (x, y) = placement
+                    .position
+                    .map_or(("-".to_owned(), "-".to_owned()), |pos| {
+                        (format!("{:.1}", pos.x), format!("{:.1}", pos.y))
+                    });
+                format!(
+                    "{}={x},{y},{:.1},{:.1}\n",
+                    kind.settings_key(),
+                    placement.inner_size.x,
+                    placement.inner_size.y,
+                )
+            })
+        })
+        .collect::<String>();
+    fs::write(&path, contents)
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
 }
 
 fn piano_roll_mouse_wheel_nudge_settings_file() -> Option<PathBuf> {

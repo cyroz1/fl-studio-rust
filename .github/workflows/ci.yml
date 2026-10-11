@@ -118,6 +118,8 @@ jobs:
           mkdir -p dist/gui-preview
           cat > "$RUNNER_TEMP/capture-ui.sh" <<'BASH'
           set -euo pipefail
+          export XDG_CONFIG_HOME="$RUNNER_TEMP/fl-studio-ui-config"
+          rm -rf "$XDG_CONFIG_HOME"
           target/release/fl-studio-rebuild > "$RUNNER_TEMP/gui-preview.log" 2>&1 &
           app_pid=$!
           cleanup() {
@@ -464,6 +466,7 @@ jobs:
             exit 1
           fi
           xdotool windowmove "$detached_playlist_window" 420 48
+          xdotool windowsize "$detached_playlist_window" 1000 650
           xdotool windowfocus --sync "$detached_playlist_window"
           sleep 0.5
           ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
@@ -478,6 +481,68 @@ jobs:
             cat "$RUNNER_TEMP/mixer-preview.log"
             exit 1
           fi
+
+          detached_layout="$XDG_CONFIG_HOME/fl-studio-rebuild/detached-window-placements.txt"
+          python3 - "$detached_layout" <<'PY'
+          from pathlib import Path
+          import sys
+
+          layout_path = Path(sys.argv[1])
+          if not layout_path.is_file():
+              raise SystemExit("Docking the Playlist did not persist detached-window placement.")
+          placement = next(
+              (line.removeprefix("playlist=").split(",") for line in layout_path.read_text().splitlines()
+               if line.startswith("playlist=")),
+              None,
+          )
+          if placement is None or len(placement) != 4:
+              raise SystemExit("The saved Playlist placement is missing or malformed.")
+          width, height = map(float, placement[2:])
+          if abs(width - 1000) > 4 or abs(height - 650) > 4:
+              raise SystemExit(f"The saved Playlist size is unexpected: {width}x{height}.")
+          PY
+
+          kill "$app_pid" 2>/dev/null || true
+          wait "$app_pid" 2>/dev/null || true
+          app_pid=""
+          target/release/fl-studio-rebuild "$RUNNER_TEMP/mixer-preview.flp" \
+            > "$RUNNER_TEMP/mixer-preview-restored.log" 2>&1 &
+          app_pid=$!
+          for attempt in $(seq 1 10); do
+            if ! kill -0 "$app_pid" 2>/dev/null; then
+              cat "$RUNNER_TEMP/mixer-preview-restored.log"
+              exit 1
+            fi
+            sleep 1
+          done
+          mixer_window=$(xdotool search --onlyvisible --name '^FL Studio Rebuild$' | head -n 1 || true)
+          if [[ -z "$mixer_window" ]]; then
+            echo "Could not find the app window for detached Playlist placement restore."
+            cat "$RUNNER_TEMP/mixer-preview-restored.log"
+            exit 1
+          fi
+          xdotool windowfocus --sync "$mixer_window"
+          xdotool mousemove 287 16 click 1
+          sleep 0.3
+          xdotool mousemove 350 294 click 1
+          sleep 1
+          restored_playlist_window=$(xdotool search --onlyvisible --name '^Playlist$' | head -n 1 || true)
+          if [[ -z "$restored_playlist_window" ]]; then
+            echo "The detached Playlist did not reopen after restoring its saved placement."
+            cat "$RUNNER_TEMP/mixer-preview-restored.log"
+            exit 1
+          fi
+          window_geometry=$(xdotool getwindowgeometry --shell "$restored_playlist_window")
+          eval "$window_geometry"
+          python3 - "$X" "$Y" "$WIDTH" "$HEIGHT" <<'PY'
+          import sys
+
+          x, y, width, height = map(int, sys.argv[1:])
+          if abs(width - 1000) > 4 or abs(height - 650) > 4:
+              raise SystemExit(f"The detached Playlist size was not restored: {width}x{height}.")
+          if abs(x - 420) > 30 or abs(y - 48) > 30:
+              raise SystemExit(f"The detached Playlist position was not restored: {x},{y}.")
+          PY
 
           kill "$app_pid" 2>/dev/null || true
           wait "$app_pid" 2>/dev/null || true
