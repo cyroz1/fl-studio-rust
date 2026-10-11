@@ -988,7 +988,7 @@ pub struct PatternControllerEdit {
     pub value: Option<f32>,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PatternNote {
     pub position: u32,
     pub flags: u16,
@@ -1005,6 +1005,9 @@ pub struct PatternNote {
     pub mod_x: u8,
     pub mod_y: u8,
 }
+
+/// FL Studio's observed flags word for ordinary score notes.
+pub const PATTERN_NOTE_DEFAULT_FLAGS: u16 = 0x4000;
 
 /// FL Studio score-note flag for slide notes.
 pub const PATTERN_NOTE_SLIDE_FLAG: u16 = 1 << 3;
@@ -2085,6 +2088,27 @@ impl PatternNote {
         }
         if let Some(value) = edit.mod_y {
             self.mod_y = value;
+        }
+    }
+}
+
+impl Default for PatternNote {
+    fn default() -> Self {
+        Self {
+            position: 0,
+            flags: PATTERN_NOTE_DEFAULT_FLAGS,
+            channel_id: 0,
+            length: 0,
+            key: 60,
+            group: 0,
+            fine_pitch: 120,
+            reserved: 0,
+            release: 64,
+            midi_channel: 0,
+            pan: 64,
+            velocity: 100,
+            mod_x: 128,
+            mod_y: 128,
         }
     }
 }
@@ -16451,6 +16475,12 @@ mod tests {
         let patterns = document.patterns().expect("patterns should decode");
         assert_eq!(patterns[0].notes.len(), 2);
         assert_eq!(patterns[0].notes[1].position, 120);
+        assert_eq!(patterns[0].notes[1].flags, PATTERN_NOTE_DEFAULT_FLAGS);
+        assert_eq!(patterns[0].notes[1].fine_pitch, 120);
+        assert_eq!(patterns[0].notes[1].release, 64);
+        assert_eq!(patterns[0].notes[1].pan, 64);
+        assert_eq!(patterns[0].notes[1].mod_x, 128);
+        assert_eq!(patterns[0].notes[1].mod_y, 128);
         let notes_event = document
             .events()
             .iter()
