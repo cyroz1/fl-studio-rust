@@ -5459,6 +5459,10 @@ impl DawUi {
                     ("F9", "Mixer"),
                     ("Shift+Arrow", "Nudge selected Piano roll notes"),
                     ("Ctrl/Cmd+Up/Down", "Transpose Piano roll notes by octave"),
+                    (
+                        "Piano roll Shift+D",
+                        "Discard selected note lengths to snap",
+                    ),
                     ("Piano roll Ctrl/Cmd+L", "Quick Legato"),
                     ("Piano roll Ctrl/Cmd+G", "Glue selected notes"),
                     ("Piano roll Shift+Q", "Quick quantize note starts"),
@@ -12638,6 +12642,64 @@ impl DawUi {
         }
     }
 
+    fn discard_piano_roll_selection_lengths(
+        &mut self,
+        pattern: &Pattern,
+        pattern_id: u16,
+        minimum_length_ticks: u32,
+    ) {
+        let length = minimum_length_ticks.max(1);
+        let targets = self
+            .selected_piano_notes
+            .iter()
+            .filter(|(selected_pattern, _, _)| *selected_pattern == pattern_id)
+            .filter_map(|(_, channel_id, note_index)| {
+                pattern
+                    .notes
+                    .iter()
+                    .filter(|note| note.channel_id == *channel_id)
+                    .nth(*note_index)
+                    .map(|note| (*channel_id, *note_index, note))
+            })
+            .filter_map(|(channel_id, note_index, note)| {
+                piano_roll_discard_length_edit(note, length)
+                    .map(|edit| (channel_id, note_index, edit))
+            })
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            self.status = if self.selected_piano_notes.is_empty() {
+                "Select notes before discarding their lengths".to_owned()
+            } else {
+                "Selected note lengths already match the snap value".to_owned()
+            };
+            return;
+        }
+
+        let mut updated = self.document.clone();
+        let Some(document) = updated.as_mut() else {
+            self.status = "Open a project before discarding note lengths".to_owned();
+            return;
+        };
+        let result = targets
+            .iter()
+            .try_for_each(|(channel_id, note_index, edit)| {
+                document.edit_pattern_note(pattern_id, *channel_id, *note_index, edit.clone())
+            });
+        match result {
+            Ok(()) => {
+                self.document = updated;
+                self.stop_project_playback();
+                self.dirty = true;
+                self.status = format!(
+                    "Set {} selected note{} to {length} ticks",
+                    targets.len(),
+                    if targets.len() == 1 { "" } else { "s" }
+                );
+            }
+            Err(error) => self.status = format!("Could not discard selected note lengths: {error}"),
+        }
+    }
+
     fn select_piano_roll_color_group(&mut self) {
         let Some((pattern_id, channel_id)) = self.selected_pattern.zip(self.selected_note_channel)
         else {
@@ -13021,6 +13083,7 @@ impl DawUi {
         let mut change_note_color_requested = false;
         let mut quantize_selected_requested = false;
         let mut quick_quantize_start_requested = false;
+        let mut discard_note_lengths_requested = false;
         let mut open_pattern_time_signature_dialog = false;
         let mut note_nudge_requested = None;
         if ui.memory(|memory| memory.focused().is_none()) {
@@ -13056,6 +13119,8 @@ impl DawUi {
                 ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::G));
             quick_quantize_start_requested =
                 ui.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::Q));
+            discard_note_lengths_requested =
+                ui.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::D));
             note_nudge_requested = ui.input_mut(|input| {
                 if input.consume_key(egui::Modifiers::COMMAND, egui::Key::ArrowUp) {
                     Some((0, 12))
@@ -13551,6 +13616,17 @@ impl DawUi {
                             "Selected notes",
                         );
                     });
+                if ui
+                    .add_enabled(
+                        selected_note_count > 0,
+                        egui::Button::new("Discard lengths  Shift+D"),
+                    )
+                    .on_hover_text("Set selected notes to the current snap length")
+                    .clicked()
+                {
+                    discard_note_lengths_requested = true;
+                    ui.close();
+                }
                 ui.menu_button("Quantize", |ui| {
                     if ui
                         .add_enabled(
@@ -14307,6 +14383,7 @@ impl DawUi {
                 quick_quantize_start_requested = false;
             }
             quantize_selected_requested = false;
+            discard_note_lengths_requested = false;
             legato_requested = false;
             chop_requested = false;
             glue_requested = false;
@@ -14710,6 +14787,16 @@ impl DawUi {
 
         if render_requested {
             self.render_selected_pattern_channel();
+        }
+        if discard_note_lengths_requested
+            && let Some(pattern_id) = self.selected_pattern
+            && let Some(pattern) = patterns.iter().find(|pattern| pattern.id == pattern_id)
+        {
+            let minimum_length_ticks = self.piano_roll_snap.ticks(ppq, time_signature);
+            self.discard_piano_roll_selection_lengths(pattern, pattern_id, minimum_length_ticks);
+            if let Some(document) = self.document.as_ref() {
+                patterns = document.patterns().unwrap_or_default();
+            }
         }
         if preview_requested {
             self.play_selected_pattern_channel();
@@ -21617,6 +21704,17 @@ fn piano_roll_note_nudge_edit(
     }
 }
 
+fn piano_roll_discard_length_edit(
+    note: &PatternNote,
+    minimum_length_ticks: u32,
+) -> Option<PatternNoteEdit> {
+    let length = minimum_length_ticks.max(1);
+    (note.length != length).then_some(PatternNoteEdit {
+        length: Some(length),
+        ..PatternNoteEdit::default()
+    })
+}
+
 fn piano_roll_color_group_note_ids(
     pattern: &Pattern,
     pattern_id: u16,
@@ -23987,7 +24085,7 @@ mod tests {
         encode_midi_device_selections, first_available_playlist_track, next_piano_roll_note_group,
         note_from_grid_position, parse_midi_device_selections, piano_roll_color_group_note_ids,
         piano_roll_controller_value_at, piano_roll_controller_value_range,
-        piano_roll_note_group_members, piano_roll_note_nudge_edit,
+        piano_roll_discard_length_edit, piano_roll_note_group_members, piano_roll_note_nudge_edit,
         piano_roll_random_note_selection, playlist_audio_clip_join_candidates,
         playlist_audio_drop_position_ticks, playlist_bar_ticks, playlist_clip_drag_edit,
         playlist_clip_local_recording_offset, playlist_clip_split_position,
@@ -24997,6 +25095,36 @@ mod tests {
 
         let highest = PatternNote { key: 131, ..note };
         assert_eq!(piano_roll_note_nudge_edit(&highest, 0, 1).key, None);
+    }
+
+    #[test]
+    fn piano_roll_discard_lengths_uses_snap_minimum_and_skips_matching_notes() {
+        let note = PatternNote {
+            length: 384,
+            ..PatternNote::default()
+        };
+        assert_eq!(
+            piano_roll_discard_length_edit(&note, 24)
+                .expect("a longer note should be shortened")
+                .length,
+            Some(24)
+        );
+        assert!(
+            piano_roll_discard_length_edit(
+                &PatternNote {
+                    length: 24,
+                    ..note.clone()
+                },
+                24
+            )
+            .is_none()
+        );
+        assert_eq!(
+            piano_roll_discard_length_edit(&PatternNote { length: 0, ..note }, 0)
+                .expect("a zero snap size should clamp to one tick")
+                .length,
+            Some(1)
+        );
     }
 
     #[test]
