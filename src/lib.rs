@@ -1041,6 +1041,13 @@ pub enum LimitSnapDirection {
     Alternate,
 }
 
+/// Direction used to rotate note starts by one snap unit within their measures.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PatternNoteRotation {
+    Left,
+    Right,
+}
+
 /// Pitch range, wrap mode, and optional scale settings for the Piano roll Limit operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LimitNoteOptions<'a> {
@@ -1410,6 +1417,55 @@ fn randomizer_offset(state: &mut u64, range: i32, negative: bool, bipolar: bool)
 
 fn note_index_in_scope(note_index: usize, selected_indices: Option<&HashSet<usize>>) -> bool {
     selected_indices.is_none_or(|indices| indices.contains(&note_index))
+}
+
+fn pattern_measure_bounds(
+    ppq: u16,
+    initial_signature: Option<(u8, u8)>,
+    signature_changes: &[(u32, u8, u8)],
+    tick: u32,
+) -> (u32, u64) {
+    let mut signature = initial_signature.unwrap_or((4, 4));
+    signature.0 = signature.0.max(1);
+    signature.1 = signature.1.max(1);
+    let mut segment_start = 0u32;
+    let mut change_index = 0usize;
+
+    while let Some((position, _, _)) = signature_changes.get(change_index).copied() {
+        if position > tick {
+            let bar_ticks = pattern_bar_ticks(ppq, signature);
+            let elapsed = tick - segment_start;
+            let bar_start =
+                u64::from(segment_start) + u64::from(elapsed / bar_ticks) * u64::from(bar_ticks);
+            let bar_end = (bar_start + u64::from(bar_ticks)).min(u64::from(position));
+            return (bar_start as u32, bar_end);
+        }
+        if position > segment_start {
+            segment_start = position;
+        }
+        while signature_changes
+            .get(change_index)
+            .is_some_and(|(change_position, _, _)| *change_position == position)
+        {
+            let (_, numerator, denominator) = signature_changes[change_index];
+            signature = (numerator.max(1), denominator.max(1));
+            change_index += 1;
+        }
+    }
+
+    let bar_ticks = pattern_bar_ticks(ppq, signature);
+    let elapsed = tick - segment_start;
+    let bar_start =
+        u64::from(segment_start) + u64::from(elapsed / bar_ticks) * u64::from(bar_ticks);
+    (bar_start as u32, bar_start + u64::from(bar_ticks))
+}
+
+fn pattern_bar_ticks(ppq: u16, signature: (u8, u8)) -> u32 {
+    (u32::from(ppq.max(1))
+        .saturating_mul(u32::from(signature.0.max(1)))
+        .saturating_mul(4)
+        / u32::from(signature.1.max(1)))
+    .max(1)
 }
 
 fn note_pitch_in_scale(key: i32, scale_root: u8, scale_intervals: &[u8]) -> bool {
@@ -7103,6 +7159,118 @@ impl FlpDocument {
         updated.add_pattern_notes(pattern_id, &additions)?;
         *self = updated;
         Ok(additions.len())
+    }
+
+    /// Rotates channel note starts by one snap unit, wrapping within each meter-aware measure.
+    pub fn rotate_pattern_notes(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        snap_ticks: u32,
+        direction: PatternNoteRotation,
+    ) -> Result<usize, FlpError> {
+        self.rotate_pattern_notes_in_scope(pattern_id, channel_id, None, snap_ticks, direction)
+    }
+
+    /// Rotates only the supplied channel-local note starts within their measures.
+    pub fn rotate_pattern_note_selection(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: &[usize],
+        snap_ticks: u32,
+        direction: PatternNoteRotation,
+    ) -> Result<usize, FlpError> {
+        self.rotate_pattern_notes_in_scope(
+            pattern_id,
+            channel_id,
+            Some(note_indices),
+            snap_ticks,
+            direction,
+        )
+    }
+
+    fn rotate_pattern_notes_in_scope(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: Option<&[usize]>,
+        snap_ticks: u32,
+        direction: PatternNoteRotation,
+    ) -> Result<usize, FlpError> {
+        if snap_ticks == 0 {
+            return Err(FlpError::UnsupportedEdit(
+                "note rotation snap must be at least one tick",
+            ));
+        }
+        let patterns = self.patterns()?;
+        let pattern = patterns
+            .iter()
+            .find(|pattern| pattern.id == pattern_id)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested pattern does not exist",
+            ))?;
+        let mut signature_changes = pattern
+            .time_markers
+            .iter()
+            .filter(|marker| marker.is_signature())
+            .filter_map(|marker| {
+                Some((
+                    marker.position_ticks(),
+                    marker.numerator()?.max(1),
+                    marker.denominator()?.max(1),
+                ))
+            })
+            .collect::<Vec<_>>();
+        signature_changes.sort_by_key(|(position, _, _)| *position);
+        let initial_signature = self.metadata.time_signature();
+        let ppq = self.header.ppq.max(1);
+        let selected_indices =
+            note_indices.map(|indices| indices.iter().copied().collect::<HashSet<_>>());
+        let mut edits = Vec::new();
+        for (note_index, note) in pattern
+            .notes
+            .iter()
+            .filter(|note| note.channel_id == channel_id)
+            .enumerate()
+            .filter(|(note_index, _)| note_index_in_scope(*note_index, selected_indices.as_ref()))
+        {
+            let (bar_start, bar_end) =
+                pattern_measure_bounds(ppq, initial_signature, &signature_changes, note.position);
+            let bar_length = bar_end.saturating_sub(u64::from(bar_start));
+            if bar_length <= 1 {
+                continue;
+            }
+            let offset = u64::from(note.position - bar_start);
+            let step = u64::from(snap_ticks) % bar_length;
+            let rotated_offset = match direction {
+                PatternNoteRotation::Left => (offset + bar_length - step) % bar_length,
+                PatternNoteRotation::Right => (offset + step) % bar_length,
+            };
+            let position = u32::try_from(u64::from(bar_start) + rotated_offset)
+                .map_err(|_| FlpError::LengthOverflow)?;
+            if position != note.position {
+                edits.push((note_index, position));
+            }
+        }
+        if edits.is_empty() {
+            return Ok(0);
+        }
+
+        let mut updated = self.clone();
+        for (note_index, position) in &edits {
+            updated.edit_pattern_note(
+                pattern_id,
+                channel_id,
+                *note_index,
+                PatternNoteEdit {
+                    position: Some(*position),
+                    ..PatternNoteEdit::default()
+                },
+            )?;
+        }
+        *self = updated;
+        Ok(edits.len())
     }
 
     fn chop_pattern_notes_in_scope(
@@ -17518,6 +17686,87 @@ mod tests {
             before,
             "invalid or oversized chops should leave the project unchanged"
         );
+    }
+
+    #[test]
+    fn note_rotation_wraps_inside_pattern_measures_and_follows_meter_changes() {
+        let input = pattern_fixture(
+            &[
+                note_record(0, 0, 24, 60, 100),
+                note_record(235, 0, 24, 64, 90),
+                note_record(475, 0, 24, 67, 85),
+                note_record(500, 0, 24, 72, 80),
+                note_record(0, 1, 48, 48, 70),
+            ],
+            &[0xFF, 1, 0x5A],
+        );
+        let mut right = FlpDocument::parse(&input).expect("fixture should parse");
+        right
+            .set_pattern_time_signature(7, 0, 5, 8)
+            .expect("initial Pattern meter should be set");
+        right
+            .set_pattern_time_signature(7, 480, 3, 8)
+            .expect("later Pattern meter should be set");
+
+        assert_eq!(
+            right
+                .rotate_pattern_notes(7, 0, 24, PatternNoteRotation::Right)
+                .expect("channel rotation should succeed"),
+            4
+        );
+        let right_notes = right.patterns().unwrap()[0].notes.clone();
+        assert_eq!(
+            right_notes
+                .iter()
+                .map(|note| note.position)
+                .collect::<Vec<_>>(),
+            [24, 19, 259, 524, 0]
+        );
+        assert_eq!(
+            right_notes
+                .iter()
+                .map(|note| note.length)
+                .collect::<Vec<_>>(),
+            [24, 24, 24, 24, 48]
+        );
+
+        assert_eq!(
+            right
+                .rotate_pattern_note_selection(7, 0, &[0], 24, PatternNoteRotation::Left)
+                .expect("selected note should rotate"),
+            1
+        );
+        assert_eq!(right.patterns().unwrap()[0].notes[0].position, 0);
+
+        let mut left = FlpDocument::parse(&input).expect("fixture should parse");
+        left.set_pattern_time_signature(7, 0, 5, 8)
+            .expect("initial Pattern meter should be set");
+        left.set_pattern_time_signature(7, 480, 3, 8)
+            .expect("later Pattern meter should be set");
+        assert_eq!(
+            left.rotate_pattern_notes(7, 0, 24, PatternNoteRotation::Left)
+                .expect("left rotation should succeed"),
+            4
+        );
+        assert_eq!(
+            left.patterns().unwrap()[0]
+                .notes
+                .iter()
+                .map(|note| note.position)
+                .collect::<Vec<_>>(),
+            [216, 211, 451, 620, 0]
+        );
+
+        let mut invalid = FlpDocument::parse(&input).expect("fixture should parse");
+        let before = invalid
+            .encode_lossless()
+            .expect("original project should encode");
+        assert!(
+            invalid
+                .rotate_pattern_notes(7, 0, 0, PatternNoteRotation::Right)
+                .is_err()
+        );
+        assert_eq!(invalid.encode_lossless().unwrap(), before);
     }
 
     #[test]

@@ -37,9 +37,9 @@ use flp_rebuild::{
     AutomationPoint, AutomationPointEdit, ChannelGroupSummary, ChannelSortOrder, ChannelSummary,
     ClawMachineOptions, FlpDocument, FstPreset, FstPresetKind, LimitNoteOptions,
     LimitSnapDirection, MixerInsertEdit, MixerParameterKind, MixerParameterRecord, Pattern,
-    PatternController, PatternControllerEdit, PatternNote, PatternNoteEdit, PlaylistClip,
-    PlaylistClipClipboard, PlaylistClipEdit, PlaylistClipTarget, PlaylistTrack, PlaylistTrackEdit,
-    ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions, RiffMachineOptions,
+    PatternController, PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation,
+    PlaylistClip, PlaylistClipClipboard, PlaylistClipEdit, PlaylistClipTarget, PlaylistTrack,
+    PlaylistTrackEdit, ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions, RiffMachineOptions,
     RiffMachineQuantizeMode, ScaleLevelsOptions, TimeMarker, TimeMarkerEdit,
     VstPluginStateMetadata,
 };
@@ -5458,6 +5458,10 @@ impl DawUi {
                     ("F7", "Piano roll"),
                     ("F9", "Mixer"),
                     ("Shift+Arrow", "Nudge selected Piano roll notes"),
+                    (
+                        "Shift+Ctrl/Cmd+Left/Right",
+                        "Rotate Piano roll notes with bar wrapping",
+                    ),
                     ("Ctrl/Cmd+Up/Down", "Transpose Piano roll notes by octave"),
                     (
                         "Piano roll Shift+D",
@@ -13088,6 +13092,7 @@ impl DawUi {
         let mut discard_note_lengths_requested = false;
         let mut open_pattern_time_signature_dialog = false;
         let mut note_nudge_requested = None;
+        let mut note_rotation_requested = None;
         if ui.memory(|memory| memory.focused().is_none()) {
             open_pattern_time_signature_dialog = ui.input_mut(|input| {
                 input.consume_key(
@@ -13125,6 +13130,16 @@ impl DawUi {
                 ui.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::Q));
             discard_note_lengths_requested =
                 ui.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::D));
+            note_rotation_requested = ui.input_mut(|input| {
+                let modifiers = egui::Modifiers::COMMAND | egui::Modifiers::SHIFT;
+                if input.consume_key(modifiers, egui::Key::ArrowLeft) {
+                    Some(PatternNoteRotation::Left)
+                } else if input.consume_key(modifiers, egui::Key::ArrowRight) {
+                    Some(PatternNoteRotation::Right)
+                } else {
+                    None
+                }
+            });
             note_nudge_requested = ui.input_mut(|input| {
                 if input.consume_key(egui::Modifiers::COMMAND, egui::Key::ArrowUp) {
                     Some((0, 12))
@@ -13629,6 +13644,26 @@ impl DawUi {
                     .clicked()
                 {
                     discard_note_lengths_requested = true;
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        edit_scope_available,
+                        egui::Button::new("Rotate left  Shift+Ctrl/Cmd+←"),
+                    )
+                    .clicked()
+                {
+                    note_rotation_requested = Some(PatternNoteRotation::Left);
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        edit_scope_available,
+                        egui::Button::new("Rotate right  Shift+Ctrl/Cmd+→"),
+                    )
+                    .clicked()
+                {
+                    note_rotation_requested = Some(PatternNoteRotation::Right);
                     ui.close();
                 }
                 ui.menu_button("Quantize", |ui| {
@@ -14402,6 +14437,7 @@ impl DawUi {
             quantize_selected_requested = false;
             discard_note_lengths_requested = false;
             legato_requested = false;
+            quick_chop_requested = false;
             chop_requested = false;
             glue_requested = false;
             flip_requested = false;
@@ -14414,6 +14450,7 @@ impl DawUi {
             limit_requested = false;
             arpeggiate_requested = false;
             slice_requested = false;
+            note_rotation_requested = None;
             group_selected_notes_requested = false;
             ungroup_selected_notes_requested = false;
         }
@@ -14434,6 +14471,53 @@ impl DawUi {
         } else {
             "channel"
         };
+
+        if let Some(direction) = note_rotation_requested {
+            if self.piano_roll_edit_scope == PianoRollEditScope::Selection
+                && selected_quantize_indices.is_empty()
+            {
+                self.status = "Select notes before rotating".to_owned();
+            } else if let (Some(pattern_id), Some(channel_id)) =
+                (self.selected_pattern, self.selected_note_channel)
+            {
+                let snap_ticks = self.piano_roll_snap.ticks(ppq, time_signature);
+                let result = self
+                    .document
+                    .as_mut()
+                    .ok_or_else(|| "no project is open".to_owned())
+                    .and_then(|document| {
+                        let result = if edit_selection_only {
+                            document.rotate_pattern_note_selection(
+                                pattern_id,
+                                channel_id,
+                                &selected_quantize_indices,
+                                snap_ticks,
+                                direction,
+                            )
+                        } else {
+                            document
+                                .rotate_pattern_notes(pattern_id, channel_id, snap_ticks, direction)
+                        };
+                        result.map_err(|error| error.to_string())
+                    });
+                match result {
+                    Ok(changed) => {
+                        if changed > 0 {
+                            self.stop_project_playback();
+                            self.dirty = true;
+                        }
+                        let direction_label = match direction {
+                            PatternNoteRotation::Left => "left",
+                            PatternNoteRotation::Right => "right",
+                        };
+                        self.status = format!(
+                            "Rotated {changed} note starts {direction_label} in pattern {pattern_id}, {edit_scope_description}"
+                        );
+                    }
+                    Err(error) => self.status = format!("Could not rotate notes: {error}"),
+                }
+            }
+        }
 
         if scale_levels_requested
             && let (Some(pattern_id), Some(channel_id)) =
