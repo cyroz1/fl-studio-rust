@@ -26018,7 +26018,7 @@ fn create_recorded_pattern_playlist_clip(
             .max()
             .unwrap_or_default(),
     );
-    let length_ticks = u32::try_from(pattern_length.max(bar_length).max(1))
+    let length_ticks = u32::try_from(u64::from(pattern_length).max(bar_length).max(1))
         .map_err(|_| "Recorded Pattern is too long for a Playlist clip".to_owned())?;
     if placement.start_tick.checked_add(length_ticks).is_none() {
         return Err("The recorded Pattern extends beyond the Playlist timeline".to_owned());
