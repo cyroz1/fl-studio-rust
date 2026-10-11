@@ -14020,7 +14020,6 @@ impl DawUi {
         {
             if quick_quantize_start_requested {
                 quantize_requested = false;
-                quantize_selected_requested = false;
                 quick_quantize_start_requested = false;
             }
             quantize_selected_requested = false;
