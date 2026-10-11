@@ -1779,6 +1779,7 @@ pub(crate) struct MixerRouteAudibility {
     soloed_insert_tracks: HashSet<i8>,
     source_transforms: HashMap<i8, MixerInsertSignalTransform>,
     master_fader_raw: Option<i32>,
+    master_pan_raw: Option<i32>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1786,6 +1787,7 @@ pub(crate) struct MixerInsertSignalTransform {
     polarity_reversed: bool,
     swap_left_right: bool,
     fader_volume_raw: Option<i32>,
+    mixer_pan_raw: Option<i32>,
 }
 
 impl MixerInsertSignalTransform {
@@ -1794,11 +1796,17 @@ impl MixerInsertSignalTransform {
             polarity_reversed,
             swap_left_right,
             fader_volume_raw: None,
+            mixer_pan_raw: None,
         }
     }
 
     pub(crate) const fn with_fader_volume_raw(mut self, volume_raw: Option<i32>) -> Self {
         self.fader_volume_raw = volume_raw;
+        self
+    }
+
+    pub(crate) const fn with_mixer_pan_raw(mut self, pan_raw: Option<i32>) -> Self {
+        self.mixer_pan_raw = pan_raw;
         self
     }
 
@@ -1809,6 +1817,9 @@ impl MixerInsertSignalTransform {
         if self.polarity_reversed {
             frame[0] = -frame[0];
             frame[1] = -frame[1];
+        }
+        if let Some(pan_raw) = self.mixer_pan_raw {
+            apply_mixer_pan(frame, pan_raw);
         }
         if let Some(volume_raw) = self.fader_volume_raw {
             let gain = mixer_fader_gain(volume_raw);
@@ -1835,10 +1846,12 @@ impl MixerRouteAudibility {
             };
             routing.known_tracks.insert(track);
             let fader_volume_raw = candidate_mixer_fader_volume(parameters, insert.ordinal());
+            let mixer_pan_raw = candidate_mixer_pan(parameters, insert.ordinal());
             // Master is the final destination for every normally routed source. Its
-            // saved flags and candidate fader are applied to the completed mix instead.
+            // saved flags and candidate controls are applied to the completed mix instead.
             if track == 0 {
                 routing.master_fader_raw = fader_volume_raw;
+                routing.master_pan_raw = mixer_pan_raw;
                 continue;
             }
             if insert.enabled() == Some(false) {
@@ -1851,7 +1864,8 @@ impl MixerRouteAudibility {
                 insert.polarity_reversed() == Some(true),
                 insert.swap_left_right() == Some(true),
             )
-            .with_fader_volume_raw(fader_volume_raw);
+            .with_fader_volume_raw(fader_volume_raw)
+            .with_mixer_pan_raw(mixer_pan_raw);
             if transform != MixerInsertSignalTransform::default() {
                 routing.source_transforms.insert(track, transform);
             }
@@ -1876,7 +1890,7 @@ impl MixerRouteAudibility {
         self.soloed_insert_tracks.is_empty() || self.soloed_insert_tracks.contains(&track)
     }
 
-    /// Returns the supported phase, stereo, and candidate fader transform for a known route.
+    /// Returns the supported phase, stereo, candidate pan, and fader transform for a route.
     /// Master processing is applied once to the final mix, and unknown routes are unchanged.
     pub(crate) fn transform_for_channel(&self, route: Option<i8>) -> MixerInsertSignalTransform {
         route
@@ -1887,6 +1901,10 @@ impl MixerRouteAudibility {
 
     pub(crate) fn master_fader_raw(&self) -> Option<i32> {
         self.master_fader_raw
+    }
+
+    pub(crate) fn master_pan_raw(&self) -> Option<i32> {
+        self.master_pan_raw
     }
 }
 
@@ -1908,6 +1926,33 @@ fn candidate_mixer_fader_volume(
 
 fn mixer_fader_gain(volume_raw: i32) -> f32 {
     volume_raw.clamp(0, 16_000) as f32 / 10_000.0
+}
+
+fn candidate_mixer_pan(parameters: &[MixerParameterRecord], insert_ordinal: usize) -> Option<i32> {
+    let mut matches = parameters.iter().filter(|record| {
+        record.kind() == MixerParameterKind::Pan
+            && record.candidate_insert_ordinal() == Some(insert_ordinal)
+            && record.target_scope_raw() == 0
+    });
+    let record = matches.next()?;
+    if matches.next().is_some() || !(-6_400..=6_400).contains(&record.value()) {
+        return None;
+    }
+    Some(record.value())
+}
+
+fn apply_mixer_pan(frame: &mut [f32; 2], pan_raw: i32) {
+    let pan = pan_raw.clamp(-6_400, 6_400) as f32 / 6_400.0;
+    let left = frame[0];
+    let right = frame[1];
+    if pan < 0.0 {
+        let mix = -pan;
+        frame[0] = left + right * mix;
+        frame[1] = right * (1.0 - mix);
+    } else {
+        frame[0] = left * (1.0 - pan);
+        frame[1] = right + left * pan;
+    }
 }
 
 /// Recognized parameter-ID interpretations for Mixer `0xE1` records.
@@ -15340,44 +15385,64 @@ mod tests {
             first_event_index: 0,
             end_event_index: 0,
         };
-        let parameter = |insert_ordinal: u16, scope: u16, value| MixerParameterRecord {
-            event_index: 0,
-            record_index: 0,
-            prefix: [0; 4],
-            parameter_id: 192,
-            reserved: 0,
-            channel_data: ((64 + insert_ordinal) << 6) | (scope << 13),
-            value,
-        };
-        let parameters = [parameter(0, 0, 2_500), parameter(1, 0, 5_000)];
+        let parameter =
+            |insert_ordinal: u16, scope: u16, parameter_id: u8, value| MixerParameterRecord {
+                event_index: 0,
+                record_index: 0,
+                prefix: [0; 4],
+                parameter_id,
+                reserved: 0,
+                channel_data: ((64 + insert_ordinal) << 6) | (scope << 13),
+                value,
+            };
+        let parameters = [
+            parameter(0, 0, 192, 2_500),
+            parameter(0, 0, 193, 3_200),
+            parameter(1, 0, 192, 5_000),
+            parameter(1, 0, 193, -3_200),
+        ];
         let routing = MixerRouteAudibility::from_inserts_with_parameters(
             [insert(0), insert(1), insert(2)],
             &parameters,
         );
 
         assert_eq!(routing.master_fader_raw(), Some(2_500));
-        let mut insert_frame = [0.5, -1.0];
+        assert_eq!(routing.master_pan_raw(), Some(3_200));
+        let mut insert_frame = [1.0, 2.0];
         routing
             .transform_for_channel(Some(1))
             .apply_frame(&mut insert_frame);
-        assert_eq!(insert_frame, [0.25, -0.5]);
-        let mut unmatched_frame = [0.5, -1.0];
+        assert_eq!(insert_frame, [1.0, 0.5]);
+        let mut unmatched_frame = [1.0, 2.0];
         routing
             .transform_for_channel(Some(2))
             .apply_frame(&mut unmatched_frame);
-        assert_eq!(unmatched_frame, [0.5, -1.0]);
+        assert_eq!(unmatched_frame, [1.0, 2.0]);
 
         for invalid in [
-            vec![parameter(1, 0, 5_000), parameter(1, 0, 6_000)],
-            vec![parameter(1, 1, 5_000)],
-            vec![parameter(1, 0, 16_001)],
+            vec![parameter(1, 0, 192, 5_000), parameter(1, 0, 192, 6_000)],
+            vec![parameter(1, 1, 192, 5_000)],
+            vec![parameter(1, 0, 192, 16_001)],
         ] {
             let routing = MixerRouteAudibility::from_inserts_with_parameters([insert(1)], &invalid);
-            let mut frame = [0.5, -1.0];
+            let mut frame = [1.0, 2.0];
             routing
                 .transform_for_channel(Some(1))
                 .apply_frame(&mut frame);
-            assert_eq!(frame, [0.5, -1.0]);
+            assert_eq!(frame, [1.0, 2.0]);
+        }
+
+        for invalid in [
+            vec![parameter(1, 0, 193, -3_200), parameter(1, 0, 193, 3_200)],
+            vec![parameter(1, 1, 193, -3_200)],
+            vec![parameter(1, 0, 193, 6_401)],
+        ] {
+            let routing = MixerRouteAudibility::from_inserts_with_parameters([insert(1)], &invalid);
+            let mut frame = [1.0, 2.0];
+            routing
+                .transform_for_channel(Some(1))
+                .apply_frame(&mut frame);
+            assert_eq!(frame, [1.0, 2.0]);
         }
     }
 

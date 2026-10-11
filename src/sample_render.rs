@@ -2073,6 +2073,7 @@ struct MixerMasterOutput {
     polarity_reversed: Option<bool>,
     swap_left_right: Option<bool>,
     fader_volume_raw: Option<i32>,
+    mixer_pan_raw: Option<i32>,
 }
 
 impl MixerMasterOutput {
@@ -2086,6 +2087,7 @@ impl MixerMasterOutput {
             polarity_reversed: master.polarity_reversed(),
             swap_left_right: master.swap_left_right(),
             fader_volume_raw: routing.master_fader_raw(),
+            mixer_pan_raw: routing.master_pan_raw(),
         }
     }
 
@@ -2095,8 +2097,9 @@ impl MixerMasterOutput {
             return;
         }
         let (frames, _) = stereo_samples.as_chunks_mut::<2>();
-        let fader_transform =
-            MixerInsertSignalTransform::default().with_fader_volume_raw(self.fader_volume_raw);
+        let master_transform = MixerInsertSignalTransform::default()
+            .with_mixer_pan_raw(self.mixer_pan_raw)
+            .with_fader_volume_raw(self.fader_volume_raw);
         for frame in frames {
             if self.swap_left_right == Some(true) {
                 frame.swap(0, 1);
@@ -2105,7 +2108,7 @@ impl MixerMasterOutput {
                 frame[0] = -frame[0];
                 frame[1] = -frame[1];
             }
-            fader_transform.apply_frame(frame);
+            master_transform.apply_frame(frame);
         }
     }
 }
@@ -4475,6 +4478,18 @@ mod tests {
         }
         .apply(&mut output);
         assert_eq!(output, [0.125, -0.25, 0.375, -0.5]);
+    }
+
+    #[test]
+    fn mixer_master_pan_crossmixes_the_final_bus() {
+        let mut output = [1.0, 2.0, 3.0, 4.0];
+        MixerMasterOutput {
+            enabled: Some(true),
+            mixer_pan_raw: Some(6_400),
+            ..MixerMasterOutput::default()
+        }
+        .apply(&mut output);
+        assert_eq!(output, [0.0, 3.0, 0.0, 7.0]);
     }
 
     #[test]
