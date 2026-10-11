@@ -12289,12 +12289,12 @@ mod tests {
         ArticulateOptions, ChannelGroupSummary, ChannelLevelAdjustmentsEdit, ChannelNoteRouter,
         ChannelSortOrder, ChannelSummary, ClawMachineOptions, FlpDocument, FlpError, FlpEvent,
         FstPreset, FstPresetKind, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit,
-        MixerInsertSummary, MixerParameterKind, MixerRouteAudibility, PATTERN_NOTE_SLIDE_FLAG,
-        PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation, PayloadEncoding,
-        PlaylistClipEdit, PlaylistClipTarget, PlaylistTrackEdit, ProjectInfoEdit,
-        ProjectSettingsEdit, RiffMachineOptions, RiffMachineQuantizeMode, ScaleLevelsOptions,
-        TimeMarkerEdit, midi::MidiChannelMapping, midi::MidiFile, parse_vst_plugin_state_metadata,
-        riff_machine_groove_note_timing,
+        MixerInsertSummary, MixerParameterKind, MixerRouteAudibility, PATTERN_NOTE_DEFAULT_FLAGS,
+        PATTERN_NOTE_SLIDE_FLAG, PatternControllerEdit, PatternNote, PatternNoteEdit,
+        PatternNoteRotation, PayloadEncoding, PlaylistClipEdit, PlaylistClipTarget,
+        PlaylistTrackEdit, ProjectInfoEdit, ProjectSettingsEdit, RiffMachineOptions,
+        RiffMachineQuantizeMode, ScaleLevelsOptions, TimeMarkerEdit, midi::MidiChannelMapping,
+        midi::MidiFile, parse_vst_plugin_state_metadata, riff_machine_groove_note_timing,
     };
 
     fn articulate_options(
