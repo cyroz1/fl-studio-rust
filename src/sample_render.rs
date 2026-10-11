@@ -4024,6 +4024,7 @@ fn validate_output_path_with_extension(
     Ok(())
 }
 
+#[cfg(test)]
 fn write_stereo_wav_from_buffer(
     output_path: &Path,
     samples: &[f32],
