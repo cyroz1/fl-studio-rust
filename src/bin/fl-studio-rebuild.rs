@@ -19822,12 +19822,16 @@ impl DawUi {
                 Vec2::new(inspector_width, available_height),
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
-                    ui.strong("Track inspector");
-                    ui.separator();
-                    if let Some(insert) = inserts
-                        .iter()
-                        .find(|insert| Some(insert.ordinal()) == self.selected_mixer_insert)
-                    {
+                    egui::ScrollArea::vertical()
+                        .id_salt("mixer-track-inspector")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.strong("Track inspector");
+                            ui.separator();
+                            if let Some(insert) = inserts
+                                .iter()
+                                .find(|insert| Some(insert.ordinal()) == self.selected_mixer_insert)
+                            {
                         ui.label(if insert.ordinal() == 0 {
                             "Master".to_owned()
                         } else {
@@ -20050,9 +20054,12 @@ impl DawUi {
                                     });
                             },
                         );
-                    } else {
-                        ui.label(egui::RichText::new("Select an insert track").color(MUTED));
-                    }
+                            } else {
+                                ui.label(
+                                    egui::RichText::new("Select an insert track").color(MUTED),
+                                );
+                            }
+                        });
                 },
             );
         });
