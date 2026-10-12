@@ -6,7 +6,10 @@ use std::sync::mpsc::{SyncSender, TrySendError};
 use std::time::{Duration, Instant};
 
 use flp_rebuild::PatternNote;
-use flp_rebuild::midi::{midi_pan_to_fl_note_pan, midi_release_velocity_to_fl_note_release};
+use flp_rebuild::midi::{
+    midi_pan_to_fl_note_pan, midi_pitch_bend_cents_to_fl_note_fine_pitch,
+    midi_pitch_bend_offset_cents, midi_release_velocity_to_fl_note_release,
+};
 use midir::{Ignore, MidiInput, MidiInputConnection as MidirInputConnection};
 
 use flp_rebuild::sample_render::PlaylistTempoMap;
@@ -76,6 +79,91 @@ pub enum MidiInputEvent {
         sixteenth_notes: u16,
     },
     Transport(MidiTransportCommand),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MidiInputChannelState {
+    pan: u8,
+    pitch_bend_value: u16,
+    pitch_bend_sensitivity_semitones: u8,
+    pitch_bend_sensitivity_cents: u8,
+    rpn_msb: u8,
+    rpn_lsb: u8,
+}
+
+impl Default for MidiInputChannelState {
+    fn default() -> Self {
+        Self {
+            pan: 64,
+            pitch_bend_value: 8192,
+            pitch_bend_sensitivity_semitones: 2,
+            pitch_bend_sensitivity_cents: 0,
+            rpn_msb: 127,
+            rpn_lsb: 127,
+        }
+    }
+}
+
+impl MidiInputChannelState {
+    pub fn update(&mut self, event: MidiInputEvent) {
+        match event {
+            MidiInputEvent::ControlChange {
+                controller: 10,
+                value,
+                ..
+            } => self.pan = value.min(127),
+            MidiInputEvent::ControlChange {
+                controller: 121, ..
+            } => {
+                self.pan = 64;
+                self.pitch_bend_sensitivity_semitones = 2;
+                self.pitch_bend_sensitivity_cents = 0;
+                self.rpn_msb = 127;
+                self.rpn_lsb = 127;
+            }
+            MidiInputEvent::ControlChange {
+                controller: 101,
+                value,
+                ..
+            } => self.rpn_msb = value.min(127),
+            MidiInputEvent::ControlChange {
+                controller: 100,
+                value,
+                ..
+            } => self.rpn_lsb = value.min(127),
+            MidiInputEvent::ControlChange {
+                controller: 6,
+                value,
+                ..
+            } if (self.rpn_msb, self.rpn_lsb) == (0, 0) => {
+                self.pitch_bend_sensitivity_semitones = value.min(127);
+            }
+            MidiInputEvent::ControlChange {
+                controller: 38,
+                value,
+                ..
+            } if (self.rpn_msb, self.rpn_lsb) == (0, 0) => {
+                self.pitch_bend_sensitivity_cents = value.min(99);
+            }
+            MidiInputEvent::PitchBend { value, .. } => {
+                self.pitch_bend_value = (i32::from(value) + 8192).clamp(0, 0x3FFF) as u16;
+            }
+            _ => {}
+        }
+    }
+
+    fn raw_pan(self) -> u8 {
+        self.pan
+    }
+
+    fn note_fine_pitch(self) -> u8 {
+        let cents = midi_pitch_bend_offset_cents(
+            self.pitch_bend_value,
+            self.pitch_bend_sensitivity_semitones,
+            self.pitch_bend_sensitivity_cents,
+        );
+        midi_pitch_bend_cents_to_fl_note_fine_pitch(cents)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -332,6 +420,7 @@ struct ActiveMidiNote {
     start_tick: u32,
     velocity: u8,
     pan: u8,
+    fine_pitch: u8,
 }
 
 pub struct MidiPatternRecorder {
@@ -347,7 +436,7 @@ pub struct MidiPatternRecorder {
     song_start_frame_micros: Option<u64>,
     started_at: Instant,
     timestamp_origin_micros: Option<u64>,
-    channel_pan: [u8; 16],
+    channel_state: [MidiInputChannelState; 16],
     active_notes: BTreeMap<(u8, u8), VecDeque<ActiveMidiNote>>,
     notes: Vec<PatternNote>,
     started_note_count: usize,
@@ -406,7 +495,7 @@ impl MidiPatternRecorder {
             song_start_frame_micros,
             started_at,
             timestamp_origin_micros: None,
-            channel_pan: [64; 16],
+            channel_state: [MidiInputChannelState::default(); 16],
             active_notes: BTreeMap::new(),
             notes: Vec::new(),
             started_note_count: 0,
@@ -423,8 +512,8 @@ impl MidiPatternRecorder {
         self.channel_id
     }
 
-    pub fn set_channel_pan_state(&mut self, channel_pan: [u8; 16]) {
-        self.channel_pan = channel_pan.map(|pan| pan.min(127));
+    pub fn set_channel_state(&mut self, channel_state: [MidiInputChannelState; 16]) {
+        self.channel_state = channel_state;
     }
 
     pub fn record(&mut self, message: ReceivedMidiMessage) {
@@ -437,22 +526,10 @@ impl MidiPatternRecorder {
         fixed_velocity: Option<u8>,
     ) {
         match message.event {
-            MidiInputEvent::ControlChange {
-                channel,
-                controller: 10,
-                value,
-            } => {
-                if let Some(pan) = self.channel_pan.get_mut(usize::from(channel)) {
-                    *pan = value.min(127);
-                }
-            }
-            MidiInputEvent::ControlChange {
-                channel,
-                controller: 121,
-                ..
-            } => {
-                if let Some(pan) = self.channel_pan.get_mut(usize::from(channel)) {
-                    *pan = 64;
+            MidiInputEvent::ControlChange { channel, .. }
+            | MidiInputEvent::PitchBend { channel, .. } => {
+                if let Some(state) = self.channel_state.get_mut(usize::from(channel)) {
+                    state.update(message.event);
                 }
             }
             _ => {}
@@ -476,18 +553,19 @@ impl MidiPatternRecorder {
                     return;
                 }
                 self.started_note_count += 1;
-                let pan = self
-                    .channel_pan
+                let channel_state = self
+                    .channel_state
                     .get(usize::from(channel))
                     .copied()
-                    .unwrap_or(64);
+                    .unwrap_or_default();
                 self.active_notes
                     .entry((channel, key))
                     .or_default()
                     .push_back(ActiveMidiNote {
                         start_tick: tick,
                         velocity: fixed_velocity.unwrap_or(velocity).min(127),
-                        pan,
+                        pan: channel_state.raw_pan(),
+                        fine_pitch: channel_state.note_fine_pitch(),
                     });
             }
             MidiInputEvent::NoteOff {
@@ -618,6 +696,7 @@ impl MidiPatternRecorder {
             midi_channel,
             pan: midi_pan_to_fl_note_pan(active_note.pan),
             velocity: active_note.velocity,
+            fine_pitch: active_note.fine_pitch,
             ..PatternNote::default()
         };
         if let Some(release_velocity) = release_velocity {
@@ -827,6 +906,110 @@ mod tests {
         assert_eq!(result.notes.len(), 2);
         assert_eq!(result.notes[0].pan, 0);
         assert_eq!(result.notes[1].pan, 128);
+    }
+
+    #[test]
+    fn records_pitch_bend_at_each_note_on_using_rpn_sensitivity() {
+        let started_at = Instant::now();
+        let mut recorder = MidiPatternRecorder::new(
+            MidiPatternRecorderSettings {
+                pattern_id: 1,
+                channel_id: 2,
+                project_path: None,
+                ppq: 96,
+                tempo_bpm: 120.0,
+                start_tick: 0,
+                snap_ticks: None,
+                timing_offset_ms: 0,
+                song_timeline_start: None,
+            },
+            started_at,
+        )
+        .expect("valid project timing should create a recorder");
+        let message = |elapsed_ms, event| ReceivedMidiMessage {
+            timestamp_micros: 1_000_000 + elapsed_ms * 1_000,
+            received_at: started_at + Duration::from_millis(elapsed_ms),
+            event,
+        };
+        for (elapsed_ms, controller, value) in
+            [(100, 101, 0), (110, 100, 0), (120, 6, 4), (130, 38, 0)]
+        {
+            recorder.record(message(
+                elapsed_ms,
+                MidiInputEvent::ControlChange {
+                    channel: 0,
+                    controller,
+                    value,
+                },
+            ));
+        }
+        recorder.record(message(
+            150,
+            MidiInputEvent::PitchBend {
+                channel: 0,
+                value: 8191,
+            },
+        ));
+        recorder.record(message(
+            200,
+            MidiInputEvent::NoteOn {
+                channel: 0,
+                key: 60,
+                velocity: 90,
+            },
+        ));
+        recorder.record(message(
+            300,
+            MidiInputEvent::PitchBend {
+                channel: 0,
+                value: -8192,
+            },
+        ));
+        recorder.record(message(
+            400,
+            MidiInputEvent::NoteOff {
+                channel: 0,
+                key: 60,
+                velocity: 0,
+            },
+        ));
+        recorder.record(message(
+            500,
+            MidiInputEvent::NoteOn {
+                channel: 0,
+                key: 62,
+                velocity: 90,
+            },
+        ));
+        recorder.record(message(
+            600,
+            MidiInputEvent::NoteOff {
+                channel: 0,
+                key: 62,
+                velocity: 0,
+            },
+        ));
+
+        let result = recorder.finish(None, started_at + Duration::from_millis(700));
+        assert_eq!(result.notes.len(), 2);
+        assert_eq!(result.notes[0].fine_pitch, 160);
+        assert_eq!(result.notes[1].fine_pitch, 80);
+    }
+
+    #[test]
+    fn pitch_bend_uses_two_semitone_default_sensitivity() {
+        let mut state = MidiInputChannelState::default();
+        state.update(MidiInputEvent::PitchBend {
+            channel: 0,
+            value: 8191,
+        });
+        assert_eq!(state.note_fine_pitch(), 140);
+
+        state.update(MidiInputEvent::PitchBend {
+            channel: 0,
+            value: -8192,
+        });
+        assert_eq!(state.note_fine_pitch(), 100);
     }
 
     #[test]

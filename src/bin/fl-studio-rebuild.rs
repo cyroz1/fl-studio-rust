@@ -59,9 +59,9 @@ mod midi_input;
 mod midi_output;
 
 use midi_input::{
-    ConnectedMidiInput, MidiInputDevice, MidiInputEvent, MidiPatternRecorder,
-    MidiPatternRecorderSettings, MidiTransportCommand, ReceivedMidiMessage, connect_input_device,
-    describe_event, enumerate_input_devices,
+    ConnectedMidiInput, MidiInputChannelState, MidiInputDevice, MidiInputEvent,
+    MidiPatternRecorder, MidiPatternRecorderSettings, MidiTransportCommand, ReceivedMidiMessage,
+    connect_input_device, describe_event, enumerate_input_devices,
 };
 use midi_output::{
     ConnectedMidiOutput, MIDI_CLOCK_TICK, MIDI_CONTINUE, MIDI_START, MIDI_STOP, MIDI_TEST_NOTE_OFF,
@@ -2746,7 +2746,7 @@ struct DawUi {
     midi_dropped_messages: Arc<AtomicU64>,
     midi_reported_dropped_messages: u64,
     midi_activity: Option<(String, Instant)>,
-    midi_input_channel_pan: [u8; 16],
+    midi_input_channel_state: [MidiInputChannelState; 16],
     midi_output_gain_mapping: Option<MidiControlChangeMapping>,
     midi_controller_templates: Vec<MidiControllerTemplate>,
     midi_controller_template_index: Option<usize>,
@@ -3369,7 +3369,7 @@ impl DawUi {
             midi_dropped_messages: Arc::new(AtomicU64::new(0)),
             midi_reported_dropped_messages: 0,
             midi_activity: None,
-            midi_input_channel_pan: [64; 16],
+            midi_input_channel_state: [MidiInputChannelState::default(); 16],
             midi_output_gain_mapping,
             midi_controller_templates,
             midi_controller_template_index: None,
@@ -24696,7 +24696,7 @@ impl DawUi {
         if self.midi_recording.is_some() {
             self.finish_active_midi_recording();
         }
-        self.midi_input_channel_pan = [64; 16];
+        self.midi_input_channel_state = [MidiInputChannelState::default(); 16];
         match connect_input_device(
             &device_id,
             self.midi_message_sender.clone(),
@@ -24724,7 +24724,7 @@ impl DawUi {
         };
         let device_name = connection.device_name.clone();
         drop(connection);
-        self.midi_input_channel_pan = [64; 16];
+        self.midi_input_channel_state = [MidiInputChannelState::default(); 16];
         if self.midi_recording.is_some() {
             self.finish_active_midi_recording();
         }
@@ -25427,7 +25427,7 @@ impl DawUi {
             recording_started_at,
         ) {
             Ok(mut recorder) => {
-                recorder.set_channel_pan_state(self.midi_input_channel_pan);
+                recorder.set_channel_state(self.midi_input_channel_state);
                 let scale_snap = (self.midi_record_snap_to_scale
                     && self.piano_roll_scale != PianoRollScale::None)
                     .then_some(DetectedPianoRollScale {
@@ -25900,18 +25900,11 @@ impl DawUi {
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             };
             self.midi_activity = Some((describe_event(message.event), message.received_at));
-            if let MidiInputEvent::ControlChange {
-                channel,
-                controller,
-                value,
-            } = message.event
-                && let Some(pan) = self.midi_input_channel_pan.get_mut(usize::from(channel))
+            if let MidiInputEvent::ControlChange { channel, .. }
+            | MidiInputEvent::PitchBend { channel, .. } = message.event
+                && let Some(state) = self.midi_input_channel_state.get_mut(usize::from(channel))
             {
-                match controller {
-                    10 => *pan = value.min(127),
-                    121 => *pan = 64,
-                    _ => {}
-                }
+                state.update(message.event);
             }
             self.handle_midi_control_change(message, history_snapshot_available);
             if let MidiInputEvent::Transport(command) = message.event {

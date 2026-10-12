@@ -1316,7 +1316,8 @@ pub fn midi_pan_to_fl_note_pan(pan: u8) -> u8 {
     }
 }
 
-fn midi_pitch_bend_offset_cents(value: u16, semitones: u8, cents: u8) -> i16 {
+/// Converts a 14-bit MIDI pitch-bend value to cents using its RPN 0 sensitivity.
+pub fn midi_pitch_bend_offset_cents(value: u16, semitones: u8, cents: u8) -> i16 {
     let bend = i32::from(value.min(0x3FFF)) - 8192;
     if bend == 0 {
         return 0;
