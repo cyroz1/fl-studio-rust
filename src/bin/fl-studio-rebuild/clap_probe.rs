@@ -207,7 +207,7 @@ fn decode_hex(value: &str) -> Result<String, String> {
         return Err("invalid odd-length CLAP descriptor field".to_owned());
     }
     let mut decoded = Vec::with_capacity(bytes.len() / 2);
-    for pair in bytes.chunks_exact(2) {
+    for pair in bytes.as_chunks::<2>().0 {
         let high = hex_value(pair[0])?;
         let low = hex_value(pair[1])?;
         decoded.push((high << 4) | low);
