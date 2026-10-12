@@ -11007,7 +11007,8 @@ impl FlpDocument {
 
     /// Imports the note events from one Standard MIDI File track into an existing FLP
     /// pattern and channel. Note times are converted through the MIDI tempo map or
-    /// SMPTE clock, then expressed against the existing FLP tempo.
+    /// SMPTE clock, then expressed against the existing FLP tempo. MIDI CC 10 pan
+    /// is captured at each note-on and mapped to the FL note-pan range.
     pub fn import_midi_track(
         &mut self,
         midi: &midi::MidiFile,
@@ -11112,6 +11113,7 @@ impl FlpDocument {
                 length,
                 key: u16::from(midi_note.key()),
                 midi_channel: midi_note.channel(),
+                pan: midi::midi_pan_to_fl_note_pan(midi_note.pan()),
                 velocity: midi_note.velocity(),
                 release: midi_note.release_velocity().map_or(
                     PATTERN_NOTE_DEFAULT_RELEASE,
@@ -22557,8 +22559,10 @@ mod tests {
         let project_bytes = pattern_fixture(&[original_note], &unknown_event);
         let midi_bytes = midi_fixture(
             &[
+                0x00, 0xB9, 10, 0, // Channel 9 pan is hard left.
                 0x00, 0x99, 0x3C, 0x64, // Channel 9, key 60, velocity 100 at tick 0.
                 0x83, 0x60, 0x89, 0x3C, 0x20, // Note off at tick 480.
+                0x00, 0xB0, 10, 127, // Channel 0 pan is hard right.
                 0x00, 0x90, 0x43, 0x50, // Channel 0, key 67, velocity 80 at tick 480.
                 0x81, 0x70, 0x80, 0x43, 0x00, // Note off at tick 720.
                 0x00, 0xFF, 0x2F, 0x00,
@@ -22584,6 +22588,7 @@ mod tests {
         assert_eq!(notes[1].velocity, 100);
         assert_eq!(notes[1].midi_channel, 9);
         assert_eq!(notes[1].release, 32);
+        assert_eq!(notes[1].pan, 0);
         assert_eq!(
             (notes[2].position, notes[2].length, notes[2].key),
             (96, 48, 67)
@@ -22591,6 +22596,7 @@ mod tests {
         assert_eq!(notes[2].velocity, 80);
         assert_eq!(notes[2].midi_channel, 0);
         assert_eq!(notes[2].release, 0);
+        assert_eq!(notes[2].pan, 128);
         assert_eq!(
             document.events().last().unwrap().wire_bytes(),
             &unknown_event

@@ -37,6 +37,7 @@ pub struct MidiNote {
     channel: u8,
     key: u8,
     velocity: u8,
+    pan: u8,
     start_tick: u64,
     end_tick: Option<u64>,
     release_velocity: Option<u8>,
@@ -1142,10 +1143,13 @@ impl MidiTrack {
     }
 
     /// Pairs note-on and note-off messages in channel/key order. Notes without an
-    /// ending message remain present with `end_tick == None`.
+    /// ending message remain present with `end_tick == None`. The current MIDI
+    /// CC 10 pan value is snapshotted when each note starts; a track without CC 10
+    /// uses the MIDI center value 64.
     pub fn notes(&self) -> Vec<MidiNote> {
         let mut notes = Vec::new();
         let mut active: BTreeMap<(u8, u8), VecDeque<usize>> = BTreeMap::new();
+        let mut channel_pan = BTreeMap::<u8, u8>::new();
 
         for event in &self.events {
             let MidiEventKind::ChannelVoice { status, data } = &event.kind else {
@@ -1158,12 +1162,16 @@ impl MidiTrack {
             let channel = status & 0x0F;
             let key = data[0];
             match status & 0xF0 {
+                0xB0 if key == 10 => {
+                    channel_pan.insert(channel, data[1]);
+                }
                 0x90 if data[1] != 0 => {
                     let note_index = notes.len();
                     notes.push(MidiNote {
                         channel,
                         key,
                         velocity: data[1],
+                        pan: channel_pan.get(&channel).copied().unwrap_or(64),
                         start_tick: event.absolute_tick,
                         end_tick: None,
                         release_velocity: None,
@@ -1207,6 +1215,11 @@ impl MidiNote {
         self.velocity
     }
 
+    /// MIDI CC 10 pan value (0–127) active when the note started.
+    pub fn pan(&self) -> u8 {
+        self.pan
+    }
+
     pub fn start_tick(&self) -> u64 {
         self.start_tick
     }
@@ -1239,6 +1252,16 @@ pub fn fl_note_release_to_midi_velocity(release: u8) -> u8 {
 /// Maps FL Studio's 0–128 centered note pan to the 0–127 MIDI CC 10 range.
 pub fn fl_note_pan_to_midi_value(pan: u8) -> u8 {
     ((u16::from(pan.min(128)) * 127 + 64) / 128) as u8
+}
+
+/// Maps MIDI CC 10 pan (0–127) to FL Studio's 0–128 note-pan range.
+pub fn midi_pan_to_fl_note_pan(pan: u8) -> u8 {
+    let pan = u16::from(pan.min(127));
+    if pan <= 64 {
+        pan as u8
+    } else {
+        ((pan * 128 + 63) / 127) as u8
+    }
 }
 
 impl MidiTempoEvent {
@@ -1902,6 +1925,7 @@ mod tests {
         assert_eq!(notes.len(), 1);
         assert_eq!(notes[0].key(), 60);
         assert_eq!(notes[0].velocity(), 100);
+        assert_eq!(notes[0].pan(), 64);
         assert_eq!(notes[0].start_tick(), 0);
         assert_eq!(notes[0].end_tick(), Some(240));
         assert_eq!(notes[0].duration_ticks(), Some(240));
@@ -1923,6 +1947,12 @@ mod tests {
         assert_eq!(super::fl_note_pan_to_midi_value(64), 64);
         assert_eq!(super::fl_note_pan_to_midi_value(128), 127);
         assert_eq!(super::fl_note_pan_to_midi_value(255), 127);
+        assert_eq!(super::midi_pan_to_fl_note_pan(0), 0);
+        assert_eq!(super::midi_pan_to_fl_note_pan(64), 64);
+        assert_eq!(super::midi_pan_to_fl_note_pan(65), 66);
+        assert_eq!(super::midi_pan_to_fl_note_pan(126), 127);
+        assert_eq!(super::midi_pan_to_fl_note_pan(127), 128);
+        assert_eq!(super::midi_pan_to_fl_note_pan(255), 128);
     }
 
     #[test]
