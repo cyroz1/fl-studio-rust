@@ -25816,11 +25816,17 @@ impl DawUi {
                         "System default input",
                     );
                     for device in &self.audio_catalog.inputs {
-                        ui.selectable_value(
-                            &mut self.audio_settings.input_device_id,
-                            Some(device.id.clone()),
-                            &device.name,
-                        );
+                        let selected = ui
+                            .selectable_value(
+                                &mut self.audio_settings.input_device_id,
+                                Some(device.id.clone()),
+                                &device.name,
+                            )
+                            .changed();
+                        if selected && cfg!(target_os = "windows") && device.id.starts_with("asio:")
+                        {
+                            self.audio_settings.access = AudioAccess::Shared;
+                        }
                     }
                 });
         });
@@ -25948,22 +25954,37 @@ impl DawUi {
                         "System default output",
                     );
                     for device in &self.audio_catalog.outputs {
-                        ui.selectable_value(
-                            &mut self.audio_settings.output_device_id,
-                            Some(device.id.clone()),
-                            &device.name,
-                        );
+                        let selected = ui
+                            .selectable_value(
+                                &mut self.audio_settings.output_device_id,
+                                Some(device.id.clone()),
+                                &device.name,
+                            )
+                            .changed();
+                        if selected && cfg!(target_os = "windows") && device.id.starts_with("asio:")
+                        {
+                            self.audio_settings.access = AudioAccess::Shared;
+                        }
                     }
                 });
         });
 
+        let asio_selected = self
+            .audio_settings
+            .input_device_id
+            .as_deref()
+            .into_iter()
+            .chain(self.audio_settings.output_device_id.as_deref())
+            .any(|id| id.starts_with("asio:"));
         ui.horizontal(|ui| {
-            ui.label("Windows audio API");
+            ui.label("Audio access");
             egui::ComboBox::from_id_salt("audio_access_mode")
                 .selected_text(if self.audio_settings.access == AudioAccess::Exclusive {
                     "WASAPI · Exclusive"
+                } else if cfg!(target_os = "windows") && asio_selected {
+                    "Shared · ASIO selected"
                 } else if cfg!(target_os = "windows") {
-                    "WASAPI · Shared"
+                    "Shared"
                 } else {
                     "System audio · Shared"
                 })
@@ -25971,13 +25992,9 @@ impl DawUi {
                     ui.selectable_value(
                         &mut self.audio_settings.access,
                         AudioAccess::Shared,
-                        if cfg!(target_os = "windows") {
-                            "WASAPI · Shared"
-                        } else {
-                            "System audio · Shared"
-                        },
+                        "Shared",
                     );
-                    ui.add_enabled_ui(cfg!(target_os = "windows"), |ui| {
+                    ui.add_enabled_ui(cfg!(target_os = "windows") && !asio_selected, |ui| {
                         ui.selectable_value(
                             &mut self.audio_settings.access,
                             AudioAccess::Exclusive,
@@ -25989,6 +26006,8 @@ impl DawUi {
                 ui.label(
                     egui::RichText::new("Exclusive device access is Windows-only").color(MUTED),
                 );
+            } else if asio_selected {
+                ui.label(egui::RichText::new("ASIO devices use Shared access").color(MUTED));
             }
         });
 

@@ -1,6 +1,6 @@
 //! Live device input and output for the desktop application.
 //!
-//! Shared streams use CPAL (WASAPI shared mode on Windows). Windows exclusive
+//! Shared streams use CPAL (WASAPI or ASIO on Windows). Windows exclusive
 //! streams are opened directly with WASAPI so the requested endpoint format and
 //! exclusive-access errors are visible to the application.
 
@@ -730,29 +730,42 @@ pub fn enumerate_devices() -> AudioDeviceCatalog {
         ..AudioDeviceCatalog::default()
     };
 
-    match host.devices() {
-        Ok(devices) => {
-            for device in devices {
-                let Ok(id) = device.id() else {
-                    continue;
-                };
-                let name = device
-                    .description()
-                    .map(|description| description.to_string())
-                    .unwrap_or_else(|_| device.to_string());
-                let info = AudioDeviceInfo {
-                    id: id.to_string(),
-                    name,
-                };
-                if device.supports_input() {
-                    catalog.inputs.push(info.clone());
-                }
-                if device.supports_output() {
-                    catalog.outputs.push(info);
+    let mut errors = Vec::new();
+    for host_id in cpal::available_hosts() {
+        let host = match cpal::host_from_id(host_id) {
+            Ok(host) => host,
+            Err(error) => {
+                errors.push(format!("{host_id}: {error}"));
+                continue;
+            }
+        };
+        match host.devices() {
+            Ok(devices) => {
+                for device in devices {
+                    let Ok(id) = device.id() else {
+                        continue;
+                    };
+                    let name = device
+                        .description()
+                        .map(|description| description.to_string())
+                        .unwrap_or_else(|_| device.to_string());
+                    let info = AudioDeviceInfo {
+                        id: id.to_string(),
+                        name: format!("{} · {name}", host_id.to_string().to_ascii_uppercase()),
+                    };
+                    if device.supports_input() {
+                        catalog.inputs.push(info.clone());
+                    }
+                    if device.supports_output() {
+                        catalog.outputs.push(info);
+                    }
                 }
             }
+            Err(error) => errors.push(format!("{host_id}: {error}")),
         }
-        Err(error) => catalog.error = Some(error.to_string()),
+    }
+    if !errors.is_empty() {
+        catalog.error = Some(errors.join("; "));
     }
 
     catalog
@@ -1312,6 +1325,20 @@ fn validate_settings(settings: &AudioSettings) -> Result<(), String> {
     if !(32..=8_192).contains(&settings.buffer_frames) {
         return Err("Audio buffer must be between 32 and 8,192 frames".into());
     }
+    if settings.access == AudioAccess::Exclusive
+        && [
+            settings.input_device_id.as_deref(),
+            settings.output_device_id.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|id| {
+            id.split_once(':')
+                .is_some_and(|(host, _)| !host.eq_ignore_ascii_case("wasapi"))
+        })
+    {
+        return Err("Exclusive device access is available through WASAPI devices only; switch to Shared access for this device".into());
+    }
     Ok(())
 }
 
@@ -1325,7 +1352,9 @@ fn resolve_device(
             let id = selected_id
                 .parse::<cpal::DeviceId>()
                 .map_err(|error| format!("Invalid audio device id: {error}"))?;
-            host.device_by_id(&id).map(Some).ok_or_else(|| {
+            let selected_host = cpal::host_from_id(id.host())
+                .map_err(|error| format!("Could not open audio host for {selected_id}: {error}"))?;
+            selected_host.device_by_id(&id).map(Some).ok_or_else(|| {
                 format!("Selected audio device is no longer available: {selected_id}")
             })
         }
@@ -2377,6 +2406,26 @@ mod tests {
         assert_eq!(settings.access, AudioAccess::Shared);
         assert_eq!(settings.sample_rate, 48_000);
         assert_eq!(settings.buffer_frames, 256);
+    }
+
+    #[test]
+    fn exclusive_audio_rejects_devices_from_non_wasapi_hosts() {
+        let settings = AudioSettings {
+            access: AudioAccess::Exclusive,
+            output_device_id: Some("asio:studio-interface".into()),
+            ..AudioSettings::default()
+        };
+        assert_eq!(
+            validate_settings(&settings).unwrap_err(),
+            "Exclusive device access is available through WASAPI devices only; switch to Shared access for this device"
+        );
+
+        let settings = AudioSettings {
+            access: AudioAccess::Exclusive,
+            output_device_id: Some("wasapi:system-endpoint".into()),
+            ..AudioSettings::default()
+        };
+        assert!(validate_settings(&settings).is_ok());
     }
 
     #[test]
