@@ -3041,7 +3041,7 @@ impl DawUi {
         }
     }
 
-    fn dock_all_and_reset_detached_window_positions(&mut self) {
+    fn dock_all_and_reset_detached_window_positions(&mut self, context: &egui::Context) {
         self.piano_roll_window_detached = false;
         self.mixer_window_detached = false;
         self.channel_rack_window_detached = false;
@@ -3050,21 +3050,50 @@ impl DawUi {
         self.audio_window_detached = false;
         self.automation_window_detached = false;
 
+        let (main_window_position, available_size) = context.input(|input| {
+            let viewport = input.viewport();
+            let window_rect = viewport.outer_rect.or(viewport.inner_rect);
+            (
+                window_rect.map_or(egui::Pos2::ZERO, |rect| rect.min),
+                window_rect
+                    .map(|rect| rect.size())
+                    .or(viewport.monitor_size),
+            )
+        });
         let mut placements = self.detached_window_placements;
-        for kind in DetachedWindowKind::ALL {
+        for (index, kind) in DetachedWindowKind::ALL.into_iter().enumerate() {
             if let Some(mut placement) = self
                 .detached_window_current_placements
                 .get(kind)
                 .or_else(|| placements.get(kind))
             {
-                placement.position = None;
+                let cascade = index as f32 * 8.0;
+                placement.position = Some(egui::pos2(
+                    main_window_position.x + 480.0 + cascade,
+                    main_window_position.y + 48.0 + cascade,
+                ));
+                if let Some(available_size) = available_size {
+                    let minimum_size = kind.minimum_size();
+                    placement.inner_size = Vec2::new(
+                        placement
+                            .inner_size
+                            .x
+                            .min((available_size.x - 544.0).max(minimum_size.x)),
+                        placement
+                            .inner_size
+                            .y
+                            .min((available_size.y - 112.0).max(minimum_size.y)),
+                    );
+                }
                 placements.set(kind, placement);
             }
         }
         self.detached_window_placements = placements;
         self.detached_window_current_placements = placements;
         self.status = match save_detached_window_placements(placements) {
-            Ok(()) => "All detached views docked; saved window positions reset".to_owned(),
+            Ok(()) => {
+                "All detached views docked; window positions reset near the main window".to_owned()
+            }
             Err(error) => {
                 format!("Detached views docked, but window positions could not be reset: {error}")
             }
@@ -6851,7 +6880,7 @@ impl DawUi {
                 }
                 ui.separator();
                 if ui.button("Dock all and reset window positions").clicked() {
-                    self.dock_all_and_reset_detached_window_positions();
+                    self.dock_all_and_reset_detached_window_positions(ui.ctx());
                     ui.close();
                 }
             });

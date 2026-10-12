@@ -550,6 +550,10 @@ jobs:
               raise SystemExit(f"The detached Playlist position was not restored: {x},{y}.")
           PY
 
+          main_window_geometry=$(xdotool getwindowgeometry --shell "$mixer_window")
+          eval "$main_window_geometry"
+          main_window_x=$X
+          main_window_y=$Y
           xdotool windowmove "$restored_playlist_window" 2200 1400
           xdotool windowfocus --sync "$mixer_window"
           xdotool mousemove 287 16 click 1
@@ -561,18 +565,22 @@ jobs:
             cat "$RUNNER_TEMP/mixer-preview-restored.log"
             exit 1
           fi
-          python3 - "$detached_layout" <<'PY'
+          python3 - "$detached_layout" "$main_window_x" "$main_window_y" <<'PY'
           from pathlib import Path
           import sys
 
           layout_path = Path(sys.argv[1])
+          main_x, main_y = map(float, sys.argv[2:])
           placement = next(
               (line.removeprefix("playlist=").split(",") for line in layout_path.read_text().splitlines()
                if line.startswith("playlist=")),
               None,
           )
-          if placement is None or placement[:2] != ["-", "-"]:
-              raise SystemExit("Resetting detached positions did not clear the saved Playlist coordinates.")
+          if placement is None or len(placement) != 4:
+              raise SystemExit("Resetting detached positions left the saved Playlist placement malformed.")
+          x, y = map(float, placement[:2])
+          if abs(x - (main_x + 480)) > 30 or abs(y - (main_y + 48)) > 30:
+              raise SystemExit(f"Resetting detached positions did not place the Playlist beside the main window: {x},{y}.")
           width, height = map(float, placement[2:])
           if abs(width - 1000) > 4 or abs(height - 650) > 4:
               raise SystemExit(f"Resetting positions unexpectedly changed the saved Playlist size: {width}x{height}.")
@@ -593,12 +601,14 @@ jobs:
           fi
           window_geometry=$(xdotool getwindowgeometry --shell "$recovered_playlist_window")
           eval "$window_geometry"
-          python3 - "$X" "$Y" <<'PY'
+          python3 - "$X" "$Y" "$main_window_x" "$main_window_y" <<'PY'
           import sys
 
-          x, y = map(int, sys.argv[1:])
+          x, y, main_x, main_y = map(int, sys.argv[1:])
           if not (-50 <= x < 1600 and -50 <= y < 900):
               raise SystemExit(f"The recovered Playlist opened outside the current display: {x},{y}.")
+          if abs(x - (main_x + 480)) > 30 or abs(y - (main_y + 48)) > 30:
+              raise SystemExit(f"The recovered Playlist did not open beside the main window: {x},{y}.")
           PY
           xdotool windowfocus --sync "$mixer_window"
           xdotool mousemove 287 16 click 1
