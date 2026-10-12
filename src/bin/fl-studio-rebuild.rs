@@ -26961,7 +26961,7 @@ impl DawUi {
                 save_template = ui.button("Save learned mappings as template").clicked();
             });
         });
-        ui.small("Built-ins: General MIDI Ch. 1 maps CC 7 to output gain and CC 64 to Play/Pause; MIDI Expression Ch. 1 maps CC 11 to output gain. User templates save learned CC assignments for reuse with another input.");
+        ui.small("Built-ins: General MIDI Ch. 1 maps CC 7 to output gain and CC 64 to Play/Pause; MIDI Expression Ch. 1 maps CC 11 to output gain; X-TOUCH MINI Preset A maps CC 9 on Ch. 11 to output gain. User templates save learned CC assignments for reuse with another input.");
         if let Some(index) = apply_template_index {
             self.apply_midi_controller_template(index);
         }
@@ -29960,6 +29960,15 @@ fn built_in_midi_controller_templates() -> Vec<MidiControllerTemplate> {
             output_gain: Some(MidiControllerCcBinding {
                 channel: 0,
                 controller: 11,
+            }),
+            play_pause: None,
+            built_in: true,
+        },
+        MidiControllerTemplate {
+            name: "X-TOUCH MINI Preset A (Ch. 11)".to_owned(),
+            output_gain: Some(MidiControllerCcBinding {
+                channel: 10,
+                controller: 9,
             }),
             play_pause: None,
             built_in: true,
@@ -33786,9 +33795,9 @@ mod tests {
     }
 
     #[test]
-    fn built_in_general_midi_controller_template_uses_channel_one_ccs() {
+    fn built_in_midi_controller_templates_use_documented_cc_mappings() {
         let templates = built_in_midi_controller_templates();
-        assert_eq!(templates.len(), 2);
+        assert_eq!(templates.len(), 3);
         assert_eq!(templates[0].name, "General MIDI Ch. 1 (CC 7 + CC 64)");
         assert!(templates[0].built_in);
         assert_eq!(
@@ -33815,6 +33824,16 @@ mod tests {
             })
         );
         assert_eq!(templates[1].play_pause, None);
+        assert_eq!(templates[2].name, "X-TOUCH MINI Preset A (Ch. 11)");
+        assert!(templates[2].built_in);
+        assert_eq!(
+            templates[2].output_gain,
+            Some(MidiControllerCcBinding {
+                channel: 10,
+                controller: 9,
+            })
+        );
+        assert_eq!(templates[2].play_pause, None);
         assert!(serialize_midi_controller_templates(&templates).is_empty());
     }
 
