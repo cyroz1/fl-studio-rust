@@ -1486,6 +1486,7 @@ enum PianoRollScale {
     LocrianNaturalTwo,
     LocrianNaturalSix,
     HarmonicMinor,
+    HarmonicMinorFlatFive,
     MelodicMinor,
     NeapolitanMinor,
     NeapolitanMajor,
@@ -1503,7 +1504,7 @@ enum PianoRollScale {
 }
 
 impl PianoRollScale {
-    const ALL: [Self; 40] = [
+    const ALL: [Self; 41] = [
         Self::None,
         Self::Major,
         Self::HarmonicMajor,
@@ -1530,6 +1531,7 @@ impl PianoRollScale {
         Self::LocrianNaturalTwo,
         Self::LocrianNaturalSix,
         Self::HarmonicMinor,
+        Self::HarmonicMinorFlatFive,
         Self::MelodicMinor,
         Self::NeapolitanMinor,
         Self::NeapolitanMajor,
@@ -1574,6 +1576,7 @@ impl PianoRollScale {
             Self::LocrianNaturalTwo => "Locrian natural 2",
             Self::LocrianNaturalSix => "Locrian natural 6",
             Self::HarmonicMinor => "Harmonic minor",
+            Self::HarmonicMinorFlatFive => "Harmonic minor b5",
             Self::MelodicMinor => "Melodic minor",
             Self::NeapolitanMinor => "Neapolitan minor",
             Self::NeapolitanMajor => "Neapolitan major",
@@ -1626,6 +1629,7 @@ impl PianoRollScale {
             Self::LocrianNaturalTwo => &[0, 2, 3, 5, 6, 8, 10],
             Self::LocrianNaturalSix => &[0, 1, 3, 5, 6, 9, 10],
             Self::HarmonicMinor => &[0, 2, 3, 5, 7, 8, 11],
+            Self::HarmonicMinorFlatFive => &[0, 2, 3, 5, 6, 8, 11],
             Self::MelodicMinor => &[0, 2, 3, 5, 7, 9, 11],
             Self::NeapolitanMinor => &[0, 1, 3, 5, 7, 8, 11],
             Self::NeapolitanMajor => &[0, 1, 3, 5, 7, 9, 11],
@@ -1692,6 +1696,7 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
         PianoRollScale::LocrianNaturalTwo,
         PianoRollScale::LocrianNaturalSix,
         PianoRollScale::HarmonicMinor,
+        PianoRollScale::HarmonicMinorFlatFive,
         PianoRollScale::MelodicMinor,
         PianoRollScale::NeapolitanMinor,
         PianoRollScale::NeapolitanMajor,
@@ -1763,6 +1768,7 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
                 PianoRollScale::DorianFlatFive => -23,
                 PianoRollScale::NaturalMinor => 2,
                 PianoRollScale::HarmonicMinor => 1,
+                PianoRollScale::HarmonicMinorFlatFive => -34,
                 PianoRollScale::MelodicMinor => 0,
                 PianoRollScale::NeapolitanMinor => -27,
                 PianoRollScale::NeapolitanMajor => -28,
@@ -33745,7 +33751,7 @@ mod tests {
 
     #[test]
     fn piano_roll_scales_use_documented_intervals_and_auto_detection() {
-        let cases: [(PianoRollScale, u8, [u16; 8], &'static [u8]); 27] = [
+        let cases: [(PianoRollScale, u8, [u16; 8], &'static [u8]); 28] = [
             (
                 PianoRollScale::Dorian,
                 2,
@@ -33811,6 +33817,12 @@ mod tests {
                 0,
                 [60, 61, 63, 66, 67, 69, 70, 72],
                 &[0, 1, 3, 6, 7, 9, 10],
+            ),
+            (
+                PianoRollScale::HarmonicMinorFlatFive,
+                0,
+                [60, 62, 63, 65, 66, 68, 71, 72],
+                &[0, 2, 3, 5, 6, 8, 11],
             ),
             (
                 PianoRollScale::Persian,
