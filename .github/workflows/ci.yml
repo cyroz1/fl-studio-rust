@@ -530,7 +530,7 @@ jobs:
           xdotool windowfocus --sync "$mixer_window"
           xdotool mousemove 287 16 click 1
           sleep 0.3
-          xdotool mousemove 350 294 click 1
+          xdotool mousemove 350 319 click 1
           sleep 1
           restored_playlist_window=$(xdotool search --onlyvisible --name '^Playlist$' | head -n 1 || true)
           if [[ -z "$restored_playlist_window" ]]; then
@@ -558,7 +558,7 @@ jobs:
           xdotool windowfocus --sync "$mixer_window"
           xdotool mousemove 287 16 click 1
           sleep 0.3
-          xdotool mousemove 380 429 click 1
+          xdotool mousemove 380 454 click 1
           sleep 1
           if xdotool search --onlyvisible --name '^Playlist$' >/dev/null 2>&1; then
             echo "View > Dock all and reset window positions did not dock the off-screen Playlist."
@@ -591,7 +591,7 @@ jobs:
           xdotool windowfocus --sync "$mixer_window"
           xdotool mousemove 287 16 click 1
           sleep 0.3
-          xdotool mousemove 350 294 click 1
+          xdotool mousemove 350 319 click 1
           sleep 1
           recovered_playlist_window=$(xdotool search --onlyvisible --name '^Playlist$' | head -n 1 || true)
           if [[ -z "$recovered_playlist_window" ]]; then
@@ -613,7 +613,7 @@ jobs:
           xdotool windowfocus --sync "$mixer_window"
           xdotool mousemove 287 16 click 1
           sleep 0.3
-          xdotool mousemove 350 294 click 1
+          xdotool mousemove 350 319 click 1
           sleep 1
           if xdotool search --onlyvisible --name '^Playlist$' >/dev/null 2>&1; then
             echo "View > Dock Playlist did not close the recovered native window."
@@ -624,7 +624,7 @@ jobs:
           xdotool windowfocus --sync "$mixer_window"
           xdotool mousemove 287 16 click 1
           sleep 0.3
-          xdotool mousemove 350 319 click 1
+          xdotool mousemove 350 344 click 1
           sleep 1
           detached_plugins_window=$(xdotool search --onlyvisible --name '^Plug-ins$' | head -n 1 || true)
           if [[ -z "$detached_plugins_window" ]]; then
