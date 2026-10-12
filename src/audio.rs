@@ -25,6 +25,8 @@ const INPUT_RECORDING_BUFFER_FRAMES: usize = 65_536;
 const AUDIO_ERROR_HISTORY_LIMIT: usize = 16;
 const AUDIO_COMMAND_QUEUE_CAPACITY: usize = 128;
 const STREAM_PREFILL_FRAMES: usize = 512;
+const OUTPUT_GAIN_MAX: f32 = 2.0;
+const OUTPUT_GAIN_SMOOTHING_SECONDS: f32 = 0.02;
 const BROWSER_PREVIEW_ACTIVE_BIT: u64 = 1 << 63;
 const BROWSER_PREVIEW_FRAME_MASK: u64 = !BROWSER_PREVIEW_ACTIVE_BIT;
 const TEST_TONE_HZ: f32 = 440.0;
@@ -210,6 +212,7 @@ pub struct AudioSettings {
     pub enable_output: bool,
     pub input_device_id: Option<String>,
     pub output_device_id: Option<String>,
+    pub output_gain: f32,
     pub sample_rate: u32,
     pub buffer_frames: u32,
     pub access: AudioAccess,
@@ -222,6 +225,7 @@ impl Default for AudioSettings {
             enable_output: true,
             input_device_id: None,
             output_device_id: None,
+            output_gain: 1.0,
             sample_rate: 48_000,
             buffer_frames: 256,
             access: AudioAccess::Shared,
@@ -239,6 +243,7 @@ struct PlaybackState {
     browser_preview_state: AtomicU64,
     browser_preview_looping: AtomicBool,
     browser_preview_gain: AtomicU32,
+    output_gain: AtomicU32,
     output_peak: AtomicU32,
 }
 
@@ -481,6 +486,7 @@ impl PlaybackState {
             browser_preview_state: AtomicU64::new(0),
             browser_preview_looping: AtomicBool::new(false),
             browser_preview_gain: AtomicU32::new(1.0_f32.to_bits()),
+            output_gain: AtomicU32::new(1.0_f32.to_bits()),
             output_peak: AtomicU32::new(0.0_f32.to_bits()),
         }
     }
@@ -905,6 +911,20 @@ impl AudioEngine {
         }
     }
 
+    /// Set a live master output gain for every device playback source.
+    ///
+    /// The audio callback smooths changes to prevent clicks.
+    pub fn set_output_gain(&self, gain: f32) {
+        let gain = if gain.is_finite() {
+            gain.clamp(0.0, OUTPUT_GAIN_MAX)
+        } else {
+            1.0
+        };
+        self.playback
+            .output_gain
+            .store(gain.to_bits(), Ordering::Release);
+    }
+
     /// Begin consuming interleaved stereo samples from a bounded producer ring.
     ///
     /// VST3 and other block processors can render on a worker thread while the shared or
@@ -1068,6 +1088,9 @@ impl AudioEngine {
         let ring = Arc::new(AudioRingBuffer::new(INPUT_MONITOR_RING_CAPACITY));
         let source = Arc::new(AtomicU8::new(AUDIO_SOURCE_SILENT));
         let playback = Arc::new(PlaybackState::new());
+        playback
+            .output_gain
+            .store(settings.output_gain.to_bits(), Ordering::Release);
         let input_peak = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
         let input_recording = Arc::new(ArcSwapOption::empty());
         let error = Arc::new(AudioErrorState::default());
@@ -1149,6 +1172,9 @@ impl AudioEngine {
         let ring = Arc::new(AudioRingBuffer::new(INPUT_MONITOR_RING_CAPACITY));
         let source = Arc::new(AtomicU8::new(AUDIO_SOURCE_SILENT));
         let playback = Arc::new(PlaybackState::new());
+        playback
+            .output_gain
+            .store(settings.output_gain.to_bits(), Ordering::Release);
         let input_peak = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
         let input_recording = Arc::new(ArcSwapOption::empty());
         let error = Arc::new(AudioErrorState::default());
@@ -1325,6 +1351,10 @@ fn validate_settings(settings: &AudioSettings) -> Result<(), String> {
     if !(32..=8_192).contains(&settings.buffer_frames) {
         return Err("Audio buffer must be between 32 and 8,192 frames".into());
     }
+    if !settings.output_gain.is_finite() || !(0.0..=OUTPUT_GAIN_MAX).contains(&settings.output_gain)
+    {
+        return Err("Output gain must be between 0 and 2".into());
+    }
     if settings.access == AudioAccess::Exclusive
         && [
             settings.input_device_id.as_deref(),
@@ -1454,9 +1484,18 @@ fn build_typed_output(
     ring: Arc<AudioRingBuffer>,
     error: Arc<AudioErrorState>,
 ) -> Result<Stream, String> {
+    let initial_gain = f32::from_bits(playback.output_gain.load(Ordering::Relaxed));
     macro_rules! build {
         ($sample:ty) => {
-            build_tone_stream::<$sample>(device, config, source, playback, ring, error)
+            build_tone_stream::<$sample>(
+                device,
+                config,
+                source,
+                playback,
+                ring,
+                error,
+                initial_gain,
+            )
         };
     }
     match format {
@@ -1485,11 +1524,13 @@ fn build_tone_stream<T>(
     playback: Arc<PlaybackState>,
     ring: Arc<AudioRingBuffer>,
     error: Arc<AudioErrorState>,
+    mut output_gain: f32,
 ) -> Result<Stream, String>
 where
     T: cpal::SizedSample + FromSample<f32>,
 {
     let sample_rate = config.sample_rate as f32;
+    let gain_alpha = output_gain_smoothing_alpha(sample_rate);
     let channels = usize::from(config.channels).max(1);
     let mut phase = 0.0_f32;
     let playback_for_callback = Arc::clone(&playback);
@@ -1502,8 +1543,11 @@ where
                 let playback_samples = playback_for_callback.samples.load();
                 let streaming = playback_for_callback.streaming.load();
                 let browser_preview_samples = playback_for_callback.browser_preview_samples.load();
+                let target_gain =
+                    f32::from_bits(playback_for_callback.output_gain.load(Ordering::Relaxed));
                 let mut output_peak = 0.0_f32;
                 for frame in output.chunks_mut(channels) {
+                    output_gain = smooth_output_gain(output_gain, target_gain, gain_alpha);
                     let [left, right] = next_output_frame_with_browser_preview(AudioFrameInputs {
                         source: &source,
                         ring: &ring,
@@ -1517,11 +1561,13 @@ where
                         phase: &mut phase,
                     });
                     for (channel, destination) in frame.iter_mut().enumerate() {
-                        let sample = sanitize_output_sample(match channel {
-                            0 => left,
-                            1 => right,
-                            _ => 0.0,
-                        });
+                        let sample = sanitize_output_sample(
+                            match channel {
+                                0 => left,
+                                1 => right,
+                                _ => 0.0,
+                            } * output_gain,
+                        );
                         output_peak = output_peak.max(sample.abs());
                         *destination = T::from_sample(sample);
                     }
@@ -1763,6 +1809,17 @@ fn next_output_frame_with_browser_preview(inputs: AudioFrameInputs<'_>) -> [f32;
     ]
 }
 
+fn output_gain_smoothing_alpha(sample_rate: f32) -> f32 {
+    if !sample_rate.is_finite() || sample_rate <= 0.0 {
+        return 1.0;
+    }
+    1.0 - (-1.0 / (sample_rate * OUTPUT_GAIN_SMOOTHING_SECONDS)).exp()
+}
+
+fn smooth_output_gain(current: f32, target: f32, alpha: f32) -> f32 {
+    current + (target - current) * alpha.clamp(0.0, 1.0)
+}
+
 fn sanitize_output_sample(sample: f32) -> f32 {
     if sample.is_finite() {
         sample.clamp(-1.0, 1.0)
@@ -1913,6 +1970,7 @@ fn wasapi_exclusive_output_worker(
             .get_audiorenderclient()
             .map_err(|error| error.to_string())?;
         let mut phase = 0.0_f32;
+        let mut output_gain = settings.output_gain;
         let initial_frames = client
             .get_available_space_in_frames()
             .map_err(|error| error.to_string())? as usize;
@@ -1926,6 +1984,7 @@ fn wasapi_exclusive_output_worker(
             &playback,
             &ring,
             &mut phase,
+            &mut output_gain,
             &mut output,
         )?;
         render
@@ -1951,6 +2010,7 @@ fn wasapi_exclusive_output_worker(
                         &playback,
                         &ring,
                         &mut phase,
+                        &mut output_gain,
                         &mut output,
                     )?;
                     render
@@ -2272,16 +2332,20 @@ fn render_wasapi_buffer(
     playback: &PlaybackState,
     ring: &AudioRingBuffer,
     phase: &mut f32,
+    output_gain: &mut f32,
     output: &mut Vec<u8>,
 ) -> Result<(), String> {
     playback.apply_pending_commands(source);
     output.resize(frames.saturating_mul(format.frame_bytes), 0);
     let sample_rate = format.get_sample_rate();
+    let gain_alpha = output_gain_smoothing_alpha(sample_rate);
+    let target_gain = f32::from_bits(playback.output_gain.load(Ordering::Relaxed));
     let playback_samples = playback.samples.load();
     let streaming = playback.streaming.load();
     let browser_preview_samples = playback.browser_preview_samples.load();
     let mut output_peak = 0.0_f32;
     for frame in output.chunks_exact_mut(format.frame_bytes) {
+        *output_gain = smooth_output_gain(*output_gain, target_gain, gain_alpha);
         let stereo = next_output_frame_with_browser_preview(AudioFrameInputs {
             source,
             ring,
@@ -2293,11 +2357,13 @@ fn render_wasapi_buffer(
             phase,
         });
         for (channel_index, channel) in frame.chunks_exact_mut(format.sample_bytes).enumerate() {
-            let sample = sanitize_output_sample(match channel_index {
-                0 => stereo[0],
-                1 => stereo[1],
-                _ => 0.0,
-            });
+            let sample = sanitize_output_sample(
+                match channel_index {
+                    0 => stereo[0],
+                    1 => stereo[1],
+                    _ => 0.0,
+                } * *output_gain,
+            );
             output_peak = output_peak.max(sample.abs());
             format.encode(sample, channel)?;
         }
@@ -2324,7 +2390,8 @@ mod tests {
         AUDIO_SOURCE_SILENT, AUDIO_SOURCE_STREAM, AUDIO_SOURCE_TEST_TONE, AudioAccess,
         AudioInputRecording, AudioRingBuffer, AudioSettings, InputRecordingState, ParameterCommand,
         PlaybackState, StereoFrameDelay, TransportCommand, enable_denormal_protection,
-        next_output_frame, sanitize_output_sample, tone_sample, validate_settings,
+        next_output_frame, output_gain_smoothing_alpha, sanitize_output_sample, smooth_output_gain,
+        tone_sample, validate_settings,
     };
 
     #[test]
@@ -2401,9 +2468,23 @@ mod tests {
     }
 
     #[test]
+    fn output_gain_changes_are_smoothed_over_multiple_audio_frames() {
+        let alpha = output_gain_smoothing_alpha(48_000.0);
+        let first_frame = smooth_output_gain(1.0, 0.0, alpha);
+        assert!(first_frame < 1.0 && first_frame > 0.99);
+
+        let after_block = (0..256).fold(1.0, |gain, _| smooth_output_gain(gain, 0.0, alpha));
+        assert!(after_block < first_frame && after_block > 0.75);
+
+        let settled = (0..10_000).fold(1.0, |gain, _| smooth_output_gain(gain, 0.0, alpha));
+        assert!(settled < 0.001);
+    }
+
+    #[test]
     fn shared_is_the_default_access_mode_and_device_settings_are_sane() {
         let settings = AudioSettings::default();
         assert_eq!(settings.access, AudioAccess::Shared);
+        assert_eq!(settings.output_gain, 1.0);
         assert_eq!(settings.sample_rate, 48_000);
         assert_eq!(settings.buffer_frames, 256);
     }
@@ -2437,6 +2518,11 @@ mod tests {
         assert!(validate_settings(&settings).is_err());
         let settings = AudioSettings {
             buffer_frames: 1,
+            ..AudioSettings::default()
+        };
+        assert!(validate_settings(&settings).is_err());
+        let settings = AudioSettings {
+            output_gain: 2.1,
             ..AudioSettings::default()
         };
         assert!(validate_settings(&settings).is_err());

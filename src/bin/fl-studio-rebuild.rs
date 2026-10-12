@@ -2664,6 +2664,8 @@ struct DawUi {
     midi_dropped_messages: Arc<AtomicU64>,
     midi_reported_dropped_messages: u64,
     midi_activity: Option<(String, Instant)>,
+    midi_output_gain_mapping: Option<MidiControlChangeMapping>,
+    midi_output_gain_learning: bool,
     midi_recording: Option<ActiveMidiRecording>,
     midi_record_snap: PianoRollSnap,
     midi_recording_offset_ms: i16,
@@ -2856,6 +2858,13 @@ struct ActiveMidiRecording {
     playlist_clip_placement: Option<MidiPlaylistClipPlacement>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MidiControlChangeMapping {
+    input_device_id: String,
+    channel: u8,
+    controller: u8,
+}
+
 impl ActiveMidiRecording {
     fn record(&mut self, message: ReceivedMidiMessage) {
         if let Some(fixed_velocity) = self.fixed_velocity {
@@ -2989,6 +2998,7 @@ impl DawUi {
         if let Some(rate) = audio_catalog.default_sample_rate {
             audio_settings.sample_rate = rate;
         }
+        let midi_output_gain_mapping = load_midi_output_gain_mapping();
         let live_resampling_quality = load_live_resampling_quality();
         let playlist_render_quality = load_playlist_render_quality();
         let detached_window_placements = load_detached_window_placements();
@@ -3236,6 +3246,8 @@ impl DawUi {
             midi_dropped_messages: Arc::new(AtomicU64::new(0)),
             midi_reported_dropped_messages: 0,
             midi_activity: None,
+            midi_output_gain_mapping,
+            midi_output_gain_learning: false,
             midi_recording: None,
             midi_record_snap: PianoRollSnap::None,
             midi_recording_offset_ms,
@@ -24031,6 +24043,7 @@ impl DawUi {
                 "The selected MIDI input is no longer available; refresh devices".to_owned();
             return;
         };
+        self.midi_output_gain_learning = false;
         let previous_connection = self.midi_input_connection.take();
         drop(previous_connection);
         if self.midi_recording.is_some() {
@@ -24055,6 +24068,7 @@ impl DawUi {
     }
 
     fn disconnect_midi_input(&mut self) {
+        self.midi_output_gain_learning = false;
         let Some(connection) = self.midi_input_connection.take() else {
             return;
         };
@@ -24977,6 +24991,66 @@ impl DawUi {
         }
     }
 
+    fn apply_midi_output_gain(&mut self, value: u8) {
+        let gain = f32::from(value) * (2.0 / 127.0);
+        self.audio_settings.output_gain = gain;
+        if let Some(engine) = &self.audio_engine {
+            engine.set_output_gain(gain);
+        }
+        self.status = format!("MIDI output gain · {gain:.2}×");
+    }
+
+    fn handle_midi_output_gain_control(&mut self, event: MidiInputEvent) {
+        let MidiInputEvent::ControlChange {
+            channel,
+            controller,
+            value,
+        } = event
+        else {
+            return;
+        };
+
+        if self.midi_output_gain_learning {
+            let Some(connection) = self.midi_input_connection.as_ref() else {
+                return;
+            };
+            let mapping = MidiControlChangeMapping {
+                input_device_id: connection.device_id.clone(),
+                channel,
+                controller,
+            };
+            self.midi_output_gain_mapping = Some(mapping.clone());
+            self.midi_output_gain_learning = false;
+            let save_error = save_midi_output_gain_mapping(Some(&mapping)).err();
+            self.apply_midi_output_gain(value);
+            self.status = save_error.map_or_else(
+                || {
+                    format!(
+                        "Learned MIDI CC {controller} · channel {} for output gain · {:.2}×",
+                        channel + 1,
+                        self.audio_settings.output_gain
+                    )
+                },
+                |error| {
+                    format!("Using learned MIDI CC for this session; could not save it: {error}")
+                },
+            );
+            return;
+        }
+
+        let Some(mapping) = self.midi_output_gain_mapping.as_ref() else {
+            return;
+        };
+        let matches_input = self
+            .midi_input_connection
+            .as_ref()
+            .is_some_and(|connection| connection.device_id == mapping.input_device_id);
+        if matches_input && mapping.channel == channel && mapping.controller == controller {
+            self.apply_midi_output_gain(value);
+            self.status = format!("MIDI output gain · {:.2}×", self.audio_settings.output_gain);
+        }
+    }
+
     fn poll_midi_input(&mut self, history_snapshot_available: bool) {
         for _ in 0..midi_input::MIDI_INPUT_QUEUE_CAPACITY {
             let message = match self.midi_message_receiver.try_recv() {
@@ -24984,6 +25058,7 @@ impl DawUi {
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             };
             self.midi_activity = Some((describe_event(message.event), message.received_at));
+            self.handle_midi_output_gain_control(message.event);
             if let MidiInputEvent::Transport(command) = message.event {
                 self.handle_midi_transport(command, message, history_snapshot_available);
             } else if let Some(recording) = self.midi_recording.as_mut() {
@@ -25967,6 +26042,64 @@ impl DawUi {
                         }
                     }
                 });
+        });
+
+        let output_gain_changed = ui
+            .add(
+                egui::Slider::new(&mut self.audio_settings.output_gain, 0.0..=2.0)
+                    .text("Live output gain")
+                    .suffix("×"),
+            )
+            .changed();
+        if output_gain_changed && let Some(engine) = &self.audio_engine {
+            engine.set_output_gain(self.audio_settings.output_gain);
+        }
+        let learned_mapping_label = self.midi_output_gain_mapping.as_ref().map(|mapping| {
+            let input_name = self
+                .midi_input_devices
+                .iter()
+                .find(|device| device.id == mapping.input_device_id)
+                .map(|device| device.name.as_str())
+                .unwrap_or(mapping.input_device_id.as_str());
+            format!(
+                "CC {} · channel {} · {input_name}",
+                mapping.controller,
+                mapping.channel + 1
+            )
+        });
+        ui.horizontal(|ui| {
+            if self.midi_output_gain_learning {
+                ui.label(egui::RichText::new("Move a MIDI CC control…").color(ORANGE));
+                if ui.button("Cancel learn").clicked() {
+                    self.midi_output_gain_learning = false;
+                }
+            } else if ui
+                .add_enabled(
+                    self.midi_input_connection.is_some(),
+                    egui::Button::new("Learn CC for output gain"),
+                )
+                .on_hover_text("Connect a MIDI input, then move one CC control to map it")
+                .clicked()
+            {
+                self.midi_output_gain_learning = true;
+                self.status = "Move a MIDI CC control to map output gain".to_owned();
+            }
+            if let Some(label) = &learned_mapping_label {
+                ui.label(egui::RichText::new(label).color(MUTED));
+                if ui.small_button("Clear mapping").clicked() {
+                    self.midi_output_gain_mapping = None;
+                    self.midi_output_gain_learning = false;
+                    if let Err(error) = save_midi_output_gain_mapping(None) {
+                        self.status = format!("Could not clear MIDI output gain mapping: {error}");
+                    } else {
+                        self.status = "Cleared MIDI output gain mapping".to_owned();
+                    }
+                }
+            } else if self.midi_input_connection.is_none() {
+                ui.label(
+                    egui::RichText::new("Connect a MIDI input to learn a control").color(MUTED),
+                );
+            }
         });
 
         let asio_selected = self
@@ -28883,6 +29016,63 @@ fn midi_device_selections_file() -> Option<PathBuf> {
         .map(|directory| directory.join("midi-device-selections.txt"))
 }
 
+fn midi_output_gain_mapping_file() -> Option<PathBuf> {
+    browser_favorites_file()?
+        .parent()
+        .map(|directory| directory.join("midi-output-gain-mapping.txt"))
+}
+
+fn load_midi_output_gain_mapping() -> Option<MidiControlChangeMapping> {
+    let contents = fs::read_to_string(midi_output_gain_mapping_file()?).ok()?;
+    parse_midi_output_gain_mapping(&contents)
+}
+
+fn save_midi_output_gain_mapping(mapping: Option<&MidiControlChangeMapping>) -> Result<(), String> {
+    let path = midi_output_gain_mapping_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the MIDI output mapping path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    let contents = mapping.map_or_else(
+        || "input=\nchannel=\ncontroller=\n".to_owned(),
+        |mapping| {
+            format!(
+                "input={}\nchannel={}\ncontroller={}\n",
+                encode_midi_device_id(&mapping.input_device_id),
+                mapping.channel,
+                mapping.controller
+            )
+        },
+    );
+    fs::write(&path, contents)
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
+fn parse_midi_output_gain_mapping(contents: &str) -> Option<MidiControlChangeMapping> {
+    let mut input_device_id = None;
+    let mut channel = None;
+    let mut controller = None;
+    for line in contents.lines() {
+        if let Some(input) = line.strip_prefix("input=") {
+            input_device_id = decode_midi_device_id(input);
+        } else if let Some(value) = line.strip_prefix("channel=") {
+            channel = value.parse::<u8>().ok();
+        } else if let Some(value) = line.strip_prefix("controller=") {
+            controller = value.parse::<u8>().ok();
+        }
+    }
+    let input_device_id = input_device_id?;
+    let channel = channel?;
+    let controller = controller?;
+    (channel < 16 && controller < 128).then_some(MidiControlChangeMapping {
+        input_device_id,
+        channel,
+        controller,
+    })
+}
+
 fn recording_input_targets(
     audio_filter_enabled: bool,
     notes_filter_enabled: bool,
@@ -31668,20 +31858,20 @@ mod tests {
     use super::{
         ActivePlaylistClipDrag, Arrangement, ChannelDisplayFilter, DetachedWindowKind,
         DetachedWindowPlacement, DetachedWindowPlacements, DetectedPianoRollScale, FlpDocument,
-        MainView, PIANO_ROLL_RULER_HEIGHT, Pattern, PatternController, PatternNote,
-        PianoRollChordStamp, PianoRollGrid, PianoRollScale, PianoRollSnap, PlaylistClip,
-        PlaylistClipDragKind, PlaylistTempoMap, PlaylistTrack, PluginCandidate, PluginFormat,
-        TimeSelectionShift, TouchGesture, TouchTapTracker, TouchZoomConfig,
+        MainView, MidiControlChangeMapping, PIANO_ROLL_RULER_HEIGHT, Pattern, PatternController,
+        PatternNote, PianoRollChordStamp, PianoRollGrid, PianoRollScale, PianoRollSnap,
+        PlaylistClip, PlaylistClipDragKind, PlaylistTempoMap, PlaylistTrack, PluginCandidate,
+        PluginFormat, TimeSelectionShift, TouchGesture, TouchTapTracker, TouchZoomConfig,
         WINDOW_LAYOUT_PRESETS_HEADER, WindowLayoutPreset, audio_recording_start_tick_with_offset,
         candidate_matches_vst_identity, candidate_mixer_controls,
         candidate_mixer_stereo_separation, detect_chord_name, detect_piano_roll_channel_scale,
-        detect_piano_roll_scale, encode_midi_device_selections, first_available_playlist_track,
-        next_piano_roll_note_group, note_from_grid_position, parse_midi_device_selections,
-        parse_window_layout_presets, piano_roll_color_group_note_ids,
-        piano_roll_controller_stroke_points, piano_roll_controller_value_at,
-        piano_roll_controller_value_range, piano_roll_discard_length_edit,
-        piano_roll_duplicate_offset, piano_roll_key_at_y, piano_roll_note_group_members,
-        piano_roll_note_nudge_edit, piano_roll_odd_note_selection,
+        detect_piano_roll_scale, encode_midi_device_id, encode_midi_device_selections,
+        first_available_playlist_track, next_piano_roll_note_group, note_from_grid_position,
+        parse_midi_device_selections, parse_midi_output_gain_mapping, parse_window_layout_presets,
+        piano_roll_color_group_note_ids, piano_roll_controller_stroke_points,
+        piano_roll_controller_value_at, piano_roll_controller_value_range,
+        piano_roll_discard_length_edit, piano_roll_duplicate_offset, piano_roll_key_at_y,
+        piano_roll_note_group_members, piano_roll_note_nudge_edit, piano_roll_odd_note_selection,
         piano_roll_overlap_note_selection, piano_roll_pitch_range_note_selection,
         piano_roll_random_note_selection, piano_roll_selection_time_range,
         piano_roll_shift_time_range, piano_roll_time_range_from_drag,
@@ -32297,6 +32487,33 @@ mod tests {
         assert_eq!(
             parse_midi_device_selections("input=\noutput=\nclock=1\nfixed_velocity=1\n"),
             (None, None, true, false, true, true, true)
+        );
+    }
+
+    #[test]
+    fn midi_output_gain_mapping_round_trips_device_channel_and_controller() {
+        let mapping = MidiControlChangeMapping {
+            input_device_id: "alsa:keyboard\t雪".to_owned(),
+            channel: 15,
+            controller: 74,
+        };
+        let encoded = format!(
+            "input={}\nchannel={}\ncontroller={}\n",
+            encode_midi_device_id(&mapping.input_device_id),
+            mapping.channel,
+            mapping.controller
+        );
+        assert_eq!(parse_midi_output_gain_mapping(&encoded), Some(mapping));
+    }
+
+    #[test]
+    fn midi_output_gain_mapping_rejects_out_of_range_or_incomplete_entries() {
+        assert!(parse_midi_output_gain_mapping("input=\nchannel=0\ncontroller=7\n").is_none());
+        assert!(
+            parse_midi_output_gain_mapping("input=706f7274\nchannel=16\ncontroller=7\n").is_none()
+        );
+        assert!(
+            parse_midi_output_gain_mapping("input=706f7274\nchannel=0\ncontroller=128\n").is_none()
         );
     }
 
