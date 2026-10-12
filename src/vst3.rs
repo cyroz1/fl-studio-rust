@@ -56,13 +56,15 @@ struct ScheduledMidiEvent {
     fine_pitch_offset_cents: i16,
     note_id: i32,
     note_pan: u8,
+    note_release: u8,
 }
 
 #[derive(Clone, Copy)]
-struct ScheduledVst3NoteExpression {
+struct ScheduledVst3Note {
     note_id: i32,
     note_pan: u8,
-    supports_note_pan: bool,
+    note_release: u8,
+    supports_pan: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -205,6 +207,7 @@ struct PlaylistMidiNote {
     midi_channel: u8,
     fine_pitch_offset_cents: i16,
     pan: u8,
+    release: u8,
 }
 
 struct PlaylistPluginStream {
@@ -502,10 +505,11 @@ impl PlaylistPluginStream {
                             offset,
                             self.render.pitch_offset_cents,
                             event.fine_pitch_offset_cents,
-                            ScheduledVst3NoteExpression {
+                            ScheduledVst3Note {
                                 note_id: event.note_id,
                                 note_pan: event.note_pan,
-                                supports_note_pan: self.render.supports_note_pan,
+                                note_release: event.note_release,
+                                supports_pan: self.render.supports_note_pan,
                             },
                         )?;
                         self.next_event += 1;
@@ -1419,6 +1423,7 @@ impl Vst3HostRuntime {
                     midi_channel: note.midi_channel,
                     fine_pitch_offset_cents: note.fine_pitch_offset_cents(),
                     pan: note.pan,
+                    release: note.release,
                 });
         }
 
@@ -1723,6 +1728,7 @@ fn scheduled_playlist_midi_events_with_tempo_map(
             fine_pitch_offset_cents: note.fine_pitch_offset_cents,
             note_id,
             note_pan: note.pan,
+            note_release: note.release,
         });
         events.push(ScheduledMidiEvent {
             frame: end_frame,
@@ -1735,6 +1741,7 @@ fn scheduled_playlist_midi_events_with_tempo_map(
             fine_pitch_offset_cents: note.fine_pitch_offset_cents,
             note_id,
             note_pan: note.pan,
+            note_release: note.release,
         });
         note_count += 1;
     }
@@ -1849,6 +1856,10 @@ fn next_vst3_note_expression_id() -> i32 {
 
 fn vst3_note_pan_value(note_pan: u8) -> f64 {
     f64::from(note_pan.min(128)) / 128.0
+}
+
+fn vst3_note_release_value(note_release: u8) -> f32 {
+    f32::from(note_release.min(128)) / 128.0
 }
 
 fn prepare_parameter_automation(
@@ -2088,10 +2099,11 @@ fn process_pattern_render(
                     offset,
                     render.pitch_offset_cents,
                     event.fine_pitch_offset_cents,
-                    ScheduledVst3NoteExpression {
+                    ScheduledVst3Note {
                         note_id: event.note_id,
                         note_pan: event.note_pan,
-                        supports_note_pan: render.supports_note_pan,
+                        note_release: event.note_release,
+                        supports_pan: render.supports_note_pan,
                     },
                 )?;
                 event_index += 1;
@@ -2177,10 +2189,11 @@ fn stream_pattern_render(
                         offset,
                         render.pitch_offset_cents,
                         event.fine_pitch_offset_cents,
-                        ScheduledVst3NoteExpression {
+                        ScheduledVst3Note {
                             note_id: event.note_id,
                             note_pan: event.note_pan,
-                            supports_note_pan: render.supports_note_pan,
+                            note_release: event.note_release,
+                            supports_pan: render.supports_note_pan,
                         },
                     )?;
                     event_index += 1;
@@ -2393,38 +2406,62 @@ fn plugin_event_with_pitch_offset_and_note_id(
     Ok(plugin_event)
 }
 
+fn set_vst3_note_off_release_velocity(
+    plugin_event: &mut PluginEvent,
+    note_release: u8,
+) -> Result<(), String> {
+    match &mut plugin_event.data {
+        PluginEventData::NoteOff { velocity, .. } => {
+            *velocity = vst3_note_release_value(note_release);
+            Ok(())
+        }
+        _ => Err("VST3 release velocity can only be applied to note-off events".to_owned()),
+    }
+}
+
 fn send_scheduled_midi_event(
     plugin: &mut Plugin,
     event: MidiEvent,
     sample_offset: i32,
     project_pitch_offset_cents: i16,
     fine_pitch_offset_cents: i16,
-    note_expression: ScheduledVst3NoteExpression,
+    note: ScheduledVst3Note,
 ) -> Result<(), String> {
     let pitch_offset_cents =
         combined_pitch_offset_cents(project_pitch_offset_cents, fine_pitch_offset_cents);
-    if note_expression.supports_note_pan {
-        let plugin_event = plugin_event_with_pitch_offset_and_note_id(
+    if note.supports_pan {
+        let mut plugin_event = plugin_event_with_pitch_offset_and_note_id(
             event,
             sample_offset,
             pitch_offset_cents,
-            note_expression.note_id,
+            note.note_id,
         )?;
         let is_note_on = matches!(event, MidiEvent::NoteOn { .. });
+        if matches!(event, MidiEvent::NoteOff { .. }) {
+            set_vst3_note_off_release_velocity(&mut plugin_event, note.note_release)?;
+        }
         plugin
             .send_plugin_event(plugin_event)
             .map_err(|error| error.to_string())?;
         if is_note_on {
             plugin
                 .send_note_expression_at(
-                    NoteId::from_raw(note_expression.note_id),
+                    NoteId::from_raw(note.note_id),
                     NoteExpressionType::Pan,
-                    vst3_note_pan_value(note_expression.note_pan),
+                    vst3_note_pan_value(note.note_pan),
                     sample_offset,
                 )
                 .map_err(|error| error.to_string())?;
         }
         return Ok(());
+    }
+    if matches!(event, MidiEvent::NoteOff { .. }) {
+        let mut plugin_event =
+            plugin_event_with_pitch_offset(event, sample_offset, pitch_offset_cents)?;
+        set_vst3_note_off_release_velocity(&mut plugin_event, note.note_release)?;
+        return plugin
+            .send_plugin_event(plugin_event)
+            .map_err(|error| error.to_string());
     }
     if pitch_offset_cents == 0 {
         plugin
@@ -2545,6 +2582,7 @@ fn scheduled_pattern_events(
             fine_pitch_offset_cents: note.fine_pitch_offset_cents(),
             note_id,
             note_pan: note.pan,
+            note_release: note.release,
         });
         events.push(ScheduledMidiEvent {
             frame: end_frame as u64,
@@ -2557,6 +2595,7 @@ fn scheduled_pattern_events(
             fine_pitch_offset_cents: note.fine_pitch_offset_cents(),
             note_id,
             note_pan: note.pan,
+            note_release: note.release,
         });
         note_count += 1;
     }
@@ -3172,11 +3211,37 @@ mod tests {
     }
 
     #[test]
+    fn pattern_scheduler_carries_note_release_to_note_off() {
+        let note = PatternNote {
+            position: 0,
+            length: 120,
+            channel_id: 7,
+            key: 64,
+            release: 110,
+            ..PatternNote::default()
+        };
+        let (events, _) =
+            scheduled_pattern_events(&[note], 7, 480, 120.0, 48_000.0, 0, 128).unwrap();
+
+        assert_eq!(events[0].note_release, 110);
+        assert_eq!(events[1].note_release, 110);
+        assert!(matches!(events[1].event, MidiEvent::NoteOff { .. }));
+    }
+
+    #[test]
     fn vst3_note_pan_maps_fl_values_to_normalized_expression_values() {
         assert_eq!(vst3_note_pan_value(0), 0.0);
         assert_eq!(vst3_note_pan_value(64), 0.5);
         assert_eq!(vst3_note_pan_value(128), 1.0);
         assert_eq!(vst3_note_pan_value(255), 1.0);
+    }
+
+    #[test]
+    fn vst3_note_release_maps_fl_values_to_normalized_velocity() {
+        assert_eq!(vst3_note_release_value(0), 0.0);
+        assert_eq!(vst3_note_release_value(64), 0.5);
+        assert_eq!(vst3_note_release_value(128), 1.0);
+        assert_eq!(vst3_note_release_value(255), 1.0);
     }
 
     #[test]
@@ -3295,6 +3360,30 @@ mod tests {
     }
 
     #[test]
+    fn note_off_event_uses_fl_release_velocity() {
+        let mut note_off = plugin_event_with_pitch_offset(
+            MidiEvent::NoteOff {
+                channel: MidiChannel::Ch1,
+                note: 64,
+                velocity: 0,
+            },
+            29,
+            0,
+        )
+        .unwrap();
+        set_vst3_note_off_release_velocity(&mut note_off, 96).unwrap();
+
+        assert!(matches!(
+            note_off.data,
+            PluginEventData::NoteOff {
+                velocity,
+                tuning,
+                ..
+            } if velocity == 0.75 && tuning == 0.0
+        ));
+    }
+
+    #[test]
     fn pattern_scheduler_applies_channel_rack_swing_to_note_on_and_off() {
         let note = PatternNote {
             position: 120,
@@ -3350,6 +3439,7 @@ mod tests {
                 midi_channel: 0,
                 fine_pitch_offset_cents: 0,
                 pan: 0,
+                release: 89,
             },
             PlaylistMidiNote {
                 start_tick: 720,
@@ -3359,6 +3449,7 @@ mod tests {
                 midi_channel: 0,
                 fine_pitch_offset_cents: 0,
                 pan: 128,
+                release: 21,
             },
         ];
 
@@ -3389,8 +3480,10 @@ mod tests {
         ));
         assert_eq!(events[0].note_pan, 0);
         assert_eq!(events[0].note_id, events[1].note_id);
+        assert_eq!(events[1].note_release, 89);
         assert_eq!(events[2].note_pan, 128);
         assert_eq!(events[2].note_id, events[3].note_id);
+        assert_eq!(events[3].note_release, 21);
     }
 
     #[test]
@@ -3404,6 +3497,7 @@ mod tests {
             midi_channel: 0,
             fine_pitch_offset_cents: 0,
             pan: 64,
+            release: 64,
         };
 
         let (events, note_count) =
@@ -3424,6 +3518,7 @@ mod tests {
             midi_channel: 16,
             fine_pitch_offset_cents: 0,
             pan: 64,
+            release: 64,
         };
         assert!(
             scheduled_playlist_midi_events(&[note], 480, 120.0, 48_000.0)
