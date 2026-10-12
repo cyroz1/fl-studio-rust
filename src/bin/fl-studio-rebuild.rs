@@ -5719,6 +5719,25 @@ impl DawUi {
                                     }
                                 });
                         });
+                        ui.horizontal(|ui| {
+                            ui.label("Dither");
+                            egui::ComboBox::from_id_salt("playlist-render-mp3-dither")
+                                .selected_text(self.playlist_render_dither_mode.label())
+                                .show_ui(ui, |ui| {
+                                    for mode in [
+                                        WavDitherMode::Off,
+                                        WavDitherMode::Tpdf,
+                                        WavDitherMode::HighPassTpdf,
+                                    ] {
+                                        ui.selectable_value(
+                                            &mut self.playlist_render_dither_mode,
+                                            mode,
+                                            mode.label(),
+                                        );
+                                    }
+                                });
+                        });
+                        ui.label("Dither is applied during 16-bit quantization before MP3 encoding.");
                         ui.label("MP3 is lossy; supported render rates are 32, 44.1, and 48 kHz.");
                     }
                 }
@@ -6952,6 +6971,25 @@ impl DawUi {
                                                 &mut self.playlist_render_mp3_bitrate_kbps,
                                                 bitrate,
                                                 format!("{bitrate} kbps"),
+                                            );
+                                        }
+                                    },
+                                );
+                                ui.menu_button(
+                                    format!(
+                                        "MP3 dither: {}",
+                                        self.playlist_render_dither_mode.label()
+                                    ),
+                                    |ui| {
+                                        for mode in [
+                                            WavDitherMode::Off,
+                                            WavDitherMode::Tpdf,
+                                            WavDitherMode::HighPassTpdf,
+                                        ] {
+                                            ui.selectable_value(
+                                                &mut self.playlist_render_dither_mode,
+                                                mode,
+                                                mode.label(),
                                             );
                                         }
                                     },

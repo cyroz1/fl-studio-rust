@@ -300,6 +300,7 @@ pub enum AudioRenderOutput {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AudioRenderEncodingOptions {
     pub wav_sample_format: WavSampleFormat,
+    /// Dither for 16-bit WAV PCM and the 16-bit input stage used by MP3 exports.
     pub wav_dither_mode: WavDitherMode,
     pub wav_channel_mode: WavChannelMode,
 }
@@ -447,6 +448,7 @@ impl WavSampleFormat {
     }
 }
 
+/// Dither used before 16-bit WAV or MP3 encoding.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WavDitherMode {
     Off,
@@ -1426,6 +1428,7 @@ fn render_playlist_with_vst3_cancellable(
                 options.sample_rate,
                 options.wav_channel_mode,
                 bitrate_kbps,
+                options.wav_dither_mode,
             )?;
             summary.voices_stolen = stream_prepared_playlist_render(
                 PreparedPlaylistBlockMix {
@@ -1899,7 +1902,9 @@ struct StreamingMp3Writer<'a> {
     file: &'a mut File,
     encoder: Mp3Encoder,
     channel_mode: WavChannelMode,
+    dither_state: Option<WavDitherState>,
     channel_buffers: Vec<Vec<f32>>,
+    interleaved_buffer: Vec<f32>,
     encoded_buffer: Vec<u8>,
 }
 
@@ -1909,6 +1914,7 @@ impl<'a> StreamingMp3Writer<'a> {
         sample_rate: u32,
         channel_mode: WavChannelMode,
         bitrate_kbps: u16,
+        dither_mode: WavDitherMode,
     ) -> Result<Self, String> {
         let channels = channel_mode.channel_count() as u8;
         let bitrate = mp3_bitrate(bitrate_kbps)
@@ -1946,9 +1952,11 @@ impl<'a> StreamingMp3Writer<'a> {
             file,
             encoder,
             channel_mode,
+            dither_state: WavDitherState::new(dither_mode, WavSampleFormat::Pcm16),
             channel_buffers: (0..usize::from(channels))
                 .map(|_| Vec::with_capacity(STREAM_BLOCK_FRAMES))
                 .collect(),
+            interleaved_buffer: Vec::with_capacity(STREAM_BLOCK_FRAMES * 2),
             encoded_buffer: Vec::with_capacity(capacity),
         })
     }
@@ -1963,23 +1971,40 @@ impl StreamingMp3Writer<'_> {
         for channel in &mut self.channel_buffers {
             channel.clear();
         }
-        if self.channel_mode != WavChannelMode::Stereo {
-            for frame in stereo_block.as_chunks::<2>().0 {
-                let sample = match self.channel_mode {
-                    WavChannelMode::Stereo => unreachable!(),
-                    WavChannelMode::MonoMerged => frame[0] * 0.5 + frame[1] * 0.5,
-                    WavChannelMode::MonoLeft => frame[0],
-                    WavChannelMode::MonoRight => frame[1],
-                };
-                self.channel_buffers[0].push(sample);
+        let channel_mode = self.channel_mode;
+        {
+            let dither_state = &mut self.dither_state;
+            let channel_buffers = &mut self.channel_buffers;
+            let interleaved_buffer = &mut self.interleaved_buffer;
+            if channel_mode == WavChannelMode::Stereo && dither_state.is_some() {
+                interleaved_buffer.clear();
+                for frame in stereo_block.as_chunks::<2>().0 {
+                    interleaved_buffer.push(quantize_mp3_input_sample(frame[0], dither_state, 0));
+                    interleaved_buffer.push(quantize_mp3_input_sample(frame[1], dither_state, 1));
+                }
+            } else if channel_mode != WavChannelMode::Stereo {
+                for frame in stereo_block.as_chunks::<2>().0 {
+                    let sample = match channel_mode {
+                        WavChannelMode::Stereo => unreachable!(),
+                        WavChannelMode::MonoMerged => frame[0] * 0.5 + frame[1] * 0.5,
+                        WavChannelMode::MonoLeft => frame[0],
+                        WavChannelMode::MonoRight => frame[1],
+                    };
+                    channel_buffers[0].push(quantize_mp3_input_sample(sample, dither_state, 0));
+                }
             }
         }
         self.encoded_buffer.clear();
         self.encoded_buffer
             .reserve(mp3lame_encoder::max_required_buffer_size(frame_count));
         let result = if self.channel_mode == WavChannelMode::Stereo {
+            let input = if self.dither_state.is_some() {
+                self.interleaved_buffer.as_slice()
+            } else {
+                stereo_block
+            };
             self.encoder
-                .encode_to_vec(InterleavedPcm(stereo_block), &mut self.encoded_buffer)
+                .encode_to_vec(InterleavedPcm(input), &mut self.encoded_buffer)
         } else {
             self.encoder
                 .encode_to_vec(MonoPcm(&self.channel_buffers[0]), &mut self.encoded_buffer)
@@ -2332,6 +2357,7 @@ impl<'a> AudioFileStreamEncoder<'a> {
                     sample_rate,
                     options.wav_channel_mode,
                     bitrate_kbps,
+                    options.wav_dither_mode,
                 )?))
             }
         }
@@ -2434,8 +2460,7 @@ fn append_wav_sample_with_dither(
     match format {
         WavSampleFormat::Float32 => output.extend_from_slice(&sample.to_le_bytes()),
         WavSampleFormat::Pcm16 => {
-            let dithered_sample = sample + (dither_noise_lsb / 32_768.0) as f32;
-            let quantized = quantize_signed_pcm(dithered_sample, 32_768.0, 32_767.0) as i16;
+            let quantized = quantize_pcm16_sample(sample, dither_noise_lsb);
             output.extend_from_slice(&quantized.to_le_bytes());
         }
         WavSampleFormat::Pcm24 => {
@@ -2531,6 +2556,23 @@ impl WavDitherState {
             Self::HighPassTpdf(dither) => dither.next_lsb_noise(output_channel),
         }
     }
+}
+
+fn quantize_mp3_input_sample(
+    sample: f32,
+    dither_state: &mut Option<WavDitherState>,
+    output_channel: usize,
+) -> f32 {
+    let Some(dither_state) = dither_state.as_mut() else {
+        return sample;
+    };
+    let noise = dither_state.next_lsb_noise(output_channel);
+    f32::from(quantize_pcm16_sample(sample, noise)) / 32_768.0
+}
+
+fn quantize_pcm16_sample(sample: f32, dither_noise_lsb: f64) -> i16 {
+    let dithered_sample = sample + (dither_noise_lsb / 32_768.0) as f32;
+    quantize_signed_pcm(dithered_sample, 32_768.0, 32_767.0) as i16
 }
 
 const HIGH_PASS_DITHER_POLE: f64 = 0.95;
@@ -7606,41 +7648,50 @@ mod tests {
         ));
         fs::create_dir_all(&root).unwrap();
 
-        for (index, (channel_mode, expected_channels)) in [
+        let dither_modes = [
+            WavDitherMode::Off,
+            WavDitherMode::Tpdf,
+            WavDitherMode::HighPassTpdf,
+        ];
+        let channel_modes = [
             (WavChannelMode::Stereo, 2),
             (WavChannelMode::MonoMerged, 1),
             (WavChannelMode::MonoLeft, 1),
             (WavChannelMode::MonoRight, 1),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let output = root.join(format!("stream-{index}.mp3"));
-            let mut file = File::create(&output).unwrap();
-            let mut writer = StreamingMp3Writer::new(&mut file, 48_000, channel_mode, 192).unwrap();
-            for block_index in 0..48 {
-                let mut stereo_block = Vec::with_capacity(STREAM_BLOCK_FRAMES * 2);
-                for frame_index in 0..STREAM_BLOCK_FRAMES {
-                    let sample_index = block_index * STREAM_BLOCK_FRAMES + frame_index;
-                    let phase = std::f32::consts::TAU * sample_index as f32 / 96.0;
-                    stereo_block.extend_from_slice(&[phase.sin() * 0.25, phase.cos() * 0.25]);
+        ];
+        for (dither_index, dither_mode) in dither_modes.into_iter().enumerate() {
+            for (channel_index, (channel_mode, expected_channels)) in
+                channel_modes.into_iter().enumerate()
+            {
+                let output = root.join(format!("stream-{dither_index}-{channel_index}.mp3"));
+                let mut file = File::create(&output).unwrap();
+                let mut writer =
+                    StreamingMp3Writer::new(&mut file, 48_000, channel_mode, 192, dither_mode)
+                        .unwrap();
+                for block_index in 0..48 {
+                    let mut stereo_block = Vec::with_capacity(STREAM_BLOCK_FRAMES * 2);
+                    for frame_index in 0..STREAM_BLOCK_FRAMES {
+                        let sample_index = block_index * STREAM_BLOCK_FRAMES + frame_index;
+                        let phase = std::f32::consts::TAU * sample_index as f32 / 96.0;
+                        stereo_block.extend_from_slice(&[phase.sin() * 0.25, phase.cos() * 0.25]);
+                    }
+                    writer.write_stereo_block(&stereo_block).unwrap();
                 }
-                writer.write_stereo_block(&stereo_block).unwrap();
-            }
-            writer.finalize().unwrap();
-            drop(file);
+                writer.finalize().unwrap();
+                drop(file);
 
-            let decoded = decode_audio_file(&output).unwrap();
-            assert_eq!(decoded.sample_rate, 48_000);
-            assert_eq!(decoded.channels.len(), expected_channels);
-            assert!(!decoded.channels[0].is_empty());
-            assert!(
-                decoded
-                    .channels
-                    .iter()
-                    .flatten()
-                    .any(|sample| sample.abs() > 0.01)
-            );
+                let decoded = decode_audio_file(&output).unwrap();
+                assert_eq!(decoded.sample_rate, 48_000);
+                assert_eq!(decoded.channels.len(), expected_channels);
+                assert!(!decoded.channels[0].is_empty());
+                assert!(
+                    decoded
+                        .channels
+                        .iter()
+                        .flatten()
+                        .any(|sample| sample.abs() > 0.01)
+                );
+            }
         }
 
         fs::remove_dir_all(root).unwrap();
@@ -7843,6 +7894,29 @@ mod tests {
                 "channel {channel} did not show the expected high-pass noise shape: {adjacent_correlation}"
             );
         }
+    }
+
+    #[test]
+    fn mp3_dither_applies_a_sixteen_bit_stage_only_when_enabled() {
+        let mut disabled = None;
+        assert_eq!(
+            quantize_mp3_input_sample(0.123_456, &mut disabled, 0),
+            0.123_456
+        );
+
+        let mut enabled =
+            WavDitherState::from_seed(WavDitherMode::HighPassTpdf, 0x1234_5678_9ABC_DEF0);
+        let mut nonzero_dithered_samples = 0;
+        for _ in 0..512 {
+            let sample = quantize_mp3_input_sample(0.0, &mut enabled, 0);
+            let quantized_level = sample * 32_768.0;
+            assert_eq!(quantized_level.round(), quantized_level);
+            assert!(quantized_level.abs() <= 2.0);
+            if sample != 0.0 {
+                nonzero_dithered_samples += 1;
+            }
+        }
+        assert!(nonzero_dithered_samples > 0);
     }
 
     #[test]
