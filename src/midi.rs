@@ -38,9 +38,33 @@ pub struct MidiNote {
     key: u8,
     velocity: u8,
     pan: u8,
+    pitch_bend_offset_cents: i16,
     start_tick: u64,
     end_tick: Option<u64>,
     release_velocity: Option<u8>,
+}
+
+#[derive(Clone, Copy)]
+struct MidiChannelNoteState {
+    pan: u8,
+    pitch_bend_value: u16,
+    pitch_bend_sensitivity_semitones: u8,
+    pitch_bend_sensitivity_cents: u8,
+    rpn_msb: u8,
+    rpn_lsb: u8,
+}
+
+impl Default for MidiChannelNoteState {
+    fn default() -> Self {
+        Self {
+            pan: 64,
+            pitch_bend_value: 8192,
+            pitch_bend_sensitivity_semitones: 2,
+            pitch_bend_sensitivity_cents: 0,
+            rpn_msb: 127,
+            rpn_lsb: 127,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1144,12 +1168,13 @@ impl MidiTrack {
 
     /// Pairs note-on and note-off messages in channel/key order. Notes without an
     /// ending message remain present with `end_tick == None`. The current MIDI
-    /// CC 10 pan value is snapshotted when each note starts; a track without CC 10
-    /// uses the MIDI center value 64.
+    /// CC 10 pan and pitch bend are snapshotted when each note starts. A track
+    /// without CC 10 uses the MIDI center value 64; a track without RPN 0 pitch
+    /// sensitivity assumes a two-semitone range.
     pub fn notes(&self) -> Vec<MidiNote> {
         let mut notes = Vec::new();
         let mut active: BTreeMap<(u8, u8), VecDeque<usize>> = BTreeMap::new();
-        let mut channel_pan = BTreeMap::<u8, u8>::new();
+        let mut channel_state = BTreeMap::<u8, MidiChannelNoteState>::new();
 
         for event in &self.events {
             let MidiEventKind::ChannelVoice { status, data } = &event.kind else {
@@ -1162,16 +1187,38 @@ impl MidiTrack {
             let channel = status & 0x0F;
             let key = data[0];
             match status & 0xF0 {
-                0xB0 if key == 10 => {
-                    channel_pan.insert(channel, data[1]);
+                0xB0 => {
+                    let state = channel_state.entry(channel).or_default();
+                    match key {
+                        10 => state.pan = data[1],
+                        101 => state.rpn_msb = data[1],
+                        100 => state.rpn_lsb = data[1],
+                        6 if (state.rpn_msb, state.rpn_lsb) == (0, 0) => {
+                            state.pitch_bend_sensitivity_semitones = data[1];
+                        }
+                        38 if (state.rpn_msb, state.rpn_lsb) == (0, 0) => {
+                            state.pitch_bend_sensitivity_cents = data[1];
+                        }
+                        _ => {}
+                    }
+                }
+                0xE0 => {
+                    let state = channel_state.entry(channel).or_default();
+                    state.pitch_bend_value = u16::from(data[0]) | (u16::from(data[1]) << 7);
                 }
                 0x90 if data[1] != 0 => {
+                    let state = channel_state.get(&channel).copied().unwrap_or_default();
                     let note_index = notes.len();
                     notes.push(MidiNote {
                         channel,
                         key,
                         velocity: data[1],
-                        pan: channel_pan.get(&channel).copied().unwrap_or(64),
+                        pan: state.pan,
+                        pitch_bend_offset_cents: midi_pitch_bend_offset_cents(
+                            state.pitch_bend_value,
+                            state.pitch_bend_sensitivity_semitones,
+                            state.pitch_bend_sensitivity_cents,
+                        ),
                         start_tick: event.absolute_tick,
                         end_tick: None,
                         release_velocity: None,
@@ -1220,6 +1267,11 @@ impl MidiNote {
         self.pan
     }
 
+    /// Pitch bend offset in cents active when the note started.
+    pub fn pitch_bend_offset_cents(&self) -> i16 {
+        self.pitch_bend_offset_cents
+    }
+
     pub fn start_tick(&self) -> u64 {
         self.start_tick
     }
@@ -1262,6 +1314,29 @@ pub fn midi_pan_to_fl_note_pan(pan: u8) -> u8 {
     } else {
         ((pan * 128 + 63) / 127) as u8
     }
+}
+
+fn midi_pitch_bend_offset_cents(value: u16, semitones: u8, cents: u8) -> i16 {
+    let bend = i32::from(value.min(0x3FFF)) - 8192;
+    if bend == 0 {
+        return 0;
+    }
+    let range_cents = i64::from(semitones) * 100 + i64::from(cents);
+    let scale = if bend < 0 { 8192 } else { 8191 };
+    let magnitude = (i64::from(bend.abs()) * range_cents + i64::from(scale) / 2) / i64::from(scale);
+    let offset = if bend < 0 { -magnitude } else { magnitude };
+    offset.clamp(-1200, 1200) as i16
+}
+
+/// Maps a MIDI pitch-bend offset in cents to FL Studio's 10-cent note-fine-pitch steps.
+pub fn midi_pitch_bend_cents_to_fl_note_fine_pitch(cents: i16) -> u8 {
+    let cents = i32::from(cents).clamp(-1200, 1200);
+    let steps = if cents < 0 {
+        -((-cents + 5) / 10)
+    } else {
+        (cents + 5) / 10
+    };
+    (120 + steps) as u8
 }
 
 impl MidiTempoEvent {
@@ -1926,6 +2001,7 @@ mod tests {
         assert_eq!(notes[0].key(), 60);
         assert_eq!(notes[0].velocity(), 100);
         assert_eq!(notes[0].pan(), 64);
+        assert_eq!(notes[0].pitch_bend_offset_cents(), 0);
         assert_eq!(notes[0].start_tick(), 0);
         assert_eq!(notes[0].end_tick(), Some(240));
         assert_eq!(notes[0].duration_ticks(), Some(240));
@@ -1953,6 +2029,23 @@ mod tests {
         assert_eq!(super::midi_pan_to_fl_note_pan(126), 127);
         assert_eq!(super::midi_pan_to_fl_note_pan(127), 128);
         assert_eq!(super::midi_pan_to_fl_note_pan(255), 128);
+    }
+
+    #[test]
+    fn midi_pitch_bend_cents_map_to_fl_fine_pitch_steps() {
+        assert_eq!(super::midi_pitch_bend_cents_to_fl_note_fine_pitch(-1200), 0);
+        assert_eq!(super::midi_pitch_bend_cents_to_fl_note_fine_pitch(-5), 119);
+        assert_eq!(super::midi_pitch_bend_cents_to_fl_note_fine_pitch(0), 120);
+        assert_eq!(super::midi_pitch_bend_cents_to_fl_note_fine_pitch(5), 121);
+        assert_eq!(super::midi_pitch_bend_cents_to_fl_note_fine_pitch(600), 180);
+        assert_eq!(
+            super::midi_pitch_bend_cents_to_fl_note_fine_pitch(1200),
+            240
+        );
+        assert_eq!(
+            super::midi_pitch_bend_cents_to_fl_note_fine_pitch(2000),
+            240
+        );
     }
 
     #[test]
