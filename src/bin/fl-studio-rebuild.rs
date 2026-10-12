@@ -966,6 +966,74 @@ fn piano_roll_mouse_wheel_step_delta(scroll_delta_y: f32, fine: bool, remainder:
         .saturating_mul(if fine { 1 } else { 4 })
 }
 
+#[derive(Clone, Copy)]
+struct TouchGesture {
+    center: egui::Pos2,
+    translation: Vec2,
+    zoom_factor: f32,
+}
+
+#[derive(Clone, Copy)]
+struct TouchZoomConfig {
+    origin_x: f32,
+    current: f32,
+    min: f32,
+    max: f32,
+    allowed: bool,
+}
+
+fn touch_pan_zoom_scroll_offset(
+    viewport: egui::Rect,
+    current_offset: Vec2,
+    gesture: TouchGesture,
+    zoom_config: TouchZoomConfig,
+) -> Option<(f32, Vec2)> {
+    if !viewport.contains(gesture.center)
+        || !zoom_config.current.is_finite()
+        || zoom_config.current <= 0.0
+        || !zoom_config.origin_x.is_finite()
+    {
+        return None;
+    }
+
+    let zoom_factor = if gesture.zoom_factor.is_finite() && gesture.zoom_factor > 0.0 {
+        gesture.zoom_factor.clamp(0.5, 2.0)
+    } else {
+        1.0
+    };
+    let new_zoom = if zoom_config.allowed {
+        (zoom_config.current * zoom_factor).clamp(zoom_config.min, zoom_config.max)
+    } else {
+        zoom_config.current
+    };
+    let viewport_x = gesture.center.x - viewport.left();
+    let translation_x = if gesture.translation.x.is_finite() {
+        gesture.translation.x
+    } else {
+        0.0
+    };
+    let previous_viewport_x = viewport_x - translation_x;
+    let content_x = zoom_config.origin_x
+        + (current_offset.x + previous_viewport_x - zoom_config.origin_x)
+            * (new_zoom / zoom_config.current);
+    let translation_y = if gesture.translation.y.is_finite() {
+        gesture.translation.y
+    } else {
+        0.0
+    };
+    let new_offset = Vec2::new(
+        (content_x - viewport_x).max(0.0),
+        (current_offset.y - translation_y).max(0.0),
+    );
+    if (new_zoom - zoom_config.current).abs() <= f32::EPSILON
+        && (new_offset - current_offset).length_sq() <= 0.01
+    {
+        None
+    } else {
+        Some((new_zoom, new_offset))
+    }
+}
+
 fn piano_roll_event_target_selector(ui: &mut egui::Ui, target: &mut PianoRollEventTarget) {
     egui::ComboBox::from_id_salt("piano-roll-event-target")
         .selected_text(format!("Target: {}", target.label()))
@@ -2269,6 +2337,7 @@ struct DawUi {
     piano_roll_chord_stamp: PianoRollChordStamp,
     last_piano_roll_audition: Option<(u16, u16, usize)>,
     piano_roll_zoom: f32,
+    piano_roll_touch_gesture_active: bool,
     piano_roll_window_detached: bool,
     mixer_window_detached: bool,
     channel_rack_window_detached: bool,
@@ -2283,6 +2352,10 @@ struct DawUi {
     piano_roll_pending_scroll_offset: Option<Vec2>,
     piano_roll_grid_viewport: Option<egui::Rect>,
     piano_roll_grid_scroll_offset: Vec2,
+    playlist_touch_gesture_active: bool,
+    playlist_pending_scroll_offset: Option<Vec2>,
+    playlist_grid_viewport: Option<egui::Rect>,
+    playlist_grid_scroll_offset: Vec2,
     step_sequencer_bar: u32,
     selected_graph_channel: Option<u16>,
     selected_rack_channels: BTreeSet<u16>,
@@ -2812,6 +2885,7 @@ impl DawUi {
             piano_roll_chord_stamp: PianoRollChordStamp::Major,
             last_piano_roll_audition: None,
             piano_roll_zoom: 0.10,
+            piano_roll_touch_gesture_active: false,
             piano_roll_window_detached: false,
             mixer_window_detached: false,
             channel_rack_window_detached: false,
@@ -2826,6 +2900,10 @@ impl DawUi {
             piano_roll_pending_scroll_offset: None,
             piano_roll_grid_viewport: None,
             piano_roll_grid_scroll_offset: Vec2::ZERO,
+            playlist_touch_gesture_active: false,
+            playlist_pending_scroll_offset: None,
+            playlist_grid_viewport: None,
+            playlist_grid_scroll_offset: Vec2::ZERO,
             step_sequencer_bar: 0,
             selected_graph_channel: None,
             selected_rack_channels: BTreeSet::new(),
@@ -10219,6 +10297,42 @@ impl DawUi {
             .or_else(|| arrangement.clips.first())
             .and_then(|clip| clip.track_index)
             .unwrap_or(0);
+        let label_width = 178.0;
+        let touch_gesture = ui.input(|input| input.multi_touch());
+        let any_touches = ui.input(|input| input.any_touches());
+        if let (Some(viewport), Some(touch)) = (self.playlist_grid_viewport, touch_gesture)
+            && touch.start_pos.x >= viewport.left() + label_width
+            && touch.start_pos.y >= viewport.top() + 34.0
+            && touch.center_pos.x >= viewport.left() + label_width
+            && touch.center_pos.y >= viewport.top() + 34.0
+        {
+            self.playlist_touch_gesture_active = true;
+            self.active_playlist_clip_drag = None;
+            if let Some((zoom, offset)) = touch_pan_zoom_scroll_offset(
+                viewport,
+                self.playlist_grid_scroll_offset,
+                TouchGesture {
+                    center: touch.center_pos,
+                    translation: touch.translation_delta,
+                    zoom_factor: touch.zoom_delta,
+                },
+                TouchZoomConfig {
+                    origin_x: label_width,
+                    current: self.timeline_zoom,
+                    min: 0.04,
+                    max: 0.24,
+                    allowed: true,
+                },
+            ) {
+                self.timeline_zoom = zoom;
+                self.playlist_pending_scroll_offset = Some(offset);
+            }
+        }
+        let suppress_playlist_touch_edits = self.playlist_touch_gesture_active;
+        if !any_touches {
+            self.playlist_touch_gesture_active = false;
+        }
+
         let grid_width = ((max_tick as f32 * self.timeline_zoom) + 240.0).clamp(1800.0, 50000.0);
         let last_track = arrangement
             .clips
@@ -10235,7 +10349,6 @@ impl DawUi {
             .max()
             .unwrap_or(15)
             .max(15);
-        let label_width = 178.0;
         let row_height = 27.0;
         let tick_scale = self.timeline_zoom;
         let playhead_tick = self.current_playhead_tick();
@@ -10249,9 +10362,12 @@ impl DawUi {
             measure_tick_limit,
         );
 
-        egui::ScrollArea::both()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
+        let pending_touch_scroll_offset = self.playlist_pending_scroll_offset.take();
+        let mut scroll_area = egui::ScrollArea::both().auto_shrink([false, false]);
+        if let Some(offset) = pending_touch_scroll_offset {
+            scroll_area = scroll_area.scroll_offset(offset);
+        }
+        let scroll_output = scroll_area.show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let (label_rect, _) =
                         ui.allocate_exact_size(Vec2::new(label_width, 34.0), Sense::hover());
@@ -10745,7 +10861,11 @@ impl DawUi {
                             let response = ui.interact(
                                 clip_rect,
                                 Id::new(("playlist-clip", arrangement.id, clip_index)),
-                                Sense::click_and_drag(),
+                                if suppress_playlist_touch_edits {
+                                    Sense::hover()
+                                } else {
+                                    Sense::click_and_drag()
+                                },
                             );
                             let response = if let flp_rebuild::PlaylistClipTarget::Channel { id } =
                                 clip.target()
@@ -11401,7 +11521,9 @@ impl DawUi {
                         }
                     });
                 }
-            });
+        });
+        self.playlist_grid_viewport = Some(scroll_output.inner_rect);
+        self.playlist_grid_scroll_offset = scroll_output.state.offset;
 
         if let Some((path, arrangement_id, position_ticks, track_index)) = dropped_playlist_audio {
             self.queue_playlist_audio_drop(
@@ -20273,6 +20395,44 @@ impl DawUi {
         }) {
             self.piano_roll_pitch_selection_drag = None;
         }
+        let touch_gesture = ui.input(|input| input.multi_touch());
+        let any_touches = ui.input(|input| input.any_touches());
+        if let (Some(viewport), Some(touch)) = (self.piano_roll_grid_viewport, touch_gesture)
+            && touch.start_pos.x >= viewport.left() + 68.0
+            && touch.start_pos.y >= viewport.top() + PIANO_ROLL_RULER_HEIGHT
+            && touch.center_pos.x >= viewport.left() + 68.0
+            && touch.center_pos.y >= viewport.top() + PIANO_ROLL_RULER_HEIGHT
+        {
+            self.piano_roll_touch_gesture_active = true;
+            self.active_note_drag = None;
+            self.piano_roll_selection_drag = None;
+            self.piano_roll_time_selection_drag = None;
+            self.piano_roll_controller_stroke = None;
+            self.piano_roll_zoom_drag = None;
+            if let Some((zoom, offset)) = touch_pan_zoom_scroll_offset(
+                viewport,
+                self.piano_roll_grid_scroll_offset,
+                TouchGesture {
+                    center: touch.center_pos,
+                    translation: touch.translation_delta,
+                    zoom_factor: touch.zoom_delta,
+                },
+                TouchZoomConfig {
+                    origin_x: 68.0,
+                    current: self.piano_roll_zoom,
+                    min: 0.06,
+                    max: 0.24,
+                    allowed: true,
+                },
+            ) {
+                self.piano_roll_zoom = zoom;
+                self.piano_roll_pending_scroll_offset = Some(offset);
+            }
+        }
+        let suppress_piano_roll_touch_edits = self.piano_roll_touch_gesture_active;
+        if !any_touches {
+            self.piano_roll_touch_gesture_active = false;
+        }
         if let (Some(viewport), Some(pointer)) = (
             self.piano_roll_grid_viewport,
             ui.input(|input| input.pointer.hover_pos()),
@@ -20396,7 +20556,14 @@ impl DawUi {
                 keyboard_width + grid_width,
                 PIANO_ROLL_RULER_HEIGHT + grid_height,
             );
-            let (rect, grid_response) = ui.allocate_exact_size(size, Sense::click_and_drag());
+            let (rect, grid_response) = ui.allocate_exact_size(
+                size,
+                if suppress_piano_roll_touch_edits {
+                    Sense::hover()
+                } else {
+                    Sense::click_and_drag()
+                },
+            );
             let ruler_rect = egui::Rect::from_min_max(
                 rect.min,
                 egui::pos2(rect.right(), rect.top() + PIANO_ROLL_RULER_HEIGHT),
@@ -20421,7 +20588,11 @@ impl DawUi {
                 .interact(
                     ruler_rect,
                     Id::new(("piano-roll-time-ruler", pattern.id)),
-                    Sense::click_and_drag(),
+                    if suppress_piano_roll_touch_edits {
+                        Sense::hover()
+                    } else {
+                        Sense::click_and_drag()
+                    },
                 )
                 .on_hover_text(
                     "Ctrl/Cmd-drag to select notes by time range · Shift adds to selection",
@@ -20434,7 +20605,11 @@ impl DawUi {
                 .interact(
                     keyboard_area_rect,
                     Id::new(("piano-roll-pitch-keyboard", pattern.id)),
-                    Sense::click_and_drag(),
+                    if suppress_piano_roll_touch_edits {
+                        Sense::hover()
+                    } else {
+                        Sense::click_and_drag()
+                    },
                 )
                 .on_hover_text(
                     "Ctrl/Cmd-click or drag vertically to select pitches · Shift adds to selection",
@@ -20784,6 +20959,7 @@ impl DawUi {
                     Id::new(("piano-note", pattern.id, note.channel_id, *channel_index)),
                     if self.piano_roll_zoom_mode
                         || (ghost && !self.piano_roll_editable_ghost_channels)
+                        || suppress_piano_roll_touch_edits
                     {
                         Sense::hover()
                     } else {
@@ -30510,13 +30686,13 @@ mod tests {
         DetachedWindowPlacement, DetachedWindowPlacements, DetectedPianoRollScale, FlpDocument,
         MainView, Pattern, PatternController, PatternNote, PianoRollChordStamp, PianoRollGrid,
         PianoRollScale, PianoRollSnap, PlaylistClip, PlaylistClipDragKind, PlaylistTempoMap,
-        PlaylistTrack, PluginCandidate, PluginFormat, TimeSelectionShift,
-        WINDOW_LAYOUT_PRESETS_HEADER, WindowLayoutPreset, audio_recording_start_tick_with_offset,
-        candidate_matches_vst_identity, candidate_mixer_controls,
-        candidate_mixer_stereo_separation, detect_chord_name, detect_piano_roll_channel_scale,
-        detect_piano_roll_scale, encode_midi_device_selections, first_available_playlist_track,
-        next_piano_roll_note_group, note_from_grid_position, parse_midi_device_selections,
-        parse_window_layout_presets, piano_roll_color_group_note_ids,
+        PlaylistTrack, PluginCandidate, PluginFormat, TimeSelectionShift, TouchGesture,
+        TouchZoomConfig, WINDOW_LAYOUT_PRESETS_HEADER, WindowLayoutPreset,
+        audio_recording_start_tick_with_offset, candidate_matches_vst_identity,
+        candidate_mixer_controls, candidate_mixer_stereo_separation, detect_chord_name,
+        detect_piano_roll_channel_scale, detect_piano_roll_scale, encode_midi_device_selections,
+        first_available_playlist_track, next_piano_roll_note_group, note_from_grid_position,
+        parse_midi_device_selections, parse_window_layout_presets, piano_roll_color_group_note_ids,
         piano_roll_controller_stroke_points, piano_roll_controller_value_at,
         piano_roll_controller_value_range, piano_roll_discard_length_edit,
         piano_roll_duplicate_offset, piano_roll_key_at_y, piano_roll_note_group_members,
@@ -30532,8 +30708,9 @@ mod tests {
         playlist_pattern_recording_placement_tick, playlist_seek_tick_to_frame,
         playlist_signature_at_tick, playlist_song_position_label, playlist_track_group_range,
         playlist_track_is_hidden, recolor_piano_roll_notes, serialize_window_layout_presets,
-        snap_note_tick, toggle_piano_roll_note_group_selection, update_channel_rack_selection,
-        update_layer_child_selection, update_piano_roll_box_selection,
+        snap_note_tick, toggle_piano_roll_note_group_selection, touch_pan_zoom_scroll_offset,
+        update_channel_rack_selection, update_layer_child_selection,
+        update_piano_roll_box_selection,
     };
 
     fn playlist_track_arrangement_fixture(clips: &[(u32, u32, u16)]) -> Arrangement {
@@ -32128,5 +32305,90 @@ mod tests {
             "4e6f2076696577"
         );
         assert!(parse_window_layout_presets(&contents).is_empty());
+    }
+
+    #[test]
+    fn touch_pinch_zoom_keeps_the_timeline_point_under_fingers() {
+        let viewport = eframe::egui::Rect::from_min_size(
+            eframe::egui::pos2(100.0, 50.0),
+            eframe::egui::vec2(400.0, 300.0),
+        );
+        let (zoom, offset) = touch_pan_zoom_scroll_offset(
+            viewport,
+            eframe::egui::vec2(200.0, 30.0),
+            TouchGesture {
+                center: eframe::egui::pos2(300.0, 150.0),
+                translation: eframe::egui::Vec2::ZERO,
+                zoom_factor: 1.5,
+            },
+            TouchZoomConfig {
+                origin_x: 68.0,
+                current: 0.10,
+                min: 0.04,
+                max: 0.24,
+                allowed: true,
+            },
+        )
+        .expect("pinch should update the view");
+
+        assert!((zoom - 0.15).abs() < f32::EPSILON);
+        assert!((offset.x - 366.0).abs() < 0.01);
+        assert_eq!(offset.y, 30.0);
+    }
+
+    #[test]
+    fn touch_pan_moves_the_view_and_clamps_at_the_origin() {
+        let viewport = eframe::egui::Rect::from_min_size(
+            eframe::egui::pos2(100.0, 50.0),
+            eframe::egui::vec2(400.0, 300.0),
+        );
+        let (zoom, offset) = touch_pan_zoom_scroll_offset(
+            viewport,
+            eframe::egui::vec2(12.0, 30.0),
+            TouchGesture {
+                center: eframe::egui::pos2(300.0, 150.0),
+                translation: eframe::egui::vec2(25.0, -12.0),
+                zoom_factor: 1.0,
+            },
+            TouchZoomConfig {
+                origin_x: 178.0,
+                current: 0.10,
+                min: 0.04,
+                max: 0.24,
+                allowed: true,
+            },
+        )
+        .expect("pan should update the view");
+
+        assert_eq!(zoom, 0.10);
+        assert_eq!(offset, eframe::egui::vec2(0.0, 42.0));
+    }
+
+    #[test]
+    fn touch_gestures_outside_the_editor_viewport_are_ignored() {
+        let viewport = eframe::egui::Rect::from_min_size(
+            eframe::egui::pos2(100.0, 50.0),
+            eframe::egui::vec2(400.0, 300.0),
+        );
+
+        assert!(
+            touch_pan_zoom_scroll_offset(
+                viewport,
+                eframe::egui::Vec2::ZERO,
+                TouchGesture {
+                    center: eframe::egui::pos2(50.0, 150.0),
+                    translation: eframe::egui::vec2(10.0, 10.0),
+                    zoom_factor: 1.5,
+                },
+                TouchZoomConfig {
+                    origin_x: 68.0,
+                    current: 0.10,
+                    min: 0.04,
+                    max: 0.24,
+                    allowed: true,
+                },
+            )
+            .is_none()
+        );
     }
 }
