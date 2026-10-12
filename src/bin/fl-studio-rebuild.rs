@@ -27084,7 +27084,7 @@ impl DawUi {
                 save_template = ui.button("Save learned mappings as template").clicked();
             });
         });
-        ui.small("Built-ins: General MIDI Ch. 1 maps CC 7 to output gain and CC 64 to Play/Pause; MIDI Expression Ch. 1 maps CC 11 to output gain; X-TOUCH MINI Preset A maps CC 9 and Preset B maps CC 10 on Ch. 11 to output gain; X-TOUCH COMPACT Preset Layer A Fader 9 maps CC 9 on Ch. 1 to output gain; Akai MIDImix Master Fader maps CC 62 and Fader 1 maps CC 19 on Ch. 1 to output gain. User templates save learned CC assignments for reuse with another input.");
+        ui.small("Built-ins: General MIDI Ch. 1 maps CC 7 to output gain and CC 64 to Play/Pause; MIDI Expression Ch. 1 maps CC 11 to output gain; X-TOUCH MINI Preset A maps CC 9 and Preset B maps CC 10 on Ch. 11 to output gain; X-TOUCH COMPACT Preset Layer A Fader 9 maps CC 9 on Ch. 1 to output gain; Akai MIDImix Master Fader maps CC 62 and Faders 1–8 map their default CCs on Ch. 1 to output gain. User templates save learned CC assignments for reuse with another input.");
         if let Some(index) = apply_template_index {
             self.apply_midi_controller_template(index);
         }
@@ -30065,7 +30065,7 @@ fn load_midi_controller_templates() -> Vec<MidiControllerTemplate> {
 }
 
 fn built_in_midi_controller_templates() -> Vec<MidiControllerTemplate> {
-    vec![
+    let mut templates = vec![
         MidiControllerTemplate {
             name: "General MIDI Ch. 1 (CC 7 + CC 64)".to_owned(),
             output_gain: Some(MidiControllerCcBinding {
@@ -30132,7 +30132,29 @@ fn built_in_midi_controller_templates() -> Vec<MidiControllerTemplate> {
             play_pause: None,
             built_in: true,
         },
-    ]
+    ];
+    templates.extend(
+        [
+            (2, 23),
+            (3, 27),
+            (4, 31),
+            (5, 49),
+            (6, 53),
+            (7, 57),
+            (8, 61),
+        ]
+        .into_iter()
+        .map(|(fader, controller)| MidiControllerTemplate {
+            name: format!("Akai MIDImix Fader {fader} (Ch. 1)"),
+            output_gain: Some(MidiControllerCcBinding {
+                channel: 0,
+                controller,
+            }),
+            play_pause: None,
+            built_in: true,
+        }),
+    );
+    templates
 }
 
 fn save_midi_output_gain_mapping(mapping: Option<&MidiControlChangeMapping>) -> Result<(), String> {
@@ -34068,7 +34090,7 @@ mod tests {
     #[test]
     fn built_in_midi_controller_templates_use_documented_cc_mappings() {
         let templates = built_in_midi_controller_templates();
-        assert_eq!(templates.len(), 7);
+        assert_eq!(templates.len(), 14);
         assert_eq!(templates[0].name, "General MIDI Ch. 1 (CC 7 + CC 64)");
         assert!(templates[0].built_in);
         assert_eq!(
@@ -34148,6 +34170,26 @@ mod tests {
             })
         );
         assert_eq!(templates[6].play_pause, None);
+        for (template, (fader, controller)) in templates[7..].iter().zip([
+            (2, 23),
+            (3, 27),
+            (4, 31),
+            (5, 49),
+            (6, 53),
+            (7, 57),
+            (8, 61),
+        ]) {
+            assert_eq!(template.name, format!("Akai MIDImix Fader {fader} (Ch. 1)"));
+            assert!(template.built_in);
+            assert_eq!(
+                template.output_gain,
+                Some(MidiControllerCcBinding {
+                    channel: 0,
+                    controller,
+                })
+            );
+            assert_eq!(template.play_pause, None);
+        }
         assert!(serialize_midi_controller_templates(&templates).is_empty());
     }
 
