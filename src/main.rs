@@ -1128,6 +1128,7 @@ fn parse_scale_name(value: &str) -> Result<&'static [u8], String> {
         "dorian" => Ok(&[0, 2, 3, 5, 7, 9, 10]),
         "dorian-b2" => Ok(&[0, 1, 3, 5, 7, 9, 10]),
         "dorian-sharp-4" => Ok(&[0, 2, 3, 6, 7, 9, 10]),
+        "dorian-b5" => Ok(&[0, 2, 3, 5, 6, 9, 10]),
         "phrygian" => Ok(&[0, 1, 3, 5, 7, 8, 10]),
         "phrygian-dominant" => Ok(&[0, 1, 4, 5, 7, 8, 10]),
         "lydian" => Ok(&[0, 2, 4, 6, 7, 9, 11]),
@@ -1150,7 +1151,7 @@ fn parse_scale_name(value: &str) -> Result<&'static [u8], String> {
         "half-whole-diminished" => Ok(&[0, 1, 3, 4, 6, 7, 9, 10]),
         "altered" => Ok(&[0, 1, 3, 4, 6, 8, 10]),
         "super-locrian-bb7" => Ok(&[0, 1, 3, 4, 6, 8, 9]),
-        _ => Err("scale name must be major, harmonic-major, ionian-sharp-5, dorian, dorian-b2, dorian-sharp-4, phrygian, phrygian-dominant, lydian, lydian-sharp-2, lydian-augmented, lydian-dominant, mixolydian, mixolydian-b6, natural-minor, locrian, locrian-natural-2, locrian-natural-6, harmonic-minor, melodic-minor, blues, major-pentatonic, minor-pentatonic, whole-tone, whole-half-diminished, half-whole-diminished, altered, or super-locrian-bb7".to_owned()),
+        _ => Err("scale name must be major, harmonic-major, ionian-sharp-5, dorian, dorian-b2, dorian-sharp-4, dorian-b5, phrygian, phrygian-dominant, lydian, lydian-sharp-2, lydian-augmented, lydian-dominant, mixolydian, mixolydian-b6, natural-minor, locrian, locrian-natural-2, locrian-natural-6, harmonic-minor, melodic-minor, blues, major-pentatonic, minor-pentatonic, whole-tone, whole-half-diminished, half-whole-diminished, altered, or super-locrian-bb7".to_owned()),
     }
 }
 
@@ -3848,6 +3849,10 @@ mod tests {
         assert_eq!(
             parse_scale_name("dorian-sharp-4"),
             Ok(&[0, 2, 3, 6, 7, 9, 10][..])
+        );
+        assert_eq!(
+            parse_scale_name("dorian-b5"),
+            Ok(&[0, 2, 3, 5, 6, 9, 10][..])
         );
         assert_eq!(
             parse_scale_name("phrygian"),
