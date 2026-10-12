@@ -3787,6 +3787,7 @@ fn prepare_sampler_arrangement(
             channel_id: placed.target_channel_id,
             key: note.key,
             velocity: note.velocity,
+            pan: note.pan,
             fine_pitch_offset_cents: note.fine_pitch_offset_cents(),
         });
     }
@@ -3851,6 +3852,7 @@ struct ScheduledSamplerNote {
     channel_id: u16,
     key: u16,
     velocity: u8,
+    pan: u8,
     fine_pitch_offset_cents: i16,
 }
 
@@ -4088,6 +4090,7 @@ fn prepare_sampler_pattern(
             channel_id: target_channel_id,
             key: note.key,
             velocity: note.velocity,
+            pan: note.pan,
             fine_pitch_offset_cents: note.fine_pitch_offset_cents(),
         });
     }
@@ -4339,8 +4342,12 @@ impl<'a> SamplerVoiceEngine<'a> {
         } else {
             source_step
         };
-        let (left_gain, right_gain) =
-            channel_pan_gains(source.pan, source.audio.channels.len() == 1, self.pan_law);
+        let effective_pan = sampler_note_pan(source.pan, note.pan);
+        let (left_gain, right_gain) = channel_pan_gains(
+            effective_pan,
+            source.audio.channels.len() == 1,
+            self.pan_law,
+        );
         let velocity_gain = f32::from(note.velocity.min(127)) / 127.0;
         let mixer_transform = self
             .mixer_transforms_by_channel
@@ -4444,6 +4451,12 @@ pub(crate) fn channel_pan_gains(pan: f32, mono: bool, pan_law: PanLaw) -> (f32, 
     } else {
         (1.0 - pan, 1.0)
     }
+}
+
+/// Treats the stored 0–128 note pan as an offset from the channel pan, centered at 64.
+fn sampler_note_pan(channel_pan: f32, note_pan: u8) -> f32 {
+    let note_pan_offset = f32::from(note_pan.min(128)) / 64.0 - 1.0;
+    (channel_pan + note_pan_offset).clamp(-1.0, 1.0)
 }
 
 fn sampler_wav_gain(gain_db: Option<i8>) -> f32 {
@@ -6256,6 +6269,7 @@ mod tests {
                 channel_id: 2,
                 key: SAMPLER_ROOT_KEY,
                 velocity: 127,
+                pan: 64,
                 fine_pitch_offset_cents: 0,
             }],
             sources_by_channel: HashMap::from([(
@@ -6693,6 +6707,16 @@ mod tests {
     }
 
     #[test]
+    fn sampler_note_pan_is_a_centered_offset_from_channel_pan() {
+        assert_eq!(sampler_note_pan(0.0, 64), 0.0);
+        assert_eq!(sampler_note_pan(0.0, 0), -1.0);
+        assert_eq!(sampler_note_pan(0.0, 128), 1.0);
+        assert_eq!(sampler_note_pan(-0.5, 96), 0.0);
+        assert_eq!(sampler_note_pan(0.5, 128), 1.0);
+        assert_eq!(sampler_note_pan(-0.5, 0), -1.0);
+    }
+
+    #[test]
     fn sampler_voice_starts_at_exact_frame_and_renders_identically_across_blocks() {
         let source = Arc::new(DecodedAudio {
             sample_rate: 4,
@@ -6717,6 +6741,7 @@ mod tests {
             channel_id: 7,
             key: SAMPLER_ROOT_KEY,
             velocity: 127,
+            pan: 64,
             fine_pitch_offset_cents: 0,
         }];
 
@@ -6734,6 +6759,61 @@ mod tests {
         assert!((whole[2] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
         assert!((whole[3] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
         assert_eq!(&whole[14..], &[0.0, 0.0]);
+    }
+
+    #[test]
+    fn sampler_voice_applies_each_note_pan_through_the_project_pan_law() {
+        let sources = HashMap::from([(
+            7,
+            SamplerVoiceSource {
+                audio: Arc::new(DecodedAudio {
+                    sample_rate: 4,
+                    channels: vec![vec![1.0; 4]],
+                }),
+                gain: 1.0,
+                pan: 0.0,
+                reverse: false,
+                root_key: SAMPLER_ROOT_KEY,
+                fine_tune_cents: 0.0,
+                loop_bounds: None,
+                ping_pong_loop: false,
+            },
+        )]);
+        let notes = [
+            ScheduledSamplerNote {
+                start_frame: 0,
+                stop_frame: None,
+                channel_id: 7,
+                key: SAMPLER_ROOT_KEY,
+                velocity: 127,
+                pan: 96,
+                fine_pitch_offset_cents: 0,
+            },
+            ScheduledSamplerNote {
+                start_frame: 4,
+                stop_frame: None,
+                channel_id: 7,
+                key: SAMPLER_ROOT_KEY,
+                velocity: 127,
+                pan: 32,
+                fine_pitch_offset_cents: 0,
+            },
+        ];
+        let mut engine = SamplerVoiceEngine::new(&sources, &notes, 1, 4, 4);
+        let mut output = vec![0.0; 16];
+
+        engine.render_block(0, 8, &mut output);
+
+        let right_half = channel_pan_gains(0.5, true, PanLaw::Circular);
+        let left_half = channel_pan_gains(-0.5, true, PanLaw::Circular);
+        for frame in output[..8].chunks_exact(2) {
+            assert!((frame[0] - right_half.0).abs() < 1.0e-6);
+            assert!((frame[1] - right_half.1).abs() < 1.0e-6);
+        }
+        for frame in output[8..].chunks_exact(2) {
+            assert!((frame[0] - left_half.0).abs() < 1.0e-6);
+            assert!((frame[1] - left_half.1).abs() < 1.0e-6);
+        }
     }
 
     #[test]
@@ -6766,6 +6846,7 @@ mod tests {
             channel_id: 7,
             key: SAMPLER_ROOT_KEY,
             velocity: 127,
+            pan: 64,
             fine_pitch_offset_cents: 0,
         }];
         let mut engine = SamplerVoiceEngine::new(&sources, &notes, 1, 4, 4);
@@ -6802,6 +6883,7 @@ mod tests {
             channel_id: 7,
             key: SAMPLER_ROOT_KEY,
             velocity: 127,
+            pan: 64,
             fine_pitch_offset_cents: 0,
         }];
         let mut engine = SamplerVoiceEngine::new(&sources, &notes, 1, 4, 4);
@@ -6835,6 +6917,7 @@ mod tests {
             channel_id: 7,
             key: SAMPLER_ROOT_KEY,
             velocity: 127,
+            pan: 64,
             fine_pitch_offset_cents: 0,
         }];
         let mut engine = SamplerVoiceEngine::new(&sources, &notes, 1, 4, 4);
@@ -6874,6 +6957,7 @@ mod tests {
             channel_id: 7,
             key: SAMPLER_ROOT_KEY,
             velocity: 127,
+            pan: 64,
             fine_pitch_offset_cents: 0,
         }];
         let mut engine = SamplerVoiceEngine::new(&sources, &notes, 1, 4, 4);
@@ -6914,6 +6998,7 @@ mod tests {
             channel_id: 2,
             key: SAMPLER_ROOT_KEY + 12,
             velocity: 127,
+            pan: 64,
             fine_pitch_offset_cents: 0,
         }];
         let mut engine = SamplerVoiceEngine::new(&sources, &notes, 1, 4, 4);
@@ -6949,6 +7034,7 @@ mod tests {
             channel_id: 2,
             key: SAMPLER_ROOT_KEY,
             velocity: 127,
+            pan: 64,
             fine_pitch_offset_cents: 0,
         }];
         let mut engine = SamplerVoiceEngine::new(&sources, &notes, 1, 4, 4);
@@ -7012,6 +7098,7 @@ mod tests {
             channel_id: 7,
             key: SAMPLER_ROOT_KEY,
             velocity: 127,
+            pan: 64,
             fine_pitch_offset_cents: 50,
         }];
         let mut engine = SamplerVoiceEngine::new(&sources, &notes, 1, 4, 4);
@@ -7047,6 +7134,7 @@ mod tests {
             channel_id: 3,
             key: SAMPLER_ROOT_KEY,
             velocity: 127,
+            pan: 64,
             fine_pitch_offset_cents: 0,
         }];
         let mut engine = SamplerVoiceEngine::new(&sources, &notes, 1, 4, 4);
@@ -7105,6 +7193,7 @@ mod tests {
                 channel_id: 1,
                 key: SAMPLER_ROOT_KEY,
                 velocity: 127,
+                pan: 64,
                 fine_pitch_offset_cents: 0,
             },
             ScheduledSamplerNote {
@@ -7113,6 +7202,7 @@ mod tests {
                 channel_id: 2,
                 key: SAMPLER_ROOT_KEY,
                 velocity: 127,
+                pan: 64,
                 fine_pitch_offset_cents: 0,
             },
         ];
