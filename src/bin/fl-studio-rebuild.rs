@@ -2333,6 +2333,15 @@ struct PendingSampleEditor {
     path: PathBuf,
     receiver: Receiver<Result<(DecodedAudio, AudioWaveform), String>>,
     worker: thread::JoinHandle<()>,
+    recording_notice: Option<String>,
+}
+
+struct SampleEditorRecordingSession {
+    receiver: Receiver<Result<AudioRecordingSummary, String>>,
+    worker: thread::JoinHandle<()>,
+    output_path: PathBuf,
+    started_at: Instant,
+    capture_active: bool,
 }
 
 struct SampleEditorState {
@@ -2760,6 +2769,7 @@ struct DawUi {
     browser_preview_error: Option<String>,
     sample_editor: Option<SampleEditorState>,
     sample_editor_pending: Option<PendingSampleEditor>,
+    sample_editor_recording: Option<SampleEditorRecordingSession>,
     audio_test_tone: bool,
     audio_monitor_input: bool,
     project_info_open: bool,
@@ -3360,6 +3370,7 @@ impl DawUi {
             browser_preview_error: None,
             sample_editor: None,
             sample_editor_pending: None,
+            sample_editor_recording: None,
             audio_test_tone: false,
             audio_monitor_input: false,
             project_info_open: false,
@@ -9666,6 +9677,10 @@ impl DawUi {
     }
 
     fn request_sample_editor(&mut self, path: PathBuf, ctx: &egui::Context) {
+        if self.sample_editor_recording.is_some() {
+            self.status = "Stop sample editor recording before opening another sample".to_owned();
+            return;
+        }
         if self.sample_editor_pending.is_some() {
             self.status = "A sample is already loading in the editor".to_owned();
             return;
@@ -9695,6 +9710,7 @@ impl DawUi {
             path: path.clone(),
             receiver,
             worker,
+            recording_notice: None,
         });
         self.status = format!("Loading sample editor for {}…", path.display());
         ctx.request_repaint_after(Duration::from_millis(40));
@@ -9717,7 +9733,9 @@ impl DawUi {
             match result {
                 Ok((audio, waveform)) => {
                     let selection_end = audio.frame_count();
-                    self.status = format!("Sample editor loaded {}", pending.path.display());
+                    self.status = pending.recording_notice.unwrap_or_else(|| {
+                        format!("Sample editor loaded {}", pending.path.display())
+                    });
                     self.sample_editor = Some(SampleEditorState {
                         path: pending.path,
                         audio,
@@ -9729,7 +9747,11 @@ impl DawUi {
                     });
                 }
                 Err(error) => {
-                    self.status = format!("Could not load sample editor: {error}");
+                    self.status = if let Some(notice) = pending.recording_notice {
+                        format!("{notice}; could not open recording: {error}")
+                    } else {
+                        format!("Could not load sample editor: {error}")
+                    };
                 }
             }
         }
@@ -9753,10 +9775,44 @@ impl DawUi {
         }
 
         let Some(editor) = self.sample_editor.as_mut() else {
+            let Some(recording) = self.sample_editor_recording.as_ref() else {
+                return;
+            };
+            let mut stop_recording = false;
+            egui::Window::new("Sample editor recording")
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    if recording.capture_active {
+                        ui.colored_label(
+                            Color32::from_rgb(228, 105, 105),
+                            format!(
+                                "● Recording input · {:.1}s",
+                                recording.started_at.elapsed().as_secs_f64()
+                            ),
+                        );
+                        stop_recording = ui.button("Stop recording").clicked();
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Finalizing recording…");
+                        });
+                    }
+                });
+            if stop_recording {
+                self.stop_sample_editor_recording();
+            }
+            ctx.request_repaint_after(Duration::from_millis(100));
             return;
         };
+        let sample_recording_status = self
+            .sample_editor_recording
+            .as_ref()
+            .map(|recording| (recording.capture_active, recording.started_at.elapsed()));
         let mut open = true;
         let mut save_selection = false;
+        let mut start_recording = false;
+        let mut stop_recording = false;
         egui::Window::new("Sample editor")
             .open(&mut open)
             .default_size(Vec2::new(720.0, 430.0))
@@ -9774,6 +9830,22 @@ impl DawUi {
                 ui.label(format!(
                     "{channel_label} · {sample_rate} Hz · {duration:.2} seconds"
                 ));
+                ui.horizontal(|ui| {
+                    if let Some((capture_active, elapsed)) = sample_recording_status {
+                        if capture_active {
+                            ui.colored_label(
+                                Color32::from_rgb(228, 105, 105),
+                                format!("● Recording input · {:.1}s", elapsed.as_secs_f64()),
+                            );
+                            stop_recording = ui.button("Stop").clicked();
+                        } else {
+                            ui.spinner();
+                            ui.label("Finalizing recording…");
+                        }
+                    } else {
+                        start_recording = ui.button("Record into editor…").clicked();
+                    }
+                });
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut editor.spectral_view, false, "Waveform");
                     ui.selectable_value(&mut editor.spectral_view, true, "Spectrum");
@@ -9832,6 +9904,14 @@ impl DawUi {
         if save_selection {
             self.save_sample_editor_selection();
         }
+        if stop_recording {
+            self.stop_sample_editor_recording();
+        } else if start_recording {
+            self.start_sample_editor_recording(ctx);
+        }
+        if self.sample_editor_recording.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
     }
 
     fn save_sample_editor_selection(&mut self) {
@@ -9877,6 +9957,161 @@ impl DawUi {
             Err(error) => {
                 self.status = format!("Could not save trimmed sample: {error}");
             }
+        }
+    }
+
+    fn start_sample_editor_recording(&mut self, ctx: &egui::Context) {
+        if self.sample_editor_recording.is_some() || self.audio_recording.is_some() {
+            self.status =
+                "An audio input recording is already active or being finalized".to_owned();
+            return;
+        }
+        if !self.audio_settings.enable_input {
+            self.status =
+                "Enable audio input in Audio settings before recording into the editor".to_owned();
+            return;
+        }
+        let Some(source_path) = self
+            .sample_editor
+            .as_ref()
+            .map(|editor| editor.path.clone())
+        else {
+            self.status = "Open a sample before recording into the editor".to_owned();
+            return;
+        };
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Record audio into sample editor")
+            .set_file_name("Sample recording.wav")
+            .add_filter("Wave audio", &["wav"]);
+        if let Some(parent) = source_path.parent() {
+            dialog = dialog.set_directory(parent);
+        }
+        let Some(mut output_path) = dialog.save_file() else {
+            return;
+        };
+        if !output_path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("wav"))
+        {
+            output_path.set_extension("wav");
+        }
+        if fs::canonicalize(&source_path)
+            .ok()
+            .zip(fs::canonicalize(&output_path).ok())
+            .is_some_and(|(source, destination)| source == destination)
+        {
+            self.status = "Choose a new file to keep the source sample unchanged".to_owned();
+            return;
+        }
+        if self.audio_engine.is_none() {
+            match AudioEngine::start(&self.audio_settings) {
+                Ok(engine) => self.audio_engine = Some(engine),
+                Err(error) => {
+                    self.status = format!("Could not start audio input: {error}");
+                    return;
+                }
+            }
+        }
+        let Some(engine) = self.audio_engine.as_ref() else {
+            self.status = "Audio input is not available".to_owned();
+            return;
+        };
+        if !engine.input_active() {
+            self.status = "Audio input is not active; enable input and restart the audio engine before recording".to_owned();
+            return;
+        }
+        let recording = match engine.start_input_recording() {
+            Ok(recording) => recording,
+            Err(error) => {
+                self.status = format!("Could not start sample editor recording: {error}");
+                return;
+            }
+        };
+        let worker_path = output_path.clone();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name("sample-editor-recording-writer".to_owned())
+            .spawn(move || {
+                let result = write_input_recording_to_wav(&recording, &worker_path);
+                let _ = sender.send(result);
+            });
+        let worker = match worker {
+            Ok(worker) => worker,
+            Err(error) => {
+                engine.stop_input_recording();
+                self.status =
+                    format!("Could not start the sample editor recording writer: {error}");
+                return;
+            }
+        };
+        self.sample_editor_recording = Some(SampleEditorRecordingSession {
+            receiver,
+            worker,
+            output_path: output_path.clone(),
+            started_at: Instant::now(),
+            capture_active: true,
+        });
+        self.status = format!("Recording sample editor audio to {}", output_path.display());
+        ctx.request_repaint_after(Duration::from_millis(100));
+    }
+
+    fn stop_sample_editor_recording(&mut self) {
+        let Some(recording) = self.sample_editor_recording.as_mut() else {
+            return;
+        };
+        if recording.capture_active {
+            if let Some(engine) = self.audio_engine.as_ref() {
+                engine.stop_input_recording();
+            }
+            recording.capture_active = false;
+            self.status = "Finalizing sample editor recording…".to_owned();
+        }
+    }
+
+    fn poll_sample_editor_recording(&mut self, ctx: &egui::Context) {
+        let completed = self
+            .sample_editor_recording
+            .as_ref()
+            .and_then(|recording| match recording.receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Disconnected) => Some(Err(
+                    "sample editor recording writer stopped unexpectedly".to_owned(),
+                )),
+                Err(TryRecvError::Empty) => None,
+            });
+        if let Some(result) = completed
+            && let Some(mut recording) = self.sample_editor_recording.take()
+        {
+            if recording.capture_active {
+                if let Some(engine) = self.audio_engine.as_ref() {
+                    engine.stop_input_recording();
+                }
+                recording.capture_active = false;
+            }
+            let _ = recording.worker.join();
+            match result {
+                Ok(summary) => {
+                    let seconds = summary.frames as f64 / f64::from(summary.sample_rate.max(1));
+                    let notice = if summary.overflow_frames == 0 {
+                        format!("Recorded {seconds:.1}s into the sample editor")
+                    } else {
+                        format!(
+                            "Recorded {seconds:.1}s into the sample editor · {} input frames overflowed",
+                            summary.overflow_frames
+                        )
+                    };
+                    self.request_sample_editor(recording.output_path, ctx);
+                    if let Some(pending) = self.sample_editor_pending.as_mut() {
+                        pending.recording_notice = Some(notice);
+                    }
+                }
+                Err(error) => {
+                    self.status = format!("Sample editor recording failed: {error}");
+                }
+            }
+        }
+        if self.sample_editor_recording.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(100));
         }
     }
 
@@ -27618,6 +27853,7 @@ impl eframe::App for DawUi {
         self.poll_vst3_stream();
         self.poll_sampler_stream();
         self.poll_browser_preview(ui.ctx());
+        self.poll_sample_editor_recording(ui.ctx());
         self.poll_sample_editor(ui.ctx());
         self.sample_editor_window(ui.ctx());
         self.reap_audio_render_workers();
@@ -28612,6 +28848,14 @@ impl Drop for DawUi {
     fn drop(&mut self) {
         self.stop_project_playback();
         if let Some(session) = self.audio_recording.take() {
+            if session.capture_active
+                && let Some(engine) = self.audio_engine.as_ref()
+            {
+                engine.stop_input_recording();
+            }
+            let _ = session.worker.join();
+        }
+        if let Some(session) = self.sample_editor_recording.take() {
             if session.capture_active
                 && let Some(engine) = self.audio_engine.as_ref()
             {
