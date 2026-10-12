@@ -2762,7 +2762,7 @@ struct DawUi {
     playlist_render_flac_bits_per_sample: u8,
     playlist_render_ogg_bitrate_kbps: u16,
     playlist_render_mp3_bitrate_kbps: u16,
-    playlist_render_dither: bool,
+    playlist_render_dither_mode: WavDitherMode,
     playlist_render_quality: ResamplingQuality,
     playlist_render_channel_mode: WavChannelMode,
     playlist_render_tail_seconds: u8,
@@ -3331,7 +3331,7 @@ impl DawUi {
             playlist_render_flac_bits_per_sample: 24,
             playlist_render_ogg_bitrate_kbps: 192,
             playlist_render_mp3_bitrate_kbps: 192,
-            playlist_render_dither: false,
+            playlist_render_dither_mode: WavDitherMode::Off,
             playlist_render_quality,
             playlist_render_channel_mode: WavChannelMode::Stereo,
             playlist_render_tail_seconds: 0,
@@ -5637,9 +5637,28 @@ impl DawUi {
                         let dither_enabled =
                             self.playlist_render_format == WavSampleFormat::Pcm16;
                         ui.add_enabled_ui(dither_enabled, |ui| {
-                            ui.checkbox(&mut self.playlist_render_dither, "TPDF dither");
+                            ui.horizontal(|ui| {
+                                ui.label("Dither");
+                                egui::ComboBox::from_id_salt("playlist-render-dither")
+                                    .selected_text(self.playlist_render_dither_mode.label())
+                                    .show_ui(ui, |ui| {
+                                        for mode in [
+                                            WavDitherMode::Off,
+                                            WavDitherMode::Tpdf,
+                                            WavDitherMode::HighPassTpdf,
+                                        ] {
+                                            ui.selectable_value(
+                                                &mut self.playlist_render_dither_mode,
+                                                mode,
+                                                mode.label(),
+                                            );
+                                        }
+                                    });
+                            });
                         });
-                        ui.label("Adds triangular dither during 16-bit output only.");
+                        ui.label(
+                            "High-pass TPDF shifts most dither noise toward high frequencies.",
+                        );
                         ui.label(match self.playlist_render_format {
                             WavSampleFormat::Pcm16 | WavSampleFormat::Pcm24 => {
                                 "Integer PCM clips samples to the [-1, 1] range."
@@ -5667,7 +5686,7 @@ impl DawUi {
                                     }
                                 });
                         });
-                        ui.label("FLAC is lossless compressed audio. TPDF dither is not applied.");
+                        ui.label("FLAC is lossless compressed audio. WAV dither is not applied.");
                     }
                     PlaylistSongOutputFormat::Ogg => {
                         ui.horizontal(|ui| {
@@ -6961,7 +6980,25 @@ impl DawUi {
                             ui.add_enabled_ui(
                                 self.playlist_render_format == WavSampleFormat::Pcm16,
                                 |ui| {
-                                    ui.checkbox(&mut self.playlist_render_dither, "TPDF dither");
+                                    ui.menu_button(
+                                        format!(
+                                            "Dither: {}",
+                                            self.playlist_render_dither_mode.label()
+                                        ),
+                                        |ui| {
+                                            for mode in [
+                                                WavDitherMode::Off,
+                                                WavDitherMode::Tpdf,
+                                                WavDitherMode::HighPassTpdf,
+                                            ] {
+                                                ui.selectable_value(
+                                                    &mut self.playlist_render_dither_mode,
+                                                    mode,
+                                                    mode.label(),
+                                                );
+                                            }
+                                        },
+                                    );
                                 },
                             );
                             ui.menu_button(
@@ -18998,11 +19035,7 @@ impl DawUi {
         };
         let encoding_options = AudioRenderEncodingOptions {
             wav_sample_format: self.playlist_render_format,
-            wav_dither_mode: if self.playlist_render_dither {
-                WavDitherMode::Tpdf
-            } else {
-                WavDitherMode::Off
-            },
+            wav_dither_mode: self.playlist_render_dither_mode,
             wav_channel_mode: self.playlist_render_channel_mode,
         };
 
@@ -19560,11 +19593,7 @@ impl DawUi {
             arrangement_id: self.selected_arrangement.unwrap_or_default(),
             sample_rate: self.audio_settings.sample_rate,
             wav_sample_format: self.playlist_render_format,
-            wav_dither_mode: if self.playlist_render_dither {
-                WavDitherMode::Tpdf
-            } else {
-                WavDitherMode::Off
-            },
+            wav_dither_mode: self.playlist_render_dither_mode,
             wav_channel_mode: self.playlist_render_channel_mode,
             resampling_quality: self.playlist_render_quality,
             soloed_playlist_track_range: self.soloed_playlist_track_range,
@@ -19638,11 +19667,7 @@ impl DawUi {
             arrangement_id,
             sample_rate: self.audio_settings.sample_rate,
             wav_sample_format: self.playlist_render_format,
-            wav_dither_mode: if self.playlist_render_dither {
-                WavDitherMode::Tpdf
-            } else {
-                WavDitherMode::Off
-            },
+            wav_dither_mode: self.playlist_render_dither_mode,
             wav_channel_mode: self.playlist_render_channel_mode,
             resampling_quality: self.playlist_render_quality,
             clip_index: Some(clip_index),
@@ -20112,11 +20137,7 @@ impl DawUi {
             soloed_playlist_track_range: self.soloed_playlist_track_range,
             read_sample_root_note: self.read_sample_root_note,
             wav_sample_format: self.playlist_render_format,
-            wav_dither_mode: if self.playlist_render_dither {
-                WavDitherMode::Tpdf
-            } else {
-                WavDitherMode::Off
-            },
+            wav_dither_mode: self.playlist_render_dither_mode,
             resampling_quality: self.playlist_render_quality,
             wav_channel_mode: self.playlist_render_channel_mode,
             tail_seconds: self.playlist_render_tail_seconds,
@@ -20244,11 +20265,7 @@ impl DawUi {
             soloed_playlist_track_range: self.soloed_playlist_track_range,
             read_sample_root_note: self.read_sample_root_note,
             wav_sample_format: self.playlist_render_format,
-            wav_dither_mode: if self.playlist_render_dither {
-                WavDitherMode::Tpdf
-            } else {
-                WavDitherMode::Off
-            },
+            wav_dither_mode: self.playlist_render_dither_mode,
             resampling_quality: self.playlist_render_quality,
             wav_channel_mode: self.playlist_render_channel_mode,
             tail_seconds: self.playlist_render_tail_seconds,
@@ -20432,11 +20449,7 @@ impl DawUi {
             resampling_quality: self.playlist_render_quality,
             read_sample_root_note: self.read_sample_root_note,
             wav_sample_format: self.playlist_render_format,
-            wav_dither_mode: if self.playlist_render_dither {
-                WavDitherMode::Tpdf
-            } else {
-                WavDitherMode::Off
-            },
+            wav_dither_mode: self.playlist_render_dither_mode,
             wav_channel_mode: self.playlist_render_channel_mode,
             ..SamplerPatternRenderOptions::default()
         };

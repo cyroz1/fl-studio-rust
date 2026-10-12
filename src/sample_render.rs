@@ -451,6 +451,7 @@ impl WavSampleFormat {
 pub enum WavDitherMode {
     Off,
     Tpdf,
+    HighPassTpdf,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -564,6 +565,7 @@ impl WavDitherMode {
         match self {
             Self::Off => "Off",
             Self::Tpdf => "TPDF dither",
+            Self::HighPassTpdf => "High-pass TPDF dither",
         }
     }
 }
@@ -1344,9 +1346,8 @@ fn render_playlist_with_vst3_cancellable(
                     * usize::from(options.wav_channel_mode.channel_count())
                     * usize::from(options.wav_sample_format.bytes_per_sample()),
             );
-            let mut dither_state = (options.wav_dither_mode == WavDitherMode::Tpdf
-                && options.wav_sample_format == WavSampleFormat::Pcm16)
-                .then(TpdfDither::new);
+            let mut dither_state =
+                WavDitherState::new(options.wav_dither_mode, options.wav_sample_format);
             summary.voices_stolen = stream_prepared_playlist_render(
                 PreparedPlaylistBlockMix {
                     audio: &audio,
@@ -1638,9 +1639,10 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
                         * usize::from(options.wav_channel_mode.channel_count())
                         * usize::from(options.wav_sample_format.bytes_per_sample()),
                 ),
-                dither_state: (options.wav_dither_mode == WavDitherMode::Tpdf
-                    && options.wav_sample_format == WavSampleFormat::Pcm16)
-                    .then(TpdfDither::new),
+                dither_state: WavDitherState::new(
+                    options.wav_dither_mode,
+                    options.wav_sample_format,
+                ),
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -1812,7 +1814,7 @@ struct MixerStemTemporaryOutput {
     temporary: TemporaryRenderFile,
     peak: f32,
     bytes: Vec<u8>,
-    dither_state: Option<TpdfDither>,
+    dither_state: Option<WavDitherState>,
 }
 
 struct StreamingOggWriter<'a> {
@@ -2191,7 +2193,7 @@ impl<'a> StreamingFlacWriter<'a> {
 struct StreamingWavWriter<'a> {
     file: &'a mut File,
     sample_format: WavSampleFormat,
-    dither_state: Option<TpdfDither>,
+    dither_state: Option<WavDitherState>,
     channel_mode: WavChannelMode,
     expected_frames: u64,
     frames_written: u64,
@@ -2226,9 +2228,7 @@ impl<'a> StreamingWavWriter<'a> {
         Ok(Self {
             file,
             sample_format: options.wav_sample_format,
-            dither_state: (options.wav_dither_mode == WavDitherMode::Tpdf
-                && options.wav_sample_format == WavSampleFormat::Pcm16)
-                .then(TpdfDither::new),
+            dither_state: WavDitherState::new(options.wav_dither_mode, options.wav_sample_format),
             channel_mode: options.wav_channel_mode,
             expected_frames,
             frames_written: 0,
@@ -2460,17 +2460,17 @@ fn append_wav_block_samples_with_dither(
     stereo_block: &[f32],
     sample_format: WavSampleFormat,
     channel_mode: WavChannelMode,
-    mut dither_state: Option<&mut TpdfDither>,
+    mut dither_state: Option<&mut WavDitherState>,
     output: &mut Vec<u8>,
 ) -> Result<(), String> {
     if !stereo_block.len().is_multiple_of(2) {
         return Err("render block must contain interleaved stereo frames".to_owned());
     }
-    let mut append_sample = |sample| {
+    let mut append_sample = |sample, output_channel| {
         let noise = if sample_format == WavSampleFormat::Pcm16 {
             dither_state
                 .as_deref_mut()
-                .map_or(0.0, TpdfDither::next_lsb_noise)
+                .map_or(0.0, |state| state.next_lsb_noise(output_channel))
         } else {
             0.0
         };
@@ -2479,15 +2479,15 @@ fn append_wav_block_samples_with_dither(
     for frame in stereo_block.as_chunks::<2>().0 {
         match channel_mode {
             WavChannelMode::Stereo => {
-                append_sample(frame[0]);
-                append_sample(frame[1]);
+                append_sample(frame[0], 0);
+                append_sample(frame[1], 1);
             }
             WavChannelMode::MonoMerged => {
                 let merged = frame[0] * 0.5 + frame[1] * 0.5;
-                append_sample(merged);
+                append_sample(merged, 0);
             }
-            WavChannelMode::MonoLeft => append_sample(frame[0]),
-            WavChannelMode::MonoRight => append_sample(frame[1]),
+            WavChannelMode::MonoLeft => append_sample(frame[0], 0),
+            WavChannelMode::MonoRight => append_sample(frame[1], 0),
         }
     }
     Ok(())
@@ -2495,6 +2495,76 @@ fn append_wav_block_samples_with_dither(
 
 struct TpdfDither {
     state: u64,
+}
+
+enum WavDitherState {
+    Tpdf(TpdfDither),
+    HighPassTpdf(HighPassTpdfDither),
+}
+
+impl WavDitherState {
+    fn new(mode: WavDitherMode, sample_format: WavSampleFormat) -> Option<Self> {
+        if sample_format != WavSampleFormat::Pcm16 {
+            return None;
+        }
+        match mode {
+            WavDitherMode::Off => None,
+            WavDitherMode::Tpdf => Some(Self::Tpdf(TpdfDither::new())),
+            WavDitherMode::HighPassTpdf => Some(Self::HighPassTpdf(HighPassTpdfDither::new())),
+        }
+    }
+
+    #[cfg(test)]
+    fn from_seed(mode: WavDitherMode, seed: u64) -> Option<Self> {
+        match mode {
+            WavDitherMode::Off => None,
+            WavDitherMode::Tpdf => Some(Self::Tpdf(TpdfDither::from_seed(seed))),
+            WavDitherMode::HighPassTpdf => {
+                Some(Self::HighPassTpdf(HighPassTpdfDither::from_seed(seed)))
+            }
+        }
+    }
+
+    fn next_lsb_noise(&mut self, output_channel: usize) -> f64 {
+        match self {
+            Self::Tpdf(dither) => dither.next_lsb_noise(),
+            Self::HighPassTpdf(dither) => dither.next_lsb_noise(output_channel),
+        }
+    }
+}
+
+const HIGH_PASS_DITHER_POLE: f64 = 0.95;
+
+struct HighPassTpdfDither {
+    noise: TpdfDither,
+    previous_noise: [f64; 2],
+}
+
+impl HighPassTpdfDither {
+    fn new() -> Self {
+        let noise = TpdfDither::new();
+        Self::from_noise(noise)
+    }
+
+    #[cfg(test)]
+    fn from_seed(seed: u64) -> Self {
+        Self::from_noise(TpdfDither::from_seed(seed))
+    }
+
+    fn from_noise(mut noise: TpdfDither) -> Self {
+        Self {
+            previous_noise: [noise.next_lsb_noise(), noise.next_lsb_noise()],
+            noise,
+        }
+    }
+
+    fn next_lsb_noise(&mut self, output_channel: usize) -> f64 {
+        let current_noise = self.noise.next_lsb_noise();
+        let shaped_noise =
+            current_noise - HIGH_PASS_DITHER_POLE * self.previous_noise[output_channel];
+        self.previous_noise[output_channel] = current_noise;
+        shaped_noise
+    }
 }
 
 impl TpdfDither {
@@ -5401,9 +5471,7 @@ fn write_stereo_wav_from_buffer(
         let bytes_per_sample = usize::from(sample_format.bytes_per_sample());
         let mut bytes =
             Vec::with_capacity(STREAM_BLOCK_FRAMES * samples_per_frame * bytes_per_sample);
-        let mut dither_state = (dither_mode == WavDitherMode::Tpdf
-            && sample_format == WavSampleFormat::Pcm16)
-            .then(TpdfDither::new);
+        let mut dither_state = WavDitherState::new(dither_mode, sample_format);
         for block in samples.chunks(STREAM_BLOCK_FRAMES * 2) {
             bytes.clear();
             append_wav_block_samples_with_dither(
@@ -7746,6 +7814,45 @@ mod tests {
             assert!((-1.0..=1.0).contains(&noise));
             assert_eq!(noise, second.next_lsb_noise());
         }
+    }
+
+    #[test]
+    fn high_pass_tpdf_dither_is_reproducible_and_shapes_noise_per_channel() {
+        let seed = 0x1234_5678_9ABC_DEF0;
+        let mut first = WavDitherState::from_seed(WavDitherMode::HighPassTpdf, seed).unwrap();
+        let mut second = WavDitherState::from_seed(WavDitherMode::HighPassTpdf, seed).unwrap();
+        let mut previous = [0.0; 2];
+        let mut adjacent_products = [0.0; 2];
+        let mut powers = [0.0; 2];
+
+        for _ in 0..16_384 {
+            for channel in 0..2 {
+                let noise = first.next_lsb_noise(channel);
+                assert_eq!(noise, second.next_lsb_noise(channel));
+                assert!((-1.95..=1.95).contains(&noise));
+                adjacent_products[channel] += noise * previous[channel];
+                powers[channel] += noise * noise;
+                previous[channel] = noise;
+            }
+        }
+
+        for channel in 0..2 {
+            let adjacent_correlation = adjacent_products[channel] / powers[channel];
+            assert!(
+                adjacent_correlation < -0.4,
+                "channel {channel} did not show the expected high-pass noise shape: {adjacent_correlation}"
+            );
+        }
+    }
+
+    #[test]
+    fn wav_dither_state_only_applies_to_sixteen_bit_pcm() {
+        assert!(WavDitherState::new(WavDitherMode::HighPassTpdf, WavSampleFormat::Pcm16).is_some());
+        assert!(WavDitherState::new(WavDitherMode::HighPassTpdf, WavSampleFormat::Pcm24).is_none());
+        assert!(
+            WavDitherState::new(WavDitherMode::HighPassTpdf, WavSampleFormat::Float32).is_none()
+        );
+        assert!(WavDitherState::new(WavDitherMode::Off, WavSampleFormat::Pcm16).is_none());
     }
 
     #[test]
