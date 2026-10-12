@@ -12682,6 +12682,7 @@ impl DawUi {
         let mut save_channel_preset = None;
         let mut channel_enabled_edits = Vec::new();
         let mut channel_main_pitch_edits = Vec::new();
+        let mut channel_add_to_key_edits = Vec::new();
         let mut channel_zipped_edits = Vec::new();
         let (zip_selected, unzip_all, group_selected, previous_group, next_group) =
             if ui.memory(|memory| memory.focused().is_none()) {
@@ -13185,6 +13186,17 @@ impl DawUi {
                                         channel_main_pitch_edits
                                             .push((channel.id(), main_pitch_enabled));
                                     }
+                                    let mut add_to_key_enabled =
+                                        channel.keyboard_add_to_key_enabled();
+                                    let add_to_key_response = ui
+                                        .checkbox(&mut add_to_key_enabled, "Add to Key")
+                                        .on_hover_text(
+                                            "This saved setting does not yet change the note used by playback or rendering.",
+                                        );
+                                    if add_to_key_response.changed() {
+                                        channel_add_to_key_edits
+                                            .push((channel.id(), add_to_key_enabled));
+                                    }
                                 }
                                 ui.separator();
                                 let preset_supported = !channel
@@ -13636,6 +13648,26 @@ impl DawUi {
                 }
                 Some(Err(error)) => {
                     self.status = format!("Could not change channel main pitch: {error}");
+                }
+                None => {}
+            }
+        }
+        for (channel_id, enabled) in channel_add_to_key_edits {
+            let result = self
+                .document
+                .as_mut()
+                .map(|document| document.set_channel_add_to_key_enabled(channel_id, enabled));
+            match result {
+                Some(Ok(())) => {
+                    self.stop_project_playback();
+                    self.dirty = true;
+                    self.status = format!(
+                        "Channel {channel_id} Add to Key {}",
+                        if enabled { "enabled" } else { "disabled" }
+                    );
+                }
+                Some(Err(error)) => {
+                    self.status = format!("Could not change channel Add to Key: {error}");
                 }
                 None => {}
             }

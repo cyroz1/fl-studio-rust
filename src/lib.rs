@@ -445,6 +445,7 @@ pub struct ChannelSummary {
     sampler_flags: Option<u32>,
     sampler_root_note: Option<u32>,
     keyboard_main_pitch: Option<bool>,
+    keyboard_add_root: Option<bool>,
     keyboard_key_region: Option<(u32, u32)>,
     ping_pong_loop: bool,
     swing_mix: Option<u16>,
@@ -742,6 +743,12 @@ impl ChannelSummary {
     /// Missing Parameters data defaults to disabled.
     pub fn keyboard_main_pitch_enabled(&self) -> bool {
         self.keyboard_main_pitch.unwrap_or(false)
+    }
+
+    /// Whether the channel uses its root key when project Master pitch changes.
+    /// Missing Parameters data defaults to disabled.
+    pub fn keyboard_add_to_key_enabled(&self) -> bool {
+        self.keyboard_add_root.unwrap_or(false)
     }
 
     /// Raw four-byte channel color value, in little-endian RGBA byte order.
@@ -2982,6 +2989,9 @@ impl FlpDocument {
                     }
                     if event.payload.len() >= 12 && channel.keyboard_main_pitch.is_none() {
                         channel.keyboard_main_pitch = Some(event.payload[11] != 0);
+                    }
+                    if event.payload.len() >= 64 && channel.keyboard_add_root.is_none() {
+                        channel.keyboard_add_root = Some(event.payload[63] != 0);
                     }
                 }
                 0xD5 if matches!(event.encoding, PayloadEncoding::Data { .. }) => {
@@ -12129,6 +12139,85 @@ impl FlpDocument {
         Ok(())
     }
 
+    /// Enables or disables the channel's Add to Key option for project Master pitch.
+    /// The flag is stored at byte 64 of the channel Parameters (`0xC7`) payload.
+    pub fn set_channel_add_to_key_enabled(
+        &mut self,
+        channel_id: u16,
+        enabled: bool,
+    ) -> Result<(), FlpError> {
+        self.require_unique_channel(channel_id)?;
+        let channel = self
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id == channel_id)
+            .ok_or(FlpError::ChannelNotFound(channel_id))?;
+        if !matches!(channel.kind, Some(0 | 2 | 4)) {
+            return Err(FlpError::UnsupportedEdit(
+                "Add to Key can only be enabled on Sampler, Native instrument, or Audio Clip channels",
+            ));
+        }
+
+        let c7_events = channel
+            .event_range()
+            .filter(|index| self.events[*index].opcode == 0xC7)
+            .collect::<Vec<_>>();
+        let mut parameter_events = c7_events.iter().copied().filter(|index| {
+            matches!(self.events[*index].encoding, PayloadEncoding::Data { .. })
+                && ascii_version(&self.events[*index].payload).is_none()
+        });
+        let parameters_index = parameter_events.next();
+        if parameter_events.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel has multiple Parameters (`0xC7`) events",
+            ));
+        }
+        if parameters_index.is_none() && !enabled {
+            return Ok(());
+        }
+        if parameters_index.is_none() && !c7_events.is_empty() {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel's `0xC7` event is not a recognized Parameters payload",
+            ));
+        }
+
+        let mut candidate = self.clone();
+        if let Some(event_index) = parameters_index {
+            let mut payload = candidate.events[event_index].payload.clone();
+            payload.resize(payload.len().max(64), 0);
+            payload[63] = u8::from(enabled);
+            candidate.events[event_index].replace_data_payload(payload)?;
+        } else {
+            let mut kind_events = channel
+                .event_range()
+                .filter(|index| self.events[*index].opcode == 0x15);
+            let Some(kind_index) = kind_events.next() else {
+                return Err(FlpError::UnsupportedEdit(
+                    "the selected channel has no recognized `0x15` kind event",
+                ));
+            };
+            if kind_events.next().is_some() {
+                return Err(FlpError::UnsupportedEdit(
+                    "the selected channel has multiple `0x15` kind events",
+                ));
+            }
+            let kind_event = &candidate.events[kind_index];
+            if kind_event.encoding != PayloadEncoding::Byte || kind_event.payload.len() != 1 {
+                return Err(FlpError::UnsupportedEdit(
+                    "the selected channel's `0x15` kind event is not a one-byte event",
+                ));
+            }
+            let mut payload = vec![0; 64];
+            payload[63] = 1;
+            candidate
+                .events
+                .insert(kind_index + 1, FlpEvent::new_data(0xC7, payload)?);
+        }
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
     /// Sets the per-channel multiplier for Channel Rack swing in FL's 0..=128 range.
     /// The `0x61` word event defaults to 128 (100%) when absent. Sampler and Native instrument (generator)
     /// channels can be edited; audio, Layer, Automation, and unknown channel types are not supported.
@@ -18190,6 +18279,32 @@ mod tests {
     }
 
     #[test]
+    fn decodes_add_to_key_from_channel_parameters_byte_sixty_four() {
+        for (stored, expected) in [(0, false), (1, true), (0xA5, true)] {
+            let mut parameters = channel_key_region_parameters(36, 84);
+            parameters[63] = stored;
+            let mut event_stream = vec![0x40, 7, 0, 0x15, 0];
+            append_data_event(&mut event_stream, 0xC7, &parameters);
+            event_stream.extend_from_slice(&[0x62, 0, 0]);
+            let input = flp_fixture(&event_stream, &[], &[]);
+            let document = FlpDocument::parse(&input).expect("fixture should parse");
+
+            assert_eq!(
+                document.channels()[0].keyboard_add_to_key_enabled(),
+                expected
+            );
+            assert_eq!(document.encode_lossless().unwrap(), input);
+        }
+
+        let mut short_event_stream = vec![0x40, 7, 0, 0x15, 0];
+        append_data_event(&mut short_event_stream, 0xC7, &[0; 63]);
+        short_event_stream.extend_from_slice(&[0x62, 0, 0]);
+        let short_document = FlpDocument::parse(&flp_fixture(&short_event_stream, &[], &[]))
+            .expect("short Parameters fixture should parse");
+        assert!(!short_document.channels()[0].keyboard_add_to_key_enabled());
+    }
+
+    #[test]
     fn edits_enable_main_pitch_without_rewriting_other_channel_parameters() {
         let mut parameters = channel_key_region_parameters(36, 84);
         parameters[11] = 0xA5;
@@ -18223,6 +18338,46 @@ mod tests {
         assert!(!document.channels()[0].keyboard_main_pitch_enabled());
         let mut expected_parameters = parameters;
         expected_parameters[11] = 0;
+        assert_eq!(
+            document.events()[parameter_event_index].payload(),
+            expected_parameters
+        );
+    }
+
+    #[test]
+    fn edits_add_to_key_without_rewriting_other_channel_parameters() {
+        let mut parameters = channel_key_region_parameters(36, 84);
+        parameters[63] = 0xA5;
+        parameters.extend_from_slice(&[0xAA, 0x55]);
+        let mut event_stream = vec![0x40, 7, 0, 0x15, 0, 0x05, 0xFA];
+        append_data_event(&mut event_stream, 0xC7, &parameters);
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        let input = flp_fixture(&event_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+        let parameter_event_index = document.channels()[0]
+            .event_range()
+            .find(|index| document.events()[*index].opcode() == 0xC7)
+            .expect("channel should have Parameters data");
+        let unrelated_event_before = document.events()[2].wire_bytes().to_vec();
+        let mut expected_parameters = parameters.clone();
+        expected_parameters[63] = 0;
+
+        document
+            .set_channel_add_to_key_enabled(7, false)
+            .expect("Add to Key should be disabled");
+        assert!(!document.channels()[0].keyboard_add_to_key_enabled());
+        assert_eq!(
+            document.events()[parameter_event_index].payload(),
+            expected_parameters
+        );
+        assert_eq!(document.events()[2].wire_bytes(), unrelated_event_before);
+
+        document
+            .set_channel_add_to_key_enabled(7, true)
+            .expect("Add to Key should be enabled");
+        assert!(document.channels()[0].keyboard_add_to_key_enabled());
+        let mut expected_parameters = parameters;
+        expected_parameters[63] = 1;
         assert_eq!(
             document.events()[parameter_event_index].payload(),
             expected_parameters
@@ -18271,6 +18426,51 @@ mod tests {
         let mut duplicate =
             FlpDocument::parse(&duplicate_input).expect("duplicate fixture should parse");
         assert!(duplicate.set_channel_main_pitch_enabled(7, true).is_err());
+        assert_eq!(duplicate.encode_lossless().unwrap(), duplicate_input);
+    }
+
+    #[test]
+    fn inserts_add_to_key_parameters_and_rejects_ambiguous_channels_atomically() {
+        let mut no_parameters_stream = vec![0x40, 7, 0, 0x15, 0, 0x05, 0xFA];
+        no_parameters_stream.extend_from_slice(&[0x62, 0, 0]);
+        let input = flp_fixture(&no_parameters_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+        document
+            .set_channel_add_to_key_enabled(7, false)
+            .expect("disabling an absent flag should leave it absent");
+        assert_eq!(document.encode_lossless().unwrap(), input);
+        document
+            .set_channel_add_to_key_enabled(7, true)
+            .expect("Parameters event should be inserted after the kind event");
+        assert!(document.channels()[0].keyboard_add_to_key_enabled());
+        assert_eq!(document.events()[2].opcode(), 0xC7);
+        assert_eq!(document.events()[2].payload().len(), 64);
+        assert_eq!(document.events()[2].payload()[63], 1);
+        assert_eq!(document.events()[3].wire_bytes(), &[0x05, 0xFA]);
+
+        let mut layer_stream = vec![0x40, 7, 0, 0x15, 3];
+        layer_stream.extend_from_slice(&[0x62, 0, 0]);
+        let layer_input = flp_fixture(&layer_stream, &[], &[]);
+        let mut layer = FlpDocument::parse(&layer_input).expect("Layer fixture should parse");
+        assert!(layer.set_channel_add_to_key_enabled(7, true).is_err());
+        assert_eq!(layer.encode_lossless().unwrap(), layer_input);
+
+        let mut duplicate_stream = vec![0x40, 7, 0, 0x15, 0];
+        append_data_event(
+            &mut duplicate_stream,
+            0xC7,
+            &channel_key_region_parameters(36, 84),
+        );
+        append_data_event(
+            &mut duplicate_stream,
+            0xC7,
+            &channel_key_region_parameters(48, 96),
+        );
+        duplicate_stream.extend_from_slice(&[0x62, 0, 0]);
+        let duplicate_input = flp_fixture(&duplicate_stream, &[], &[]);
+        let mut duplicate =
+            FlpDocument::parse(&duplicate_input).expect("duplicate fixture should parse");
+        assert!(duplicate.set_channel_add_to_key_enabled(7, true).is_err());
         assert_eq!(duplicate.encode_lossless().unwrap(), duplicate_input);
     }
 
