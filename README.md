@@ -116,7 +116,7 @@ The Piano roll **View** menu can snap dragged notes to the nearest pitch in the 
 
 In Audio settings, **Snap recorded notes to selected scale** moves incoming MIDI note pitches to the nearest note in the selected Piano roll scale before the take is saved. The scale is captured when recording starts; timing, velocity, and note properties are preserved.
 
-Audio settings' controller templates include the Akai MIDImix Master Fader profile, which maps channel 1 CC 62 to output gain. Other MIDImix controls are not mapped yet.
+Audio settings' controller templates include Akai MIDImix Master Fader (channel 1 CC 62) and Fader 1 (channel 1 CC 19) profiles for output gain. Other MIDImix controls are not mapped yet.
 
 Resolved audio-channel clips show an asynchronously decoded combined waveform in the Playlist. It follows horizontal zoom and clip source offsets. Stereo or spectral previews, fades, and gain envelopes are not shown yet.
 
