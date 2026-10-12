@@ -5,6 +5,11 @@ use midir::{MidiOutput, MidiOutputConnection as MidirOutputConnection};
 
 const MAX_PATTERN_PREVIEW_NOTES: usize = 100_000;
 
+fn fl_note_release_to_midi_velocity(release: u8) -> u8 {
+    let release = u16::from(release.min(128));
+    ((release * 127 + 64) / 128) as u8
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ScheduledMidiMessage {
     pub after: Duration,
@@ -95,7 +100,11 @@ pub fn pattern_preview_messages(
             tick: end_tick,
             priority: 0,
             order: note_index.saturating_mul(2).saturating_add(1),
-            bytes: [0x80 | channel, key, 0],
+            bytes: [
+                0x80 | channel,
+                key,
+                fl_note_release_to_midi_velocity(note.release),
+            ],
         });
     }
     ordered.sort_unstable_by_key(|event| (event.tick, event.priority, event.order));
@@ -195,9 +204,19 @@ mod tests {
     use flp_rebuild::{Pattern, PatternNote};
 
     use super::{
-        all_notes_off_message, midi_clock_pulse_count_at_tick, midi_sixteenth_notes_from_tick,
-        midi_song_position_pointer_message, pattern_preview_messages,
+        all_notes_off_message, fl_note_release_to_midi_velocity, midi_clock_pulse_count_at_tick,
+        midi_sixteenth_notes_from_tick, midi_song_position_pointer_message,
+        pattern_preview_messages,
     };
+
+    #[test]
+    fn fl_note_release_maps_to_midi_note_off_velocity() {
+        assert_eq!(fl_note_release_to_midi_velocity(0), 0);
+        assert_eq!(fl_note_release_to_midi_velocity(64), 64);
+        assert_eq!(fl_note_release_to_midi_velocity(65), 64);
+        assert_eq!(fl_note_release_to_midi_velocity(128), 127);
+        assert_eq!(fl_note_release_to_midi_velocity(255), 127);
+    }
 
     #[test]
     fn all_notes_off_uses_the_requested_midi_channel() {
@@ -215,6 +234,7 @@ mod tests {
                 key: 64,
                 midi_channel: 2,
                 velocity: 96,
+                release: 128,
                 ..PatternNote::default()
             }],
             ..Pattern::default()
@@ -229,7 +249,7 @@ mod tests {
                 },
                 super::ScheduledMidiMessage {
                     after: Duration::from_micros(500_000),
-                    bytes: [0x82, 64, 0],
+                    bytes: [0x82, 64, 127],
                 },
             ]
         );
@@ -243,6 +263,7 @@ mod tests {
                     length: 48,
                     key: 60,
                     velocity: 96,
+                    release: 32,
                     ..PatternNote::default()
                 },
                 PatternNote {
@@ -250,6 +271,7 @@ mod tests {
                     length: 24,
                     key: 60,
                     velocity: 80,
+                    release: 128,
                     ..PatternNote::default()
                 },
             ],
@@ -258,9 +280,9 @@ mod tests {
 
         let messages = pattern_preview_messages(&pattern, 96, 120.0).unwrap();
         assert_eq!(messages[0].bytes, [0x90, 60, 96]);
-        assert_eq!(messages[1].bytes, [0x80, 60, 0]);
+        assert_eq!(messages[1].bytes, [0x80, 60, 32]);
         assert_eq!(messages[2].bytes, [0x90, 60, 80]);
-        assert_eq!(messages[3].bytes, [0x80, 60, 0]);
+        assert_eq!(messages[3].bytes, [0x80, 60, 127]);
     }
 
     #[test]
