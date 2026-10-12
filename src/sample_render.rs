@@ -3755,7 +3755,7 @@ fn prepare_sampler_arrangement(
                 options.sample_rate,
                 note.key,
                 source.root_key,
-                source.fine_tune_cents,
+                source.fine_tune_cents + f64::from(note.fine_pitch_offset_cents()),
             ))
         .ceil();
         if !natural_duration.is_finite()
@@ -3787,6 +3787,7 @@ fn prepare_sampler_arrangement(
             channel_id: placed.target_channel_id,
             key: note.key,
             velocity: note.velocity,
+            fine_pitch_offset_cents: note.fine_pitch_offset_cents(),
         });
     }
     notes.sort_by_key(|note| (note.start_frame, note.channel_id, note.key));
@@ -3850,6 +3851,7 @@ struct ScheduledSamplerNote {
     channel_id: u16,
     key: u16,
     velocity: u8,
+    fine_pitch_offset_cents: i16,
 }
 
 fn prepare_sampler_pattern(
@@ -4055,7 +4057,7 @@ fn prepare_sampler_pattern(
                 options.sample_rate,
                 note.key,
                 source.root_key,
-                source.fine_tune_cents,
+                source.fine_tune_cents + f64::from(note.fine_pitch_offset_cents()),
             ))
         .ceil();
         if !natural_duration.is_finite()
@@ -4086,6 +4088,7 @@ fn prepare_sampler_pattern(
             channel_id: target_channel_id,
             key: note.key,
             velocity: note.velocity,
+            fine_pitch_offset_cents: note.fine_pitch_offset_cents(),
         });
     }
 
@@ -4329,7 +4332,7 @@ impl<'a> SamplerVoiceEngine<'a> {
             self.output_sample_rate,
             note.key,
             source.root_key,
-            source.fine_tune_cents,
+            source.fine_tune_cents + f64::from(note.fine_pitch_offset_cents),
         );
         let source_step = if source.reverse {
             -source_step
@@ -6253,6 +6256,7 @@ mod tests {
                 channel_id: 2,
                 key: SAMPLER_ROOT_KEY,
                 velocity: 127,
+                fine_pitch_offset_cents: 0,
             }],
             sources_by_channel: HashMap::from([(
                 2,
@@ -6713,6 +6717,7 @@ mod tests {
             channel_id: 7,
             key: SAMPLER_ROOT_KEY,
             velocity: 127,
+            fine_pitch_offset_cents: 0,
         }];
 
         let mut whole_engine = SamplerVoiceEngine::new(&sources, &notes, 4, 4, 4);
@@ -6761,6 +6766,7 @@ mod tests {
             channel_id: 7,
             key: SAMPLER_ROOT_KEY,
             velocity: 127,
+            fine_pitch_offset_cents: 0,
         }];
         let mut engine = SamplerVoiceEngine::new(&sources, &notes, 1, 4, 4);
         engine.mixer_transforms_by_channel = Some(&transforms);
@@ -6796,6 +6802,7 @@ mod tests {
             channel_id: 7,
             key: SAMPLER_ROOT_KEY,
             velocity: 127,
+            fine_pitch_offset_cents: 0,
         }];
         let mut engine = SamplerVoiceEngine::new(&sources, &notes, 1, 4, 4);
         let mut output = vec![0.0; 8];
@@ -6828,6 +6835,7 @@ mod tests {
             channel_id: 7,
             key: SAMPLER_ROOT_KEY,
             velocity: 127,
+            fine_pitch_offset_cents: 0,
         }];
         let mut engine = SamplerVoiceEngine::new(&sources, &notes, 1, 4, 4);
         let mut output = vec![0.0; 18];
@@ -6866,6 +6874,7 @@ mod tests {
             channel_id: 7,
             key: SAMPLER_ROOT_KEY,
             velocity: 127,
+            fine_pitch_offset_cents: 0,
         }];
         let mut engine = SamplerVoiceEngine::new(&sources, &notes, 1, 4, 4);
         let mut output = vec![0.0; 18];
@@ -6905,6 +6914,7 @@ mod tests {
             channel_id: 2,
             key: SAMPLER_ROOT_KEY + 12,
             velocity: 127,
+            fine_pitch_offset_cents: 0,
         }];
         let mut engine = SamplerVoiceEngine::new(&sources, &notes, 1, 4, 4);
         let mut output = vec![0.0; 8];
@@ -6939,6 +6949,7 @@ mod tests {
             channel_id: 2,
             key: SAMPLER_ROOT_KEY,
             velocity: 127,
+            fine_pitch_offset_cents: 0,
         }];
         let mut engine = SamplerVoiceEngine::new(&sources, &notes, 1, 4, 4);
         let mut output = vec![0.0; 8];
@@ -6978,6 +6989,40 @@ mod tests {
     }
 
     #[test]
+    fn sampler_voice_applies_scheduled_note_fine_pitch() {
+        let sources = HashMap::from([(
+            7,
+            SamplerVoiceSource {
+                audio: Arc::new(DecodedAudio {
+                    sample_rate: 4,
+                    channels: vec![vec![1.0; 8]],
+                }),
+                gain: 1.0,
+                pan: 0.0,
+                reverse: false,
+                root_key: SAMPLER_ROOT_KEY,
+                fine_tune_cents: 0.0,
+                loop_bounds: None,
+                ping_pong_loop: false,
+            },
+        )]);
+        let notes = [ScheduledSamplerNote {
+            start_frame: 0,
+            stop_frame: None,
+            channel_id: 7,
+            key: SAMPLER_ROOT_KEY,
+            velocity: 127,
+            fine_pitch_offset_cents: 50,
+        }];
+        let mut engine = SamplerVoiceEngine::new(&sources, &notes, 1, 4, 4);
+
+        engine.render_block(0, 1, &mut [0.0; 2]);
+
+        let voice = engine.voices[0].as_ref().expect("note should start");
+        assert!((voice.source_step - 2.0f64.powf(50.0 / 1_200.0)).abs() < 1e-12);
+    }
+
+    #[test]
     fn zero_length_sampler_note_plays_the_sample_to_its_end() {
         let source = Arc::new(DecodedAudio {
             sample_rate: 4,
@@ -7002,6 +7047,7 @@ mod tests {
             channel_id: 3,
             key: SAMPLER_ROOT_KEY,
             velocity: 127,
+            fine_pitch_offset_cents: 0,
         }];
         let mut engine = SamplerVoiceEngine::new(&sources, &notes, 1, 4, 4);
         let mut output = vec![0.0; 12];
@@ -7059,6 +7105,7 @@ mod tests {
                 channel_id: 1,
                 key: SAMPLER_ROOT_KEY,
                 velocity: 127,
+                fine_pitch_offset_cents: 0,
             },
             ScheduledSamplerNote {
                 start_frame: 1,
@@ -7066,6 +7113,7 @@ mod tests {
                 channel_id: 2,
                 key: SAMPLER_ROOT_KEY,
                 velocity: 127,
+                fine_pitch_offset_cents: 0,
             },
         ];
         let mut engine = SamplerVoiceEngine::new(&sources, &notes, 1, 4, 4);

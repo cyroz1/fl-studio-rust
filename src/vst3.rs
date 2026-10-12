@@ -47,6 +47,7 @@ struct ScheduledMidiEvent {
     frame: u64,
     priority: u8,
     event: MidiEvent,
+    fine_pitch_offset_cents: i16,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -186,6 +187,7 @@ struct PlaylistMidiNote {
     key: u16,
     velocity: u8,
     midi_channel: u8,
+    fine_pitch_offset_cents: i16,
 }
 
 struct PlaylistPluginStream {
@@ -482,6 +484,7 @@ impl PlaylistPluginStream {
                             event.event,
                             offset,
                             self.render.pitch_offset_cents,
+                            event.fine_pitch_offset_cents,
                         )?;
                         self.next_event += 1;
                     }
@@ -1392,6 +1395,7 @@ impl Vst3HostRuntime {
                     key: note.key,
                     velocity: note.velocity,
                     midi_channel: note.midi_channel,
+                    fine_pitch_offset_cents: note.fine_pitch_offset_cents(),
                 });
         }
 
@@ -1690,6 +1694,7 @@ fn scheduled_playlist_midi_events_with_tempo_map(
                 note: note.key as u8,
                 velocity: note.velocity,
             },
+            fine_pitch_offset_cents: note.fine_pitch_offset_cents,
         });
         events.push(ScheduledMidiEvent {
             frame: end_frame,
@@ -1699,6 +1704,7 @@ fn scheduled_playlist_midi_events_with_tempo_map(
                 note: note.key as u8,
                 velocity: 0,
             },
+            fine_pitch_offset_cents: note.fine_pitch_offset_cents,
         });
         note_count += 1;
     }
@@ -2022,7 +2028,13 @@ fn process_pattern_render(
                 && event.frame < block_end
             {
                 let offset = event.frame.saturating_sub(rendered_frames) as i32;
-                send_scheduled_midi_event(plugin, event.event, offset, render.pitch_offset_cents)?;
+                send_scheduled_midi_event(
+                    plugin,
+                    event.event,
+                    offset,
+                    render.pitch_offset_cents,
+                    event.fine_pitch_offset_cents,
+                )?;
                 event_index += 1;
             }
 
@@ -2105,6 +2117,7 @@ fn stream_pattern_render(
                         event.event,
                         offset,
                         render.pitch_offset_cents,
+                        event.fine_pitch_offset_cents,
                     )?;
                     event_index += 1;
                 }
@@ -2282,12 +2295,12 @@ fn finite_sample(sample: f32) -> f32 {
 fn plugin_event_with_pitch_offset(
     event: MidiEvent,
     sample_offset: i32,
-    pitch_offset_cents: i16,
+    pitch_offset_cents: i32,
 ) -> Result<PluginEvent, String> {
     let mut plugin_event = PluginEvent::from(event).at(sample_offset);
     match &mut plugin_event.data {
         PluginEventData::NoteOn { tuning, .. } | PluginEventData::NoteOff { tuning, .. } => {
-            *tuning = f32::from(pitch_offset_cents);
+            *tuning = pitch_offset_cents as f32;
         }
         _ => return Err("VST3 pitch tuning can only be applied to note events".to_owned()),
     }
@@ -2298,8 +2311,11 @@ fn send_scheduled_midi_event(
     plugin: &mut Plugin,
     event: MidiEvent,
     sample_offset: i32,
-    pitch_offset_cents: i16,
+    project_pitch_offset_cents: i16,
+    fine_pitch_offset_cents: i16,
 ) -> Result<(), String> {
+    let pitch_offset_cents =
+        combined_pitch_offset_cents(project_pitch_offset_cents, fine_pitch_offset_cents);
     if pitch_offset_cents == 0 {
         plugin
             .send_midi_event_at(event, sample_offset)
@@ -2310,6 +2326,13 @@ fn send_scheduled_midi_event(
             .send_plugin_event(event)
             .map_err(|error| error.to_string())
     }
+}
+
+fn combined_pitch_offset_cents(
+    project_pitch_offset_cents: i16,
+    fine_pitch_offset_cents: i16,
+) -> i32 {
+    i32::from(project_pitch_offset_cents) + i32::from(fine_pitch_offset_cents)
 }
 
 fn append_vst_output_block_to_stereo(
@@ -2408,6 +2431,7 @@ fn scheduled_pattern_events(
                 note: note.key as u8,
                 velocity: note.velocity,
             },
+            fine_pitch_offset_cents: note.fine_pitch_offset_cents(),
         });
         events.push(ScheduledMidiEvent {
             frame: end_frame as u64,
@@ -2417,6 +2441,7 @@ fn scheduled_pattern_events(
                 note: note.key as u8,
                 velocity: 0,
             },
+            fine_pitch_offset_cents: note.fine_pitch_offset_cents(),
         });
         note_count += 1;
     }
@@ -2985,6 +3010,34 @@ mod tests {
     }
 
     #[test]
+    fn pattern_scheduler_carries_fine_pitch_to_both_note_events() {
+        let note = PatternNote {
+            position: 0,
+            length: 120,
+            channel_id: 7,
+            key: 64,
+            velocity: 100,
+            fine_pitch: 130,
+            ..PatternNote::default()
+        };
+        let (events, _) =
+            scheduled_pattern_events(&[note], 7, 480, 120.0, 48_000.0, 0, 128).unwrap();
+
+        assert_eq!(events[0].fine_pitch_offset_cents, 100);
+        assert_eq!(events[1].fine_pitch_offset_cents, 100);
+        for event in &events {
+            let total_pitch = combined_pitch_offset_cents(375, event.fine_pitch_offset_cents);
+            let plugin_event = plugin_event_with_pitch_offset(event.event, 0, total_pitch).unwrap();
+            assert!(matches!(
+                plugin_event.data,
+                PluginEventData::NoteOn { tuning, .. }
+                    | PluginEventData::NoteOff { tuning, .. }
+                    if tuning == 475.0
+            ));
+        }
+    }
+
+    #[test]
     fn applies_master_pitch_as_vst3_note_tuning() {
         let note_on = plugin_event_with_pitch_offset(
             MidiEvent::NoteOn {
@@ -3081,6 +3134,7 @@ mod tests {
                 key: 64,
                 velocity: 96,
                 midi_channel: 0,
+                fine_pitch_offset_cents: 0,
             },
             PlaylistMidiNote {
                 start_tick: 720,
@@ -3088,6 +3142,7 @@ mod tests {
                 key: 64,
                 velocity: 80,
                 midi_channel: 0,
+                fine_pitch_offset_cents: 0,
             },
         ];
 
@@ -3127,6 +3182,7 @@ mod tests {
             key: 64,
             velocity: 96,
             midi_channel: 0,
+            fine_pitch_offset_cents: 0,
         };
 
         let (events, note_count) =
@@ -3145,6 +3201,7 @@ mod tests {
             key: 60,
             velocity: 100,
             midi_channel: 16,
+            fine_pitch_offset_cents: 0,
         };
         assert!(
             scheduled_playlist_midi_events(&[note], 480, 120.0, 48_000.0)

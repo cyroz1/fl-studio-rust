@@ -2642,6 +2642,18 @@ impl PatternNote {
         self.flags & PATTERN_NOTE_SLIDE_FLAG != 0
     }
 
+    /// The note's fine-pitch offset in cents.
+    ///
+    /// FL Studio stores this as an unsigned byte centered at 120. Values 0 through 240 map to
+    /// -1200 through +1200 cents in ten-cent steps. Out-of-range raw values are retained for
+    /// lossless round-tripping but ignored during playback.
+    pub fn fine_pitch_offset_cents(&self) -> i16 {
+        if self.fine_pitch > 240 {
+            return 0;
+        }
+        (i16::from(self.fine_pitch) - 120) * 10
+    }
+
     fn decode(bytes: &[u8]) -> Self {
         debug_assert_eq!(bytes.len(), FLP_NOTE_RECORD_SIZE);
         Self {
@@ -20514,6 +20526,25 @@ mod tests {
         let reparsed = FlpDocument::parse(&encoded).expect("edited file should parse");
         assert_eq!(reparsed.patterns().unwrap()[0].notes.len(), 2);
         assert_eq!(reparsed.trailing_bytes(), &[0xB2]);
+    }
+
+    #[test]
+    fn fine_pitch_offsets_map_to_fl_studio_ten_cent_steps() {
+        for (raw, cents) in [(0, -1_200), (119, -10), (120, 0), (121, 10), (240, 1_200)] {
+            let note = PatternNote {
+                fine_pitch: raw,
+                ..PatternNote::default()
+            };
+            assert_eq!(note.fine_pitch_offset_cents(), cents);
+        }
+
+        for raw in [241, u8::MAX] {
+            let note = PatternNote {
+                fine_pitch: raw,
+                ..PatternNote::default()
+            };
+            assert_eq!(note.fine_pitch_offset_cents(), 0);
+        }
     }
 
     #[test]
