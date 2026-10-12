@@ -22639,9 +22639,10 @@ mod tests {
         assert_eq!(exported_note.release_velocity(), Some(127));
         assert_eq!(exported_note.start_tick(), 96);
         assert_eq!(exported_note.end_tick(), Some(144));
-        assert!(!track.events().iter().any(|event| {
-            matches!(event.kind(), MidiEventKind::ChannelVoice { status, data }
-                if status & 0xF0 == 0xB0 && data[0] == 10)
+        assert!(track.events().iter().any(|event| {
+            event.absolute_tick() == 96
+                && matches!(event.kind(), MidiEventKind::ChannelVoice { status, data }
+                    if *status == 0xB9 && data == &[10, 0])
         }));
     }
 
