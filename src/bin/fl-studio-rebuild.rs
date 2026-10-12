@@ -1467,6 +1467,7 @@ enum PianoRollScale {
     IonianSharpFive,
     Dorian,
     DorianFlatTwo,
+    UkrainianDorianFlatTwo,
     DorianSharpFour,
     DorianFlatFive,
     Phrygian,
@@ -1502,7 +1503,7 @@ enum PianoRollScale {
 }
 
 impl PianoRollScale {
-    const ALL: [Self; 39] = [
+    const ALL: [Self; 40] = [
         Self::None,
         Self::Major,
         Self::HarmonicMajor,
@@ -1510,6 +1511,7 @@ impl PianoRollScale {
         Self::IonianSharpFive,
         Self::Dorian,
         Self::DorianFlatTwo,
+        Self::UkrainianDorianFlatTwo,
         Self::DorianSharpFour,
         Self::DorianFlatFive,
         Self::Phrygian,
@@ -1553,6 +1555,7 @@ impl PianoRollScale {
             Self::IonianSharpFive => "Ionian #5",
             Self::Dorian => "Dorian",
             Self::DorianFlatTwo => "Dorian b2",
+            Self::UkrainianDorianFlatTwo => "Ukrainian Dorian b2",
             Self::DorianSharpFour => "Dorian #4",
             Self::DorianFlatFive => "Dorian b5",
             Self::Phrygian => "Phrygian",
@@ -1604,6 +1607,7 @@ impl PianoRollScale {
             Self::IonianSharpFive => &[0, 2, 4, 5, 8, 9, 11],
             Self::Dorian => &[0, 2, 3, 5, 7, 9, 10],
             Self::DorianFlatTwo => &[0, 1, 3, 5, 7, 9, 10],
+            Self::UkrainianDorianFlatTwo => &[0, 1, 3, 6, 7, 9, 10],
             Self::DorianSharpFour => &[0, 2, 3, 6, 7, 9, 10],
             Self::DorianFlatFive => &[0, 2, 3, 5, 6, 9, 10],
             Self::Phrygian => &[0, 1, 3, 5, 7, 8, 10],
@@ -1669,6 +1673,7 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
         PianoRollScale::IonianSharpFive,
         PianoRollScale::Dorian,
         PianoRollScale::DorianFlatTwo,
+        PianoRollScale::UkrainianDorianFlatTwo,
         PianoRollScale::DorianSharpFour,
         PianoRollScale::DorianFlatFive,
         PianoRollScale::Phrygian,
@@ -1767,6 +1772,7 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
                 PianoRollScale::MajorPentatonic => 0,
                 PianoRollScale::MinorPentatonic => -1,
                 PianoRollScale::Dorian => -2,
+                PianoRollScale::UkrainianDorianFlatTwo => -33,
                 PianoRollScale::Phrygian => -3,
                 PianoRollScale::PhrygianFlatFour => -24,
                 PianoRollScale::PhrygianDominant => -11,
@@ -33739,7 +33745,7 @@ mod tests {
 
     #[test]
     fn piano_roll_scales_use_documented_intervals_and_auto_detection() {
-        let cases: [(PianoRollScale, u8, [u16; 8], &'static [u8]); 26] = [
+        let cases: [(PianoRollScale, u8, [u16; 8], &'static [u8]); 27] = [
             (
                 PianoRollScale::Dorian,
                 2,
@@ -33799,6 +33805,12 @@ mod tests {
                 0,
                 [60, 63, 64, 66, 67, 69, 70, 72],
                 &[0, 3, 4, 6, 7, 9, 10],
+            ),
+            (
+                PianoRollScale::UkrainianDorianFlatTwo,
+                0,
+                [60, 61, 63, 66, 67, 69, 70, 72],
+                &[0, 1, 3, 6, 7, 9, 10],
             ),
             (
                 PianoRollScale::Persian,
