@@ -1123,14 +1123,16 @@ fn parse_bool(value: &str, description: &str) -> Result<bool, String> {
 fn parse_scale_name(value: &str) -> Result<&'static [u8], String> {
     match value {
         "major" => Ok(&[0, 2, 4, 5, 7, 9, 11]),
+        "dorian" => Ok(&[0, 2, 3, 5, 7, 9, 10]),
+        "phrygian" => Ok(&[0, 1, 3, 5, 7, 8, 10]),
+        "lydian" => Ok(&[0, 2, 4, 6, 7, 9, 11]),
+        "mixolydian" => Ok(&[0, 2, 4, 5, 7, 9, 10]),
         "natural-minor" => Ok(&[0, 2, 3, 5, 7, 8, 10]),
+        "locrian" => Ok(&[0, 1, 3, 5, 6, 8, 10]),
         "harmonic-minor" => Ok(&[0, 2, 3, 5, 7, 8, 11]),
         "major-pentatonic" => Ok(&[0, 2, 4, 7, 9]),
         "minor-pentatonic" => Ok(&[0, 3, 5, 7, 10]),
-        _ => Err(
-            "scale name must be major, natural-minor, harmonic-minor, major-pentatonic, or minor-pentatonic"
-                .to_owned(),
-        ),
+        _ => Err("scale name must be major, dorian, phrygian, lydian, mixolydian, natural-minor, locrian, harmonic-minor, major-pentatonic, or minor-pentatonic".to_owned()),
     }
 }
 
@@ -3800,7 +3802,7 @@ fn delete_time_marker(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_clip_indices, parse_rgb_hex};
+    use super::{parse_clip_indices, parse_rgb_hex, parse_scale_name};
 
     #[test]
     fn parses_channel_rgb_in_hex_form_with_optional_prefix() {
@@ -3816,5 +3818,21 @@ mod tests {
         assert!(parse_clip_indices("1").is_err());
         assert!(parse_clip_indices("1,,2").is_err());
         assert!(parse_clip_indices("one,2").is_err());
+    }
+
+    #[test]
+    fn parses_diatonic_modes_for_scale_constrained_randomization() {
+        assert_eq!(parse_scale_name("dorian"), Ok(&[0, 2, 3, 5, 7, 9, 10][..]));
+        assert_eq!(
+            parse_scale_name("phrygian"),
+            Ok(&[0, 1, 3, 5, 7, 8, 10][..])
+        );
+        assert_eq!(parse_scale_name("lydian"), Ok(&[0, 2, 4, 6, 7, 9, 11][..]));
+        assert_eq!(
+            parse_scale_name("mixolydian"),
+            Ok(&[0, 2, 4, 5, 7, 9, 10][..])
+        );
+        assert_eq!(parse_scale_name("locrian"), Ok(&[0, 1, 3, 5, 6, 8, 10][..]));
+        assert!(parse_scale_name("unknown").is_err());
     }
 }

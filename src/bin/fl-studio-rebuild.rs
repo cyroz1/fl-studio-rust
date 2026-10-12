@@ -1462,17 +1462,27 @@ impl PianoRollSnap {
 enum PianoRollScale {
     None,
     Major,
+    Dorian,
+    Phrygian,
+    Lydian,
+    Mixolydian,
     NaturalMinor,
+    Locrian,
     HarmonicMinor,
     MajorPentatonic,
     MinorPentatonic,
 }
 
 impl PianoRollScale {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 11] = [
         Self::None,
         Self::Major,
+        Self::Dorian,
+        Self::Phrygian,
+        Self::Lydian,
+        Self::Mixolydian,
         Self::NaturalMinor,
+        Self::Locrian,
         Self::HarmonicMinor,
         Self::MajorPentatonic,
         Self::MinorPentatonic,
@@ -1482,7 +1492,12 @@ impl PianoRollScale {
         match self {
             Self::None => "None",
             Self::Major => "Major",
+            Self::Dorian => "Dorian",
+            Self::Phrygian => "Phrygian",
+            Self::Lydian => "Lydian",
+            Self::Mixolydian => "Mixolydian",
             Self::NaturalMinor => "Natural minor",
+            Self::Locrian => "Locrian",
             Self::HarmonicMinor => "Harmonic minor",
             Self::MajorPentatonic => "Major pentatonic",
             Self::MinorPentatonic => "Minor pentatonic",
@@ -1490,22 +1505,22 @@ impl PianoRollScale {
     }
 
     fn contains(self, key: u16, root: u8) -> bool {
-        let intervals: &[u8] = match self {
-            Self::None => return true,
-            Self::Major => &[0, 2, 4, 5, 7, 9, 11],
-            Self::NaturalMinor => &[0, 2, 3, 5, 7, 8, 10],
-            Self::HarmonicMinor => &[0, 2, 3, 5, 7, 8, 11],
-            Self::MajorPentatonic => &[0, 2, 4, 7, 9],
-            Self::MinorPentatonic => &[0, 3, 5, 7, 10],
-        };
-        intervals.contains(&(((key % 12 + 12 - u16::from(root)) % 12) as u8))
+        self == Self::None
+            || self
+                .intervals()
+                .contains(&(((key % 12 + 12 - u16::from(root)) % 12) as u8))
     }
 
     fn intervals(self) -> &'static [u8] {
         match self {
             Self::None => &[],
             Self::Major => &[0, 2, 4, 5, 7, 9, 11],
+            Self::Dorian => &[0, 2, 3, 5, 7, 9, 10],
+            Self::Phrygian => &[0, 1, 3, 5, 7, 8, 10],
+            Self::Lydian => &[0, 2, 4, 6, 7, 9, 11],
+            Self::Mixolydian => &[0, 2, 4, 5, 7, 9, 10],
             Self::NaturalMinor => &[0, 2, 3, 5, 7, 8, 10],
+            Self::Locrian => &[0, 1, 3, 5, 6, 8, 10],
             Self::HarmonicMinor => &[0, 2, 3, 5, 7, 8, 11],
             Self::MajorPentatonic => &[0, 2, 4, 7, 9],
             Self::MinorPentatonic => &[0, 3, 5, 7, 10],
@@ -1537,7 +1552,12 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
     let last_pitch_class = usize::from(*pitches.last()? % 12);
     let scales = [
         PianoRollScale::Major,
+        PianoRollScale::Dorian,
+        PianoRollScale::Phrygian,
+        PianoRollScale::Lydian,
+        PianoRollScale::Mixolydian,
         PianoRollScale::NaturalMinor,
+        PianoRollScale::Locrian,
         PianoRollScale::HarmonicMinor,
         PianoRollScale::MajorPentatonic,
         PianoRollScale::MinorPentatonic,
@@ -1582,6 +1602,11 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
                 PianoRollScale::HarmonicMinor => 1,
                 PianoRollScale::MajorPentatonic => 0,
                 PianoRollScale::MinorPentatonic => -1,
+                PianoRollScale::Dorian => -2,
+                PianoRollScale::Phrygian => -3,
+                PianoRollScale::Lydian => -4,
+                PianoRollScale::Mixolydian => -5,
+                PianoRollScale::Locrian => -6,
                 PianoRollScale::None => unreachable!("None is not a detection candidate"),
             };
             let candidate = DetectedPianoRollScale { root, scale };
@@ -33391,6 +33416,50 @@ mod tests {
                 scale: PianoRollScale::MajorPentatonic,
             })
         );
+    }
+
+    #[test]
+    fn piano_roll_modes_use_documented_intervals_and_auto_detection() {
+        let cases = [
+            (
+                PianoRollScale::Dorian,
+                2,
+                [62, 64, 65, 67, 69, 71, 72, 74],
+                [0, 2, 3, 5, 7, 9, 10],
+            ),
+            (
+                PianoRollScale::Phrygian,
+                4,
+                [64, 65, 67, 69, 71, 72, 74, 76],
+                [0, 1, 3, 5, 7, 8, 10],
+            ),
+            (
+                PianoRollScale::Lydian,
+                5,
+                [65, 67, 69, 71, 72, 74, 76, 77],
+                [0, 2, 4, 6, 7, 9, 11],
+            ),
+            (
+                PianoRollScale::Mixolydian,
+                7,
+                [67, 69, 71, 72, 74, 76, 77, 79],
+                [0, 2, 4, 5, 7, 9, 10],
+            ),
+            (
+                PianoRollScale::Locrian,
+                11,
+                [71, 72, 74, 76, 77, 79, 81, 83],
+                [0, 1, 3, 5, 6, 8, 10],
+            ),
+        ];
+
+        for (scale, root, pitches, intervals) in cases {
+            assert_eq!(scale.intervals(), intervals);
+            assert_eq!(
+                detect_piano_roll_scale(&pitches),
+                Some(DetectedPianoRollScale { root, scale })
+            );
+        }
     }
 
     #[test]
