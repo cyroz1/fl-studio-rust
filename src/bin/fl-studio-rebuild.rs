@@ -26961,7 +26961,7 @@ impl DawUi {
                 save_template = ui.button("Save learned mappings as template").clicked();
             });
         });
-        ui.small("General MIDI Ch. 1 maps CC 7 to output gain and CC 64 to Play/Pause. User templates save learned CC assignments for reuse with another input.");
+        ui.small("Built-ins: General MIDI Ch. 1 maps CC 7 to output gain and CC 64 to Play/Pause; MIDI Expression Ch. 1 maps CC 11 to output gain. User templates save learned CC assignments for reuse with another input.");
         if let Some(index) = apply_template_index {
             self.apply_midi_controller_template(index);
         }
@@ -29942,18 +29942,29 @@ fn load_midi_controller_templates() -> Vec<MidiControllerTemplate> {
 }
 
 fn built_in_midi_controller_templates() -> Vec<MidiControllerTemplate> {
-    vec![MidiControllerTemplate {
-        name: "General MIDI Ch. 1 (CC 7 + CC 64)".to_owned(),
-        output_gain: Some(MidiControllerCcBinding {
-            channel: 0,
-            controller: 7,
-        }),
-        play_pause: Some(MidiControllerCcBinding {
-            channel: 0,
-            controller: 64,
-        }),
-        built_in: true,
-    }]
+    vec![
+        MidiControllerTemplate {
+            name: "General MIDI Ch. 1 (CC 7 + CC 64)".to_owned(),
+            output_gain: Some(MidiControllerCcBinding {
+                channel: 0,
+                controller: 7,
+            }),
+            play_pause: Some(MidiControllerCcBinding {
+                channel: 0,
+                controller: 64,
+            }),
+            built_in: true,
+        },
+        MidiControllerTemplate {
+            name: "MIDI Expression Ch. 1 (CC 11)".to_owned(),
+            output_gain: Some(MidiControllerCcBinding {
+                channel: 0,
+                controller: 11,
+            }),
+            play_pause: None,
+            built_in: true,
+        },
+    ]
 }
 
 fn save_midi_output_gain_mapping(mapping: Option<&MidiControlChangeMapping>) -> Result<(), String> {
@@ -33777,7 +33788,7 @@ mod tests {
     #[test]
     fn built_in_general_midi_controller_template_uses_channel_one_ccs() {
         let templates = built_in_midi_controller_templates();
-        assert_eq!(templates.len(), 1);
+        assert_eq!(templates.len(), 2);
         assert_eq!(templates[0].name, "General MIDI Ch. 1 (CC 7 + CC 64)");
         assert!(templates[0].built_in);
         assert_eq!(
@@ -33794,6 +33805,16 @@ mod tests {
                 controller: 64,
             })
         );
+        assert_eq!(templates[1].name, "MIDI Expression Ch. 1 (CC 11)");
+        assert!(templates[1].built_in);
+        assert_eq!(
+            templates[1].output_gain,
+            Some(MidiControllerCcBinding {
+                channel: 0,
+                controller: 11,
+            })
+        );
+        assert_eq!(templates[1].play_pause, None);
         assert!(serialize_midi_controller_templates(&templates).is_empty());
     }
 
