@@ -4,10 +4,11 @@ use std::hash::{Hash, Hasher};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use clap_probe::{ClapInspectionResponse, ClapInspectionState};
 use eframe::egui::{self, Align2, Color32, FontId, Id, PointerButton, Sense, Stroke, Vec2};
 use flp_rebuild::audio::{
     AudioAccess, AudioDeviceCatalog, AudioEngine, AudioSettings, MIXER_TRACK_METER_COUNT,
@@ -47,6 +48,8 @@ use flp_rebuild::{
 };
 use md5::{Digest, Md5};
 
+#[path = "fl-studio-rebuild/clap_probe.rs"]
+mod clap_probe;
 mod midi_input;
 mod midi_output;
 
@@ -530,7 +533,18 @@ fn matching_vst3_candidate<'a>(
 }
 
 fn main() -> eframe::Result {
-    let initial_project = std::env::args_os().nth(1).map(PathBuf::from);
+    let args = std::env::args_os().collect::<Vec<_>>();
+    if args
+        .get(1)
+        .is_some_and(|argument| argument == std::ffi::OsStr::new(clap_probe::PROBE_FLAG))
+    {
+        let Some(path) = args.get(2).map(PathBuf::from) else {
+            eprintln!("CLAP descriptor probe needs a bundle or library path");
+            std::process::exit(2);
+        };
+        std::process::exit(clap_probe::run_child(&path));
+    }
+    let initial_project = args.get(1).map(PathBuf::from);
     let ui_scale = load_ui_scale();
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
@@ -2605,6 +2619,9 @@ struct DawUi {
     playlist_track_zoom: f32,
     playlist_waveform_mode: PlaylistWaveformMode,
     plugin_candidates: Vec<PluginCandidate>,
+    clap_inspection_sender: Sender<PathBuf>,
+    clap_inspection_receiver: Receiver<ClapInspectionResponse>,
+    clap_inspection_states: BTreeMap<PathBuf, ClapInspectionState>,
     vst3_host: Option<Vst3HostRuntime>,
     channel_vst3_instances: BTreeMap<u16, u64>,
     audio_catalog: AudioDeviceCatalog,
@@ -2921,6 +2938,8 @@ impl DawUi {
                 MIN_WINDOW_INNER_HEIGHT / ui_scale,
             )));
         let plugin_candidates = scan_installed_plugins().candidates;
+        let (clap_inspection_sender, clap_inspection_receiver) =
+            clap_probe::start_worker(creation.egui_ctx.clone());
         let audio_catalog = enumerate_devices();
         let (midi_message_sender, midi_message_receiver) =
             mpsc::sync_channel(midi_input::MIDI_INPUT_QUEUE_CAPACITY);
@@ -3164,6 +3183,9 @@ impl DawUi {
             playlist_track_zoom: 1.0,
             playlist_waveform_mode: PlaylistWaveformMode::Combined,
             plugin_candidates,
+            clap_inspection_sender,
+            clap_inspection_receiver,
+            clap_inspection_states: BTreeMap::new(),
             vst3_host: None,
             channel_vst3_instances: BTreeMap::new(),
             audio_catalog,
@@ -25986,9 +26008,18 @@ impl DawUi {
         let mut refresh = false;
         let mut load_path = None;
         let mut restore_request = None;
+        let mut inspect_clap_path = None;
         let mut open_id = None;
         let mut close_id = None;
         let mut parameter_edits = Vec::new();
+
+        while let Ok((path, result)) = self.clap_inspection_receiver.try_recv() {
+            let state = match result {
+                Ok(descriptors) => ClapInspectionState::Inspected(descriptors),
+                Err(error) => ClapInspectionState::Failed(error),
+            };
+            self.clap_inspection_states.insert(path, state);
+        }
 
         ui.horizontal(|ui| {
             ui.strong("Installed plug-ins");
@@ -26224,21 +26255,93 @@ impl DawUi {
             ui.heading(format!("Detected CLAP plug-ins ({})", clap_candidates.len()));
             ui.label(
                 egui::RichText::new(
-                    "CLAP bundles are discovered from CLAP_PATH and common platform folders. Hosting is not available yet.",
+                    "Inspect reads CLAP descriptors in a short-lived helper process. Audio hosting is not available yet.",
                 )
                 .color(MUTED),
             );
             for candidate in clap_candidates {
+                let inspection = self.clap_inspection_states.get(&candidate.path);
                 egui::Frame::new()
                     .fill(PANEL_DARK)
                     .inner_margin(6.0)
                     .show(ui, |ui| {
-                        ui.strong(&candidate.name);
-                        ui.small(candidate.path.display().to_string());
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.strong(&candidate.name);
+                                ui.small(candidate.path.display().to_string());
+                            });
+                            if matches!(inspection, Some(ClapInspectionState::Inspecting)) {
+                                ui.spinner();
+                                ui.small("Inspecting");
+                            } else if ui
+                                .button(if matches!(
+                                    inspection,
+                                    Some(ClapInspectionState::Failed(_))
+                                ) {
+                                    "Retry inspection"
+                                } else {
+                                    "Inspect descriptors"
+                                })
+                                .clicked()
+                            {
+                                inspect_clap_path = Some(candidate.path.clone());
+                            }
+                        });
+
+                        match inspection {
+                            Some(ClapInspectionState::Inspected(descriptors)) => {
+                                if descriptors.is_empty() {
+                                    ui.small("No CLAP descriptors were reported.");
+                                }
+                                for descriptor in descriptors {
+                                    ui.separator();
+                                    ui.horizontal(|ui| {
+                                        ui.strong(&descriptor.name);
+                                        ui.small(format!("ID: {}", descriptor.id));
+                                    });
+                                    let mut details = Vec::new();
+                                    if let Some(vendor) = &descriptor.vendor {
+                                        details.push(vendor.clone());
+                                    }
+                                    if let Some(version) = &descriptor.version {
+                                        details.push(format!("v{version}"));
+                                    }
+                                    if !details.is_empty() {
+                                        ui.small(details.join(" · "));
+                                    }
+                                    if let Some(description) = &descriptor.description {
+                                        ui.small(description);
+                                    }
+                                    if !descriptor.features.is_empty() {
+                                        ui.small(format!(
+                                            "Features: {}",
+                                            descriptor.features.join(", ")
+                                        ));
+                                    }
+                                }
+                            }
+                            Some(ClapInspectionState::Failed(error)) => {
+                                ui.colored_label(ORANGE, error);
+                            }
+                            Some(ClapInspectionState::Inspecting) | None => {}
+                        }
                     });
                 ui.add_space(3.0);
             }
         });
+
+        if let Some(path) = inspect_clap_path {
+            self.clap_inspection_states
+                .insert(path.clone(), ClapInspectionState::Inspecting);
+            if self.clap_inspection_sender.send(path.clone()).is_err() {
+                self.clap_inspection_states.insert(
+                    path,
+                    ClapInspectionState::Failed("descriptor worker is unavailable".to_owned()),
+                );
+            } else {
+                ui.ctx().request_repaint();
+            }
+        }
 
         if let Some((path, channel_id, class_uid)) = restore_request {
             self.load_installed_vst3(&path, Some(channel_id), class_uid);
