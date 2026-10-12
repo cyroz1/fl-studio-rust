@@ -624,6 +624,8 @@ jobs:
           xdotool windowfocus --sync "$mixer_window"
           xdotool mousemove 287 16 click 1
           sleep 0.3
+          ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
+            -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/view-menu-playlist-active.png"
           xdotool mousemove 350 344 click 1
           sleep 1
           detached_plugins_window=$(xdotool search --onlyvisible --name '^Plug-ins$' | head -n 1 || true)
