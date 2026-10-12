@@ -1488,10 +1488,11 @@ enum PianoRollScale {
     WholeHalfDiminished,
     HalfWholeDiminished,
     Altered,
+    SuperLocrianDoubleFlatSeven,
 }
 
 impl PianoRollScale {
-    const ALL: [Self; 28] = [
+    const ALL: [Self; 29] = [
         Self::None,
         Self::Major,
         Self::HarmonicMajor,
@@ -1520,6 +1521,7 @@ impl PianoRollScale {
         Self::WholeHalfDiminished,
         Self::HalfWholeDiminished,
         Self::Altered,
+        Self::SuperLocrianDoubleFlatSeven,
     ];
 
     fn label(self) -> &'static str {
@@ -1552,6 +1554,7 @@ impl PianoRollScale {
             Self::WholeHalfDiminished => "Whole-half diminished",
             Self::HalfWholeDiminished => "Half-whole diminished",
             Self::Altered => "Altered",
+            Self::SuperLocrianDoubleFlatSeven => "Super-Locrian bb7",
         }
     }
 
@@ -1592,6 +1595,7 @@ impl PianoRollScale {
             Self::WholeHalfDiminished => &[0, 2, 3, 5, 6, 8, 9, 11],
             Self::HalfWholeDiminished => &[0, 1, 3, 4, 6, 7, 9, 10],
             Self::Altered => &[0, 1, 3, 4, 6, 8, 10],
+            Self::SuperLocrianDoubleFlatSeven => &[0, 1, 3, 4, 6, 8, 9],
         }
     }
 }
@@ -1646,6 +1650,7 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
         PianoRollScale::WholeHalfDiminished,
         PianoRollScale::HalfWholeDiminished,
         PianoRollScale::Altered,
+        PianoRollScale::SuperLocrianDoubleFlatSeven,
     ];
     let mut best: Option<((usize, usize, usize, i8), DetectedPianoRollScale)> = None;
 
@@ -1721,6 +1726,7 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
                 PianoRollScale::WholeHalfDiminished => -9,
                 PianoRollScale::HalfWholeDiminished => -10,
                 PianoRollScale::Altered => -13,
+                PianoRollScale::SuperLocrianDoubleFlatSeven => -22,
                 PianoRollScale::None => unreachable!("None is not a detection candidate"),
             };
             let candidate = DetectedPianoRollScale { root, scale };
@@ -33673,7 +33679,7 @@ mod tests {
 
     #[test]
     fn piano_roll_scales_use_documented_intervals_and_auto_detection() {
-        let cases: [(PianoRollScale, u8, [u16; 8], &'static [u8]); 15] = [
+        let cases: [(PianoRollScale, u8, [u16; 8], &'static [u8]); 16] = [
             (
                 PianoRollScale::Dorian,
                 2,
@@ -33763,6 +33769,12 @@ mod tests {
                 0,
                 [60, 61, 63, 64, 66, 67, 69, 70],
                 &[0, 1, 3, 4, 6, 7, 9, 10],
+            ),
+            (
+                PianoRollScale::SuperLocrianDoubleFlatSeven,
+                0,
+                [60, 61, 63, 64, 66, 68, 69, 72],
+                &[0, 1, 3, 4, 6, 8, 9],
             ),
         ];
 
