@@ -18,7 +18,8 @@ use flp_rebuild::audio::{
     MixerTrackPeakMeters, enumerate_devices,
 };
 use flp_rebuild::media::{
-    AudioWaveform, SamplePathResolver, decode_audio_preview, decode_audio_waveform,
+    AudioWaveform, DecodedAudio, SamplePathResolver, WaveformPeak, decode_audio_file,
+    decode_audio_preview, decode_audio_waveform, write_audio_range_to_wav,
 };
 use flp_rebuild::midi::{MidiChannelMapping, MidiFile};
 use flp_rebuild::plugins::{PluginCandidate, PluginFormat, scan_installed_plugins};
@@ -2327,6 +2328,20 @@ struct PendingBrowserPreview {
     worker: thread::JoinHandle<()>,
 }
 
+struct PendingSampleEditor {
+    path: PathBuf,
+    receiver: Receiver<Result<(DecodedAudio, Vec<WaveformPeak>), String>>,
+    worker: thread::JoinHandle<()>,
+}
+
+struct SampleEditorState {
+    path: PathBuf,
+    audio: DecodedAudio,
+    waveform: Vec<WaveformPeak>,
+    selection_start: usize,
+    selection_end: usize,
+}
+
 struct PendingBackupWrite {
     source_path: PathBuf,
     purpose: BackupPurpose,
@@ -2740,6 +2755,8 @@ struct DawUi {
     browser_preview_cancelled: bool,
     browser_preview_path: Option<PathBuf>,
     browser_preview_error: Option<String>,
+    sample_editor: Option<SampleEditorState>,
+    sample_editor_pending: Option<PendingSampleEditor>,
     audio_test_tone: bool,
     audio_monitor_input: bool,
     project_info_open: bool,
@@ -3338,6 +3355,8 @@ impl DawUi {
             browser_preview_cancelled: false,
             browser_preview_path: None,
             browser_preview_error: None,
+            sample_editor: None,
+            sample_editor_pending: None,
             audio_test_tone: false,
             audio_monitor_input: false,
             project_info_open: false,
@@ -9547,6 +9566,7 @@ impl DawUi {
         };
         let mut play_to_end = false;
         let mut stop_preview = false;
+        let mut edit_sample = false;
         let mut volume_changed = false;
         let mut looping_changed = false;
         let mut seek_frame = None;
@@ -9572,6 +9592,10 @@ impl DawUi {
                     .on_hover_text("Play selected sample to the end")
                     .clicked();
                 stop_preview = ui.small_button("■").on_hover_text("Stop preview").clicked();
+                edit_sample = ui
+                    .small_button("Trim…")
+                    .on_hover_text("Open a sample editor and save a selected range as a new WAV")
+                    .clicked();
             });
             if loaded_preview && frame_count > 0 {
                 ui.horizontal(|ui| {
@@ -9631,7 +9655,202 @@ impl DawUi {
             self.stop_browser_preview();
         }
         if play_to_end {
-            self.request_browser_preview(path, true);
+            self.request_browser_preview(path.clone(), true);
+        }
+        if edit_sample {
+            self.request_sample_editor(path, ui.ctx());
+        }
+    }
+
+    fn request_sample_editor(&mut self, path: PathBuf, ctx: &egui::Context) {
+        if self.sample_editor_pending.is_some() {
+            self.status = "A sample is already loading in the editor".to_owned();
+            return;
+        }
+        let worker_path = path.clone();
+        let (sender, receiver) = mpsc::channel();
+        let worker = match thread::Builder::new()
+            .name("sample-editor-decode".to_owned())
+            .spawn(move || {
+                let result = decode_audio_file(&worker_path).and_then(|audio| {
+                    if audio.frame_count() == 0 {
+                        return Err("sample contains no audio frames".to_owned());
+                    }
+                    let waveform = sample_editor_waveform(&audio, 2_048);
+                    Ok((audio, waveform))
+                });
+                let _ = sender.send(result);
+            }) {
+            Ok(worker) => worker,
+            Err(error) => {
+                self.status = format!("Could not start sample editor: {error}");
+                return;
+            }
+        };
+        self.sample_editor = None;
+        self.sample_editor_pending = Some(PendingSampleEditor {
+            path: path.clone(),
+            receiver,
+            worker,
+        });
+        self.status = format!("Loading sample editor for {}…", path.display());
+        ctx.request_repaint_after(Duration::from_millis(40));
+    }
+
+    fn poll_sample_editor(&mut self, ctx: &egui::Context) {
+        let completed = self.sample_editor_pending.as_ref().and_then(|pending| {
+            match pending.receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Disconnected) => {
+                    Some(Err("sample editor decoder stopped unexpectedly".to_owned()))
+                }
+                Err(TryRecvError::Empty) => None,
+            }
+        });
+        if let Some(result) = completed
+            && let Some(pending) = self.sample_editor_pending.take()
+        {
+            let _ = pending.worker.join();
+            match result {
+                Ok((audio, waveform)) => {
+                    let selection_end = audio.frame_count();
+                    self.status = format!("Sample editor loaded {}", pending.path.display());
+                    self.sample_editor = Some(SampleEditorState {
+                        path: pending.path,
+                        audio,
+                        waveform,
+                        selection_start: 0,
+                        selection_end,
+                    });
+                }
+                Err(error) => {
+                    self.status = format!("Could not load sample editor: {error}");
+                }
+            }
+        }
+        if self.sample_editor_pending.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(40));
+        }
+    }
+
+    fn sample_editor_window(&mut self, ctx: &egui::Context) {
+        if self.sample_editor_pending.is_some() {
+            egui::Window::new("Sample editor")
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Decoding audio and building waveform…");
+                    });
+                });
+            return;
+        }
+
+        let Some(editor) = self.sample_editor.as_mut() else {
+            return;
+        };
+        let mut open = true;
+        let mut save_selection = false;
+        egui::Window::new("Sample editor")
+            .open(&mut open)
+            .default_size(Vec2::new(720.0, 430.0))
+            .resizable(true)
+            .show(ctx, |ui| {
+                let sample_rate = editor.audio.sample_rate.max(1);
+                let frame_count = editor.audio.frame_count();
+                let duration = frame_count as f64 / f64::from(sample_rate);
+                let channel_label = if editor.audio.channels.len() == 1 {
+                    "Mono".to_owned()
+                } else {
+                    format!("{} channels", editor.audio.channels.len())
+                };
+                ui.label(egui::RichText::new(editor.path.display().to_string()).color(MUTED));
+                ui.label(format!(
+                    "{channel_label} · {sample_rate} Hz · {duration:.2} seconds"
+                ));
+                paint_sample_editor_waveform(
+                    ui,
+                    &editor.waveform,
+                    frame_count,
+                    editor.selection_start..editor.selection_end,
+                );
+                let start_max = editor.selection_end.saturating_sub(1);
+                ui.add(
+                    egui::Slider::new(&mut editor.selection_start, 0..=start_max)
+                        .text("Selection start frame"),
+                );
+                let end_min = editor.selection_start.saturating_add(1).min(frame_count);
+                ui.add(
+                    egui::Slider::new(&mut editor.selection_end, end_min..=frame_count)
+                        .text("Selection end frame"),
+                );
+                let selection_duration =
+                    (editor.selection_end - editor.selection_start) as f64 / f64::from(sample_rate);
+                ui.label(format!(
+                    "Selected {:.3}–{:.3}s · {:.3}s",
+                    editor.selection_start as f64 / f64::from(sample_rate),
+                    editor.selection_end as f64 / f64::from(sample_rate),
+                    selection_duration
+                ));
+                ui.horizontal(|ui| {
+                    if ui.button("Save selection as WAV…").clicked() {
+                        save_selection = true;
+                    }
+                    ui.small("The source file stays unchanged.");
+                });
+            });
+        if !open {
+            self.sample_editor = None;
+        }
+        if save_selection {
+            self.save_sample_editor_selection();
+        }
+    }
+
+    fn save_sample_editor_selection(&mut self) {
+        let Some(editor) = self.sample_editor.as_ref() else {
+            return;
+        };
+        let default_name = editor
+            .path
+            .file_stem()
+            .map(|stem| format!("{}-trim.wav", stem.to_string_lossy()))
+            .unwrap_or_else(|| "trimmed-sample.wav".to_owned());
+        let mut dialog = rfd::FileDialog::new()
+            .set_file_name(default_name)
+            .add_filter("WAV audio", &["wav"]);
+        if let Some(parent) = editor.path.parent() {
+            dialog = dialog.set_directory(parent);
+        }
+        let Some(mut output_path) = dialog.save_file() else {
+            return;
+        };
+        if !output_path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("wav"))
+        {
+            output_path.set_extension("wav");
+        }
+        if fs::canonicalize(&editor.path)
+            .ok()
+            .zip(fs::canonicalize(&output_path).ok())
+            .is_some_and(|(source, destination)| source == destination)
+        {
+            self.status = "Choose a new file to keep the source sample unchanged".to_owned();
+            return;
+        }
+        match write_audio_range_to_wav(
+            &editor.audio,
+            editor.selection_start..editor.selection_end,
+            &output_path,
+        ) {
+            Ok(()) => {
+                self.status = format!("Saved trimmed sample {}", output_path.display());
+            }
+            Err(error) => {
+                self.status = format!("Could not save trimmed sample: {error}");
+            }
         }
     }
 
@@ -27373,6 +27592,8 @@ impl eframe::App for DawUi {
         self.poll_vst3_stream();
         self.poll_sampler_stream();
         self.poll_browser_preview(ui.ctx());
+        self.poll_sample_editor(ui.ctx());
+        self.sample_editor_window(ui.ctx());
         self.reap_audio_render_workers();
         self.reap_song_render_workers();
         self.reap_vst3_workers();
@@ -30772,6 +30993,100 @@ fn note_name(key: u16) -> String {
     format!("{}{}", NAMES[(key % 12) as usize], key / 12)
 }
 
+fn sample_editor_waveform(audio: &DecodedAudio, maximum_buckets: usize) -> Vec<WaveformPeak> {
+    let frame_count = audio.frame_count();
+    if frame_count == 0 || audio.channels.is_empty() || maximum_buckets == 0 {
+        return Vec::new();
+    }
+    let bucket_count = frame_count.min(maximum_buckets);
+    (0..bucket_count)
+        .map(|bucket| {
+            let start = (bucket as u128 * frame_count as u128 / bucket_count as u128) as usize;
+            let end = ((bucket + 1) as u128 * frame_count as u128 / bucket_count as u128) as usize;
+            let mut peak = WaveformPeak {
+                minimum: 0.0,
+                maximum: 0.0,
+            };
+            let mut initialized = false;
+            for channel in &audio.channels {
+                for sample in &channel[start..end] {
+                    let sample = if sample.is_finite() { *sample } else { 0.0 };
+                    if initialized {
+                        peak.minimum = peak.minimum.min(sample);
+                        peak.maximum = peak.maximum.max(sample);
+                    } else {
+                        peak.minimum = sample;
+                        peak.maximum = sample;
+                        initialized = true;
+                    }
+                }
+            }
+            peak
+        })
+        .collect()
+}
+
+fn paint_sample_editor_waveform(
+    ui: &mut egui::Ui,
+    peaks: &[WaveformPeak],
+    frame_count: usize,
+    selection: std::ops::Range<usize>,
+) {
+    let width = ui.available_width().max(180.0);
+    let (response, painter) = ui.allocate_painter(Vec2::new(width, 144.0), Sense::hover());
+    let rect = response.rect;
+    painter.rect_filled(rect, egui::CornerRadius::same(5), PANEL);
+    if frame_count == 0 || peaks.is_empty() {
+        return;
+    }
+    let frame_scale = rect.width() / frame_count as f32;
+    let selection_rect = egui::Rect::from_min_max(
+        egui::pos2(
+            rect.left() + selection.start as f32 * frame_scale,
+            rect.top(),
+        ),
+        egui::pos2(
+            rect.left() + selection.end as f32 * frame_scale,
+            rect.bottom(),
+        ),
+    );
+    painter.rect_filled(
+        selection_rect,
+        egui::CornerRadius::ZERO,
+        Color32::from_rgba_unmultiplied(75, 180, 145, 30),
+    );
+    let center_y = rect.center().y;
+    let amplitude = (rect.height() * 0.47).max(1.0);
+    painter.line_segment(
+        [
+            egui::pos2(rect.left(), center_y),
+            egui::pos2(rect.right(), center_y),
+        ],
+        Stroke::new(1.0, BORDER),
+    );
+    for (index, peak) in peaks.iter().enumerate() {
+        let x = rect.left() + (index as f32 + 0.5) * rect.width() / peaks.len() as f32;
+        let sample_start = index * frame_count / peaks.len();
+        let sample_end = (index + 1) * frame_count / peaks.len();
+        let selected = sample_start < selection.end && selection.start < sample_end;
+        let color = if selected {
+            Color32::from_rgb(112, 192, 168)
+        } else {
+            Color32::from_rgb(117, 145, 151)
+        };
+        let minimum = peak.minimum.clamp(-1.0, 1.0);
+        let maximum = peak.maximum.clamp(-1.0, 1.0);
+        painter.line_segment(
+            [
+                egui::pos2(x, center_y - maximum * amplitude),
+                egui::pos2(x, center_y - minimum * amplitude),
+            ],
+            Stroke::new(1.0, color),
+        );
+    }
+    ui.add_space(4.0);
+}
+
 fn draw_audio_clip_waveform(
     painter: &egui::Painter,
     clip_rect: egui::Rect,
@@ -32005,19 +32320,19 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        ActivePlaylistClipDrag, Arrangement, ChannelDisplayFilter, DetachedWindowKind,
-        DetachedWindowPlacement, DetachedWindowPlacements, DetectedPianoRollScale, FlpDocument,
-        MainView, MidiControlChangeMapping, PIANO_ROLL_RULER_HEIGHT, Pattern, PatternController,
-        PatternNote, PianoRollChordStamp, PianoRollGrid, PianoRollScale, PianoRollSnap,
-        PlaylistClip, PlaylistClipDragKind, PlaylistTempoMap, PlaylistTrack, PluginCandidate,
-        PluginFormat, TimeSelectionShift, TouchGesture, TouchTapTracker, TouchZoomConfig,
-        WINDOW_LAYOUT_PRESETS_HEADER, WindowLayoutPreset, audio_recording_start_tick_with_offset,
-        candidate_matches_vst_identity, candidate_mixer_controls,
-        candidate_mixer_stereo_separation, detect_chord_name, detect_piano_roll_channel_scale,
-        detect_piano_roll_scale, encode_midi_device_id, encode_midi_device_selections,
-        first_available_playlist_track, midi_button_press_edge, next_piano_roll_note_group,
-        note_from_grid_position, parse_midi_control_change_mapping, parse_midi_device_selections,
-        parse_window_layout_presets, piano_roll_color_group_note_ids,
+        ActivePlaylistClipDrag, Arrangement, ChannelDisplayFilter, DecodedAudio,
+        DetachedWindowKind, DetachedWindowPlacement, DetachedWindowPlacements,
+        DetectedPianoRollScale, FlpDocument, MainView, MidiControlChangeMapping,
+        PIANO_ROLL_RULER_HEIGHT, Pattern, PatternController, PatternNote, PianoRollChordStamp,
+        PianoRollGrid, PianoRollScale, PianoRollSnap, PlaylistClip, PlaylistClipDragKind,
+        PlaylistTempoMap, PlaylistTrack, PluginCandidate, PluginFormat, TimeSelectionShift,
+        TouchGesture, TouchTapTracker, TouchZoomConfig, WINDOW_LAYOUT_PRESETS_HEADER, WaveformPeak,
+        WindowLayoutPreset, audio_recording_start_tick_with_offset, candidate_matches_vst_identity,
+        candidate_mixer_controls, candidate_mixer_stereo_separation, detect_chord_name,
+        detect_piano_roll_channel_scale, detect_piano_roll_scale, encode_midi_device_id,
+        encode_midi_device_selections, first_available_playlist_track, midi_button_press_edge,
+        next_piano_roll_note_group, note_from_grid_position, parse_midi_control_change_mapping,
+        parse_midi_device_selections, parse_window_layout_presets, piano_roll_color_group_note_ids,
         piano_roll_controller_stroke_points, piano_roll_controller_value_at,
         piano_roll_controller_value_range, piano_roll_discard_length_edit,
         piano_roll_duplicate_offset, piano_roll_key_at_y, piano_roll_note_group_members,
@@ -32033,9 +32348,10 @@ mod tests {
         playlist_pattern_recording_placement_tick, playlist_seek_tick_to_frame,
         playlist_signature_at_tick, playlist_song_position_label, playlist_track_group_range,
         playlist_track_is_hidden, recolor_piano_roll_notes, recording_input_targets,
-        serialize_window_layout_presets, snap_note_tick, toggle_piano_roll_note_group_selection,
-        touch_pan_zoom_scroll_offset, track_two_finger_tap, update_channel_rack_selection,
-        update_layer_child_selection, update_piano_roll_box_selection, zoom_to_fit,
+        sample_editor_waveform, serialize_window_layout_presets, snap_note_tick,
+        toggle_piano_roll_note_group_selection, touch_pan_zoom_scroll_offset, track_two_finger_tap,
+        update_channel_rack_selection, update_layer_child_selection,
+        update_piano_roll_box_selection, zoom_to_fit,
     };
 
     fn playlist_track_arrangement_fixture(clips: &[(u32, u32, u16)]) -> Arrangement {
@@ -32677,6 +32993,40 @@ mod tests {
         assert!(!midi_button_press_edge(0, &mut active));
         assert!(!midi_button_press_edge(0, &mut active));
         assert!(midi_button_press_edge(64, &mut active));
+    }
+
+    #[test]
+    fn sample_editor_waveform_buckets_all_frames_across_channels() {
+        let audio = DecodedAudio {
+            sample_rate: 48_000,
+            channels: vec![
+                vec![-0.5, 0.25, -1.0, 0.3, 0.0, 1.0],
+                vec![0.1, 0.2, 0.3, 0.4, -0.2, -0.4],
+            ],
+        };
+        let peaks = sample_editor_waveform(&audio, 3);
+        assert_eq!(peaks.len(), 3);
+        assert_eq!(
+            peaks[0],
+            WaveformPeak {
+                minimum: -0.5,
+                maximum: 0.25
+            }
+        );
+        assert_eq!(
+            peaks[1],
+            WaveformPeak {
+                minimum: -1.0,
+                maximum: 0.4
+            }
+        );
+        assert_eq!(
+            peaks[2],
+            WaveformPeak {
+                minimum: -0.4,
+                maximum: 1.0
+            }
+        );
     }
 
     #[test]

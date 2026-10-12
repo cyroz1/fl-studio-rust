@@ -1,8 +1,10 @@
 //! Project media path resolution.
 
-use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use symphonia::core::audio::sample::Sample;
 use symphonia::core::codecs::audio::AudioDecoderOptions;
@@ -17,6 +19,7 @@ const MAX_DECODED_SAMPLE_BYTES: usize = 512 * 1024 * 1024;
 const WAVEFORM_SPECTRUM_WINDOW: usize = 256;
 const WAVEFORM_SPECTRUM_COLUMNS: usize = 128;
 const WAVEFORM_SPECTRUM_BANDS: usize = 32;
+static NEXT_AUDIO_WAV_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Fully decoded, deinterleaved audio for sample preview and offline processing.
 #[derive(Clone, Debug, PartialEq)]
@@ -118,6 +121,184 @@ impl DecodedAudio {
     pub fn duration_seconds(&self) -> f64 {
         self.frame_count() as f64 / f64::from(self.sample_rate)
     }
+}
+
+/// Write a frame range from decoded audio to a new interleaved 32-bit-float WAV file.
+///
+/// The destination is replaced atomically after the complete WAV has been written. The source
+/// buffer is never modified.
+pub fn write_audio_range_to_wav(
+    audio: &DecodedAudio,
+    frame_range: Range<usize>,
+    output_path: impl AsRef<Path>,
+) -> Result<(), String> {
+    let output_path = output_path.as_ref();
+    if !output_path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("wav"))
+    {
+        return Err("trimmed audio output must use the .wav extension".to_owned());
+    }
+    if !(8_000..=384_000).contains(&audio.sample_rate) {
+        return Err("sample rate must be between 8,000 and 384,000 Hz".to_owned());
+    }
+    let channel_count = audio.channels.len();
+    if channel_count == 0 || channel_count > usize::from(u16::MAX) {
+        return Err("audio must contain between 1 and 65,535 channels".to_owned());
+    }
+    let source_frames = audio.frame_count();
+    if audio
+        .channels
+        .iter()
+        .any(|channel| channel.len() != source_frames)
+    {
+        return Err("audio channels must have the same frame count".to_owned());
+    }
+    if frame_range.start >= frame_range.end || frame_range.end > source_frames {
+        return Err("audio selection must contain frames from the source".to_owned());
+    }
+    let block_align = channel_count
+        .checked_mul(std::mem::size_of::<f32>())
+        .and_then(|bytes| u16::try_from(bytes).ok())
+        .ok_or_else(|| "audio has too many channels for a WAV frame".to_owned())?;
+    let byte_rate = audio
+        .sample_rate
+        .checked_mul(u32::from(block_align))
+        .ok_or_else(|| "WAV byte rate overflow".to_owned())?;
+    let frames = frame_range.end - frame_range.start;
+    let data_bytes = frames
+        .checked_mul(usize::from(block_align))
+        .and_then(|bytes| u32::try_from(bytes).ok())
+        .ok_or_else(|| "selected audio exceeds the RIFF/WAVE size limit".to_owned())?;
+    let riff_size = 36_u32
+        .checked_add(data_bytes)
+        .ok_or_else(|| "selected audio exceeds the RIFF/WAVE size limit".to_owned())?;
+
+    let parent = output_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = output_path
+        .file_name()
+        .ok_or_else(|| "WAV output path must include a file name".to_owned())?
+        .to_string_lossy();
+    let mut temporary_path = None;
+    let mut temporary_file = None;
+    for _ in 0..32 {
+        let id = NEXT_AUDIO_WAV_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(".{file_name}.tmp-{}-{id}", std::process::id()));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                temporary_path = Some(candidate);
+                temporary_file = Some(file);
+                break;
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(format!(
+                    "could not create temporary WAV beside {}: {error}",
+                    output_path.display()
+                ));
+            }
+        }
+    }
+    let temporary_path =
+        temporary_path.ok_or_else(|| "could not reserve a temporary WAV file name".to_owned())?;
+    let write_result = (|| {
+        let file = temporary_file.as_mut().expect("temporary WAV file is open");
+        file.write_all(b"RIFF")
+            .and_then(|()| file.write_all(&riff_size.to_le_bytes()))
+            .and_then(|()| file.write_all(b"WAVEfmt "))
+            .and_then(|()| file.write_all(&16_u32.to_le_bytes()))
+            .and_then(|()| file.write_all(&3_u16.to_le_bytes()))
+            .and_then(|()| file.write_all(&(channel_count as u16).to_le_bytes()))
+            .and_then(|()| file.write_all(&audio.sample_rate.to_le_bytes()))
+            .and_then(|()| file.write_all(&byte_rate.to_le_bytes()))
+            .and_then(|()| file.write_all(&block_align.to_le_bytes()))
+            .and_then(|()| file.write_all(&32_u16.to_le_bytes()))
+            .and_then(|()| file.write_all(b"data"))
+            .and_then(|()| file.write_all(&data_bytes.to_le_bytes()))
+            .map_err(|error| format!("could not write WAV header: {error}"))?;
+        let mut frame_bytes = Vec::with_capacity(usize::from(block_align));
+        for frame in frame_range.clone() {
+            frame_bytes.clear();
+            for channel in &audio.channels {
+                let sample = channel[frame];
+                frame_bytes.extend_from_slice(
+                    &(if sample.is_finite() { sample } else { 0.0 }).to_le_bytes(),
+                );
+            }
+            file.write_all(&frame_bytes)
+                .map_err(|error| format!("could not write WAV samples: {error}"))?;
+        }
+        file.sync_all()
+            .map_err(|error| format!("could not finalize WAV samples: {error}"))
+    })();
+    drop(temporary_file);
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(error);
+    }
+    let backup = if fs::symlink_metadata(output_path).is_ok() {
+        if !output_path.is_file() {
+            let _ = fs::remove_file(&temporary_path);
+            return Err("WAV output path is not a file".to_owned());
+        }
+        let (backup_directory, backup_path) = loop {
+            let id = NEXT_AUDIO_WAV_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+            let directory = parent.join(format!(".{file_name}.backup-{}-{id}", std::process::id()));
+            match fs::create_dir(&directory) {
+                Ok(()) => break (directory.clone(), directory.join("previous.wav")),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    let _ = fs::remove_file(&temporary_path);
+                    return Err(format!("could not reserve WAV backup path: {error}"));
+                }
+            }
+        };
+        if let Err(error) = fs::rename(output_path, &backup_path) {
+            let _ = fs::remove_file(&temporary_path);
+            let _ = fs::remove_dir(&backup_directory);
+            return Err(format!(
+                "could not preserve existing output {}: {error}",
+                output_path.display()
+            ));
+        }
+        Some((backup_directory, backup_path))
+    } else {
+        None
+    };
+    if let Err(error) = fs::rename(&temporary_path, output_path) {
+        let restore_error = backup.as_ref().and_then(|(directory, backup_path)| {
+            fs::rename(backup_path, output_path).err().map(|restore| {
+                format!(
+                    "; could not restore prior output from {}: {restore}",
+                    directory.display()
+                )
+            })
+        });
+        let _ = fs::remove_file(&temporary_path);
+        if let Some((directory, backup_path)) = &backup
+            && restore_error.is_none()
+        {
+            let _ = fs::remove_file(backup_path);
+            let _ = fs::remove_dir(directory);
+        }
+        return Err(format!(
+            "could not save trimmed WAV to {}: {error}{}",
+            output_path.display(),
+            restore_error.unwrap_or_default()
+        ));
+    }
+    if let Some((directory, backup_path)) = backup {
+        let _ = fs::remove_file(backup_path);
+        let _ = fs::remove_dir(directory);
+    }
+    Ok(())
 }
 
 /// Decode common FL Studio sample formats by inspecting file content rather than its extension.
@@ -1122,6 +1303,54 @@ mod tests {
         bytes.extend_from_slice(&(samples.len() as u32).to_le_bytes());
         bytes.extend_from_slice(&samples);
         bytes
+    }
+
+    #[test]
+    fn writes_selected_audio_frames_to_a_new_interleaved_float_wav() {
+        let root = fixture_root();
+        fs::create_dir_all(&root).expect("fixture directory should be created");
+        let output_path = root.join("trimmed.wav");
+        let audio = DecodedAudio {
+            sample_rate: 48_000,
+            channels: vec![vec![0.0, 0.25, -0.5, 1.0], vec![0.1, 0.2, 0.3, 0.4]],
+        };
+
+        write_audio_range_to_wav(&audio, 1..3, &output_path)
+            .expect("selected source frames should be written");
+
+        let bytes = fs::read(&output_path).expect("trimmed WAV should be readable");
+        assert_eq!(&bytes[..4], b"RIFF");
+        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 52);
+        assert_eq!(&bytes[8..16], b"WAVEfmt ");
+        assert_eq!(u16::from_le_bytes(bytes[20..22].try_into().unwrap()), 3);
+        assert_eq!(u16::from_le_bytes(bytes[22..24].try_into().unwrap()), 2);
+        assert_eq!(
+            u32::from_le_bytes(bytes[24..28].try_into().unwrap()),
+            48_000
+        );
+        assert_eq!(&bytes[36..40], b"data");
+        assert_eq!(u32::from_le_bytes(bytes[40..44].try_into().unwrap()), 16);
+        let samples = bytes[44..]
+            .chunks_exact(4)
+            .map(|sample| f32::from_le_bytes(sample.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(samples, [0.25, 0.2, -0.5, 0.3]);
+        fs::remove_dir_all(root).expect("fixture directory should be removed");
+    }
+
+    #[test]
+    fn rejects_empty_or_out_of_bounds_audio_selections() {
+        let root = fixture_root();
+        fs::create_dir_all(&root).expect("fixture directory should be created");
+        let output_path = root.join("trimmed.wav");
+        let audio = DecodedAudio {
+            sample_rate: 48_000,
+            channels: vec![vec![0.0, 0.25]],
+        };
+        assert!(write_audio_range_to_wav(&audio, 1..1, &output_path).is_err());
+        assert!(write_audio_range_to_wav(&audio, 0..3, &output_path).is_err());
+        assert!(!output_path.exists());
+        fs::remove_dir_all(root).expect("fixture directory should be removed");
     }
 
     fn wav_with_sampler_loop_fixture() -> Vec<u8> {
