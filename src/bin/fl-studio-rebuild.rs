@@ -977,6 +977,17 @@ struct TouchGesture {
 }
 
 #[derive(Clone, Copy)]
+struct TouchTapTracker {
+    start_time: f64,
+    start_center: egui::Pos2,
+    last_center: egui::Pos2,
+    travel: f32,
+    zoom_change: f32,
+    rotation_change: f32,
+    eligible: bool,
+}
+
+#[derive(Clone, Copy)]
 struct TouchZoomConfig {
     origin: Vec2,
     current: Vec2,
@@ -984,6 +995,73 @@ struct TouchZoomConfig {
     max: Vec2,
     horizontal: bool,
     vertical: bool,
+}
+
+fn track_two_finger_tap(
+    tracker: &mut Option<TouchTapTracker>,
+    viewport: egui::Rect,
+    body_inset: Vec2,
+    touch: Option<egui::MultiTouchInfo>,
+    any_touches: bool,
+    now: f64,
+) -> Option<egui::Pos2> {
+    let body = egui::Rect::from_min_max(viewport.min + body_inset, viewport.max);
+    if let Some(touch) = touch {
+        if tracker.is_none()
+            && touch.num_touches == 2
+            && body.contains(touch.start_pos)
+            && body.contains(touch.center_pos)
+        {
+            *tracker = Some(TouchTapTracker {
+                start_time: touch.start_time,
+                start_center: touch.center_pos,
+                last_center: touch.center_pos,
+                travel: 0.0,
+                zoom_change: 0.0,
+                rotation_change: 0.0,
+                eligible: true,
+            });
+        }
+
+        if let Some(candidate) = tracker.as_mut() {
+            if candidate.start_time != touch.start_time || touch.num_touches != 2 {
+                candidate.eligible = false;
+            } else {
+                candidate.travel += candidate.last_center.distance(touch.center_pos);
+                candidate.travel = candidate
+                    .travel
+                    .max(touch.center_pos.distance(candidate.start_center));
+                candidate.zoom_change += if touch.zoom_delta.is_finite() && touch.zoom_delta > 0.0 {
+                    touch.zoom_delta.ln().abs()
+                } else {
+                    f32::INFINITY
+                };
+                candidate.rotation_change += touch.rotation_delta.abs();
+                candidate.last_center = touch.center_pos;
+                candidate.eligible &= body.contains(touch.center_pos);
+            }
+        }
+    } else if !any_touches
+        && let Some(candidate) = tracker.take()
+        && candidate.eligible
+        && (0.0..=0.5).contains(&(now - candidate.start_time))
+        && candidate.travel <= 12.0
+        && candidate.zoom_change <= 0.04
+        && candidate.rotation_change <= 0.04
+    {
+        return Some(candidate.start_center);
+    }
+    None
+}
+
+fn zoom_to_fit(available_span: f32, content_span_at_unit_zoom: f32, min: f32, max: f32) -> f32 {
+    if !available_span.is_finite()
+        || !content_span_at_unit_zoom.is_finite()
+        || content_span_at_unit_zoom <= 0.0
+    {
+        return min;
+    }
+    (available_span.max(1.0) / content_span_at_unit_zoom).clamp(min, max)
 }
 
 fn touch_pan_zoom_scroll_offset(
@@ -2375,6 +2453,7 @@ struct DawUi {
     piano_roll_zoom: f32,
     piano_roll_vertical_zoom: f32,
     piano_roll_touch_gesture_active: bool,
+    piano_roll_touch_tap: Option<TouchTapTracker>,
     piano_roll_window_detached: bool,
     mixer_window_detached: bool,
     channel_rack_window_detached: bool,
@@ -2390,6 +2469,7 @@ struct DawUi {
     piano_roll_grid_viewport: Option<egui::Rect>,
     piano_roll_grid_scroll_offset: Vec2,
     playlist_touch_gesture_active: bool,
+    playlist_touch_tap: Option<TouchTapTracker>,
     playlist_pending_scroll_offset: Option<Vec2>,
     playlist_grid_viewport: Option<egui::Rect>,
     playlist_grid_scroll_offset: Vec2,
@@ -2928,6 +3008,7 @@ impl DawUi {
             piano_roll_zoom: 0.10,
             piano_roll_vertical_zoom: 1.0,
             piano_roll_touch_gesture_active: false,
+            piano_roll_touch_tap: None,
             piano_roll_window_detached: false,
             mixer_window_detached: false,
             channel_rack_window_detached: false,
@@ -2943,6 +3024,7 @@ impl DawUi {
             piano_roll_grid_viewport: None,
             piano_roll_grid_scroll_offset: Vec2::ZERO,
             playlist_touch_gesture_active: false,
+            playlist_touch_tap: None,
             playlist_pending_scroll_offset: None,
             playlist_grid_viewport: None,
             playlist_grid_scroll_offset: Vec2::ZERO,
@@ -10354,6 +10436,18 @@ impl DawUi {
         let label_width = 178.0;
         let touch_gesture = ui.input(|input| input.multi_touch());
         let any_touches = ui.input(|input| input.any_touches());
+        let input_time = ui.input(|input| input.time);
+        let touch_zoom_out_full = self.playlist_grid_viewport.is_some_and(|viewport| {
+            track_two_finger_tap(
+                &mut self.playlist_touch_tap,
+                viewport,
+                Vec2::new(label_width, 34.0),
+                touch_gesture,
+                any_touches,
+                input_time,
+            )
+            .is_some()
+        });
         if let (Some(viewport), Some(touch)) = (self.playlist_grid_viewport, touch_gesture)
             && touch.start_pos.x >= viewport.left() + label_width
             && touch.start_pos.y >= viewport.top() + 34.0
@@ -10390,7 +10484,6 @@ impl DawUi {
             self.playlist_touch_gesture_active = false;
         }
 
-        let grid_width = ((max_tick as f32 * self.timeline_zoom) + 240.0).clamp(1800.0, 50000.0);
         let last_track = arrangement
             .clips
             .iter()
@@ -10406,6 +10499,27 @@ impl DawUi {
             .max()
             .unwrap_or(15)
             .max(15);
+        if touch_zoom_out_full && let Some(viewport) = self.playlist_grid_viewport {
+            self.timeline_zoom = zoom_to_fit(
+                viewport.width() - label_width - 240.0,
+                max_tick as f32,
+                0.04,
+                0.24,
+            );
+            self.playlist_track_zoom = zoom_to_fit(
+                viewport.height() - 34.0,
+                f32::from(last_track + 1) * 27.0,
+                0.6,
+                2.0,
+            );
+            self.playlist_pending_scroll_offset = Some(Vec2::ZERO);
+        }
+        let visible_width = self
+            .playlist_grid_viewport
+            .map_or_else(|| ui.available_width(), |rect| rect.width());
+        let min_grid_width = (visible_width - label_width).max(240.0);
+        let grid_width =
+            ((max_tick as f32 * self.timeline_zoom) + 240.0).clamp(min_grid_width, 50000.0);
         let row_height = 27.0 * self.playlist_track_zoom;
         let tick_scale = self.timeline_zoom;
         let playhead_tick = self.current_playhead_tick();
@@ -20454,6 +20568,18 @@ impl DawUi {
         }
         let touch_gesture = ui.input(|input| input.multi_touch());
         let any_touches = ui.input(|input| input.any_touches());
+        let input_time = ui.input(|input| input.time);
+        let touch_zoom_out_full = self.piano_roll_grid_viewport.is_some_and(|viewport| {
+            track_two_finger_tap(
+                &mut self.piano_roll_touch_tap,
+                viewport,
+                Vec2::new(68.0, PIANO_ROLL_RULER_HEIGHT),
+                touch_gesture,
+                any_touches,
+                input_time,
+            )
+            .is_some()
+        });
         if let (Some(viewport), Some(touch)) = (self.piano_roll_grid_viewport, touch_gesture)
             && touch.start_pos.x >= viewport.left() + 68.0
             && touch.start_pos.y >= viewport.top() + PIANO_ROLL_RULER_HEIGHT
@@ -20513,7 +20639,6 @@ impl DawUi {
                 );
             }
         }
-        let tick_scale = (self.piano_roll_zoom * 0.9).clamp(0.05, 0.22);
         let max_tick = pattern
             .notes
             .iter()
@@ -20539,7 +20664,27 @@ impl DawUi {
             .max()
             .unwrap_or(ppq as u32 * 16)
             .max(ppq as u32 * 16);
-        let grid_width = (max_tick as f32 * tick_scale + 160.0).clamp(1400.0, 30000.0);
+        if touch_zoom_out_full && let Some(viewport) = self.piano_roll_grid_viewport {
+            self.piano_roll_zoom = zoom_to_fit(
+                viewport.width() - keyboard_width - 160.0,
+                max_tick as f32 * 0.9,
+                0.06,
+                0.24,
+            );
+            self.piano_roll_vertical_zoom = zoom_to_fit(
+                viewport.height() - PIANO_ROLL_RULER_HEIGHT,
+                f32::from(key_high - key_low + 1) * 13.0,
+                0.5,
+                2.0,
+            );
+            self.piano_roll_pending_scroll_offset = Some(Vec2::ZERO);
+        }
+        let tick_scale = (self.piano_roll_zoom * 0.9).clamp(0.05, 0.22);
+        let visible_width = self
+            .piano_roll_grid_viewport
+            .map_or_else(|| ui.available_width(), |rect| rect.width());
+        let min_grid_width = (visible_width - keyboard_width).max(240.0);
+        let grid_width = (max_tick as f32 * tick_scale + 160.0).clamp(min_grid_width, 30000.0);
         let grid_height = f32::from(key_high - key_low + 1) * key_height;
         let mut notes_to_add = Vec::new();
         let pending_scroll_offset = self.piano_roll_pending_scroll_offset.take();
@@ -30967,12 +31112,13 @@ mod tests {
         MainView, PIANO_ROLL_RULER_HEIGHT, Pattern, PatternController, PatternNote,
         PianoRollChordStamp, PianoRollGrid, PianoRollScale, PianoRollSnap, PlaylistClip,
         PlaylistClipDragKind, PlaylistTempoMap, PlaylistTrack, PluginCandidate, PluginFormat,
-        TimeSelectionShift, TouchGesture, TouchZoomConfig, WINDOW_LAYOUT_PRESETS_HEADER,
-        WindowLayoutPreset, audio_recording_start_tick_with_offset, candidate_matches_vst_identity,
-        candidate_mixer_controls, candidate_mixer_stereo_separation, detect_chord_name,
-        detect_piano_roll_channel_scale, detect_piano_roll_scale, encode_midi_device_selections,
-        first_available_playlist_track, next_piano_roll_note_group, note_from_grid_position,
-        parse_midi_device_selections, parse_window_layout_presets, piano_roll_color_group_note_ids,
+        TimeSelectionShift, TouchGesture, TouchTapTracker, TouchZoomConfig,
+        WINDOW_LAYOUT_PRESETS_HEADER, WindowLayoutPreset, audio_recording_start_tick_with_offset,
+        candidate_matches_vst_identity, candidate_mixer_controls,
+        candidate_mixer_stereo_separation, detect_chord_name, detect_piano_roll_channel_scale,
+        detect_piano_roll_scale, encode_midi_device_selections, first_available_playlist_track,
+        next_piano_roll_note_group, note_from_grid_position, parse_midi_device_selections,
+        parse_window_layout_presets, piano_roll_color_group_note_ids,
         piano_roll_controller_stroke_points, piano_roll_controller_value_at,
         piano_roll_controller_value_range, piano_roll_discard_length_edit,
         piano_roll_duplicate_offset, piano_roll_key_at_y, piano_roll_note_group_members,
@@ -30989,8 +31135,8 @@ mod tests {
         playlist_signature_at_tick, playlist_song_position_label, playlist_track_group_range,
         playlist_track_is_hidden, recolor_piano_roll_notes, serialize_window_layout_presets,
         snap_note_tick, toggle_piano_roll_note_group_selection, touch_pan_zoom_scroll_offset,
-        update_channel_rack_selection, update_layer_child_selection,
-        update_piano_roll_box_selection,
+        track_two_finger_tap, update_channel_rack_selection, update_layer_child_selection,
+        update_piano_roll_box_selection, zoom_to_fit,
     };
 
     fn playlist_track_arrangement_fixture(clips: &[(u32, u32, u16)]) -> Arrangement {
@@ -32591,6 +32737,112 @@ mod tests {
             "4e6f2076696577"
         );
         assert!(parse_window_layout_presets(&contents).is_empty());
+    }
+
+    #[test]
+    fn two_finger_tap_is_detected_when_both_touches_release_quickly() {
+        let viewport = eframe::egui::Rect::from_min_size(
+            eframe::egui::pos2(100.0, 50.0),
+            eframe::egui::vec2(400.0, 300.0),
+        );
+        let center = eframe::egui::pos2(260.0, 150.0);
+        let mut tracker: Option<TouchTapTracker> = None;
+        let touch = eframe::egui::MultiTouchInfo {
+            start_time: 5.0,
+            start_pos: center,
+            center_pos: center,
+            num_touches: 2,
+            zoom_delta: 1.0,
+            zoom_delta_2d: eframe::egui::Vec2::splat(1.0),
+            rotation_delta: 0.0,
+            translation_delta: eframe::egui::Vec2::ZERO,
+            force: 0.0,
+        };
+
+        assert_eq!(
+            track_two_finger_tap(
+                &mut tracker,
+                viewport,
+                eframe::egui::vec2(68.0, PIANO_ROLL_RULER_HEIGHT),
+                Some(touch),
+                true,
+                5.05,
+            ),
+            None
+        );
+        assert_eq!(
+            track_two_finger_tap(
+                &mut tracker,
+                viewport,
+                eframe::egui::vec2(68.0, PIANO_ROLL_RULER_HEIGHT),
+                None,
+                false,
+                5.2,
+            ),
+            Some(center)
+        );
+        assert!(tracker.is_none());
+    }
+
+    #[test]
+    fn two_finger_tap_rejects_a_drag_or_pinch() {
+        let viewport = eframe::egui::Rect::from_min_size(
+            eframe::egui::pos2(100.0, 50.0),
+            eframe::egui::vec2(400.0, 300.0),
+        );
+        let center = eframe::egui::pos2(260.0, 150.0);
+        let mut tracker: Option<TouchTapTracker> = None;
+        let mut touch = eframe::egui::MultiTouchInfo {
+            start_time: 5.0,
+            start_pos: center,
+            center_pos: center,
+            num_touches: 2,
+            zoom_delta: 1.0,
+            zoom_delta_2d: eframe::egui::Vec2::splat(1.0),
+            rotation_delta: 0.0,
+            translation_delta: eframe::egui::Vec2::ZERO,
+            force: 0.0,
+        };
+
+        track_two_finger_tap(
+            &mut tracker,
+            viewport,
+            eframe::egui::vec2(68.0, PIANO_ROLL_RULER_HEIGHT),
+            Some(touch),
+            true,
+            5.05,
+        );
+        touch.center_pos.x += 15.0;
+        touch.zoom_delta = 1.1;
+        assert_eq!(
+            track_two_finger_tap(
+                &mut tracker,
+                viewport,
+                eframe::egui::vec2(68.0, PIANO_ROLL_RULER_HEIGHT),
+                Some(touch),
+                true,
+                5.1,
+            ),
+            None
+        );
+        assert_eq!(
+            track_two_finger_tap(
+                &mut tracker,
+                viewport,
+                eframe::egui::vec2(68.0, PIANO_ROLL_RULER_HEIGHT),
+                None,
+                false,
+                5.2,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn fit_zoom_stays_within_editor_zoom_limits() {
+        assert!((zoom_to_fit(800.0, 400.0, 0.04, 0.24) - 0.24).abs() < f32::EPSILON);
+        assert!((zoom_to_fit(100.0, 10_000.0, 0.04, 0.24) - 0.04).abs() < f32::EPSILON);
+        assert!((zoom_to_fit(200.0, 1_000.0, 0.04, 0.24) - 0.2).abs() < f32::EPSILON);
     }
 
     #[test]
