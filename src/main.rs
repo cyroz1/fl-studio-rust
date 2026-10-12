@@ -1132,6 +1132,7 @@ fn parse_scale_name(value: &str) -> Result<&'static [u8], String> {
         "lydian-augmented" => Ok(&[0, 2, 4, 6, 8, 9, 11]),
         "lydian-dominant" => Ok(&[0, 2, 4, 6, 7, 9, 10]),
         "mixolydian" => Ok(&[0, 2, 4, 5, 7, 9, 10]),
+        "mixolydian-b6" => Ok(&[0, 2, 4, 5, 7, 8, 10]),
         "natural-minor" => Ok(&[0, 2, 3, 5, 7, 8, 10]),
         "locrian" => Ok(&[0, 1, 3, 5, 6, 8, 10]),
         "harmonic-minor" => Ok(&[0, 2, 3, 5, 7, 8, 11]),
@@ -1143,7 +1144,7 @@ fn parse_scale_name(value: &str) -> Result<&'static [u8], String> {
         "whole-half-diminished" => Ok(&[0, 2, 3, 5, 6, 8, 9, 11]),
         "half-whole-diminished" => Ok(&[0, 1, 3, 4, 6, 7, 9, 10]),
         "altered" => Ok(&[0, 1, 3, 4, 6, 8, 10]),
-        _ => Err("scale name must be major, harmonic-major, dorian, dorian-b2, phrygian, phrygian-dominant, lydian, lydian-augmented, lydian-dominant, mixolydian, natural-minor, locrian, harmonic-minor, melodic-minor, blues, major-pentatonic, minor-pentatonic, whole-tone, whole-half-diminished, half-whole-diminished, or altered".to_owned()),
+        _ => Err("scale name must be major, harmonic-major, dorian, dorian-b2, phrygian, phrygian-dominant, lydian, lydian-augmented, lydian-dominant, mixolydian, mixolydian-b6, natural-minor, locrian, harmonic-minor, melodic-minor, blues, major-pentatonic, minor-pentatonic, whole-tone, whole-half-diminished, half-whole-diminished, or altered".to_owned()),
     }
 }
 
