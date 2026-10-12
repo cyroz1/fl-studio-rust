@@ -1492,6 +1492,28 @@ fn randomizer_offset(state: &mut u64, range: i32, negative: bool, bipolar: bool)
     }
 }
 
+fn randomizer_pitch_in_scale(
+    state: &mut u64,
+    key: u16,
+    range: u8,
+    bipolar: bool,
+    scale_root: u8,
+    scale_intervals: &[u8],
+) -> u16 {
+    let key = i32::from(key);
+    let range = i32::from(range);
+    let lower = if bipolar { key - range } else { key }.max(0);
+    let upper = (key + range).min(131);
+    let candidates = (lower..=upper)
+        .filter(|candidate| note_pitch_in_scale(*candidate, scale_root, scale_intervals))
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return key as u16;
+    }
+    let choice = (next_randomizer_value(state) % candidates.len() as u64) as usize;
+    candidates[choice] as u16
+}
+
 fn note_index_in_scope(note_index: usize, selected_indices: Option<&HashSet<usize>>) -> bool {
     selected_indices.is_none_or(|indices| indices.contains(&note_index))
 }
@@ -9984,7 +10006,26 @@ impl FlpDocument {
         channel_id: u16,
         options: RandomizerOptions,
     ) -> Result<usize, FlpError> {
-        self.randomize_pattern_notes_in_scope(pattern_id, channel_id, None, options)
+        self.randomize_pattern_notes_in_scope(pattern_id, channel_id, None, options, None)
+    }
+
+    /// Randomizes notes while keeping generated pitches in a selected scale.
+    /// Pitches are chosen from scale notes within the configured range and direction.
+    pub fn randomize_pattern_notes_with_scale(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        options: RandomizerOptions,
+        scale_root: u8,
+        scale_intervals: &[u8],
+    ) -> Result<usize, FlpError> {
+        self.randomize_pattern_notes_in_scope(
+            pattern_id,
+            channel_id,
+            None,
+            options,
+            Some((scale_root, scale_intervals)),
+        )
     }
 
     /// Randomizes only selected notes, preserving the seeded behavior within that selection.
@@ -9995,7 +10036,32 @@ impl FlpDocument {
         note_indices: &[usize],
         options: RandomizerOptions,
     ) -> Result<usize, FlpError> {
-        self.randomize_pattern_notes_in_scope(pattern_id, channel_id, Some(note_indices), options)
+        self.randomize_pattern_notes_in_scope(
+            pattern_id,
+            channel_id,
+            Some(note_indices),
+            options,
+            None,
+        )
+    }
+
+    /// Randomizes only selected notes while keeping generated pitches in a selected scale.
+    pub fn randomize_pattern_note_selection_with_scale(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: &[usize],
+        options: RandomizerOptions,
+        scale_root: u8,
+        scale_intervals: &[u8],
+    ) -> Result<usize, FlpError> {
+        self.randomize_pattern_notes_in_scope(
+            pattern_id,
+            channel_id,
+            Some(note_indices),
+            options,
+            Some((scale_root, scale_intervals)),
+        )
     }
 
     fn randomize_pattern_notes_in_scope(
@@ -10004,6 +10070,7 @@ impl FlpDocument {
         channel_id: u16,
         note_indices: Option<&[usize]>,
         options: RandomizerOptions,
+        scale: Option<(u8, &[u8])>,
     ) -> Result<usize, FlpError> {
         let RandomizerOptions {
             seed,
@@ -10023,6 +10090,17 @@ impl FlpDocument {
         if pitch_range_semitones > 24 {
             return Err(FlpError::UnsupportedEdit(
                 "randomizer pitch range must be between 0 and 24 semitones",
+            ));
+        }
+        if let Some((scale_root, scale_intervals)) = scale
+            && (scale_root > 11
+                || scale_intervals.is_empty()
+                || scale_intervals.first() != Some(&0)
+                || scale_intervals.iter().any(|interval| *interval > 11)
+                || scale_intervals.windows(2).any(|pair| pair[0] >= pair[1]))
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "randomizer scale intervals must be unique, ordered pitch classes starting at zero",
             ));
         }
         let patterns = self.patterns()?;
@@ -10073,8 +10151,6 @@ impl FlpDocument {
                 pan_amount_percent.is_negative(),
                 bipolar,
             );
-            let pitch_offset =
-                randomizer_offset(&mut state, i32::from(pitch_range_semitones), false, bipolar);
             let velocity = if !reset_levels && velocity_amount_percent == 0 {
                 note.velocity
             } else {
@@ -10085,10 +10161,27 @@ impl FlpDocument {
             } else {
                 (pan_base + pan_offset).clamp(0, 127) as u8
             };
-            let key = if pitch_range_semitones == 0 {
-                note.key
-            } else {
-                (i32::from(note.key) + pitch_offset).clamp(0, i32::from(u16::MAX)) as u16
+            let key = match scale {
+                Some((scale_root, scale_intervals)) if pitch_range_semitones > 0 => {
+                    randomizer_pitch_in_scale(
+                        &mut state,
+                        note.key,
+                        pitch_range_semitones,
+                        bipolar,
+                        scale_root,
+                        scale_intervals,
+                    )
+                }
+                _ if pitch_range_semitones > 0 => {
+                    let pitch_offset = randomizer_offset(
+                        &mut state,
+                        i32::from(pitch_range_semitones),
+                        false,
+                        bipolar,
+                    );
+                    (i32::from(note.key) + pitch_offset).clamp(0, i32::from(u16::MAX)) as u16
+                }
+                _ => note.key,
             };
             if velocity != note.velocity || pan != note.pan || key != note.key {
                 edits.push((note_index, velocity, pan, key));
@@ -14318,9 +14411,9 @@ mod tests {
         PATTERN_NOTE_SLIDE_FLAG, PLAYLIST_CLIP_MUTED_FLAG, PatternControllerEdit, PatternNote,
         PatternNoteEdit, PatternNoteRotation, PayloadEncoding, PlaylistClipEdit,
         PlaylistClipTarget, PlaylistTrackEdit, ProjectInfoEdit, ProjectSettingsEdit,
-        RiffMachineOptions, RiffMachineQuantizeMode, ScaleLevelsOptions, TimeMarkerEdit,
-        apply_mixer_pan, apply_mixer_stereo_separation, midi::MidiChannelMapping,
-        midi::MidiEventKind, midi::MidiFile, parse_vst_plugin_state_metadata,
+        RandomizerOptions, RiffMachineOptions, RiffMachineQuantizeMode, ScaleLevelsOptions,
+        TimeMarkerEdit, apply_mixer_pan, apply_mixer_stereo_separation, midi::MidiChannelMapping,
+        midi::MidiEventKind, midi::MidiFile, note_pitch_in_scale, parse_vst_plugin_state_metadata,
         riff_machine_groove_note_timing,
     };
 
@@ -21235,6 +21328,55 @@ mod tests {
         .expect("end-time quantization should succeed");
         assert_eq!(duration, (29, 24));
         assert_eq!(end, (29, 19));
+    }
+
+    #[test]
+    fn randomizer_keeps_generated_pitches_in_the_requested_scale() {
+        let input = pattern_fixture(
+            &[
+                note_record(0, 0, 96, 61, 80),
+                note_record(96, 0, 96, 65, 80),
+                note_record(192, 0, 96, 68, 80),
+                note_record(288, 0, 96, 72, 80),
+                note_record(0, 1, 96, 61, 80),
+            ],
+            &[0xFF, 0],
+        );
+        let options = RandomizerOptions {
+            seed: 41,
+            velocity_amount_percent: 0,
+            pan_amount_percent: 0,
+            pitch_range_semitones: 5,
+            bipolar: true,
+            reset_levels: false,
+        };
+        let mut first = FlpDocument::parse(&input).expect("fixture should parse");
+        let mut second = FlpDocument::parse(&input).expect("fixture should parse");
+        let first_changed = first
+            .randomize_pattern_notes_with_scale(7, 0, options, 2, &[0, 2, 4, 5, 7, 9, 11])
+            .expect("scale-aware randomizer should succeed");
+        let second_changed = second
+            .randomize_pattern_notes_with_scale(7, 0, options, 2, &[0, 2, 4, 5, 7, 9, 11])
+            .expect("the same seed should produce the same result");
+
+        assert!(first_changed > 0);
+        assert_eq!(first_changed, second_changed);
+        assert_eq!(
+            first.encode_lossless().unwrap(),
+            second.encode_lossless().unwrap()
+        );
+        let notes = first.patterns().unwrap().remove(0).notes;
+        for (note, original_key) in notes.iter().take(4).zip([61_i32, 65, 68, 72]) {
+            assert_eq!(note.channel_id, 0);
+            assert!(note_pitch_in_scale(
+                i32::from(note.key),
+                2,
+                &[0, 2, 4, 5, 7, 9, 11]
+            ));
+            assert!((i32::from(note.key) - original_key).abs() <= 5);
+        }
+        assert_eq!(notes[4].key, 61);
+        assert_eq!(notes[4].channel_id, 1);
     }
 
     #[test]

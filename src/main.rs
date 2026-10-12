@@ -654,6 +654,28 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 },
             )
         }
+        [command, input, output, pattern_id, channel_id, seed, velocity_amount, pan_amount,
+            pitch_range, bipolar, reset_levels, scale_name, scale_root]
+            if command == "randomize-notes-scale" =>
+        {
+            let scale_intervals = parse_scale_name(scale_name)?;
+            randomize_notes_with_scale(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                RandomizerOptions {
+                    seed: parse_u64(seed, "randomizer seed")?,
+                    velocity_amount_percent: parse_i16(velocity_amount, "velocity amount")?,
+                    pan_amount_percent: parse_i16(pan_amount, "pan amount")?,
+                    pitch_range_semitones: parse_u8(pitch_range, "pitch range")?,
+                    bipolar: parse_bool(bipolar, "bipolar")?,
+                    reset_levels: parse_bool(reset_levels, "reset levels")?,
+                },
+                parse_u8(scale_root, "scale root")?,
+                scale_intervals,
+            )
+        }
         [command, input, output, pattern_id, channel_id, seed, timing_range, velocity_variation]
             if command == "humanize-notes" =>
         {
@@ -1008,6 +1030,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild strum-notes <input.flp> <output.flp> <pattern-id> <channel-id> <spread-ticks> <up|down>\n",
             "  flp-rebuild flam-notes <input.flp> <output.flp> <pattern-id> <channel-id> <stroke-ticks> <velocity-0..127> <before|after>\n",
             "  flp-rebuild randomize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <velocity-amount:-100..100> <pan-amount:-100..100> <pitch-range:0..24> <bipolar:0|1> <reset:0|1>\n",
+            "  flp-rebuild randomize-notes-scale <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <velocity-amount:-100..100> <pan-amount:-100..100> <pitch-range:0..24> <bipolar:0|1> <reset:0|1> <scale-name> <scale-root:0..11>\n",
             "  flp-rebuild humanize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <timing-range-ticks> <velocity-variation-0..100>\n",
             "  flp-rebuild limit-notes <input.flp> <output.flp> <pattern-id> <channel-id> <minimum-key-0..127> <maximum-key-0..127>\n",
             "  flp-rebuild arp-notes <input.flp> <output.flp> <pattern-id> <channel-id> <step-ticks> <range-octaves-1..4> <gate-1..100> <up|down|up-down>\n",
@@ -1094,6 +1117,20 @@ fn parse_bool(value: &str, description: &str) -> Result<bool, String> {
         "0" | "false" => Ok(false),
         "1" | "true" => Ok(true),
         _ => Err(format!("{description} must be 0 or 1")),
+    }
+}
+
+fn parse_scale_name(value: &str) -> Result<&'static [u8], String> {
+    match value {
+        "major" => Ok(&[0, 2, 4, 5, 7, 9, 11]),
+        "natural-minor" => Ok(&[0, 2, 3, 5, 7, 8, 10]),
+        "harmonic-minor" => Ok(&[0, 2, 3, 5, 7, 8, 11]),
+        "major-pentatonic" => Ok(&[0, 2, 4, 7, 9]),
+        "minor-pentatonic" => Ok(&[0, 3, 5, 7, 10]),
+        _ => Err(
+            "scale name must be major, natural-minor, harmonic-minor, major-pentatonic, or minor-pentatonic"
+                .to_owned(),
+        ),
     }
 }
 
@@ -3012,10 +3049,48 @@ fn randomize_notes(
     channel_id: u16,
     options: RandomizerOptions,
 ) -> Result<(), String> {
+    randomize_notes_inner(input, output, pattern_id, channel_id, options, None)
+}
+
+fn randomize_notes_with_scale(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    options: RandomizerOptions,
+    scale_root: u8,
+    scale_intervals: &[u8],
+) -> Result<(), String> {
+    randomize_notes_inner(
+        input,
+        output,
+        pattern_id,
+        channel_id,
+        options,
+        Some((scale_root, scale_intervals)),
+    )
+}
+
+fn randomize_notes_inner(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    options: RandomizerOptions,
+    scale: Option<(u8, &[u8])>,
+) -> Result<(), String> {
     let (_, mut document) = load_document(input)?;
-    let changed = document
-        .randomize_pattern_notes(pattern_id, channel_id, options)
-        .map_err(|error| error.to_string())?;
+    let changed = match scale {
+        Some((scale_root, scale_intervals)) => document.randomize_pattern_notes_with_scale(
+            pattern_id,
+            channel_id,
+            options,
+            scale_root,
+            scale_intervals,
+        ),
+        None => document.randomize_pattern_notes(pattern_id, channel_id, options),
+    }
+    .map_err(|error| error.to_string())?;
     let bytes = document
         .encode_lossless()
         .map_err(|error| format!("could not encode {}: {error}", input.display()))?;

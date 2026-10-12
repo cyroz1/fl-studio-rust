@@ -2550,6 +2550,7 @@ struct DawUi {
     randomizer_pitch_range: u8,
     randomizer_bipolar: bool,
     randomizer_reset_levels: bool,
+    randomizer_snap_to_scale: bool,
     scale_levels_center_percent: i16,
     scale_levels_tension_percent: i16,
     scale_levels_multiplier_percent: u16,
@@ -3121,6 +3122,7 @@ impl DawUi {
             randomizer_pitch_range: 0,
             randomizer_bipolar: true,
             randomizer_reset_levels: false,
+            randomizer_snap_to_scale: false,
             scale_levels_center_percent: 0,
             scale_levels_tension_percent: 0,
             scale_levels_multiplier_percent: 100,
@@ -18029,6 +18031,9 @@ impl DawUi {
                 ui.add(egui::DragValue::new(&mut self.randomizer_seed).prefix("Seed "));
                 ui.checkbox(&mut self.randomizer_bipolar, "Bipolar");
                 ui.checkbox(&mut self.randomizer_reset_levels, "Reset levels first");
+                ui.add_enabled_ui(self.piano_roll_scale != PianoRollScale::None, |ui| {
+                    ui.checkbox(&mut self.randomizer_snap_to_scale, "Keep pitches in scale");
+                });
                 ui.add(
                     egui::Slider::new(&mut self.humanize_timing_range_ticks, 0..=96)
                         .text("Humanize timing (± ticks)"),
@@ -18482,38 +18487,60 @@ impl DawUi {
             let pitch_range = self.randomizer_pitch_range;
             let bipolar = self.randomizer_bipolar;
             let reset_levels = self.randomizer_reset_levels;
+            let scale_root = self.piano_roll_scale_root;
+            let scale_intervals = self.piano_roll_scale.intervals();
+            let snap_to_scale = self.randomizer_snap_to_scale && !scale_intervals.is_empty();
             let result = self
                 .document
                 .as_mut()
                 .ok_or_else(|| "no project is open".to_owned())
                 .and_then(|document| {
                     let result = if edit_selection_only {
-                        document.randomize_pattern_note_selection(
-                            pattern_id,
-                            channel_id,
-                            &selected_quantize_indices,
-                            RandomizerOptions {
-                                seed,
-                                velocity_amount_percent: velocity_amount,
-                                pan_amount_percent: pan_amount,
-                                pitch_range_semitones: pitch_range,
-                                bipolar,
-                                reset_levels,
-                            },
-                        )
+                        let options = RandomizerOptions {
+                            seed,
+                            velocity_amount_percent: velocity_amount,
+                            pan_amount_percent: pan_amount,
+                            pitch_range_semitones: pitch_range,
+                            bipolar,
+                            reset_levels,
+                        };
+                        if snap_to_scale {
+                            document.randomize_pattern_note_selection_with_scale(
+                                pattern_id,
+                                channel_id,
+                                &selected_quantize_indices,
+                                options,
+                                scale_root,
+                                scale_intervals,
+                            )
+                        } else {
+                            document.randomize_pattern_note_selection(
+                                pattern_id,
+                                channel_id,
+                                &selected_quantize_indices,
+                                options,
+                            )
+                        }
                     } else {
-                        document.randomize_pattern_notes(
-                            pattern_id,
-                            channel_id,
-                            RandomizerOptions {
-                                seed,
-                                velocity_amount_percent: velocity_amount,
-                                pan_amount_percent: pan_amount,
-                                pitch_range_semitones: pitch_range,
-                                bipolar,
-                                reset_levels,
-                            },
-                        )
+                        let options = RandomizerOptions {
+                            seed,
+                            velocity_amount_percent: velocity_amount,
+                            pan_amount_percent: pan_amount,
+                            pitch_range_semitones: pitch_range,
+                            bipolar,
+                            reset_levels,
+                        };
+                        if snap_to_scale {
+                            document.randomize_pattern_notes_with_scale(
+                                pattern_id,
+                                channel_id,
+                                options,
+                                scale_root,
+                                scale_intervals,
+                            )
+                        } else {
+                            document.randomize_pattern_notes(pattern_id, channel_id, options)
+                        }
                     };
                     result.map_err(|error| error.to_string())
                 });
@@ -18525,7 +18552,12 @@ impl DawUi {
                         self.dirty = true;
                     }
                     self.status = format!(
-                        "Randomized {changed} notes in pattern {pattern_id}, {edit_scope_description} using seed {seed}"
+                        "Randomized {changed} notes in pattern {pattern_id}, {edit_scope_description} using seed {seed}{}",
+                        if snap_to_scale {
+                            " within the current scale"
+                        } else {
+                            ""
+                        }
                     );
                 }
                 Err(error) => self.status = format!("Could not randomize notes: {error}"),

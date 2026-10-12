@@ -82,6 +82,7 @@ flp-rebuild flip-notes <input.flp> <output.flp> <pattern-id> <channel-id>
 flp-rebuild strum-notes <input.flp> <output.flp> <pattern-id> <channel-id> <spread-ticks> <up|down>
 flp-rebuild flam-notes <input.flp> <output.flp> <pattern-id> <channel-id> <stroke-ticks> <velocity-0..127> <before|after>
 flp-rebuild randomize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <velocity-amount:-100..100> <pan-amount:-100..100> <pitch-range:0..24> <bipolar:0|1> <reset:0|1>
+flp-rebuild randomize-notes-scale <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <velocity-amount:-100..100> <pan-amount:-100..100> <pitch-range:0..24> <bipolar:0|1> <reset:0|1> <scale-name> <scale-root:0..11>
 flp-rebuild humanize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <timing-range-ticks> <velocity-variation-0..100>
 flp-rebuild limit-notes <input.flp> <output.flp> <pattern-id> <channel-id> <minimum-key-0..127> <maximum-key-0..127>
 flp-rebuild arp-notes <input.flp> <output.flp> <pattern-id> <channel-id> <step-ticks> <range-octaves-1..4> <gate-1..100> <up|down|up-down>
@@ -155,7 +156,7 @@ The Piano roll's **Edit** target selector applies note-transform buttons to eith
 
 **Flam channel/selected** and `flam-notes` add a short same-pitch stroke for each targeted note. Set stroke time and velocity, and choose before or after placement. Before strokes earlier than tick zero are clamped to tick zero. Tempo-based timing, presets, and grouping are not implemented.
 
-**Randomize channel/selected** and `randomize-notes` apply repeatable seeded changes to targeted note velocity, pan, and pitch. Velocity and pan amounts range from -100 to 100 percent; pitch range is 0 to 24 semitones. Bipolar mode allows changes in either direction, and Reset levels first uses velocity 100 and centered pan as the starting values. Scale-aware sequence generation remains incomplete.
+**Randomize channel/selected** and `randomize-notes` apply repeatable seeded changes to targeted note velocity, pan, and pitch. Velocity and pan amounts range from -100 to 100 percent; pitch range is 0 to 24 semitones. Bipolar mode allows changes in either direction, and Reset levels first uses velocity 100 and centered pan as the starting values. **Keep pitches in scale** restricts generated pitches to the Piano roll's selected scale and root while staying within the configured pitch range. `randomize-notes-scale` exposes the same option with a scale name (`major`, `natural-minor`, `harmonic-minor`, `major-pentatonic`, or `minor-pentatonic`) and a root pitch class from 0 (C) through 11 (B).
 
 **Humanize channel/selected** and `humanize-notes` apply seeded onset shifts within a symmetric tick range and velocity variation within a symmetric percentage range. Note lengths and other properties are retained. Tempo-relative timing remains incomplete.
 
