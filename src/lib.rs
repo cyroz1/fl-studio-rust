@@ -444,6 +444,7 @@ pub struct ChannelSummary {
     sampler_fx_flags: Option<u16>,
     sampler_flags: Option<u32>,
     sampler_root_note: Option<u32>,
+    keyboard_main_pitch: Option<bool>,
     keyboard_key_region: Option<(u32, u32)>,
     ping_pong_loop: bool,
     swing_mix: Option<u16>,
@@ -735,6 +736,12 @@ impl ChannelSummary {
     pub fn keyboard_key_region(&self) -> Option<(u16, u16)> {
         let (low, high) = self.keyboard_key_region?;
         (low <= high && high <= 127).then_some((low as u16, high as u16))
+    }
+
+    /// Whether this channel responds to the project's Master pitch control.
+    /// Missing Parameters data defaults to disabled.
+    pub fn keyboard_main_pitch_enabled(&self) -> bool {
+        self.keyboard_main_pitch.unwrap_or(false)
     }
 
     /// Raw four-byte channel color value, in little-endian RGBA byte order.
@@ -2958,20 +2965,24 @@ impl FlpDocument {
                     ));
                 }
                 0xC7 if matches!(event.encoding, PayloadEncoding::Data { .. })
-                    && event.payload.len() >= 76
-                    && channel.keyboard_key_region.is_none() =>
+                    && ascii_version(&event.payload).is_none() =>
                 {
-                    let low = u32::from_le_bytes(
-                        event.payload[68..72]
-                            .try_into()
-                            .expect("the key-region low bound has four payload bytes"),
-                    );
-                    let high = u32::from_le_bytes(
-                        event.payload[72..76]
-                            .try_into()
-                            .expect("the key-region high bound has four payload bytes"),
-                    );
-                    channel.keyboard_key_region = Some((low, high));
+                    if event.payload.len() >= 76 && channel.keyboard_key_region.is_none() {
+                        let low = u32::from_le_bytes(
+                            event.payload[68..72]
+                                .try_into()
+                                .expect("the key-region low bound has four payload bytes"),
+                        );
+                        let high = u32::from_le_bytes(
+                            event.payload[72..76]
+                                .try_into()
+                                .expect("the key-region high bound has four payload bytes"),
+                        );
+                        channel.keyboard_key_region = Some((low, high));
+                    }
+                    if event.payload.len() >= 12 && channel.keyboard_main_pitch.is_none() {
+                        channel.keyboard_main_pitch = Some(event.payload[11] != 0);
+                    }
                 }
                 0xD5 if matches!(event.encoding, PayloadEncoding::Data { .. }) => {
                     if let Some(level_adjustments) = ChannelLevelAdjustments::decode(&event.payload)
@@ -12037,6 +12048,84 @@ impl FlpDocument {
         Ok(())
     }
 
+    /// Enables or disables this channel's response to project Master pitch.
+    /// The flag is stored at byte 12 of the channel Parameters (`0xC7`) payload.
+    /// Existing payload bytes are retained; a missing Parameters event is created only when
+    /// the channel has no other `0xC7` event that could be confused with it.
+    pub fn set_channel_main_pitch_enabled(
+        &mut self,
+        channel_id: u16,
+        enabled: bool,
+    ) -> Result<(), FlpError> {
+        self.require_unique_channel(channel_id)?;
+        let channel = self
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id == channel_id)
+            .ok_or(FlpError::ChannelNotFound(channel_id))?;
+        if !matches!(channel.kind, Some(0 | 2 | 4)) {
+            return Err(FlpError::UnsupportedEdit(
+                "Master pitch can only be enabled on Sampler, Native instrument, or Audio Clip channels",
+            ));
+        }
+
+        let c7_events = channel
+            .event_range()
+            .filter(|index| self.events[*index].opcode == 0xC7)
+            .collect::<Vec<_>>();
+        let mut parameter_events = c7_events.iter().copied().filter(|index| {
+            matches!(self.events[*index].encoding, PayloadEncoding::Data { .. })
+                && ascii_version(&self.events[*index].payload).is_none()
+        });
+        let parameters_index = parameter_events.next();
+        if parameter_events.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel has multiple Parameters (`0xC7`) events",
+            ));
+        }
+        if parameters_index.is_none() && !c7_events.is_empty() {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel's `0xC7` event is not a recognized Parameters payload",
+            ));
+        }
+
+        let mut candidate = self.clone();
+        if let Some(event_index) = parameters_index {
+            let mut payload = candidate.events[event_index].payload.clone();
+            payload.resize(payload.len().max(12), 0);
+            payload[11] = u8::from(enabled);
+            candidate.events[event_index].replace_data_payload(payload)?;
+        } else {
+            let mut kind_events = channel
+                .event_range()
+                .filter(|index| self.events[*index].opcode == 0x15);
+            let Some(kind_index) = kind_events.next() else {
+                return Err(FlpError::UnsupportedEdit(
+                    "the selected channel has no recognized `0x15` kind event",
+                ));
+            };
+            if kind_events.next().is_some() {
+                return Err(FlpError::UnsupportedEdit(
+                    "the selected channel has multiple `0x15` kind events",
+                ));
+            }
+            let kind_event = &candidate.events[kind_index];
+            if kind_event.encoding != PayloadEncoding::Byte || kind_event.payload.len() != 1 {
+                return Err(FlpError::UnsupportedEdit(
+                    "the selected channel's `0x15` kind event is not a one-byte event",
+                ));
+            }
+            let mut payload = vec![0; 12];
+            payload[11] = u8::from(enabled);
+            candidate
+                .events
+                .insert(kind_index + 1, FlpEvent::new_data(0xC7, payload)?);
+        }
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
     /// Sets the per-channel multiplier for Channel Rack swing in FL's 0..=128 range.
     /// The `0x61` word event defaults to 128 (100%) when absent. Sampler and Native instrument (generator)
     /// channels can be edited; audio, Layer, Automation, and unknown channel types are not supported.
@@ -18069,6 +18158,113 @@ mod tests {
         let short_document = FlpDocument::parse(&flp_fixture(&short_event_stream, &[], &[]))
             .expect("short parameters fixture should parse");
         assert_eq!(short_document.channels()[0].keyboard_key_region(), None);
+    }
+
+    #[test]
+    fn decodes_enable_main_pitch_from_channel_parameters_byte_twelve() {
+        for (stored, expected) in [(0, false), (1, true), (0xA5, true)] {
+            let mut parameters = channel_key_region_parameters(36, 84);
+            parameters[11] = stored;
+            let mut event_stream = vec![0x40, 7, 0, 0x15, 0];
+            append_data_event(&mut event_stream, 0xC7, &parameters);
+            event_stream.extend_from_slice(&[0x62, 0, 0]);
+            let input = flp_fixture(&event_stream, &[], &[]);
+            let document = FlpDocument::parse(&input).expect("fixture should parse");
+
+            assert_eq!(
+                document.channels()[0].keyboard_main_pitch_enabled(),
+                expected
+            );
+            assert_eq!(document.encode_lossless().unwrap(), input);
+        }
+
+        let mut short_event_stream = vec![0x40, 7, 0, 0x15, 0];
+        append_data_event(&mut short_event_stream, 0xC7, &[0; 11]);
+        short_event_stream.extend_from_slice(&[0x62, 0, 0]);
+        let short_document = FlpDocument::parse(&flp_fixture(&short_event_stream, &[], &[]))
+            .expect("short Parameters fixture should parse");
+        assert!(!short_document.channels()[0].keyboard_main_pitch_enabled());
+    }
+
+    #[test]
+    fn edits_enable_main_pitch_without_rewriting_other_channel_parameters() {
+        let mut parameters = channel_key_region_parameters(36, 84);
+        parameters[11] = 0xA5;
+        parameters.extend_from_slice(&[0xAA, 0x55]);
+        let mut event_stream = vec![0x40, 7, 0, 0x15, 0, 0x05, 0xFA];
+        append_data_event(&mut event_stream, 0xC7, &parameters);
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        let input = flp_fixture(&event_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+        let parameter_event_index = document.channels()[0]
+            .event_range()
+            .find(|index| document.events()[*index].opcode() == 0xC7)
+            .expect("channel should have Parameters data");
+        let unrelated_event_before = document.events()[2].wire_bytes().to_vec();
+        let mut expected_parameters = parameters.clone();
+        expected_parameters[11] = 1;
+
+        document
+            .set_channel_main_pitch_enabled(7, true)
+            .expect("main pitch should be enabled");
+        assert!(document.channels()[0].keyboard_main_pitch_enabled());
+        assert_eq!(
+            document.events()[parameter_event_index].payload(),
+            expected_parameters
+        );
+        assert_eq!(document.events()[2].wire_bytes(), unrelated_event_before);
+
+        document
+            .set_channel_main_pitch_enabled(7, false)
+            .expect("main pitch should be disabled");
+        assert!(!document.channels()[0].keyboard_main_pitch_enabled());
+        let mut expected_parameters = parameters;
+        expected_parameters[11] = 0;
+        assert_eq!(
+            document.events()[parameter_event_index].payload(),
+            expected_parameters
+        );
+    }
+
+    #[test]
+    fn inserts_enable_main_pitch_parameters_and_rejects_ambiguous_channels_atomically() {
+        let mut no_parameters_stream = vec![0x40, 7, 0, 0x15, 0, 0x05, 0xFA];
+        no_parameters_stream.extend_from_slice(&[0x62, 0, 0]);
+        let input = flp_fixture(&no_parameters_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+        document
+            .set_channel_main_pitch_enabled(7, true)
+            .expect("Parameters event should be inserted after the kind event");
+        assert!(document.channels()[0].keyboard_main_pitch_enabled());
+        assert_eq!(document.events()[2].opcode(), 0xC7);
+        assert_eq!(document.events()[2].payload().len(), 12);
+        assert_eq!(document.events()[2].payload()[11], 1);
+        assert_eq!(document.events()[3].wire_bytes(), &[0x05, 0xFA]);
+
+        let mut layer_stream = vec![0x40, 7, 0, 0x15, 3];
+        layer_stream.extend_from_slice(&[0x62, 0, 0]);
+        let layer_input = flp_fixture(&layer_stream, &[], &[]);
+        let mut layer = FlpDocument::parse(&layer_input).expect("Layer fixture should parse");
+        assert!(layer.set_channel_main_pitch_enabled(7, true).is_err());
+        assert_eq!(layer.encode_lossless().unwrap(), layer_input);
+
+        let mut duplicate_stream = vec![0x40, 7, 0, 0x15, 0];
+        append_data_event(
+            &mut duplicate_stream,
+            0xC7,
+            &channel_key_region_parameters(36, 84),
+        );
+        append_data_event(
+            &mut duplicate_stream,
+            0xC7,
+            &channel_key_region_parameters(48, 96),
+        );
+        duplicate_stream.extend_from_slice(&[0x62, 0, 0]);
+        let duplicate_input = flp_fixture(&duplicate_stream, &[], &[]);
+        let mut duplicate =
+            FlpDocument::parse(&duplicate_input).expect("duplicate fixture should parse");
+        assert!(duplicate.set_channel_main_pitch_enabled(7, true).is_err());
+        assert_eq!(duplicate.encode_lossless().unwrap(), duplicate_input);
     }
 
     #[test]

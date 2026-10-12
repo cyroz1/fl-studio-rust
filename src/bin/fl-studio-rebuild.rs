@@ -5182,7 +5182,7 @@ impl DawUi {
                 });
                 ui.label(
                     egui::RichText::new(
-                        "Saved with the project. Pitch changes during playback and rendering are not implemented yet.",
+                        "Affects Sampler playback when Enable main pitch is on. Audio Clip and VST3 pitch routing are incomplete.",
                     )
                     .color(MUTED),
                 );
@@ -12681,6 +12681,7 @@ impl DawUi {
         let mut delete_group = None;
         let mut save_channel_preset = None;
         let mut channel_enabled_edits = Vec::new();
+        let mut channel_main_pitch_edits = Vec::new();
         let mut channel_zipped_edits = Vec::new();
         let (zip_selected, unzip_all, group_selected, previous_group, next_group) =
             if ui.memory(|memory| memory.focused().is_none()) {
@@ -13174,6 +13175,17 @@ impl DawUi {
                                     self.selected_note_channel = Some(channel.id());
                                     ui.close();
                                 }
+                                if matches!(channel.kind(), Some(0 | 2 | 4)) {
+                                    let mut main_pitch_enabled =
+                                        channel.keyboard_main_pitch_enabled();
+                                    if ui
+                                        .checkbox(&mut main_pitch_enabled, "Enable main pitch")
+                                        .changed()
+                                    {
+                                        channel_main_pitch_edits
+                                            .push((channel.id(), main_pitch_enabled));
+                                    }
+                                }
                                 ui.separator();
                                 let preset_supported = !channel
                                     .layer_child_ids()
@@ -13604,6 +13616,26 @@ impl DawUi {
                 }
                 Some(Err(error)) => {
                     self.status = format!("Could not change channel mute state: {error}");
+                }
+                None => {}
+            }
+        }
+        for (channel_id, enabled) in channel_main_pitch_edits {
+            let result = self
+                .document
+                .as_mut()
+                .map(|document| document.set_channel_main_pitch_enabled(channel_id, enabled));
+            match result {
+                Some(Ok(())) => {
+                    self.stop_project_playback();
+                    self.dirty = true;
+                    self.status = format!(
+                        "Channel {channel_id} main pitch {}",
+                        if enabled { "enabled" } else { "disabled" }
+                    );
+                }
+                Some(Err(error)) => {
+                    self.status = format!("Could not change channel main pitch: {error}");
                 }
                 None => {}
             }

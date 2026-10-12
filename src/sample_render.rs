@@ -3702,7 +3702,11 @@ fn prepare_sampler_arrangement(
                     wave_metadata.root_key,
                     options.read_sample_root_note,
                 ),
-                fine_tune_cents: wave_metadata.fine_tune_cents.unwrap_or_default(),
+                fine_tune_cents: wave_metadata.fine_tune_cents.unwrap_or_default()
+                    + sampler_master_pitch_cents(
+                        channel.keyboard_main_pitch_enabled(),
+                        document.metadata().master_pitch_cents(),
+                    ),
                 loop_bounds,
                 ping_pong_loop: channel.sampler_ping_pong_loop_enabled(),
             });
@@ -3985,7 +3989,11 @@ fn prepare_sampler_pattern(
                     wave_metadata.root_key,
                     options.read_sample_root_note,
                 ),
-                fine_tune_cents: wave_metadata.fine_tune_cents.unwrap_or_default(),
+                fine_tune_cents: wave_metadata.fine_tune_cents.unwrap_or_default()
+                    + sampler_master_pitch_cents(
+                        channel.keyboard_main_pitch_enabled(),
+                        document.metadata().master_pitch_cents(),
+                    ),
                 loop_bounds,
                 ping_pong_loop: channel.sampler_ping_pong_loop_enabled(),
             });
@@ -4424,6 +4432,18 @@ pub(crate) fn channel_pan_gains(pan: f32, mono: bool, pan_law: PanLaw) -> (f32, 
 
 fn sampler_wav_gain(gain_db: Option<i8>) -> f32 {
     gain_db.map_or(1.0, |gain_db| 10.0f32.powf(f32::from(gain_db) / 20.0))
+}
+
+fn sampler_master_pitch_cents(channel_enabled: bool, project_cents: Option<i16>) -> f64 {
+    if channel_enabled {
+        f64::from(
+            project_cents
+                .filter(|cents| (-1200..=1200).contains(cents))
+                .unwrap_or_default(),
+        )
+    } else {
+        0.0
+    }
 }
 
 fn sampler_source_step(
@@ -6893,6 +6913,14 @@ mod tests {
         assert_eq!(sampler_wav_gain(Some(0)), 1.0);
         assert!((sampler_wav_gain(Some(-6)) - 10.0f32.powf(-6.0 / 20.0)).abs() < 1e-6);
         assert_eq!(sampler_wav_gain(Some(20)), 10.0);
+    }
+
+    #[test]
+    fn sampler_master_pitch_requires_the_channel_enable_flag() {
+        assert_eq!(sampler_master_pitch_cents(true, Some(375)), 375.0);
+        assert_eq!(sampler_master_pitch_cents(false, Some(375)), 0.0);
+        assert_eq!(sampler_master_pitch_cents(true, None), 0.0);
+        assert_eq!(sampler_master_pitch_cents(true, Some(1201)), 0.0);
     }
 
     #[test]
