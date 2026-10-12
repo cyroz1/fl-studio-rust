@@ -2356,6 +2356,7 @@ struct SampleEditorState {
     fade_out_seconds: f32,
     normalize_export: bool,
     normalization_target_dbfs: f32,
+    reverse_export: bool,
 }
 
 struct PendingBackupWrite {
@@ -9752,6 +9753,7 @@ impl DawUi {
                         fade_out_seconds: 0.0,
                         normalize_export: false,
                         normalization_target_dbfs: 0.0,
+                        reverse_export: false,
                     });
                 }
                 Err(error) => {
@@ -9920,11 +9922,12 @@ impl DawUi {
                             .text("Target (dBFS)"),
                     );
                 });
+                ui.checkbox(&mut editor.reverse_export, "Reverse selection on export");
                 ui.horizontal(|ui| {
                     if ui.button("Save selection as WAV…").clicked() {
                         save_selection = true;
                     }
-                    ui.small("Fades and normalization apply to the export; the source stays unchanged.");
+                    ui.small("Fades, normalization, and reversal apply to the export; the source stays unchanged.");
                 });
             });
         if !open {
@@ -9988,6 +9991,7 @@ impl DawUi {
             editor.selection_start..editor.selection_end,
             fade_in_frames,
             fade_out_frames,
+            editor.reverse_export,
             editor
                 .normalize_export
                 .then_some(editor.normalization_target_dbfs),

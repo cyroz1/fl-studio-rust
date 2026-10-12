@@ -151,6 +151,7 @@ pub fn write_audio_range_to_wav_with_fades(
         frame_range,
         fade_in_frames,
         fade_out_frames,
+        false,
         None,
         output_path,
     )
@@ -166,6 +167,7 @@ pub fn write_audio_range_to_wav_with_processing(
     frame_range: Range<usize>,
     fade_in_frames: usize,
     fade_out_frames: usize,
+    reverse: bool,
     normalization_target_dbfs: Option<f32>,
     output_path: impl AsRef<Path>,
 ) -> Result<(), String> {
@@ -284,7 +286,12 @@ pub fn write_audio_range_to_wav_with_processing(
             .and_then(|()| file.write_all(&data_bytes.to_le_bytes()))
             .map_err(|error| format!("could not write WAV header: {error}"))?;
         let mut frame_bytes = Vec::with_capacity(usize::from(block_align));
-        for (offset, frame) in frame_range.clone().enumerate() {
+        for offset in 0..frames {
+            let frame = if reverse {
+                frame_range.end - 1 - offset
+            } else {
+                frame_range.start + offset
+            };
             frame_bytes.clear();
             let fade_in_gain = if fade_in_frames > 0 && offset < fade_in_frames {
                 offset as f32 / fade_in_frames as f32
@@ -1454,8 +1461,16 @@ mod tests {
             channels: vec![vec![0.25, -0.5, 1.0, 0.75]],
         };
 
-        write_audio_range_to_wav_with_processing(&audio, 0..3, 0, 0, Some(-6.020_6), &output_path)
-            .expect("selected audio should be peak-normalized");
+        write_audio_range_to_wav_with_processing(
+            &audio,
+            0..3,
+            0,
+            0,
+            false,
+            Some(-6.020_6),
+            &output_path,
+        )
+        .expect("selected audio should be peak-normalized");
 
         let bytes = fs::read(&output_path).expect("normalized WAV should be readable");
         let samples = bytes[44..]
@@ -1472,6 +1487,30 @@ mod tests {
     }
 
     #[test]
+    fn reverses_only_the_selected_audio_frames() {
+        let root = fixture_root();
+        fs::create_dir_all(&root).expect("fixture directory should be created");
+        let output_path = root.join("reversed.wav");
+        let audio = DecodedAudio {
+            sample_rate: 48_000,
+            channels: vec![vec![0.0, 0.25, 0.5, 0.75]],
+        };
+
+        write_audio_range_to_wav_with_processing(&audio, 1..4, 0, 0, true, None, &output_path)
+            .expect("selected audio frames should be reversed");
+
+        let bytes = fs::read(&output_path).expect("reversed WAV should be readable");
+        let samples = bytes[44..]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&sample| f32::from_le_bytes(sample))
+            .collect::<Vec<_>>();
+        assert_eq!(samples, [0.75, 0.5, 0.25]);
+        fs::remove_dir_all(root).expect("fixture directory should be removed");
+    }
+
+    #[test]
     fn rejects_empty_or_out_of_bounds_audio_selections() {
         let root = fixture_root();
         fs::create_dir_all(&root).expect("fixture directory should be created");
@@ -1484,8 +1523,16 @@ mod tests {
         assert!(write_audio_range_to_wav(&audio, 0..3, &output_path).is_err());
         assert!(write_audio_range_to_wav_with_fades(&audio, 0..2, 3, 0, &output_path).is_err());
         assert!(
-            write_audio_range_to_wav_with_processing(&audio, 0..2, 0, 0, Some(1.0), &output_path)
-                .is_err()
+            write_audio_range_to_wav_with_processing(
+                &audio,
+                0..2,
+                0,
+                0,
+                false,
+                Some(1.0),
+                &output_path,
+            )
+            .is_err()
         );
         assert!(!output_path.exists());
         fs::remove_dir_all(root).expect("fixture directory should be removed");
