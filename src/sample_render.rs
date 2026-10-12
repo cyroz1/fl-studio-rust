@@ -252,6 +252,9 @@ fn playlist_wav_cue_points(
     document: &FlpDocument,
     arrangement_id: u16,
     sample_rate: u32,
+    save_playlist_markers: bool,
+    save_note_markers: bool,
+    soloed_playlist_track_range: Option<(u32, u32)>,
 ) -> Result<Vec<WavCuePoint>, String> {
     let arrangement = document
         .arrangements()
@@ -260,31 +263,129 @@ fn playlist_wav_cue_points(
         .find(|arrangement| arrangement.id == arrangement_id)
         .ok_or_else(|| format!("arrangement {arrangement_id} was not found"))?;
     let tempo_map = PlaylistTempoMap::for_arrangement(document, arrangement_id)?;
-    let mut cue_points = arrangement
-        .time_markers
-        .iter()
-        .enumerate()
-        .map(|(index, marker)| {
-            let identifier = u32::try_from(index + 1)
-                .map_err(|_| "Playlist contains too many time markers for WAV output".to_owned())?;
+    let mut cue_points = Vec::new();
+    if save_playlist_markers {
+        for (index, marker) in arrangement.time_markers.iter().enumerate() {
             let sample_offset =
                 tempo_map.frame_at_tick(u64::from(marker.position_ticks()), sample_rate)?;
-            let sample_offset = u32::try_from(sample_offset)
-                .map_err(|_| "Playlist marker is outside the RIFF/WAVE sample range".to_owned())?;
             let label = marker
                 .name()
                 .filter(|name| !name.trim().is_empty())
                 .map(str::to_owned)
                 .unwrap_or_else(|| format!("Time marker {}", index + 1));
-            Ok(WavCuePoint {
-                identifier,
+            push_wav_cue_point(
+                &mut cue_points,
                 sample_offset,
                 label,
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
+                "Playlist marker is outside the RIFF/WAVE sample range",
+            )?;
+        }
+    }
+    if save_note_markers {
+        let ppq = document.header().ppq();
+        if ppq == 0 {
+            return Err("project PPQ must be greater than zero".to_owned());
+        }
+        let disabled_track_ids = document
+            .playlist_tracks()
+            .into_iter()
+            .filter(|track| track.enabled == Some(false))
+            .map(|track| track.id)
+            .collect::<BTreeSet<_>>();
+        let track_filter =
+            PlaylistTrackFilter::new(&disabled_track_ids, soloed_playlist_track_range);
+        let channels = document.channels();
+        let audio_channel_ids = channels
+            .iter()
+            .filter(|channel| channel.kind() == Some(4) && channel.enabled() != Some(false))
+            .map(|channel| channel.id())
+            .collect::<BTreeSet<_>>();
+
+        let patterns = document.patterns().map_err(|error| error.to_string())?;
+        let channel_swing_mix = channels
+            .iter()
+            .map(|channel| (channel.id(), channel.swing_mix()))
+            .collect::<HashMap<_, _>>();
+        let schedule = schedule_playlist_pattern_notes(
+            &patterns,
+            &arrangement,
+            track_filter,
+            PlaylistPatternScheduleOptions {
+                ppq,
+                global_swing_mix_raw: document.metadata().global_swing_mix(),
+                play_truncated_notes_in_clips: document
+                    .project_settings()
+                    .is_none_or(|settings| settings.play_truncated_notes_in_clips),
+            },
+            |channel_id| channel_swing_mix.get(&channel_id).copied().unwrap_or(128),
+            |channel_id, _, _| vec![channel_id],
+        )?;
+        append_wav_note_cue_points(
+            &mut cue_points,
+            &arrangement,
+            &tempo_map,
+            sample_rate,
+            track_filter,
+            &audio_channel_ids,
+            &schedule,
+        )?;
+    }
     cue_points.sort_by_key(|point| (point.sample_offset, point.identifier));
     Ok(cue_points)
+}
+
+fn push_wav_cue_point(
+    cue_points: &mut Vec<WavCuePoint>,
+    sample_offset: u64,
+    label: String,
+    range_error: &str,
+) -> Result<(), String> {
+    let identifier = u32::try_from(cue_points.len() + 1)
+        .map_err(|_| "Playlist contains too many WAV cue points".to_owned())?;
+    let sample_offset = u32::try_from(sample_offset).map_err(|_| range_error.to_owned())?;
+    cue_points.push(WavCuePoint {
+        identifier,
+        sample_offset,
+        label,
+    });
+    Ok(())
+}
+
+fn append_wav_note_cue_points(
+    cue_points: &mut Vec<WavCuePoint>,
+    arrangement: &Arrangement,
+    tempo_map: &PlaylistTempoMap,
+    sample_rate: u32,
+    track_filter: PlaylistTrackFilter<'_>,
+    audio_channel_ids: &BTreeSet<u16>,
+    schedule: &PlaylistPatternSchedule<'_>,
+) -> Result<(), String> {
+    for clip in &arrangement.clips {
+        if track_filter.clip_is_muted(clip) {
+            continue;
+        }
+        let PlaylistClipTarget::Channel { id } = clip.target() else {
+            continue;
+        };
+        if !audio_channel_ids.contains(&id) {
+            continue;
+        }
+        push_wav_cue_point(
+            cue_points,
+            tempo_map.frame_at_tick(u64::from(clip.position_ticks), sample_rate)?,
+            "Audio Clip".to_owned(),
+            "Audio Clip marker is outside the RIFF/WAVE sample range",
+        )?;
+    }
+    for placed in &schedule.notes {
+        push_wav_cue_point(
+            cue_points,
+            tempo_map.frame_at_tick(placed.start_tick, sample_rate)?,
+            "Note".to_owned(),
+            "Playlist note marker is outside the RIFF/WAVE sample range",
+        )?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -648,6 +749,8 @@ pub struct PlaylistRenderOptions {
     pub wav_channel_mode: WavChannelMode,
     /// Write Playlist time markers as RIFF/WAVE cue points and labels.
     pub wav_save_playlist_markers: bool,
+    /// Write note onsets and Audio Clip starts as RIFF/WAVE cue points.
+    pub wav_save_note_markers: bool,
     pub tail_seconds: u8,
     /// Render only this inclusive one-based Playlist track range when soloing.
     pub soloed_playlist_track_range: Option<(u32, u32)>,
@@ -665,6 +768,7 @@ impl Default for PlaylistRenderOptions {
             resampling_quality: ResamplingQuality::RENDER_DEFAULT,
             wav_channel_mode: WavChannelMode::Stereo,
             wav_save_playlist_markers: false,
+            wav_save_note_markers: false,
             tail_seconds: 0,
             soloed_playlist_track_range: None,
             read_sample_root_note: true,
@@ -1332,18 +1436,26 @@ fn render_playlist_with_vst3_cancellable(
     if let Some(processor) = vst3_processor.as_mut() {
         content_frames = content_frames.max(processor.summary().frames);
     }
-    let wav_cue_points =
-        if matches!(output, PlaylistRenderOutput::Wav) && options.wav_save_playlist_markers {
-            playlist_wav_cue_points(document, options.arrangement_id, options.sample_rate)?
-        } else {
-            Vec::new()
-        };
-    if let Some(last_marker_frame) = wav_cue_points
+    let wav_cue_points = if matches!(output, PlaylistRenderOutput::Wav)
+        && (options.wav_save_playlist_markers || options.wav_save_note_markers)
+    {
+        playlist_wav_cue_points(
+            document,
+            options.arrangement_id,
+            options.sample_rate,
+            options.wav_save_playlist_markers,
+            options.wav_save_note_markers,
+            options.soloed_playlist_track_range,
+        )?
+    } else {
+        Vec::new()
+    };
+    if let Some(last_cue_frame) = wav_cue_points
         .iter()
         .map(|point| u64::from(point.sample_offset))
         .max()
     {
-        content_frames = content_frames.max(last_marker_frame);
+        content_frames = content_frames.max(last_cue_frame);
     }
     let frames = add_render_tail_frames(content_frames, options.sample_rate, options.tail_seconds)?;
     if let Some(processor) = vst3_processor.as_mut() {
@@ -1666,17 +1778,24 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
     if let Some(processor) = vst3_processor.as_mut() {
         content_frames = content_frames.max(processor.summary().frames);
     }
-    let wav_cue_points = if options.wav_save_playlist_markers {
-        playlist_wav_cue_points(document, options.arrangement_id, options.sample_rate)?
+    let wav_cue_points = if options.wav_save_playlist_markers || options.wav_save_note_markers {
+        playlist_wav_cue_points(
+            document,
+            options.arrangement_id,
+            options.sample_rate,
+            options.wav_save_playlist_markers,
+            options.wav_save_note_markers,
+            options.soloed_playlist_track_range,
+        )?
     } else {
         Vec::new()
     };
-    if let Some(last_marker_frame) = wav_cue_points
+    if let Some(last_cue_frame) = wav_cue_points
         .iter()
         .map(|point| u64::from(point.sample_offset))
         .max()
     {
-        content_frames = content_frames.max(last_marker_frame);
+        content_frames = content_frames.max(last_cue_frame);
     }
     let frames = add_render_tail_frames(content_frames, options.sample_rate, options.tail_seconds)?;
     if let Some(processor) = vst3_processor.as_mut() {
@@ -6598,6 +6717,7 @@ mod tests {
                     resampling_quality: ResamplingQuality::Linear,
                     wav_channel_mode: WavChannelMode::Stereo,
                     wav_save_playlist_markers: false,
+                    wav_save_note_markers: false,
                     tail_seconds: 0,
                     soloed_playlist_track_range: None,
                     read_sample_root_note: true,
@@ -6724,6 +6844,64 @@ mod tests {
         assert_eq!(&bytes[154..162], b"Verse 2\0");
 
         fs::remove_dir_all(root).expect("temporary test folder should be removed");
+    }
+
+    #[test]
+    fn wav_note_markers_map_note_onsets_and_audio_clip_starts_to_frames() {
+        let tempo_map = PlaylistTempoMap {
+            ppq: 96,
+            segments: vec![TempoSegment {
+                start_tick: 0,
+                start_seconds: 0.0,
+                tempo_bpm: 120.0,
+            }],
+        };
+        let mut audio_clip = test_pattern_clip(0, 24, 96);
+        audio_clip.item_index = 2;
+        let arrangement = Arrangement {
+            id: 0,
+            clips: vec![audio_clip, test_pattern_clip(5, 0, 192)],
+            ..Arrangement::default()
+        };
+        let pattern = Pattern {
+            id: 5,
+            notes: vec![PatternNote {
+                position: 0,
+                length: 24,
+                channel_id: 3,
+                ..PatternNote::default()
+            }],
+            ..Pattern::default()
+        };
+        let schedule = PlaylistPatternSchedule {
+            notes: vec![PlaylistPatternNote {
+                note: &pattern.notes[0],
+                target_channel_id: 3,
+                start_tick: 96,
+                stop_tick: Some(120),
+                clip_index: 1,
+            }],
+            clips_skipped_unsupported_scale: 0,
+        };
+        let mut cue_points = Vec::new();
+        append_wav_note_cue_points(
+            &mut cue_points,
+            &arrangement,
+            &tempo_map,
+            9_600,
+            PlaylistTrackFilter::new(&BTreeSet::new(), None),
+            &BTreeSet::from([2]),
+            &schedule,
+        )
+        .unwrap();
+
+        assert_eq!(
+            cue_points
+                .iter()
+                .map(|point| (point.identifier, point.sample_offset, point.label.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, 1_200, "Audio Clip"), (2, 4_800, "Note")]
+        );
     }
 
     #[test]
