@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 pub enum PluginFormat {
     Vst2Candidate,
     Vst3,
+    Clap,
 }
 
 impl fmt::Display for PluginFormat {
@@ -16,6 +17,7 @@ impl fmt::Display for PluginFormat {
         match self {
             Self::Vst2Candidate => formatter.write_str("VST2 candidate (not validated)"),
             Self::Vst3 => formatter.write_str("VST3"),
+            Self::Clap => formatter.write_str("CLAP"),
         }
     }
 }
@@ -43,9 +45,10 @@ struct SearchRoot {
     path: PathBuf,
 }
 
-/// Finds VST bundles and DLL candidates in conventional platform plug-in folders.
-/// `VST3_PATH` and `VST2_PATH` can add directories using platform path-list syntax.
-/// VST2 DLLs are listed as candidates only; checking one requires loading executable code.
+/// Finds VST and CLAP plug-in candidates in conventional platform folders.
+/// `VST3_PATH`, `VST2_PATH`, and `CLAP_PATH` can add directories using platform
+/// path-list syntax. VST2 DLLs and CLAP bundles are listed as candidates only;
+/// checking them requires loading executable code.
 pub fn scan_installed_plugins() -> PluginScanReport {
     let roots = default_search_roots();
     let mut report = PluginScanReport {
@@ -92,6 +95,12 @@ fn default_search_roots() -> Vec<SearchRoot> {
             path,
         });
     }
+    for path in environment_paths("CLAP_PATH") {
+        roots.push(SearchRoot {
+            format: PluginFormat::Clap,
+            path,
+        });
+    }
 
     #[cfg(target_os = "windows")]
     windows_search_roots(&mut roots);
@@ -123,6 +132,10 @@ fn windows_search_roots(roots: &mut Vec<SearchRoot>) {
                 path: program_files.join("Common Files").join("VST3"),
             });
             roots.push(SearchRoot {
+                format: PluginFormat::Clap,
+                path: program_files.join("Common Files").join("CLAP"),
+            });
+            roots.push(SearchRoot {
                 format: PluginFormat::Vst2Candidate,
                 path: program_files.join("VstPlugins"),
             });
@@ -137,6 +150,10 @@ fn windows_search_roots(roots: &mut Vec<SearchRoot>) {
         roots.push(SearchRoot {
             format: PluginFormat::Vst3,
             path: local_app_data.join("Programs").join("Common").join("VST3"),
+        });
+        roots.push(SearchRoot {
+            format: PluginFormat::Clap,
+            path: local_app_data.join("Programs").join("Common").join("CLAP"),
         });
         roots.push(SearchRoot {
             format: PluginFormat::Vst2Candidate,
@@ -155,6 +172,10 @@ fn macos_search_roots(roots: &mut Vec<SearchRoot>) {
         roots.push(SearchRoot {
             format: PluginFormat::Vst3,
             path: base.join("VST3"),
+        });
+        roots.push(SearchRoot {
+            format: PluginFormat::Clap,
+            path: base.join("CLAP"),
         });
         roots.push(SearchRoot {
             format: PluginFormat::Vst2Candidate,
@@ -177,10 +198,20 @@ fn linux_search_roots(roots: &mut Vec<SearchRoot>) {
             path: PathBuf::from(path),
         });
     }
+    for path in ["/usr/lib/clap", "/usr/local/lib/clap", "/usr/lib64/clap"] {
+        roots.push(SearchRoot {
+            format: PluginFormat::Clap,
+            path: PathBuf::from(path),
+        });
+    }
     if let Some(home) = home_dir() {
         roots.push(SearchRoot {
             format: PluginFormat::Vst3,
             path: home.join(".vst3"),
+        });
+        roots.push(SearchRoot {
+            format: PluginFormat::Clap,
+            path: home.join(".clap"),
         });
         roots.push(SearchRoot {
             format: PluginFormat::Vst2Candidate,
@@ -252,6 +283,10 @@ fn walk(
             continue;
         }
         if format == PluginFormat::Vst2Candidate && extension.eq_ignore_ascii_case("dll") {
+            add_candidate(&path, format, report, found);
+            continue;
+        }
+        if format == PluginFormat::Clap && extension.eq_ignore_ascii_case("clap") {
             add_candidate(&path, format, report, found);
             continue;
         }
@@ -360,12 +395,21 @@ mod tests {
         let temp = TestDirectory::new();
         let vst3 = temp.0.join("Vendor").join("Example.vst3");
         let dll = temp.0.join("legacy").join("Example.dll");
+        let clap_bundle = temp.0.join("Vendor").join("Example.clap");
+        let clap_library = temp.0.join("portable").join("Example.clap");
         fs::create_dir_all(vst3.join("Contents")).expect("bundle directory should be created");
+        fs::create_dir_all(clap_bundle.join("Contents/MacOS"))
+            .expect("CLAP bundle directory should be created");
         fs::create_dir_all(dll.parent().expect("DLL has parent"))
             .expect("legacy plug-in directory should be created");
+        fs::create_dir_all(clap_library.parent().expect("CLAP has parent"))
+            .expect("portable plug-in directory should be created");
         fs::write(vst3.join("Contents").join("module.bin"), b"bundle")
             .expect("bundle content should be written");
+        fs::write(clap_bundle.join("Contents/MacOS/Example"), b"bundle")
+            .expect("CLAP bundle content should be written");
         fs::write(&dll, b"candidate").expect("DLL candidate should be written");
+        fs::write(&clap_library, b"candidate").expect("CLAP candidate should be written");
 
         let mut report = PluginScanReport::default();
         let mut visited = HashSet::new();
@@ -386,8 +430,16 @@ mod tests {
             &mut visited,
             &mut found,
         );
+        walk(
+            &temp.0,
+            PluginFormat::Clap,
+            0,
+            &mut report,
+            &mut visited,
+            &mut found,
+        );
 
-        assert_eq!(report.candidates.len(), 2);
+        assert_eq!(report.candidates.len(), 4);
         assert!(
             report.candidates.iter().any(|candidate| {
                 candidate.format == PluginFormat::Vst3 && candidate.path == vst3
@@ -396,6 +448,13 @@ mod tests {
         assert!(report.candidates.iter().any(|candidate| {
             candidate.format == PluginFormat::Vst2Candidate && candidate.path == dll
         }));
+        assert!(report.candidates.iter().any(|candidate| {
+            candidate.format == PluginFormat::Clap && candidate.path == clap_bundle
+        }));
+        assert!(report.candidates.iter().any(|candidate| {
+            candidate.format == PluginFormat::Clap && candidate.path == clap_library
+        }));
+        assert!(report.scan_errors.is_empty());
     }
 
     #[test]

@@ -25945,7 +25945,7 @@ impl DawUi {
         let mut parameter_edits = Vec::new();
 
         ui.horizontal(|ui| {
-            ui.strong("Installed VST3 plug-ins");
+            ui.strong("Installed plug-ins");
             ui.separator();
             if ui.button("Refresh scan").clicked() {
                 refresh = true;
@@ -25953,7 +25953,7 @@ impl DawUi {
         });
         ui.label(
             egui::RichText::new(
-                "Matching installed VST3 channels load with the project. Open a plug-in's native editor when you need it.",
+                "Matching VST3 channels load with the project. Detected CLAP bundles are listed below.",
             )
             .color(MUTED),
         );
@@ -26165,6 +26165,30 @@ impl DawUi {
                                 },
                             );
                         });
+                    });
+                ui.add_space(3.0);
+            }
+
+            let clap_candidates = self
+                .plugin_candidates
+                .iter()
+                .filter(|candidate| candidate.format == PluginFormat::Clap)
+                .collect::<Vec<_>>();
+            ui.separator();
+            ui.heading(format!("Detected CLAP plug-ins ({})", clap_candidates.len()));
+            ui.label(
+                egui::RichText::new(
+                    "CLAP bundles are discovered from CLAP_PATH and common platform folders. Hosting is not available yet.",
+                )
+                .color(MUTED),
+            );
+            for candidate in clap_candidates {
+                egui::Frame::new()
+                    .fill(PANEL_DARK)
+                    .inner_margin(6.0)
+                    .show(ui, |ui| {
+                        ui.strong(&candidate.name);
+                        ui.small(candidate.path.display().to_string());
                     });
                 ui.add_space(3.0);
             }
