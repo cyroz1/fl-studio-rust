@@ -2342,6 +2342,7 @@ struct SampleEditorState {
     selection_start: usize,
     selection_end: usize,
     spectral_view: bool,
+    selection_drag_anchor: Option<usize>,
 }
 
 struct PendingBackupWrite {
@@ -9724,6 +9725,7 @@ impl DawUi {
                         selection_start: 0,
                         selection_end,
                         spectral_view: false,
+                        selection_drag_anchor: None,
                     });
                 }
                 Err(error) => {
@@ -9777,16 +9779,28 @@ impl DawUi {
                     ui.selectable_value(&mut editor.spectral_view, true, "Spectrum");
                 });
                 let selection = editor.selection_start..editor.selection_end;
-                if editor.spectral_view {
-                    paint_sample_editor_spectrum(ui, &editor.waveform, frame_count, selection);
+                let selection_update = if editor.spectral_view {
+                    paint_sample_editor_spectrum(
+                        ui,
+                        &editor.waveform,
+                        frame_count,
+                        selection,
+                        &mut editor.selection_drag_anchor,
+                    )
                 } else {
                     paint_sample_editor_waveform(
                         ui,
                         &editor.waveform.peaks,
                         frame_count,
                         selection,
-                    );
+                        &mut editor.selection_drag_anchor,
+                    )
+                };
+                if let Some(selection) = selection_update {
+                    editor.selection_start = selection.start;
+                    editor.selection_end = selection.end;
                 }
+                ui.small("Drag across the preview to select a range; use the frame controls for fine adjustment.");
                 let start_max = editor.selection_end.saturating_sub(1);
                 ui.add(
                     egui::Slider::new(&mut editor.selection_start, 0..=start_max)
@@ -31010,13 +31024,14 @@ fn paint_sample_editor_waveform(
     peaks: &[WaveformPeak],
     frame_count: usize,
     selection: std::ops::Range<usize>,
-) {
+    selection_drag_anchor: &mut Option<usize>,
+) -> Option<std::ops::Range<usize>> {
     let width = ui.available_width().max(180.0);
-    let (response, painter) = ui.allocate_painter(Vec2::new(width, 144.0), Sense::hover());
+    let (response, painter) = ui.allocate_painter(Vec2::new(width, 144.0), Sense::click_and_drag());
     let rect = response.rect;
     painter.rect_filled(rect, egui::CornerRadius::same(5), PANEL);
     if frame_count == 0 || peaks.is_empty() {
-        return;
+        return None;
     }
     let frame_scale = rect.width() / frame_count as f32;
     let selection_rect = egui::Rect::from_min_max(
@@ -31064,6 +31079,7 @@ fn paint_sample_editor_waveform(
         );
     }
     ui.add_space(4.0);
+    sample_editor_canvas_selection(&response, frame_count, selection_drag_anchor)
 }
 
 fn paint_sample_editor_spectrum(
@@ -31071,20 +31087,19 @@ fn paint_sample_editor_spectrum(
     waveform: &AudioWaveform,
     frame_count: usize,
     selection: std::ops::Range<usize>,
-) {
+    selection_drag_anchor: &mut Option<usize>,
+) -> Option<std::ops::Range<usize>> {
     let width = ui.available_width().max(180.0);
-    let (response, painter) = ui.allocate_painter(Vec2::new(width, 144.0), Sense::hover());
+    let (response, painter) = ui.allocate_painter(Vec2::new(width, 144.0), Sense::click_and_drag());
     let rect = response.rect;
     painter.rect_filled(rect, egui::CornerRadius::same(5), PANEL_DARK);
     if frame_count == 0 || waveform.spectral_bands.is_empty() {
-        return;
+        return None;
     }
-    let Some(first_column) = waveform.spectral_bands.first() else {
-        return;
-    };
+    let first_column = waveform.spectral_bands.first()?;
     let band_count = first_column.len();
     if band_count == 0 {
-        return;
+        return None;
     }
     let column_count = waveform.spectral_bands.len();
     let band_height = rect.height() / band_count as f32;
@@ -31146,6 +31161,55 @@ fn paint_sample_editor_spectrum(
         );
     }
     ui.add_space(4.0);
+    sample_editor_canvas_selection(&response, frame_count, selection_drag_anchor)
+}
+
+fn sample_editor_canvas_selection(
+    response: &egui::Response,
+    frame_count: usize,
+    selection_drag_anchor: &mut Option<usize>,
+) -> Option<std::ops::Range<usize>> {
+    if frame_count == 0 {
+        *selection_drag_anchor = None;
+        return None;
+    }
+    let pointer_frame = response.interact_pointer_pos().map(|pointer| {
+        let width = response.rect.width().max(f32::EPSILON);
+        (((pointer.x - response.rect.left()).clamp(0.0, width) / width) * frame_count as f32)
+            .floor() as usize
+    });
+    if response.drag_started() {
+        *selection_drag_anchor = pointer_frame.map(|frame| frame.min(frame_count - 1));
+    }
+    let selection = if response.dragged() || response.drag_stopped() {
+        selection_drag_anchor
+            .zip(pointer_frame)
+            .and_then(|(anchor, current)| {
+                sample_editor_selection_for_drag(anchor, current, frame_count)
+            })
+    } else {
+        None
+    };
+    if response.drag_stopped() {
+        *selection_drag_anchor = None;
+    }
+    selection
+}
+
+fn sample_editor_selection_for_drag(
+    anchor_frame: usize,
+    current_frame: usize,
+    frame_count: usize,
+) -> Option<std::ops::Range<usize>> {
+    if frame_count == 0 {
+        return None;
+    }
+    let start = anchor_frame.min(current_frame).min(frame_count - 1);
+    let end = anchor_frame
+        .max(current_frame)
+        .min(frame_count - 1)
+        .saturating_add(1);
+    Some(start..end)
 }
 
 fn draw_audio_clip_waveform(
@@ -32409,9 +32473,10 @@ mod tests {
         playlist_pattern_recording_placement_tick, playlist_seek_tick_to_frame,
         playlist_signature_at_tick, playlist_song_position_label, playlist_track_group_range,
         playlist_track_is_hidden, recolor_piano_roll_notes, recording_input_targets,
-        serialize_window_layout_presets, snap_note_tick, toggle_piano_roll_note_group_selection,
-        touch_pan_zoom_scroll_offset, track_two_finger_tap, update_channel_rack_selection,
-        update_layer_child_selection, update_piano_roll_box_selection, zoom_to_fit,
+        sample_editor_selection_for_drag, serialize_window_layout_presets, snap_note_tick,
+        toggle_piano_roll_note_group_selection, touch_pan_zoom_scroll_offset, track_two_finger_tap,
+        update_channel_rack_selection, update_layer_child_selection,
+        update_piano_roll_box_selection, zoom_to_fit,
     };
 
     fn playlist_track_arrangement_fixture(clips: &[(u32, u32, u16)]) -> Arrangement {
@@ -33053,6 +33118,14 @@ mod tests {
         assert!(!midi_button_press_edge(0, &mut active));
         assert!(!midi_button_press_edge(0, &mut active));
         assert!(midi_button_press_edge(64, &mut active));
+    }
+
+    #[test]
+    fn sample_editor_drag_selection_normalizes_direction_and_keeps_one_frame() {
+        assert_eq!(sample_editor_selection_for_drag(2, 5, 8), Some(2..6));
+        assert_eq!(sample_editor_selection_for_drag(5, 2, 8), Some(2..6));
+        assert_eq!(sample_editor_selection_for_drag(7, 7, 8), Some(7..8));
+        assert_eq!(sample_editor_selection_for_drag(0, 0, 0), None);
     }
 
     #[test]
