@@ -346,6 +346,7 @@ pub struct ProjectMetadata {
     time_signature: Option<(u8, u8)>,
     global_swing_mix: Option<u8>,
     pan_law_raw: Option<u8>,
+    master_pitch_cents: Option<i16>,
     build_number: Option<u32>,
     title: Option<String>,
     author: Option<String>,
@@ -384,6 +385,8 @@ pub struct ProjectSettingsEdit {
     pub pan_law_raw: Option<u8>,
     /// Project time-signature numerator and denominator from global `0x11`/`0x12` events.
     pub time_signature: Option<(u8, u8)>,
+    /// Master pitch in cents from the global signed-word `0x50` event.
+    pub master_pitch_cents: Option<i16>,
 }
 
 /// A known FL channel kind, while retaining unrecognized raw values.
@@ -2749,6 +2752,12 @@ impl ProjectMetadata {
     /// FL Studio uses 0 for Circular (the default) and 2 for Triangular.
     pub fn pan_law_raw(&self) -> Option<u8> {
         self.pan_law_raw
+    }
+
+    /// Project Master pitch in cents from its global signed-word `0x50` event.
+    /// An absent event uses FL Studio's zero-cent default.
+    pub fn master_pitch_cents(&self) -> Option<i16> {
+        self.master_pitch_cents
     }
 
     pub fn build_number(&self) -> Option<u32> {
@@ -11006,9 +11015,21 @@ impl FlpDocument {
                 "project time-signature numerator and denominator must be positive",
             ));
         }
+        if edit
+            .master_pitch_cents
+            .is_some_and(|cents| !(-1200..=1200).contains(&cents))
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "project Master pitch must be in the -1200..=1200 cent range",
+            ));
+        }
         let advanced_edit = edit.play_truncated_notes_in_clips.is_some()
             || edit.fast_declick_for_cut_groups.is_some();
-        if !advanced_edit && edit.pan_law_raw.is_none() && edit.time_signature.is_none() {
+        if !advanced_edit
+            && edit.pan_law_raw.is_none()
+            && edit.time_signature.is_none()
+            && edit.master_pitch_cents.is_none()
+        {
             return Ok(());
         }
         let mut candidate = self.clone();
@@ -11079,6 +11100,39 @@ impl FlpDocument {
                 candidate
                     .events
                     .insert(channel_start, FlpEvent::new_byte(0x17, pan_law_raw));
+            }
+        }
+
+        if let Some(master_pitch_cents) = edit.master_pitch_cents {
+            let channel_start = candidate
+                .events
+                .iter()
+                .position(|event| event.opcode == 0x40)
+                .unwrap_or(candidate.events.len());
+            let mut master_pitch_event = None;
+            for (index, event) in candidate.events.iter().take(channel_start).enumerate() {
+                if event.opcode != 0x50 {
+                    continue;
+                }
+                if master_pitch_event.is_some() {
+                    return Err(FlpError::UnsupportedEdit(
+                        "the project has multiple global 0x50 Master pitch events",
+                    ));
+                }
+                if event.encoding != PayloadEncoding::Word || event.payload.len() != 2 {
+                    return Err(FlpError::UnsupportedEdit(
+                        "the project's 0x50 Master pitch event is not a signed word value",
+                    ));
+                }
+                master_pitch_event = Some(index);
+            }
+            if let Some(index) = master_pitch_event {
+                candidate.events[index].replace_word_payload(master_pitch_cents as u16)?;
+            } else if master_pitch_cents != 0 {
+                candidate.events.insert(
+                    channel_start,
+                    FlpEvent::new_word(0x50, master_pitch_cents as u16),
+                );
             }
         }
 
@@ -13475,6 +13529,9 @@ fn read_project_metadata(events: &[FlpEvent], project_version: Option<&str>) -> 
     let mut global_swing_mix = None;
     let mut pan_law_event = None;
     let mut duplicate_pan_law_events = false;
+    let mut master_pitch_cents = None;
+    let mut duplicate_master_pitch_events = false;
+    let mut invalid_master_pitch_event = false;
     let mut build_number = None;
     let mut title = None;
     let mut author = None;
@@ -13517,6 +13574,16 @@ fn read_project_metadata(events: &[FlpEvent], project_version: Option<&str>) -> 
                     duplicate_pan_law_events = true;
                 } else {
                     pan_law_event = Some(event);
+                }
+            }
+            0x50 if event_index < channel_start => {
+                if master_pitch_cents.is_some() {
+                    duplicate_master_pitch_events = true;
+                } else if event.encoding != PayloadEncoding::Word || event.payload.len() != 2 {
+                    invalid_master_pitch_event = true;
+                } else {
+                    master_pitch_cents =
+                        Some(i16::from_le_bytes([event.payload[0], event.payload[1]]));
                 }
             }
             0x42 if event.payload.len() == 2 => {
@@ -13577,6 +13644,11 @@ fn read_project_metadata(events: &[FlpEvent], project_version: Option<&str>) -> 
                 .then_some(event.payload[0])
         })
     };
+    let master_pitch_cents = if duplicate_master_pitch_events || invalid_master_pitch_event {
+        None
+    } else {
+        master_pitch_cents
+    };
     let tempo_milli_bpm = modern_tempo.or_else(|| {
         legacy_coarse_tempo.map(|coarse| {
             coarse
@@ -13590,6 +13662,7 @@ fn read_project_metadata(events: &[FlpEvent], project_version: Option<&str>) -> 
         time_signature,
         global_swing_mix,
         pan_law_raw,
+        master_pitch_cents,
         build_number,
         title,
         author,
@@ -14761,6 +14834,124 @@ mod tests {
         );
         assert_eq!(reparsed.metadata().pan_law_raw(), Some(2));
         assert_eq!(reparsed.trailing_bytes(), &[0xD1, 0xD2]);
+    }
+
+    #[test]
+    fn project_master_pitch_decodes_edits_and_roundtrips_losslessly() {
+        let mut event_stream = vec![0x20, 7, 0x50];
+        event_stream.extend_from_slice(&(-725i16).to_le_bytes());
+        event_stream.extend_from_slice(&[0x22, 0x99, 0x40, 7, 0, 0x15, 0]);
+        let original = flp_fixture(&event_stream, &[0xA1], &[0xD1, 0xD2]);
+        let mut document = FlpDocument::parse(&original).expect("fixture should parse");
+        assert_eq!(document.metadata().master_pitch_cents(), Some(-725));
+
+        let unrelated_events: Vec<_> = document
+            .events()
+            .iter()
+            .filter(|event| event.opcode() != 0x50)
+            .map(|event| event.wire_bytes().to_vec())
+            .collect();
+        document
+            .set_project_settings(ProjectSettingsEdit {
+                master_pitch_cents: Some(400),
+                ..ProjectSettingsEdit::default()
+            })
+            .expect("Master pitch should be editable");
+        assert_eq!(document.metadata().master_pitch_cents(), Some(400));
+        assert_eq!(
+            document
+                .events()
+                .iter()
+                .filter(|event| event.opcode() != 0x50)
+                .map(|event| event.wire_bytes().to_vec())
+                .collect::<Vec<_>>(),
+            unrelated_events
+        );
+
+        let encoded = document.encode_lossless().expect("document should encode");
+        let reparsed = FlpDocument::parse(&encoded).expect("edited project should reparse");
+        assert_eq!(reparsed.metadata().master_pitch_cents(), Some(400));
+        assert_eq!(reparsed.trailing_bytes(), &[0xD1, 0xD2]);
+    }
+
+    #[test]
+    fn project_master_pitch_defaults_to_zero_and_ignores_channel_events() {
+        let original = flp_fixture(
+            &[0x40, 7, 0, 0x50, 0x34, 0x12, 0x15, 0, 0x62, 0, 0],
+            &[],
+            &[0xD1],
+        );
+        let mut document = FlpDocument::parse(&original).expect("fixture should parse");
+        assert_eq!(document.metadata().master_pitch_cents(), None);
+        let channel_events = document
+            .events()
+            .iter()
+            .map(|event| event.wire_bytes().to_vec())
+            .collect::<Vec<_>>();
+        document
+            .set_project_settings(ProjectSettingsEdit {
+                master_pitch_cents: Some(0),
+                ..ProjectSettingsEdit::default()
+            })
+            .expect("the zero-cent default should not need a new event");
+        assert_eq!(document.metadata().master_pitch_cents(), None);
+
+        document
+            .set_project_settings(ProjectSettingsEdit {
+                master_pitch_cents: Some(-1200),
+                ..ProjectSettingsEdit::default()
+            })
+            .expect("global Master pitch should be inserted before channel data");
+        assert_eq!(document.metadata().master_pitch_cents(), Some(-1200));
+        let first_channel = document
+            .events()
+            .iter()
+            .position(|event| event.opcode() == 0x40)
+            .expect("the channel marker should remain");
+        assert_eq!(
+            document.events()[first_channel..]
+                .iter()
+                .map(|event| event.wire_bytes().to_vec())
+                .collect::<Vec<_>>(),
+            channel_events
+        );
+
+        let encoded = document.encode_lossless().expect("document should encode");
+        assert_eq!(
+            FlpDocument::parse(&encoded)
+                .expect("edited project should reparse")
+                .metadata()
+                .master_pitch_cents(),
+            Some(-1200)
+        );
+    }
+
+    #[test]
+    fn invalid_or_ambiguous_project_master_pitch_edits_are_refused_without_mutation() {
+        let duplicate_pitch = flp_fixture(&[0x50, 0, 0, 0x50, 1, 0], &[], &[0xD1]);
+        let mut duplicate = FlpDocument::parse(&duplicate_pitch).expect("fixture should parse");
+        assert_eq!(duplicate.metadata().master_pitch_cents(), None);
+        assert!(
+            duplicate
+                .set_project_settings(ProjectSettingsEdit {
+                    master_pitch_cents: Some(100),
+                    ..ProjectSettingsEdit::default()
+                })
+                .is_err()
+        );
+        assert_eq!(duplicate.encode_lossless().unwrap(), duplicate_pitch);
+
+        let original = flp_fixture(&[0x22, 7], &[], &[0xD1]);
+        let mut out_of_range = FlpDocument::parse(&original).expect("fixture should parse");
+        assert!(
+            out_of_range
+                .set_project_settings(ProjectSettingsEdit {
+                    master_pitch_cents: Some(1201),
+                    ..ProjectSettingsEdit::default()
+                })
+                .is_err()
+        );
+        assert_eq!(out_of_range.encode_lossless().unwrap(), original);
     }
 
     #[test]

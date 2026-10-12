@@ -275,6 +275,16 @@ fn run(args: Vec<String>) -> Result<(), String> {
         [command, input, output] if command == "create-pattern" => {
             create_pattern(Path::new(input), Path::new(output))
         }
+        [command, input, output, cents] if command == "set-project-master-pitch" => {
+            write_project_settings(
+                Path::new(input),
+                Path::new(output),
+                ProjectSettingsEdit {
+                    master_pitch_cents: Some(parse_i16(cents, "Master pitch cents")?),
+                    ..ProjectSettingsEdit::default()
+                },
+            )
+        }
         [command, input, output, title, author, genre, comments, web_link]
             if command == "set-project-info" =>
         {
@@ -940,6 +950,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild create-pattern <input.flp> <output.flp>\n",
             "  flp-rebuild set-project-info <input.flp> <output.flp> <title|-> <author|-> <genre|-> <comments|-> <web-link|->\n",
             "  flp-rebuild set-project-settings <input.flp> <output.flp> <play-truncated:0|1|-> <fast-declick:0|1|-> [pan-law-raw|-]\n",
+            "  flp-rebuild set-project-master-pitch <input.flp> <output.flp> <cents:-1200..1200>\n",
             "  flp-rebuild set-project-time-signature <input.flp> <output.flp> <numerator> <denominator>\n",
             "  flp-rebuild set-pattern-time-signature <input.flp> <output.flp> <pattern-id> <position-ticks> <numerator> <denominator>\n",
             "  flp-rebuild delete-pattern-time-signature <input.flp> <output.flp> <pattern-id> <position-ticks>\n",
@@ -1463,6 +1474,10 @@ fn show_project_settings(path: &Path) -> Result<(), String> {
             println!("project time signature: {numerator}/{denominator}");
         }
         None => println!("project time signature: not uniquely stored"),
+    }
+    match document.metadata().master_pitch_cents() {
+        Some(cents) => println!("master pitch: {cents} cents"),
+        None => println!("master pitch: not uniquely stored (0 cents when the event is absent)"),
     }
     Ok(())
 }

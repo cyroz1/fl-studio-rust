@@ -2498,6 +2498,8 @@ struct DawUi {
     project_settings_advanced_supported: bool,
     project_settings_play_truncated: bool,
     project_settings_fast_declick: bool,
+    project_settings_master_pitch_cents: i16,
+    project_settings_master_pitch_changed: bool,
     project_settings_pan_law_raw: u8,
     project_settings_time_signature_enabled: bool,
     project_settings_time_signature_numerator: u8,
@@ -3033,6 +3035,8 @@ impl DawUi {
             project_settings_advanced_supported: false,
             project_settings_play_truncated: false,
             project_settings_fast_declick: false,
+            project_settings_master_pitch_cents: 0,
+            project_settings_master_pitch_changed: false,
             project_settings_pan_law_raw: 0,
             project_settings_time_signature_enabled: false,
             project_settings_time_signature_numerator: 4,
@@ -3731,6 +3735,9 @@ impl DawUi {
                     self.project_settings_fast_declick = false;
                 }
                 self.project_settings_pan_law_raw = document.metadata().pan_law_raw().unwrap_or(0);
+                self.project_settings_master_pitch_cents =
+                    document.metadata().master_pitch_cents().unwrap_or(0);
+                self.project_settings_master_pitch_changed = false;
                 if let Some((numerator, denominator)) = document.metadata().time_signature() {
                     self.project_settings_time_signature_enabled = true;
                     self.project_settings_time_signature_numerator = numerator;
@@ -5034,6 +5041,9 @@ impl DawUi {
             self.project_settings_fast_declick = false;
         }
         self.project_settings_pan_law_raw = document.metadata().pan_law_raw().unwrap_or(0);
+        self.project_settings_master_pitch_cents =
+            document.metadata().master_pitch_cents().unwrap_or(0);
+        self.project_settings_master_pitch_changed = false;
         if let Some((numerator, denominator)) = document.metadata().time_signature() {
             self.project_settings_time_signature_enabled = true;
             self.project_settings_time_signature_numerator = numerator;
@@ -5059,6 +5069,9 @@ impl DawUi {
                 .project_settings_advanced_supported
                 .then_some(self.project_settings_fast_declick),
             pan_law_raw: Some(self.project_settings_pan_law_raw),
+            master_pitch_cents: self
+                .project_settings_master_pitch_changed
+                .then_some(self.project_settings_master_pitch_cents),
             time_signature: self.project_settings_time_signature_enabled.then_some((
                 self.project_settings_time_signature_numerator,
                 self.project_settings_time_signature_denominator,
@@ -5155,6 +5168,22 @@ impl DawUi {
                             );
                         });
                 });
+                ui.horizontal(|ui| {
+                    ui.label("Master pitch");
+                    if ui.add(
+                        egui::DragValue::new(&mut self.project_settings_master_pitch_cents)
+                            .range(-1200..=1200)
+                            .suffix(" cents"),
+                    ).changed() {
+                        self.project_settings_master_pitch_changed = true;
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "Saved with the project. Pitch changes during playback and rendering are not implemented yet.",
+                    )
+                    .color(MUTED),
+                );
                 ui.separator();
                 if self.project_settings_time_signature_enabled {
                     ui.horizontal(|ui| {
@@ -5725,6 +5754,9 @@ impl DawUi {
                 self.project_settings_fast_declick = false;
             }
             self.project_settings_pan_law_raw = document.metadata().pan_law_raw().unwrap_or(0);
+            self.project_settings_master_pitch_cents =
+                document.metadata().master_pitch_cents().unwrap_or(0);
+            self.project_settings_master_pitch_changed = false;
             if let Some((numerator, denominator)) = document.metadata().time_signature() {
                 self.project_settings_time_signature_enabled = true;
                 self.project_settings_time_signature_numerator = numerator;
