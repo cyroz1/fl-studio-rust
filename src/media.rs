@@ -132,6 +132,20 @@ pub fn write_audio_range_to_wav(
     frame_range: Range<usize>,
     output_path: impl AsRef<Path>,
 ) -> Result<(), String> {
+    write_audio_range_to_wav_with_fades(audio, frame_range, 0, 0, output_path)
+}
+
+/// Write a selected frame range to WAV with optional linear fades at its edges.
+///
+/// Fade lengths are measured in frames and may overlap; overlapping fade gains are multiplied.
+/// The decoded source buffer is never modified.
+pub fn write_audio_range_to_wav_with_fades(
+    audio: &DecodedAudio,
+    frame_range: Range<usize>,
+    fade_in_frames: usize,
+    fade_out_frames: usize,
+    output_path: impl AsRef<Path>,
+) -> Result<(), String> {
     let output_path = output_path.as_ref();
     if !output_path
         .extension()
@@ -166,6 +180,9 @@ pub fn write_audio_range_to_wav(
         .checked_mul(u32::from(block_align))
         .ok_or_else(|| "WAV byte rate overflow".to_owned())?;
     let frames = frame_range.end - frame_range.start;
+    if fade_in_frames > frames || fade_out_frames > frames {
+        return Err("fade lengths cannot exceed the selected frame range".to_owned());
+    }
     let data_bytes = frames
         .checked_mul(usize::from(block_align))
         .and_then(|bytes| u32::try_from(bytes).ok())
@@ -224,12 +241,24 @@ pub fn write_audio_range_to_wav(
             .and_then(|()| file.write_all(&data_bytes.to_le_bytes()))
             .map_err(|error| format!("could not write WAV header: {error}"))?;
         let mut frame_bytes = Vec::with_capacity(usize::from(block_align));
-        for frame in frame_range.clone() {
+        for (offset, frame) in frame_range.clone().enumerate() {
             frame_bytes.clear();
+            let fade_in_gain = if fade_in_frames > 0 && offset < fade_in_frames {
+                offset as f32 / fade_in_frames as f32
+            } else {
+                1.0
+            };
+            let remaining_frames = frames - offset - 1;
+            let fade_out_gain = if fade_out_frames > 0 && remaining_frames < fade_out_frames {
+                remaining_frames as f32 / fade_out_frames as f32
+            } else {
+                1.0
+            };
+            let gain = fade_in_gain * fade_out_gain;
             for channel in &audio.channels {
                 let sample = channel[frame];
                 frame_bytes.extend_from_slice(
-                    &(if sample.is_finite() { sample } else { 0.0 }).to_le_bytes(),
+                    &((if sample.is_finite() { sample } else { 0.0 }) * gain).to_le_bytes(),
                 );
             }
             file.write_all(&frame_bytes)
@@ -1342,6 +1371,32 @@ mod tests {
     }
 
     #[test]
+    fn writes_selected_audio_with_linear_edge_fades_without_changing_source() {
+        let root = fixture_root();
+        fs::create_dir_all(&root).expect("fixture directory should be created");
+        let output_path = root.join("faded.wav");
+        let audio = DecodedAudio {
+            sample_rate: 48_000,
+            channels: vec![vec![1.0; 4], vec![0.5; 4]],
+        };
+        let original = audio.clone();
+
+        write_audio_range_to_wav_with_fades(&audio, 0..4, 2, 2, &output_path)
+            .expect("selected source frames should be faded and written");
+
+        let bytes = fs::read(&output_path).expect("faded WAV should be readable");
+        let samples = bytes[44..]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&sample| f32::from_le_bytes(sample))
+            .collect::<Vec<_>>();
+        assert_eq!(samples, [0.0, 0.0, 0.5, 0.25, 0.5, 0.25, 0.0, 0.0]);
+        assert_eq!(audio, original);
+        fs::remove_dir_all(root).expect("fixture directory should be removed");
+    }
+
+    #[test]
     fn rejects_empty_or_out_of_bounds_audio_selections() {
         let root = fixture_root();
         fs::create_dir_all(&root).expect("fixture directory should be created");
@@ -1352,6 +1407,7 @@ mod tests {
         };
         assert!(write_audio_range_to_wav(&audio, 1..1, &output_path).is_err());
         assert!(write_audio_range_to_wav(&audio, 0..3, &output_path).is_err());
+        assert!(write_audio_range_to_wav_with_fades(&audio, 0..2, 3, 0, &output_path).is_err());
         assert!(!output_path.exists());
         fs::remove_dir_all(root).expect("fixture directory should be removed");
     }

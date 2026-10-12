@@ -20,7 +20,7 @@ use flp_rebuild::audio::{
 use flp_rebuild::media::{
     AudioWaveform, DecodedAudio, SamplePathResolver, WaveformPeak, decode_audio_file,
     decode_audio_preview, decode_audio_waveform, summarize_audio_waveform,
-    write_audio_range_to_wav,
+    write_audio_range_to_wav_with_fades,
 };
 use flp_rebuild::midi::{MidiChannelMapping, MidiFile};
 use flp_rebuild::plugins::{PluginCandidate, PluginFormat, scan_installed_plugins};
@@ -2352,6 +2352,8 @@ struct SampleEditorState {
     selection_end: usize,
     spectral_view: bool,
     selection_drag_anchor: Option<usize>,
+    fade_in_seconds: f32,
+    fade_out_seconds: f32,
 }
 
 struct PendingBackupWrite {
@@ -9744,6 +9746,8 @@ impl DawUi {
                         selection_end,
                         spectral_view: false,
                         selection_drag_anchor: None,
+                        fade_in_seconds: 0.0,
+                        fade_out_seconds: 0.0,
                     });
                 }
                 Err(error) => {
@@ -9891,11 +9895,24 @@ impl DawUi {
                     editor.selection_end as f64 / f64::from(sample_rate),
                     selection_duration
                 ));
+                let maximum_fade_seconds = selection_duration as f32;
+                editor.fade_in_seconds =
+                    editor.fade_in_seconds.clamp(0.0, maximum_fade_seconds);
+                editor.fade_out_seconds =
+                    editor.fade_out_seconds.clamp(0.0, maximum_fade_seconds);
+                ui.add(
+                    egui::Slider::new(&mut editor.fade_in_seconds, 0.0..=maximum_fade_seconds)
+                        .text("Fade in (seconds)"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut editor.fade_out_seconds, 0.0..=maximum_fade_seconds)
+                        .text("Fade out (seconds)"),
+                );
                 ui.horizontal(|ui| {
                     if ui.button("Save selection as WAV…").clicked() {
                         save_selection = true;
                     }
-                    ui.small("The source file stays unchanged.");
+                    ui.small("Linear fades apply to the export; the source stays unchanged.");
                 });
             });
         if !open {
@@ -9946,9 +9963,19 @@ impl DawUi {
             self.status = "Choose a new file to keep the source sample unchanged".to_owned();
             return;
         }
-        match write_audio_range_to_wav(
+        let selected_frames = editor.selection_end - editor.selection_start;
+        let sample_rate = f64::from(editor.audio.sample_rate.max(1));
+        let fade_in_frames = (f64::from(editor.fade_in_seconds.max(0.0)) * sample_rate)
+            .round()
+            .clamp(0.0, selected_frames as f64) as usize;
+        let fade_out_frames = (f64::from(editor.fade_out_seconds.max(0.0)) * sample_rate)
+            .round()
+            .clamp(0.0, selected_frames as f64) as usize;
+        match write_audio_range_to_wav_with_fades(
             &editor.audio,
             editor.selection_start..editor.selection_end,
+            fade_in_frames,
+            fade_out_frames,
             &output_path,
         ) {
             Ok(()) => {
