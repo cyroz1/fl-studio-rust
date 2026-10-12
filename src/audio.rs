@@ -24,6 +24,8 @@ const INPUT_RECORDING_BUFFER_FRAMES: usize = 65_536;
 const AUDIO_ERROR_HISTORY_LIMIT: usize = 16;
 const AUDIO_COMMAND_QUEUE_CAPACITY: usize = 128;
 const STREAM_PREFILL_FRAMES: usize = 512;
+const BROWSER_PREVIEW_ACTIVE_BIT: u64 = 1 << 63;
+const BROWSER_PREVIEW_FRAME_MASK: u64 = !BROWSER_PREVIEW_ACTIVE_BIT;
 const TEST_TONE_HZ: f32 = 440.0;
 const TEST_TONE_LEVEL: f32 = 0.12;
 
@@ -233,8 +235,7 @@ struct PlaybackState {
     cursor_frames: AtomicU64,
     active: AtomicBool,
     browser_preview_samples: ArcSwapOption<Vec<f32>>,
-    browser_preview_cursor_frames: AtomicU64,
-    browser_preview_active: AtomicBool,
+    browser_preview_state: AtomicU64,
     browser_preview_looping: AtomicBool,
     browser_preview_gain: AtomicU32,
     output_peak: AtomicU32,
@@ -476,8 +477,7 @@ impl PlaybackState {
             cursor_frames: AtomicU64::new(0),
             active: AtomicBool::new(false),
             browser_preview_samples: ArcSwapOption::empty(),
-            browser_preview_cursor_frames: AtomicU64::new(0),
-            browser_preview_active: AtomicBool::new(false),
+            browser_preview_state: AtomicU64::new(0),
             browser_preview_looping: AtomicBool::new(false),
             browser_preview_gain: AtomicU32::new(1.0_f32.to_bits()),
             output_peak: AtomicU32::new(0.0_f32.to_bits()),
@@ -526,20 +526,17 @@ impl PlaybackState {
     fn start_browser_preview(&self, samples: Vec<f32>) {
         self.stop_browser_preview();
         self.browser_preview_samples.store(Some(Arc::new(samples)));
-        self.browser_preview_cursor_frames
-            .store(0, Ordering::Release);
-        self.browser_preview_active.store(true, Ordering::Release);
+        self.browser_preview_state
+            .store(BROWSER_PREVIEW_ACTIVE_BIT, Ordering::Release);
     }
 
     fn stop_browser_preview(&self) {
-        self.browser_preview_active.store(false, Ordering::Release);
-        self.browser_preview_cursor_frames
-            .store(0, Ordering::Release);
+        self.browser_preview_state.store(0, Ordering::Release);
         self.browser_preview_samples.store(None);
     }
 
     fn browser_preview_active(&self) -> bool {
-        self.browser_preview_active.load(Ordering::Acquire)
+        self.browser_preview_state.load(Ordering::Acquire) & BROWSER_PREVIEW_ACTIVE_BIT != 0
     }
 
     fn browser_preview_frame_count(&self) -> u64 {
@@ -550,8 +547,7 @@ impl PlaybackState {
     }
 
     fn browser_preview_position_frames(&self) -> u64 {
-        self.browser_preview_cursor_frames
-            .load(Ordering::Acquire)
+        (self.browser_preview_state.load(Ordering::Acquire) & BROWSER_PREVIEW_FRAME_MASK)
             .min(self.browser_preview_frame_count())
     }
 
@@ -560,9 +556,10 @@ impl PlaybackState {
         if frame_count == 0 {
             return;
         }
-        self.browser_preview_cursor_frames
-            .store(frame.min(frame_count - 1), Ordering::Release);
-        self.browser_preview_active.store(true, Ordering::Release);
+        self.browser_preview_state.store(
+            BROWSER_PREVIEW_ACTIVE_BIT | frame.min(frame_count - 1),
+            Ordering::Release,
+        );
     }
 
     fn set_browser_preview_looping(&self, looping: bool) {
@@ -571,48 +568,49 @@ impl PlaybackState {
     }
 
     fn next_browser_preview_frame(&self, samples: Option<&[f32]>) -> [f32; 2] {
-        if !self.browser_preview_active.load(Ordering::Acquire) {
+        if !self.browser_preview_active() {
             return [0.0, 0.0];
         }
         let Some(samples) = samples else {
-            self.browser_preview_active.store(false, Ordering::Release);
             return [0.0, 0.0];
         };
         let frame_count = (samples.len() / 2) as u64;
         if frame_count == 0 {
-            self.browser_preview_active.store(false, Ordering::Release);
             return [0.0, 0.0];
         }
         let looping = self.browser_preview_looping.load(Ordering::Acquire);
-        let frame = self.browser_preview_cursor_frames.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |cursor| {
-                if cursor < frame_count {
-                    Some(cursor + 1)
-                } else if looping {
-                    Some(cursor % frame_count + 1)
-                } else {
-                    None
-                }
-            },
-        );
-        let frame = match frame {
-            Ok(frame) => frame % frame_count,
-            Err(_) => {
-                self.browser_preview_active.store(false, Ordering::Release);
+        let mut state = self.browser_preview_state.load(Ordering::Relaxed);
+        let frame = loop {
+            if state & BROWSER_PREVIEW_ACTIVE_BIT == 0 {
                 return [0.0, 0.0];
+            }
+            let cursor = state & BROWSER_PREVIEW_FRAME_MASK;
+            let (frame, next_state) = if cursor < frame_count {
+                (cursor, BROWSER_PREVIEW_ACTIVE_BIT | (cursor + 1))
+            } else if looping {
+                let frame = cursor % frame_count;
+                (frame, BROWSER_PREVIEW_ACTIVE_BIT | (frame + 1))
+            } else {
+                (0, cursor)
+            };
+            match self.browser_preview_state.compare_exchange_weak(
+                state,
+                next_state,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) if cursor >= frame_count && !looping => return [0.0, 0.0],
+                Ok(_) => break frame,
+                Err(observed) => state = observed,
             }
         };
         let Some(offset) = usize::try_from(frame)
             .ok()
             .and_then(|frame| frame.checked_mul(2))
         else {
-            self.browser_preview_active.store(false, Ordering::Release);
             return [0.0, 0.0];
         };
         let Some(frame_samples) = samples.get(offset..offset.saturating_add(2)) else {
-            self.browser_preview_active.store(false, Ordering::Release);
             return [0.0, 0.0];
         };
         let gain = f32::from_bits(self.browser_preview_gain.load(Ordering::Relaxed));
