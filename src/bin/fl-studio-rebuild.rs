@@ -2614,6 +2614,7 @@ struct DawUi {
     audio_engine: Option<AudioEngine>,
     audio_recording: Option<AudioRecordingSession>,
     audio_recording_offset_ms: i16,
+    record_audio_enabled: bool,
     audio_record_start_requested: bool,
     audio_record_stop_requested: bool,
     midi_input_devices: Vec<MidiInputDevice>,
@@ -2629,6 +2630,7 @@ struct DawUi {
     midi_record_snap: PianoRollSnap,
     midi_recording_offset_ms: i16,
     midi_record_fixed_velocity: bool,
+    record_notes_enabled: bool,
     midi_record_toggle_requested: bool,
     midi_input_refresh_requested: bool,
     midi_input_toggle_requested: bool,
@@ -2936,6 +2938,8 @@ impl DawUi {
             midi_output_send_clock,
             midi_output_send_playlist_notes,
             midi_record_fixed_velocity,
+            record_audio_enabled,
+            record_notes_enabled,
         ) = load_midi_device_selections();
         let mut audio_settings = AudioSettings::default();
         if let Some(rate) = audio_catalog.default_sample_rate {
@@ -3169,6 +3173,7 @@ impl DawUi {
             audio_engine: None,
             audio_recording: None,
             audio_recording_offset_ms,
+            record_audio_enabled,
             audio_record_start_requested: false,
             audio_record_stop_requested: false,
             midi_input_devices,
@@ -3184,6 +3189,7 @@ impl DawUi {
             midi_record_snap: PianoRollSnap::None,
             midi_recording_offset_ms,
             midi_record_fixed_velocity,
+            record_notes_enabled,
             midi_record_toggle_requested: false,
             midi_input_refresh_requested: false,
             midi_input_toggle_requested: false,
@@ -7610,10 +7616,14 @@ impl DawUi {
                     .as_ref()
                     .is_none_or(AudioEngine::input_active)
                 && !audio_recording_finalizing;
-            let can_record = recording_midi
-                || recording_audio
-                || (self.midi_input_connection.is_some() && self.document.is_some())
-                || can_record_audio;
+            let (start_audio_recording, start_notes_recording) = recording_input_targets(
+                self.record_audio_enabled,
+                self.record_notes_enabled,
+                can_record_audio,
+                self.midi_input_connection.is_some() && self.document.is_some(),
+            );
+            let can_record =
+                recording_midi || recording_audio || start_audio_recording || start_notes_recording;
             let recording = recording_midi || recording_audio;
             let record_button = egui::Button::new(
                 egui::RichText::new(if recording { "■" } else { "●" }).color(if recording {
@@ -7624,27 +7634,61 @@ impl DawUi {
             )
             .fill(if recording { RED } else { PANEL })
             .stroke(Stroke::NONE);
-            if ui
-                .add_enabled(can_record, record_button)
-                .on_hover_text(if recording_audio {
-                    "Finish audio recording"
-                } else if recording_midi {
-                    "Finish MIDI note recording"
-                } else if audio_recording_finalizing {
-                    "Finalizing the recorded audio take"
-                } else if self.midi_input_connection.is_some() {
-                    "Record MIDI notes; use Audio settings to record audio"
-                } else {
-                    "Record audio to the Playlist or MIDI notes into the selected pattern"
-                })
-                .clicked()
-            {
+            let record_response =
+                ui.add(record_button)
+                    .on_hover_text(if recording_audio && recording_midi {
+                        "Finish audio and MIDI note recording"
+                    } else if recording_audio {
+                        "Finish audio recording"
+                    } else if recording_midi {
+                        "Finish MIDI note recording"
+                    } else if audio_recording_finalizing {
+                        "Finalizing the recorded audio take"
+                    } else if can_record {
+                        "Record the selected audio and MIDI input types"
+                    } else {
+                        "Enable a recording filter and connect its input first"
+                    });
+            let mut record_filters_changed = false;
+            let _ = record_response.context_menu(|ui| {
+                ui.strong("Recording filter");
+                ui.add_enabled_ui(!recording && !audio_recording_finalizing, |ui| {
+                    record_filters_changed |= ui
+                        .checkbox(&mut self.record_audio_enabled, "Audio")
+                        .changed();
+                    record_filters_changed |= ui
+                        .checkbox(&mut self.record_notes_enabled, "Notes")
+                        .changed();
+                    let mut automation_filter_enabled = false;
+                    ui.add_enabled(
+                        false,
+                        egui::Checkbox::new(&mut automation_filter_enabled, "Automation"),
+                    )
+                    .on_hover_text("Automation recording is not available yet.");
+                });
+                ui.separator();
+                ui.label("Audio and Notes can be recorded together.");
+            });
+            if record_filters_changed {
+                self.persist_midi_device_selections();
+            }
+            if record_response.clicked() {
                 if recording_audio {
                     self.audio_record_stop_requested = true;
-                } else if recording_midi || self.midi_input_connection.is_some() {
+                }
+                if recording_midi {
                     self.midi_record_toggle_requested = true;
-                } else {
-                    self.audio_record_start_requested = true;
+                }
+                if !recording && can_record {
+                    if start_notes_recording {
+                        self.midi_record_toggle_requested = true;
+                    }
+                    if start_audio_recording {
+                        self.audio_record_start_requested = true;
+                    }
+                } else if !recording && !can_record {
+                    self.status =
+                        "Enable a recording filter and connect its input first".to_owned();
                 }
             }
             if ui.button("■").on_hover_text("Stop").clicked() {
@@ -23802,6 +23846,8 @@ impl DawUi {
             self.midi_output_send_clock,
             self.midi_output_send_playlist_notes,
             self.midi_record_fixed_velocity,
+            self.record_audio_enabled,
+            self.record_notes_enabled,
         ) {
             self.status = format!("Could not save MIDI device selections: {error}");
         }
@@ -28376,12 +28422,24 @@ fn midi_device_selections_file() -> Option<PathBuf> {
         .map(|directory| directory.join("midi-device-selections.txt"))
 }
 
-fn load_midi_device_selections() -> (Option<String>, Option<String>, bool, bool, bool) {
+fn recording_input_targets(
+    audio_filter_enabled: bool,
+    notes_filter_enabled: bool,
+    audio_available: bool,
+    notes_available: bool,
+) -> (bool, bool) {
+    (
+        audio_filter_enabled && audio_available,
+        notes_filter_enabled && notes_available,
+    )
+}
+
+fn load_midi_device_selections() -> (Option<String>, Option<String>, bool, bool, bool, bool, bool) {
     let Some(path) = midi_device_selections_file() else {
-        return (None, None, false, false, false);
+        return (None, None, false, false, false, true, true);
     };
     let Ok(contents) = fs::read_to_string(path) else {
-        return (None, None, false, false, false);
+        return (None, None, false, false, false, true, true);
     };
     parse_midi_device_selections(&contents)
 }
@@ -28392,6 +28450,8 @@ fn save_midi_device_selections(
     send_clock: bool,
     send_playlist_notes: bool,
     fixed_velocity: bool,
+    record_audio: bool,
+    record_notes: bool,
 ) -> Result<(), String> {
     let path = midi_device_selections_file()
         .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
@@ -28408,6 +28468,8 @@ fn save_midi_device_selections(
             send_clock,
             send_playlist_notes,
             fixed_velocity,
+            record_audio,
+            record_notes,
         ),
     )
     .map_err(|error| format!("could not write {}: {error}", path.display()))
@@ -28419,25 +28481,31 @@ fn encode_midi_device_selections(
     send_clock: bool,
     send_playlist_notes: bool,
     fixed_velocity: bool,
+    record_audio: bool,
+    record_notes: bool,
 ) -> String {
     format!(
-        "input={}\noutput={}\nclock={}\nplaylist_notes={}\nfixed_velocity={}\n",
+        "input={}\noutput={}\nclock={}\nplaylist_notes={}\nfixed_velocity={}\nrecord_audio={}\nrecord_notes={}\n",
         encode_midi_device_id(input_id.unwrap_or_default()),
         encode_midi_device_id(output_id.unwrap_or_default()),
         u8::from(send_clock),
         u8::from(send_playlist_notes),
-        u8::from(fixed_velocity)
+        u8::from(fixed_velocity),
+        u8::from(record_audio),
+        u8::from(record_notes)
     )
 }
 
 fn parse_midi_device_selections(
     contents: &str,
-) -> (Option<String>, Option<String>, bool, bool, bool) {
+) -> (Option<String>, Option<String>, bool, bool, bool, bool, bool) {
     let mut input_id = None;
     let mut output_id = None;
     let mut send_clock = false;
     let mut send_playlist_notes = false;
     let mut fixed_velocity = false;
+    let mut record_audio = true;
+    let mut record_notes = true;
     for line in contents.lines() {
         if let Some(encoded_id) = line.strip_prefix("input=") {
             input_id = decode_midi_device_id(encoded_id);
@@ -28449,6 +28517,10 @@ fn parse_midi_device_selections(
             send_playlist_notes = enabled == "1";
         } else if let Some(enabled) = line.strip_prefix("fixed_velocity=") {
             fixed_velocity = enabled == "1";
+        } else if let Some(enabled) = line.strip_prefix("record_audio=") {
+            record_audio = enabled == "1";
+        } else if let Some(enabled) = line.strip_prefix("record_notes=") {
+            record_notes = enabled == "1";
         }
     }
     (
@@ -28457,6 +28529,8 @@ fn parse_midi_device_selections(
         send_clock,
         send_playlist_notes,
         fixed_velocity,
+        record_audio,
+        record_notes,
     )
 }
 
@@ -31157,10 +31231,10 @@ mod tests {
         playlist_pattern_clip_join_candidates, playlist_pattern_clip_split_supported,
         playlist_pattern_recording_placement_tick, playlist_seek_tick_to_frame,
         playlist_signature_at_tick, playlist_song_position_label, playlist_track_group_range,
-        playlist_track_is_hidden, recolor_piano_roll_notes, serialize_window_layout_presets,
-        snap_note_tick, toggle_piano_roll_note_group_selection, touch_pan_zoom_scroll_offset,
-        track_two_finger_tap, update_channel_rack_selection, update_layer_child_selection,
-        update_piano_roll_box_selection, zoom_to_fit,
+        playlist_track_is_hidden, recolor_piano_roll_notes, recording_input_targets,
+        serialize_window_layout_presets, snap_note_tick, toggle_piano_roll_note_group_selection,
+        touch_pan_zoom_scroll_offset, track_two_finger_tap, update_channel_rack_selection,
+        update_layer_child_selection, update_piano_roll_box_selection, zoom_to_fit,
     };
 
     fn playlist_track_arrangement_fixture(clips: &[(u32, u32, u16)]) -> Arrangement {
@@ -31729,8 +31803,15 @@ mod tests {
     fn midi_device_selections_round_trip_opaque_port_ids() {
         let input_id = "alsa:card=Keyboard\tport\n雪";
         let output_id = "CoreMIDI:0123456789ABCDEF";
-        let encoded =
-            encode_midi_device_selections(Some(input_id), Some(output_id), true, true, true);
+        let encoded = encode_midi_device_selections(
+            Some(input_id),
+            Some(output_id),
+            true,
+            true,
+            true,
+            false,
+            true,
+        );
 
         assert_eq!(
             parse_midi_device_selections(&encoded),
@@ -31739,6 +31820,8 @@ mod tests {
                 Some(output_id.to_owned()),
                 true,
                 true,
+                true,
+                false,
                 true
             )
         );
@@ -31748,11 +31831,35 @@ mod tests {
     fn midi_device_selections_skip_malformed_or_unknown_entries() {
         assert_eq!(
             parse_midi_device_selections("input=0\noutput=xyz\nclock=invalid\nother=01\n"),
-            (None, None, false, false, false)
+            (None, None, false, false, false, true, true)
         );
         assert_eq!(
             parse_midi_device_selections("input=\noutput=\nclock=1\nfixed_velocity=1\n"),
-            (None, None, true, false, true)
+            (None, None, true, false, true, true, true)
+        );
+    }
+
+    #[test]
+    fn recording_input_targets_follow_enabled_filters_and_available_inputs() {
+        assert_eq!(
+            recording_input_targets(true, true, true, true),
+            (true, true)
+        );
+        assert_eq!(
+            recording_input_targets(false, true, true, true),
+            (false, true)
+        );
+        assert_eq!(
+            recording_input_targets(true, true, false, true),
+            (false, true)
+        );
+        assert_eq!(
+            recording_input_targets(true, false, true, true),
+            (true, false)
+        );
+        assert_eq!(
+            recording_input_targets(false, false, true, true),
+            (false, false)
         );
     }
 
