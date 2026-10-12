@@ -6,7 +6,7 @@ use std::sync::mpsc::{SyncSender, TrySendError};
 use std::time::{Duration, Instant};
 
 use flp_rebuild::PatternNote;
-use flp_rebuild::midi::midi_release_velocity_to_fl_note_release;
+use flp_rebuild::midi::{midi_pan_to_fl_note_pan, midi_release_velocity_to_fl_note_release};
 use midir::{Ignore, MidiInput, MidiInputConnection as MidirInputConnection};
 
 use flp_rebuild::sample_render::PlaylistTempoMap;
@@ -328,6 +328,12 @@ pub struct MidiPatternRecorderSettings {
     pub song_timeline_start: Option<(PlaylistTempoMap, f64)>,
 }
 
+struct ActiveMidiNote {
+    start_tick: u32,
+    velocity: u8,
+    pan: u8,
+}
+
 pub struct MidiPatternRecorder {
     pattern_id: u16,
     channel_id: u16,
@@ -341,7 +347,8 @@ pub struct MidiPatternRecorder {
     song_start_frame_micros: Option<u64>,
     started_at: Instant,
     timestamp_origin_micros: Option<u64>,
-    active_notes: BTreeMap<(u8, u8), VecDeque<(u32, u8)>>,
+    channel_pan: [u8; 16],
+    active_notes: BTreeMap<(u8, u8), VecDeque<ActiveMidiNote>>,
     notes: Vec<PatternNote>,
     started_note_count: usize,
     last_position_tick: u32,
@@ -399,6 +406,7 @@ impl MidiPatternRecorder {
             song_start_frame_micros,
             started_at,
             timestamp_origin_micros: None,
+            channel_pan: [64; 16],
             active_notes: BTreeMap::new(),
             notes: Vec::new(),
             started_note_count: 0,
@@ -415,6 +423,10 @@ impl MidiPatternRecorder {
         self.channel_id
     }
 
+    pub fn set_channel_pan_state(&mut self, channel_pan: [u8; 16]) {
+        self.channel_pan = channel_pan.map(|pan| pan.min(127));
+    }
+
     pub fn record(&mut self, message: ReceivedMidiMessage) {
         self.record_with_velocity_override(message, None);
     }
@@ -424,6 +436,27 @@ impl MidiPatternRecorder {
         message: ReceivedMidiMessage,
         fixed_velocity: Option<u8>,
     ) {
+        match message.event {
+            MidiInputEvent::ControlChange {
+                channel,
+                controller: 10,
+                value,
+            } => {
+                if let Some(pan) = self.channel_pan.get_mut(usize::from(channel)) {
+                    *pan = value.min(127);
+                }
+            }
+            MidiInputEvent::ControlChange {
+                channel,
+                controller: 121,
+                ..
+            } => {
+                if let Some(pan) = self.channel_pan.get_mut(usize::from(channel)) {
+                    *pan = 64;
+                }
+            }
+            _ => {}
+        }
         if message.received_at < self.started_at {
             return;
         }
@@ -443,10 +476,19 @@ impl MidiPatternRecorder {
                     return;
                 }
                 self.started_note_count += 1;
+                let pan = self
+                    .channel_pan
+                    .get(usize::from(channel))
+                    .copied()
+                    .unwrap_or(64);
                 self.active_notes
                     .entry((channel, key))
                     .or_default()
-                    .push_back((tick, fixed_velocity.unwrap_or(velocity).min(127)));
+                    .push_back(ActiveMidiNote {
+                        start_tick: tick,
+                        velocity: fixed_velocity.unwrap_or(velocity).min(127),
+                        pan,
+                    });
             }
             MidiInputEvent::NoteOff {
                 channel,
@@ -464,15 +506,9 @@ impl MidiPatternRecorder {
                 if remove_key {
                     self.active_notes.remove(&event_key);
                 }
-                if let Some((start_tick, velocity)) = ended_note {
-                    let note = self.make_note(
-                        start_tick,
-                        tick,
-                        channel,
-                        key,
-                        velocity,
-                        Some(release_velocity),
-                    );
+                if let Some(active_note) = ended_note {
+                    let note =
+                        self.make_note(active_note, tick, channel, key, Some(release_velocity));
                     self.notes.push(note);
                 }
             }
@@ -500,8 +536,8 @@ impl MidiPatternRecorder {
             .min(MAX_NOTE_TICK);
         let finish_tick = finish_tick.max(self.last_position_tick);
         for ((channel, key), active) in std::mem::take(&mut self.active_notes) {
-            for (start_tick, velocity) in active {
-                let note = self.make_note(start_tick, finish_tick, channel, key, velocity, None);
+            for active_note in active {
+                let note = self.make_note(active_note, finish_tick, channel, key, None);
                 self.notes.push(note);
             }
         }
@@ -566,14 +602,13 @@ impl MidiPatternRecorder {
 
     fn make_note(
         &self,
-        start_tick: u32,
+        active_note: ActiveMidiNote,
         end_tick: u32,
         midi_channel: u8,
         key: u8,
-        velocity: u8,
         release_velocity: Option<u8>,
     ) -> PatternNote {
-        let position = quantize_recording_tick(start_tick, self.snap_ticks);
+        let position = quantize_recording_tick(active_note.start_tick, self.snap_ticks);
         let end_tick = quantize_recording_tick(end_tick, self.snap_ticks);
         let mut note = PatternNote {
             position,
@@ -581,7 +616,8 @@ impl MidiPatternRecorder {
             length: end_tick.saturating_sub(position).max(1),
             key: u16::from(key),
             midi_channel,
-            velocity,
+            pan: midi_pan_to_fl_note_pan(active_note.pan),
+            velocity: active_note.velocity,
             ..PatternNote::default()
         };
         if let Some(release_velocity) = release_velocity {
@@ -711,7 +747,86 @@ mod tests {
         assert_eq!(result.notes[0].key, 60);
         assert_eq!(result.notes[0].midi_channel, 9);
         assert_eq!(result.notes[0].velocity, 101);
+        assert_eq!(result.notes[0].pan, 64);
         assert_eq!(result.notes[0].release, 65);
+    }
+
+    #[test]
+    fn records_channel_pan_at_each_note_on() {
+        let started_at = Instant::now();
+        let mut recorder = MidiPatternRecorder::new(
+            MidiPatternRecorderSettings {
+                pattern_id: 1,
+                channel_id: 2,
+                project_path: None,
+                ppq: 96,
+                tempo_bpm: 120.0,
+                start_tick: 0,
+                snap_ticks: None,
+                timing_offset_ms: 0,
+                song_timeline_start: None,
+            },
+            started_at,
+        )
+        .expect("valid project timing should create a recorder");
+        let message = |elapsed_ms, event| ReceivedMidiMessage {
+            timestamp_micros: 1_000_000 + elapsed_ms * 1_000,
+            received_at: started_at + Duration::from_millis(elapsed_ms),
+            event,
+        };
+        recorder.record(message(
+            100,
+            MidiInputEvent::ControlChange {
+                channel: 0,
+                controller: 10,
+                value: 0,
+            },
+        ));
+        recorder.record(message(
+            200,
+            MidiInputEvent::NoteOn {
+                channel: 0,
+                key: 60,
+                velocity: 90,
+            },
+        ));
+        recorder.record(message(
+            300,
+            MidiInputEvent::ControlChange {
+                channel: 0,
+                controller: 10,
+                value: 127,
+            },
+        ));
+        recorder.record(message(
+            400,
+            MidiInputEvent::NoteOff {
+                channel: 0,
+                key: 60,
+                velocity: 0,
+            },
+        ));
+        recorder.record(message(
+            500,
+            MidiInputEvent::NoteOn {
+                channel: 0,
+                key: 62,
+                velocity: 90,
+            },
+        ));
+        recorder.record(message(
+            600,
+            MidiInputEvent::NoteOff {
+                channel: 0,
+                key: 62,
+                velocity: 0,
+            },
+        ));
+
+        let result = recorder.finish(None, started_at + Duration::from_millis(700));
+        assert_eq!(result.notes.len(), 2);
+        assert_eq!(result.notes[0].pan, 0);
+        assert_eq!(result.notes[1].pan, 128);
     }
 
     #[test]
