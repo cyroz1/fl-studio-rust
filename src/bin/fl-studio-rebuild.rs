@@ -1464,6 +1464,7 @@ enum PianoRollScale {
     Major,
     HarmonicMajor,
     Dorian,
+    DorianFlatTwo,
     Phrygian,
     PhrygianDominant,
     Lydian,
@@ -1483,11 +1484,12 @@ enum PianoRollScale {
 }
 
 impl PianoRollScale {
-    const ALL: [Self; 20] = [
+    const ALL: [Self; 21] = [
         Self::None,
         Self::Major,
         Self::HarmonicMajor,
         Self::Dorian,
+        Self::DorianFlatTwo,
         Self::Phrygian,
         Self::PhrygianDominant,
         Self::Lydian,
@@ -1512,6 +1514,7 @@ impl PianoRollScale {
             Self::Major => "Major",
             Self::HarmonicMajor => "Harmonic major",
             Self::Dorian => "Dorian",
+            Self::DorianFlatTwo => "Dorian b2",
             Self::Phrygian => "Phrygian",
             Self::PhrygianDominant => "Phrygian dominant",
             Self::Lydian => "Lydian",
@@ -1544,6 +1547,7 @@ impl PianoRollScale {
             Self::Major => &[0, 2, 4, 5, 7, 9, 11],
             Self::HarmonicMajor => &[0, 2, 4, 5, 7, 8, 11],
             Self::Dorian => &[0, 2, 3, 5, 7, 9, 10],
+            Self::DorianFlatTwo => &[0, 1, 3, 5, 7, 9, 10],
             Self::Phrygian => &[0, 1, 3, 5, 7, 8, 10],
             Self::PhrygianDominant => &[0, 1, 4, 5, 7, 8, 10],
             Self::Lydian => &[0, 2, 4, 6, 7, 9, 11],
@@ -1590,6 +1594,7 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
         PianoRollScale::Major,
         PianoRollScale::HarmonicMajor,
         PianoRollScale::Dorian,
+        PianoRollScale::DorianFlatTwo,
         PianoRollScale::Phrygian,
         PianoRollScale::PhrygianDominant,
         PianoRollScale::Lydian,
@@ -1656,6 +1661,7 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
             let scale_preference = match scale {
                 PianoRollScale::Major => 3,
                 PianoRollScale::HarmonicMajor => 0,
+                PianoRollScale::DorianFlatTwo => -14,
                 PianoRollScale::NaturalMinor => 2,
                 PianoRollScale::HarmonicMinor => 1,
                 PianoRollScale::MelodicMinor => 0,

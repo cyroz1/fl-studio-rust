@@ -1125,6 +1125,7 @@ fn parse_scale_name(value: &str) -> Result<&'static [u8], String> {
         "major" => Ok(&[0, 2, 4, 5, 7, 9, 11]),
         "harmonic-major" => Ok(&[0, 2, 4, 5, 7, 8, 11]),
         "dorian" => Ok(&[0, 2, 3, 5, 7, 9, 10]),
+        "dorian-b2" => Ok(&[0, 1, 3, 5, 7, 9, 10]),
         "phrygian" => Ok(&[0, 1, 3, 5, 7, 8, 10]),
         "phrygian-dominant" => Ok(&[0, 1, 4, 5, 7, 8, 10]),
         "lydian" => Ok(&[0, 2, 4, 6, 7, 9, 11]),
@@ -1141,7 +1142,7 @@ fn parse_scale_name(value: &str) -> Result<&'static [u8], String> {
         "whole-half-diminished" => Ok(&[0, 2, 3, 5, 6, 8, 9, 11]),
         "half-whole-diminished" => Ok(&[0, 1, 3, 4, 6, 7, 9, 10]),
         "altered" => Ok(&[0, 1, 3, 4, 6, 8, 10]),
-        _ => Err("scale name must be major, harmonic-major, dorian, phrygian, phrygian-dominant, lydian, lydian-dominant, mixolydian, natural-minor, locrian, harmonic-minor, melodic-minor, blues, major-pentatonic, minor-pentatonic, whole-tone, whole-half-diminished, half-whole-diminished, or altered".to_owned()),
+        _ => Err("scale name must be major, harmonic-major, dorian, dorian-b2, phrygian, phrygian-dominant, lydian, lydian-dominant, mixolydian, natural-minor, locrian, harmonic-minor, melodic-minor, blues, major-pentatonic, minor-pentatonic, whole-tone, whole-half-diminished, half-whole-diminished, or altered".to_owned()),
     }
 }
 
