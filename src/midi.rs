@@ -84,6 +84,8 @@ pub struct MidiExportNote {
     pub velocity: u8,
     pub start_tick: u64,
     pub end_tick: u64,
+    /// Fine pitch from equal temperament, expressed in cents from -1200 to +1200.
+    pub fine_pitch_offset_cents: i16,
 }
 
 /// A named MIDI track representing one FL Studio channel.
@@ -105,6 +107,40 @@ struct MidiExportMarker {
     tick: u64,
     name: String,
     time_signature: Option<(u8, u8)>,
+}
+
+#[derive(Clone, Copy)]
+struct PendingMidiExportNote {
+    track_index: usize,
+    note_index: usize,
+    preferred_channel: u8,
+    start_tick: u64,
+    end_tick: u64,
+    fine_pitch_offset_cents: i16,
+}
+
+#[derive(Clone, Copy)]
+struct AssignedMidiExportNote {
+    track_index: usize,
+    note_index: usize,
+    channel: u8,
+    start_tick: u64,
+    end_tick: u64,
+    fine_pitch_offset_cents: i16,
+}
+
+#[derive(Clone, Copy)]
+struct ActiveMidiExportNote {
+    end_tick: u64,
+    track_index: usize,
+    fine_pitch_offset_cents: i16,
+}
+
+#[derive(Clone, Copy)]
+struct EndedMidiExportNote {
+    end_tick: u64,
+    track_index: usize,
+    fine_pitch_offset_cents: i16,
 }
 
 struct MidiExportOptions<'a> {
@@ -659,6 +695,8 @@ impl MidiFile {
             .enumerate()
             .map(|(index, channel_id)| (channel_id, (index % 16) as u8))
             .collect();
+        let assigned_notes =
+            assign_export_note_channels(tracks, channel_mapping, &channel_indices)?;
 
         let mut output = Vec::new();
         output.extend_from_slice(MTHD);
@@ -723,41 +761,69 @@ impl MidiFile {
         write_end_of_track(&mut conductor, 0)?;
         append_track_chunk(&mut output, conductor)?;
 
-        for track in tracks {
-            let mut events = Vec::<TimedMidiBytes>::new();
+        let mut events_by_track = tracks
+            .iter()
+            .map(|_| Vec::<TimedMidiBytes>::new())
+            .collect::<Vec<_>>();
+        for (track_index, track) in tracks.iter().enumerate() {
+            let events = &mut events_by_track[track_index];
             events.push(TimedMidiBytes {
                 tick: 0,
                 order: 0,
                 bytes: meta_event_bytes(0x03, track.name.as_bytes())?,
             });
-            let assigned_channel = track
-                .project_channel_id
-                .and_then(|id| channel_indices.get(&id).copied())
-                .unwrap_or(0);
-            for note in &track.notes {
-                if note.key > 127 {
-                    return Err(MidiError::InvalidExport(
-                        "a note key exceeds the MIDI range 0..=127",
-                    ));
-                }
-                let channel = match channel_mapping {
-                    MidiChannelMapping::PreserveNoteChannels => note.channel & 0x0F,
-                    MidiChannelMapping::AssignProjectChannels => assigned_channel,
-                };
-                let start_tick = note.start_tick;
-                let end_tick = note.end_tick.max(start_tick.saturating_add(1));
-                let velocity = note.velocity.min(127);
-                events.push(TimedMidiBytes {
-                    tick: start_tick,
-                    order: 2,
-                    bytes: vec![0x90 | channel, note.key, velocity],
-                });
-                events.push(TimedMidiBytes {
-                    tick: end_tick,
+        }
+
+        let mut configured_pitch_channels = std::collections::BTreeSet::new();
+        for assigned in assigned_notes.iter().flatten() {
+            if assigned.fine_pitch_offset_cents != 0 {
+                configured_pitch_channels.insert((assigned.track_index, assigned.channel));
+            }
+        }
+        for (track_index, channel) in configured_pitch_channels {
+            for bytes in pitch_bend_range_setup_messages(channel) {
+                events_by_track[track_index].push(TimedMidiBytes {
+                    tick: 0,
                     order: 1,
-                    bytes: vec![0x80 | channel, note.key, 0],
+                    bytes: bytes.to_vec(),
                 });
             }
+        }
+
+        for track_notes in &assigned_notes {
+            for assigned in track_notes {
+                let note = &tracks[assigned.track_index].notes[assigned.note_index];
+                let events = &mut events_by_track[assigned.track_index];
+                let velocity = note.velocity.min(127);
+                events.push(TimedMidiBytes {
+                    tick: assigned.start_tick,
+                    order: 5,
+                    bytes: vec![0x90 | assigned.channel, note.key, velocity],
+                });
+                events.push(TimedMidiBytes {
+                    tick: assigned.end_tick,
+                    order: 2,
+                    bytes: vec![0x80 | assigned.channel, note.key, 0],
+                });
+                if assigned.fine_pitch_offset_cents != 0 {
+                    events.push(TimedMidiBytes {
+                        tick: assigned.start_tick,
+                        order: 4,
+                        bytes: pitch_bend_bytes(assigned.channel, assigned.fine_pitch_offset_cents),
+                    });
+                }
+            }
+        }
+        for (track_index, channel, tick) in pitch_bend_reset_events(&assigned_notes) {
+            events_by_track[track_index].push(TimedMidiBytes {
+                tick,
+                order: 3,
+                bytes: pitch_bend_bytes(channel, 0),
+            });
+        }
+
+        for (track_index, track) in tracks.iter().enumerate() {
+            let mut events = std::mem::take(&mut events_by_track[track_index]);
             events.sort_by_key(|event| (event.tick, event.order));
             let mut track_bytes = Vec::new();
             let mut previous_tick = 0u64;
@@ -777,6 +843,195 @@ impl MidiFile {
         }
         Ok(output)
     }
+}
+
+fn assign_export_note_channels(
+    tracks: &[MidiExportTrack],
+    channel_mapping: MidiChannelMapping,
+    channel_indices: &BTreeMap<u16, u8>,
+) -> Result<Vec<Vec<AssignedMidiExportNote>>, MidiError> {
+    let mut pending = Vec::new();
+    for (track_index, track) in tracks.iter().enumerate() {
+        let assigned_channel = track
+            .project_channel_id
+            .and_then(|id| channel_indices.get(&id).copied())
+            .unwrap_or(0);
+        for (note_index, note) in track.notes.iter().enumerate() {
+            if note.key > 127 {
+                return Err(MidiError::InvalidExport(
+                    "a note key exceeds the MIDI range 0..=127",
+                ));
+            }
+            if !(-1200..=1200).contains(&note.fine_pitch_offset_cents) {
+                return Err(MidiError::InvalidExport(
+                    "a note fine-pitch offset exceeds the MIDI pitch-bend range of +/-1200 cents",
+                ));
+            }
+            pending.push(PendingMidiExportNote {
+                track_index,
+                note_index,
+                preferred_channel: match channel_mapping {
+                    MidiChannelMapping::PreserveNoteChannels => note.channel & 0x0F,
+                    MidiChannelMapping::AssignProjectChannels => assigned_channel,
+                },
+                start_tick: note.start_tick,
+                end_tick: note.end_tick.max(note.start_tick.saturating_add(1)),
+                fine_pitch_offset_cents: note.fine_pitch_offset_cents,
+            });
+        }
+    }
+    pending.sort_by_key(|note| (note.start_tick, note.track_index, note.note_index));
+    let reserved_channels = pending
+        .iter()
+        .map(|note| note.preferred_channel)
+        .collect::<std::collections::BTreeSet<_>>();
+
+    let mut active = (0..16)
+        .map(|_| Vec::<ActiveMidiExportNote>::new())
+        .collect::<Vec<_>>();
+    let mut last_ended = vec![None::<EndedMidiExportNote>; 16];
+    let mut assigned = vec![Vec::new(); tracks.len()];
+
+    for note in pending {
+        for channel in 0..16 {
+            let mut still_active = Vec::with_capacity(active[channel].len());
+            for voice in active[channel].drain(..) {
+                if voice.end_tick <= note.start_tick {
+                    if last_ended[channel]
+                        .is_none_or(|previous| voice.end_tick >= previous.end_tick)
+                    {
+                        last_ended[channel] = Some(EndedMidiExportNote {
+                            end_tick: voice.end_tick,
+                            track_index: voice.track_index,
+                            fine_pitch_offset_cents: voice.fine_pitch_offset_cents,
+                        });
+                    }
+                } else {
+                    still_active.push(voice);
+                }
+            }
+            active[channel] = still_active;
+        }
+
+        let channel_can_carry_note = |channel: usize| {
+            let active_pitch_matches = active[channel]
+                .iter()
+                .all(|voice| voice.fine_pitch_offset_cents == note.fine_pitch_offset_cents);
+            let bend_change_is_ordered = last_ended[channel].is_none_or(|previous| {
+                previous.end_tick != note.start_tick
+                    || previous.fine_pitch_offset_cents == note.fine_pitch_offset_cents
+                    || previous.track_index == note.track_index
+            });
+            active_pitch_matches && (!active[channel].is_empty() || bend_change_is_ordered)
+        };
+
+        let preferred_channel = usize::from(note.preferred_channel);
+        let channel = if channel_can_carry_note(preferred_channel) {
+            preferred_channel
+        } else if let Some(channel) = (0..16).find(|channel| {
+            !reserved_channels.contains(&(*channel as u8))
+                && active[*channel].is_empty()
+                && channel_can_carry_note(*channel)
+        }) {
+            channel
+        } else {
+            return Err(MidiError::InvalidExport(
+                "fine-pitched notes need a free MIDI channel for an independent bend, but none is available under this channel mapping",
+            ));
+        };
+
+        active[channel].push(ActiveMidiExportNote {
+            end_tick: note.end_tick,
+            track_index: note.track_index,
+            fine_pitch_offset_cents: note.fine_pitch_offset_cents,
+        });
+        assigned[note.track_index].push(AssignedMidiExportNote {
+            track_index: note.track_index,
+            note_index: note.note_index,
+            channel: channel as u8,
+            start_tick: note.start_tick,
+            end_tick: note.end_tick,
+            fine_pitch_offset_cents: note.fine_pitch_offset_cents,
+        });
+    }
+
+    Ok(assigned)
+}
+
+fn pitch_bend_reset_events(assigned: &[Vec<AssignedMidiExportNote>]) -> Vec<(usize, u8, u64)> {
+    let mut notes_by_channel = (0..16)
+        .map(|_| Vec::<AssignedMidiExportNote>::new())
+        .collect::<Vec<_>>();
+    for note in assigned.iter().flatten() {
+        notes_by_channel[usize::from(note.channel)].push(*note);
+    }
+
+    let mut resets = Vec::new();
+    for (channel, mut notes) in notes_by_channel.into_iter().enumerate() {
+        notes.sort_by_key(|note| (note.start_tick, note.end_tick, note.track_index));
+        let mut run = None::<(i16, u64, usize)>;
+        for note in notes {
+            if let Some((pitch, end_tick, track_index)) = run
+                && pitch == note.fine_pitch_offset_cents
+                && note.start_tick <= end_tick
+            {
+                run = Some((
+                    pitch,
+                    end_tick.max(note.end_tick),
+                    if note.end_tick >= end_tick {
+                        note.track_index
+                    } else {
+                        track_index
+                    },
+                ));
+                continue;
+            }
+            if let Some((pitch, end_tick, track_index)) = run.take()
+                && pitch != 0
+            {
+                resets.push((track_index, channel as u8, end_tick));
+            }
+            run = Some((
+                note.fine_pitch_offset_cents,
+                note.end_tick,
+                note.track_index,
+            ));
+        }
+        if let Some((pitch, end_tick, track_index)) = run
+            && pitch != 0
+        {
+            resets.push((track_index, channel as u8, end_tick));
+        }
+    }
+    resets
+}
+
+fn pitch_bend_range_setup_messages(channel: u8) -> [[u8; 3]; 6] {
+    let status = 0xB0 | channel;
+    [
+        [status, 101, 0],
+        [status, 100, 0],
+        [status, 6, 12],
+        [status, 38, 0],
+        [status, 101, 127],
+        [status, 100, 127],
+    ]
+}
+
+fn pitch_bend_bytes(channel: u8, offset_cents: i16) -> Vec<u8> {
+    let bend = midi_pitch_bend_value(offset_cents);
+    vec![
+        0xE0 | channel,
+        (bend & 0x7F) as u8,
+        ((bend >> 7) & 0x7F) as u8,
+    ]
+}
+
+fn midi_pitch_bend_value(offset_cents: i16) -> u16 {
+    let cents = i64::from(offset_cents.clamp(-1200, 1200));
+    let scale = if cents < 0 { 8192 } else { 8191 };
+    let magnitude = (cents.abs() * scale + 600) / 1200;
+    (8192 + if cents < 0 { -magnitude } else { magnitude }) as u16
 }
 
 impl MidiTrack {
@@ -1262,6 +1517,7 @@ fn export_note(note: &PatternNote, start_tick: u64, end_tick: u64) -> MidiExport
         velocity: note.velocity,
         start_tick,
         end_tick,
+        fine_pitch_offset_cents: note.fine_pitch_offset_cents(),
     }
 }
 
@@ -1608,6 +1864,7 @@ mod tests {
             velocity: 96,
             start_tick: 0,
             end_tick: 240,
+            fine_pitch_offset_cents: 0,
         });
         let mut bass = MidiExportTrack::new("Bass", Some(27));
         bass.end_tick = 480;
@@ -1617,6 +1874,7 @@ mod tests {
             velocity: 128,
             start_tick: 120,
             end_tick: 480,
+            fine_pitch_offset_cents: 0,
         });
 
         let bytes = MidiFile::encode_export_tracks(
@@ -1658,6 +1916,7 @@ mod tests {
             velocity: 100,
             start_tick: u64::from(super::MAX_VLQ as u32) + 17,
             end_tick: u64::from(super::MAX_VLQ as u32) + 200,
+            fine_pitch_offset_cents: 0,
         });
         let bytes = MidiFile::encode_export_tracks(
             &[track],
@@ -1685,6 +1944,7 @@ mod tests {
             velocity: 100,
             start_tick: 0,
             end_tick: 24,
+            fine_pitch_offset_cents: 0,
         });
         let bytes = MidiFile::encode_export_tracks(
             &[track],
@@ -1708,6 +1968,7 @@ mod tests {
             velocity: 100,
             start_tick: 0,
             end_tick: 24,
+            fine_pitch_offset_cents: 0,
         });
         let mut bass = MidiExportTrack::new("Bass", Some(27));
         bass.notes.push(MidiExportNote {
@@ -1716,6 +1977,7 @@ mod tests {
             velocity: 100,
             start_tick: 0,
             end_tick: 24,
+            fine_pitch_offset_cents: 0,
         });
         let bytes = MidiFile::encode_export_tracks_with_channel_order(
             &[piano, bass],
@@ -1733,6 +1995,216 @@ mod tests {
     }
 
     #[test]
+    fn exports_note_fine_pitch_with_pitch_bend_and_a_twelve_semitone_range() {
+        let mut track = MidiExportTrack::new("Fine pitch", Some(0));
+        track.notes.push(MidiExportNote {
+            channel: 0,
+            key: 60,
+            velocity: 100,
+            start_tick: 0,
+            end_tick: 24,
+            fine_pitch_offset_cents: 100,
+        });
+        track.notes.push(MidiExportNote {
+            channel: 0,
+            key: 64,
+            velocity: 100,
+            start_tick: 0,
+            end_tick: 24,
+            fine_pitch_offset_cents: 0,
+        });
+        let mut other_track = MidiExportTrack::new("Other mapped channel", Some(1));
+        other_track.notes.push(MidiExportNote {
+            channel: 1,
+            key: 48,
+            velocity: 100,
+            start_tick: 0,
+            end_tick: 24,
+            fine_pitch_offset_cents: 0,
+        });
+        let bytes = MidiFile::encode_export_tracks(
+            &[track, other_track],
+            96,
+            140.0,
+            None,
+            MidiChannelMapping::PreserveNoteChannels,
+        )
+        .expect("independent fine pitches should be assigned separate MIDI channels");
+        let midi = MidiFile::parse(&bytes).expect("encoded MIDI should parse");
+        let midi_track = &midi.tracks()[1];
+        let notes = midi_track.notes();
+        let bent_channel = notes
+            .iter()
+            .find(|note| note.key() == 60)
+            .expect("fine-pitched note should be present")
+            .channel();
+        let plain_channel = notes
+            .iter()
+            .find(|note| note.key() == 64)
+            .expect("unpitched note should be present")
+            .channel();
+        assert_ne!(bent_channel, plain_channel);
+        assert_eq!(plain_channel, 2);
+        assert_eq!(midi.tracks()[2].notes()[0].channel(), 1);
+
+        let bend_events = midi_track
+            .events()
+            .iter()
+            .filter_map(|event| match event.kind() {
+                super::MidiEventKind::ChannelVoice { status, data }
+                    if status & 0xF0 == 0xE0 && status & 0x0F == bent_channel =>
+                {
+                    Some((
+                        event.absolute_tick(),
+                        u16::from(data[0]) | (u16::from(data[1]) << 7),
+                    ))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bend_events,
+            vec![(0, super::midi_pitch_bend_value(100)), (24, 8192),]
+        );
+
+        let range_setup = midi_track
+            .events()
+            .iter()
+            .filter_map(|event| match event.kind() {
+                super::MidiEventKind::ChannelVoice { status, data }
+                    if status & 0xF0 == 0xB0
+                        && status & 0x0F == bent_channel
+                        && matches!(data[0], 6 | 38 | 100 | 101) =>
+                {
+                    Some([data[0], data[1]])
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            range_setup,
+            vec![[101, 0], [100, 0], [6, 12], [38, 0], [101, 127], [100, 127],]
+        );
+    }
+
+    #[test]
+    fn overlapping_notes_with_the_same_fine_pitch_share_a_bend_until_the_last_note_ends() {
+        let mut track = MidiExportTrack::new("Overlapping notes", Some(0));
+        track.notes.push(MidiExportNote {
+            channel: 0,
+            key: 60,
+            velocity: 100,
+            start_tick: 0,
+            end_tick: 24,
+            fine_pitch_offset_cents: 100,
+        });
+        track.notes.push(MidiExportNote {
+            channel: 0,
+            key: 64,
+            velocity: 100,
+            start_tick: 12,
+            end_tick: 36,
+            fine_pitch_offset_cents: 100,
+        });
+        let bytes = MidiFile::encode_export_tracks(
+            &[track],
+            96,
+            140.0,
+            None,
+            MidiChannelMapping::PreserveNoteChannels,
+        )
+        .expect("matching bends can share a MIDI channel");
+        let midi = MidiFile::parse(&bytes).expect("encoded MIDI should parse");
+        let midi_track = &midi.tracks()[1];
+        let notes = midi_track.notes();
+        assert_eq!(notes[0].channel(), notes[1].channel());
+
+        let bend_events = midi_track
+            .events()
+            .iter()
+            .filter_map(|event| match event.kind() {
+                super::MidiEventKind::ChannelVoice { status, data }
+                    if status & 0xF0 == 0xE0 && status & 0x0F == notes[0].channel() =>
+                {
+                    Some((
+                        event.absolute_tick(),
+                        u16::from(data[0]) | (u16::from(data[1]) << 7),
+                    ))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bend_events,
+            vec![
+                (0, super::midi_pitch_bend_value(100)),
+                (12, super::midi_pitch_bend_value(100)),
+                (36, 8192),
+            ]
+        );
+    }
+
+    #[test]
+    fn uses_a_spare_channel_when_bend_changes_at_a_cross_track_boundary() {
+        let mut first = MidiExportTrack::new("Bent part", Some(0));
+        first.notes.push(MidiExportNote {
+            channel: 0,
+            key: 60,
+            velocity: 100,
+            start_tick: 0,
+            end_tick: 24,
+            fine_pitch_offset_cents: 100,
+        });
+        let mut second = MidiExportTrack::new("Plain part", Some(1));
+        second.notes.push(MidiExportNote {
+            channel: 0,
+            key: 64,
+            velocity: 100,
+            start_tick: 24,
+            end_tick: 48,
+            fine_pitch_offset_cents: 0,
+        });
+        let bytes = MidiFile::encode_export_tracks(
+            &[first, second],
+            96,
+            140.0,
+            None,
+            MidiChannelMapping::PreserveNoteChannels,
+        )
+        .expect("a spare channel should keep separate track events ordered");
+        let midi = MidiFile::parse(&bytes).expect("encoded MIDI should parse");
+        let bent_channel = midi.tracks()[1].notes()[0].channel();
+        let plain_channel = midi.tracks()[2].notes()[0].channel();
+        assert_ne!(bent_channel, plain_channel);
+        assert_eq!(bent_channel, 0);
+        assert_eq!(plain_channel, 1);
+    }
+
+    #[test]
+    fn rejects_fine_pitch_polyphony_that_exhausts_all_midi_channels() {
+        let mut track = MidiExportTrack::new("Too many pitches", Some(0));
+        for index in 0..17 {
+            track.notes.push(MidiExportNote {
+                channel: (index % 16) as u8,
+                key: 48 + index as u8,
+                velocity: 100,
+                start_tick: 0,
+                end_tick: 24,
+                fine_pitch_offset_cents: (index as i16 - 8) * 100,
+            });
+        }
+        let error = MidiFile::encode_export_tracks(
+            &[track],
+            96,
+            140.0,
+            None,
+            MidiChannelMapping::PreserveNoteChannels,
+        )
+        .expect_err("17 independent simultaneous tunings exceed MIDI 1.0 channel capacity");
+        assert!(matches!(error, MidiError::InvalidExport(_)));
+    }
+
+    #[test]
     fn rejects_unrepresentable_midi_export_values() {
         let mut track = MidiExportTrack::new("Invalid", Some(0));
         track.notes.push(MidiExportNote {
@@ -1741,6 +2213,7 @@ mod tests {
             velocity: 100,
             start_tick: 0,
             end_tick: 1,
+            fine_pitch_offset_cents: 0,
         });
         let error = MidiFile::encode_export_tracks(
             &[track],
