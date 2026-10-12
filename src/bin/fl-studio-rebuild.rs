@@ -3055,9 +3055,9 @@ impl DawUi {
             let window_rect = viewport.outer_rect.or(viewport.inner_rect);
             (
                 window_rect.map_or(egui::Pos2::ZERO, |rect| rect.min),
-                window_rect
-                    .map(|rect| rect.size())
-                    .or(viewport.monitor_size),
+                viewport
+                    .monitor_size
+                    .or_else(|| window_rect.map(|rect| rect.size())),
             )
         });
         let mut placements = self.detached_window_placements;
