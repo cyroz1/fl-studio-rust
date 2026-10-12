@@ -123,6 +123,8 @@ const UI_SCALE_STEPS: [f32; 7] = [0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4];
 const BROWSER_SEARCH_ROOT_LIMIT: usize = 30;
 const MIDI_RECORDING_OFFSET_MIN_MS: i16 = -200;
 const MIDI_RECORDING_OFFSET_MAX_MS: i16 = 200;
+const AUDIO_RECORDING_OFFSET_MIN_MS: i16 = -200;
+const AUDIO_RECORDING_OFFSET_MAX_MS: i16 = 200;
 const MIDI_FIXED_RECORDING_VELOCITY: u8 = 100;
 const MAX_BROWSER_RECURSIVE_SCAN_ENTRIES: usize = 20_000;
 const AUTOSAVE_INTERVALS_MINUTES: [u8; 5] = [0, 1, 5, 10, 15];
@@ -2419,6 +2421,7 @@ struct DawUi {
     read_sample_root_note: bool,
     audio_engine: Option<AudioEngine>,
     audio_recording: Option<AudioRecordingSession>,
+    audio_recording_offset_ms: i16,
     audio_record_start_requested: bool,
     audio_record_stop_requested: bool,
     midi_input_devices: Vec<MidiInputDevice>,
@@ -2605,6 +2608,7 @@ struct AudioRecordingSession {
     output_path: PathBuf,
     arrangement_id: u16,
     start_tick: u32,
+    recording_offset_ms: i16,
     tempo_map: PlaylistTempoMap,
     project_generation: u64,
     capture_active: bool,
@@ -2747,6 +2751,7 @@ impl DawUi {
         let detached_window_placements = load_detached_window_placements();
         let window_layout_presets = load_window_layout_presets();
         let read_sample_root_note = load_read_sample_root_note();
+        let audio_recording_offset_ms = load_audio_recording_offset_ms();
         let midi_recording_offset_ms = load_midi_recording_offset_ms();
         let piano_roll_nudge_notes_with_mouse_wheel =
             load_piano_roll_nudge_notes_with_mouse_wheel();
@@ -2957,6 +2962,7 @@ impl DawUi {
             read_sample_root_note,
             audio_engine: None,
             audio_recording: None,
+            audio_recording_offset_ms,
             audio_record_start_requested: false,
             audio_record_stop_requested: false,
             midi_input_devices,
@@ -24281,6 +24287,7 @@ impl DawUi {
             output_path: output_path.clone(),
             arrangement_id,
             start_tick,
+            recording_offset_ms: self.audio_recording_offset_ms,
             tempo_map,
             project_generation,
             capture_active: true,
@@ -24391,10 +24398,25 @@ impl DawUi {
                 return;
             }
         };
+        let placement_tick = match audio_recording_start_tick_with_offset(
+            session.start_tick,
+            session.recording_offset_ms,
+            &session.tempo_map,
+            summary.sample_rate,
+        ) {
+            Ok(tick) => tick,
+            Err(error) => {
+                self.status = format!(
+                    "Saved {}, but its compensated Playlist position is invalid: {error}",
+                    session.output_path.display()
+                );
+                return;
+            }
+        };
         let length_ticks = match session
             .tempo_map
             .ticks_for_audio_frames(
-                u64::from(session.start_tick),
+                u64::from(placement_tick),
                 summary.frames,
                 summary.sample_rate,
             )
@@ -24411,7 +24433,7 @@ impl DawUi {
                 return;
             }
         };
-        if session.start_tick.checked_add(length_ticks).is_none() {
+        if placement_tick.checked_add(length_ticks).is_none() {
             self.status = format!(
                 "Saved {}, but the take extends beyond the supported Playlist timeline",
                 session.output_path.display()
@@ -24419,7 +24441,7 @@ impl DawUi {
             return;
         }
         let Some(track_index) =
-            first_available_playlist_track(&arrangement, session.start_tick, length_ticks)
+            first_available_playlist_track(&arrangement, placement_tick, length_ticks)
         else {
             self.status = format!(
                 "Saved {}, but all Playlist tracks overlap the take",
@@ -24460,7 +24482,7 @@ impl DawUi {
         let clip_index = match updated.create_playlist_audio_clip(
             session.arrangement_id,
             channel_id,
-            session.start_tick,
+            placement_tick,
             length_ticks,
             track_index,
         ) {
@@ -24946,6 +24968,30 @@ impl DawUi {
         ui.label(
             egui::RichText::new(
                 "Records the selected input to WAV and adds the take to the Playlist. This path records the direct device input without Mixer effects.",
+            )
+            .color(MUTED),
+        );
+        let audio_recording_offset_changed = ui
+            .add_enabled_ui(self.audio_recording.is_none(), |ui| {
+                ui.add(
+                    egui::Slider::new(
+                        &mut self.audio_recording_offset_ms,
+                        AUDIO_RECORDING_OFFSET_MIN_MS..=AUDIO_RECORDING_OFFSET_MAX_MS,
+                    )
+                    .text("Input latency compensation")
+                    .suffix(" ms"),
+                )
+            })
+            .inner
+            .changed();
+        if audio_recording_offset_changed
+            && let Err(error) = save_audio_recording_offset_ms(self.audio_recording_offset_ms)
+        {
+            self.status = format!("Could not save audio recording offset: {error}");
+        }
+        ui.label(
+            egui::RichText::new(
+                "Positive values move recorded clips earlier; negative values move them later. This manual offset affects Playlist placement, not the WAV capture.",
             )
             .color(MUTED),
         );
@@ -28132,6 +28178,12 @@ fn midi_recording_offset_settings_file() -> Option<PathBuf> {
         .map(|directory| directory.join("midi-recording-offset-ms.txt"))
 }
 
+fn audio_recording_offset_settings_file() -> Option<PathBuf> {
+    browser_favorites_file()?
+        .parent()
+        .map(|directory| directory.join("audio-recording-offset-ms.txt"))
+}
+
 fn live_resampling_quality_settings_file() -> Option<PathBuf> {
     browser_favorites_file()?
         .parent()
@@ -28209,6 +28261,33 @@ fn load_midi_recording_offset_ms() -> i16 {
             (MIDI_RECORDING_OFFSET_MIN_MS..=MIDI_RECORDING_OFFSET_MAX_MS).contains(offset_ms)
         })
         .unwrap_or(0)
+}
+
+fn load_audio_recording_offset_ms() -> i16 {
+    audio_recording_offset_settings_file()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|contents| contents.trim().parse::<i16>().ok())
+        .filter(|offset_ms| {
+            (AUDIO_RECORDING_OFFSET_MIN_MS..=AUDIO_RECORDING_OFFSET_MAX_MS).contains(offset_ms)
+        })
+        .unwrap_or(0)
+}
+
+fn save_audio_recording_offset_ms(offset_ms: i16) -> Result<(), String> {
+    if !(AUDIO_RECORDING_OFFSET_MIN_MS..=AUDIO_RECORDING_OFFSET_MAX_MS).contains(&offset_ms) {
+        return Err(format!(
+            "unsupported audio input timing offset: {offset_ms} ms"
+        ));
+    }
+    let path = audio_recording_offset_settings_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path.parent().ok_or_else(|| {
+        "the audio recording offset settings path has no parent folder".to_owned()
+    })?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(&path, format!("{offset_ms}\n"))
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
 }
 
 fn save_midi_recording_offset_ms(offset_ms: i16) -> Result<(), String> {
@@ -30083,6 +30162,33 @@ fn note_from_grid_position(
     })
 }
 
+fn audio_recording_start_tick_with_offset(
+    start_tick: u32,
+    offset_ms: i16,
+    tempo_map: &PlaylistTempoMap,
+    sample_rate: u32,
+) -> Result<u32, String> {
+    if sample_rate == 0 {
+        return Err("input sample rate must be greater than zero".to_owned());
+    }
+    let start_frame = tempo_map.frame_at_tick(u64::from(start_tick), sample_rate)?;
+    let offset_frames = i64::from(offset_ms) * i64::from(sample_rate) / 1_000;
+    let compensated_frame = if offset_frames >= 0 {
+        start_frame.saturating_sub(offset_frames as u64)
+    } else {
+        start_frame
+            .checked_add(offset_frames.unsigned_abs())
+            .ok_or_else(|| "audio input timing offset exceeds the renderable timeline".to_owned())?
+    };
+    let compensated_tick = tempo_map
+        .tick_at_frame(compensated_frame, sample_rate)
+        .ok_or_else(|| "audio input timing offset is outside the renderable timeline".to_owned())?;
+    if !compensated_tick.is_finite() {
+        return Err("audio input timing offset is outside the renderable timeline".to_owned());
+    }
+    Ok(compensated_tick.round().clamp(0.0, f64::from(u32::MAX)) as u32)
+}
+
 fn playlist_pattern_recording_offset(
     playhead_tick: f64,
     pattern_id: u16,
@@ -30235,11 +30341,12 @@ mod tests {
         MainView, Pattern, PatternController, PatternNote, PianoRollChordStamp, PianoRollGrid,
         PianoRollScale, PianoRollSnap, PlaylistClip, PlaylistClipDragKind, PlaylistTempoMap,
         PlaylistTrack, PluginCandidate, PluginFormat, TimeSelectionShift,
-        WINDOW_LAYOUT_PRESETS_HEADER, WindowLayoutPreset, candidate_matches_vst_identity,
-        candidate_mixer_controls, candidate_mixer_stereo_separation, detect_chord_name,
-        detect_piano_roll_channel_scale, detect_piano_roll_scale, encode_midi_device_selections,
-        first_available_playlist_track, next_piano_roll_note_group, note_from_grid_position,
-        parse_midi_device_selections, parse_window_layout_presets, piano_roll_color_group_note_ids,
+        WINDOW_LAYOUT_PRESETS_HEADER, WindowLayoutPreset, audio_recording_start_tick_with_offset,
+        candidate_matches_vst_identity, candidate_mixer_controls,
+        candidate_mixer_stereo_separation, detect_chord_name, detect_piano_roll_channel_scale,
+        detect_piano_roll_scale, encode_midi_device_selections, first_available_playlist_track,
+        next_piano_roll_note_group, note_from_grid_position, parse_midi_device_selections,
+        parse_window_layout_presets, piano_roll_color_group_note_ids,
         piano_roll_controller_stroke_points, piano_roll_controller_value_at,
         piano_roll_controller_value_range, piano_roll_discard_length_edit,
         piano_roll_duplicate_offset, piano_roll_key_at_y, piano_roll_note_group_members,
@@ -30898,6 +31005,25 @@ mod tests {
 
         let unknown_track = playlist_track_arrangement_fixture(&[(0, 960, 600)]);
         assert_eq!(first_available_playlist_track(&unknown_track, 0, 480), None);
+    }
+
+    #[test]
+    fn audio_recording_offset_moves_playlist_start_and_clamps_at_zero() {
+        let tempo_map =
+            PlaylistTempoMap::constant(400, 120.0).expect("constant tempo map should be valid");
+        assert_eq!(
+            audio_recording_start_tick_with_offset(1_000, 25, &tempo_map, 48_000),
+            Ok(980)
+        );
+        assert_eq!(
+            audio_recording_start_tick_with_offset(1_000, -25, &tempo_map, 48_000),
+            Ok(1_020)
+        );
+        assert_eq!(
+            audio_recording_start_tick_with_offset(1, 200, &tempo_map, 48_000),
+            Ok(0)
+        );
+        assert!(audio_recording_start_tick_with_offset(1_000, 0, &tempo_map, 0).is_err());
     }
 
     #[test]
