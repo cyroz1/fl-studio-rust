@@ -3167,10 +3167,7 @@ fn prepare_audio_clip_render(
             resolved_path,
             gain,
             pan,
-            audio_clip_master_pitch_ratio(
-                channel.keyboard_main_pitch_enabled(),
-                master_pitch_cents,
-            ),
+            audio_clip_master_pitch_ratio(channel.master_pitch_offset_cents(master_pitch_cents)),
             mixer_track,
             mixer_route_plan,
         ));
@@ -3721,9 +3718,8 @@ fn prepare_sampler_arrangement(
                     options.read_sample_root_note,
                 ),
                 fine_tune_cents: wave_metadata.fine_tune_cents.unwrap_or_default()
-                    + channel_master_pitch_cents(
-                        channel.keyboard_main_pitch_enabled(),
-                        document.metadata().master_pitch_cents(),
+                    + f64::from(
+                        channel.master_pitch_offset_cents(document.metadata().master_pitch_cents()),
                     ),
                 loop_bounds,
                 ping_pong_loop: channel.sampler_ping_pong_loop_enabled(),
@@ -4008,9 +4004,8 @@ fn prepare_sampler_pattern(
                     options.read_sample_root_note,
                 ),
                 fine_tune_cents: wave_metadata.fine_tune_cents.unwrap_or_default()
-                    + channel_master_pitch_cents(
-                        channel.keyboard_main_pitch_enabled(),
-                        document.metadata().master_pitch_cents(),
+                    + f64::from(
+                        channel.master_pitch_offset_cents(document.metadata().master_pitch_cents()),
                     ),
                 loop_bounds,
                 ping_pong_loop: channel.sampler_ping_pong_loop_enabled(),
@@ -4452,22 +4447,9 @@ fn sampler_wav_gain(gain_db: Option<i8>) -> f32 {
     gain_db.map_or(1.0, |gain_db| 10.0f32.powf(f32::from(gain_db) / 20.0))
 }
 
-fn channel_master_pitch_cents(channel_enabled: bool, project_cents: Option<i16>) -> f64 {
-    if channel_enabled {
-        f64::from(
-            project_cents
-                .filter(|cents| (-1200..=1200).contains(cents))
-                .unwrap_or_default(),
-        )
-    } else {
-        0.0
-    }
+fn audio_clip_master_pitch_ratio(pitch_offset_cents: i16) -> f64 {
+    2.0f64.powf(f64::from(pitch_offset_cents) / 1_200.0)
 }
-
-fn audio_clip_master_pitch_ratio(channel_enabled: bool, project_cents: Option<i16>) -> f64 {
-    2.0f64.powf(channel_master_pitch_cents(channel_enabled, project_cents) / 1_200.0)
-}
-
 fn sampler_source_step(
     source_rate: u32,
     output_rate: u32,
@@ -6547,13 +6529,11 @@ mod tests {
 
     #[test]
     fn playlist_audio_clip_master_pitch_changes_playback_rate_and_duration() {
-        let pitch_up = audio_clip_master_pitch_ratio(true, Some(1_200));
-        let pitch_down = audio_clip_master_pitch_ratio(true, Some(-1_200));
+        let pitch_up = audio_clip_master_pitch_ratio(1_200);
+        let pitch_down = audio_clip_master_pitch_ratio(-1_200);
         assert_eq!(pitch_up, 2.0);
         assert_eq!(pitch_down, 0.5);
-        assert_eq!(audio_clip_master_pitch_ratio(false, Some(1_200)), 1.0);
-        assert_eq!(audio_clip_master_pitch_ratio(true, None), 1.0);
-        assert_eq!(audio_clip_master_pitch_ratio(true, Some(1_201)), 1.0);
+        assert_eq!(audio_clip_master_pitch_ratio(0), 1.0);
         assert_eq!(source_duration_to_frames(4, 4, 4, pitch_up).unwrap(), 2);
         assert_eq!(source_duration_to_frames(4, 4, 4, pitch_down).unwrap(), 8);
 
@@ -6984,14 +6964,6 @@ mod tests {
         assert_eq!(sampler_wav_gain(Some(0)), 1.0);
         assert!((sampler_wav_gain(Some(-6)) - 10.0f32.powf(-6.0 / 20.0)).abs() < 1e-6);
         assert_eq!(sampler_wav_gain(Some(20)), 10.0);
-    }
-
-    #[test]
-    fn sampler_master_pitch_requires_the_channel_enable_flag() {
-        assert_eq!(channel_master_pitch_cents(true, Some(375)), 375.0);
-        assert_eq!(channel_master_pitch_cents(false, Some(375)), 0.0);
-        assert_eq!(channel_master_pitch_cents(true, None), 0.0);
-        assert_eq!(channel_master_pitch_cents(true, Some(1201)), 0.0);
     }
 
     #[test]

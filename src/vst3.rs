@@ -23,7 +23,7 @@ use crate::{
     MixerSourceRouteTransform,
 };
 use vst3_host::audio::AudioBuffers;
-use vst3_host::midi::{MidiChannel, MidiEvent};
+use vst3_host::midi::{MidiChannel, MidiEvent, PluginEvent, PluginEventData};
 use vst3_host::{Plugin, PluginWindow, Vst3Host};
 
 use crate::PatternNote;
@@ -60,6 +60,7 @@ pub struct Vst3RenderSummary {
 struct PreparedPatternRender {
     events: Vec<ScheduledMidiEvent>,
     parameter_automation: Vec<PreparedParameterAutomation>,
+    pitch_offset_cents: i16,
     note_count: usize,
     sample_rate: f64,
     sample_rate_u32: u32,
@@ -145,6 +146,8 @@ pub struct Vst3PatternRenderOptions {
     pub tail_seconds: f64,
     pub global_swing_mix_raw: u8,
     pub channel_swing_mix_raw: u16,
+    /// Effective project Master pitch for this channel, in cents; use zero when disabled.
+    pub pitch_offset_cents: i16,
 }
 
 /// One normalized VST3 parameter value at a pattern-relative beat position.
@@ -474,9 +477,12 @@ impl PlaylistPluginStream {
                         && event.frame < block_end
                     {
                         let offset = event.frame.saturating_sub(self.source_frame) as i32;
-                        plugin
-                            .send_midi_event_at(event.event, offset)
-                            .map_err(|error| error.to_string())?;
+                        send_scheduled_midi_event(
+                            &mut plugin,
+                            event.event,
+                            offset,
+                            self.render.pitch_offset_cents,
+                        )?;
                         self.next_event += 1;
                     }
                     crate::audio::enable_denormal_protection();
@@ -1311,6 +1317,7 @@ impl Vst3HostRuntime {
             .iter()
             .map(|channel| (channel.id(), channel))
             .collect();
+        let project_master_pitch_cents = document.metadata().master_pitch_cents();
         let mixer_route_audibility = MixerRouteAudibility::from_document(document);
         let channel_router = ChannelNoteRouter::new(channels.clone());
         let mut plugin_channels: BTreeSet<_> = document
@@ -1424,6 +1431,9 @@ impl Vst3HostRuntime {
                 continue;
             };
             let channel = channels_by_id.get(&channel_id);
+            let pitch_offset_cents = channel.map_or(0, |channel| {
+                channel.master_pitch_offset_cents(project_master_pitch_cents)
+            });
             let (gain, pan) = channel_gain_pan(
                 channel.and_then(|channel| channel.volume()),
                 channel.and_then(|channel| channel.pan()),
@@ -1465,6 +1475,7 @@ impl Vst3HostRuntime {
                     &notes,
                     &tempo_map,
                     source_frames as u64,
+                    pitch_offset_cents,
                 )?;
                 (render, latency_frames)
             };
@@ -1569,6 +1580,7 @@ fn prepare_playlist_pattern_render(
     notes: &[PlaylistMidiNote],
     tempo_map: &PlaylistTempoMap,
     total_frames: u64,
+    pitch_offset_cents: i16,
 ) -> Result<PreparedPatternRender, String> {
     if notes.is_empty() {
         return Err("VST3 Playlist channel has no notes to render".to_owned());
@@ -1598,6 +1610,7 @@ fn prepare_playlist_pattern_render(
     Ok(PreparedPatternRender {
         events,
         parameter_automation: Vec::new(),
+        pitch_offset_cents,
         note_count,
         sample_rate,
         sample_rate_u32,
@@ -1706,7 +1719,11 @@ fn prepare_pattern_render_with_automation(
         tail_seconds,
         global_swing_mix_raw,
         channel_swing_mix_raw,
+        pitch_offset_cents,
     } = options;
+    if !(-1200..=1200).contains(&pitch_offset_cents) {
+        return Err("VST3 pitch offset must be between -1200 and 1200 cents".to_owned());
+    }
     if ppq == 0 {
         return Err("project PPQ must be greater than zero".to_owned());
     }
@@ -1764,6 +1781,7 @@ fn prepare_pattern_render_with_automation(
     Ok(PreparedPatternRender {
         events,
         parameter_automation,
+        pitch_offset_cents,
         note_count,
         sample_rate,
         sample_rate_u32,
@@ -2004,9 +2022,7 @@ fn process_pattern_render(
                 && event.frame < block_end
             {
                 let offset = event.frame.saturating_sub(rendered_frames) as i32;
-                plugin
-                    .send_midi_event_at(event.event, offset)
-                    .map_err(|error| error.to_string())?;
+                send_scheduled_midi_event(plugin, event.event, offset, render.pitch_offset_cents)?;
                 event_index += 1;
             }
 
@@ -2084,9 +2100,12 @@ fn stream_pattern_render(
                     && event.frame < block_end
                 {
                     let offset = event.frame.saturating_sub(rendered_frames) as i32;
-                    plugin
-                        .send_midi_event_at(event.event, offset)
-                        .map_err(|error| error.to_string())?;
+                    send_scheduled_midi_event(
+                        &mut plugin,
+                        event.event,
+                        offset,
+                        render.pitch_offset_cents,
+                    )?;
                     event_index += 1;
                 }
                 crate::audio::enable_denormal_protection();
@@ -2258,6 +2277,39 @@ impl StereoStreamResampler {
 
 fn finite_sample(sample: f32) -> f32 {
     if sample.is_finite() { sample } else { 0.0 }
+}
+
+fn plugin_event_with_pitch_offset(
+    event: MidiEvent,
+    sample_offset: i32,
+    pitch_offset_cents: i16,
+) -> Result<PluginEvent, String> {
+    let mut plugin_event = PluginEvent::from(event).at(sample_offset);
+    match &mut plugin_event.data {
+        PluginEventData::NoteOn { tuning, .. } | PluginEventData::NoteOff { tuning, .. } => {
+            *tuning = f32::from(pitch_offset_cents);
+        }
+        _ => return Err("VST3 pitch tuning can only be applied to note events".to_owned()),
+    }
+    Ok(plugin_event)
+}
+
+fn send_scheduled_midi_event(
+    plugin: &mut Plugin,
+    event: MidiEvent,
+    sample_offset: i32,
+    pitch_offset_cents: i16,
+) -> Result<(), String> {
+    if pitch_offset_cents == 0 {
+        plugin
+            .send_midi_event_at(event, sample_offset)
+            .map_err(|error| error.to_string())
+    } else {
+        let event = plugin_event_with_pitch_offset(event, sample_offset, pitch_offset_cents)?;
+        plugin
+            .send_plugin_event(event)
+            .map_err(|error| error.to_string())
+    }
 }
 
 fn append_vst_output_block_to_stereo(
@@ -2929,6 +2981,49 @@ mod tests {
                 note: 60,
                 velocity: 0
             }
+        ));
+    }
+
+    #[test]
+    fn applies_master_pitch_as_vst3_note_tuning() {
+        let note_on = plugin_event_with_pitch_offset(
+            MidiEvent::NoteOn {
+                channel: MidiChannel::Ch1,
+                note: 64,
+                velocity: 100,
+            },
+            17,
+            375,
+        )
+        .unwrap();
+        assert_eq!(note_on.sample_offset, 17);
+        assert!(matches!(
+            note_on.data,
+            PluginEventData::NoteOn {
+                pitch: 64,
+                tuning,
+                ..
+            } if tuning == 375.0
+        ));
+
+        let note_off = plugin_event_with_pitch_offset(
+            MidiEvent::NoteOff {
+                channel: MidiChannel::Ch1,
+                note: 64,
+                velocity: 0,
+            },
+            29,
+            375,
+        )
+        .unwrap();
+        assert_eq!(note_off.sample_offset, 29);
+        assert!(matches!(
+            note_off.data,
+            PluginEventData::NoteOff {
+                pitch: 64,
+                tuning,
+                ..
+            } if tuning == 375.0
         ));
     }
 

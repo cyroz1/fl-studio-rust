@@ -751,6 +751,17 @@ impl ChannelSummary {
         self.keyboard_add_root.unwrap_or(false)
     }
 
+    /// Returns the project's pitch offset for this channel, or zero when the channel is not
+    /// enabled for Master pitch or the stored project value is outside FL Studio's range.
+    pub fn master_pitch_offset_cents(&self, project_master_pitch_cents: Option<i16>) -> i16 {
+        if !self.keyboard_main_pitch_enabled() {
+            return 0;
+        }
+        project_master_pitch_cents
+            .filter(|cents| (-1200..=1200).contains(cents))
+            .unwrap_or_default()
+    }
+
     /// Raw four-byte channel color value, in little-endian RGBA byte order.
     pub fn color(&self) -> Option<[u8; 4]> {
         self.color.map(u32::to_le_bytes)
@@ -18267,6 +18278,15 @@ mod tests {
                 document.channels()[0].keyboard_main_pitch_enabled(),
                 expected
             );
+            assert_eq!(
+                document.channels()[0].master_pitch_offset_cents(Some(375)),
+                if expected { 375 } else { 0 }
+            );
+            assert_eq!(document.channels()[0].master_pitch_offset_cents(None), 0);
+            assert_eq!(
+                document.channels()[0].master_pitch_offset_cents(Some(1201)),
+                0
+            );
             assert_eq!(document.encode_lossless().unwrap(), input);
         }
 
@@ -18276,6 +18296,10 @@ mod tests {
         let short_document = FlpDocument::parse(&flp_fixture(&short_event_stream, &[], &[]))
             .expect("short Parameters fixture should parse");
         assert!(!short_document.channels()[0].keyboard_main_pitch_enabled());
+        assert_eq!(
+            short_document.channels()[0].master_pitch_offset_cents(Some(375)),
+            0
+        );
     }
 
     #[test]

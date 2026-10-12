@@ -1252,20 +1252,16 @@ fn render_pattern_vst3(
         .into_iter()
         .find(|pattern| pattern.id == pattern_id)
         .ok_or_else(|| format!("pattern id {pattern_id} was not found"))?;
-    if !document
-        .channels()
-        .iter()
-        .any(|channel| channel.id() == channel_id)
-    {
-        return Err(format!("channel id {channel_id} was not found"));
-    }
-
-    let class_uid = matching_project_class_uid(&document, channel_id, bundle_path);
-    let channel_swing_mix_raw = document
+    let channel = document
         .channels()
         .into_iter()
         .find(|channel| channel.id() == channel_id)
-        .map_or(128, |channel| channel.swing_mix());
+        .ok_or_else(|| format!("channel id {channel_id} was not found"))?;
+
+    let class_uid = matching_project_class_uid(&document, channel_id, bundle_path);
+    let channel_swing_mix_raw = channel.swing_mix();
+    let pitch_offset_cents =
+        channel.master_pitch_offset_cents(document.metadata().master_pitch_cents());
     let mut host = Vst3HostRuntime::new(48_000.0, 512)?;
     let plugin = host.load(bundle_path, class_uid.as_deref())?;
     let output_extension = output_path
@@ -1292,6 +1288,7 @@ fn render_pattern_vst3(
             tail_seconds,
             global_swing_mix_raw: document.metadata().global_swing_mix(),
             channel_swing_mix_raw,
+            pitch_offset_cents,
         },
         output_path,
         AudioFileRenderOptions {
