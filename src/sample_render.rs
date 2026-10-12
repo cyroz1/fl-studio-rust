@@ -248,6 +248,45 @@ impl PlaylistTempoMap {
     }
 }
 
+fn playlist_wav_cue_points(
+    document: &FlpDocument,
+    arrangement_id: u16,
+    sample_rate: u32,
+) -> Result<Vec<WavCuePoint>, String> {
+    let arrangement = document
+        .arrangements()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|arrangement| arrangement.id == arrangement_id)
+        .ok_or_else(|| format!("arrangement {arrangement_id} was not found"))?;
+    let tempo_map = PlaylistTempoMap::for_arrangement(document, arrangement_id)?;
+    let mut cue_points = arrangement
+        .time_markers
+        .iter()
+        .enumerate()
+        .map(|(index, marker)| {
+            let identifier = u32::try_from(index + 1)
+                .map_err(|_| "Playlist contains too many time markers for WAV output".to_owned())?;
+            let sample_offset =
+                tempo_map.frame_at_tick(u64::from(marker.position_ticks()), sample_rate)?;
+            let sample_offset = u32::try_from(sample_offset)
+                .map_err(|_| "Playlist marker is outside the RIFF/WAVE sample range".to_owned())?;
+            let label = marker
+                .name()
+                .filter(|name| !name.trim().is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("Time marker {}", index + 1));
+            Ok(WavCuePoint {
+                identifier,
+                sample_offset,
+                label,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    cue_points.sort_by_key(|point| (point.sample_offset, point.identifier));
+    Ok(cue_points)
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum PanLaw {
     #[default]
@@ -607,6 +646,8 @@ pub struct PlaylistRenderOptions {
     pub wav_dither_mode: WavDitherMode,
     pub resampling_quality: ResamplingQuality,
     pub wav_channel_mode: WavChannelMode,
+    /// Write Playlist time markers as RIFF/WAVE cue points and labels.
+    pub wav_save_playlist_markers: bool,
     pub tail_seconds: u8,
     /// Render only this inclusive one-based Playlist track range when soloing.
     pub soloed_playlist_track_range: Option<(u32, u32)>,
@@ -623,11 +664,19 @@ impl Default for PlaylistRenderOptions {
             wav_dither_mode: WavDitherMode::Off,
             resampling_quality: ResamplingQuality::RENDER_DEFAULT,
             wav_channel_mode: WavChannelMode::Stereo,
+            wav_save_playlist_markers: false,
             tail_seconds: 0,
             soloed_playlist_track_range: None,
             read_sample_root_note: true,
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WavCuePoint {
+    identifier: u32,
+    sample_offset: u32,
+    label: String,
 }
 
 /// Optional live Playlist meter output and seek position for device streaming.
@@ -1283,6 +1332,19 @@ fn render_playlist_with_vst3_cancellable(
     if let Some(processor) = vst3_processor.as_mut() {
         content_frames = content_frames.max(processor.summary().frames);
     }
+    let wav_cue_points =
+        if matches!(output, PlaylistRenderOutput::Wav) && options.wav_save_playlist_markers {
+            playlist_wav_cue_points(document, options.arrangement_id, options.sample_rate)?
+        } else {
+            Vec::new()
+        };
+    if let Some(last_marker_frame) = wav_cue_points
+        .iter()
+        .map(|point| u64::from(point.sample_offset))
+        .max()
+    {
+        content_frames = content_frames.max(last_marker_frame);
+    }
     let frames = add_render_tail_frames(content_frames, options.sample_rate, options.tail_seconds)?;
     if let Some(processor) = vst3_processor.as_mut() {
         processor.extend_to_output_frames(frames)?;
@@ -1447,6 +1509,9 @@ fn render_playlist_with_vst3_cancellable(
             encoder.finalize()?;
         }
     }
+    if matches!(output, PlaylistRenderOutput::Wav) {
+        write_wav_cue_points(file, &wav_cue_points)?;
+    }
     summary.mixer_insert_peaks = Some(take_mixer_insert_peaks(&mixer_track_meters));
     temporary.commit(output_path)?;
     Ok(summary)
@@ -1601,6 +1666,18 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
     if let Some(processor) = vst3_processor.as_mut() {
         content_frames = content_frames.max(processor.summary().frames);
     }
+    let wav_cue_points = if options.wav_save_playlist_markers {
+        playlist_wav_cue_points(document, options.arrangement_id, options.sample_rate)?
+    } else {
+        Vec::new()
+    };
+    if let Some(last_marker_frame) = wav_cue_points
+        .iter()
+        .map(|point| u64::from(point.sample_offset))
+        .max()
+    {
+        content_frames = content_frames.max(last_marker_frame);
+    }
     let frames = add_render_tail_frames(content_frames, options.sample_rate, options.tail_seconds)?;
     if let Some(processor) = vst3_processor.as_mut() {
         processor.extend_to_output_frames(frames)?;
@@ -1734,8 +1811,16 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
     if rendered_stems == 0 {
         return Err("render contained no non-silent selected Mixer stems".into());
     }
-    for output in outputs {
+    for mut output in outputs {
         if output.peak > 0.0 {
+            write_wav_cue_points(
+                output
+                    .temporary
+                    .file
+                    .as_mut()
+                    .expect("temporary Mixer stem file is open"),
+                &wav_cue_points,
+            )?;
             output.temporary.commit(&output.output_path)?;
         }
     }
@@ -2444,6 +2529,82 @@ fn write_wav_header(
         return Err("rendered WAV contains no frames".to_owned());
     }
     Ok(())
+}
+
+fn append_riff_chunk(
+    output: &mut Vec<u8>,
+    identifier: &[u8; 4],
+    data: &[u8],
+) -> Result<(), String> {
+    let size = u32::try_from(data.len())
+        .map_err(|_| "WAV marker metadata exceeds the RIFF chunk-size limit".to_owned())?;
+    output.extend_from_slice(identifier);
+    output.extend_from_slice(&size.to_le_bytes());
+    output.extend_from_slice(data);
+    if !data.len().is_multiple_of(2) {
+        output.push(0);
+    }
+    Ok(())
+}
+
+fn write_wav_cue_points(file: &mut File, cue_points: &[WavCuePoint]) -> Result<(), String> {
+    if cue_points.is_empty() {
+        return Ok(());
+    }
+    let cue_count = u32::try_from(cue_points.len())
+        .map_err(|_| "Playlist contains too many WAV cue points".to_owned())?;
+    let cue_capacity = cue_points
+        .len()
+        .checked_mul(24)
+        .and_then(|size| size.checked_add(4))
+        .ok_or_else(|| "WAV cue-point table size overflow".to_owned())?;
+    let mut cue_data = Vec::with_capacity(cue_capacity);
+    cue_data.extend_from_slice(&cue_count.to_le_bytes());
+    for point in cue_points {
+        cue_data.extend_from_slice(&point.identifier.to_le_bytes());
+        cue_data.extend_from_slice(&point.sample_offset.to_le_bytes());
+        cue_data.extend_from_slice(b"data");
+        cue_data.extend_from_slice(&0_u32.to_le_bytes());
+        cue_data.extend_from_slice(&0_u32.to_le_bytes());
+        cue_data.extend_from_slice(&point.sample_offset.to_le_bytes());
+    }
+
+    let mut associated_data = Vec::new();
+    associated_data.extend_from_slice(b"adtl");
+    for point in cue_points {
+        let label = point
+            .label
+            .chars()
+            .filter(|character| *character != '\0')
+            .collect::<String>();
+        let label_length = 4_usize
+            .checked_add(label.len())
+            .and_then(|length| length.checked_add(1))
+            .ok_or_else(|| "WAV cue label size overflow".to_owned())?;
+        let mut label_data = Vec::with_capacity(label_length);
+        label_data.extend_from_slice(&point.identifier.to_le_bytes());
+        label_data.extend_from_slice(label.as_bytes());
+        label_data.push(0);
+        append_riff_chunk(&mut associated_data, b"labl", &label_data)?;
+    }
+
+    let mut chunks = Vec::new();
+    append_riff_chunk(&mut chunks, b"cue ", &cue_data)?;
+    append_riff_chunk(&mut chunks, b"LIST", &associated_data)?;
+    let current_length = file
+        .seek(SeekFrom::End(0))
+        .map_err(|error| format!("could not seek to the end of the WAV file: {error}"))?;
+    let new_length = current_length
+        .checked_add(chunks.len() as u64)
+        .ok_or_else(|| "WAV file size overflow".to_owned())?;
+    let riff_size = u32::try_from(new_length.saturating_sub(8))
+        .map_err(|_| "WAV markers exceed the RIFF/WAVE size limit".to_owned())?;
+    file.write_all(&chunks)
+        .map_err(|error| format!("could not write WAV cue points: {error}"))?;
+    file.seek(SeekFrom::Start(4))
+        .and_then(|_| file.write_all(&riff_size.to_le_bytes()))
+        .and_then(|_| file.seek(SeekFrom::End(0)).map(|_| ()))
+        .map_err(|error| format!("could not finalize WAV cue-point metadata: {error}"))
 }
 
 #[cfg(test)]
@@ -6436,6 +6597,7 @@ mod tests {
                     wav_dither_mode: WavDitherMode::Off,
                     resampling_quality: ResamplingQuality::Linear,
                     wav_channel_mode: WavChannelMode::Stereo,
+                    wav_save_playlist_markers: false,
                     tail_seconds: 0,
                     soloed_playlist_track_range: None,
                     read_sample_root_note: true,
@@ -6496,6 +6658,72 @@ mod tests {
             check_cancelled(Some(&cancelled)),
             Err("audio render cancelled".to_owned())
         );
+    }
+
+    #[test]
+    fn wav_playlist_markers_write_standard_cue_points_and_labels() {
+        let root = std::env::temp_dir().join(format!(
+            "flp-rebuild-wav-cues-{}-{}",
+            std::process::id(),
+            NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).expect("temporary test folder should be created");
+        let path = root.join("markers.wav");
+        let mut file = File::create(&path).expect("temporary WAV should be created");
+        write_wav_header(
+            &mut file,
+            44_100,
+            2,
+            8,
+            WavSampleFormat::Pcm16,
+            WavChannelMode::Stereo,
+        )
+        .unwrap();
+        let original_audio_data = [1, 2, 3, 4, 5, 6, 7, 8];
+        file.write_all(&original_audio_data).unwrap();
+        write_wav_cue_points(
+            &mut file,
+            &[
+                WavCuePoint {
+                    identifier: 1,
+                    sample_offset: 1,
+                    label: "Intro".to_owned(),
+                },
+                WavCuePoint {
+                    identifier: 2,
+                    sample_offset: 2,
+                    label: "Verse 2".to_owned(),
+                },
+            ],
+        )
+        .unwrap();
+        drop(file);
+
+        let bytes = fs::read(&path).expect("rendered WAV should be readable");
+        assert_eq!(&bytes[..4], b"RIFF");
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize,
+            bytes.len() - 8
+        );
+        assert_eq!(&bytes[44..52], &original_audio_data);
+        assert_eq!(&bytes[52..56], b"cue ");
+        assert_eq!(u32::from_le_bytes(bytes[56..60].try_into().unwrap()), 52);
+        assert_eq!(u32::from_le_bytes(bytes[60..64].try_into().unwrap()), 2);
+        assert_eq!(u32::from_le_bytes(bytes[64..68].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(bytes[68..72].try_into().unwrap()), 1);
+        assert_eq!(&bytes[72..76], b"data");
+        assert_eq!(u32::from_le_bytes(bytes[84..88].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(bytes[88..92].try_into().unwrap()), 2);
+        assert_eq!(&bytes[112..116], b"LIST");
+        assert_eq!(&bytes[120..124], b"adtl");
+        assert_eq!(&bytes[124..128], b"labl");
+        assert_eq!(u32::from_le_bytes(bytes[132..136].try_into().unwrap()), 1);
+        assert_eq!(&bytes[136..142], b"Intro\0");
+        assert_eq!(&bytes[142..146], b"labl");
+        assert_eq!(u32::from_le_bytes(bytes[150..154].try_into().unwrap()), 2);
+        assert_eq!(&bytes[154..162], b"Verse 2\0");
+
+        fs::remove_dir_all(root).expect("temporary test folder should be removed");
     }
 
     #[test]

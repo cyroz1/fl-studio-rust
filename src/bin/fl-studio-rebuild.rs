@@ -2763,6 +2763,7 @@ struct DawUi {
     playlist_render_ogg_bitrate_kbps: u16,
     playlist_render_mp3_bitrate_kbps: u16,
     playlist_render_dither_mode: WavDitherMode,
+    playlist_render_save_markers: bool,
     playlist_render_quality: ResamplingQuality,
     playlist_render_channel_mode: WavChannelMode,
     playlist_render_tail_seconds: u8,
@@ -3332,6 +3333,7 @@ impl DawUi {
             playlist_render_ogg_bitrate_kbps: 192,
             playlist_render_mp3_bitrate_kbps: 192,
             playlist_render_dither_mode: WavDitherMode::Off,
+            playlist_render_save_markers: false,
             playlist_render_quality,
             playlist_render_channel_mode: WavChannelMode::Stereo,
             playlist_render_tail_seconds: 0,
@@ -5741,6 +5743,17 @@ impl DawUi {
                         ui.label("MP3 is lossy; supported render rates are 32, 44.1, and 48 kHz.");
                     }
                 }
+                let wav_markers_available = self.playlist_render_mixer_stems
+                    || render_format == PlaylistSongOutputFormat::Wav;
+                ui.add_enabled_ui(wav_markers_available, |ui| {
+                    ui.checkbox(
+                        &mut self.playlist_render_save_markers,
+                        "Save Playlist markers",
+                    );
+                });
+                if wav_markers_available {
+                    ui.label("Writes time markers as WAV cue points and labels.");
+                }
                 let mut render_quality_changed = false;
                 ui.horizontal(|ui| {
                     ui.label("Resampling");
@@ -7038,6 +7051,10 @@ impl DawUi {
                                         },
                                     );
                                 },
+                            );
+                            ui.checkbox(
+                                &mut self.playlist_render_save_markers,
+                                "Save Playlist markers",
                             );
                             ui.menu_button(
                                 format!("Channels: {}", self.playlist_render_channel_mode.label()),
@@ -20176,6 +20193,7 @@ impl DawUi {
             read_sample_root_note: self.read_sample_root_note,
             wav_sample_format: self.playlist_render_format,
             wav_dither_mode: self.playlist_render_dither_mode,
+            wav_save_playlist_markers: self.playlist_render_save_markers,
             resampling_quality: self.playlist_render_quality,
             wav_channel_mode: self.playlist_render_channel_mode,
             tail_seconds: self.playlist_render_tail_seconds,
@@ -20304,6 +20322,7 @@ impl DawUi {
             read_sample_root_note: self.read_sample_root_note,
             wav_sample_format: self.playlist_render_format,
             wav_dither_mode: self.playlist_render_dither_mode,
+            wav_save_playlist_markers: self.playlist_render_save_markers,
             resampling_quality: self.playlist_render_quality,
             wav_channel_mode: self.playlist_render_channel_mode,
             tail_seconds: self.playlist_render_tail_seconds,
