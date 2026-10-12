@@ -581,6 +581,18 @@ impl DetachedWindowKind {
         }
     }
 
+    const fn index(self) -> usize {
+        match self {
+            Self::Playlist => 0,
+            Self::ChannelRack => 1,
+            Self::PianoRoll => 2,
+            Self::Mixer => 3,
+            Self::Plugins => 4,
+            Self::Audio => 5,
+            Self::Automation => 6,
+        }
+    }
+
     const fn minimum_size(self) -> Vec2 {
         match self {
             Self::Playlist => Vec2::new(800.0, 560.0),
@@ -617,7 +629,7 @@ impl DetachedWindowPlacement {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct DetachedWindowPlacements {
     playlist: Option<DetachedWindowPlacement>,
     channel_rack: Option<DetachedWindowPlacement>,
@@ -651,6 +663,33 @@ impl DetachedWindowPlacements {
             DetachedWindowKind::Audio => self.audio = Some(placement),
             DetachedWindowKind::Automation => self.automation = Some(placement),
         }
+    }
+}
+
+const WINDOW_LAYOUT_PRESET_LIMIT: usize = 32;
+const WINDOW_LAYOUT_PRESET_NAME_LIMIT: usize = 40;
+const WINDOW_LAYOUT_PRESETS_HEADER: &str = "fl-studio-rust-window-layouts-v1";
+
+#[derive(Clone, Debug, PartialEq)]
+struct WindowLayoutPreset {
+    name: String,
+    main_view: MainView,
+    browser_visible: bool,
+    detached: [bool; 7],
+    placements: DetachedWindowPlacements,
+}
+
+impl WindowLayoutPreset {
+    fn is_valid(&self) -> bool {
+        let name = self.name.trim();
+        !name.is_empty()
+            && name.chars().count() <= WINDOW_LAYOUT_PRESET_NAME_LIMIT
+            && !name.chars().any(char::is_control)
+            && DetachedWindowKind::ALL.into_iter().all(|kind| {
+                self.placements
+                    .get(kind)
+                    .is_none_or(|placement| placement.is_valid(kind))
+            })
     }
 }
 
@@ -2129,6 +2168,31 @@ impl MainView {
             Self::Automation => "Automation",
         }
     }
+
+    const fn settings_key(self) -> &'static str {
+        match self {
+            Self::Playlist => "playlist",
+            Self::ChannelRack => "channel_rack",
+            Self::PianoRoll => "piano_roll",
+            Self::Mixer => "mixer",
+            Self::Plugins => "plugins",
+            Self::Audio => "audio",
+            Self::Automation => "automation",
+        }
+    }
+
+    fn from_settings_key(key: &str) -> Option<Self> {
+        match key {
+            "playlist" => Some(Self::Playlist),
+            "channel_rack" => Some(Self::ChannelRack),
+            "piano_roll" => Some(Self::PianoRoll),
+            "mixer" => Some(Self::Mixer),
+            "plugins" => Some(Self::Plugins),
+            "audio" => Some(Self::Audio),
+            "automation" => Some(Self::Automation),
+            _ => None,
+        }
+    }
 }
 
 struct ActiveMidiPatternPlayback {
@@ -2201,6 +2265,8 @@ struct DawUi {
     automation_window_detached: bool,
     detached_window_placements: DetachedWindowPlacements,
     detached_window_current_placements: DetachedWindowPlacements,
+    window_layout_presets: Vec<WindowLayoutPreset>,
+    window_layout_preset_name: String,
     piano_roll_pending_scroll_offset: Option<Vec2>,
     piano_roll_grid_viewport: Option<egui::Rect>,
     piano_roll_grid_scroll_offset: Vec2,
@@ -2665,6 +2731,7 @@ impl DawUi {
         let live_resampling_quality = load_live_resampling_quality();
         let playlist_render_quality = load_playlist_render_quality();
         let detached_window_placements = load_detached_window_placements();
+        let window_layout_presets = load_window_layout_presets();
         let read_sample_root_note = load_read_sample_root_note();
         let midi_recording_offset_ms = load_midi_recording_offset_ms();
         let piano_roll_nudge_notes_with_mouse_wheel =
@@ -2733,6 +2800,8 @@ impl DawUi {
             automation_window_detached: false,
             detached_window_placements,
             detached_window_current_placements: detached_window_placements,
+            window_layout_presets,
+            window_layout_preset_name: String::new(),
             piano_roll_pending_scroll_offset: None,
             piano_roll_grid_viewport: None,
             piano_roll_grid_scroll_offset: Vec2::ZERO,
@@ -3098,6 +3167,118 @@ impl DawUi {
                 format!("Detached views docked, but window positions could not be reset: {error}")
             }
         };
+    }
+
+    fn capture_window_layout_preset(&self, name: String) -> WindowLayoutPreset {
+        let mut placements = self.detached_window_placements;
+        for kind in DetachedWindowKind::ALL {
+            if let Some(placement) = self.detached_window_current_placements.get(kind) {
+                placements.set(kind, placement);
+            }
+        }
+        WindowLayoutPreset {
+            name,
+            main_view: self.view,
+            browser_visible: self.browser_visible,
+            detached: [
+                self.playlist_window_detached,
+                self.channel_rack_window_detached,
+                self.piano_roll_window_detached,
+                self.mixer_window_detached,
+                self.plugins_window_detached,
+                self.audio_window_detached,
+                self.automation_window_detached,
+            ],
+            placements,
+        }
+    }
+
+    fn save_window_layout_preset(&mut self) {
+        let name = self.window_layout_preset_name.trim().to_owned();
+        let preset = self.capture_window_layout_preset(name);
+        if !preset.is_valid() {
+            self.status = format!(
+                "Layout name must contain 1–{WINDOW_LAYOUT_PRESET_NAME_LIMIT} characters and no control characters"
+            );
+            return;
+        }
+
+        let mut presets = self.window_layout_presets.clone();
+        if let Some(existing) = presets
+            .iter_mut()
+            .find(|existing| existing.name.eq_ignore_ascii_case(&preset.name))
+        {
+            *existing = preset.clone();
+        } else if presets.len() >= WINDOW_LAYOUT_PRESET_LIMIT {
+            self.status =
+                format!("At most {WINDOW_LAYOUT_PRESET_LIMIT} window layout presets can be saved");
+            return;
+        } else {
+            presets.push(preset.clone());
+        }
+        presets.sort_by_key(|item| item.name.to_lowercase());
+
+        if let Err(error) = save_window_layout_presets(&presets) {
+            self.status = format!("Could not save window layout preset: {error}");
+            return;
+        }
+        self.window_layout_presets = presets;
+        self.detached_window_placements = preset.placements;
+        self.detached_window_current_placements = preset.placements;
+        self.window_layout_preset_name.clear();
+        self.status = match save_detached_window_placements(preset.placements) {
+            Ok(()) => format!("Saved window layout preset ‘{}’", preset.name),
+            Err(error) => format!(
+                "Saved window layout preset ‘{}’, but could not save default window positions: {error}",
+                preset.name
+            ),
+        };
+    }
+
+    fn apply_window_layout_preset(&mut self, preset: WindowLayoutPreset) {
+        self.view = preset.main_view;
+        self.browser_visible = preset.browser_visible;
+        self.playlist_window_detached = preset.detached[DetachedWindowKind::Playlist.index()];
+        self.channel_rack_window_detached =
+            preset.detached[DetachedWindowKind::ChannelRack.index()];
+        self.piano_roll_window_detached = preset.detached[DetachedWindowKind::PianoRoll.index()];
+        self.mixer_window_detached = preset.detached[DetachedWindowKind::Mixer.index()];
+        self.plugins_window_detached = preset.detached[DetachedWindowKind::Plugins.index()];
+        self.audio_window_detached = preset.detached[DetachedWindowKind::Audio.index()];
+        self.automation_window_detached = preset.detached[DetachedWindowKind::Automation.index()];
+        self.detached_window_placements = preset.placements;
+        self.detached_window_current_placements = preset.placements;
+
+        let browser_result = save_browser_visibility(preset.browser_visible);
+        let placements_result = save_detached_window_placements(preset.placements);
+        self.status = match (browser_result, placements_result) {
+            (Ok(()), Ok(())) => format!("Applied window layout preset ‘{}’", preset.name),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => {
+                format!(
+                    "Applied window layout preset ‘{}’, but could not save settings: {error}",
+                    preset.name
+                )
+            }
+            (Err(browser_error), Err(placement_error)) => format!(
+                "Applied window layout preset ‘{}’, but could not save Browser settings ({browser_error}) or window positions ({placement_error})",
+                preset.name
+            ),
+        };
+    }
+
+    fn delete_window_layout_preset(&mut self, name: &str) {
+        let mut presets = self.window_layout_presets.clone();
+        let original_len = presets.len();
+        presets.retain(|preset| !preset.name.eq_ignore_ascii_case(name));
+        if presets.len() == original_len {
+            return;
+        }
+        if let Err(error) = save_window_layout_presets(&presets) {
+            self.status = format!("Could not delete window layout preset: {error}");
+            return;
+        }
+        self.window_layout_presets = presets;
+        self.status = format!("Deleted window layout preset ‘{name}’");
     }
 
     fn show_detached_auxiliary_view(
@@ -6709,6 +6890,7 @@ impl DawUi {
                     }
                 }
             });
+            let saved_layout_presets = self.window_layout_presets.clone();
             ui.menu_button("View", |ui| {
                 for view in MainView::ALL {
                     let shortcut = match view {
@@ -6883,6 +7065,47 @@ impl DawUi {
                     self.dock_all_and_reset_detached_window_positions(ui.ctx());
                     ui.close();
                 }
+                ui.separator();
+                ui.menu_button("Window layout presets", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.window_layout_preset_name)
+                                .desired_width(140.0)
+                                .hint_text("Preset name"),
+                        );
+                        if ui
+                            .add_enabled(
+                                !self.window_layout_preset_name.trim().is_empty(),
+                                egui::Button::new("Save / update"),
+                            )
+                            .clicked()
+                        {
+                            self.save_window_layout_preset();
+                            ui.close();
+                        }
+                    });
+                    if saved_layout_presets.is_empty() {
+                        ui.label("No saved layouts");
+                    } else {
+                        ui.separator();
+                        for preset in &saved_layout_presets {
+                            ui.horizontal(|ui| {
+                                if ui.button(&preset.name).clicked() {
+                                    self.apply_window_layout_preset(preset.clone());
+                                    ui.close();
+                                }
+                                if ui
+                                    .small_button("×")
+                                    .on_hover_text("Delete preset")
+                                    .clicked()
+                                {
+                                    self.delete_window_layout_preset(&preset.name);
+                                    ui.close();
+                                }
+                            });
+                        }
+                    }
+                });
             });
             ui.menu_button("Options", |ui| {
                 if ui
@@ -27405,6 +27628,12 @@ fn detached_window_placements_settings_file() -> Option<PathBuf> {
         .map(|directory| directory.join("detached-window-placements.txt"))
 }
 
+fn window_layout_presets_settings_file() -> Option<PathBuf> {
+    browser_favorites_file()?
+        .parent()
+        .map(|directory| directory.join("window-layout-presets.txt"))
+}
+
 fn load_detached_window_placements() -> DetachedWindowPlacements {
     let Some(path) = detached_window_placements_settings_file() else {
         return DetachedWindowPlacements::default();
@@ -27489,6 +27718,186 @@ fn save_detached_window_placements(placements: DetachedWindowPlacements) -> Resu
         })
         .collect::<String>();
     fs::write(&path, contents)
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
+fn encode_window_layout_name(name: &str) -> String {
+    name.as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn decode_window_layout_name(encoded: &str) -> Option<String> {
+    let encoded = encoded.as_bytes();
+    if !encoded.len().is_multiple_of(2) {
+        return None;
+    }
+    let bytes = encoded
+        .chunks_exact(2)
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok())
+        .collect::<Option<Vec<_>>>()?;
+    String::from_utf8(bytes).ok()
+}
+
+fn parse_window_layout_placement(
+    value: &str,
+    kind: DetachedWindowKind,
+) -> Option<Option<DetachedWindowPlacement>> {
+    if value == "-" {
+        return Some(None);
+    }
+    let mut fields = value.split(',');
+    let (Some(x), Some(y), Some(width), Some(height)) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
+    else {
+        return None;
+    };
+    if fields.next().is_some() {
+        return None;
+    }
+    let position = match (x, y) {
+        ("-", "-") => None,
+        ("-", _) | (_, "-") => return None,
+        (x, y) => Some(egui::pos2(x.parse().ok()?, y.parse().ok()?)),
+    };
+    let placement = DetachedWindowPlacement {
+        position,
+        inner_size: Vec2::new(width.parse().ok()?, height.parse().ok()?),
+    };
+    placement.is_valid(kind).then_some(Some(placement))
+}
+
+fn parse_window_layout_presets(contents: &str) -> Vec<WindowLayoutPreset> {
+    let mut lines = contents.lines();
+    if lines.next() != Some(WINDOW_LAYOUT_PRESETS_HEADER) {
+        return Vec::new();
+    }
+    let mut presets = Vec::new();
+    for line in lines {
+        if presets.len() >= WINDOW_LAYOUT_PRESET_LIMIT {
+            break;
+        }
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() != 4 + DetachedWindowKind::ALL.len() {
+            continue;
+        }
+        let Some(name) = decode_window_layout_name(fields[0]) else {
+            continue;
+        };
+        let Some(main_view) = MainView::from_settings_key(fields[1]) else {
+            continue;
+        };
+        let browser_visible = match fields[2] {
+            "0" => false,
+            "1" => true,
+            _ => continue,
+        };
+        let Ok(detached_mask) = u8::from_str_radix(fields[3], 16) else {
+            continue;
+        };
+        if detached_mask & !0x7f != 0 {
+            continue;
+        }
+        let detached = std::array::from_fn(|index| detached_mask & (1 << index) != 0);
+        let mut placements = DetachedWindowPlacements::default();
+        let mut placements_valid = true;
+        for kind in DetachedWindowKind::ALL {
+            match parse_window_layout_placement(fields[4 + kind.index()], kind) {
+                Some(Some(placement)) => placements.set(kind, placement),
+                Some(None) => {}
+                None => placements_valid = false,
+            }
+        }
+        if !placements_valid {
+            continue;
+        }
+        let preset = WindowLayoutPreset {
+            name,
+            main_view,
+            browser_visible,
+            detached,
+            placements,
+        };
+        if !preset.is_valid()
+            || presets.iter().any(|existing: &WindowLayoutPreset| {
+                existing.name.eq_ignore_ascii_case(&preset.name)
+            })
+        {
+            continue;
+        }
+        presets.push(preset);
+    }
+    presets
+}
+
+fn serialize_window_layout_presets(presets: &[WindowLayoutPreset]) -> String {
+    let mut contents = format!("{WINDOW_LAYOUT_PRESETS_HEADER}\n");
+    for preset in presets
+        .iter()
+        .filter(|preset| preset.is_valid())
+        .take(WINDOW_LAYOUT_PRESET_LIMIT)
+    {
+        let detached_mask =
+            preset
+                .detached
+                .iter()
+                .enumerate()
+                .fold(0u8, |mask, (index, is_detached)| {
+                    if *is_detached {
+                        mask | (1 << index)
+                    } else {
+                        mask
+                    }
+                });
+        let _ = std::fmt::Write::write_fmt(
+            &mut contents,
+            format_args!(
+                "{}\t{}\t{}\t{detached_mask:02x}",
+                encode_window_layout_name(&preset.name),
+                preset.main_view.settings_key(),
+                u8::from(preset.browser_visible),
+            ),
+        );
+        for kind in DetachedWindowKind::ALL {
+            contents.push('\t');
+            if let Some(placement) = preset.placements.get(kind) {
+                let (x, y) = placement
+                    .position
+                    .map_or(("-".to_owned(), "-".to_owned()), |pos| {
+                        (format!("{:.1}", pos.x), format!("{:.1}", pos.y))
+                    });
+                let _ = std::fmt::Write::write_fmt(
+                    &mut contents,
+                    format_args!(
+                        "{x},{y},{:.1},{:.1}",
+                        placement.inner_size.x, placement.inner_size.y
+                    ),
+                );
+            } else {
+                contents.push('-');
+            }
+        }
+        contents.push('\n');
+    }
+    contents
+}
+
+fn load_window_layout_presets() -> Vec<WindowLayoutPreset> {
+    window_layout_presets_settings_file()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .map_or_else(Vec::new, |contents| parse_window_layout_presets(&contents))
+}
+
+fn save_window_layout_presets(presets: &[WindowLayoutPreset]) -> Result<(), String> {
+    let path = window_layout_presets_settings_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the window layout presets path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(&path, serialize_window_layout_presets(presets))
         .map_err(|error| format!("could not write {}: {error}", path.display()))
 }
 
@@ -29639,18 +30048,20 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        ActivePlaylistClipDrag, Arrangement, ChannelDisplayFilter, DetectedPianoRollScale,
-        FlpDocument, Pattern, PatternController, PatternNote, PianoRollChordStamp, PianoRollGrid,
+        ActivePlaylistClipDrag, Arrangement, ChannelDisplayFilter, DetachedWindowKind,
+        DetachedWindowPlacement, DetachedWindowPlacements, DetectedPianoRollScale, FlpDocument,
+        MainView, Pattern, PatternController, PatternNote, PianoRollChordStamp, PianoRollGrid,
         PianoRollScale, PianoRollSnap, PlaylistClip, PlaylistClipDragKind, PlaylistTempoMap,
         PlaylistTrack, PluginCandidate, PluginFormat, TimeSelectionShift,
-        candidate_matches_vst_identity, candidate_mixer_controls,
-        candidate_mixer_stereo_separation, detect_chord_name, detect_piano_roll_channel_scale,
-        detect_piano_roll_scale, encode_midi_device_selections, first_available_playlist_track,
-        next_piano_roll_note_group, note_from_grid_position, parse_midi_device_selections,
-        piano_roll_color_group_note_ids, piano_roll_controller_stroke_points,
-        piano_roll_controller_value_at, piano_roll_controller_value_range,
-        piano_roll_discard_length_edit, piano_roll_duplicate_offset, piano_roll_key_at_y,
-        piano_roll_note_group_members, piano_roll_note_nudge_edit, piano_roll_odd_note_selection,
+        WINDOW_LAYOUT_PRESETS_HEADER, WindowLayoutPreset, candidate_matches_vst_identity,
+        candidate_mixer_controls, candidate_mixer_stereo_separation, detect_chord_name,
+        detect_piano_roll_channel_scale, detect_piano_roll_scale, encode_midi_device_selections,
+        first_available_playlist_track, next_piano_roll_note_group, note_from_grid_position,
+        parse_midi_device_selections, parse_window_layout_presets, piano_roll_color_group_note_ids,
+        piano_roll_controller_stroke_points, piano_roll_controller_value_at,
+        piano_roll_controller_value_range, piano_roll_discard_length_edit,
+        piano_roll_duplicate_offset, piano_roll_key_at_y, piano_roll_note_group_members,
+        piano_roll_note_nudge_edit, piano_roll_odd_note_selection,
         piano_roll_overlap_note_selection, piano_roll_pitch_range_note_selection,
         piano_roll_random_note_selection, piano_roll_selection_time_range,
         piano_roll_shift_time_range, piano_roll_time_range_from_drag,
@@ -29661,8 +30072,9 @@ mod tests {
         playlist_pattern_clip_join_candidates, playlist_pattern_recording_placement_tick,
         playlist_seek_tick_to_frame, playlist_signature_at_tick, playlist_song_position_label,
         playlist_track_group_range, playlist_track_is_hidden, recolor_piano_roll_notes,
-        snap_note_tick, toggle_piano_roll_note_group_selection, update_channel_rack_selection,
-        update_layer_child_selection, update_piano_roll_box_selection,
+        serialize_window_layout_presets, snap_note_tick, toggle_piano_roll_note_group_selection,
+        update_channel_rack_selection, update_layer_child_selection,
+        update_piano_roll_box_selection,
     };
 
     fn playlist_track_arrangement_fixture(clips: &[(u32, u32, u16)]) -> Arrangement {
@@ -31154,5 +31566,36 @@ mod tests {
         ] {
             assert!(note_from_grid_position(pointer, test_grid(), 5).is_none());
         }
+    }
+
+    #[test]
+    fn window_layout_presets_round_trip_unicode_names_and_window_geometry() {
+        let mut placements = DetachedWindowPlacements::default();
+        placements.set(
+            DetachedWindowKind::PianoRoll,
+            DetachedWindowPlacement {
+                position: Some(eframe::egui::pos2(-1200.5, 80.0)),
+                inner_size: eframe::egui::vec2(1280.0, 720.0),
+            },
+        );
+        let preset = WindowLayoutPreset {
+            name: "Mixing 🎛".to_owned(),
+            main_view: MainView::Playlist,
+            browser_visible: false,
+            detached: [true, false, true, true, false, false, false],
+            placements,
+        };
+        let encoded = serialize_window_layout_presets(std::slice::from_ref(&preset));
+        let decoded = parse_window_layout_presets(&encoded);
+        assert_eq!(decoded, vec![preset]);
+    }
+
+    #[test]
+    fn window_layout_presets_ignore_invalid_records() {
+        let contents = format!(
+            "{WINDOW_LAYOUT_PRESETS_HEADER}\nnot-a-record\n{}\tunknown\t1\t00\t-\t-\t-\t-\t-\t-\t-\n",
+            "4e6f2076696577"
+        );
+        assert!(parse_window_layout_presets(&contents).is_empty());
     }
 }
