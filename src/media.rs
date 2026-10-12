@@ -1331,8 +1331,10 @@ mod tests {
         assert_eq!(&bytes[36..40], b"data");
         assert_eq!(u32::from_le_bytes(bytes[40..44].try_into().unwrap()), 16);
         let samples = bytes[44..]
-            .chunks_exact(4)
-            .map(|sample| f32::from_le_bytes(sample.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&sample| f32::from_le_bytes(sample))
             .collect::<Vec<_>>();
         assert_eq!(samples, [0.25, 0.2, -0.5, 0.3]);
         fs::remove_dir_all(root).expect("fixture directory should be removed");
