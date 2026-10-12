@@ -1140,7 +1140,8 @@ fn parse_scale_name(value: &str) -> Result<&'static [u8], String> {
         "whole-tone" => Ok(&[0, 2, 4, 6, 8, 10]),
         "whole-half-diminished" => Ok(&[0, 2, 3, 5, 6, 8, 9, 11]),
         "half-whole-diminished" => Ok(&[0, 1, 3, 4, 6, 7, 9, 10]),
-        _ => Err("scale name must be major, harmonic-major, dorian, phrygian, phrygian-dominant, lydian, lydian-dominant, mixolydian, natural-minor, locrian, harmonic-minor, melodic-minor, blues, major-pentatonic, minor-pentatonic, whole-tone, whole-half-diminished, or half-whole-diminished".to_owned()),
+        "altered" => Ok(&[0, 1, 3, 4, 6, 8, 10]),
+        _ => Err("scale name must be major, harmonic-major, dorian, phrygian, phrygian-dominant, lydian, lydian-dominant, mixolydian, natural-minor, locrian, harmonic-minor, melodic-minor, blues, major-pentatonic, minor-pentatonic, whole-tone, whole-half-diminished, half-whole-diminished, or altered".to_owned()),
     }
 }
 

@@ -1479,10 +1479,11 @@ enum PianoRollScale {
     WholeTone,
     WholeHalfDiminished,
     HalfWholeDiminished,
+    Altered,
 }
 
 impl PianoRollScale {
-    const ALL: [Self; 19] = [
+    const ALL: [Self; 20] = [
         Self::None,
         Self::Major,
         Self::HarmonicMajor,
@@ -1502,6 +1503,7 @@ impl PianoRollScale {
         Self::WholeTone,
         Self::WholeHalfDiminished,
         Self::HalfWholeDiminished,
+        Self::Altered,
     ];
 
     fn label(self) -> &'static str {
@@ -1525,6 +1527,7 @@ impl PianoRollScale {
             Self::WholeTone => "Whole tone",
             Self::WholeHalfDiminished => "Whole-half diminished",
             Self::HalfWholeDiminished => "Half-whole diminished",
+            Self::Altered => "Altered",
         }
     }
 
@@ -1556,6 +1559,7 @@ impl PianoRollScale {
             Self::WholeTone => &[0, 2, 4, 6, 8, 10],
             Self::WholeHalfDiminished => &[0, 2, 3, 5, 6, 8, 9, 11],
             Self::HalfWholeDiminished => &[0, 1, 3, 4, 6, 7, 9, 10],
+            Self::Altered => &[0, 1, 3, 4, 6, 8, 10],
         }
     }
 }
@@ -1601,6 +1605,7 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
         PianoRollScale::WholeTone,
         PianoRollScale::WholeHalfDiminished,
         PianoRollScale::HalfWholeDiminished,
+        PianoRollScale::Altered,
     ];
     let mut best: Option<((usize, usize, usize, i8), DetectedPianoRollScale)> = None;
 
@@ -1667,6 +1672,7 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
                 PianoRollScale::WholeTone => -8,
                 PianoRollScale::WholeHalfDiminished => -9,
                 PianoRollScale::HalfWholeDiminished => -10,
+                PianoRollScale::Altered => -13,
                 PianoRollScale::None => unreachable!("None is not a detection candidate"),
             };
             let candidate = DetectedPianoRollScale { root, scale };
