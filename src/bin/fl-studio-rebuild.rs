@@ -1641,6 +1641,12 @@ fn snap_piano_roll_key_to_scale(
         .unwrap_or(clamped_key)
 }
 
+fn snap_recorded_midi_notes_to_scale(notes: &mut [PatternNote], scale: DetectedPianoRollScale) {
+    for note in notes {
+        note.key = snap_piano_roll_key_to_scale(note.key, scale.scale, scale.root, 0, 127);
+    }
+}
+
 fn detect_piano_roll_channel_scale(
     pattern: &Pattern,
     pattern_id: u16,
@@ -2604,6 +2610,7 @@ struct DawUi {
     piano_roll_scale_root: u8,
     piano_roll_auto_scale_highlighting: bool,
     piano_roll_snap_notes_to_scale: bool,
+    midi_record_snap_to_scale: bool,
     piano_roll_ghost_channels: bool,
     piano_roll_hidden_ghost_channels: BTreeSet<u16>,
     piano_roll_editable_ghost_channels: bool,
@@ -2940,6 +2947,7 @@ struct ActiveMidiRecording {
     recorder: MidiPatternRecorder,
     fixed_velocity: Option<u8>,
     playlist_clip_placement: Option<MidiPlaylistClipPlacement>,
+    scale_snap: Option<DetectedPianoRollScale>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3224,6 +3232,7 @@ impl DawUi {
             piano_roll_scale_root: 0,
             piano_roll_auto_scale_highlighting: false,
             piano_roll_snap_notes_to_scale: false,
+            midi_record_snap_to_scale: false,
             piano_roll_ghost_channels: true,
             piano_roll_hidden_ghost_channels: BTreeSet::new(),
             piano_roll_editable_ghost_channels: false,
@@ -25414,12 +25423,19 @@ impl DawUi {
             recording_started_at,
         ) {
             Ok(recorder) => {
+                let scale_snap = (self.midi_record_snap_to_scale
+                    && self.piano_roll_scale != PianoRollScale::None)
+                    .then_some(DetectedPianoRollScale {
+                        root: self.piano_roll_scale_root,
+                        scale: self.piano_roll_scale,
+                    });
                 self.midi_recording = Some(ActiveMidiRecording {
                     recorder,
                     fixed_velocity: self
                         .midi_record_fixed_velocity
                         .then_some(MIDI_FIXED_RECORDING_VELOCITY),
                     playlist_clip_placement,
+                    scale_snap,
                 });
                 let channel_name = channels
                     .iter()
@@ -25451,10 +25467,15 @@ impl DawUi {
         let ActiveMidiRecording {
             recorder,
             playlist_clip_placement,
+            scale_snap,
             ..
         } = recording;
         let result = recorder.finish(stop_timestamp_micros, finished_at);
-        if result.notes.is_empty() {
+        let mut notes = result.notes;
+        if let Some(scale) = scale_snap {
+            snap_recorded_midi_notes_to_scale(&mut notes, scale);
+        }
+        if notes.is_empty() {
             self.status = if result.overflowed {
                 "MIDI recording reached its note limit before any note was completed".to_owned()
             } else {
@@ -25465,7 +25486,7 @@ impl DawUi {
         if self.current_path != result.project_path {
             self.status = format!(
                 "Discarded {} MIDI note(s) because the active project changed during recording",
-                result.notes.len()
+                notes.len()
             );
             return;
         }
@@ -25486,7 +25507,7 @@ impl DawUi {
             }
         };
         let mut updated = document.clone();
-        match updated.add_pattern_notes(result.pattern_id, &result.notes) {
+        match updated.add_pattern_notes(result.pattern_id, &notes) {
             Ok(()) => {
                 let playlist_clip_result = playlist_clip_placement.map(|placement| {
                     create_recorded_pattern_playlist_clip(
@@ -25505,15 +25526,22 @@ impl DawUi {
                 let mut status = if result.overflowed {
                     format!(
                         "Recorded {} MIDI note(s); the capture limit was reached and later notes were ignored",
-                        result.notes.len()
+                        notes.len()
                     )
                 } else {
                     format!(
                         "Recorded {} MIDI note(s) into Pattern {}",
-                        result.notes.len(),
+                        notes.len(),
                         result.pattern_id
                     )
                 };
+                if let Some(scale) = scale_snap {
+                    status.push_str(&format!(
+                        " · snapped to {} {}",
+                        PITCH_CLASSES[usize::from(scale.root)],
+                        scale.scale.label()
+                    ));
+                }
                 if let Some(placement_result) = playlist_clip_result {
                     match placement_result {
                         Ok((clip_index, track_index)) => {
@@ -26372,6 +26400,25 @@ impl DawUi {
             && let Err(error) = save_midi_recording_offset_ms(self.midi_recording_offset_ms)
         {
             self.status = format!("Could not save MIDI input timing offset: {error}");
+        }
+        ui.add_enabled_ui(
+            self.midi_recording.is_none() && self.piano_roll_scale != PianoRollScale::None,
+            |ui| {
+                ui.checkbox(
+                    &mut self.midi_record_snap_to_scale,
+                    "Snap recorded notes to selected scale",
+                )
+                .on_hover_text(
+                    "Move incoming note pitches to the nearest pitch in the selected Piano roll scale.",
+                );
+            },
+        );
+        if self.midi_record_snap_to_scale && self.piano_roll_scale != PianoRollScale::None {
+            ui.small(format!(
+                "Using {} {} for the next recording take.",
+                PITCH_CLASSES[usize::from(self.piano_roll_scale_root)],
+                self.piano_roll_scale.label()
+            ));
         }
         let fixed_velocity_changed = ui
             .add_enabled_ui(self.midi_recording.is_none(), |ui| {
@@ -33223,9 +33270,9 @@ mod tests {
         playlist_track_is_hidden, recolor_piano_roll_notes, recording_input_targets,
         sample_editor_selection_for_drag, serialize_midi_controller_templates,
         serialize_window_layout_presets, snap_note_tick, snap_piano_roll_key_to_scale,
-        toggle_piano_roll_note_group_selection, touch_pan_zoom_scroll_offset, track_two_finger_tap,
-        update_channel_rack_selection, update_layer_child_selection,
-        update_piano_roll_box_selection, zoom_to_fit,
+        snap_recorded_midi_notes_to_scale, toggle_piano_roll_note_group_selection,
+        touch_pan_zoom_scroll_offset, track_two_finger_tap, update_channel_rack_selection,
+        update_layer_child_selection, update_piano_roll_box_selection, zoom_to_fit,
     };
 
     fn playlist_track_arrangement_fixture(clips: &[(u32, u32, u16)]) -> Arrangement {
@@ -33523,6 +33570,50 @@ mod tests {
             snap_piano_roll_key_to_scale(61, PianoRollScale::None, 0, 36, 83),
             61,
             "None accepts every pitch",
+        );
+    }
+
+    #[test]
+    fn midi_record_scale_snap_changes_only_out_of_scale_pitches() {
+        let mut notes = vec![
+            PatternNote {
+                key: 61,
+                velocity: 93,
+                length: 48,
+                ..PatternNote::default()
+            },
+            PatternNote {
+                key: 67,
+                velocity: 72,
+                length: 96,
+                ..PatternNote::default()
+            },
+            PatternNote {
+                key: 127,
+                velocity: 101,
+                length: 24,
+                ..PatternNote::default()
+            },
+        ];
+        snap_recorded_midi_notes_to_scale(
+            &mut notes,
+            DetectedPianoRollScale {
+                root: 0,
+                scale: PianoRollScale::Major,
+            },
+        );
+
+        assert_eq!(
+            notes.iter().map(|note| note.key).collect::<Vec<_>>(),
+            vec![60, 67, 127]
+        );
+        assert_eq!(
+            notes.iter().map(|note| note.velocity).collect::<Vec<_>>(),
+            vec![93, 72, 101]
+        );
+        assert_eq!(
+            notes.iter().map(|note| note.length).collect::<Vec<_>>(),
+            vec![48, 96, 24]
         );
     }
 
