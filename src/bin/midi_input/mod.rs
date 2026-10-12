@@ -447,7 +447,11 @@ impl MidiPatternRecorder {
                     .or_default()
                     .push_back((tick, fixed_velocity.unwrap_or(velocity).min(127)));
             }
-            MidiInputEvent::NoteOff { channel, key, .. } => {
+            MidiInputEvent::NoteOff {
+                channel,
+                key,
+                velocity: release_velocity,
+            } => {
                 let event_key = (channel, key);
                 let (ended_note, remove_key) =
                     if let Some(active) = self.active_notes.get_mut(&event_key) {
@@ -460,7 +464,14 @@ impl MidiPatternRecorder {
                     self.active_notes.remove(&event_key);
                 }
                 if let Some((start_tick, velocity)) = ended_note {
-                    let note = self.make_note(start_tick, tick, channel, key, velocity);
+                    let note = self.make_note(
+                        start_tick,
+                        tick,
+                        channel,
+                        key,
+                        velocity,
+                        Some(release_velocity),
+                    );
                     self.notes.push(note);
                 }
             }
@@ -489,7 +500,7 @@ impl MidiPatternRecorder {
         let finish_tick = finish_tick.max(self.last_position_tick);
         for ((channel, key), active) in std::mem::take(&mut self.active_notes) {
             for (start_tick, velocity) in active {
-                let note = self.make_note(start_tick, finish_tick, channel, key, velocity);
+                let note = self.make_note(start_tick, finish_tick, channel, key, velocity, None);
                 self.notes.push(note);
             }
         }
@@ -559,10 +570,11 @@ impl MidiPatternRecorder {
         midi_channel: u8,
         key: u8,
         velocity: u8,
+        release_velocity: Option<u8>,
     ) -> PatternNote {
         let position = quantize_recording_tick(start_tick, self.snap_ticks);
         let end_tick = quantize_recording_tick(end_tick, self.snap_ticks);
-        PatternNote {
+        let mut note = PatternNote {
             position,
             channel_id: self.channel_id,
             length: end_tick.saturating_sub(position).max(1),
@@ -570,8 +582,17 @@ impl MidiPatternRecorder {
             midi_channel,
             velocity,
             ..PatternNote::default()
+        };
+        if let Some(release_velocity) = release_velocity {
+            note.release = midi_release_velocity_to_pattern_release(release_velocity);
         }
+        note
     }
+}
+
+fn midi_release_velocity_to_pattern_release(velocity: u8) -> u8 {
+    let velocity = u16::from(velocity.min(127));
+    ((velocity * 128 + 63) / 127) as u8
 }
 
 fn quantize_recording_tick(tick: u32, snap_ticks: Option<u32>) -> u32 {
@@ -681,7 +702,7 @@ mod tests {
             event: MidiInputEvent::NoteOff {
                 channel: 9,
                 key: 60,
-                velocity: 0,
+                velocity: 64,
             },
         });
         let result = recorder.finish(Some(1_300_000), started_at + Duration::from_millis(500));
@@ -694,6 +715,15 @@ mod tests {
         assert_eq!(result.notes[0].key, 60);
         assert_eq!(result.notes[0].midi_channel, 9);
         assert_eq!(result.notes[0].velocity, 101);
+        assert_eq!(result.notes[0].release, 65);
+    }
+
+    #[test]
+    fn midi_release_velocity_maps_to_fl_note_release_range() {
+        assert_eq!(midi_release_velocity_to_pattern_release(0), 0);
+        assert_eq!(midi_release_velocity_to_pattern_release(64), 65);
+        assert_eq!(midi_release_velocity_to_pattern_release(127), 128);
+        assert_eq!(midi_release_velocity_to_pattern_release(255), 128);
     }
 
     #[test]
@@ -814,6 +844,7 @@ mod tests {
         });
         let result = recorder.finish(None, started_at + Duration::from_millis(600));
         assert_eq!(result.notes.len(), 1);
+        assert_eq!(result.notes[0].release, 64);
         assert_eq!(result.notes[0].length, 96);
     }
 
