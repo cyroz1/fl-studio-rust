@@ -14312,8 +14312,9 @@ mod tests {
         PatternNoteEdit, PatternNoteRotation, PayloadEncoding, PlaylistClipEdit,
         PlaylistClipTarget, PlaylistTrackEdit, ProjectInfoEdit, ProjectSettingsEdit,
         RiffMachineOptions, RiffMachineQuantizeMode, ScaleLevelsOptions, TimeMarkerEdit,
-        apply_mixer_pan, apply_mixer_stereo_separation, midi::MidiChannelMapping, midi::MidiFile,
-        parse_vst_plugin_state_metadata, riff_machine_groove_note_timing,
+        apply_mixer_pan, apply_mixer_stereo_separation, midi::MidiChannelMapping,
+        midi::MidiEventKind, midi::MidiFile, parse_vst_plugin_state_metadata,
+        riff_machine_groove_note_timing,
     };
 
     fn articulate_options(
@@ -22389,6 +22390,7 @@ mod tests {
     fn exports_pattern_notes_with_project_ppq_and_stored_midi_channels() {
         let mut note = note_record(96, 3, 48, 60, 96);
         note[19] = 9;
+        note[20] = 0;
         let document = FlpDocument::parse(&pattern_fixture(&[note], &[]))
             .expect("project fixture should parse");
         let source_tempo = document.metadata().tempo_bpm().unwrap_or(140.0);
@@ -22421,6 +22423,11 @@ mod tests {
         assert_eq!(exported_note.velocity(), 96);
         assert_eq!(exported_note.start_tick(), 96);
         assert_eq!(exported_note.end_tick(), Some(144));
+        assert!(track.events().iter().any(|event| {
+            event.absolute_tick() == 96
+                && matches!(event.kind(), MidiEventKind::ChannelVoice { status, data }
+                    if *status == 0xB9 && data == &[10, 0])
+        }));
     }
 
     #[test]

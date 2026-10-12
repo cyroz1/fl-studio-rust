@@ -86,6 +86,8 @@ pub struct MidiExportNote {
     pub end_tick: u64,
     /// Fine pitch from equal temperament, expressed in cents from -1200 to +1200.
     pub fine_pitch_offset_cents: i16,
+    /// FL Studio note pan, centered at 64 and ranging from 0 to 128.
+    pub pan: u8,
 }
 
 /// A named MIDI track representing one FL Studio channel.
@@ -117,6 +119,7 @@ struct PendingMidiExportNote {
     start_tick: u64,
     end_tick: u64,
     fine_pitch_offset_cents: i16,
+    pan: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -127,6 +130,7 @@ struct AssignedMidiExportNote {
     start_tick: u64,
     end_tick: u64,
     fine_pitch_offset_cents: i16,
+    pan: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -134,6 +138,7 @@ struct ActiveMidiExportNote {
     end_tick: u64,
     track_index: usize,
     fine_pitch_offset_cents: i16,
+    pan: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -141,6 +146,7 @@ struct EndedMidiExportNote {
     end_tick: u64,
     track_index: usize,
     fine_pitch_offset_cents: i16,
+    pan: u8,
 }
 
 struct MidiExportOptions<'a> {
@@ -797,7 +803,7 @@ impl MidiFile {
                 let velocity = note.velocity.min(127);
                 events.push(TimedMidiBytes {
                     tick: assigned.start_tick,
-                    order: 5,
+                    order: 6,
                     bytes: vec![0x90 | assigned.channel, note.key, velocity],
                 });
                 events.push(TimedMidiBytes {
@@ -820,6 +826,22 @@ impl MidiFile {
                 order: 3,
                 bytes: pitch_bend_bytes(channel, 0),
             });
+        }
+
+        let mut pan_notes = assigned_notes.iter().flatten().copied().collect::<Vec<_>>();
+        pan_notes.sort_by_key(|note| (note.start_tick, note.track_index, note.note_index));
+        let mut channel_pans = [64u8; 16];
+        for assigned in pan_notes {
+            let pan = midi_pan_value(assigned.pan);
+            let current_pan = &mut channel_pans[usize::from(assigned.channel)];
+            if *current_pan != pan {
+                events_by_track[assigned.track_index].push(TimedMidiBytes {
+                    tick: assigned.start_tick,
+                    order: 5,
+                    bytes: midi_pan_bytes(assigned.channel, pan),
+                });
+                *current_pan = pan;
+            }
         }
 
         for (track_index, track) in tracks.iter().enumerate() {
@@ -877,6 +899,7 @@ fn assign_export_note_channels(
                 start_tick: note.start_tick,
                 end_tick: note.end_tick.max(note.start_tick.saturating_add(1)),
                 fine_pitch_offset_cents: note.fine_pitch_offset_cents,
+                pan: note.pan,
             });
         }
     }
@@ -904,6 +927,7 @@ fn assign_export_note_channels(
                             end_tick: voice.end_tick,
                             track_index: voice.track_index,
                             fine_pitch_offset_cents: voice.fine_pitch_offset_cents,
+                            pan: voice.pan,
                         });
                     }
                 } else {
@@ -914,15 +938,17 @@ fn assign_export_note_channels(
         }
 
         let channel_can_carry_note = |channel: usize| {
-            let active_pitch_matches = active[channel]
-                .iter()
-                .all(|voice| voice.fine_pitch_offset_cents == note.fine_pitch_offset_cents);
-            let bend_change_is_ordered = last_ended[channel].is_none_or(|previous| {
+            let active_pitch_matches = active[channel].iter().all(|voice| {
+                voice.fine_pitch_offset_cents == note.fine_pitch_offset_cents
+                    && midi_pan_value(voice.pan) == midi_pan_value(note.pan)
+            });
+            let channel_state_change_is_ordered = last_ended[channel].is_none_or(|previous| {
                 previous.end_tick != note.start_tick
-                    || previous.fine_pitch_offset_cents == note.fine_pitch_offset_cents
+                    || (previous.fine_pitch_offset_cents == note.fine_pitch_offset_cents
+                        && midi_pan_value(previous.pan) == midi_pan_value(note.pan))
                     || previous.track_index == note.track_index
             });
-            active_pitch_matches && (!active[channel].is_empty() || bend_change_is_ordered)
+            active_pitch_matches && (!active[channel].is_empty() || channel_state_change_is_ordered)
         };
 
         let preferred_channel = usize::from(note.preferred_channel);
@@ -936,7 +962,7 @@ fn assign_export_note_channels(
             channel
         } else {
             return Err(MidiError::InvalidExport(
-                "fine-pitched notes need a free MIDI channel for an independent bend, but none is available under this channel mapping",
+                "overlapping notes need a free MIDI channel for independent pitch or pan, but none is available under this channel mapping",
             ));
         };
 
@@ -944,6 +970,7 @@ fn assign_export_note_channels(
             end_tick: note.end_tick,
             track_index: note.track_index,
             fine_pitch_offset_cents: note.fine_pitch_offset_cents,
+            pan: note.pan,
         });
         assigned[note.track_index].push(AssignedMidiExportNote {
             track_index: note.track_index,
@@ -952,6 +979,7 @@ fn assign_export_note_channels(
             start_tick: note.start_tick,
             end_tick: note.end_tick,
             fine_pitch_offset_cents: note.fine_pitch_offset_cents,
+            pan: note.pan,
         });
     }
 
@@ -1025,6 +1053,15 @@ fn pitch_bend_bytes(channel: u8, offset_cents: i16) -> Vec<u8> {
         (bend & 0x7F) as u8,
         ((bend >> 7) & 0x7F) as u8,
     ]
+}
+
+fn midi_pan_bytes(channel: u8, pan: u8) -> Vec<u8> {
+    vec![0xB0 | channel, 10, pan]
+}
+
+fn midi_pan_value(fl_pan: u8) -> u8 {
+    let pan = u16::from(fl_pan.min(128));
+    ((pan * 127 + 64) / 128) as u8
 }
 
 fn midi_pitch_bend_value(offset_cents: i16) -> u16 {
@@ -1518,6 +1555,7 @@ fn export_note(note: &PatternNote, start_tick: u64, end_tick: u64) -> MidiExport
         start_tick,
         end_tick,
         fine_pitch_offset_cents: note.fine_pitch_offset_cents(),
+        pan: note.pan,
     }
 }
 
@@ -1865,6 +1903,7 @@ mod tests {
             start_tick: 0,
             end_tick: 240,
             fine_pitch_offset_cents: 0,
+            pan: 64,
         });
         let mut bass = MidiExportTrack::new("Bass", Some(27));
         bass.end_tick = 480;
@@ -1875,6 +1914,7 @@ mod tests {
             start_tick: 120,
             end_tick: 480,
             fine_pitch_offset_cents: 0,
+            pan: 64,
         });
 
         let bytes = MidiFile::encode_export_tracks(
@@ -1917,6 +1957,7 @@ mod tests {
             start_tick: u64::from(super::MAX_VLQ as u32) + 17,
             end_tick: u64::from(super::MAX_VLQ as u32) + 200,
             fine_pitch_offset_cents: 0,
+            pan: 64,
         });
         let bytes = MidiFile::encode_export_tracks(
             &[track],
@@ -1945,6 +1986,7 @@ mod tests {
             start_tick: 0,
             end_tick: 24,
             fine_pitch_offset_cents: 0,
+            pan: 64,
         });
         let bytes = MidiFile::encode_export_tracks(
             &[track],
@@ -1969,6 +2011,7 @@ mod tests {
             start_tick: 0,
             end_tick: 24,
             fine_pitch_offset_cents: 0,
+            pan: 64,
         });
         let mut bass = MidiExportTrack::new("Bass", Some(27));
         bass.notes.push(MidiExportNote {
@@ -1978,6 +2021,7 @@ mod tests {
             start_tick: 0,
             end_tick: 24,
             fine_pitch_offset_cents: 0,
+            pan: 64,
         });
         let bytes = MidiFile::encode_export_tracks_with_channel_order(
             &[piano, bass],
@@ -1995,6 +2039,100 @@ mod tests {
     }
 
     #[test]
+    fn exports_note_pan_through_cc10_and_updates_the_channel_at_note_boundaries() {
+        let mut track = MidiExportTrack::new("Pan", Some(0));
+        for (key, start_tick, end_tick, pan) in
+            [(60, 0, 24, 0), (62, 24, 48, 128), (64, 48, 72, 64)]
+        {
+            track.notes.push(MidiExportNote {
+                channel: 0,
+                key,
+                velocity: 100,
+                start_tick,
+                end_tick,
+                fine_pitch_offset_cents: 0,
+                pan,
+            });
+        }
+        let bytes = MidiFile::encode_export_tracks(
+            &[track],
+            96,
+            140.0,
+            None,
+            MidiChannelMapping::PreserveNoteChannels,
+        )
+        .expect("valid note pan should serialize");
+        let midi = MidiFile::parse(&bytes).expect("encoded MIDI should parse");
+        let midi_track = &midi.tracks()[1];
+        let pan_events = midi_track
+            .events()
+            .iter()
+            .filter_map(|event| match event.kind() {
+                super::MidiEventKind::ChannelVoice { status, data }
+                    if status & 0xF0 == 0xB0 && data[0] == 10 =>
+                {
+                    Some((event.absolute_tick(), status & 0x0F, data[1]))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(pan_events, vec![(0, 0, 0), (24, 0, 127), (48, 0, 64)]);
+        assert!(midi_track.notes().iter().all(|note| note.channel() == 0));
+    }
+
+    #[test]
+    fn overlapping_notes_with_different_pan_use_separate_midi_channels() {
+        let mut track = MidiExportTrack::new("Stereo chord", Some(0));
+        track.notes.push(MidiExportNote {
+            channel: 0,
+            key: 60,
+            velocity: 100,
+            start_tick: 0,
+            end_tick: 24,
+            fine_pitch_offset_cents: 0,
+            pan: 0,
+        });
+        track.notes.push(MidiExportNote {
+            channel: 0,
+            key: 64,
+            velocity: 100,
+            start_tick: 0,
+            end_tick: 24,
+            fine_pitch_offset_cents: 0,
+            pan: 128,
+        });
+        let bytes = MidiFile::encode_export_tracks(
+            &[track],
+            96,
+            140.0,
+            None,
+            MidiChannelMapping::PreserveNoteChannels,
+        )
+        .expect("overlapping notes with independent pan should use a spare channel");
+        let midi = MidiFile::parse(&bytes).expect("encoded MIDI should parse");
+        let midi_track = &midi.tracks()[1];
+        let notes = midi_track.notes();
+        assert_ne!(notes[0].channel(), notes[1].channel());
+
+        let pan_events = midi_track
+            .events()
+            .iter()
+            .filter_map(|event| match event.kind() {
+                super::MidiEventKind::ChannelVoice { status, data }
+                    if status & 0xF0 == 0xB0 && data[0] == 10 =>
+                {
+                    Some((event.absolute_tick(), status & 0x0F, data[1]))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(pan_events.len(), 2);
+        assert_eq!(pan_events[0], (0, notes[0].channel(), 0));
+        assert_eq!(pan_events[1], (0, notes[1].channel(), 127));
+    }
+
+    #[test]
     fn exports_note_fine_pitch_with_pitch_bend_and_a_twelve_semitone_range() {
         let mut track = MidiExportTrack::new("Fine pitch", Some(0));
         track.notes.push(MidiExportNote {
@@ -2004,6 +2142,7 @@ mod tests {
             start_tick: 0,
             end_tick: 24,
             fine_pitch_offset_cents: 100,
+            pan: 64,
         });
         track.notes.push(MidiExportNote {
             channel: 0,
@@ -2012,6 +2151,7 @@ mod tests {
             start_tick: 0,
             end_tick: 24,
             fine_pitch_offset_cents: 0,
+            pan: 64,
         });
         let mut other_track = MidiExportTrack::new("Other mapped channel", Some(1));
         other_track.notes.push(MidiExportNote {
@@ -2021,6 +2161,7 @@ mod tests {
             start_tick: 0,
             end_tick: 24,
             fine_pitch_offset_cents: 0,
+            pan: 64,
         });
         let bytes = MidiFile::encode_export_tracks(
             &[track, other_track],
@@ -2097,6 +2238,7 @@ mod tests {
             start_tick: 0,
             end_tick: 24,
             fine_pitch_offset_cents: 100,
+            pan: 64,
         });
         track.notes.push(MidiExportNote {
             channel: 0,
@@ -2105,6 +2247,7 @@ mod tests {
             start_tick: 12,
             end_tick: 36,
             fine_pitch_offset_cents: 100,
+            pan: 64,
         });
         let bytes = MidiFile::encode_export_tracks(
             &[track],
@@ -2154,6 +2297,7 @@ mod tests {
             start_tick: 0,
             end_tick: 24,
             fine_pitch_offset_cents: 100,
+            pan: 64,
         });
         let mut second = MidiExportTrack::new("Plain part", Some(1));
         second.notes.push(MidiExportNote {
@@ -2163,6 +2307,7 @@ mod tests {
             start_tick: 24,
             end_tick: 48,
             fine_pitch_offset_cents: 0,
+            pan: 64,
         });
         let bytes = MidiFile::encode_export_tracks(
             &[first, second],
@@ -2191,6 +2336,7 @@ mod tests {
                 start_tick: 0,
                 end_tick: 24,
                 fine_pitch_offset_cents: (index as i16 - 8) * 100,
+                pan: 64,
             });
         }
         let error = MidiFile::encode_export_tracks(
@@ -2214,6 +2360,7 @@ mod tests {
             start_tick: 0,
             end_tick: 1,
             fine_pitch_offset_cents: 0,
+            pan: 64,
         });
         let error = MidiFile::encode_export_tracks(
             &[track],
