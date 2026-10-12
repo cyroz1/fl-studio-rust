@@ -27730,12 +27730,19 @@ fn encode_window_layout_name(name: &str) -> String {
 
 fn decode_window_layout_name(encoded: &str) -> Option<String> {
     let encoded = encoded.as_bytes();
-    if !encoded.len().is_multiple_of(2) {
+    let (pairs, remainder) = encoded.as_chunks::<2>();
+    if !remainder.is_empty() {
         return None;
     }
-    let bytes = encoded
-        .chunks_exact(2)
-        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok())
+    let decode_nibble = |byte| match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    };
+    let bytes = pairs
+        .iter()
+        .map(|pair| Some((decode_nibble(pair[0])? << 4) | decode_nibble(pair[1])?))
         .collect::<Option<Vec<_>>>()?;
     String::from_utf8(bytes).ok()
 }
