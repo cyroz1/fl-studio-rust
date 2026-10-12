@@ -1501,11 +1501,12 @@ enum PianoRollScale {
     WholeHalfDiminished,
     HalfWholeDiminished,
     Altered,
+    AlteredDominantNaturalSix,
     SuperLocrianDoubleFlatSeven,
 }
 
 impl PianoRollScale {
-    const ALL: [Self; 42] = [
+    const ALL: [Self; 43] = [
         Self::None,
         Self::Major,
         Self::HarmonicMajor,
@@ -1547,6 +1548,7 @@ impl PianoRollScale {
         Self::WholeHalfDiminished,
         Self::HalfWholeDiminished,
         Self::Altered,
+        Self::AlteredDominantNaturalSix,
         Self::SuperLocrianDoubleFlatSeven,
     ];
 
@@ -1593,6 +1595,7 @@ impl PianoRollScale {
             Self::WholeHalfDiminished => "Whole-half diminished",
             Self::HalfWholeDiminished => "Half-whole diminished",
             Self::Altered => "Altered",
+            Self::AlteredDominantNaturalSix => "Altered dominant natural 6",
             Self::SuperLocrianDoubleFlatSeven => "Super-Locrian bb7",
         }
     }
@@ -1647,6 +1650,7 @@ impl PianoRollScale {
             Self::WholeHalfDiminished => &[0, 2, 3, 5, 6, 8, 9, 11],
             Self::HalfWholeDiminished => &[0, 1, 3, 4, 6, 7, 9, 10],
             Self::Altered => &[0, 1, 3, 4, 6, 8, 10],
+            Self::AlteredDominantNaturalSix => &[0, 1, 3, 4, 6, 9, 10],
             Self::SuperLocrianDoubleFlatSeven => &[0, 1, 3, 4, 6, 8, 9],
         }
     }
@@ -1715,6 +1719,7 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
         PianoRollScale::WholeHalfDiminished,
         PianoRollScale::HalfWholeDiminished,
         PianoRollScale::Altered,
+        PianoRollScale::AlteredDominantNaturalSix,
         PianoRollScale::SuperLocrianDoubleFlatSeven,
     ];
     let mut best: Option<((usize, usize, usize, i8), DetectedPianoRollScale)> = None;
@@ -1804,6 +1809,7 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
                 PianoRollScale::WholeHalfDiminished => -9,
                 PianoRollScale::HalfWholeDiminished => -10,
                 PianoRollScale::Altered => -13,
+                PianoRollScale::AlteredDominantNaturalSix => -36,
                 PianoRollScale::SuperLocrianDoubleFlatSeven => -22,
                 PianoRollScale::None => unreachable!("None is not a detection candidate"),
             };
@@ -33757,7 +33763,7 @@ mod tests {
 
     #[test]
     fn piano_roll_scales_use_documented_intervals_and_auto_detection() {
-        let cases: [(PianoRollScale, u8, [u16; 8], &'static [u8]); 29] = [
+        let cases: [(PianoRollScale, u8, [u16; 8], &'static [u8]); 30] = [
             (
                 PianoRollScale::Dorian,
                 2,
@@ -33835,6 +33841,12 @@ mod tests {
                 0,
                 [60, 62, 63, 65, 68, 69, 71, 72],
                 &[0, 2, 3, 5, 8, 9, 11],
+            ),
+            (
+                PianoRollScale::AlteredDominantNaturalSix,
+                0,
+                [60, 61, 63, 64, 66, 69, 70, 72],
+                &[0, 1, 3, 4, 6, 9, 10],
             ),
             (
                 PianoRollScale::Persian,
