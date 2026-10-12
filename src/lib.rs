@@ -12083,6 +12083,9 @@ impl FlpDocument {
                 "the selected channel has multiple Parameters (`0xC7`) events",
             ));
         }
+        if parameters_index.is_none() && !enabled {
+            return Ok(());
+        }
         if parameters_index.is_none() && !c7_events.is_empty() {
             return Err(FlpError::UnsupportedEdit(
                 "the selected channel's `0xC7` event is not a recognized Parameters payload",
@@ -18232,6 +18235,10 @@ mod tests {
         no_parameters_stream.extend_from_slice(&[0x62, 0, 0]);
         let input = flp_fixture(&no_parameters_stream, &[], &[]);
         let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+        document
+            .set_channel_main_pitch_enabled(7, false)
+            .expect("disabling an absent flag should leave it absent");
+        assert_eq!(document.encode_lossless().unwrap(), input);
         document
             .set_channel_main_pitch_enabled(7, true)
             .expect("Parameters event should be inserted after the kind event");
