@@ -1468,6 +1468,7 @@ enum PianoRollScale {
     Phrygian,
     PhrygianDominant,
     Lydian,
+    LydianAugmented,
     LydianDominant,
     Mixolydian,
     NaturalMinor,
@@ -1484,7 +1485,7 @@ enum PianoRollScale {
 }
 
 impl PianoRollScale {
-    const ALL: [Self; 21] = [
+    const ALL: [Self; 22] = [
         Self::None,
         Self::Major,
         Self::HarmonicMajor,
@@ -1493,6 +1494,7 @@ impl PianoRollScale {
         Self::Phrygian,
         Self::PhrygianDominant,
         Self::Lydian,
+        Self::LydianAugmented,
         Self::LydianDominant,
         Self::Mixolydian,
         Self::NaturalMinor,
@@ -1518,6 +1520,7 @@ impl PianoRollScale {
             Self::Phrygian => "Phrygian",
             Self::PhrygianDominant => "Phrygian dominant",
             Self::Lydian => "Lydian",
+            Self::LydianAugmented => "Lydian augmented",
             Self::LydianDominant => "Lydian dominant",
             Self::Mixolydian => "Mixolydian",
             Self::NaturalMinor => "Natural minor",
@@ -1551,6 +1554,7 @@ impl PianoRollScale {
             Self::Phrygian => &[0, 1, 3, 5, 7, 8, 10],
             Self::PhrygianDominant => &[0, 1, 4, 5, 7, 8, 10],
             Self::Lydian => &[0, 2, 4, 6, 7, 9, 11],
+            Self::LydianAugmented => &[0, 2, 4, 6, 8, 9, 11],
             Self::LydianDominant => &[0, 2, 4, 6, 7, 9, 10],
             Self::Mixolydian => &[0, 2, 4, 5, 7, 9, 10],
             Self::NaturalMinor => &[0, 2, 3, 5, 7, 8, 10],
@@ -1598,6 +1602,7 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
         PianoRollScale::Phrygian,
         PianoRollScale::PhrygianDominant,
         PianoRollScale::Lydian,
+        PianoRollScale::LydianAugmented,
         PianoRollScale::LydianDominant,
         PianoRollScale::Mixolydian,
         PianoRollScale::NaturalMinor,
@@ -1671,6 +1676,7 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
                 PianoRollScale::Phrygian => -3,
                 PianoRollScale::PhrygianDominant => -11,
                 PianoRollScale::Lydian => -4,
+                PianoRollScale::LydianAugmented => -15,
                 PianoRollScale::LydianDominant => -12,
                 PianoRollScale::Mixolydian => -5,
                 PianoRollScale::Locrian => -6,
