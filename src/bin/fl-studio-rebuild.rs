@@ -2480,6 +2480,7 @@ struct DawUi {
     browser_recent_projects: Vec<PathBuf>,
     browser_error: Option<String>,
     browser_full_sample: bool,
+    browser_preview_looping: bool,
     browser_preview_volume: f32,
     browser_preview_pending: Option<PendingBrowserPreview>,
     browser_preview_queued: Option<(PathBuf, bool)>,
@@ -3017,6 +3018,7 @@ impl DawUi {
             browser_recent_projects: load_recent_projects(),
             browser_error: None,
             browser_full_sample: false,
+            browser_preview_looping: false,
             browser_preview_volume: 1.0,
             browser_preview_pending: None,
             browser_preview_queued: None,
@@ -8828,6 +8830,7 @@ impl DawUi {
                 Ok(samples) => {
                     let start_result = if let Some(engine) = self.audio_engine.as_ref() {
                         engine.set_browser_preview_gain(self.browser_preview_volume);
+                        engine.set_browser_preview_looping(self.browser_preview_looping);
                         engine.set_browser_preview(samples)
                     } else {
                         Err("Audio output is not available".to_owned())
@@ -8856,9 +8859,9 @@ impl DawUi {
             && self
                 .audio_engine
                 .as_ref()
-                .is_none_or(|engine| !engine.browser_preview_active())
+                .is_some_and(|engine| engine.browser_preview_active())
         {
-            self.browser_preview_path = None;
+            ctx.request_repaint_after(std::time::Duration::from_millis(40));
         }
     }
 
@@ -9028,16 +9031,37 @@ impl DawUi {
             .as_ref()
             .filter(|path| browser_file_kind(path) == Some(BrowserFileKind::Audio))
             .cloned();
-        let path = selected_audio
+        let path = self
+            .browser_preview_pending
+            .as_ref()
+            .map(|pending| pending.path.clone())
             .or_else(|| {
-                self.browser_preview_pending
+                self.audio_engine
                     .as_ref()
-                    .map(|pending| pending.path.clone())
+                    .is_some_and(|engine| engine.browser_preview_active())
+                    .then(|| self.browser_preview_path.clone())
+                    .flatten()
             })
+            .or(selected_audio)
             .or_else(|| self.browser_preview_path.clone());
         let Some(path) = path else {
             return;
         };
+        let loaded_preview = self.browser_preview_path.as_ref() == Some(&path);
+        let (frame_count, mut preview_position, preview_active, preview_sample_rate) = self
+            .audio_engine
+            .as_ref()
+            .filter(|_| loaded_preview)
+            .map(|engine| {
+                let frame_count = engine.browser_preview_frame_count();
+                (
+                    frame_count,
+                    engine.browser_preview_position_frames().min(frame_count),
+                    engine.browser_preview_active(),
+                    engine.sample_rate(),
+                )
+            })
+            .unwrap_or((0, 0, false, 1));
         let name = path
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
@@ -9050,23 +9074,49 @@ impl DawUi {
         let mut play_to_end = false;
         let mut stop_preview = false;
         let mut volume_changed = false;
+        let mut looping_changed = false;
+        let mut seek_frame = None;
         ui.group(|ui| {
             ui.horizontal(|ui| {
                 ui.strong("Preview");
                 ui.label(egui::RichText::new(display_name).small())
                     .on_hover_text(path.display().to_string());
             });
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.checkbox(&mut self.browser_full_sample, "Full sample")
                     .on_hover_text(
                         "Play the full file on click; otherwise previews stop after five seconds",
                     );
+                looping_changed = ui
+                    .checkbox(&mut self.browser_preview_looping, "Loop")
+                    .on_hover_text(
+                        "Repeat the loaded preview region; use Full sample or Play-to-end to load the whole file",
+                    )
+                    .changed();
                 play_to_end = ui
                     .small_button("▶")
                     .on_hover_text("Play selected sample to the end")
                     .clicked();
                 stop_preview = ui.small_button("■").on_hover_text("Stop preview").clicked();
             });
+            if loaded_preview && frame_count > 0 {
+                ui.horizontal(|ui| {
+                    let slider_width = (ui.available_width() - 54.0).max(48.0);
+                    let seek = ui.add_sized(
+                        Vec2::new(slider_width, 18.0),
+                        egui::Slider::new(&mut preview_position, 0..=frame_count)
+                            .show_value(false),
+                    );
+                    if seek.changed() {
+                        seek_frame = Some(preview_position.min(frame_count - 1));
+                    }
+                    ui.small(format!(
+                        "{:.1}/{:.1}s",
+                        preview_position as f64 / preview_sample_rate as f64,
+                        frame_count as f64 / preview_sample_rate as f64
+                    ));
+                });
+            }
             ui.horizontal(|ui| {
                 ui.small("Volume");
                 volume_changed = ui
@@ -9082,14 +9132,26 @@ impl DawUi {
                 ui.label(egui::RichText::new(error).color(ORANGE).small());
             } else if self.browser_preview_pending.is_some() && !self.browser_preview_cancelled {
                 ui.small("Loading sample preview…");
-            } else if self.browser_preview_path.as_ref() == Some(&path) {
-                ui.small("Playing");
+            } else if loaded_preview {
+                ui.small(if preview_active {
+                    "Playing"
+                } else {
+                    "Preview loaded · seek to play"
+                });
             } else {
                 ui.small("Ready");
             }
         });
         if volume_changed && let Some(engine) = self.audio_engine.as_ref() {
             engine.set_browser_preview_gain(self.browser_preview_volume);
+        }
+        if looping_changed && let Some(engine) = self.audio_engine.as_ref() {
+            engine.set_browser_preview_looping(self.browser_preview_looping);
+        }
+        if let Some(frame) = seek_frame
+            && let Some(engine) = self.audio_engine.as_ref()
+        {
+            engine.seek_browser_preview(frame);
         }
         if stop_preview {
             self.stop_browser_preview();

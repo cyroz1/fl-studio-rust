@@ -235,6 +235,7 @@ struct PlaybackState {
     browser_preview_samples: ArcSwapOption<Vec<f32>>,
     browser_preview_cursor_frames: AtomicU64,
     browser_preview_active: AtomicBool,
+    browser_preview_looping: AtomicBool,
     browser_preview_gain: AtomicU32,
     output_peak: AtomicU32,
 }
@@ -477,6 +478,7 @@ impl PlaybackState {
             browser_preview_samples: ArcSwapOption::empty(),
             browser_preview_cursor_frames: AtomicU64::new(0),
             browser_preview_active: AtomicBool::new(false),
+            browser_preview_looping: AtomicBool::new(false),
             browser_preview_gain: AtomicU32::new(1.0_f32.to_bits()),
             output_peak: AtomicU32::new(0.0_f32.to_bits()),
         }
@@ -540,13 +542,68 @@ impl PlaybackState {
         self.browser_preview_active.load(Ordering::Acquire)
     }
 
+    fn browser_preview_frame_count(&self) -> u64 {
+        self.browser_preview_samples
+            .load()
+            .as_ref()
+            .map_or(0, |samples| (samples.len() / 2) as u64)
+    }
+
+    fn browser_preview_position_frames(&self) -> u64 {
+        self.browser_preview_cursor_frames
+            .load(Ordering::Acquire)
+            .min(self.browser_preview_frame_count())
+    }
+
+    fn seek_browser_preview(&self, frame: u64) {
+        let frame_count = self.browser_preview_frame_count();
+        if frame_count == 0 {
+            return;
+        }
+        self.browser_preview_cursor_frames
+            .store(frame.min(frame_count - 1), Ordering::Release);
+        self.browser_preview_active.store(true, Ordering::Release);
+    }
+
+    fn set_browser_preview_looping(&self, looping: bool) {
+        self.browser_preview_looping
+            .store(looping, Ordering::Release);
+    }
+
     fn next_browser_preview_frame(&self, samples: Option<&[f32]>) -> [f32; 2] {
         if !self.browser_preview_active.load(Ordering::Acquire) {
             return [0.0, 0.0];
         }
-        let frame = self
-            .browser_preview_cursor_frames
-            .fetch_add(1, Ordering::Relaxed);
+        let Some(samples) = samples else {
+            self.browser_preview_active.store(false, Ordering::Release);
+            return [0.0, 0.0];
+        };
+        let frame_count = (samples.len() / 2) as u64;
+        if frame_count == 0 {
+            self.browser_preview_active.store(false, Ordering::Release);
+            return [0.0, 0.0];
+        }
+        let looping = self.browser_preview_looping.load(Ordering::Acquire);
+        let frame = self.browser_preview_cursor_frames.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |cursor| {
+                if cursor < frame_count {
+                    Some(cursor + 1)
+                } else if looping {
+                    Some(cursor % frame_count + 1)
+                } else {
+                    None
+                }
+            },
+        );
+        let frame = match frame {
+            Ok(frame) => frame % frame_count,
+            Err(_) => {
+                self.browser_preview_active.store(false, Ordering::Release);
+                return [0.0, 0.0];
+            }
+        };
         let Some(offset) = usize::try_from(frame)
             .ok()
             .and_then(|frame| frame.checked_mul(2))
@@ -554,14 +611,12 @@ impl PlaybackState {
             self.browser_preview_active.store(false, Ordering::Release);
             return [0.0, 0.0];
         };
-        let Some(samples) =
-            samples.and_then(|samples| samples.get(offset..offset.saturating_add(2)))
-        else {
+        let Some(frame_samples) = samples.get(offset..offset.saturating_add(2)) else {
             self.browser_preview_active.store(false, Ordering::Release);
             return [0.0, 0.0];
         };
         let gain = f32::from_bits(self.browser_preview_gain.load(Ordering::Relaxed));
-        [samples[0] * gain, samples[1] * gain]
+        [frame_samples[0] * gain, frame_samples[1] * gain]
     }
 
     fn start_streaming(&self, initial_position_frames: u64) -> StreamingAudioWriter {
@@ -800,6 +855,26 @@ impl AudioEngine {
 
     pub fn browser_preview_active(&self) -> bool {
         self.playback.browser_preview_active()
+    }
+
+    /// Number of stereo frames in the currently loaded Browser preview.
+    pub fn browser_preview_frame_count(&self) -> u64 {
+        self.playback.browser_preview_frame_count()
+    }
+
+    /// Next frame position in the currently loaded Browser preview.
+    pub fn browser_preview_position_frames(&self) -> u64 {
+        self.playback.browser_preview_position_frames()
+    }
+
+    /// Seek to a frame in the loaded Browser preview and resume it there.
+    pub fn seek_browser_preview(&self, frame: u64) {
+        self.playback.seek_browser_preview(frame);
+    }
+
+    /// Repeat the loaded Browser preview region while it plays.
+    pub fn set_browser_preview_looping(&self, looping: bool) {
+        self.playback.set_browser_preview_looping(looping);
     }
 
     pub fn set_browser_preview_gain(&self, gain: f32) {
@@ -2382,6 +2457,39 @@ mod tests {
             f32::from_bits(playback.browser_preview_gain.load(Ordering::Acquire)),
             0.75
         );
+    }
+
+    #[test]
+    fn browser_preview_seeking_and_looping_follow_loaded_frame_bounds() {
+        let playback = PlaybackState::new();
+        let next_frame = |playback: &PlaybackState| {
+            let samples = playback.browser_preview_samples.load();
+            playback.next_browser_preview_frame(samples.as_deref().map(Vec::as_slice))
+        };
+
+        playback.start_browser_preview(vec![0.1, 0.1, 0.2, 0.2]);
+        assert_eq!(playback.browser_preview_frame_count(), 2);
+        assert_eq!(next_frame(&playback), [0.1, 0.1]);
+        assert_eq!(playback.browser_preview_position_frames(), 1);
+
+        playback.seek_browser_preview(1);
+        assert_eq!(next_frame(&playback), [0.2, 0.2]);
+        assert_eq!(playback.browser_preview_position_frames(), 2);
+        assert_eq!(next_frame(&playback), [0.0, 0.0]);
+        assert!(!playback.browser_preview_active());
+
+        playback.set_browser_preview_looping(true);
+        playback.seek_browser_preview(0);
+        assert_eq!(next_frame(&playback), [0.1, 0.1]);
+        assert_eq!(next_frame(&playback), [0.2, 0.2]);
+        assert_eq!(next_frame(&playback), [0.1, 0.1]);
+        assert_eq!(playback.browser_preview_position_frames(), 1);
+
+        playback.seek_browser_preview(u64::MAX);
+        assert_eq!(next_frame(&playback), [0.2, 0.2]);
+        playback.stop_browser_preview();
+        assert_eq!(playback.browser_preview_frame_count(), 0);
+        assert_eq!(playback.browser_preview_position_frames(), 0);
     }
 
     #[test]
