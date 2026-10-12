@@ -10067,6 +10067,7 @@ impl DawUi {
         let mut make_audio_clip_unique_as_sample_requested = None;
         let mut consolidate_audio_clip_requested = None;
         let mut split_clip_requested = None;
+        let mut split_pattern_clip_requested = None;
         let mut join_clip_requested = None;
         let mut join_pattern_clip_requested = None;
         let mut merge_pattern_clips_requested = None;
@@ -10925,6 +10926,17 @@ impl DawUi {
                                 && source_window_supported
                                 && scale_supported
                                 && !tempo_automation_overlaps;
+                            let can_split_pattern_clip = context_split_position.is_some_and(
+                                |split_position| {
+                                    playlist_pattern_clip_split_supported(
+                                        clip,
+                                        split_position,
+                                        &arrangement.clips,
+                                        &patterns,
+                                        &tempo_channel_ids,
+                                    )
+                                },
+                            );
                             let drag_hint = if self.playlist_mute_tool_active {
                                 "Mute tool selected: click to mute or unmute this clip. Press T or select Mute to return to move mode."
                             } else if !clip.can_resize_timeline_length() {
@@ -11111,6 +11123,21 @@ impl DawUi {
                                         ui.close();
                                     }
                                 } else if is_pattern_clip {
+                                    let split_pattern_button = ui.add_enabled(
+                                        can_split_pattern_clip,
+                                        egui::Button::new("Split Pattern at cursor"),
+                                    );
+                                    if split_pattern_button
+                                        .on_disabled_hover_text(
+                                            "Requires a repeat boundary, cycle-contained notes, default scale, a full source window, and no Playlist tempo automation.",
+                                        )
+                                        .clicked()
+                                        && let Some(split_position_ticks) = context_split_position
+                                    {
+                                        split_pattern_clip_requested =
+                                            Some((clip_index, split_position_ticks));
+                                        ui.close();
+                                    }
                                     if let Some(selected_indices) = self
                                         .selected_playlist_pattern_clip_indices(arrangement.id)
                                         && ui
@@ -11560,6 +11587,35 @@ impl DawUi {
             self.selected_playlist_clips.clear();
             self.selected_playlist_clips.insert(clip_index);
             self.render_selected_audio_clip_dialog(start_from_song_start, true);
+        }
+
+        if let Some((clip_index, split_position_ticks)) = split_pattern_clip_requested {
+            if let Some(document) = self.document.as_mut() {
+                match document.split_playlist_pattern_clip(
+                    arrangement.id,
+                    clip_index,
+                    split_position_ticks,
+                ) {
+                    Ok(right_clip_index) => {
+                        self.stop_project_playback();
+                        self.selected_arrangement = Some(arrangement.id);
+                        self.selected_clip = Some(right_clip_index);
+                        self.playlist_clip_context_split = None;
+                        self.active_playlist_clip_drag = None;
+                        self.dirty = true;
+                        self.status = format!(
+                            "Split Pattern Clip {} at tick {split_position_ticks}",
+                            clip_index + 1
+                        );
+                        playlist_clip_list_changed = true;
+                    }
+                    Err(error) => {
+                        self.status = format!("Could not split Pattern Clip: {error}");
+                    }
+                }
+            } else {
+                self.status = "Open a project to split Playlist Pattern Clips".to_owned();
+            }
         }
 
         if let Some((clip_index, split_position_ticks, full_source_length_ms)) =
@@ -29574,6 +29630,73 @@ fn playlist_audio_clip_join_candidates(
     (previous_clip_index, next_clip_index)
 }
 
+fn playlist_pattern_clip_split_supported(
+    clip: &PlaylistClip,
+    split_position_ticks: u32,
+    clips: &[PlaylistClip],
+    patterns: &[Pattern],
+    tempo_channel_ids: &BTreeSet<u16>,
+) -> bool {
+    let PlaylistClipTarget::Pattern { id: pattern_id } = clip.target() else {
+        return false;
+    };
+    if !clip.can_resize_timeline_length()
+        || clip.length_ticks == 0
+        || clip
+            .scale
+            .is_some_and(|scale| !scale.is_finite() || (scale - 1.0).abs() > 1e-9)
+    {
+        return false;
+    }
+    let Some(relative_split_ticks) = split_position_ticks
+        .checked_sub(clip.position_ticks)
+        .filter(|ticks| *ticks > 0 && *ticks < clip.length_ticks)
+    else {
+        return false;
+    };
+    let mut matching_patterns = patterns.iter().filter(|pattern| pattern.id == pattern_id);
+    let Some(pattern) = matching_patterns.next() else {
+        return false;
+    };
+    if matching_patterns.next().is_some() {
+        return false;
+    }
+    let inferred_length = pattern
+        .notes
+        .iter()
+        .filter(|note| note.length > 0)
+        .map(|note| u64::from(note.position) + u64::from(note.length))
+        .max()
+        .unwrap_or(0);
+    let Some(repeat_length) = pattern
+        .length_ticks
+        .map(u64::from)
+        .filter(|length| *length > 0)
+        .or_else(|| (inferred_length > 0).then_some(inferred_length))
+    else {
+        return false;
+    };
+    if !u64::from(relative_split_ticks).is_multiple_of(repeat_length)
+        || pattern.notes.iter().any(|note| {
+            u64::from(note.position) >= repeat_length
+                || (note.length > 0
+                    && u64::from(note.position) % repeat_length + u64::from(note.length)
+                        > repeat_length)
+        })
+    {
+        return false;
+    }
+    let Some(clip_end_ticks) = clip.position_ticks.checked_add(clip.length_ticks) else {
+        return false;
+    };
+    !playlist_tempo_overlaps_range(
+        clips,
+        tempo_channel_ids,
+        clip.position_ticks,
+        clip_end_ticks,
+    )
+}
+
 fn playlist_pattern_clip_joinable(
     left: &PlaylistClip,
     right: &PlaylistClip,
@@ -30358,12 +30481,12 @@ mod tests {
         playlist_audio_clip_join_candidates, playlist_audio_drop_position_ticks,
         playlist_bar_ticks, playlist_clip_drag_edit, playlist_clip_local_recording_offset,
         playlist_clip_split_position, playlist_group_parent_ids, playlist_measure_boundaries,
-        playlist_pattern_clip_join_candidates, playlist_pattern_recording_placement_tick,
-        playlist_seek_tick_to_frame, playlist_signature_at_tick, playlist_song_position_label,
-        playlist_track_group_range, playlist_track_is_hidden, recolor_piano_roll_notes,
-        serialize_window_layout_presets, snap_note_tick, toggle_piano_roll_note_group_selection,
-        update_channel_rack_selection, update_layer_child_selection,
-        update_piano_roll_box_selection,
+        playlist_pattern_clip_join_candidates, playlist_pattern_clip_split_supported,
+        playlist_pattern_recording_placement_tick, playlist_seek_tick_to_frame,
+        playlist_signature_at_tick, playlist_song_position_label, playlist_track_group_range,
+        playlist_track_is_hidden, recolor_piano_roll_notes, serialize_window_layout_presets,
+        snap_note_tick, toggle_piano_roll_note_group_selection, update_channel_rack_selection,
+        update_layer_child_selection, update_piano_roll_box_selection,
     };
 
     fn playlist_track_arrangement_fixture(clips: &[(u32, u32, u16)]) -> Arrangement {
@@ -31533,6 +31656,57 @@ mod tests {
             ),
             (None, None)
         );
+    }
+
+    #[test]
+    fn playlist_pattern_split_menu_requires_repeat_boundary_and_cycle_safe_notes() {
+        let (mut clips, _) = playlist_audio_clip_fixture();
+        clips[0].position_ticks = 240;
+        clips[0].length_ticks = 192;
+        clips[0].pattern_base = 0x5000;
+        clips[0].item_index = 0x5007;
+        let clip = &clips[0];
+        let pattern = Pattern {
+            id: 7,
+            length_ticks: Some(96),
+            notes: vec![PatternNote {
+                position: 0,
+                length: 48,
+                ..PatternNote::default()
+            }],
+            ..Pattern::default()
+        };
+
+        assert!(playlist_pattern_clip_split_supported(
+            clip,
+            336,
+            &clips,
+            std::slice::from_ref(&pattern),
+            &BTreeSet::new(),
+        ));
+        assert!(!playlist_pattern_clip_split_supported(
+            clip,
+            288,
+            &clips,
+            std::slice::from_ref(&pattern),
+            &BTreeSet::new(),
+        ));
+
+        let pattern_with_crossing_note = Pattern {
+            notes: vec![PatternNote {
+                position: 80,
+                length: 24,
+                ..PatternNote::default()
+            }],
+            ..pattern.clone()
+        };
+        assert!(!playlist_pattern_clip_split_supported(
+            clip,
+            336,
+            &clips,
+            std::slice::from_ref(&pattern_with_crossing_note),
+            &BTreeSet::new(),
+        ));
     }
 
     #[test]

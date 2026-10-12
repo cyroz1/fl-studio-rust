@@ -811,6 +811,17 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_optional_f32(source_length, "full source length in milliseconds")?,
             )
         }
+        [command, input, output, arrangement_id, clip_index, split_position]
+            if command == "split-pattern-clip" =>
+        {
+            split_pattern_clip(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(arrangement_id, "arrangement id")?,
+                parse_usize(clip_index, "clip index")?,
+                parse_u32(split_position, "split position ticks")?,
+            )
+        }
         [command, input, output, arrangement_id, left_clip_index, right_clip_index]
             if command == "join-audio-clips" =>
         {
@@ -1010,6 +1021,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild edit-clip-properties <input.flp> <output.flp> <arrangement-id> <clip-index> <item-index-raw|-> <track-index-raw|-> <group-raw|-> <flags-raw|-> <start-offset|-> <end-offset|-> <scale|->\n",
             "  flp-rebuild duplicate-clip <input.flp> <output.flp> <arrangement-id> <clip-index> <position|-> <track-index-raw|->\n",
             "  flp-rebuild split-audio-clip <input.flp> <output.flp> <arrangement-id> <clip-index> <split-position-ticks> <source-length-ms|->\n",
+            "  flp-rebuild split-pattern-clip <input.flp> <output.flp> <arrangement-id> <clip-index> <split-position-ticks>\n",
             "  flp-rebuild join-audio-clips <input.flp> <output.flp> <arrangement-id> <left-clip-index> <right-clip-index>\n",
             "  flp-rebuild make-audio-clip-unique <input.flp> <output.flp> <arrangement-id> <clip-index>\n",
             "  flp-rebuild make-audio-clip-unique-as-sample <input.flp> <output.flp> <arrangement-id> <clip-index>\n",
@@ -3354,6 +3366,29 @@ fn split_audio_clip(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "split arrangement {arrangement_id} Audio Clip {clip_index} at tick {split_position_ticks}; right clip is {right_clip_index} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn split_pattern_clip(
+    input: &Path,
+    output: &Path,
+    arrangement_id: u16,
+    clip_index: usize,
+    split_position_ticks: u32,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let right_clip_index = document
+        .split_playlist_pattern_clip(arrangement_id, clip_index, split_position_ticks)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "split arrangement {arrangement_id} Pattern Clip {clip_index} at tick {split_position_ticks}; right clip is {right_clip_index} in {}",
         output.display()
     );
     Ok(())

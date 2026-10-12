@@ -7336,6 +7336,193 @@ impl FlpDocument {
         })
     }
 
+    /// Splits a Pattern Clip at a pattern repeat boundary without changing playback.
+    /// The existing clip is shortened and a copy of its record is inserted after it.
+    /// Full-window 88-byte Pattern Clips are supported; non-default scale, notes that
+    /// cross a repeat boundary, and Playlist tempo automation within the clip are rejected.
+    pub fn split_playlist_pattern_clip(
+        &mut self,
+        arrangement_id: u16,
+        clip_index: usize,
+        split_position_ticks: u32,
+    ) -> Result<usize, FlpError> {
+        let arrangements = self.arrangements()?;
+        let mut matching_arrangements = arrangements
+            .iter()
+            .filter(|arrangement| arrangement.id == arrangement_id);
+        let Some(arrangement) = matching_arrangements.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested arrangement does not exist",
+            ));
+        };
+        if matching_arrangements.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested arrangement id is ambiguous",
+            ));
+        }
+        let Some(clip) = arrangement.clips.get(clip_index) else {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested Playlist clip does not exist",
+            ));
+        };
+        let PlaylistClipTarget::Pattern { id: pattern_id } = clip.target() else {
+            return Err(FlpError::UnsupportedEdit(
+                "only Playlist Pattern Clips can be split",
+            ));
+        };
+        if !clip.can_resize_timeline_length() {
+            return Err(FlpError::UnsupportedEdit(
+                "this Pattern Clip does not have a recognized full source window for splitting",
+            ));
+        }
+        if clip
+            .scale
+            .is_some_and(|scale| !scale.is_finite() || (scale - 1.0).abs() > 1e-9)
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "Pattern Clips with a non-default or invalid scale cannot be split",
+            ));
+        }
+        let relative_split_ticks = split_position_ticks.checked_sub(clip.position_ticks);
+        let Some(relative_split_ticks) =
+            relative_split_ticks.filter(|ticks| *ticks > 0 && *ticks < clip.length_ticks)
+        else {
+            return Err(FlpError::UnsupportedEdit(
+                "the split point must fall inside the Playlist Pattern Clip",
+            ));
+        };
+
+        let mut matching_patterns = self
+            .patterns()?
+            .into_iter()
+            .filter(|pattern| pattern.id == pattern_id);
+        let Some(pattern) = matching_patterns.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the Playlist Pattern Clip pattern does not exist",
+            ));
+        };
+        if matching_patterns.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the Playlist Pattern Clip pattern is ambiguous",
+            ));
+        }
+        let inferred_length = pattern
+            .notes
+            .iter()
+            .filter(|note| note.length > 0)
+            .map(|note| u64::from(note.position) + u64::from(note.length))
+            .max()
+            .unwrap_or(0);
+        let repeat_length = pattern
+            .length_ticks
+            .map(u64::from)
+            .filter(|length| *length > 0)
+            .or_else(|| (inferred_length > 0).then_some(inferred_length))
+            .ok_or(FlpError::UnsupportedEdit(
+                "splitting Pattern Clips requires a known nonzero pattern repeat length",
+            ))?;
+        if !u64::from(relative_split_ticks).is_multiple_of(repeat_length) {
+            return Err(FlpError::UnsupportedEdit(
+                "the split point must fall on a pattern repeat boundary",
+            ));
+        }
+        if pattern.notes.iter().any(|note| {
+            u64::from(note.position) >= repeat_length
+                || (note.length > 0
+                    && u64::from(note.position) % repeat_length + u64::from(note.length)
+                        > repeat_length)
+        }) {
+            return Err(FlpError::UnsupportedEdit(
+                "splitting this Pattern Clip would let a note cross a repeat boundary",
+            ));
+        }
+
+        let clip_end_ticks = clip
+            .position_ticks
+            .checked_add(clip.length_ticks)
+            .ok_or(FlpError::LengthOverflow)?;
+        let channels = self.channels();
+        let tempo_channel_ids = channels
+            .iter()
+            .filter(|channel| {
+                channel.kind() == Some(5)
+                    && channel
+                        .display_name()
+                        .is_some_and(|name| name.eq_ignore_ascii_case("TEMPO"))
+            })
+            .map(ChannelSummary::id)
+            .collect::<HashSet<_>>();
+        if arrangement.clips.iter().any(|candidate| {
+            let PlaylistClipTarget::Channel { id } = candidate.target() else {
+                return false;
+            };
+            tempo_channel_ids.contains(&id)
+                && candidate.position_ticks < clip_end_ticks
+                && candidate
+                    .position_ticks
+                    .saturating_add(candidate.length_ticks)
+                    > clip.position_ticks
+        }) {
+            return Err(FlpError::UnsupportedEdit(
+                "splitting Pattern Clips across Playlist tempo automation is unsupported",
+            ));
+        }
+
+        let record_size = clip.record_size;
+        let record_start = clip
+            .source_record_index
+            .checked_mul(record_size)
+            .ok_or(FlpError::LengthOverflow)?;
+        let record_end = record_start
+            .checked_add(record_size)
+            .ok_or(FlpError::LengthOverflow)?;
+        let event_index = clip.source_event_index;
+        let event = self
+            .events
+            .get(event_index)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the Playlist Pattern Clip event no longer exists",
+            ))?;
+        if event.opcode != 0xE9
+            || !matches!(event.encoding, PayloadEncoding::Data { .. })
+            || record_end > event.payload.len()
+            || !event.payload.len().is_multiple_of(record_size)
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "the Playlist Pattern Clip record does not fit its event payload",
+            ));
+        }
+
+        let left_length = relative_split_ticks;
+        let right_length = clip.length_ticks - relative_split_ticks;
+        let mut left_record = event.payload[record_start..record_end].to_vec();
+        let mut right_record = left_record.clone();
+        left_record[8..12].copy_from_slice(&left_length.to_le_bytes());
+        right_record[0..4].copy_from_slice(&split_position_ticks.to_le_bytes());
+        right_record[8..12].copy_from_slice(&right_length.to_le_bytes());
+        if record_size == 88 {
+            left_record[28..32].copy_from_slice(&left_length.to_le_bytes());
+            right_record[24..28].copy_from_slice(&0u32.to_le_bytes());
+            right_record[28..32].copy_from_slice(&right_length.to_le_bytes());
+        }
+        if playlist_record_has_clip_id(record_size) {
+            right_record[32..36]
+                .copy_from_slice(&next_playlist_clip_id(arrangement, None)?.to_le_bytes());
+        }
+
+        let mut candidate = self.clone();
+        let mut payload = event.payload.clone();
+        payload.splice(record_start..record_end, left_record);
+        let right_record_start = record_start
+            .checked_add(record_size)
+            .ok_or(FlpError::LengthOverflow)?;
+        payload.splice(right_record_start..right_record_start, right_record);
+        candidate.events[event_index].replace_data_payload(payload)?;
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(clip_index.saturating_add(1))
+    }
+
     fn pattern_score_for_playlist_merge(
         &self,
         pattern_id: u16,
@@ -14720,6 +14907,33 @@ mod tests {
             .expect("Pattern Clip fixture should parse")
     }
 
+    fn modern_pattern_clip_fixture(
+        length_ticks: u32,
+        source_start_ticks: u32,
+        note_position: u32,
+        note_length: u32,
+    ) -> FlpDocument {
+        let note = note_record(note_position, 0, note_length, 60, 100);
+        let mut event_stream = vec![0x40, 0, 0, 0x41, 7, 0, 0xD0, 24];
+        event_stream.extend_from_slice(&note);
+        event_stream.extend_from_slice(&[0xA4]);
+        event_stream.extend_from_slice(&96u32.to_le_bytes());
+        event_stream.extend_from_slice(&[0x40, 9, 0, 0x15, 4, 0x48, 9, 0, 0x62, 0, 0, 0x63, 3, 0]);
+
+        let mut clip = [0xA5u8; 88];
+        clip[0..4].copy_from_slice(&0u32.to_le_bytes());
+        clip[4..6].copy_from_slice(&0x5000u16.to_le_bytes());
+        clip[6..8].copy_from_slice(&0x5007u16.to_le_bytes());
+        clip[8..12].copy_from_slice(&length_ticks.to_le_bytes());
+        clip[12..14].copy_from_slice(&499u16.to_le_bytes());
+        clip[24..28].copy_from_slice(&source_start_ticks.to_le_bytes());
+        clip[28..32].copy_from_slice(&length_ticks.to_le_bytes());
+        append_data_event(&mut event_stream, 0xC7, b"26.1.0.0\0");
+        append_data_event(&mut event_stream, 0xE9, &clip);
+        FlpDocument::parse(&flp_fixture(&event_stream, &[], &[]))
+            .expect("modern Pattern Clip fixture should parse")
+    }
+
     fn audio_clip_fixture() -> FlpDocument {
         let mut event_stream = vec![0x40, 9, 0, 0x15, 4];
         append_data_event(
@@ -16635,6 +16849,154 @@ mod tests {
             .encode_lossless()
             .expect("the joined project should encode");
         FlpDocument::parse(&encoded).expect("the joined project should parse again");
+    }
+
+    #[test]
+    fn splits_playlist_pattern_clip_at_repeat_boundary_and_preserves_records() {
+        let mut document = adjacent_pattern_clip_fixture(192, 96, 0, 48);
+        let original_left = document
+            .events()
+            .iter()
+            .find(|event| event.opcode() == 0xE9)
+            .expect("the Playlist event should be present")
+            .payload()[..80]
+            .to_vec();
+
+        let right_clip_index = document
+            .split_playlist_pattern_clip(3, 0, 96)
+            .expect("a split on the pattern repeat boundary should succeed");
+
+        assert_eq!(right_clip_index, 1);
+        let arrangements = document.arrangements().unwrap();
+        assert_eq!(arrangements[0].clips.len(), 3);
+        assert_eq!(arrangements[0].clips[0].position_ticks, 0);
+        assert_eq!(arrangements[0].clips[0].length_ticks, 96);
+        assert_eq!(arrangements[0].clips[0].clip_id, Some(1));
+        assert_eq!(arrangements[0].clips[1].position_ticks, 96);
+        assert_eq!(arrangements[0].clips[1].length_ticks, 96);
+        assert_eq!(arrangements[0].clips[1].clip_id, Some(3));
+        assert_eq!(arrangements[0].clips[2].position_ticks, 192);
+        assert_eq!(arrangements[0].clips[2].length_ticks, 96);
+        assert_eq!(arrangements[0].clips[2].clip_id, Some(2));
+
+        let clip_payload = document
+            .events()
+            .iter()
+            .find(|event| event.opcode() == 0xE9)
+            .expect("the Playlist event should remain present")
+            .payload();
+        let mut expected_left = original_left.clone();
+        expected_left[8..12].copy_from_slice(&96u32.to_le_bytes());
+        let mut expected_right = original_left;
+        expected_right[0..4].copy_from_slice(&96u32.to_le_bytes());
+        expected_right[8..12].copy_from_slice(&96u32.to_le_bytes());
+        expected_right[32..36].copy_from_slice(&3u32.to_le_bytes());
+        assert_eq!(&clip_payload[..80], expected_left);
+        assert_eq!(&clip_payload[80..160], expected_right);
+        let encoded = document.encode_lossless().unwrap();
+        FlpDocument::parse(&encoded).expect("the split project should parse again");
+    }
+
+    #[test]
+    fn splits_full_window_modern_pattern_clip_and_updates_both_source_windows() {
+        let mut document = modern_pattern_clip_fixture(192, 0, 0, 48);
+
+        let right_clip_index = document
+            .split_playlist_pattern_clip(3, 0, 96)
+            .expect("a full-window 88-byte Pattern Clip should split");
+
+        assert_eq!(right_clip_index, 1);
+        let arrangements = document.arrangements().unwrap();
+        assert_eq!(arrangements[0].clips.len(), 2);
+        assert_eq!(arrangements[0].clips[0].length_ticks, 96);
+        assert_eq!(
+            arrangements[0].clips[0].source_window_ticks(),
+            Some((0, 96))
+        );
+        assert_eq!(arrangements[0].clips[1].position_ticks, 96);
+        assert_eq!(arrangements[0].clips[1].length_ticks, 96);
+        assert_eq!(
+            arrangements[0].clips[1].source_window_ticks(),
+            Some((0, 96))
+        );
+
+        let clip_payload = document
+            .events()
+            .iter()
+            .find(|event| event.opcode() == 0xE9)
+            .expect("the Playlist event should remain present")
+            .payload();
+        assert_eq!(clip_payload.len(), 176);
+        assert_eq!(&clip_payload[24..32], &[0, 0, 0, 0, 96, 0, 0, 0]);
+        assert_eq!(&clip_payload[88 + 24..88 + 32], &[0, 0, 0, 0, 96, 0, 0, 0]);
+        assert_eq!(&clip_payload[32..88], &clip_payload[88 + 32..]);
+        let encoded = document.encode_lossless().unwrap();
+        FlpDocument::parse(&encoded).expect("the split project should parse again");
+    }
+
+    #[test]
+    fn playlist_pattern_clip_split_rejects_unsafe_boundaries_atomically() {
+        let mut non_repeat_boundary = adjacent_pattern_clip_fixture(192, 96, 0, 48);
+        let before_split = non_repeat_boundary.encode_lossless().unwrap();
+        assert!(
+            non_repeat_boundary
+                .split_playlist_pattern_clip(3, 0, 48)
+                .is_err()
+        );
+        assert_eq!(non_repeat_boundary.encode_lossless().unwrap(), before_split);
+
+        let mut crossing_note = adjacent_pattern_clip_fixture(192, 96, 80, 24);
+        let before_split = crossing_note.encode_lossless().unwrap();
+        assert!(crossing_note.split_playlist_pattern_clip(3, 0, 96).is_err());
+        assert_eq!(crossing_note.encode_lossless().unwrap(), before_split);
+
+        let mut partial_modern_window = modern_pattern_clip_fixture(192, 24, 0, 48);
+        let before_split = partial_modern_window.encode_lossless().unwrap();
+        assert!(
+            partial_modern_window
+                .split_playlist_pattern_clip(3, 0, 96)
+                .is_err()
+        );
+        assert_eq!(
+            partial_modern_window.encode_lossless().unwrap(),
+            before_split
+        );
+    }
+
+    #[test]
+    fn playlist_pattern_clip_split_rejects_tempo_automation_atomically() {
+        let note = note_record(0, 0, 48, 60, 100);
+        let mut event_stream = vec![0x40, 0, 0, 0x41, 7, 0, 0xD0, 24];
+        event_stream.extend_from_slice(&note);
+        event_stream.extend_from_slice(&[0xA4]);
+        event_stream.extend_from_slice(&96u32.to_le_bytes());
+        event_stream.extend_from_slice(&[0x40, 9, 0, 0x15, 4, 0x48, 9, 0]);
+        event_stream.extend_from_slice(&[0x40, 10, 0, 0x15, 5, 0x48, 10, 0]);
+        append_project_info_string(&mut event_stream, 0xCB, "TEMPO");
+        event_stream.extend_from_slice(&[0x62, 0, 0, 0x63, 3, 0]);
+
+        let mut pattern_clip = [0u8; 80];
+        pattern_clip[4..6].copy_from_slice(&0x5000u16.to_le_bytes());
+        pattern_clip[6..8].copy_from_slice(&0x5007u16.to_le_bytes());
+        pattern_clip[8..12].copy_from_slice(&192u32.to_le_bytes());
+        pattern_clip[12..14].copy_from_slice(&499u16.to_le_bytes());
+        pattern_clip[28..32].copy_from_slice(&1.0f32.to_le_bytes());
+        pattern_clip[32..36].copy_from_slice(&1u32.to_le_bytes());
+        pattern_clip[64..72].copy_from_slice(&1.0f64.to_le_bytes());
+        let mut tempo_clip = [0u8; 80];
+        tempo_clip[0..4].copy_from_slice(&120u32.to_le_bytes());
+        tempo_clip[4..6].copy_from_slice(&0x5000u16.to_le_bytes());
+        tempo_clip[6..8].copy_from_slice(&10u16.to_le_bytes());
+        tempo_clip[8..12].copy_from_slice(&24u32.to_le_bytes());
+        tempo_clip[12..14].copy_from_slice(&498u16.to_le_bytes());
+        let mut clip_payload = pattern_clip.to_vec();
+        clip_payload.extend_from_slice(&tempo_clip);
+        append_data_event(&mut event_stream, 0xE9, &clip_payload);
+        let input = flp_fixture(&event_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&input).expect("the project fixture should parse");
+
+        assert!(document.split_playlist_pattern_clip(3, 0, 96).is_err());
+        assert_eq!(document.encode_lossless().unwrap(), input);
     }
 
     #[test]
