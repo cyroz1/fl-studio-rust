@@ -146,6 +146,29 @@ pub fn write_audio_range_to_wav_with_fades(
     fade_out_frames: usize,
     output_path: impl AsRef<Path>,
 ) -> Result<(), String> {
+    write_audio_range_to_wav_with_processing(
+        audio,
+        frame_range,
+        fade_in_frames,
+        fade_out_frames,
+        None,
+        output_path,
+    )
+}
+
+/// Write a selected frame range with optional linear fades and peak normalization.
+///
+/// The normalization target is expressed in dBFS and must be between -60 and 0. Fade lengths
+/// are measured in frames and may overlap; overlapping fade gains are multiplied. Processing
+/// affects only the exported WAV and never modifies the decoded source buffer.
+pub fn write_audio_range_to_wav_with_processing(
+    audio: &DecodedAudio,
+    frame_range: Range<usize>,
+    fade_in_frames: usize,
+    fade_out_frames: usize,
+    normalization_target_dbfs: Option<f32>,
+    output_path: impl AsRef<Path>,
+) -> Result<(), String> {
     let output_path = output_path.as_ref();
     if !output_path
         .extension()
@@ -183,6 +206,26 @@ pub fn write_audio_range_to_wav_with_fades(
     if fade_in_frames > frames || fade_out_frames > frames {
         return Err("fade lengths cannot exceed the selected frame range".to_owned());
     }
+    if normalization_target_dbfs
+        .is_some_and(|target| !target.is_finite() || !(-60.0..=0.0).contains(&target))
+    {
+        return Err("normalization target must be between -60 and 0 dBFS".to_owned());
+    }
+    let normalization_gain = normalization_target_dbfs.map_or(1.0, |target| {
+        let peak = audio
+            .channels
+            .iter()
+            .flat_map(|channel| &channel[frame_range.clone()])
+            .copied()
+            .filter(|sample| sample.is_finite())
+            .map(f32::abs)
+            .fold(0.0_f32, f32::max);
+        if peak == 0.0 {
+            1.0
+        } else {
+            10.0_f64.powf(f64::from(target) / 20.0) / f64::from(peak)
+        }
+    });
     let data_bytes = frames
         .checked_mul(usize::from(block_align))
         .and_then(|bytes| u32::try_from(bytes).ok())
@@ -258,7 +301,12 @@ pub fn write_audio_range_to_wav_with_fades(
             for channel in &audio.channels {
                 let sample = channel[frame];
                 frame_bytes.extend_from_slice(
-                    &((if sample.is_finite() { sample } else { 0.0 }) * gain).to_le_bytes(),
+                    &((if sample.is_finite() {
+                        f64::from(sample) * normalization_gain * f64::from(gain)
+                    } else {
+                        0.0
+                    }) as f32)
+                        .to_le_bytes(),
                 );
             }
             file.write_all(&frame_bytes)
@@ -1397,6 +1445,33 @@ mod tests {
     }
 
     #[test]
+    fn peak_normalizes_only_selected_audio_to_requested_dbfs() {
+        let root = fixture_root();
+        fs::create_dir_all(&root).expect("fixture directory should be created");
+        let output_path = root.join("normalized.wav");
+        let audio = DecodedAudio {
+            sample_rate: 48_000,
+            channels: vec![vec![0.25, -0.5, 1.0, 0.75]],
+        };
+
+        write_audio_range_to_wav_with_processing(&audio, 0..3, 0, 0, Some(-6.020_6), &output_path)
+            .expect("selected audio should be peak-normalized");
+
+        let bytes = fs::read(&output_path).expect("normalized WAV should be readable");
+        let samples = bytes[44..]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&sample| f32::from_le_bytes(sample))
+            .collect::<Vec<_>>();
+        assert!((samples[0] - 0.125).abs() < 1.0e-5);
+        assert!((samples[1] + 0.25).abs() < 1.0e-5);
+        assert!((samples[2] - 0.5).abs() < 1.0e-5);
+        assert_eq!(samples.len(), 3);
+        fs::remove_dir_all(root).expect("fixture directory should be removed");
+    }
+
+    #[test]
     fn rejects_empty_or_out_of_bounds_audio_selections() {
         let root = fixture_root();
         fs::create_dir_all(&root).expect("fixture directory should be created");
@@ -1408,6 +1483,10 @@ mod tests {
         assert!(write_audio_range_to_wav(&audio, 1..1, &output_path).is_err());
         assert!(write_audio_range_to_wav(&audio, 0..3, &output_path).is_err());
         assert!(write_audio_range_to_wav_with_fades(&audio, 0..2, 3, 0, &output_path).is_err());
+        assert!(
+            write_audio_range_to_wav_with_processing(&audio, 0..2, 0, 0, Some(1.0), &output_path)
+                .is_err()
+        );
         assert!(!output_path.exists());
         fs::remove_dir_all(root).expect("fixture directory should be removed");
     }

@@ -20,7 +20,7 @@ use flp_rebuild::audio::{
 use flp_rebuild::media::{
     AudioWaveform, DecodedAudio, SamplePathResolver, WaveformPeak, decode_audio_file,
     decode_audio_preview, decode_audio_waveform, summarize_audio_waveform,
-    write_audio_range_to_wav_with_fades,
+    write_audio_range_to_wav_with_processing,
 };
 use flp_rebuild::midi::{MidiChannelMapping, MidiFile};
 use flp_rebuild::plugins::{PluginCandidate, PluginFormat, scan_installed_plugins};
@@ -2354,6 +2354,8 @@ struct SampleEditorState {
     selection_drag_anchor: Option<usize>,
     fade_in_seconds: f32,
     fade_out_seconds: f32,
+    normalize_export: bool,
+    normalization_target_dbfs: f32,
 }
 
 struct PendingBackupWrite {
@@ -9748,6 +9750,8 @@ impl DawUi {
                         selection_drag_anchor: None,
                         fade_in_seconds: 0.0,
                         fade_out_seconds: 0.0,
+                        normalize_export: false,
+                        normalization_target_dbfs: 0.0,
                     });
                 }
                 Err(error) => {
@@ -9909,10 +9913,18 @@ impl DawUi {
                         .text("Fade out (seconds)"),
                 );
                 ui.horizontal(|ui| {
+                    ui.checkbox(&mut editor.normalize_export, "Normalize peak");
+                    ui.add_enabled(
+                        editor.normalize_export,
+                        egui::Slider::new(&mut editor.normalization_target_dbfs, -24.0..=0.0)
+                            .text("Target (dBFS)"),
+                    );
+                });
+                ui.horizontal(|ui| {
                     if ui.button("Save selection as WAV…").clicked() {
                         save_selection = true;
                     }
-                    ui.small("Linear fades apply to the export; the source stays unchanged.");
+                    ui.small("Fades and normalization apply to the export; the source stays unchanged.");
                 });
             });
         if !open {
@@ -9971,11 +9983,14 @@ impl DawUi {
         let fade_out_frames = (f64::from(editor.fade_out_seconds.max(0.0)) * sample_rate)
             .round()
             .clamp(0.0, selected_frames as f64) as usize;
-        match write_audio_range_to_wav_with_fades(
+        match write_audio_range_to_wav_with_processing(
             &editor.audio,
             editor.selection_start..editor.selection_end,
             fade_in_frames,
             fade_out_frames,
+            editor
+                .normalize_export
+                .then_some(editor.normalization_target_dbfs),
             &output_path,
         ) {
             Ok(()) => {
