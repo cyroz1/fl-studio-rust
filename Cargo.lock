@@ -671,6 +671,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "clack-extensions"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "733d43b7ebd76a65931e8de2aa077200add4902514f4bda941c99326c14937dd"
+dependencies = [
+ "bitflags 2.13.2",
+ "clack-common",
+ "clack-host",
+ "clap-sys",
+]
+
+[[package]]
 name = "clack-host"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1318,6 +1330,7 @@ name = "flp-rebuild"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "clack-extensions",
  "clack-host",
  "cpal",
  "crossbeam-queue",

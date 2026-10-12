@@ -8,7 +8,10 @@ use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use clap_probe::{ClapInspectionResponse, ClapInspectionState};
+use clap_probe::{
+    ClapInspectionResponse, ClapInspectionState, ClapInstanceInspectionResponse,
+    ClapInstanceInspectionState,
+};
 use eframe::egui::{self, Align2, Color32, FontId, Id, PointerButton, Sense, Stroke, Vec2};
 use flp_rebuild::audio::{
     AudioAccess, AudioDeviceCatalog, AudioEngine, AudioSettings, MIXER_TRACK_METER_COUNT,
@@ -543,6 +546,20 @@ fn main() -> eframe::Result {
             std::process::exit(2);
         };
         std::process::exit(clap_probe::run_child(&path));
+    }
+    if args
+        .get(1)
+        .is_some_and(|argument| argument == std::ffi::OsStr::new(clap_probe::INSTANCE_PROBE_FLAG))
+    {
+        let Some(path) = args.get(2).map(PathBuf::from) else {
+            eprintln!("CLAP instance probe needs a bundle or library path and plug-in ID");
+            std::process::exit(2);
+        };
+        let Some(plugin_id) = args.get(3).and_then(|value| value.to_str()) else {
+            eprintln!("CLAP instance probe needs a UTF-8 plug-in ID");
+            std::process::exit(2);
+        };
+        std::process::exit(clap_probe::run_instance_child(&path, plugin_id));
     }
     let initial_project = args.get(1).map(PathBuf::from);
     let ui_scale = load_ui_scale();
@@ -2622,6 +2639,9 @@ struct DawUi {
     clap_inspection_sender: Sender<PathBuf>,
     clap_inspection_receiver: Receiver<ClapInspectionResponse>,
     clap_inspection_states: BTreeMap<PathBuf, ClapInspectionState>,
+    clap_instance_inspection_sender: Sender<(PathBuf, String)>,
+    clap_instance_inspection_receiver: Receiver<ClapInstanceInspectionResponse>,
+    clap_instance_inspection_states: BTreeMap<(PathBuf, String), ClapInstanceInspectionState>,
     vst3_host: Option<Vst3HostRuntime>,
     channel_vst3_instances: BTreeMap<u16, u64>,
     audio_catalog: AudioDeviceCatalog,
@@ -2940,6 +2960,8 @@ impl DawUi {
         let plugin_candidates = scan_installed_plugins().candidates;
         let (clap_inspection_sender, clap_inspection_receiver) =
             clap_probe::start_worker(creation.egui_ctx.clone());
+        let (clap_instance_inspection_sender, clap_instance_inspection_receiver) =
+            clap_probe::start_instance_worker(creation.egui_ctx.clone());
         let audio_catalog = enumerate_devices();
         let (midi_message_sender, midi_message_receiver) =
             mpsc::sync_channel(midi_input::MIDI_INPUT_QUEUE_CAPACITY);
@@ -3186,6 +3208,9 @@ impl DawUi {
             clap_inspection_sender,
             clap_inspection_receiver,
             clap_inspection_states: BTreeMap::new(),
+            clap_instance_inspection_sender,
+            clap_instance_inspection_receiver,
+            clap_instance_inspection_states: BTreeMap::new(),
             vst3_host: None,
             channel_vst3_instances: BTreeMap::new(),
             audio_catalog,
@@ -26009,6 +26034,7 @@ impl DawUi {
         let mut load_path = None;
         let mut restore_request = None;
         let mut inspect_clap_path = None;
+        let mut inspect_clap_instance = None;
         let mut open_id = None;
         let mut close_id = None;
         let mut parameter_edits = Vec::new();
@@ -26019,6 +26045,15 @@ impl DawUi {
                 Err(error) => ClapInspectionState::Failed(error),
             };
             self.clap_inspection_states.insert(path, state);
+        }
+        while let Ok((path, plugin_id, result)) = self.clap_instance_inspection_receiver.try_recv()
+        {
+            let state = match result {
+                Ok(info) => ClapInstanceInspectionState::Inspected(info),
+                Err(error) => ClapInstanceInspectionState::Failed(error),
+            };
+            self.clap_instance_inspection_states
+                .insert((path, plugin_id), state);
         }
 
         ui.horizontal(|ui| {
@@ -26255,7 +26290,7 @@ impl DawUi {
             ui.heading(format!("Detected CLAP plug-ins ({})", clap_candidates.len()));
             ui.label(
                 egui::RichText::new(
-                    "Inspect reads CLAP descriptors in a short-lived helper process. Audio hosting is not available yet.",
+                    "Descriptor scans and selected plug-in initialization run in helper processes. Audio hosting is not available yet.",
                 )
                 .color(MUTED),
             );
@@ -26298,6 +26333,35 @@ impl DawUi {
                                     ui.horizontal(|ui| {
                                         ui.strong(&descriptor.name);
                                         ui.small(format!("ID: {}", descriptor.id));
+                                        let instance_key =
+                                            (candidate.path.clone(), descriptor.id.clone());
+                                        let instance_inspection = self
+                                            .clap_instance_inspection_states
+                                            .get(&instance_key);
+                                        if matches!(
+                                            instance_inspection,
+                                            Some(ClapInstanceInspectionState::Inspecting)
+                                        ) {
+                                            ui.spinner();
+                                            ui.small("Loading in helper");
+                                        } else if ui
+                                            .button(if matches!(
+                                                instance_inspection,
+                                                Some(ClapInstanceInspectionState::Failed(_))
+                                            ) {
+                                                "Retry port inspection"
+                                            } else if matches!(
+                                                instance_inspection,
+                                                Some(ClapInstanceInspectionState::Inspected(_))
+                                            ) {
+                                                "Refresh ports & parameters"
+                                            } else {
+                                                "Inspect ports & parameters"
+                                            })
+                                            .clicked()
+                                        {
+                                            inspect_clap_instance = Some(instance_key);
+                                        }
                                     });
                                     let mut details = Vec::new();
                                     if let Some(vendor) = &descriptor.vendor {
@@ -26318,6 +26382,145 @@ impl DawUi {
                                             descriptor.features.join(", ")
                                         ));
                                     }
+                                    let instance_key =
+                                        (candidate.path.clone(), descriptor.id.clone());
+                                    match self.clap_instance_inspection_states.get(&instance_key) {
+                                        Some(ClapInstanceInspectionState::Inspected(info)) => {
+                                            ui.small(format!(
+                                                "Audio: {} input / {} output ports · Notes: {} input / {} output ports",
+                                                info.audio_input_count,
+                                                info.audio_output_count,
+                                                info.note_input_count,
+                                                info.note_output_count,
+                                            ));
+                                            ui.collapsing(
+                                                format!("Parameters ({})", info.parameter_count),
+                                                |ui| {
+                                                    for parameter in &info.parameters {
+                                                        let mut label = format!(
+                                                            "{} · {}",
+                                                            parameter.id, parameter.name
+                                                        );
+                                                        if !parameter.module.is_empty() {
+                                                            label.push_str(&format!(
+                                                                " · {}",
+                                                                parameter.module
+                                                            ));
+                                                        }
+                                                        label.push_str(&format!(
+                                                            " · {:.3} to {:.3} (default {:.3})",
+                                                            parameter.min_value,
+                                                            parameter.max_value,
+                                                            parameter.default_value,
+                                                        ));
+                                                        if let Some(value) = parameter.current_value {
+                                                            label.push_str(&format!(
+                                                                " · current {:.3}",
+                                                                value
+                                                            ));
+                                                        }
+                                                        ui.small(label);
+                                                    }
+                                                    if info.parameters.len()
+                                                        < info.parameter_count as usize
+                                                    {
+                                                        ui.small(format!(
+                                                            "Showing the first {} parameters.",
+                                                            info.parameters.len()
+                                                        ));
+                                                    }
+                                                },
+                                            );
+                                            ui.collapsing(
+                                                format!(
+                                                    "Audio ports ({} input, {} output)",
+                                                    info.audio_input_count,
+                                                    info.audio_output_count
+                                                ),
+                                                |ui| {
+                                                    for (direction, ports, count) in [
+                                                        (
+                                                            "Input",
+                                                            &info.audio_inputs,
+                                                            info.audio_input_count,
+                                                        ),
+                                                        (
+                                                            "Output",
+                                                            &info.audio_outputs,
+                                                            info.audio_output_count,
+                                                        ),
+                                                    ] {
+                                                        for port in ports {
+                                                            ui.small(format!(
+                                                                "{direction}: {} · {} channel(s){}{}",
+                                                                port.name,
+                                                                port.channel_count,
+                                                                port.port_type.as_ref().map_or(
+                                                                    String::new(),
+                                                                    |kind| format!(" · {kind}")
+                                                                ),
+                                                                if port.is_main {
+                                                                    " · main".to_owned()
+                                                                } else {
+                                                                    String::new()
+                                                                }
+                                                            ));
+                                                        }
+                                                        if ports.len() < count as usize {
+                                                            ui.small(format!(
+                                                                "Showing the first {} {} ports.",
+                                                                ports.len(),
+                                                                direction.to_lowercase(),
+                                                            ));
+                                                        }
+                                                    }
+                                                },
+                                            );
+                                            ui.collapsing(
+                                                format!(
+                                                    "Note ports ({} input, {} output)",
+                                                    info.note_input_count,
+                                                    info.note_output_count
+                                                ),
+                                                |ui| {
+                                                    for (direction, ports, count) in [
+                                                        (
+                                                            "Input",
+                                                            &info.note_inputs,
+                                                            info.note_input_count,
+                                                        ),
+                                                        (
+                                                            "Output",
+                                                            &info.note_outputs,
+                                                            info.note_output_count,
+                                                        ),
+                                                    ] {
+                                                        for port in ports {
+                                                            ui.small(format!(
+                                                                "{direction}: {} · dialects 0x{:x}{}",
+                                                                port.name,
+                                                                port.supported_dialects,
+                                                                port.preferred_dialect
+                                                                    .as_ref()
+                                                                    .map_or(String::new(), |dialect| format!(" · prefers {dialect}"))
+                                                            ));
+                                                        }
+                                                        if ports.len() < count as usize {
+                                                            ui.small(format!(
+                                                                "Showing the first {} {} ports.",
+                                                                ports.len(),
+                                                                direction.to_lowercase(),
+                                                            ));
+                                                        }
+                                                    }
+                                                },
+                                            );
+                                        }
+                                        Some(ClapInstanceInspectionState::Failed(error)) => {
+                                            ui.colored_label(ORANGE, error);
+                                        }
+                                        Some(ClapInstanceInspectionState::Inspecting) | None => {}
+                                    }
                                 }
                             }
                             Some(ClapInspectionState::Failed(error)) => {
@@ -26337,6 +26540,26 @@ impl DawUi {
                 self.clap_inspection_states.insert(
                     path,
                     ClapInspectionState::Failed("descriptor worker is unavailable".to_owned()),
+                );
+            } else {
+                ui.ctx().request_repaint();
+            }
+        }
+
+        if let Some((path, plugin_id)) = inspect_clap_instance {
+            let key = (path.clone(), plugin_id.clone());
+            self.clap_instance_inspection_states
+                .insert(key.clone(), ClapInstanceInspectionState::Inspecting);
+            if self
+                .clap_instance_inspection_sender
+                .send((path, plugin_id))
+                .is_err()
+            {
+                self.clap_instance_inspection_states.insert(
+                    key,
+                    ClapInstanceInspectionState::Failed(
+                        "instance probe worker is unavailable".to_owned(),
+                    ),
                 );
             } else {
                 ui.ctx().request_repaint();

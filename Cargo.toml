@@ -9,6 +9,7 @@ license = "MIT"
 arc-swap = "1.7.1"
 crossbeam-queue = "0.3.14"
 cpal = "0.18.2"
+clack-extensions = { version = "0.2.0", default-features = false, features = ["audio-ports", "clack-host", "note-ports", "params"] }
 clack-host = "0.2.0"
 eframe = { version = "0.36.2", default-features = false, features = ["accesskit", "default_fonts", "links", "wayland", "wgpu", "x11"] }
 flacenc = { version = "0.5.1", default-features = false }
