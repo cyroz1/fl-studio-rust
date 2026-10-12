@@ -1474,6 +1474,7 @@ enum PianoRollScale {
     MixolydianFlatSix,
     NaturalMinor,
     Locrian,
+    LocrianNaturalTwo,
     HarmonicMinor,
     MelodicMinor,
     Blues,
@@ -1486,7 +1487,7 @@ enum PianoRollScale {
 }
 
 impl PianoRollScale {
-    const ALL: [Self; 23] = [
+    const ALL: [Self; 24] = [
         Self::None,
         Self::Major,
         Self::HarmonicMajor,
@@ -1501,6 +1502,7 @@ impl PianoRollScale {
         Self::MixolydianFlatSix,
         Self::NaturalMinor,
         Self::Locrian,
+        Self::LocrianNaturalTwo,
         Self::HarmonicMinor,
         Self::MelodicMinor,
         Self::Blues,
@@ -1528,6 +1530,7 @@ impl PianoRollScale {
             Self::MixolydianFlatSix => "Mixolydian b6",
             Self::NaturalMinor => "Natural minor",
             Self::Locrian => "Locrian",
+            Self::LocrianNaturalTwo => "Locrian natural 2",
             Self::HarmonicMinor => "Harmonic minor",
             Self::MelodicMinor => "Melodic minor",
             Self::Blues => "Blues",
@@ -1563,6 +1566,7 @@ impl PianoRollScale {
             Self::MixolydianFlatSix => &[0, 2, 4, 5, 7, 8, 10],
             Self::NaturalMinor => &[0, 2, 3, 5, 7, 8, 10],
             Self::Locrian => &[0, 1, 3, 5, 6, 8, 10],
+            Self::LocrianNaturalTwo => &[0, 2, 3, 5, 6, 8, 10],
             Self::HarmonicMinor => &[0, 2, 3, 5, 7, 8, 11],
             Self::MelodicMinor => &[0, 2, 3, 5, 7, 9, 11],
             Self::Blues => &[0, 3, 5, 6, 7, 10],
@@ -1612,6 +1616,7 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
         PianoRollScale::MixolydianFlatSix,
         PianoRollScale::NaturalMinor,
         PianoRollScale::Locrian,
+        PianoRollScale::LocrianNaturalTwo,
         PianoRollScale::HarmonicMinor,
         PianoRollScale::MelodicMinor,
         PianoRollScale::Blues,
@@ -1686,6 +1691,7 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
                 PianoRollScale::Mixolydian => -5,
                 PianoRollScale::MixolydianFlatSix => -16,
                 PianoRollScale::Locrian => -6,
+                PianoRollScale::LocrianNaturalTwo => -17,
                 PianoRollScale::Blues => -7,
                 PianoRollScale::WholeTone => -8,
                 PianoRollScale::WholeHalfDiminished => -9,
@@ -33643,7 +33649,7 @@ mod tests {
 
     #[test]
     fn piano_roll_scales_use_documented_intervals_and_auto_detection() {
-        let cases: [(PianoRollScale, u8, [u16; 8], &'static [u8]); 10] = [
+        let cases: [(PianoRollScale, u8, [u16; 8], &'static [u8]); 11] = [
             (
                 PianoRollScale::Dorian,
                 2,
@@ -33673,6 +33679,12 @@ mod tests {
                 11,
                 [71, 72, 74, 76, 77, 79, 81, 83],
                 &[0, 1, 3, 5, 6, 8, 10],
+            ),
+            (
+                PianoRollScale::LocrianNaturalTwo,
+                0,
+                [60, 62, 63, 65, 66, 68, 70, 72],
+                &[0, 2, 3, 5, 6, 8, 10],
             ),
             (
                 PianoRollScale::WholeTone,
