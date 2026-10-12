@@ -467,6 +467,10 @@ mod tests {
             [
                 super::ScheduledMidiTickMessage {
                     tick: 96,
+                    bytes: vec![0xB2, 10, 64],
+                },
+                super::ScheduledMidiTickMessage {
+                    tick: 96,
                     bytes: vec![0x92, 64, 96],
                 },
                 super::ScheduledMidiTickMessage {
@@ -508,7 +512,8 @@ mod tests {
             .filter(|message| message.tick == 96)
             .collect::<Vec<_>>();
         assert_eq!(at_tick[0].bytes, [0x80, 60, 12]);
-        assert_eq!(at_tick[1].bytes, [0x90, 60, 80]);
+        assert_eq!(at_tick[1].bytes, [0xB0, 10, 64]);
+        assert_eq!(at_tick[2].bytes, [0x90, 60, 80]);
     }
 
     #[test]
@@ -547,7 +552,7 @@ mod tests {
                 .filter(|message| message.bytes[0] & 0xF0 == 0xB0)
                 .map(|message| message.bytes[1])
                 .collect::<Vec<_>>(),
-            [101, 100, 6, 38, 101, 100]
+            [101, 100, 6, 38, 101, 100, 10]
         );
         assert_eq!(messages.last().unwrap().tick, 144);
     }
