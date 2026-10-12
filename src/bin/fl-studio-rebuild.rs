@@ -1469,13 +1469,14 @@ enum PianoRollScale {
     NaturalMinor,
     Locrian,
     HarmonicMinor,
+    Blues,
     MajorPentatonic,
     MinorPentatonic,
     WholeTone,
 }
 
 impl PianoRollScale {
-    const ALL: [Self; 12] = [
+    const ALL: [Self; 13] = [
         Self::None,
         Self::Major,
         Self::Dorian,
@@ -1485,6 +1486,7 @@ impl PianoRollScale {
         Self::NaturalMinor,
         Self::Locrian,
         Self::HarmonicMinor,
+        Self::Blues,
         Self::MajorPentatonic,
         Self::MinorPentatonic,
         Self::WholeTone,
@@ -1501,6 +1503,7 @@ impl PianoRollScale {
             Self::NaturalMinor => "Natural minor",
             Self::Locrian => "Locrian",
             Self::HarmonicMinor => "Harmonic minor",
+            Self::Blues => "Blues",
             Self::MajorPentatonic => "Major pentatonic",
             Self::MinorPentatonic => "Minor pentatonic",
             Self::WholeTone => "Whole tone",
@@ -1525,6 +1528,7 @@ impl PianoRollScale {
             Self::NaturalMinor => &[0, 2, 3, 5, 7, 8, 10],
             Self::Locrian => &[0, 1, 3, 5, 6, 8, 10],
             Self::HarmonicMinor => &[0, 2, 3, 5, 7, 8, 11],
+            Self::Blues => &[0, 3, 5, 6, 7, 10],
             Self::MajorPentatonic => &[0, 2, 4, 7, 9],
             Self::MinorPentatonic => &[0, 3, 5, 7, 10],
             Self::WholeTone => &[0, 2, 4, 6, 8, 10],
@@ -1563,6 +1567,7 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
         PianoRollScale::NaturalMinor,
         PianoRollScale::Locrian,
         PianoRollScale::HarmonicMinor,
+        PianoRollScale::Blues,
         PianoRollScale::MajorPentatonic,
         PianoRollScale::MinorPentatonic,
         PianoRollScale::WholeTone,
@@ -1577,7 +1582,9 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
         {
             continue;
         }
-        if scale == PianoRollScale::WholeTone && distinct_pitch_classes < 6 {
+        if matches!(scale, PianoRollScale::Blues | PianoRollScale::WholeTone)
+            && distinct_pitch_classes < 6
+        {
             continue;
         }
         for root in 0..12u8 {
@@ -1615,7 +1622,8 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
                 PianoRollScale::Lydian => -4,
                 PianoRollScale::Mixolydian => -5,
                 PianoRollScale::Locrian => -6,
-                PianoRollScale::WholeTone => -7,
+                PianoRollScale::Blues => -7,
+                PianoRollScale::WholeTone => -8,
                 PianoRollScale::None => unreachable!("None is not a detection candidate"),
             };
             let candidate = DetectedPianoRollScale { root, scale };
@@ -33568,7 +33576,7 @@ mod tests {
 
     #[test]
     fn piano_roll_scales_use_documented_intervals_and_auto_detection() {
-        let cases: [(PianoRollScale, u8, [u16; 8], &'static [u8]); 6] = [
+        let cases: [(PianoRollScale, u8, [u16; 8], &'static [u8]); 7] = [
             (
                 PianoRollScale::Dorian,
                 2,
@@ -33604,6 +33612,12 @@ mod tests {
                 0,
                 [60, 62, 64, 66, 68, 70, 72, 74],
                 &[0, 2, 4, 6, 8, 10],
+            ),
+            (
+                PianoRollScale::Blues,
+                0,
+                [60, 63, 65, 66, 67, 70, 72, 75],
+                &[0, 3, 5, 6, 7, 10],
             ),
         ];
 
