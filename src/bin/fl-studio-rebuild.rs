@@ -1464,6 +1464,7 @@ enum PianoRollScale {
     Major,
     Dorian,
     Phrygian,
+    PhrygianDominant,
     Lydian,
     Mixolydian,
     NaturalMinor,
@@ -1479,11 +1480,12 @@ enum PianoRollScale {
 }
 
 impl PianoRollScale {
-    const ALL: [Self; 16] = [
+    const ALL: [Self; 17] = [
         Self::None,
         Self::Major,
         Self::Dorian,
         Self::Phrygian,
+        Self::PhrygianDominant,
         Self::Lydian,
         Self::Mixolydian,
         Self::NaturalMinor,
@@ -1504,6 +1506,7 @@ impl PianoRollScale {
             Self::Major => "Major",
             Self::Dorian => "Dorian",
             Self::Phrygian => "Phrygian",
+            Self::PhrygianDominant => "Phrygian dominant",
             Self::Lydian => "Lydian",
             Self::Mixolydian => "Mixolydian",
             Self::NaturalMinor => "Natural minor",
@@ -1532,6 +1535,7 @@ impl PianoRollScale {
             Self::Major => &[0, 2, 4, 5, 7, 9, 11],
             Self::Dorian => &[0, 2, 3, 5, 7, 9, 10],
             Self::Phrygian => &[0, 1, 3, 5, 7, 8, 10],
+            Self::PhrygianDominant => &[0, 1, 4, 5, 7, 8, 10],
             Self::Lydian => &[0, 2, 4, 6, 7, 9, 11],
             Self::Mixolydian => &[0, 2, 4, 5, 7, 9, 10],
             Self::NaturalMinor => &[0, 2, 3, 5, 7, 8, 10],
@@ -1574,6 +1578,7 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
         PianoRollScale::Major,
         PianoRollScale::Dorian,
         PianoRollScale::Phrygian,
+        PianoRollScale::PhrygianDominant,
         PianoRollScale::Lydian,
         PianoRollScale::Mixolydian,
         PianoRollScale::NaturalMinor,
@@ -1642,6 +1647,7 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
                 PianoRollScale::MinorPentatonic => -1,
                 PianoRollScale::Dorian => -2,
                 PianoRollScale::Phrygian => -3,
+                PianoRollScale::PhrygianDominant => -11,
                 PianoRollScale::Lydian => -4,
                 PianoRollScale::Mixolydian => -5,
                 PianoRollScale::Locrian => -6,

@@ -1125,6 +1125,7 @@ fn parse_scale_name(value: &str) -> Result<&'static [u8], String> {
         "major" => Ok(&[0, 2, 4, 5, 7, 9, 11]),
         "dorian" => Ok(&[0, 2, 3, 5, 7, 9, 10]),
         "phrygian" => Ok(&[0, 1, 3, 5, 7, 8, 10]),
+        "phrygian-dominant" => Ok(&[0, 1, 4, 5, 7, 8, 10]),
         "lydian" => Ok(&[0, 2, 4, 6, 7, 9, 11]),
         "mixolydian" => Ok(&[0, 2, 4, 5, 7, 9, 10]),
         "natural-minor" => Ok(&[0, 2, 3, 5, 7, 8, 10]),
@@ -1137,7 +1138,7 @@ fn parse_scale_name(value: &str) -> Result<&'static [u8], String> {
         "whole-tone" => Ok(&[0, 2, 4, 6, 8, 10]),
         "whole-half-diminished" => Ok(&[0, 2, 3, 5, 6, 8, 9, 11]),
         "half-whole-diminished" => Ok(&[0, 1, 3, 4, 6, 7, 9, 10]),
-        _ => Err("scale name must be major, dorian, phrygian, lydian, mixolydian, natural-minor, locrian, harmonic-minor, melodic-minor, blues, major-pentatonic, minor-pentatonic, whole-tone, whole-half-diminished, or half-whole-diminished".to_owned()),
+        _ => Err("scale name must be major, dorian, phrygian, phrygian-dominant, lydian, mixolydian, natural-minor, locrian, harmonic-minor, melodic-minor, blues, major-pentatonic, minor-pentatonic, whole-tone, whole-half-diminished, or half-whole-diminished".to_owned()),
     }
 }
 
