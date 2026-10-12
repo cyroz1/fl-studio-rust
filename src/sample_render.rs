@@ -717,8 +717,9 @@ fn take_mixer_insert_peaks(meters: &MixerTrackPeakMeters) -> Vec<MixerInsertPeak
 /// This early render path uses the project's tempo map, clip positions, observed audio source
 /// offsets, and decoded audio-channel volume/pan. Clips with default `-1` offsets use the full
 /// source file. The raw volume/pan mapping is provisional and has not been compared against
-/// native FL Studio output. Source pitch and sample playback rate remain unchanged, so tempo-sync
-/// and time-stretch modes, Pattern instruments, plug-ins, and Mixer effects are not rendered.
+/// native FL Studio output. Unstretched sources follow project Master pitch when their channel
+/// enables it. Tempo-sync and time-stretch modes, Pattern instruments, plug-ins, and Mixer effects
+/// are not rendered.
 pub fn render_audio_clips_to_wav(
     document: &FlpDocument,
     project_path: impl AsRef<Path>,
@@ -3066,6 +3067,7 @@ fn prepare_audio_clip_render(
     }
     let tempo_map = PlaylistTempoMap::for_arrangement(document, options.arrangement_id)?;
     let pan_law = project_pan_law(document);
+    let master_pitch_cents = document.metadata().master_pitch_cents();
     let arrangement = document
         .arrangements()
         .map_err(|error| error.to_string())?
@@ -3109,6 +3111,7 @@ fn prepare_audio_clip_render(
         PathBuf,
         f32,
         f32,
+        f64,
         Option<i8>,
         MixerSourceRoutePlan,
     )>::new();
@@ -3164,6 +3167,10 @@ fn prepare_audio_clip_render(
             resolved_path,
             gain,
             pan,
+            audio_clip_master_pitch_ratio(
+                channel.keyboard_main_pitch_enabled(),
+                master_pitch_cents,
+            ),
             mixer_track,
             mixer_route_plan,
         ));
@@ -3186,7 +3193,7 @@ fn prepare_audio_clip_render(
     )?;
     let mut decoded_by_path = HashMap::<PathBuf, DecodedAudio>::new();
     let mut cached_source_bytes = 0usize;
-    for (_, _, _, path, _, _, _, _) in &candidate_clips {
+    for (_, _, _, path, _, _, _, _, _) in &candidate_clips {
         check_cancelled(cancelled)?;
         if decoded_by_path.contains_key(path) {
             continue;
@@ -3207,8 +3214,17 @@ fn prepare_audio_clip_render(
 
     let mut clips = Vec::with_capacity(candidate_clips.len());
     let mut output_frames = timeline_frames;
-    for (clip_index, clip, channel_id, path, gain, pan, mixer_track, mixer_route_plan) in
-        &candidate_clips
+    for (
+        clip_index,
+        clip,
+        channel_id,
+        path,
+        gain,
+        pan,
+        pitch_ratio,
+        mixer_track,
+        mixer_route_plan,
+    ) in &candidate_clips
     {
         check_cancelled(cancelled)?;
         let audio = decoded_by_path
@@ -3236,6 +3252,7 @@ fn prepare_audio_clip_render(
             source_bounds.end - source_bounds.start,
             audio.sample_rate,
             options.sample_rate,
+            *pitch_ratio,
         )?;
         let timeline_clip_frames = tempo_map.frames_between_ticks(
             absolute_start_tick,
@@ -3254,6 +3271,7 @@ fn prepare_audio_clip_render(
             path: path.clone(),
             start_frame,
             source_bounds,
+            pitch_ratio: *pitch_ratio,
             duration_frames,
             gain: *gain,
             pan: *pan,
@@ -3703,7 +3721,7 @@ fn prepare_sampler_arrangement(
                     options.read_sample_root_note,
                 ),
                 fine_tune_cents: wave_metadata.fine_tune_cents.unwrap_or_default()
-                    + sampler_master_pitch_cents(
+                    + channel_master_pitch_cents(
                         channel.keyboard_main_pitch_enabled(),
                         document.metadata().master_pitch_cents(),
                     ),
@@ -3990,7 +4008,7 @@ fn prepare_sampler_pattern(
                     options.read_sample_root_note,
                 ),
                 fine_tune_cents: wave_metadata.fine_tune_cents.unwrap_or_default()
-                    + sampler_master_pitch_cents(
+                    + channel_master_pitch_cents(
                         channel.keyboard_main_pitch_enabled(),
                         document.metadata().master_pitch_cents(),
                     ),
@@ -4434,7 +4452,7 @@ fn sampler_wav_gain(gain_db: Option<i8>) -> f32 {
     gain_db.map_or(1.0, |gain_db| 10.0f32.powf(f32::from(gain_db) / 20.0))
 }
 
-fn sampler_master_pitch_cents(channel_enabled: bool, project_cents: Option<i16>) -> f64 {
+fn channel_master_pitch_cents(channel_enabled: bool, project_cents: Option<i16>) -> f64 {
     if channel_enabled {
         f64::from(
             project_cents
@@ -4444,6 +4462,10 @@ fn sampler_master_pitch_cents(channel_enabled: bool, project_cents: Option<i16>)
     } else {
         0.0
     }
+}
+
+fn audio_clip_master_pitch_ratio(channel_enabled: bool, project_cents: Option<i16>) -> f64 {
+    2.0f64.powf(channel_master_pitch_cents(channel_enabled, project_cents) / 1_200.0)
 }
 
 fn sampler_source_step(
@@ -4587,6 +4609,7 @@ struct PreparedClip {
     path: PathBuf,
     start_frame: u64,
     source_bounds: SampleBounds,
+    pitch_ratio: f64,
     duration_frames: u64,
     gain: f32,
     pan: f32,
@@ -5056,11 +5079,16 @@ fn source_duration_to_frames(
     source_frames: usize,
     source_rate: u32,
     output_rate: u32,
+    playback_rate_ratio: f64,
 ) -> Result<u64, String> {
     if source_rate == 0 || output_rate == 0 {
         return Err("audio sample rate must be greater than zero".to_owned());
     }
-    let duration = source_frames as f64 * f64::from(output_rate) / f64::from(source_rate);
+    if !playback_rate_ratio.is_finite() || playback_rate_ratio <= 0.0 {
+        return Err("audio playback rate must be finite and greater than zero".to_owned());
+    }
+    let duration = source_frames as f64 * f64::from(output_rate)
+        / (f64::from(source_rate) * playback_rate_ratio);
     if !duration.is_finite() || duration < 0.0 || duration > u64::MAX as f64 {
         return Err("audio clip duration is outside the renderable range".to_owned());
     }
@@ -5198,7 +5226,8 @@ fn mix_clip_window_into_stereo_with_quality_and_meter(
     }
     let (left_pan_gain, right_pan_gain) =
         channel_pan_gains(clip.pan, source.channels.len() == 1, clip.pan_law);
-    let source_frames_per_output = f64::from(source.sample_rate) / f64::from(output_rate);
+    let source_frames_per_output =
+        f64::from(source.sample_rate) / f64::from(output_rate) * clip.pitch_ratio;
     for output_frame in overlap_start..overlap_end {
         let output_offset = output_frame - clip.start_frame;
         if output_offset.is_multiple_of(16_384) {
@@ -6204,6 +6233,7 @@ mod tests {
                 path,
                 start_frame: 0,
                 source_bounds: SampleBounds { start: 0, end: 2 },
+                pitch_ratio: 1.0,
                 duration_frames: 2,
                 gain: 0.5,
                 pan: 0.0,
@@ -6411,6 +6441,7 @@ mod tests {
                 path: path.clone(),
                 start_frame,
                 source_bounds: SampleBounds { start: 0, end: 8 },
+                pitch_ratio: 1.0,
                 duration_frames: 8,
                 gain,
                 pan: 0.0,
@@ -6488,6 +6519,7 @@ mod tests {
             path: PathBuf::new(),
             start_frame: 0,
             source_bounds: SampleBounds { start: 0, end: 2 },
+            pitch_ratio: 1.0,
             duration_frames: 4,
             gain: 1.0,
             pan: 0.0,
@@ -6514,6 +6546,43 @@ mod tests {
     }
 
     #[test]
+    fn playlist_audio_clip_master_pitch_changes_playback_rate_and_duration() {
+        let pitch_up = audio_clip_master_pitch_ratio(true, Some(1_200));
+        let pitch_down = audio_clip_master_pitch_ratio(true, Some(-1_200));
+        assert_eq!(pitch_up, 2.0);
+        assert_eq!(pitch_down, 0.5);
+        assert_eq!(audio_clip_master_pitch_ratio(false, Some(1_200)), 1.0);
+        assert_eq!(audio_clip_master_pitch_ratio(true, None), 1.0);
+        assert_eq!(audio_clip_master_pitch_ratio(true, Some(1_201)), 1.0);
+        assert_eq!(source_duration_to_frames(4, 4, 4, pitch_up).unwrap(), 2);
+        assert_eq!(source_duration_to_frames(4, 4, 4, pitch_down).unwrap(), 8);
+
+        let source = DecodedAudio {
+            sample_rate: 4,
+            channels: vec![vec![0.0, 1.0, 2.0, 3.0]],
+        };
+        let clip = PreparedClip {
+            clip_index: 0,
+            channel_id: 0,
+            mixer_track: None,
+            path: PathBuf::new(),
+            start_frame: 0,
+            source_bounds: SampleBounds { start: 0, end: 4 },
+            pitch_ratio: pitch_up,
+            duration_frames: 2,
+            gain: 1.0,
+            pan: 0.0,
+            pan_law: PanLaw::Circular,
+            mixer_transform: MixerSourceRouteTransform::default(),
+            mixer_meter_transforms: Vec::new(),
+        };
+        let mut mix = vec![0.0; 4];
+        mix_clip_into_stereo(&mut mix, &source, &clip, 4, None).unwrap();
+        let center_gain = std::f32::consts::FRAC_1_SQRT_2;
+        assert_eq!(mix, vec![0.0, 0.0, 2.0 * center_gain, 2.0 * center_gain]);
+    }
+
+    #[test]
     fn mixer_insert_transform_swaps_and_reverses_audio_clip_frames() {
         let source = DecodedAudio {
             sample_rate: 4,
@@ -6526,6 +6595,7 @@ mod tests {
             path: PathBuf::new(),
             start_frame: 0,
             source_bounds: SampleBounds { start: 0, end: 1 },
+            pitch_ratio: 1.0,
             duration_frames: 1,
             gain: 1.0,
             pan: 0.0,
@@ -6559,6 +6629,7 @@ mod tests {
             path: path.clone(),
             start_frame: 2,
             source_bounds: SampleBounds { start: 0, end: 5 },
+            pitch_ratio: 1.0,
             duration_frames: 5,
             gain: 0.5,
             pan: 0.5,
@@ -6917,10 +6988,10 @@ mod tests {
 
     #[test]
     fn sampler_master_pitch_requires_the_channel_enable_flag() {
-        assert_eq!(sampler_master_pitch_cents(true, Some(375)), 375.0);
-        assert_eq!(sampler_master_pitch_cents(false, Some(375)), 0.0);
-        assert_eq!(sampler_master_pitch_cents(true, None), 0.0);
-        assert_eq!(sampler_master_pitch_cents(true, Some(1201)), 0.0);
+        assert_eq!(channel_master_pitch_cents(true, Some(375)), 375.0);
+        assert_eq!(channel_master_pitch_cents(false, Some(375)), 0.0);
+        assert_eq!(channel_master_pitch_cents(true, None), 0.0);
+        assert_eq!(channel_master_pitch_cents(true, Some(1201)), 0.0);
     }
 
     #[test]

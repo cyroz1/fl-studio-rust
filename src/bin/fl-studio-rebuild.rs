@@ -5182,7 +5182,7 @@ impl DawUi {
                 });
                 ui.label(
                     egui::RichText::new(
-                        "Affects Sampler playback when Enable main pitch is on. Audio Clip and VST3 pitch routing are incomplete.",
+                        "Affects supported Sampler playback and unstretched Playlist Audio Clips when Enable main pitch is on. Native instruments, stretched Audio Clips, and VST3 pitch routing remain incomplete.",
                     )
                     .color(MUTED),
                 );
