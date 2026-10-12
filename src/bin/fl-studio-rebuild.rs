@@ -1625,6 +1625,22 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
     best.map(|(_, detected)| detected)
 }
 
+fn snap_piano_roll_key_to_scale(
+    key: u16,
+    scale: PianoRollScale,
+    root: u8,
+    minimum_key: u16,
+    maximum_key: u16,
+) -> u16 {
+    let low = minimum_key.min(maximum_key);
+    let high = minimum_key.max(maximum_key);
+    let clamped_key = key.clamp(low, high);
+    (low..=high)
+        .filter(|candidate| scale.contains(*candidate, root))
+        .min_by_key(|candidate| (candidate.abs_diff(clamped_key), *candidate))
+        .unwrap_or(clamped_key)
+}
+
 fn detect_piano_roll_channel_scale(
     pattern: &Pattern,
     pattern_id: u16,
@@ -1941,6 +1957,7 @@ struct ActiveNoteDrag {
     start_pointer: egui::Pos2,
     targets: Vec<NoteDragTarget>,
     kind: NoteDragKind,
+    scale_snap: Option<DetectedPianoRollScale>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2586,6 +2603,7 @@ struct DawUi {
     piano_roll_scale: PianoRollScale,
     piano_roll_scale_root: u8,
     piano_roll_auto_scale_highlighting: bool,
+    piano_roll_snap_notes_to_scale: bool,
     piano_roll_ghost_channels: bool,
     piano_roll_hidden_ghost_channels: BTreeSet<u16>,
     piano_roll_editable_ghost_channels: bool,
@@ -3205,6 +3223,7 @@ impl DawUi {
             piano_roll_scale: PianoRollScale::Major,
             piano_roll_scale_root: 0,
             piano_roll_auto_scale_highlighting: false,
+            piano_roll_snap_notes_to_scale: false,
             piano_roll_ghost_channels: true,
             piano_roll_hidden_ghost_channels: BTreeSet::new(),
             piano_roll_editable_ghost_channels: false,
@@ -18066,6 +18085,14 @@ impl DawUi {
                     &mut self.piano_roll_auto_scale_highlighting,
                     "Automatic scale highlighting",
                 );
+                ui.add_enabled(
+                    self.piano_roll_scale != PianoRollScale::None
+                        || self.piano_roll_auto_scale_highlighting,
+                    egui::Checkbox::new(
+                        &mut self.piano_roll_snap_notes_to_scale,
+                        "Snap dragged notes to scale",
+                    ),
+                );
                 if self.piano_roll_auto_scale_highlighting {
                     if let Some(detected) = detected_scale_for_menu {
                         ui.small(format!(
@@ -22149,6 +22176,10 @@ impl DawUi {
                         } else {
                             NoteDragKind::Move
                         },
+                        scale_snap: self
+                            .piano_roll_snap_notes_to_scale
+                            .then_some(scale_highlight)
+                            .flatten(),
                     });
                     self.selected_note = Some((pattern.id, note.channel_id, *channel_index));
                     self.selected_note_channel = Some(note.channel_id);
@@ -22177,12 +22208,21 @@ impl DawUi {
                                         snap_ticks,
                                         0,
                                     )),
-                                    key: Some(
-                                        i32::from(target.start_key)
+                                    key: Some({
+                                        let moved_key = i32::from(target.start_key)
                                             .saturating_add(semitones)
                                             .clamp(i32::from(key_low), i32::from(key_high))
-                                            as u16,
-                                    ),
+                                            as u16;
+                                        drag.scale_snap.map_or(moved_key, |scale| {
+                                            snap_piano_roll_key_to_scale(
+                                                moved_key,
+                                                scale.scale,
+                                                scale.root,
+                                                key_low,
+                                                key_high,
+                                            )
+                                        })
+                                    }),
                                     ..PatternNoteEdit::default()
                                 },
                                 NoteDragKind::Resize => PatternNoteEdit {
@@ -33182,9 +33222,10 @@ mod tests {
         playlist_signature_at_tick, playlist_song_position_label, playlist_track_group_range,
         playlist_track_is_hidden, recolor_piano_roll_notes, recording_input_targets,
         sample_editor_selection_for_drag, serialize_midi_controller_templates,
-        serialize_window_layout_presets, snap_note_tick, toggle_piano_roll_note_group_selection,
-        touch_pan_zoom_scroll_offset, track_two_finger_tap, update_channel_rack_selection,
-        update_layer_child_selection, update_piano_roll_box_selection, zoom_to_fit,
+        serialize_window_layout_presets, snap_note_tick, snap_piano_roll_key_to_scale,
+        toggle_piano_roll_note_group_selection, touch_pan_zoom_scroll_offset, track_two_finger_tap,
+        update_channel_rack_selection, update_layer_child_selection,
+        update_piano_roll_box_selection, zoom_to_fit,
     };
 
     fn playlist_track_arrangement_fixture(clips: &[(u32, u32, u16)]) -> Arrangement {
@@ -33460,6 +33501,29 @@ mod tests {
                 Some(DetectedPianoRollScale { root, scale })
             );
         }
+    }
+
+    #[test]
+    fn piano_roll_scale_snap_chooses_the_nearest_in_range_note() {
+        assert_eq!(
+            snap_piano_roll_key_to_scale(61, PianoRollScale::Major, 0, 36, 83),
+            60,
+            "an equal-distance tie resolves downward",
+        );
+        assert_eq!(
+            snap_piano_roll_key_to_scale(63, PianoRollScale::Major, 0, 36, 83),
+            62,
+        );
+        assert_eq!(
+            snap_piano_roll_key_to_scale(61, PianoRollScale::Major, 0, 61, 70),
+            62,
+            "the result stays within the visible keyboard range",
+        );
+        assert_eq!(
+            snap_piano_roll_key_to_scale(61, PianoRollScale::None, 0, 36, 83),
+            61,
+            "None accepts every pitch",
+        );
     }
 
     #[test]
