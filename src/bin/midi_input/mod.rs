@@ -6,6 +6,7 @@ use std::sync::mpsc::{SyncSender, TrySendError};
 use std::time::{Duration, Instant};
 
 use flp_rebuild::PatternNote;
+use flp_rebuild::midi::midi_release_velocity_to_fl_note_release;
 use midir::{Ignore, MidiInput, MidiInputConnection as MidirInputConnection};
 
 use flp_rebuild::sample_render::PlaylistTempoMap;
@@ -584,15 +585,10 @@ impl MidiPatternRecorder {
             ..PatternNote::default()
         };
         if let Some(release_velocity) = release_velocity {
-            note.release = midi_release_velocity_to_pattern_release(release_velocity);
+            note.release = midi_release_velocity_to_fl_note_release(release_velocity);
         }
         note
     }
-}
-
-fn midi_release_velocity_to_pattern_release(velocity: u8) -> u8 {
-    let velocity = u16::from(velocity.min(127));
-    ((velocity * 128 + 63) / 127) as u8
 }
 
 fn quantize_recording_tick(tick: u32, snap_ticks: Option<u32>) -> u32 {
@@ -720,10 +716,10 @@ mod tests {
 
     #[test]
     fn midi_release_velocity_maps_to_fl_note_release_range() {
-        assert_eq!(midi_release_velocity_to_pattern_release(0), 0);
-        assert_eq!(midi_release_velocity_to_pattern_release(64), 65);
-        assert_eq!(midi_release_velocity_to_pattern_release(127), 128);
-        assert_eq!(midi_release_velocity_to_pattern_release(255), 128);
+        assert_eq!(midi_release_velocity_to_fl_note_release(0), 0);
+        assert_eq!(midi_release_velocity_to_fl_note_release(64), 65);
+        assert_eq!(midi_release_velocity_to_fl_note_release(127), 128);
+        assert_eq!(midi_release_velocity_to_fl_note_release(255), 128);
     }
 
     #[test]

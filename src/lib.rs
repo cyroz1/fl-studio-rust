@@ -1074,6 +1074,9 @@ pub struct PatternNote {
 /// FL Studio's observed flags word for ordinary score notes.
 pub const PATTERN_NOTE_DEFAULT_FLAGS: u16 = 0x4000;
 
+/// FL Studio's observed release value for a new score note.
+pub const PATTERN_NOTE_DEFAULT_RELEASE: u8 = 64;
+
 /// FL Studio score-note flag for slide notes.
 pub const PATTERN_NOTE_SLIDE_FLAG: u16 = 1 << 3;
 
@@ -2750,7 +2753,7 @@ impl Default for PatternNote {
             group: 0,
             fine_pitch: 120,
             reserved: 0,
-            release: 64,
+            release: PATTERN_NOTE_DEFAULT_RELEASE,
             midi_channel: 0,
             pan: 64,
             velocity: 100,
@@ -11011,6 +11014,10 @@ impl FlpDocument {
                 key: u16::from(midi_note.key()),
                 midi_channel: midi_note.channel(),
                 velocity: midi_note.velocity(),
+                release: midi_note.release_velocity().map_or(
+                    PATTERN_NOTE_DEFAULT_RELEASE,
+                    midi::midi_release_velocity_to_fl_note_release,
+                ),
                 ..PatternNote::default()
             });
         }
@@ -22371,12 +22378,14 @@ mod tests {
         );
         assert_eq!(notes[1].velocity, 100);
         assert_eq!(notes[1].midi_channel, 9);
+        assert_eq!(notes[1].release, 32);
         assert_eq!(
             (notes[2].position, notes[2].length, notes[2].key),
             (96, 48, 67)
         );
         assert_eq!(notes[2].velocity, 80);
         assert_eq!(notes[2].midi_channel, 0);
+        assert_eq!(notes[2].release, 0);
         assert_eq!(
             document.events().last().unwrap().wire_bytes(),
             &unknown_event

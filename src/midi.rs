@@ -1180,6 +1180,12 @@ impl MidiNote {
     }
 }
 
+/// Maps a MIDI release velocity (0–127) to FL Studio's note release range (0–128).
+pub fn midi_release_velocity_to_fl_note_release(velocity: u8) -> u8 {
+    let velocity = u16::from(velocity.min(127));
+    ((velocity * 128 + 63) / 127) as u8
+}
+
 impl MidiTempoEvent {
     pub fn tick(self) -> u64 {
         self.tick
