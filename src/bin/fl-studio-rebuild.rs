@@ -2385,6 +2385,7 @@ struct DawUi {
     playlist_mute_tool_active: bool,
     soloed_playlist_track_range: Option<(u32, u32)>,
     collapsed_playlist_groups: BTreeSet<(u16, u32)>,
+    hide_collapsed_playlist_groups: bool,
     active_playlist_clip_drag: Option<ActivePlaylistClipDrag>,
     selected_time_marker: Option<usize>,
     selected_pattern_time_signature: Option<usize>,
@@ -2755,6 +2756,7 @@ impl DawUi {
         let midi_recording_offset_ms = load_midi_recording_offset_ms();
         let piano_roll_nudge_notes_with_mouse_wheel =
             load_piano_roll_nudge_notes_with_mouse_wheel();
+        let hide_collapsed_playlist_groups = load_hide_collapsed_playlist_groups();
         let browser_path = initial_project
             .as_deref()
             .and_then(Path::parent)
@@ -2926,6 +2928,7 @@ impl DawUi {
             playlist_mute_tool_active: false,
             soloed_playlist_track_range: None,
             collapsed_playlist_groups: BTreeSet::new(),
+            hide_collapsed_playlist_groups,
             active_playlist_clip_drag: None,
             selected_time_marker: None,
             selected_pattern_time_signature: None,
@@ -6963,6 +6966,18 @@ impl DawUi {
                     }
                 }
                 ui.separator();
+                if self.view == MainView::Playlist
+                    && ui
+                        .checkbox(
+                            &mut self.hide_collapsed_playlist_groups,
+                            "Hide collapsed grouped tracks",
+                        )
+                        .changed()
+                    && let Err(error) =
+                        save_hide_collapsed_playlist_groups(self.hide_collapsed_playlist_groups)
+                {
+                    self.status = format!("Could not save Playlist view setting: {error}");
+                }
                 if ui
                     .button(if self.piano_roll_window_detached {
                         "Dock Piano roll"
@@ -10337,7 +10352,12 @@ impl DawUi {
                     .collect::<BTreeSet<_>>();
                 for row in 0..=last_track {
                     let track_id = u32::from(row) + 1;
-                    if playlist_track_is_hidden(track_id, &tracks, &collapsed_group_ids) {
+                    if playlist_track_is_hidden(
+                        track_id,
+                        &tracks,
+                        &collapsed_group_ids,
+                        self.hide_collapsed_playlist_groups,
+                    ) {
                         continue;
                     }
                     let track_state = tracks.iter().find(|track| track.id == track_id);
@@ -28210,6 +28230,31 @@ fn save_piano_roll_nudge_notes_with_mouse_wheel(enabled: bool) -> Result<(), Str
         .map_err(|error| format!("could not write {}: {error}", path.display()))
 }
 
+fn hide_collapsed_playlist_groups_settings_file() -> Option<PathBuf> {
+    browser_favorites_file()?
+        .parent()
+        .map(|directory| directory.join("hide-collapsed-playlist-groups.txt"))
+}
+
+fn load_hide_collapsed_playlist_groups() -> bool {
+    hide_collapsed_playlist_groups_settings_file()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|contents| contents.trim().parse::<bool>().ok())
+        .unwrap_or(true)
+}
+
+fn save_hide_collapsed_playlist_groups(enabled: bool) -> Result<(), String> {
+    let path = hide_collapsed_playlist_groups_settings_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the Playlist view settings path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(&path, format!("{enabled}\n"))
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
 fn browser_column_width_settings_file() -> Option<PathBuf> {
     browser_favorites_file()?
         .parent()
@@ -29996,11 +30041,13 @@ fn playlist_track_is_hidden(
     track_id: u32,
     tracks: &[PlaylistTrack],
     collapsed_group_ids: &BTreeSet<u32>,
+    hide_collapsed_groups: bool,
 ) -> bool {
-    tracks
-        .iter()
-        .find(|track| track.id == track_id)
-        .is_some_and(|track| track.grouped == Some(true))
+    hide_collapsed_groups
+        && tracks
+            .iter()
+            .find(|track| track.id == track_id)
+            .is_some_and(|track| track.grouped == Some(true))
         && playlist_track_group_range(track_id, tracks)
             .is_some_and(|(parent_id, _)| collapsed_group_ids.contains(&parent_id))
 }
@@ -31511,11 +31558,13 @@ mod tests {
         assert_eq!(playlist_group_parent_ids(&tracks), vec![1]);
 
         let collapsed = BTreeSet::from([1]);
-        assert!(!playlist_track_is_hidden(1, &tracks, &collapsed));
-        assert!(playlist_track_is_hidden(2, &tracks, &collapsed));
-        assert!(playlist_track_is_hidden(3, &tracks, &collapsed));
-        assert!(!playlist_track_is_hidden(4, &tracks, &collapsed));
-        assert!(!playlist_track_is_hidden(5, &tracks, &collapsed));
+        assert!(!playlist_track_is_hidden(1, &tracks, &collapsed, true));
+        assert!(playlist_track_is_hidden(2, &tracks, &collapsed, true));
+        assert!(playlist_track_is_hidden(3, &tracks, &collapsed, true));
+        assert!(!playlist_track_is_hidden(4, &tracks, &collapsed, true));
+        assert!(!playlist_track_is_hidden(5, &tracks, &collapsed, true));
+        assert!(!playlist_track_is_hidden(2, &tracks, &collapsed, false));
+        assert!(!playlist_track_is_hidden(3, &tracks, &collapsed, false));
     }
 
     #[test]
