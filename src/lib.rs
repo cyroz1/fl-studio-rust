@@ -5850,10 +5850,12 @@ impl FlpDocument {
         };
         if edit.start_offset.is_some_and(|value| !value.is_finite())
             || edit.end_offset.is_some_and(|value| !value.is_finite())
-            || edit.scale.is_some_and(|value| !value.is_finite())
+            || edit.scale.is_some_and(|value| {
+                !value.is_finite() || (clip.record_size == 60 && !(value as f32).is_finite())
+            })
         {
             return Err(FlpError::UnsupportedEdit(
-                "playlist clip offsets and scale must be finite numbers",
+                "playlist clip offsets and scale must fit finite stored numbers",
             ));
         }
         let record_start = clip
@@ -5873,7 +5875,7 @@ impl FlpDocument {
                 "this Playlist record version keeps clip flags, source offsets, and scale in opaque fields",
             ));
         }
-        if edit.scale.is_some() && record_size != 80 {
+        if edit.scale.is_some() && !matches!(record_size, 60 | 80) {
             return Err(FlpError::UnsupportedEdit(
                 "this playlist clip record has no established scale field",
             ));
@@ -5939,7 +5941,11 @@ impl FlpDocument {
             writes.push((record_start + 28, value.to_le_bytes().to_vec()));
         }
         if let Some(value) = edit.scale {
-            writes.push((record_start + 64, value.to_le_bytes().to_vec()));
+            if record_size == 60 {
+                writes.push((record_start + 52, (value as f32).to_le_bytes().to_vec()));
+            } else {
+                writes.push((record_start + 64, value.to_le_bytes().to_vec()));
+            }
         }
         for (payload_offset, bytes) in writes {
             write_event_payload_bytes(&mut self.events[event_index], payload_offset, &bytes)?;
@@ -13637,7 +13643,14 @@ fn decode_playlist_clip(
         60 => record[36..60].to_vec(),
         _ => Vec::new(),
     };
-    let scale = (record_size == 80).then(|| f64::from_le_bytes(record[64..72].try_into().unwrap()));
+    let scale = match record_size {
+        // FL 21–24 use a float32 scale candidate in the legacy tail. Offset 52
+        // is supported by the observed unit value in FL24 projects, but still
+        // needs a controlled native save with a non-default scale for proof.
+        60 => Some(f64::from(f32_at(52))),
+        80 => Some(f64::from_le_bytes(record[64..72].try_into().unwrap())),
+        _ => None,
+    };
     let trailing_bytes = if record_size == 80 {
         record[72..80].to_vec()
     } else {
@@ -16092,6 +16105,56 @@ mod tests {
                 .clips
                 .iter()
                 .all(|clip| clip.record_size == 80)
+        );
+    }
+
+    #[test]
+    fn legacy_playlist_scale_round_trips_through_its_float32_tail_field() {
+        let mut record = [0xA0u8; 60];
+        record[0..4].copy_from_slice(&120u32.to_le_bytes());
+        record[4..6].copy_from_slice(&0x5000u16.to_le_bytes());
+        record[6..8].copy_from_slice(&5u16.to_le_bytes());
+        record[8..12].copy_from_slice(&960u32.to_le_bytes());
+        record[12..14].copy_from_slice(&471u16.to_le_bytes());
+        record[14..16].copy_from_slice(&0u16.to_le_bytes());
+        record[52..56].copy_from_slice(&1.0f32.to_le_bytes());
+        let original_record = record;
+
+        let mut event_stream = Vec::new();
+        append_data_event(&mut event_stream, 0xC7, b"24.2.99.4720\0");
+        event_stream.extend_from_slice(&[0x63, 0, 0]);
+        append_data_event(&mut event_stream, 0xE9, &record);
+        let mut document =
+            FlpDocument::parse(&flp_fixture(&event_stream, &[], &[])).expect("project parses");
+
+        let arrangements = document.arrangements().expect("60-byte clips decode");
+        assert_eq!(arrangements[0].clips.len(), 1);
+        assert_eq!(arrangements[0].clips[0].record_size, 60);
+        assert_eq!(arrangements[0].clips[0].scale, Some(1.0));
+
+        document
+            .edit_playlist_clip(
+                0,
+                0,
+                PlaylistClipEdit {
+                    scale: Some(0.75),
+                    ..PlaylistClipEdit::default()
+                },
+            )
+            .expect("legacy scale field can be edited");
+
+        let playlist_payload = document
+            .events()
+            .iter()
+            .find(|event| event.opcode() == 0xE9)
+            .expect("Playlist event exists")
+            .payload();
+        let mut expected_record = original_record;
+        expected_record[52..56].copy_from_slice(&0.75f32.to_le_bytes());
+        assert_eq!(playlist_payload, expected_record);
+        assert_eq!(
+            document.arrangements().unwrap()[0].clips[0].scale,
+            Some(0.75)
         );
     }
 
