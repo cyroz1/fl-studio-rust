@@ -82,6 +82,8 @@ pub struct MidiExportNote {
     pub channel: u8,
     pub key: u8,
     pub velocity: u8,
+    /// MIDI Note Off velocity in the range 0–127.
+    pub release_velocity: u8,
     pub start_tick: u64,
     pub end_tick: u64,
     /// Fine pitch from equal temperament, expressed in cents from -1200 to +1200.
@@ -803,7 +805,11 @@ impl MidiFile {
                 events.push(TimedMidiBytes {
                     tick: assigned.end_tick,
                     order: 2,
-                    bytes: vec![0x80 | assigned.channel, note.key, 0],
+                    bytes: vec![
+                        0x80 | assigned.channel,
+                        note.key,
+                        note.release_velocity.min(127),
+                    ],
                 });
                 if assigned.fine_pitch_offset_cents != 0 {
                     events.push(TimedMidiBytes {
@@ -1186,6 +1192,12 @@ pub fn midi_release_velocity_to_fl_note_release(velocity: u8) -> u8 {
     ((velocity * 128 + 63) / 127) as u8
 }
 
+/// Maps FL Studio's note release range (0–128) to a MIDI Note Off velocity (0–127).
+pub fn fl_note_release_to_midi_velocity(release: u8) -> u8 {
+    let release = u16::from(release.min(128));
+    ((release * 127 + 64) / 128) as u8
+}
+
 impl MidiTempoEvent {
     pub fn tick(self) -> u64 {
         self.tick
@@ -1521,6 +1533,7 @@ fn export_note(note: &PatternNote, start_tick: u64, end_tick: u64) -> MidiExport
         channel: note.midi_channel,
         key: u8::try_from(note.key).unwrap_or(u8::MAX),
         velocity: note.velocity,
+        release_velocity: fl_note_release_to_midi_velocity(note.release),
         start_tick,
         end_tick,
         fine_pitch_offset_cents: note.fine_pitch_offset_cents(),
@@ -1852,6 +1865,15 @@ mod tests {
     }
 
     #[test]
+    fn fl_note_release_maps_to_midi_note_off_velocity() {
+        assert_eq!(super::fl_note_release_to_midi_velocity(0), 0);
+        assert_eq!(super::fl_note_release_to_midi_velocity(64), 64);
+        assert_eq!(super::fl_note_release_to_midi_velocity(65), 64);
+        assert_eq!(super::fl_note_release_to_midi_velocity(128), 127);
+        assert_eq!(super::fl_note_release_to_midi_velocity(255), 127);
+    }
+
+    #[test]
     fn rejects_overlong_delta_time_varints() {
         let input = midi_fixture(&[0x81, 0x80, 0x80, 0x80]);
 
@@ -1868,6 +1890,7 @@ mod tests {
             channel: 7,
             key: 60,
             velocity: 96,
+            release_velocity: 127,
             start_tick: 0,
             end_tick: 240,
             fine_pitch_offset_cents: 0,
@@ -1878,6 +1901,7 @@ mod tests {
             channel: 7,
             key: 36,
             velocity: 128,
+            release_velocity: 32,
             start_tick: 120,
             end_tick: 480,
             fine_pitch_offset_cents: 0,
@@ -1905,9 +1929,11 @@ mod tests {
         assert_eq!(piano_note.key(), 60);
         assert_eq!(piano_note.velocity(), 96);
         assert_eq!(piano_note.end_tick(), Some(240));
+        assert_eq!(piano_note.release_velocity(), Some(127));
         assert_eq!(bass_note.channel(), 1);
         assert_eq!(bass_note.velocity(), 127);
         assert_eq!(bass_note.end_tick(), Some(480));
+        assert_eq!(bass_note.release_velocity(), Some(32));
         assert!(midi.tracks()[0].events().iter().any(|event| {
             matches!(event.kind(), super::MidiEventKind::Meta { meta_type: 0x58, data } if data == &[3, 2, 24, 8])
         }));
@@ -1920,6 +1946,7 @@ mod tests {
             channel: 0,
             key: 64,
             velocity: 100,
+            release_velocity: 0,
             start_tick: u64::from(super::MAX_VLQ as u32) + 17,
             end_tick: u64::from(super::MAX_VLQ as u32) + 200,
             fine_pitch_offset_cents: 0,
@@ -1948,6 +1975,7 @@ mod tests {
             channel: 32,
             key: 60,
             velocity: 100,
+            release_velocity: 0,
             start_tick: 0,
             end_tick: 24,
             fine_pitch_offset_cents: 0,
@@ -1972,6 +2000,7 @@ mod tests {
             channel: 0,
             key: 60,
             velocity: 100,
+            release_velocity: 0,
             start_tick: 0,
             end_tick: 24,
             fine_pitch_offset_cents: 0,
@@ -1981,6 +2010,7 @@ mod tests {
             channel: 0,
             key: 36,
             velocity: 100,
+            release_velocity: 0,
             start_tick: 0,
             end_tick: 24,
             fine_pitch_offset_cents: 0,
@@ -2007,6 +2037,7 @@ mod tests {
             channel: 0,
             key: 60,
             velocity: 100,
+            release_velocity: 0,
             start_tick: 0,
             end_tick: 24,
             fine_pitch_offset_cents: 100,
@@ -2015,6 +2046,7 @@ mod tests {
             channel: 0,
             key: 64,
             velocity: 100,
+            release_velocity: 0,
             start_tick: 0,
             end_tick: 24,
             fine_pitch_offset_cents: 0,
@@ -2024,6 +2056,7 @@ mod tests {
             channel: 1,
             key: 48,
             velocity: 100,
+            release_velocity: 0,
             start_tick: 0,
             end_tick: 24,
             fine_pitch_offset_cents: 0,
@@ -2100,6 +2133,7 @@ mod tests {
             channel: 0,
             key: 60,
             velocity: 100,
+            release_velocity: 0,
             start_tick: 0,
             end_tick: 24,
             fine_pitch_offset_cents: 100,
@@ -2108,6 +2142,7 @@ mod tests {
             channel: 0,
             key: 64,
             velocity: 100,
+            release_velocity: 0,
             start_tick: 12,
             end_tick: 36,
             fine_pitch_offset_cents: 100,
@@ -2157,6 +2192,7 @@ mod tests {
             channel: 0,
             key: 60,
             velocity: 100,
+            release_velocity: 0,
             start_tick: 0,
             end_tick: 24,
             fine_pitch_offset_cents: 100,
@@ -2166,6 +2202,7 @@ mod tests {
             channel: 0,
             key: 64,
             velocity: 100,
+            release_velocity: 0,
             start_tick: 24,
             end_tick: 48,
             fine_pitch_offset_cents: 0,
@@ -2194,6 +2231,7 @@ mod tests {
                 channel: (index % 16) as u8,
                 key: 48 + index as u8,
                 velocity: 100,
+                release_velocity: 0,
                 start_tick: 0,
                 end_tick: 24,
                 fine_pitch_offset_cents: (index as i16 - 8) * 100,
@@ -2217,6 +2255,7 @@ mod tests {
             channel: 16,
             key: 128,
             velocity: 100,
+            release_velocity: 0,
             start_tick: 0,
             end_tick: 1,
             fine_pitch_offset_cents: 0,

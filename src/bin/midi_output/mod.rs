@@ -1,14 +1,10 @@
 use std::time::Duration;
 
 use flp_rebuild::Pattern;
+use flp_rebuild::midi::fl_note_release_to_midi_velocity;
 use midir::{MidiOutput, MidiOutputConnection as MidirOutputConnection};
 
 const MAX_PATTERN_PREVIEW_NOTES: usize = 100_000;
-
-fn fl_note_release_to_midi_velocity(release: u8) -> u8 {
-    let release = u16::from(release.min(128));
-    ((release * 127 + 64) / 128) as u8
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ScheduledMidiMessage {
@@ -204,19 +200,9 @@ mod tests {
     use flp_rebuild::{Pattern, PatternNote};
 
     use super::{
-        all_notes_off_message, fl_note_release_to_midi_velocity, midi_clock_pulse_count_at_tick,
-        midi_sixteenth_notes_from_tick, midi_song_position_pointer_message,
-        pattern_preview_messages,
+        all_notes_off_message, midi_clock_pulse_count_at_tick, midi_sixteenth_notes_from_tick,
+        midi_song_position_pointer_message, pattern_preview_messages,
     };
-
-    #[test]
-    fn fl_note_release_maps_to_midi_note_off_velocity() {
-        assert_eq!(fl_note_release_to_midi_velocity(0), 0);
-        assert_eq!(fl_note_release_to_midi_velocity(64), 64);
-        assert_eq!(fl_note_release_to_midi_velocity(65), 64);
-        assert_eq!(fl_note_release_to_midi_velocity(128), 127);
-        assert_eq!(fl_note_release_to_midi_velocity(255), 127);
-    }
 
     #[test]
     fn all_notes_off_uses_the_requested_midi_channel() {

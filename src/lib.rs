@@ -22398,6 +22398,7 @@ mod tests {
     #[test]
     fn exports_pattern_notes_with_project_ppq_and_stored_midi_channels() {
         let mut note = note_record(96, 3, 48, 60, 96);
+        note[18] = 128;
         note[19] = 9;
         note[20] = 0;
         let document = FlpDocument::parse(&pattern_fixture(&[note], &[]))
@@ -22430,6 +22431,7 @@ mod tests {
         assert_eq!(exported_note.channel(), 9);
         assert_eq!(exported_note.key(), 60);
         assert_eq!(exported_note.velocity(), 96);
+        assert_eq!(exported_note.release_velocity(), Some(127));
         assert_eq!(exported_note.start_tick(), 96);
         assert_eq!(exported_note.end_tick(), Some(144));
         assert!(!track.events().iter().any(|event| {
@@ -22440,7 +22442,8 @@ mod tests {
 
     #[test]
     fn exports_song_pattern_clips_with_repeats_and_clip_boundary_truncation() {
-        let note = note_record(0, 3, 48, 60, 100);
+        let mut note = note_record(0, 3, 48, 60, 100);
+        note[18] = 32;
         let mut event_stream = vec![0x40, 0, 0, 0x41, 7, 0, 0xD0, 24];
         event_stream.extend_from_slice(&note);
         event_stream.extend_from_slice(&[0x63, 0, 0]);
@@ -22470,6 +22473,7 @@ mod tests {
         assert_eq!(notes[1].end_tick(), Some(196));
         assert_eq!(notes[2].start_tick(), 196);
         assert_eq!(notes[2].end_tick(), Some(200));
+        assert!(notes.iter().all(|note| note.release_velocity() == Some(32)));
     }
 
     #[test]
