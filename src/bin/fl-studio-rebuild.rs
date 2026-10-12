@@ -2917,6 +2917,7 @@ struct MidiControllerTemplate {
     name: String,
     output_gain: Option<MidiControllerCcBinding>,
     play_pause: Option<MidiControllerCcBinding>,
+    built_in: bool,
 }
 
 fn midi_button_press_edge(value: u8, active: &mut bool) -> bool {
@@ -25592,11 +25593,20 @@ impl DawUi {
                 self.midi_play_pause_mapping.as_ref(),
                 &connection.device_id,
             ),
+            built_in: false,
         };
         if template.output_gain.is_none() && template.play_pause.is_none() {
             self.status =
                 "Learn an output gain or Play/Pause CC from this input before saving a template"
                     .to_owned();
+            return;
+        }
+        if self
+            .midi_controller_templates
+            .iter()
+            .any(|existing| existing.built_in && existing.name.eq_ignore_ascii_case(&name))
+        {
+            self.status = "That name is reserved for a built-in controller template".to_owned();
             return;
         }
         let index = if let Some(index) = self
@@ -25659,7 +25669,11 @@ impl DawUi {
     }
 
     fn delete_midi_controller_template(&mut self, index: usize) {
-        if index >= self.midi_controller_templates.len() {
+        let Some(template) = self.midi_controller_templates.get(index) else {
+            return;
+        };
+        if template.built_in {
+            self.status = "Built-in MIDI controller templates cannot be deleted".to_owned();
             return;
         }
         let removed = self.midi_controller_templates.remove(index);
@@ -26896,6 +26910,10 @@ impl DawUi {
         let mut apply_template_index = None;
         let mut delete_template_index = None;
         let mut save_template = false;
+        let selected_template_is_custom = self
+            .midi_controller_template_index
+            .and_then(|index| self.midi_controller_templates.get(index))
+            .is_some_and(|template| !template.built_in);
         ui.horizontal(|ui| {
             egui::ComboBox::from_id_salt("midi_controller_template")
                 .selected_text(selected_template_name)
@@ -26925,7 +26943,7 @@ impl DawUi {
             }
             if ui
                 .add_enabled(
-                    self.midi_controller_template_index.is_some(),
+                    selected_template_is_custom,
                     egui::Button::new("Delete template"),
                 )
                 .clicked()
@@ -26943,7 +26961,7 @@ impl DawUi {
                 save_template = ui.button("Save learned mappings as template").clicked();
             });
         });
-        ui.small("Templates save learned output-gain and Play/Pause CC assignments for reuse with another input.");
+        ui.small("General MIDI Ch. 1 maps CC 7 to output gain and CC 64 to Play/Pause. User templates save learned CC assignments for reuse with another input.");
         if let Some(index) = apply_template_index {
             self.apply_midi_controller_template(index);
         }
@@ -29908,10 +29926,34 @@ fn load_midi_play_pause_mapping() -> Option<MidiControlChangeMapping> {
 }
 
 fn load_midi_controller_templates() -> Vec<MidiControllerTemplate> {
-    midi_controller_templates_file()
+    let mut templates = midi_controller_templates_file()
         .and_then(|path| fs::read_to_string(path).ok())
         .map(|contents| parse_midi_controller_templates(&contents))
-        .unwrap_or_default()
+        .unwrap_or_default();
+    for built_in in built_in_midi_controller_templates() {
+        if !templates
+            .iter()
+            .any(|template| template.name.eq_ignore_ascii_case(&built_in.name))
+        {
+            templates.push(built_in);
+        }
+    }
+    templates
+}
+
+fn built_in_midi_controller_templates() -> Vec<MidiControllerTemplate> {
+    vec![MidiControllerTemplate {
+        name: "General MIDI Ch. 1 (CC 7 + CC 64)".to_owned(),
+        output_gain: Some(MidiControllerCcBinding {
+            channel: 0,
+            controller: 7,
+        }),
+        play_pause: Some(MidiControllerCcBinding {
+            channel: 0,
+            controller: 64,
+        }),
+        built_in: true,
+    }]
 }
 
 fn save_midi_output_gain_mapping(mapping: Option<&MidiControlChangeMapping>) -> Result<(), String> {
@@ -29985,6 +30027,9 @@ fn parse_midi_control_change_mapping(contents: &str) -> Option<MidiControlChange
 fn serialize_midi_controller_templates(templates: &[MidiControllerTemplate]) -> String {
     let mut contents = String::new();
     for template in templates {
+        if template.built_in {
+            continue;
+        }
         contents.push_str(&encode_midi_device_id(&template.name));
         contents.push('\t');
         contents.push_str(&serialize_midi_controller_binding(
@@ -30033,6 +30078,7 @@ fn parse_midi_controller_templates(contents: &str) -> Vec<MidiControllerTemplate
             name: name.to_owned(),
             output_gain,
             play_pause,
+            built_in: false,
         });
     }
     templates
@@ -33049,7 +33095,8 @@ mod tests {
         PianoRollGrid, PianoRollScale, PianoRollSnap, PlaylistClip, PlaylistClipDragKind,
         PlaylistTempoMap, PlaylistTrack, PluginCandidate, PluginFormat, TimeSelectionShift,
         TouchGesture, TouchTapTracker, TouchZoomConfig, WINDOW_LAYOUT_PRESETS_HEADER,
-        WindowLayoutPreset, audio_recording_start_tick_with_offset, candidate_matches_vst_identity,
+        WindowLayoutPreset, audio_recording_start_tick_with_offset,
+        built_in_midi_controller_templates, candidate_matches_vst_identity,
         candidate_mixer_controls, candidate_mixer_stereo_separation, detect_chord_name,
         detect_piano_roll_channel_scale, detect_piano_roll_scale, encode_midi_device_id,
         encode_midi_device_selections, first_available_playlist_track, midi_button_press_edge,
@@ -33707,6 +33754,7 @@ mod tests {
                 channel: 15,
                 controller: 80,
             }),
+            built_in: false,
         }];
         let encoded = serialize_midi_controller_templates(&templates);
         assert_eq!(parse_midi_controller_templates(&encoded), templates);
@@ -33724,6 +33772,29 @@ mod tests {
             midi_controller_binding_for_device(Some(&mapping), "another input"),
             None
         );
+    }
+
+    #[test]
+    fn built_in_general_midi_controller_template_uses_channel_one_ccs() {
+        let templates = built_in_midi_controller_templates();
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].name, "General MIDI Ch. 1 (CC 7 + CC 64)");
+        assert!(templates[0].built_in);
+        assert_eq!(
+            templates[0].output_gain,
+            Some(MidiControllerCcBinding {
+                channel: 0,
+                controller: 7,
+            })
+        );
+        assert_eq!(
+            templates[0].play_pause,
+            Some(MidiControllerCcBinding {
+                channel: 0,
+                controller: 64,
+            })
+        );
+        assert!(serialize_midi_controller_templates(&templates).is_empty());
     }
 
     #[test]
