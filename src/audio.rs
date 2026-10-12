@@ -1969,8 +1969,10 @@ fn wasapi_exclusive_output_worker(
         let render = client
             .get_audiorenderclient()
             .map_err(|error| error.to_string())?;
-        let mut phase = 0.0_f32;
-        let mut output_gain = settings.output_gain;
+        let mut render_state = WasapiRenderState {
+            phase: 0.0,
+            output_gain: settings.output_gain,
+        };
         let initial_frames = client
             .get_available_space_in_frames()
             .map_err(|error| error.to_string())? as usize;
@@ -1983,8 +1985,7 @@ fn wasapi_exclusive_output_worker(
             &source,
             &playback,
             &ring,
-            &mut phase,
-            &mut output_gain,
+            &mut render_state,
             &mut output,
         )?;
         render
@@ -2009,8 +2010,7 @@ fn wasapi_exclusive_output_worker(
                         &source,
                         &playback,
                         &ring,
-                        &mut phase,
-                        &mut output_gain,
+                        &mut render_state,
                         &mut output,
                     )?;
                     render
@@ -2325,14 +2325,19 @@ impl WasapiSampleSpec {
 }
 
 #[cfg(windows)]
+struct WasapiRenderState {
+    phase: f32,
+    output_gain: f32,
+}
+
+#[cfg(windows)]
 fn render_wasapi_buffer(
     frames: usize,
     format: &WasapiSampleSpec,
     source: &AtomicU8,
     playback: &PlaybackState,
     ring: &AudioRingBuffer,
-    phase: &mut f32,
-    output_gain: &mut f32,
+    render_state: &mut WasapiRenderState,
     output: &mut Vec<u8>,
 ) -> Result<(), String> {
     playback.apply_pending_commands(source);
@@ -2345,7 +2350,8 @@ fn render_wasapi_buffer(
     let browser_preview_samples = playback.browser_preview_samples.load();
     let mut output_peak = 0.0_f32;
     for frame in output.chunks_exact_mut(format.frame_bytes) {
-        *output_gain = smooth_output_gain(*output_gain, target_gain, gain_alpha);
+        render_state.output_gain =
+            smooth_output_gain(render_state.output_gain, target_gain, gain_alpha);
         let stereo = next_output_frame_with_browser_preview(AudioFrameInputs {
             source,
             ring,
@@ -2354,7 +2360,7 @@ fn render_wasapi_buffer(
             playback,
             browser_preview_samples: browser_preview_samples.as_deref().map(Vec::as_slice),
             sample_rate,
-            phase,
+            phase: &mut render_state.phase,
         });
         for (channel_index, channel) in frame.chunks_exact_mut(format.sample_bytes).enumerate() {
             let sample = sanitize_output_sample(
@@ -2362,7 +2368,7 @@ fn render_wasapi_buffer(
                     0 => stereo[0],
                     1 => stereo[1],
                     _ => 0.0,
-                } * *output_gain,
+                } * render_state.output_gain,
             );
             output_peak = output_peak.max(sample.abs());
             format.encode(sample, channel)?;
