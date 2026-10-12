@@ -971,15 +971,17 @@ struct TouchGesture {
     center: egui::Pos2,
     translation: Vec2,
     zoom_factor: f32,
+    rotation_delta: f32,
 }
 
 #[derive(Clone, Copy)]
 struct TouchZoomConfig {
-    origin_x: f32,
-    current: f32,
-    min: f32,
-    max: f32,
-    allowed: bool,
+    origin: Vec2,
+    current: Vec2,
+    min: Vec2,
+    max: Vec2,
+    horizontal: bool,
+    vertical: bool,
 }
 
 fn touch_pan_zoom_scroll_offset(
@@ -987,11 +989,14 @@ fn touch_pan_zoom_scroll_offset(
     current_offset: Vec2,
     gesture: TouchGesture,
     zoom_config: TouchZoomConfig,
-) -> Option<(f32, Vec2)> {
+) -> Option<(Vec2, Vec2)> {
     if !viewport.contains(gesture.center)
-        || !zoom_config.current.is_finite()
-        || zoom_config.current <= 0.0
-        || !zoom_config.origin_x.is_finite()
+        || !zoom_config.current.x.is_finite()
+        || zoom_config.current.x <= 0.0
+        || !zoom_config.current.y.is_finite()
+        || zoom_config.current.y <= 0.0
+        || !zoom_config.origin.x.is_finite()
+        || !zoom_config.origin.y.is_finite()
     {
         return None;
     }
@@ -1001,31 +1006,49 @@ fn touch_pan_zoom_scroll_offset(
     } else {
         1.0
     };
-    let new_zoom = if zoom_config.allowed {
-        (zoom_config.current * zoom_factor).clamp(zoom_config.min, zoom_config.max)
+    let rotation_delta = if gesture.rotation_delta.is_finite() {
+        gesture.rotation_delta
     } else {
-        zoom_config.current
+        0.0
     };
-    let viewport_x = gesture.center.x - viewport.left();
+    let rotation_zoom_factor = (rotation_delta * 0.4).exp().clamp(0.5, 2.0);
+    let new_zoom = Vec2::new(
+        if zoom_config.horizontal {
+            (zoom_config.current.x * zoom_factor).clamp(zoom_config.min.x, zoom_config.max.x)
+        } else {
+            zoom_config.current.x
+        },
+        if zoom_config.vertical {
+            (zoom_config.current.y * rotation_zoom_factor)
+                .clamp(zoom_config.min.y, zoom_config.max.y)
+        } else {
+            zoom_config.current.y
+        },
+    );
+    let viewport_position = gesture.center - viewport.left_top();
     let translation_x = if gesture.translation.x.is_finite() {
         gesture.translation.x
     } else {
         0.0
     };
-    let previous_viewport_x = viewport_x - translation_x;
-    let content_x = zoom_config.origin_x
-        + (current_offset.x + previous_viewport_x - zoom_config.origin_x)
-            * (new_zoom / zoom_config.current);
     let translation_y = if gesture.translation.y.is_finite() {
         gesture.translation.y
     } else {
         0.0
     };
+    let previous_viewport_position = viewport_position - Vec2::new(translation_x, translation_y);
+    let content_position = zoom_config.origin
+        + Vec2::new(
+            (current_offset.x + previous_viewport_position.x - zoom_config.origin.x)
+                * (new_zoom.x / zoom_config.current.x),
+            (current_offset.y + previous_viewport_position.y - zoom_config.origin.y)
+                * (new_zoom.y / zoom_config.current.y),
+        );
     let new_offset = Vec2::new(
-        (content_x - viewport_x).max(0.0),
-        (current_offset.y - translation_y).max(0.0),
+        (content_position.x - viewport_position.x).max(0.0),
+        (content_position.y - viewport_position.y).max(0.0),
     );
-    if (new_zoom - zoom_config.current).abs() <= f32::EPSILON
+    if (new_zoom - zoom_config.current).length_sq() <= f32::EPSILON
         && (new_offset - current_offset).length_sq() <= 0.01
     {
         None
@@ -2337,6 +2360,7 @@ struct DawUi {
     piano_roll_chord_stamp: PianoRollChordStamp,
     last_piano_roll_audition: Option<(u16, u16, usize)>,
     piano_roll_zoom: f32,
+    piano_roll_vertical_zoom: f32,
     piano_roll_touch_gesture_active: bool,
     piano_roll_window_detached: bool,
     mixer_window_detached: bool,
@@ -2485,6 +2509,7 @@ struct DawUi {
     automation_visible_beats: f64,
     last_plugin_action: Option<String>,
     timeline_zoom: f32,
+    playlist_track_zoom: f32,
     playlist_waveform_mode: PlaylistWaveformMode,
     plugin_candidates: Vec<PluginCandidate>,
     vst3_host: Option<Vst3HostRuntime>,
@@ -2885,6 +2910,7 @@ impl DawUi {
             piano_roll_chord_stamp: PianoRollChordStamp::Major,
             last_piano_roll_audition: None,
             piano_roll_zoom: 0.10,
+            piano_roll_vertical_zoom: 1.0,
             piano_roll_touch_gesture_active: false,
             piano_roll_window_detached: false,
             mixer_window_detached: false,
@@ -3033,6 +3059,7 @@ impl DawUi {
             automation_visible_beats: 16.0,
             last_plugin_action: None,
             timeline_zoom: 0.10,
+            playlist_track_zoom: 1.0,
             playlist_waveform_mode: PlaylistWaveformMode::Combined,
             plugin_candidates,
             vst3_host: None,
@@ -10315,16 +10342,19 @@ impl DawUi {
                     center: touch.center_pos,
                     translation: touch.translation_delta,
                     zoom_factor: touch.zoom_delta,
+                    rotation_delta: touch.rotation_delta,
                 },
                 TouchZoomConfig {
-                    origin_x: label_width,
-                    current: self.timeline_zoom,
-                    min: 0.04,
-                    max: 0.24,
-                    allowed: true,
+                    origin: Vec2::new(label_width, 34.0),
+                    current: Vec2::new(self.timeline_zoom, self.playlist_track_zoom),
+                    min: Vec2::new(0.04, 0.6),
+                    max: Vec2::new(0.24, 2.0),
+                    horizontal: true,
+                    vertical: true,
                 },
             ) {
-                self.timeline_zoom = zoom;
+                self.timeline_zoom = zoom.x;
+                self.playlist_track_zoom = zoom.y;
                 self.playlist_pending_scroll_offset = Some(offset);
             }
         }
@@ -10349,7 +10379,7 @@ impl DawUi {
             .max()
             .unwrap_or(15)
             .max(15);
-        let row_height = 27.0;
+        let row_height = 27.0 * self.playlist_track_zoom;
         let tick_scale = self.timeline_zoom;
         let playhead_tick = self.current_playhead_tick();
         let measure_tick_limit = (grid_width / tick_scale.max(0.001))
@@ -20382,7 +20412,7 @@ impl DawUi {
     ) {
         let key_low = 36u16;
         let key_high = 83u16;
-        let key_height = 13.0;
+        let key_height = 13.0 * self.piano_roll_vertical_zoom;
         let keyboard_width = 68.0;
         if self
             .piano_roll_time_selection_drag
@@ -20416,16 +20446,19 @@ impl DawUi {
                     center: touch.center_pos,
                     translation: touch.translation_delta,
                     zoom_factor: touch.zoom_delta,
+                    rotation_delta: touch.rotation_delta,
                 },
                 TouchZoomConfig {
-                    origin_x: 68.0,
-                    current: self.piano_roll_zoom,
-                    min: 0.06,
-                    max: 0.24,
-                    allowed: true,
+                    origin: Vec2::new(68.0, PIANO_ROLL_RULER_HEIGHT),
+                    current: Vec2::new(self.piano_roll_zoom, self.piano_roll_vertical_zoom),
+                    min: Vec2::new(0.06, 0.5),
+                    max: Vec2::new(0.24, 2.0),
+                    horizontal: true,
+                    vertical: true,
                 },
             ) {
-                self.piano_roll_zoom = zoom;
+                self.piano_roll_zoom = zoom.x;
+                self.piano_roll_vertical_zoom = zoom.y;
                 self.piano_roll_pending_scroll_offset = Some(offset);
             }
         }
@@ -30684,11 +30717,11 @@ mod tests {
     use super::{
         ActivePlaylistClipDrag, Arrangement, ChannelDisplayFilter, DetachedWindowKind,
         DetachedWindowPlacement, DetachedWindowPlacements, DetectedPianoRollScale, FlpDocument,
-        MainView, Pattern, PatternController, PatternNote, PianoRollChordStamp, PianoRollGrid,
-        PianoRollScale, PianoRollSnap, PlaylistClip, PlaylistClipDragKind, PlaylistTempoMap,
-        PlaylistTrack, PluginCandidate, PluginFormat, TimeSelectionShift, TouchGesture,
-        TouchZoomConfig, WINDOW_LAYOUT_PRESETS_HEADER, WindowLayoutPreset,
-        audio_recording_start_tick_with_offset, candidate_matches_vst_identity,
+        MainView, PIANO_ROLL_RULER_HEIGHT, Pattern, PatternController, PatternNote,
+        PianoRollChordStamp, PianoRollGrid, PianoRollScale, PianoRollSnap, PlaylistClip,
+        PlaylistClipDragKind, PlaylistTempoMap, PlaylistTrack, PluginCandidate, PluginFormat,
+        TimeSelectionShift, TouchGesture, TouchZoomConfig, WINDOW_LAYOUT_PRESETS_HEADER,
+        WindowLayoutPreset, audio_recording_start_tick_with_offset, candidate_matches_vst_identity,
         candidate_mixer_controls, candidate_mixer_stereo_separation, detect_chord_name,
         detect_piano_roll_channel_scale, detect_piano_roll_scale, encode_midi_device_selections,
         first_available_playlist_track, next_piano_roll_note_group, note_from_grid_position,
@@ -32320,18 +32353,21 @@ mod tests {
                 center: eframe::egui::pos2(300.0, 150.0),
                 translation: eframe::egui::Vec2::ZERO,
                 zoom_factor: 1.5,
+                rotation_delta: 0.0,
             },
             TouchZoomConfig {
-                origin_x: 68.0,
-                current: 0.10,
-                min: 0.04,
-                max: 0.24,
-                allowed: true,
+                origin: eframe::egui::vec2(68.0, PIANO_ROLL_RULER_HEIGHT),
+                current: eframe::egui::vec2(0.10, 1.0),
+                min: eframe::egui::vec2(0.04, 0.5),
+                max: eframe::egui::vec2(0.24, 2.0),
+                horizontal: true,
+                vertical: true,
             },
         )
         .expect("pinch should update the view");
 
-        assert!((zoom - 0.15).abs() < f32::EPSILON);
+        assert!((zoom.x - 0.15).abs() < f32::EPSILON);
+        assert_eq!(zoom.y, 1.0);
         assert!((offset.x - 366.0).abs() < 0.01);
         assert_eq!(offset.y, 30.0);
     }
@@ -32349,19 +32385,58 @@ mod tests {
                 center: eframe::egui::pos2(300.0, 150.0),
                 translation: eframe::egui::vec2(25.0, -12.0),
                 zoom_factor: 1.0,
+                rotation_delta: 0.0,
             },
             TouchZoomConfig {
-                origin_x: 178.0,
-                current: 0.10,
-                min: 0.04,
-                max: 0.24,
-                allowed: true,
+                origin: eframe::egui::vec2(178.0, 34.0),
+                current: eframe::egui::vec2(0.10, 1.0),
+                min: eframe::egui::vec2(0.04, 0.5),
+                max: eframe::egui::vec2(0.24, 2.0),
+                horizontal: true,
+                vertical: true,
             },
         )
         .expect("pan should update the view");
 
-        assert_eq!(zoom, 0.10);
+        assert_eq!(zoom, eframe::egui::vec2(0.10, 1.0));
         assert_eq!(offset, eframe::egui::vec2(0.0, 42.0));
+    }
+
+    #[test]
+    fn touch_rotation_vertically_zooms_around_the_touch_point() {
+        let viewport = eframe::egui::Rect::from_min_size(
+            eframe::egui::pos2(100.0, 50.0),
+            eframe::egui::vec2(400.0, 300.0),
+        );
+        let center = eframe::egui::pos2(300.0, 150.0);
+        let current_offset = eframe::egui::vec2(80.0, 50.0);
+        let current_scale = eframe::egui::vec2(0.10, 1.0);
+        let (new_scale, new_offset) = touch_pan_zoom_scroll_offset(
+            viewport,
+            current_offset,
+            TouchGesture {
+                center,
+                translation: eframe::egui::Vec2::ZERO,
+                zoom_factor: 1.0,
+                rotation_delta: std::f32::consts::FRAC_PI_2,
+            },
+            TouchZoomConfig {
+                origin: eframe::egui::vec2(68.0, PIANO_ROLL_RULER_HEIGHT),
+                current: current_scale,
+                min: eframe::egui::vec2(0.06, 0.5),
+                max: eframe::egui::vec2(0.24, 2.0),
+                horizontal: true,
+                vertical: true,
+            },
+        )
+        .expect("rotation should update vertical zoom");
+        let viewport_y = center.y - viewport.top();
+        let origin_y = PIANO_ROLL_RULER_HEIGHT;
+        let previous_pitch_at_center = (current_offset.y + viewport_y - origin_y) / current_scale.y;
+        let next_pitch_at_center = (new_offset.y + viewport_y - origin_y) / new_scale.y;
+
+        assert!(new_scale.y > 1.7 && new_scale.y < 1.9);
+        assert!((previous_pitch_at_center - next_pitch_at_center).abs() < 0.01);
     }
 
     #[test]
@@ -32379,13 +32454,15 @@ mod tests {
                     center: eframe::egui::pos2(50.0, 150.0),
                     translation: eframe::egui::vec2(10.0, 10.0),
                     zoom_factor: 1.5,
+                    rotation_delta: 0.0,
                 },
                 TouchZoomConfig {
-                    origin_x: 68.0,
-                    current: 0.10,
-                    min: 0.04,
-                    max: 0.24,
-                    allowed: true,
+                    origin: eframe::egui::vec2(68.0, PIANO_ROLL_RULER_HEIGHT),
+                    current: eframe::egui::vec2(0.10, 1.0),
+                    min: eframe::egui::vec2(0.04, 0.5),
+                    max: eframe::egui::vec2(0.24, 2.0),
+                    horizontal: true,
+                    vertical: true,
                 },
             )
             .is_none()
