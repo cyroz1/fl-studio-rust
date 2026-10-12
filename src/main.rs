@@ -1131,6 +1131,7 @@ fn parse_scale_name(value: &str) -> Result<&'static [u8], String> {
         "phrygian" => Ok(&[0, 1, 3, 5, 7, 8, 10]),
         "phrygian-dominant" => Ok(&[0, 1, 4, 5, 7, 8, 10]),
         "lydian" => Ok(&[0, 2, 4, 6, 7, 9, 11]),
+        "lydian-sharp-2" => Ok(&[0, 3, 4, 6, 7, 9, 11]),
         "lydian-augmented" => Ok(&[0, 2, 4, 6, 8, 9, 11]),
         "lydian-dominant" => Ok(&[0, 2, 4, 6, 7, 9, 10]),
         "mixolydian" => Ok(&[0, 2, 4, 5, 7, 9, 10]),
@@ -1148,7 +1149,7 @@ fn parse_scale_name(value: &str) -> Result<&'static [u8], String> {
         "whole-half-diminished" => Ok(&[0, 2, 3, 5, 6, 8, 9, 11]),
         "half-whole-diminished" => Ok(&[0, 1, 3, 4, 6, 7, 9, 10]),
         "altered" => Ok(&[0, 1, 3, 4, 6, 8, 10]),
-        _ => Err("scale name must be major, harmonic-major, ionian-sharp-5, dorian, dorian-b2, dorian-sharp-4, phrygian, phrygian-dominant, lydian, lydian-augmented, lydian-dominant, mixolydian, mixolydian-b6, natural-minor, locrian, locrian-natural-2, locrian-natural-6, harmonic-minor, melodic-minor, blues, major-pentatonic, minor-pentatonic, whole-tone, whole-half-diminished, half-whole-diminished, or altered".to_owned()),
+        _ => Err("scale name must be major, harmonic-major, ionian-sharp-5, dorian, dorian-b2, dorian-sharp-4, phrygian, phrygian-dominant, lydian, lydian-sharp-2, lydian-augmented, lydian-dominant, mixolydian, mixolydian-b6, natural-minor, locrian, locrian-natural-2, locrian-natural-6, harmonic-minor, melodic-minor, blues, major-pentatonic, minor-pentatonic, whole-tone, whole-half-diminished, half-whole-diminished, or altered".to_owned()),
     }
 }
 
@@ -3852,6 +3853,10 @@ mod tests {
             Ok(&[0, 1, 3, 5, 7, 8, 10][..])
         );
         assert_eq!(parse_scale_name("lydian"), Ok(&[0, 2, 4, 6, 7, 9, 11][..]));
+        assert_eq!(
+            parse_scale_name("lydian-sharp-2"),
+            Ok(&[0, 3, 4, 6, 7, 9, 11][..])
+        );
         assert_eq!(
             parse_scale_name("mixolydian"),
             Ok(&[0, 2, 4, 5, 7, 9, 10][..])
