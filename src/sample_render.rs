@@ -6806,13 +6806,12 @@ mod tests {
 
         let right_half = channel_pan_gains(0.5, true, PanLaw::Circular);
         let left_half = channel_pan_gains(-0.5, true, PanLaw::Circular);
-        for frame in output[..8].chunks_exact(2) {
-            assert!((frame[0] - right_half.0).abs() < 1.0e-6);
-            assert!((frame[1] - right_half.1).abs() < 1.0e-6);
-        }
-        for frame in output[8..].chunks_exact(2) {
-            assert!((frame[0] - left_half.0).abs() < 1.0e-6);
-            assert!((frame[1] - left_half.1).abs() < 1.0e-6);
+        for (first_frame, expected) in [(0, right_half), (4, left_half)] {
+            for frame_index in first_frame..first_frame + 4 {
+                let sample_index = frame_index * 2;
+                assert!((output[sample_index] - expected.0).abs() < 1.0e-6);
+                assert!((output[sample_index + 1] - expected.1).abs() < 1.0e-6);
+            }
         }
     }
 
