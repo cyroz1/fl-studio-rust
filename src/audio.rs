@@ -20,6 +20,7 @@ const AUDIO_SOURCE_INPUT_MONITOR: u8 = 2;
 const AUDIO_SOURCE_PROJECT: u8 = 3;
 const AUDIO_SOURCE_STREAM: u8 = 4;
 const AUDIO_RING_CAPACITY: usize = 65_536;
+const INPUT_MONITOR_RING_CAPACITY: usize = AUDIO_RING_CAPACITY * 2;
 const INPUT_RECORDING_BUFFER_FRAMES: usize = 65_536;
 const AUDIO_ERROR_HISTORY_LIMIT: usize = 16;
 const AUDIO_COMMAND_QUEUE_CAPACITY: usize = 128;
@@ -1051,7 +1052,7 @@ impl AudioEngine {
 
     fn start_shared(settings: &AudioSettings) -> Result<Self, String> {
         let host = cpal::default_host();
-        let ring = Arc::new(AudioRingBuffer::new(AUDIO_RING_CAPACITY));
+        let ring = Arc::new(AudioRingBuffer::new(INPUT_MONITOR_RING_CAPACITY));
         let source = Arc::new(AtomicU8::new(AUDIO_SOURCE_SILENT));
         let playback = Arc::new(PlaybackState::new());
         let input_peak = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
@@ -1132,7 +1133,7 @@ impl AudioEngine {
         use std::sync::mpsc;
         use std::thread;
 
-        let ring = Arc::new(AudioRingBuffer::new(AUDIO_RING_CAPACITY));
+        let ring = Arc::new(AudioRingBuffer::new(INPUT_MONITOR_RING_CAPACITY));
         let source = Arc::new(AtomicU8::new(AUDIO_SOURCE_SILENT));
         let playback = Arc::new(PlaybackState::new());
         let input_peak = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
@@ -1598,11 +1599,9 @@ where
                     if frame.is_empty() {
                         continue;
                     }
-                    let mut mono = 0.0_f32;
                     let mut stereo = [0.0_f32; 2];
                     for (channel, sample) in frame.iter().enumerate() {
                         let value = f32::from_sample(*sample).clamp(-1.0, 1.0);
-                        mono += value;
                         max_peak = max_peak.max(value.abs());
                         if channel < stereo.len() {
                             stereo[channel] = value;
@@ -1612,7 +1611,7 @@ where
                         stereo[1] = stereo[0];
                     }
                     if source.load(Ordering::Acquire) == AUDIO_SOURCE_INPUT_MONITOR {
-                        ring.push(mono / frame.len() as f32);
+                        ring.push_stereo_frame(stereo[0], stereo[1]);
                     }
                     if let Some(recording) = recording_callback.as_ref() {
                         recording.push_frame(stereo[0], stereo[1]);
@@ -1642,10 +1641,7 @@ fn next_output_frame(
             *phase = next_phase;
             [value, value]
         }
-        AUDIO_SOURCE_INPUT_MONITOR => {
-            let value = ring.pop().unwrap_or(0.0);
-            [value, value]
-        }
+        AUDIO_SOURCE_INPUT_MONITOR => ring.pop_stereo_frame().unwrap_or([0.0, 0.0]),
         AUDIO_SOURCE_PROJECT => {
             if !playback.active.load(Ordering::Acquire) {
                 return [0.0, 0.0];
@@ -1776,19 +1772,6 @@ impl AudioRingBuffer {
         }
     }
 
-    fn push(&self, sample: f32) -> bool {
-        let write = self.write_index.load(Ordering::Relaxed);
-        let read = self.read_index.load(Ordering::Acquire);
-        if write.wrapping_sub(read) >= self.samples.len() as u64 {
-            return false;
-        }
-        self.samples[write as usize % self.samples.len()]
-            .store(sample.to_bits(), Ordering::Relaxed);
-        self.write_index
-            .store(write.wrapping_add(1), Ordering::Release);
-        true
-    }
-
     fn push_stereo_frame(&self, left: f32, right: f32) -> bool {
         let write = self.write_index.load(Ordering::Relaxed);
         let read = self.read_index.load(Ordering::Acquire);
@@ -1823,20 +1806,6 @@ impl AudioRingBuffer {
         let write = self.write_index.load(Ordering::Acquire);
         let read = self.read_index.load(Ordering::Acquire);
         (write.wrapping_sub(read) / 2).min(usize::MAX as u64) as usize
-    }
-
-    fn pop(&self) -> Option<f32> {
-        let read = self.read_index.load(Ordering::Relaxed);
-        let write = self.write_index.load(Ordering::Acquire);
-        if read == write {
-            return None;
-        }
-        let sample = f32::from_bits(
-            self.samples[read as usize % self.samples.len()].load(Ordering::Relaxed),
-        );
-        self.read_index
-            .store(read.wrapping_add(1), Ordering::Release);
-        Some(sample)
     }
 }
 
@@ -2052,14 +2021,12 @@ fn wasapi_exclusive_input_worker(
                         .as_deref()
                         .and_then(InputRecordingState::begin_callback);
                     for frame in bytes[..active_bytes].chunks_exact(format_spec.frame_bytes) {
-                        let mut mono = 0.0_f32;
                         let mut stereo = [0.0_f32; 2];
                         for (channel, sample_bytes) in
                             frame.chunks_exact(format_spec.sample_bytes).enumerate()
                         {
                             let sample = format_spec.decode(sample_bytes)?;
                             max_peak = max_peak.max(sample.abs());
-                            mono += sample;
                             if channel < stereo.len() {
                                 stereo[channel] = sample;
                             }
@@ -2068,7 +2035,7 @@ fn wasapi_exclusive_input_worker(
                             stereo[1] = stereo[0];
                         }
                         if source.load(Ordering::Acquire) == AUDIO_SOURCE_INPUT_MONITOR {
-                            ring.push((mono / format_spec.channels as f32).clamp(-1.0, 1.0));
+                            ring.push_stereo_frame(stereo[0], stereo[1]);
                         }
                         if let Some(recording) = recording_callback.as_ref() {
                             recording.push_frame(stereo[0], stereo[1]);
@@ -2517,14 +2484,20 @@ mod tests {
     }
 
     #[test]
-    fn ring_buffer_preserves_capture_order_and_reports_overflow() {
-        let ring = AudioRingBuffer::new(2);
-        assert!(ring.push(-0.5));
-        assert!(ring.push(0.25));
-        assert!(!ring.push(0.75));
-        assert_eq!(ring.pop(), Some(-0.5));
-        assert_eq!(ring.pop(), Some(0.25));
-        assert_eq!(ring.pop(), None);
+    fn input_monitor_outputs_captured_stereo_channels() {
+        let ring = AudioRingBuffer::new(4);
+        assert!(ring.push_stereo_frame(0.25, -0.5));
+        let source = AtomicU8::new(AUDIO_SOURCE_INPUT_MONITOR);
+        let playback = PlaybackState::new();
+        let mut phase = 0.0;
+        assert_eq!(
+            next_output_frame(&source, &ring, None, None, &playback, 48_000.0, &mut phase,),
+            [0.25, -0.5]
+        );
+        assert_eq!(
+            next_output_frame(&source, &ring, None, None, &playback, 48_000.0, &mut phase,),
+            [0.0, 0.0]
+        );
     }
 
     #[test]
