@@ -1135,7 +1135,9 @@ fn parse_scale_name(value: &str) -> Result<&'static [u8], String> {
         "major-pentatonic" => Ok(&[0, 2, 4, 7, 9]),
         "minor-pentatonic" => Ok(&[0, 3, 5, 7, 10]),
         "whole-tone" => Ok(&[0, 2, 4, 6, 8, 10]),
-        _ => Err("scale name must be major, dorian, phrygian, lydian, mixolydian, natural-minor, locrian, harmonic-minor, melodic-minor, blues, major-pentatonic, minor-pentatonic, or whole-tone".to_owned()),
+        "whole-half-diminished" => Ok(&[0, 2, 3, 5, 6, 8, 9, 11]),
+        "half-whole-diminished" => Ok(&[0, 1, 3, 4, 6, 7, 9, 10]),
+        _ => Err("scale name must be major, dorian, phrygian, lydian, mixolydian, natural-minor, locrian, harmonic-minor, melodic-minor, blues, major-pentatonic, minor-pentatonic, whole-tone, whole-half-diminished, or half-whole-diminished".to_owned()),
     }
 }
 
@@ -3842,6 +3844,14 @@ mod tests {
         );
         assert_eq!(parse_scale_name("blues"), Ok(&[0, 3, 5, 6, 7, 10][..]));
         assert_eq!(parse_scale_name("whole-tone"), Ok(&[0, 2, 4, 6, 8, 10][..]));
+        assert_eq!(
+            parse_scale_name("whole-half-diminished"),
+            Ok(&[0, 2, 3, 5, 6, 8, 9, 11][..])
+        );
+        assert_eq!(
+            parse_scale_name("half-whole-diminished"),
+            Ok(&[0, 1, 3, 4, 6, 7, 9, 10][..])
+        );
         assert!(parse_scale_name("unknown").is_err());
     }
 }

@@ -1474,10 +1474,12 @@ enum PianoRollScale {
     MajorPentatonic,
     MinorPentatonic,
     WholeTone,
+    WholeHalfDiminished,
+    HalfWholeDiminished,
 }
 
 impl PianoRollScale {
-    const ALL: [Self; 14] = [
+    const ALL: [Self; 16] = [
         Self::None,
         Self::Major,
         Self::Dorian,
@@ -1492,6 +1494,8 @@ impl PianoRollScale {
         Self::MajorPentatonic,
         Self::MinorPentatonic,
         Self::WholeTone,
+        Self::WholeHalfDiminished,
+        Self::HalfWholeDiminished,
     ];
 
     fn label(self) -> &'static str {
@@ -1510,6 +1514,8 @@ impl PianoRollScale {
             Self::MajorPentatonic => "Major pentatonic",
             Self::MinorPentatonic => "Minor pentatonic",
             Self::WholeTone => "Whole tone",
+            Self::WholeHalfDiminished => "Whole-half diminished",
+            Self::HalfWholeDiminished => "Half-whole diminished",
         }
     }
 
@@ -1536,6 +1542,8 @@ impl PianoRollScale {
             Self::MajorPentatonic => &[0, 2, 4, 7, 9],
             Self::MinorPentatonic => &[0, 3, 5, 7, 10],
             Self::WholeTone => &[0, 2, 4, 6, 8, 10],
+            Self::WholeHalfDiminished => &[0, 2, 3, 5, 6, 8, 9, 11],
+            Self::HalfWholeDiminished => &[0, 1, 3, 4, 6, 7, 9, 10],
         }
     }
 }
@@ -1576,6 +1584,8 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
         PianoRollScale::MajorPentatonic,
         PianoRollScale::MinorPentatonic,
         PianoRollScale::WholeTone,
+        PianoRollScale::WholeHalfDiminished,
+        PianoRollScale::HalfWholeDiminished,
     ];
     let mut best: Option<((usize, usize, usize, i8), DetectedPianoRollScale)> = None;
 
@@ -1589,6 +1599,13 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
         }
         if matches!(scale, PianoRollScale::Blues | PianoRollScale::WholeTone)
             && distinct_pitch_classes < 6
+        {
+            continue;
+        }
+        if matches!(
+            scale,
+            PianoRollScale::WholeHalfDiminished | PianoRollScale::HalfWholeDiminished
+        ) && distinct_pitch_classes < 8
         {
             continue;
         }
@@ -1630,6 +1647,8 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
                 PianoRollScale::Locrian => -6,
                 PianoRollScale::Blues => -7,
                 PianoRollScale::WholeTone => -8,
+                PianoRollScale::WholeHalfDiminished => -9,
+                PianoRollScale::HalfWholeDiminished => -10,
                 PianoRollScale::None => unreachable!("None is not a detection candidate"),
             };
             let candidate = DetectedPianoRollScale { root, scale };
@@ -33582,7 +33601,7 @@ mod tests {
 
     #[test]
     fn piano_roll_scales_use_documented_intervals_and_auto_detection() {
-        let cases: [(PianoRollScale, u8, [u16; 8], &'static [u8]); 8] = [
+        let cases: [(PianoRollScale, u8, [u16; 8], &'static [u8]); 10] = [
             (
                 PianoRollScale::Dorian,
                 2,
@@ -33630,6 +33649,18 @@ mod tests {
                 9,
                 [69, 71, 72, 74, 76, 78, 80, 81],
                 &[0, 2, 3, 5, 7, 9, 11],
+            ),
+            (
+                PianoRollScale::WholeHalfDiminished,
+                0,
+                [60, 62, 63, 65, 66, 68, 69, 71],
+                &[0, 2, 3, 5, 6, 8, 9, 11],
+            ),
+            (
+                PianoRollScale::HalfWholeDiminished,
+                0,
+                [60, 61, 63, 64, 66, 67, 69, 70],
+                &[0, 1, 3, 4, 6, 7, 9, 10],
             ),
         ];
 
