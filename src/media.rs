@@ -695,7 +695,8 @@ pub fn decode_audio_waveform(
     summarize_audio_waveform(&audio, maximum_buckets)
 }
 
-fn summarize_audio_waveform(
+/// Summarize decoded audio as bounded waveform peaks and a log-frequency spectrum.
+pub fn summarize_audio_waveform(
     audio: &DecodedAudio,
     maximum_buckets: usize,
 ) -> Result<AudioWaveform, String> {

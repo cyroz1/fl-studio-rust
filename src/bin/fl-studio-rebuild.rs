@@ -19,7 +19,8 @@ use flp_rebuild::audio::{
 };
 use flp_rebuild::media::{
     AudioWaveform, DecodedAudio, SamplePathResolver, WaveformPeak, decode_audio_file,
-    decode_audio_preview, decode_audio_waveform, write_audio_range_to_wav,
+    decode_audio_preview, decode_audio_waveform, summarize_audio_waveform,
+    write_audio_range_to_wav,
 };
 use flp_rebuild::midi::{MidiChannelMapping, MidiFile};
 use flp_rebuild::plugins::{PluginCandidate, PluginFormat, scan_installed_plugins};
@@ -2330,16 +2331,17 @@ struct PendingBrowserPreview {
 
 struct PendingSampleEditor {
     path: PathBuf,
-    receiver: Receiver<Result<(DecodedAudio, Vec<WaveformPeak>), String>>,
+    receiver: Receiver<Result<(DecodedAudio, AudioWaveform), String>>,
     worker: thread::JoinHandle<()>,
 }
 
 struct SampleEditorState {
     path: PathBuf,
     audio: DecodedAudio,
-    waveform: Vec<WaveformPeak>,
+    waveform: AudioWaveform,
     selection_start: usize,
     selection_end: usize,
+    spectral_view: bool,
 }
 
 struct PendingBackupWrite {
@@ -9676,7 +9678,7 @@ impl DawUi {
                     if audio.frame_count() == 0 {
                         return Err("sample contains no audio frames".to_owned());
                     }
-                    let waveform = sample_editor_waveform(&audio, 2_048);
+                    let waveform = summarize_audio_waveform(&audio, 2_048)?;
                     Ok((audio, waveform))
                 });
                 let _ = sender.send(result);
@@ -9721,6 +9723,7 @@ impl DawUi {
                         waveform,
                         selection_start: 0,
                         selection_end,
+                        spectral_view: false,
                     });
                 }
                 Err(error) => {
@@ -9769,12 +9772,21 @@ impl DawUi {
                 ui.label(format!(
                     "{channel_label} · {sample_rate} Hz · {duration:.2} seconds"
                 ));
-                paint_sample_editor_waveform(
-                    ui,
-                    &editor.waveform,
-                    frame_count,
-                    editor.selection_start..editor.selection_end,
-                );
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut editor.spectral_view, false, "Waveform");
+                    ui.selectable_value(&mut editor.spectral_view, true, "Spectrum");
+                });
+                let selection = editor.selection_start..editor.selection_end;
+                if editor.spectral_view {
+                    paint_sample_editor_spectrum(ui, &editor.waveform, frame_count, selection);
+                } else {
+                    paint_sample_editor_waveform(
+                        ui,
+                        &editor.waveform.peaks,
+                        frame_count,
+                        selection,
+                    );
+                }
                 let start_max = editor.selection_end.saturating_sub(1);
                 ui.add(
                     egui::Slider::new(&mut editor.selection_start, 0..=start_max)
@@ -30993,39 +31005,6 @@ fn note_name(key: u16) -> String {
     format!("{}{}", NAMES[(key % 12) as usize], key / 12)
 }
 
-fn sample_editor_waveform(audio: &DecodedAudio, maximum_buckets: usize) -> Vec<WaveformPeak> {
-    let frame_count = audio.frame_count();
-    if frame_count == 0 || audio.channels.is_empty() || maximum_buckets == 0 {
-        return Vec::new();
-    }
-    let bucket_count = frame_count.min(maximum_buckets);
-    (0..bucket_count)
-        .map(|bucket| {
-            let start = (bucket as u128 * frame_count as u128 / bucket_count as u128) as usize;
-            let end = ((bucket + 1) as u128 * frame_count as u128 / bucket_count as u128) as usize;
-            let mut peak = WaveformPeak {
-                minimum: 0.0,
-                maximum: 0.0,
-            };
-            let mut initialized = false;
-            for channel in &audio.channels {
-                for sample in &channel[start..end] {
-                    let sample = if sample.is_finite() { *sample } else { 0.0 };
-                    if initialized {
-                        peak.minimum = peak.minimum.min(sample);
-                        peak.maximum = peak.maximum.max(sample);
-                    } else {
-                        peak.minimum = sample;
-                        peak.maximum = sample;
-                        initialized = true;
-                    }
-                }
-            }
-            peak
-        })
-        .collect()
-}
-
 fn paint_sample_editor_waveform(
     ui: &mut egui::Ui,
     peaks: &[WaveformPeak],
@@ -31082,6 +31061,88 @@ fn paint_sample_editor_waveform(
                 egui::pos2(x, center_y - minimum * amplitude),
             ],
             Stroke::new(1.0, color),
+        );
+    }
+    ui.add_space(4.0);
+}
+
+fn paint_sample_editor_spectrum(
+    ui: &mut egui::Ui,
+    waveform: &AudioWaveform,
+    frame_count: usize,
+    selection: std::ops::Range<usize>,
+) {
+    let width = ui.available_width().max(180.0);
+    let (response, painter) = ui.allocate_painter(Vec2::new(width, 144.0), Sense::hover());
+    let rect = response.rect;
+    painter.rect_filled(rect, egui::CornerRadius::same(5), PANEL_DARK);
+    if frame_count == 0 || waveform.spectral_bands.is_empty() {
+        return;
+    }
+    let Some(first_column) = waveform.spectral_bands.first() else {
+        return;
+    };
+    let band_count = first_column.len();
+    if band_count == 0 {
+        return;
+    }
+    let column_count = waveform.spectral_bands.len();
+    let band_height = rect.height() / band_count as f32;
+    for (column_index, bands) in waveform.spectral_bands.iter().enumerate() {
+        let column_left = rect.left() + column_index as f32 * rect.width() / column_count as f32;
+        let column_right =
+            rect.left() + (column_index + 1) as f32 * rect.width() / column_count as f32;
+        let column_start =
+            (column_index as u128 * frame_count as u128 / column_count as u128) as usize;
+        let column_end = (((column_index + 1) as u128 * frame_count as u128)
+            .div_ceil(column_count as u128)) as usize;
+        let selected = column_start < selection.end && selection.start < column_end;
+        for (band, &intensity) in bands.iter().enumerate() {
+            let intensity = f32::from(intensity) / 255.0;
+            if intensity < 0.02 {
+                continue;
+            }
+            let color = if intensity < 0.62 {
+                blend_color(PANEL_DARK, PURPLE, intensity / 0.62)
+            } else {
+                blend_color(PURPLE, BLUE, (intensity - 0.62) / 0.38)
+            };
+            let color = if selected {
+                color
+            } else {
+                blend_color(PANEL_DARK, color, 0.48)
+            };
+            let top = rect.bottom() - (band + 1) as f32 * band_height;
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(column_left, top),
+                    egui::pos2(column_right + 0.5, top + band_height + 0.5),
+                ),
+                egui::CornerRadius::ZERO,
+                color,
+            );
+        }
+    }
+    let frame_scale = rect.width() / frame_count as f32;
+    let selection_rect = egui::Rect::from_min_max(
+        egui::pos2(
+            rect.left() + selection.start as f32 * frame_scale,
+            rect.top(),
+        ),
+        egui::pos2(
+            rect.left() + selection.end as f32 * frame_scale,
+            rect.bottom(),
+        ),
+    );
+    painter.rect_filled(
+        selection_rect,
+        egui::CornerRadius::ZERO,
+        Color32::from_rgba_unmultiplied(75, 180, 145, 28),
+    );
+    for x in [selection_rect.left(), selection_rect.right()] {
+        painter.line_segment(
+            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+            Stroke::new(1.5, Color32::from_rgb(112, 192, 168)),
         );
     }
     ui.add_space(4.0);
@@ -32320,19 +32381,19 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        ActivePlaylistClipDrag, Arrangement, ChannelDisplayFilter, DecodedAudio,
-        DetachedWindowKind, DetachedWindowPlacement, DetachedWindowPlacements,
-        DetectedPianoRollScale, FlpDocument, MainView, MidiControlChangeMapping,
-        PIANO_ROLL_RULER_HEIGHT, Pattern, PatternController, PatternNote, PianoRollChordStamp,
-        PianoRollGrid, PianoRollScale, PianoRollSnap, PlaylistClip, PlaylistClipDragKind,
-        PlaylistTempoMap, PlaylistTrack, PluginCandidate, PluginFormat, TimeSelectionShift,
-        TouchGesture, TouchTapTracker, TouchZoomConfig, WINDOW_LAYOUT_PRESETS_HEADER, WaveformPeak,
-        WindowLayoutPreset, audio_recording_start_tick_with_offset, candidate_matches_vst_identity,
-        candidate_mixer_controls, candidate_mixer_stereo_separation, detect_chord_name,
-        detect_piano_roll_channel_scale, detect_piano_roll_scale, encode_midi_device_id,
-        encode_midi_device_selections, first_available_playlist_track, midi_button_press_edge,
-        next_piano_roll_note_group, note_from_grid_position, parse_midi_control_change_mapping,
-        parse_midi_device_selections, parse_window_layout_presets, piano_roll_color_group_note_ids,
+        ActivePlaylistClipDrag, Arrangement, ChannelDisplayFilter, DetachedWindowKind,
+        DetachedWindowPlacement, DetachedWindowPlacements, DetectedPianoRollScale, FlpDocument,
+        MainView, MidiControlChangeMapping, PIANO_ROLL_RULER_HEIGHT, Pattern, PatternController,
+        PatternNote, PianoRollChordStamp, PianoRollGrid, PianoRollScale, PianoRollSnap,
+        PlaylistClip, PlaylistClipDragKind, PlaylistTempoMap, PlaylistTrack, PluginCandidate,
+        PluginFormat, TimeSelectionShift, TouchGesture, TouchTapTracker, TouchZoomConfig,
+        WINDOW_LAYOUT_PRESETS_HEADER, WindowLayoutPreset, audio_recording_start_tick_with_offset,
+        candidate_matches_vst_identity, candidate_mixer_controls,
+        candidate_mixer_stereo_separation, detect_chord_name, detect_piano_roll_channel_scale,
+        detect_piano_roll_scale, encode_midi_device_id, encode_midi_device_selections,
+        first_available_playlist_track, midi_button_press_edge, next_piano_roll_note_group,
+        note_from_grid_position, parse_midi_control_change_mapping, parse_midi_device_selections,
+        parse_window_layout_presets, piano_roll_color_group_note_ids,
         piano_roll_controller_stroke_points, piano_roll_controller_value_at,
         piano_roll_controller_value_range, piano_roll_discard_length_edit,
         piano_roll_duplicate_offset, piano_roll_key_at_y, piano_roll_note_group_members,
@@ -32348,10 +32409,9 @@ mod tests {
         playlist_pattern_recording_placement_tick, playlist_seek_tick_to_frame,
         playlist_signature_at_tick, playlist_song_position_label, playlist_track_group_range,
         playlist_track_is_hidden, recolor_piano_roll_notes, recording_input_targets,
-        sample_editor_waveform, serialize_window_layout_presets, snap_note_tick,
-        toggle_piano_roll_note_group_selection, touch_pan_zoom_scroll_offset, track_two_finger_tap,
-        update_channel_rack_selection, update_layer_child_selection,
-        update_piano_roll_box_selection, zoom_to_fit,
+        serialize_window_layout_presets, snap_note_tick, toggle_piano_roll_note_group_selection,
+        touch_pan_zoom_scroll_offset, track_two_finger_tap, update_channel_rack_selection,
+        update_layer_child_selection, update_piano_roll_box_selection, zoom_to_fit,
     };
 
     fn playlist_track_arrangement_fixture(clips: &[(u32, u32, u16)]) -> Arrangement {
@@ -32993,40 +33053,6 @@ mod tests {
         assert!(!midi_button_press_edge(0, &mut active));
         assert!(!midi_button_press_edge(0, &mut active));
         assert!(midi_button_press_edge(64, &mut active));
-    }
-
-    #[test]
-    fn sample_editor_waveform_buckets_all_frames_across_channels() {
-        let audio = DecodedAudio {
-            sample_rate: 48_000,
-            channels: vec![
-                vec![-0.5, 0.25, -1.0, 0.3, 0.0, 1.0],
-                vec![0.1, 0.2, 0.3, 0.4, -0.2, -0.4],
-            ],
-        };
-        let peaks = sample_editor_waveform(&audio, 3);
-        assert_eq!(peaks.len(), 3);
-        assert_eq!(
-            peaks[0],
-            WaveformPeak {
-                minimum: -0.5,
-                maximum: 0.25
-            }
-        );
-        assert_eq!(
-            peaks[1],
-            WaveformPeak {
-                minimum: -1.0,
-                maximum: 0.4
-            }
-        );
-        assert_eq!(
-            peaks[2],
-            WaveformPeak {
-                minimum: -0.4,
-                maximum: 1.0
-            }
-        );
     }
 
     #[test]
