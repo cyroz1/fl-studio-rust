@@ -29,10 +29,11 @@ use flp_rebuild::sample_render::SamplerLiveNoteEvent;
 use flp_rebuild::sample_render::{
     AudioClipRenderOptions, AudioClipRenderSummary, AudioFileRenderOptions, AudioRecordingSummary,
     AudioRenderEncodingOptions, AudioRenderOutput, MP3_BITRATES_KBPS, MixerStemRenderOptions,
-    PlaylistRenderOptions, PlaylistRenderSummary, PlaylistStreamMonitor, PlaylistTempoMap,
-    ResamplingQuality, SamplerPatternRenderOptions, SamplerPatternRenderSummary, WavChannelMode,
-    WavDitherMode, WavSampleFormat, render_audio_clips_to_file,
+    PlaylistRenderOptions, PlaylistRenderRange, PlaylistRenderSummary, PlaylistStreamMonitor,
+    PlaylistTempoMap, ResamplingQuality, SamplerPatternRenderOptions, SamplerPatternRenderSummary,
+    WavChannelMode, WavDitherMode, WavSampleFormat, render_audio_clips_to_file,
     render_playlist_mixer_stems_with_vst3_cancellable,
+    render_playlist_with_vst3_to_file_from_frame_cancellable,
     render_playlist_with_vst3_to_flac_cancellable, render_playlist_with_vst3_to_mp3_cancellable,
     render_playlist_with_vst3_to_ogg_cancellable, render_playlist_with_vst3_to_wav_cancellable,
     render_sampler_pattern_to_file, stream_playlist_with_vst3_to_device_with_monitor,
@@ -3552,6 +3553,7 @@ struct PendingSongRender {
     output_path: PathBuf,
     kind: PendingSongRenderKind,
     track_freeze: Option<PendingPlaylistTrackFreeze>,
+    pattern_clip_consolidation: Option<PendingPlaylistPatternClipConsolidation>,
 }
 
 struct PendingPlaylistTrackFreeze {
@@ -3559,6 +3561,18 @@ struct PendingPlaylistTrackFreeze {
     track_id: u32,
     track_index: u16,
     expected_audio_clip_count: usize,
+    project_generation: u64,
+    project_path: PathBuf,
+    project_fingerprint: [u8; 16],
+}
+
+struct PendingPlaylistPatternClipConsolidation {
+    arrangement_id: u16,
+    source_clip_index: usize,
+    pattern_id: u16,
+    source_position_ticks: u32,
+    source_length_ticks: u32,
+    source_track_index: u16,
     project_generation: u64,
     project_path: PathBuf,
     project_fingerprint: [u8; 16],
@@ -12126,6 +12140,7 @@ impl DawUi {
         let mut make_audio_clip_unique_requested = None;
         let mut make_audio_clip_unique_as_sample_requested = None;
         let mut consolidate_audio_clip_requested = None;
+        let mut consolidate_pattern_clip_requested = None;
         let mut freeze_playlist_track_requested = None;
         let mut split_clip_requested = None;
         let mut split_selected_audio_clips_requested = None;
@@ -13904,6 +13919,24 @@ impl DawUi {
                                     let selected_pattern_context_indices = self
                                         .selected_playlist_pattern_clip_indices(arrangement.id)
                                         .filter(|indices| indices.contains(&clip_index));
+                                    let can_consolidate_pattern_clip = !clip.is_muted()
+                                        && clip.track_index.is_some()
+                                        && self.sample_project_path().is_some()
+                                        && self.pending_song_render.is_none();
+                                    if ui
+                                        .add_enabled(
+                                            can_consolidate_pattern_clip,
+                                            egui::Button::new("Consolidate Pattern Clip…"),
+                                        )
+                                        .on_disabled_hover_text(
+                                            "Save the project and stop playback before consolidating this Pattern Clip.",
+                                        )
+                                        .clicked()
+                                    {
+                                        consolidate_pattern_clip_requested = Some(clip_index);
+                                        ui.close();
+                                    }
+                                    ui.separator();
                                     let split_pattern_button = ui.add_enabled(
                                         can_split_pattern_clip,
                                         egui::Button::new("Split Pattern at cursor"),
@@ -15109,6 +15142,14 @@ impl DawUi {
                 start_from_song_start,
                 SelectedAudioClipRenderAction::Consolidate,
             );
+        }
+
+        if let Some(clip_index) = consolidate_pattern_clip_requested {
+            self.selected_arrangement = Some(arrangement.id);
+            self.selected_clip = Some(clip_index);
+            self.selected_playlist_clips.clear();
+            self.selected_playlist_clips.insert(clip_index);
+            self.render_playlist_pattern_clip_consolidation_dialog(arrangement.id, clip_index);
         }
 
         if let Some((track_index, track_id)) = freeze_playlist_track_requested {
@@ -25206,6 +25247,540 @@ impl DawUi {
         };
     }
 
+    fn render_playlist_pattern_clip_consolidation_dialog(
+        &mut self,
+        arrangement_id: u16,
+        clip_index: usize,
+    ) {
+        let Some(project_path) = self.sample_project_path() else {
+            self.status = "Save the project before consolidating a Pattern Clip".to_owned();
+            return;
+        };
+        let Some(document) = self.document.as_ref() else {
+            self.status = "Open a project before consolidating a Pattern Clip".to_owned();
+            return;
+        };
+        if self.pending_song_render.is_some() {
+            self.status = "A Playlist or Mixer stem render is already running".to_owned();
+            return;
+        }
+        if self.playing
+            || self.project_playback_loaded
+            || self.pending_audio_render.is_some()
+            || self.pending_vst3_stream.is_some()
+            || self.pending_sampler_stream.is_some()
+        {
+            self.status =
+                "Stop Song playback or pattern preview before consolidating a Pattern Clip"
+                    .to_owned();
+            return;
+        }
+
+        let arrangement = match document.arrangements() {
+            Ok(arrangements) => arrangements
+                .into_iter()
+                .find(|arrangement| arrangement.id == arrangement_id),
+            Err(error) => {
+                self.status = format!("Could not read the Playlist arrangement: {error}");
+                return;
+            }
+        };
+        let Some(arrangement) = arrangement else {
+            self.status = "The selected Playlist arrangement no longer exists".to_owned();
+            return;
+        };
+        let Some(clip) = arrangement.clips.get(clip_index) else {
+            self.status = "The selected Playlist clip no longer exists".to_owned();
+            return;
+        };
+        let PlaylistClipTarget::Pattern { id: pattern_id } = clip.target() else {
+            self.status = "Select a Pattern Clip before consolidating".to_owned();
+            return;
+        };
+        if clip.is_muted() {
+            self.status = "Unmute the selected Pattern Clip before consolidating it".to_owned();
+            return;
+        }
+        let Some(track_index) = clip.track_index else {
+            self.status = "The selected Pattern Clip has no Playlist track".to_owned();
+            return;
+        };
+        let track_id = u32::from(track_index).saturating_add(1);
+        if document
+            .playlist_tracks()
+            .iter()
+            .any(|track| track.id == track_id && track.enabled == Some(false))
+        {
+            self.status = format!("Unmute Playlist track {track_id} before consolidating it");
+            return;
+        }
+        if clip.length_ticks == 0 {
+            self.status = "The selected Pattern Clip has no timeline length".to_owned();
+            return;
+        }
+        if clip
+            .scale
+            .is_some_and(|scale| !scale.is_finite() || (scale - 1.0).abs() > 1e-9)
+        {
+            self.status = "Pattern Clip consolidation requires the default clip scale".to_owned();
+            return;
+        }
+        let patterns = match document.patterns() {
+            Ok(patterns) => patterns,
+            Err(error) => {
+                self.status = format!("Could not inspect Pattern Clip sources: {error}");
+                return;
+            }
+        };
+        let Some(pattern) = patterns.iter().find(|pattern| pattern.id == pattern_id) else {
+            self.status = "The selected Pattern Clip references a missing pattern".to_owned();
+            return;
+        };
+        let channels = document.channels();
+        let loaded_vst3_channels = self
+            .channel_vst3_instances
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if let Err(reason) =
+            playlist_freeze_pattern_sources_supported(pattern, &channels, &loaded_vst3_channels)
+        {
+            self.status = format!("Pattern Clip cannot be consolidated safely: {reason}");
+            return;
+        }
+        if !project_has_audio_clip_template(document) {
+            self.status =
+                "This project needs a recognized Audio Clip template before consolidating a Pattern Clip"
+                    .to_owned();
+            return;
+        }
+        let source_position_ticks = clip.position_ticks;
+        let source_length_ticks = clip.length_ticks;
+        let clip_end_tick =
+            u64::from(source_position_ticks).checked_add(u64::from(source_length_ticks));
+        let Some(clip_end_tick) = clip_end_tick else {
+            self.status = "The Pattern Clip endpoint exceeds the Playlist timeline".to_owned();
+            return;
+        };
+        let tempo_map = match PlaylistTempoMap::for_arrangement(document, arrangement_id) {
+            Ok(tempo_map) => tempo_map,
+            Err(error) => {
+                self.status = format!("Could not determine the Playlist tempo map: {error}");
+                return;
+            }
+        };
+        let output_start_frame = match tempo_map.frame_at_tick(
+            u64::from(source_position_ticks),
+            self.audio_settings.sample_rate,
+        ) {
+            Ok(frame) => frame,
+            Err(error) => {
+                self.status = format!("Could not determine the Pattern Clip start time: {error}");
+                return;
+            }
+        };
+        let minimum_content_frames =
+            match tempo_map.frame_at_tick(clip_end_tick, self.audio_settings.sample_rate) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    self.status = format!("Could not determine the Pattern Clip end time: {error}");
+                    return;
+                }
+            };
+        let project_bytes = match document.encode_lossless() {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.status = format!("Could not verify the project before consolidation: {error}");
+                return;
+            }
+        };
+        let project_fingerprint: [u8; 16] = Md5::digest(&project_bytes).into();
+
+        let tempo_channel_ids = channels
+            .iter()
+            .filter(|channel| {
+                channel.kind() == Some(5)
+                    && channel
+                        .display_name()
+                        .is_some_and(|name| name.eq_ignore_ascii_case("TEMPO"))
+            })
+            .map(ChannelSummary::id)
+            .collect::<BTreeSet<_>>();
+        let clips_to_remove = arrangement
+            .clips
+            .iter()
+            .enumerate()
+            .filter_map(|(index, candidate)| {
+                let is_tempo_clip = matches!(
+                    candidate.target(),
+                    PlaylistClipTarget::Channel { id } if tempo_channel_ids.contains(&id)
+                );
+                (index != clip_index && !is_tempo_clip).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let mut render_document = document.clone();
+        for source_index in clips_to_remove.into_iter().rev() {
+            if let Err(error) = render_document.delete_playlist_clip(arrangement_id, source_index) {
+                self.status = format!("Could not isolate the Pattern Clip for rendering: {error}");
+                return;
+            }
+        }
+
+        let project_stem = project_path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "FL_Studio_Project".to_owned());
+        let output_format = self.playlist_song_output_format;
+        let file_dialog = add_audio_render_file_filter(
+            rfd::FileDialog::new()
+                .set_title(format!("Consolidate Pattern Clip {}", clip_index + 1))
+                .set_file_name(format!(
+                    "{project_stem}_pattern_clip_{}_consolidated.{}",
+                    clip_index + 1,
+                    output_format.extension()
+                )),
+            output_format,
+        );
+        let Some(output_path) = file_dialog.save_file() else {
+            return;
+        };
+        let options = PlaylistRenderOptions {
+            arrangement_id,
+            sample_rate: self.audio_settings.sample_rate,
+            soloed_playlist_track_range: Some((track_id, track_id)),
+            read_sample_root_note: self.read_sample_root_note,
+            wav_sample_format: self.playlist_render_format,
+            wav_dither_mode: self.playlist_render_dither_mode,
+            wav_save_playlist_markers: false,
+            wav_save_note_markers: false,
+            resampling_quality: self.playlist_render_quality,
+            wav_channel_mode: self.playlist_render_channel_mode,
+            tail_seconds: self.playlist_render_tail_seconds,
+            ..PlaylistRenderOptions::default()
+        };
+        let vst3_processor = self
+            .vst3_host
+            .as_ref()
+            .map(|host| {
+                host.prepare_playlist_stream(
+                    &render_document,
+                    options,
+                    &self.channel_vst3_instances,
+                    self.playlist_render_include_plugin_tails,
+                )
+            })
+            .transpose();
+        let vst3_processor = match vst3_processor {
+            Ok(processor) => processor,
+            Err(error) => {
+                self.status = format!("Could not prepare Playlist VST3 instruments: {error}");
+                return;
+            }
+        };
+        let output_format = match output_format {
+            PlaylistSongOutputFormat::Wav => AudioRenderOutput::Wav,
+            PlaylistSongOutputFormat::Flac => AudioRenderOutput::Flac {
+                bits_per_sample: self.playlist_render_flac_bits_per_sample,
+            },
+            PlaylistSongOutputFormat::Ogg => AudioRenderOutput::Ogg {
+                bitrate_kbps: self.playlist_render_ogg_bitrate_kbps,
+            },
+            PlaylistSongOutputFormat::Mp3 => AudioRenderOutput::Mp3 {
+                bitrate_kbps: self.playlist_render_mp3_bitrate_kbps,
+            },
+        };
+        let document = render_document;
+        let output_path_for_worker = output_path.clone();
+        let worker_project_path = project_path.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name("playlist-pattern-clip-consolidation".to_owned())
+            .spawn(move || {
+                let result = render_playlist_with_vst3_to_file_from_frame_cancellable(
+                    &document,
+                    &worker_project_path,
+                    options,
+                    &output_path_for_worker,
+                    PlaylistRenderRange {
+                        output_format,
+                        output_start_frame,
+                        minimum_content_frames,
+                    },
+                    vst3_processor,
+                    &worker_cancelled,
+                );
+                let _ = sender.send(result);
+            });
+        match worker {
+            Ok(worker) => {
+                self.pending_song_render = Some(PendingSongRender {
+                    receiver,
+                    cancelled,
+                    worker,
+                    output_path: output_path.clone(),
+                    kind: PendingSongRenderKind::Mix,
+                    track_freeze: None,
+                    pattern_clip_consolidation: Some(PendingPlaylistPatternClipConsolidation {
+                        arrangement_id,
+                        source_clip_index: clip_index,
+                        pattern_id,
+                        source_position_ticks,
+                        source_length_ticks,
+                        source_track_index: track_index,
+                        project_generation: self.project_generation,
+                        project_path,
+                        project_fingerprint,
+                    }),
+                });
+                self.status = format!(
+                    "Consolidating Playlist Pattern Clip {} to {}…",
+                    clip_index + 1,
+                    output_path.display()
+                );
+            }
+            Err(error) => {
+                self.status = format!("Could not start Pattern Clip consolidation: {error}");
+            }
+        }
+    }
+
+    fn finish_playlist_pattern_clip_consolidation(
+        &mut self,
+        output_path: &Path,
+        summary: &PlaylistRenderSummary,
+        consolidation: &PendingPlaylistPatternClipConsolidation,
+        history_snapshot_available: bool,
+    ) {
+        if summary.frames == 0 || summary.sample_rate == 0 {
+            self.status = format!(
+                "Rendered {}, but it contains no audio frames to consolidate",
+                output_path.display()
+            );
+            return;
+        }
+        if summary.sampler_notes_rendered + summary.vst3_notes_rendered == 0 {
+            self.status = format!(
+                "Rendered {}, but left Pattern Clip {} unchanged because no supported notes were rendered",
+                output_path.display(),
+                consolidation.source_clip_index + 1
+            );
+            return;
+        }
+        if summary.audio_clips_skipped_unsupported_scale > 0
+            || summary.pattern_clips_skipped_unsupported_scale > 0
+            || summary.notes_skipped_unresolved_sample > 0
+            || summary.vst3_plugin_channels_unloaded > 0
+        {
+            self.status = format!(
+                "Rendered {}, but left Pattern Clip {} unchanged because the render skipped unsupported or unavailable sources",
+                output_path.display(),
+                consolidation.source_clip_index + 1
+            );
+            return;
+        }
+        let Some(project_path) = self.sample_project_path() else {
+            self.status = format!(
+                "Rendered {}, but could not consolidate the Pattern Clip because no project is open",
+                output_path.display()
+            );
+            return;
+        };
+        let Some(document) = self.document.as_ref() else {
+            self.status = format!(
+                "Rendered {}, but could not consolidate the Pattern Clip because no project is open",
+                output_path.display()
+            );
+            return;
+        };
+        let current_bytes = match document.encode_lossless() {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.status = format!(
+                    "Rendered {}, but could not verify the project before consolidation: {error}",
+                    output_path.display()
+                );
+                return;
+            }
+        };
+        let current_fingerprint: [u8; 16] = Md5::digest(&current_bytes).into();
+        if consolidation.project_generation != self.project_generation
+            || project_path != consolidation.project_path
+            || current_fingerprint != consolidation.project_fingerprint
+        {
+            self.status = format!(
+                "Rendered {}, but did not consolidate Pattern Clip {} because the project changed while rendering",
+                output_path.display(),
+                consolidation.source_clip_index + 1
+            );
+            return;
+        }
+        let arrangement = match document.arrangements().map(|arrangements| {
+            arrangements
+                .into_iter()
+                .find(|arrangement| arrangement.id == consolidation.arrangement_id)
+        }) {
+            Ok(Some(arrangement)) => arrangement,
+            Ok(None) => {
+                self.status = format!(
+                    "Rendered {}, but its Playlist arrangement no longer exists",
+                    output_path.display()
+                );
+                return;
+            }
+            Err(error) => {
+                self.status = format!(
+                    "Rendered {}, but could not decode its Playlist: {error}",
+                    output_path.display()
+                );
+                return;
+            }
+        };
+        let Some(source_clip) = arrangement.clips.get(consolidation.source_clip_index) else {
+            self.status = format!(
+                "Rendered {}, but its source Pattern Clip no longer exists",
+                output_path.display()
+            );
+            return;
+        };
+        if source_clip.target()
+            != (PlaylistClipTarget::Pattern {
+                id: consolidation.pattern_id,
+            })
+            || source_clip.position_ticks != consolidation.source_position_ticks
+            || source_clip.length_ticks != consolidation.source_length_ticks
+            || source_clip.track_index != Some(consolidation.source_track_index)
+            || source_clip.is_muted()
+        {
+            self.status = format!(
+                "Rendered {}, but its source Pattern Clip changed before consolidation",
+                output_path.display()
+            );
+            return;
+        }
+        let tempo_map =
+            match PlaylistTempoMap::for_arrangement(document, consolidation.arrangement_id) {
+                Ok(tempo_map) => tempo_map,
+                Err(error) => {
+                    self.status = format!(
+                        "Rendered {}, but could not determine its Playlist tempo map: {error}",
+                        output_path.display()
+                    );
+                    return;
+                }
+            };
+        let length_ticks = match tempo_map
+            .ticks_for_audio_frames(
+                u64::from(consolidation.source_position_ticks),
+                summary.frames,
+                summary.sample_rate,
+            )
+            .and_then(|ticks| {
+                u32::try_from(ticks)
+                    .map_err(|_| "rendered audio is too long for this Playlist".to_owned())
+            }) {
+            Ok(length_ticks) if length_ticks > 0 => length_ticks,
+            Ok(_) => {
+                self.status = format!(
+                    "Rendered {}, but its duration is shorter than one Playlist tick",
+                    output_path.display()
+                );
+                return;
+            }
+            Err(error) => {
+                self.status = format!(
+                    "Rendered {}, but could not determine its Playlist length: {error}",
+                    output_path.display()
+                );
+                return;
+            }
+        };
+        let undo_snapshot = match self.encode_history_snapshot() {
+            Ok(Some(snapshot)) if snapshot.len() <= HISTORY_LIMIT_BYTES => {
+                (!history_snapshot_available).then_some(snapshot)
+            }
+            Ok(Some(_)) => {
+                self.status = "Undo snapshot exceeds the 64 MiB history limit".to_owned();
+                return;
+            }
+            Ok(None) => {
+                self.status =
+                    "Could not capture undo state before Pattern Clip consolidation".to_owned();
+                return;
+            }
+            Err(error) => {
+                self.status = format!(
+                    "Could not capture undo state before Pattern Clip consolidation: {error}"
+                );
+                return;
+            }
+        };
+        let mut updated = document.clone();
+        let channel_path = output_path.to_string_lossy();
+        let channel_name = format!("Consolidated Pattern {}", consolidation.pattern_id);
+        let channel_id = match updated.create_audio_channel(&channel_path, &channel_name) {
+            Ok(channel_id) => channel_id,
+            Err(error) => {
+                self.status = format!(
+                    "Rendered {}, but could not create its Audio Clip channel: {error}",
+                    output_path.display()
+                );
+                return;
+            }
+        };
+        let new_clip_index = match updated.create_playlist_audio_clip(
+            consolidation.arrangement_id,
+            channel_id,
+            consolidation.source_position_ticks,
+            length_ticks,
+            consolidation.source_track_index,
+        ) {
+            Ok(clip_index) => clip_index,
+            Err(error) => {
+                self.status = format!(
+                    "Rendered {}, but could not place it in the Playlist: {error}",
+                    output_path.display()
+                );
+                return;
+            }
+        };
+        if let Err(error) = updated.edit_playlist_clip(
+            consolidation.arrangement_id,
+            consolidation.source_clip_index,
+            PlaylistClipEdit {
+                muted: Some(true),
+                ..PlaylistClipEdit::default()
+            },
+        ) {
+            self.status = format!(
+                "Rendered {}, but could not mute the source Pattern Clip: {error}",
+                output_path.display()
+            );
+            return;
+        }
+        self.stop_project_playback();
+        self.document = Some(updated);
+        if let Some(snapshot) = undo_snapshot {
+            self.remember_undo_snapshot(snapshot);
+        }
+        self.selected_arrangement = Some(consolidation.arrangement_id);
+        self.selected_clip = Some(new_clip_index);
+        self.selected_playlist_clips.clear();
+        self.selected_playlist_clips.insert(new_clip_index);
+        self.playlist_selection_anchor = Some(new_clip_index);
+        self.playlist_clip_context_split = None;
+        self.active_playlist_clip_drag = None;
+        self.dirty = true;
+        self.view = MainView::Playlist;
+        self.refresh_audio_waveform_paths();
+        self.status = format!(
+            "Consolidated Pattern Clip {} to {}; source clip muted. Tempo automation was honored; Mixer effects and parameter automation were not rendered",
+            consolidation.source_clip_index + 1,
+            output_path.display()
+        );
+    }
+
     fn finish_playlist_track_freeze(
         &mut self,
         output_path: &Path,
@@ -25690,6 +26265,7 @@ impl DawUi {
                         project_path,
                         project_fingerprint,
                     }),
+                    pattern_clip_consolidation: None,
                 });
                 self.status = format!(
                     "Freezing Playlist track {track_id} from song start to {}…",
@@ -25839,6 +26415,7 @@ impl DawUi {
                     output_path: output_path.clone(),
                     kind: PendingSongRenderKind::Mix,
                     track_freeze: None,
+                    pattern_clip_consolidation: None,
                 });
                 self.status = format!("Rendering Playlist mix to {}…", output_path.display());
             }
@@ -25946,6 +26523,7 @@ impl DawUi {
                     output_path: output_directory.clone(),
                     kind: PendingSongRenderKind::MixerStems,
                     track_freeze: None,
+                    pattern_clip_consolidation: None,
                 });
                 self.status = format!("Rendering Mixer stems into {}…", output_directory.display());
             }
@@ -25987,6 +26565,23 @@ impl DawUi {
                     self.status = format!(
                         "Could not freeze Playlist track {}: {error}",
                         track_freeze.track_id
+                    );
+                }
+            }
+            return;
+        }
+        if let Some(consolidation) = pending.pattern_clip_consolidation.as_ref() {
+            match result {
+                Ok(summary) => self.finish_playlist_pattern_clip_consolidation(
+                    &pending.output_path,
+                    &summary,
+                    consolidation,
+                    history_snapshot_available,
+                ),
+                Err(error) => {
+                    self.status = format!(
+                        "Could not consolidate Playlist Pattern Clip {}: {error}",
+                        consolidation.source_clip_index + 1
                     );
                 }
             }

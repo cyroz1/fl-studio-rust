@@ -823,6 +823,14 @@ pub struct PlaylistRenderOptions {
     pub read_sample_root_note: bool,
 }
 
+/// Output format and timeline range for a Playlist render that begins after song start.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PlaylistRenderRange {
+    pub output_format: AudioRenderOutput,
+    pub output_start_frame: u64,
+    pub minimum_content_frames: u64,
+}
+
 impl Default for PlaylistRenderOptions {
     fn default() -> Self {
         Self {
@@ -1339,7 +1347,11 @@ pub fn render_playlist_with_vst3_to_wav_cancellable(
         project_path,
         options,
         output_path,
-        PlaylistRenderOutput::Wav,
+        PlaylistRenderWindow {
+            output: PlaylistRenderOutput::Wav,
+            output_start_frame: 0,
+            minimum_content_frames: 0,
+        },
         vst3_processor,
         cancelled,
     )
@@ -1360,7 +1372,11 @@ pub fn render_playlist_with_vst3_to_flac_cancellable(
         project_path,
         options,
         output_path,
-        PlaylistRenderOutput::Flac { bits_per_sample },
+        PlaylistRenderWindow {
+            output: PlaylistRenderOutput::Flac { bits_per_sample },
+            output_start_frame: 0,
+            minimum_content_frames: 0,
+        },
         vst3_processor,
         cancelled,
     )
@@ -1381,7 +1397,11 @@ pub fn render_playlist_with_vst3_to_ogg_cancellable(
         project_path,
         options,
         output_path,
-        PlaylistRenderOutput::Ogg { bitrate_kbps },
+        PlaylistRenderWindow {
+            output: PlaylistRenderOutput::Ogg { bitrate_kbps },
+            output_start_frame: 0,
+            minimum_content_frames: 0,
+        },
         vst3_processor,
         cancelled,
     )
@@ -1402,7 +1422,46 @@ pub fn render_playlist_with_vst3_to_mp3_cancellable(
         project_path,
         options,
         output_path,
-        PlaylistRenderOutput::Mp3 { bitrate_kbps },
+        PlaylistRenderWindow {
+            output: PlaylistRenderOutput::Mp3 { bitrate_kbps },
+            output_start_frame: 0,
+            minimum_content_frames: 0,
+        },
+        vst3_processor,
+        cancelled,
+    )
+}
+
+/// Render from song start while writing only the portion beginning at `output_start_frame`.
+/// Processing before that frame is retained so tempo automation and plug-in state follow the
+/// original arrangement timeline. `minimum_content_frames` retains silence through a clip's end.
+pub fn render_playlist_with_vst3_to_file_from_frame_cancellable(
+    document: &FlpDocument,
+    project_path: impl AsRef<Path>,
+    options: PlaylistRenderOptions,
+    output_path: impl AsRef<Path>,
+    range: PlaylistRenderRange,
+    vst3_processor: Option<Vst3PlaylistStreamProcessor>,
+    cancelled: &AtomicBool,
+) -> Result<PlaylistRenderSummary, String> {
+    let output = match range.output_format {
+        AudioRenderOutput::Wav => PlaylistRenderOutput::Wav,
+        AudioRenderOutput::Flac { bits_per_sample } => {
+            PlaylistRenderOutput::Flac { bits_per_sample }
+        }
+        AudioRenderOutput::Ogg { bitrate_kbps } => PlaylistRenderOutput::Ogg { bitrate_kbps },
+        AudioRenderOutput::Mp3 { bitrate_kbps } => PlaylistRenderOutput::Mp3 { bitrate_kbps },
+    };
+    render_playlist_with_vst3_cancellable(
+        document,
+        project_path,
+        options,
+        output_path,
+        PlaylistRenderWindow {
+            output,
+            output_start_frame: range.output_start_frame,
+            minimum_content_frames: range.minimum_content_frames,
+        },
         vst3_processor,
         cancelled,
     )
@@ -1416,15 +1475,27 @@ enum PlaylistRenderOutput {
     Mp3 { bitrate_kbps: u16 },
 }
 
+#[derive(Clone, Copy)]
+struct PlaylistRenderWindow {
+    output: PlaylistRenderOutput,
+    output_start_frame: u64,
+    minimum_content_frames: u64,
+}
+
 fn render_playlist_with_vst3_cancellable(
     document: &FlpDocument,
     project_path: impl AsRef<Path>,
     options: PlaylistRenderOptions,
     output_path: impl AsRef<Path>,
-    output: PlaylistRenderOutput,
+    window: PlaylistRenderWindow,
     mut vst3_processor: Option<Vst3PlaylistStreamProcessor>,
     cancelled: &AtomicBool,
 ) -> Result<PlaylistRenderSummary, String> {
+    let PlaylistRenderWindow {
+        output,
+        output_start_frame,
+        minimum_content_frames,
+    } = window;
     let project_path = project_path.as_ref();
     let output_path = output_path.as_ref();
     match output {
@@ -1498,11 +1569,15 @@ fn render_playlist_with_vst3_cancellable(
         );
     }
 
-    let mut content_frames = audio.summary.frames.max(sampler.summary.frames);
+    let mut content_frames = audio
+        .summary
+        .frames
+        .max(sampler.summary.frames)
+        .max(minimum_content_frames);
     if let Some(processor) = vst3_processor.as_mut() {
         content_frames = content_frames.max(processor.summary().frames);
     }
-    let wav_cue_points = if matches!(output, PlaylistRenderOutput::Wav)
+    let mut wav_cue_points = if matches!(output, PlaylistRenderOutput::Wav)
         && (options.wav_save_playlist_markers || options.wav_save_note_markers)
     {
         playlist_wav_cue_points(
@@ -1523,11 +1598,29 @@ fn render_playlist_with_vst3_cancellable(
     {
         content_frames = content_frames.max(last_cue_frame);
     }
+    if output_start_frame > 0 {
+        wav_cue_points.retain_mut(|point| {
+            let Some(offset) = u64::from(point.sample_offset).checked_sub(output_start_frame)
+            else {
+                return false;
+            };
+            let Ok(offset) = u32::try_from(offset) else {
+                return false;
+            };
+            point.sample_offset = offset;
+            true
+        });
+    }
     let frames = add_render_tail_frames(content_frames, options.sample_rate, options.tail_seconds)?;
+    if output_start_frame >= frames {
+        return Err("render output start is after the end of the Playlist content".to_owned());
+    }
+    let output_frames = frames - output_start_frame;
     if let Some(processor) = vst3_processor.as_mut() {
         processor.extend_to_output_frames(frames)?;
     }
-    if matches!(output, PlaylistRenderOutput::Flac { .. }) && frames > FLAC_MAX_SAMPLE_FRAMES {
+    if matches!(output, PlaylistRenderOutput::Flac { .. }) && output_frames > FLAC_MAX_SAMPLE_FRAMES
+    {
         return Err("rendered FLAC exceeds the 36-bit sample-count limit".to_owned());
     }
     let mut source_paths: std::collections::BTreeSet<PathBuf> =
@@ -1535,7 +1628,7 @@ fn render_playlist_with_vst3_cancellable(
     source_paths.extend(sampler.source_paths.iter().cloned());
     let vst3_summary = vst3_processor.as_ref().map(|processor| processor.summary());
     let mut summary = PlaylistRenderSummary {
-        frames,
+        frames: output_frames,
         sample_rate: options.sample_rate,
         audio_clips_rendered: audio.summary.clips_rendered,
         sampler_pattern_clips_rendered: sampler.pattern_clips_rendered,
@@ -1560,6 +1653,7 @@ fn render_playlist_with_vst3_cancellable(
     };
 
     let mixer_track_meters = MixerTrackPeakMeters::default();
+    let mut frames_to_skip = output_start_frame;
     let mut temporary = TemporaryRenderFile::create(output_path)?;
     let file = temporary
         .file
@@ -1567,7 +1661,7 @@ fn render_playlist_with_vst3_cancellable(
         .expect("temporary render file is open");
     match output {
         PlaylistRenderOutput::Wav => {
-            let frames_u32 = u32::try_from(frames)
+            let frames_u32 = u32::try_from(output_frames)
                 .map_err(|_| "render is too long for a RIFF/WAVE file".to_owned())?;
             let block_align = options.wav_sample_format.bytes_per_sample()
                 * options.wav_channel_mode.channel_count();
@@ -1603,6 +1697,10 @@ fn render_playlist_with_vst3_cancellable(
                 cancelled,
                 || false,
                 |block, _meter_buses| {
+                    let block = skip_render_block_prefix(block, &mut frames_to_skip);
+                    if block.is_empty() {
+                        return Ok(());
+                    }
                     bytes.clear();
                     append_wav_block_samples_with_dither(
                         block,
@@ -1635,9 +1733,16 @@ fn render_playlist_with_vst3_cancellable(
                 Some(&mixer_track_meters),
                 cancelled,
                 || false,
-                |block, _meter_buses| encoder.write_stereo_block(block, options.wav_channel_mode),
+                |block, _meter_buses| {
+                    let block = skip_render_block_prefix(block, &mut frames_to_skip);
+                    if block.is_empty() {
+                        Ok(())
+                    } else {
+                        encoder.write_stereo_block(block, options.wav_channel_mode)
+                    }
+                },
             )?;
-            encoder.finalize(frames)?;
+            encoder.finalize(output_frames)?;
         }
         PlaylistRenderOutput::Ogg { bitrate_kbps } => {
             let mut encoder = StreamingOggWriter::new(
@@ -1658,7 +1763,14 @@ fn render_playlist_with_vst3_cancellable(
                 Some(&mixer_track_meters),
                 cancelled,
                 || false,
-                |block, _meter_buses| encoder.write_stereo_block(block),
+                |block, _meter_buses| {
+                    let block = skip_render_block_prefix(block, &mut frames_to_skip);
+                    if block.is_empty() {
+                        Ok(())
+                    } else {
+                        encoder.write_stereo_block(block)
+                    }
+                },
             )?;
             encoder.finalize()?;
         }
@@ -1682,7 +1794,14 @@ fn render_playlist_with_vst3_cancellable(
                 Some(&mixer_track_meters),
                 cancelled,
                 || false,
-                |block, _meter_buses| encoder.write_stereo_block(block),
+                |block, _meter_buses| {
+                    let block = skip_render_block_prefix(block, &mut frames_to_skip);
+                    if block.is_empty() {
+                        Ok(())
+                    } else {
+                        encoder.write_stereo_block(block)
+                    }
+                },
             )?;
             encoder.finalize()?;
         }
@@ -3230,6 +3349,13 @@ fn stream_prepared_playlist_render(
         (Ok(()), Ok(())) => {}
     }
     Ok(sampler_engine.voices_stolen)
+}
+
+fn skip_render_block_prefix<'a>(block: &'a [f32], frames_to_skip: &mut u64) -> &'a [f32] {
+    let frames = (block.len() / 2) as u64;
+    let skipped = (*frames_to_skip).min(frames);
+    *frames_to_skip -= skipped;
+    &block[skipped as usize * 2..]
 }
 
 /// Render the sample voices in one FLP pattern to a WAV using the selected bit depth and channel mode.
