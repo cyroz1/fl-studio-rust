@@ -1462,6 +1462,7 @@ impl PianoRollSnap {
 enum PianoRollScale {
     None,
     Major,
+    MajorLocrian,
     HarmonicMajor,
     DoubleHarmonicMajor,
     IonianSharpFive,
@@ -1524,9 +1525,10 @@ enum PianoRollScale {
 }
 
 impl PianoRollScale {
-    const ALL: [Self; 61] = [
+    const ALL: [Self; 62] = [
         Self::None,
         Self::Major,
+        Self::MajorLocrian,
         Self::HarmonicMajor,
         Self::DoubleHarmonicMajor,
         Self::IonianSharpFive,
@@ -1592,6 +1594,7 @@ impl PianoRollScale {
         match self {
             Self::None => "None",
             Self::Major => "Major",
+            Self::MajorLocrian => "Major Locrian",
             Self::HarmonicMajor => "Harmonic major",
             Self::DoubleHarmonicMajor => "Double harmonic major",
             Self::IonianSharpFive => "Ionian #5",
@@ -1665,6 +1668,7 @@ impl PianoRollScale {
         match self {
             Self::None => &[],
             Self::Major => &[0, 2, 4, 5, 7, 9, 11],
+            Self::MajorLocrian => &[0, 2, 4, 5, 6, 8, 10],
             Self::HarmonicMajor => &[0, 2, 4, 5, 7, 8, 11],
             Self::DoubleHarmonicMajor => &[0, 1, 4, 5, 7, 8, 11],
             Self::IonianSharpFive => &[0, 2, 4, 5, 8, 9, 11],
@@ -1752,6 +1756,7 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
     let last_pitch_class = usize::from(*pitches.last()? % 12);
     let scales = [
         PianoRollScale::Major,
+        PianoRollScale::MajorLocrian,
         PianoRollScale::HarmonicMajor,
         PianoRollScale::DoubleHarmonicMajor,
         PianoRollScale::IonianSharpFive,
@@ -1860,6 +1865,7 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
                 });
             let scale_preference = match scale {
                 PianoRollScale::Major => 3,
+                PianoRollScale::MajorLocrian => -35,
                 PianoRollScale::HarmonicMajor => 0,
                 PianoRollScale::DoubleHarmonicMajor => -29,
                 PianoRollScale::IonianSharpFive => -20,
