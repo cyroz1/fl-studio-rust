@@ -2952,6 +2952,7 @@ struct DawUi {
     piano_roll_time_selection_drag: Option<PianoRollTimeSelectionDrag>,
     piano_roll_pitch_selection_drag: Option<PianoRollPitchSelectionDrag>,
     piano_roll_select_mode: bool,
+    piano_roll_delete_mode: bool,
     piano_roll_mute_mode: bool,
     last_piano_roll_mute_note: Option<(u16, u16, usize)>,
     last_piano_roll_delete_note: Option<(u16, u16, usize)>,
@@ -3584,6 +3585,7 @@ impl DawUi {
             piano_roll_time_selection_drag: None,
             piano_roll_pitch_selection_drag: None,
             piano_roll_select_mode: false,
+            piano_roll_delete_mode: false,
             piano_roll_mute_mode: false,
             last_piano_roll_mute_note: None,
             last_piano_roll_delete_note: None,
@@ -18912,6 +18914,8 @@ impl DawUi {
                 ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::P));
             let select_paint =
                 ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::B));
+            let select_delete =
+                ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::D));
             let select_select =
                 ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::E));
             let select_zoom =
@@ -18959,6 +18963,7 @@ impl DawUi {
                 self.piano_roll_zoom_mode = false;
                 self.piano_roll_playback_mode = false;
                 self.piano_roll_stamp_mode = false;
+                self.piano_roll_delete_mode = false;
                 self.piano_roll_mute_mode = false;
             } else if select_paint {
                 self.piano_roll_paint_mode = true;
@@ -18966,13 +18971,25 @@ impl DawUi {
                 self.piano_roll_zoom_mode = false;
                 self.piano_roll_playback_mode = false;
                 self.piano_roll_stamp_mode = false;
+                self.piano_roll_delete_mode = false;
                 self.piano_roll_mute_mode = false;
+            } else if select_delete {
+                self.piano_roll_delete_mode = !self.piano_roll_delete_mode;
+                if self.piano_roll_delete_mode {
+                    self.piano_roll_paint_mode = false;
+                    self.piano_roll_select_mode = false;
+                    self.piano_roll_zoom_mode = false;
+                    self.piano_roll_playback_mode = false;
+                    self.piano_roll_stamp_mode = false;
+                    self.piano_roll_mute_mode = false;
+                }
             } else if select_select {
                 self.piano_roll_paint_mode = false;
                 self.piano_roll_select_mode = true;
                 self.piano_roll_zoom_mode = false;
                 self.piano_roll_playback_mode = false;
                 self.piano_roll_stamp_mode = false;
+                self.piano_roll_delete_mode = false;
                 self.piano_roll_mute_mode = false;
             } else if select_zoom {
                 self.piano_roll_paint_mode = false;
@@ -18980,6 +18997,7 @@ impl DawUi {
                 self.piano_roll_zoom_mode = true;
                 self.piano_roll_playback_mode = false;
                 self.piano_roll_stamp_mode = false;
+                self.piano_roll_delete_mode = false;
                 self.piano_roll_mute_mode = false;
             } else if select_playback {
                 self.piano_roll_paint_mode = false;
@@ -18987,6 +19005,7 @@ impl DawUi {
                 self.piano_roll_zoom_mode = false;
                 self.piano_roll_playback_mode = true;
                 self.piano_roll_stamp_mode = false;
+                self.piano_roll_delete_mode = false;
                 self.piano_roll_mute_mode = false;
             } else if select_mute {
                 self.piano_roll_mute_mode = !self.piano_roll_mute_mode;
@@ -18996,6 +19015,7 @@ impl DawUi {
                     self.piano_roll_zoom_mode = false;
                     self.piano_roll_playback_mode = false;
                     self.piano_roll_stamp_mode = false;
+                    self.piano_roll_delete_mode = false;
                 }
             }
         }
@@ -19163,6 +19183,7 @@ impl DawUi {
                         && !self.piano_roll_select_mode
                         && !self.piano_roll_zoom_mode
                         && !self.piano_roll_playback_mode
+                        && !self.piano_roll_delete_mode
                         && !self.piano_roll_mute_mode
                         && !self.piano_roll_stamp_mode,
                     "Draw",
@@ -19174,6 +19195,7 @@ impl DawUi {
                 self.piano_roll_select_mode = false;
                 self.piano_roll_zoom_mode = false;
                 self.piano_roll_playback_mode = false;
+                self.piano_roll_delete_mode = false;
                 self.piano_roll_mute_mode = false;
                 self.piano_roll_stamp_mode = false;
             }
@@ -19184,6 +19206,22 @@ impl DawUi {
             {
                 self.piano_roll_paint_mode = !self.piano_roll_paint_mode;
                 if self.piano_roll_paint_mode {
+                    self.piano_roll_select_mode = false;
+                    self.piano_roll_zoom_mode = false;
+                    self.piano_roll_playback_mode = false;
+                    self.piano_roll_delete_mode = false;
+                    self.piano_roll_mute_mode = false;
+                    self.piano_roll_stamp_mode = false;
+                }
+            }
+            if ui
+                .selectable_label(self.piano_roll_delete_mode, "Delete (D)")
+                .on_hover_text("Click or drag across notes to delete them")
+                .clicked()
+            {
+                self.piano_roll_delete_mode = !self.piano_roll_delete_mode;
+                if self.piano_roll_delete_mode {
+                    self.piano_roll_paint_mode = false;
                     self.piano_roll_select_mode = false;
                     self.piano_roll_zoom_mode = false;
                     self.piano_roll_playback_mode = false;
@@ -19201,6 +19239,7 @@ impl DawUi {
                     self.piano_roll_paint_mode = false;
                     self.piano_roll_zoom_mode = false;
                     self.piano_roll_playback_mode = false;
+                    self.piano_roll_delete_mode = false;
                     self.piano_roll_mute_mode = false;
                     self.piano_roll_stamp_mode = false;
                 }
@@ -19216,6 +19255,7 @@ impl DawUi {
                     self.piano_roll_select_mode = false;
                     self.piano_roll_zoom_mode = false;
                     self.piano_roll_playback_mode = false;
+                    self.piano_roll_delete_mode = false;
                     self.piano_roll_stamp_mode = false;
                 }
             }
@@ -19230,6 +19270,7 @@ impl DawUi {
                         self.piano_roll_select_mode = false;
                         self.piano_roll_zoom_mode = false;
                         self.piano_roll_playback_mode = false;
+                        self.piano_roll_delete_mode = false;
                         self.piano_roll_mute_mode = false;
                     }
                     ui.close();
@@ -19247,6 +19288,7 @@ impl DawUi {
                         self.piano_roll_paint_mode = false;
                         self.piano_roll_select_mode = false;
                         self.piano_roll_playback_mode = false;
+                        self.piano_roll_delete_mode = false;
                         self.piano_roll_mute_mode = false;
                         self.piano_roll_stamp_mode = false;
                     }
@@ -19260,6 +19302,7 @@ impl DawUi {
                         self.piano_roll_paint_mode = false;
                         self.piano_roll_select_mode = false;
                         self.piano_roll_zoom_mode = false;
+                        self.piano_roll_delete_mode = false;
                         self.piano_roll_mute_mode = false;
                         self.piano_roll_stamp_mode = false;
                     }
@@ -24141,6 +24184,7 @@ impl DawUi {
                 let wheel_target_hovered = response.hovered()
                     && !self.piano_roll_zoom_mode
                     && !self.piano_roll_playback_mode
+                    && !self.piano_roll_delete_mode
                     && !self.piano_roll_mute_mode
                     && (!ghost || self.piano_roll_editable_ghost_channels)
                     && self.piano_roll_mouse_wheel_action.is_some();
@@ -24189,8 +24233,11 @@ impl DawUi {
                     || (ui.input(|input| input.pointer.primary_down()) && response.hovered());
                 let delete_gesture = response.clicked_by(PointerButton::Secondary)
                     || (ui.input(|input| input.pointer.secondary_down()) && response.hovered());
-                if self.piano_roll_mute_mode
-                    && delete_gesture
+                let delete_note_gesture = (self.piano_roll_mute_mode && delete_gesture)
+                    || (self.piano_roll_delete_mode
+                        && mute_gesture
+                        && !modifiers.command);
+                if delete_note_gesture
                     && (!ghost || self.piano_roll_editable_ghost_channels)
                     && self.last_piano_roll_delete_note != Some(note_id)
                 {
@@ -24238,6 +24285,7 @@ impl DawUi {
                     && !self.piano_roll_zoom_mode
                     && !self.piano_roll_playback_mode
                     && !self.piano_roll_mute_mode
+                    && (!self.piano_roll_delete_mode || modifiers.command)
                 {
                     let additive = modifiers.shift || modifiers.command;
                     if !additive
@@ -24287,6 +24335,7 @@ impl DawUi {
                 if response.is_pointer_button_down_on()
                     && !self.piano_roll_zoom_mode
                     && !self.piano_roll_playback_mode
+                    && !self.piano_roll_delete_mode
                     && !self.piano_roll_mute_mode
                     && self.active_note_drag.is_none()
                     && !modifiers.command
@@ -24357,6 +24406,7 @@ impl DawUi {
                 if response.dragged()
                     && !self.piano_roll_zoom_mode
                     && !self.piano_roll_playback_mode
+                    && !self.piano_roll_delete_mode
                     && !self.piano_roll_mute_mode
                     && let Some(drag) = self.active_note_drag.as_ref().filter(|drag| {
                         drag.pattern_id == pattern.id
@@ -24722,6 +24772,7 @@ impl DawUi {
             if self.piano_roll_stamp_mode
                 && !self.piano_roll_select_mode
                 && !self.piano_roll_zoom_mode
+                && !self.piano_roll_delete_mode
                 && !self.piano_roll_mute_mode
                 && grid_response.clicked_by(PointerButton::Primary)
                 && let (Some(pointer), Some(channel_id)) = (
@@ -24759,6 +24810,7 @@ impl DawUi {
             if self.piano_roll_paint_mode
                 && !(self.piano_roll_select_mode
                     || self.piano_roll_zoom_mode
+                    || self.piano_roll_delete_mode
                     || self.piano_roll_mute_mode
                     || modifiers.command)
                 && ui.input(|input| input.pointer.primary_down())
@@ -24787,6 +24839,7 @@ impl DawUi {
                 && !self.piano_roll_stamp_mode
                 && !self.piano_roll_select_mode
                 && !self.piano_roll_zoom_mode
+                && !self.piano_roll_delete_mode
                 && !self.piano_roll_mute_mode
                 && !modifiers.command
                 && grid_response.double_clicked()
@@ -24826,7 +24879,7 @@ impl DawUi {
             self.last_piano_roll_audition = None;
             self.last_piano_roll_mute_note = None;
         }
-        if !ui.input(|input| input.pointer.secondary_down()) {
+        if !ui.input(|input| input.pointer.primary_down() || input.pointer.secondary_down()) {
             self.last_piano_roll_delete_note = None;
         }
         if !ui.input(|input| input.pointer.primary_down()) {
