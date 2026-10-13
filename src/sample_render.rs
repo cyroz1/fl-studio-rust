@@ -6,6 +6,7 @@ use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -551,6 +552,12 @@ impl Default for SamplerPatternRenderOptions {
             read_sample_root_note: true,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SamplerLiveNoteEvent {
+    NoteOn { channel: u8, key: u8, velocity: u8 },
+    NoteOff { channel: u8, key: u8 },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3301,6 +3308,146 @@ pub fn stream_sampler_pattern_to_device(
     )
 }
 
+/// Stream live MIDI note events through one Sampler channel while transport is stopped.
+///
+/// The pattern is used to prepare the selected channel's sample and routing state. Its saved
+/// notes are not played; note events arrive through `events` and are rendered on the worker.
+pub fn stream_sampler_midi_input_to_device(
+    document: &FlpDocument,
+    project_path: impl AsRef<Path>,
+    options: SamplerPatternRenderOptions,
+    channel_id: u16,
+    events: Receiver<SamplerLiveNoteEvent>,
+    writer: &StreamingAudioWriter,
+    cancelled: &AtomicBool,
+) -> Result<(), String> {
+    let channels = document.channels();
+    let channel = channels
+        .iter()
+        .find(|channel| channel.id() == channel_id)
+        .ok_or_else(|| format!("Sampler channel {channel_id} was not found"))?;
+    if channel.kind() != Some(0) || channel.enabled() == Some(false) {
+        return Err(format!(
+            "channel {channel_id} is not an enabled Sampler channel"
+        ));
+    }
+
+    let mut preview_document = document.clone();
+    let pattern = preview_document
+        .patterns()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|pattern| pattern.id == options.pattern_id)
+        .ok_or_else(|| format!("pattern {} was not found", options.pattern_id))?;
+    if !pattern
+        .notes
+        .iter()
+        .any(|note| note.channel_id == channel_id && !note.is_muted())
+    {
+        preview_document
+            .add_pattern_note(
+                options.pattern_id,
+                PatternNote {
+                    position: 0,
+                    flags: crate::PATTERN_NOTE_DEFAULT_FLAGS,
+                    channel_id,
+                    length: 1,
+                    key: SAMPLER_ROOT_KEY,
+                    group: 0,
+                    fine_pitch: 120,
+                    reserved: 0,
+                    release: crate::PATTERN_NOTE_DEFAULT_RELEASE,
+                    midi_channel: 0,
+                    pan: 64,
+                    velocity: 1,
+                    mod_x: 128,
+                    mod_y: 128,
+                },
+            )
+            .map_err(|error| format!("could not prepare Sampler input audition: {error}"))?;
+    }
+
+    let render = prepare_sampler_pattern_for_channel(
+        &preview_document,
+        project_path.as_ref(),
+        options,
+        Some(cancelled),
+        Some(channel_id),
+    )?;
+    let source = render
+        .sources_by_channel
+        .get(&channel_id)
+        .ok_or_else(|| format!("Sampler channel {channel_id} has no resolved sample"))?;
+    let pitch_offset = sampler_note_pitch_offset_semitones(
+        channel,
+        source.root_key,
+        document.metadata().master_pitch_cents(),
+    );
+    let empty_notes = [];
+    let mut engine = SamplerVoiceEngine::with_resampling_quality_and_pan_law(
+        &render.sources_by_channel,
+        &empty_notes,
+        render.voice_limit,
+        (f64::from(render.summary.sample_rate) * SAMPLER_RELEASE_SECONDS)
+            .round()
+            .max(1.0) as usize,
+        render.summary.sample_rate,
+        render.resampling_quality,
+        render.pan_law,
+    );
+    engine.mixer_transforms_by_channel = Some(&render.mixer_transforms_by_channel);
+
+    const LIVE_BLOCK_FRAMES: usize = 128;
+    let mut block = vec![0.0f32; LIVE_BLOCK_FRAMES * 2];
+    let mut block_start = 0u64;
+    loop {
+        check_cancelled(Some(cancelled))?;
+        if writer.is_cancelled() {
+            return Err("Sampler input audition was stopped".to_owned());
+        }
+        loop {
+            match events.try_recv() {
+                Ok(SamplerLiveNoteEvent::NoteOn {
+                    channel: midi_channel,
+                    key,
+                    velocity,
+                }) => {
+                    let input_key = u16::from(key.min(127));
+                    if channel
+                        .keyboard_key_region()
+                        .is_none_or(|(low, high)| (low..=high).contains(&input_key))
+                    {
+                        let note_key = transpose_sampler_note_key(input_key, pitch_offset);
+                        if let Some(slot_index) = engine.start_voice(ScheduledSamplerNote {
+                            start_frame: block_start,
+                            stop_frame: Some(u64::MAX),
+                            channel_id,
+                            key: note_key,
+                            velocity,
+                            pan: 64,
+                            fine_pitch_offset_cents: 0,
+                        }) && let Some(voice) = engine.voices[slot_index].as_mut()
+                        {
+                            voice.input_midi_channel = Some(midi_channel & 0x0F);
+                        }
+                    }
+                }
+                Ok(SamplerLiveNoteEvent::NoteOff { channel, key }) => {
+                    let input_key = u16::from(key.min(127));
+                    let note_key = transpose_sampler_note_key(input_key, pitch_offset);
+                    engine.release_note(channel_id, note_key, channel);
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return Ok(()),
+            }
+        }
+        engine.render_block(block_start, LIVE_BLOCK_FRAMES, &mut block);
+        render.master_output.apply(&mut block);
+        writer.write_stereo_samples(&block)?;
+        block_start = block_start.saturating_add(LIVE_BLOCK_FRAMES as u64);
+    }
+}
+
 fn stream_prepared_sampler_pattern(
     render: &PreparedSamplerPattern,
     cancelled: Option<&AtomicBool>,
@@ -4300,6 +4447,16 @@ fn prepare_sampler_pattern(
     options: SamplerPatternRenderOptions,
     cancelled: Option<&AtomicBool>,
 ) -> Result<PreparedSamplerPattern, String> {
+    prepare_sampler_pattern_for_channel(document, project_path, options, cancelled, None)
+}
+
+fn prepare_sampler_pattern_for_channel(
+    document: &FlpDocument,
+    project_path: &Path,
+    options: SamplerPatternRenderOptions,
+    cancelled: Option<&AtomicBool>,
+    channel_filter: Option<u16>,
+) -> Result<PreparedSamplerPattern, String> {
     check_cancelled(cancelled)?;
     if !(8_000..=384_000).contains(&options.sample_rate) {
         return Err("sampler render rate must be between 8000 and 384000 Hz".to_owned());
@@ -4351,6 +4508,9 @@ fn prepare_sampler_pattern(
                         })
                 })
                 .map(move |target_channel_id| (note, target_channel_id))
+        })
+        .filter(|(_, target_channel_id)| {
+            channel_filter.is_none_or(|channel_id| *target_channel_id == channel_id)
         })
         .collect::<Vec<_>>();
     let sampler_note_count = sampler_notes.len();
@@ -4594,6 +4754,9 @@ struct SamplerVoiceEngine<'a> {
 
 struct SamplerVoice {
     source: Arc<DecodedAudio>,
+    channel_id: u16,
+    key: u16,
+    input_midi_channel: Option<u8>,
     source_position: f64,
     source_step: f64,
     loop_bounds: Option<SampleBounds>,
@@ -4674,7 +4837,7 @@ impl<'a> SamplerVoiceEngine<'a> {
             {
                 let note = self.notes[self.next_note];
                 self.next_note += 1;
-                self.start_voice(note);
+                let _ = self.start_voice(note);
             }
             let output_frame = &mut output[offset * 2..offset * 2 + 2];
             for voice_slot in &mut self.voices {
@@ -4757,10 +4920,8 @@ impl<'a> SamplerVoiceEngine<'a> {
         }
     }
 
-    fn start_voice(&mut self, note: ScheduledSamplerNote) {
-        let Some(source) = self.sources_by_channel.get(&note.channel_id) else {
-            return;
-        };
+    fn start_voice(&mut self, note: ScheduledSamplerNote) -> Option<usize> {
+        let source = self.sources_by_channel.get(&note.channel_id)?;
         let slot_index = self
             .voices
             .iter()
@@ -4809,6 +4970,9 @@ impl<'a> SamplerVoiceEngine<'a> {
             .unwrap_or_default();
         self.voices[slot_index] = Some(SamplerVoice {
             source: Arc::clone(&source.audio),
+            channel_id: note.channel_id,
+            key: note.key,
+            input_midi_channel: None,
             source_position: if source.reverse {
                 source.audio.frame_count().saturating_sub(1) as f64
             } else {
@@ -4826,6 +4990,24 @@ impl<'a> SamplerVoiceEngine<'a> {
             mixer_meter_transforms,
             release_remaining: None,
         });
+        Some(slot_index)
+    }
+
+    fn release_note(&mut self, channel_id: u16, key: u16, midi_channel: u8) {
+        let voice = self
+            .voices
+            .iter_mut()
+            .filter_map(Option::as_mut)
+            .filter(|voice| {
+                voice.channel_id == channel_id
+                    && voice.key == key
+                    && voice.input_midi_channel == Some(midi_channel & 0x0F)
+                    && voice.release_remaining.is_none()
+            })
+            .min_by_key(|voice| voice.started_frame);
+        if let Some(voice) = voice {
+            voice.release_remaining = Some(self.release_frames);
+        }
     }
 }
 

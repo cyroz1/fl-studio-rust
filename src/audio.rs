@@ -20,6 +20,7 @@ const AUDIO_SOURCE_INPUT_MONITOR: u8 = 2;
 const AUDIO_SOURCE_PROJECT: u8 = 3;
 const AUDIO_SOURCE_STREAM: u8 = 4;
 const AUDIO_RING_CAPACITY: usize = 65_536;
+const LIVE_STREAM_RING_CAPACITY: usize = 4_096;
 const INPUT_MONITOR_RING_CAPACITY: usize = AUDIO_RING_CAPACITY * 2;
 const INPUT_RECORDING_BUFFER_FRAMES: usize = 65_536;
 const AUDIO_ERROR_HISTORY_LIMIT: usize = 16;
@@ -625,9 +626,17 @@ impl PlaybackState {
     }
 
     fn start_streaming(&self, initial_position_frames: u64) -> StreamingAudioWriter {
+        self.start_streaming_with_capacity(initial_position_frames, AUDIO_RING_CAPACITY)
+    }
+
+    fn start_streaming_with_capacity(
+        &self,
+        initial_position_frames: u64,
+        ring_capacity_samples: usize,
+    ) -> StreamingAudioWriter {
         self.stop();
         let playback = Arc::new(StreamingPlayback {
-            ring: AudioRingBuffer::new(AUDIO_RING_CAPACITY),
+            ring: AudioRingBuffer::new(ring_capacity_samples),
             active: AtomicBool::new(false),
             paused: AtomicBool::new(false),
             finished: AtomicBool::new(false),
@@ -945,6 +954,20 @@ impl AudioEngine {
             return Err("Start an output device before streaming audio".into());
         }
         let writer = self.playback.start_streaming(start_frame);
+        self.request_output_source(AUDIO_SOURCE_STREAM);
+        Ok(writer)
+    }
+
+    /// Begin a low-latency stream for interactive instrument audition.
+    ///
+    /// The smaller ring limits the delay between a producer's note event and audible output.
+    pub fn begin_live_streaming_playback(&self) -> Result<StreamingAudioWriter, String> {
+        if !self.output_active {
+            return Err("Start an output device before streaming audio".into());
+        }
+        let writer = self
+            .playback
+            .start_streaming_with_capacity(0, LIVE_STREAM_RING_CAPACITY);
         self.request_output_source(AUDIO_SOURCE_STREAM);
         Ok(writer)
     }

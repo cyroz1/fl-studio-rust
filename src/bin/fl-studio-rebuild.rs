@@ -25,6 +25,7 @@ use flp_rebuild::media::{
 use flp_rebuild::midi::{MidiChannelMapping, MidiFile};
 use flp_rebuild::plugins::{PluginCandidate, PluginFormat, scan_installed_plugins};
 use flp_rebuild::project_package::{ProjectPackageWorkspace, copy_unique_sample_file};
+use flp_rebuild::sample_render::SamplerLiveNoteEvent;
 use flp_rebuild::sample_render::{
     AudioClipRenderOptions, AudioClipRenderSummary, AudioFileRenderOptions, AudioRecordingSummary,
     AudioRenderEncodingOptions, AudioRenderOutput, MP3_BITRATES_KBPS, MixerStemRenderOptions,
@@ -35,7 +36,8 @@ use flp_rebuild::sample_render::{
     render_playlist_with_vst3_to_flac_cancellable, render_playlist_with_vst3_to_mp3_cancellable,
     render_playlist_with_vst3_to_ogg_cancellable, render_playlist_with_vst3_to_wav_cancellable,
     render_sampler_pattern_to_file, stream_playlist_with_vst3_to_device_with_monitor,
-    stream_sampler_pattern_to_device, write_input_recording_to_wav,
+    stream_sampler_midi_input_to_device, stream_sampler_pattern_to_device,
+    write_input_recording_to_wav,
 };
 use flp_rebuild::vst3::{
     MAX_REPORTED_TAIL_SECONDS, Vst3HostRuntime, Vst3PatternRenderOptions, Vst3PatternStreamHandle,
@@ -45,12 +47,12 @@ use flp_rebuild::{
     AutomationPoint, AutomationPointEdit, ChannelGroupSummary, ChannelSortOrder, ChannelSummary,
     ChannelType, ClawMachineOptions, FlpDocument, FlpError, FstPreset, FstPresetKind,
     LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerParameterKind,
-    MixerParameterRecord, Pattern, PatternController, PatternControllerEdit, PatternNote,
-    PatternNoteEdit, PatternNoteRotation, PayloadEncoding, PlaylistClip, PlaylistClipEdit,
-    PlaylistClipSelectionClipboard, PlaylistClipTarget, PlaylistTrack, PlaylistTrackEdit,
-    ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions, RiffMachineOptions,
-    RiffMachineQuantizeMode, ScaleLevelsOptions, TimeMarker, TimeMarkerEdit,
-    VstPluginStateMetadata,
+    MixerParameterRecord, PATTERN_NOTE_DEFAULT_FLAGS, PATTERN_NOTE_DEFAULT_RELEASE, Pattern,
+    PatternController, PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation,
+    PayloadEncoding, PlaylistClip, PlaylistClipEdit, PlaylistClipSelectionClipboard,
+    PlaylistClipTarget, PlaylistTrack, PlaylistTrackEdit, ProjectInfoEdit, ProjectSettingsEdit,
+    RandomizerOptions, RiffMachineOptions, RiffMachineQuantizeMode, ScaleLevelsOptions, TimeMarker,
+    TimeMarkerEdit, VstPluginStateMetadata,
 };
 use md5::{Digest, Md5};
 
@@ -3364,6 +3366,8 @@ struct DawUi {
     pending_vst3_stream: Option<Vst3PatternStreamHandle>,
     vst3_workers: Vec<Vst3PatternStreamHandle>,
     pending_sampler_stream: Option<PendingSamplerStream>,
+    live_sampler_input: Option<LiveSamplerInputSession>,
+    live_sampler_workers: Vec<thread::JoinHandle<()>>,
     sampler_workers: Vec<PendingSamplerStream>,
     audio_waveform_paths: BTreeMap<u16, PathBuf>,
     audio_waveforms: BTreeMap<PathBuf, Arc<AudioWaveform>>,
@@ -3492,6 +3496,15 @@ struct PendingSamplerPatternRender {
 
 struct PendingSamplerStream {
     receiver: Receiver<Result<SamplerPatternRenderSummary, String>>,
+    cancelled: Arc<AtomicBool>,
+    worker: thread::JoinHandle<()>,
+}
+
+struct LiveSamplerInputSession {
+    pattern_id: u16,
+    channel_id: u16,
+    sender: Sender<SamplerLiveNoteEvent>,
+    receiver: Receiver<Result<(), String>>,
     cancelled: Arc<AtomicBool>,
     worker: thread::JoinHandle<()>,
 }
@@ -4008,6 +4021,8 @@ impl DawUi {
             pending_vst3_stream: None,
             vst3_workers: Vec::new(),
             pending_sampler_stream: None,
+            live_sampler_input: None,
+            live_sampler_workers: Vec::new(),
             sampler_workers: Vec::new(),
             audio_waveform_paths: BTreeMap::new(),
             audio_waveforms: BTreeMap::new(),
@@ -7209,6 +7224,10 @@ impl DawUi {
                 return;
             }
         };
+        if let Some(session) = self.live_sampler_input.take() {
+            session.cancelled.store(true, Ordering::Release);
+            self.live_sampler_workers.push(session.worker);
+        }
         let writer = match engine.begin_streaming_playback_from_frame(start_frame) {
             Ok(writer) => writer,
             Err(error) => {
@@ -7434,6 +7453,7 @@ impl DawUi {
         self.stop_midi_playlist_playback();
         self.stop_midi_clock();
         self.stop_midi_pattern_preview();
+        self.stop_live_sampler_input();
         if let Some(pending) = self.pending_audio_render.take() {
             pending.cancelled.store(true, Ordering::Release);
             self.audio_render_workers.push(pending);
@@ -30192,6 +30212,271 @@ impl DawUi {
         }
     }
 
+    fn start_live_sampler_input(&mut self, pattern_id: u16, channel_id: u16) -> bool {
+        let Some(document) = self.document.as_ref().cloned() else {
+            return false;
+        };
+        let Some(channel) = document
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id() == channel_id)
+        else {
+            return false;
+        };
+        if channel.kind() != Some(0) {
+            self.status = "Select a Sampler channel for live MIDI audition".to_owned();
+            return false;
+        }
+        if channel.enabled() == Some(false) {
+            self.status = "Enable the selected Sampler channel for live MIDI audition".to_owned();
+            return false;
+        }
+        let Some(project_path) = self.sample_project_path() else {
+            self.status = "Save the project before auditioning its Sampler input".to_owned();
+            return false;
+        };
+        let mut preview_document = document;
+        let pattern = match preview_document.patterns() {
+            Ok(patterns) => patterns
+                .into_iter()
+                .find(|pattern| pattern.id == pattern_id),
+            Err(error) => {
+                self.status = format!("Could not decode Sampler input target: {error}");
+                return false;
+            }
+        };
+        let Some(pattern) = pattern else {
+            self.status = format!("Pattern {pattern_id} was not found");
+            return false;
+        };
+        if !pattern
+            .notes
+            .iter()
+            .any(|note| note.channel_id == channel_id && !note.is_muted())
+            && let Err(error) = preview_document.add_pattern_note(
+                pattern_id,
+                PatternNote {
+                    position: 0,
+                    flags: PATTERN_NOTE_DEFAULT_FLAGS,
+                    channel_id,
+                    length: 1,
+                    key: 60,
+                    group: 0,
+                    fine_pitch: 120,
+                    reserved: 0,
+                    release: PATTERN_NOTE_DEFAULT_RELEASE,
+                    midi_channel: 0,
+                    pan: 64,
+                    velocity: 1,
+                    mod_x: 128,
+                    mod_y: 128,
+                },
+            )
+        {
+            self.status = format!("Could not prepare Sampler input audition: {error}");
+            return false;
+        }
+        let project_bytes = match preview_document.encode_lossless() {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.status = format!("Could not encode Sampler input audition: {error}");
+                return false;
+            }
+        };
+
+        if self.audio_engine.is_none() {
+            match AudioEngine::start(&self.audio_settings) {
+                Ok(engine) => self.audio_engine = Some(engine),
+                Err(error) => {
+                    self.status = format!("Could not start audio output: {error}");
+                    return false;
+                }
+            }
+        }
+        let Some(engine) = self.audio_engine.as_ref() else {
+            self.status = "Audio output is not available".to_owned();
+            return false;
+        };
+        if !engine.output_active() {
+            self.status =
+                "Enable an output device in Audio settings before Sampler audition".to_owned();
+            return false;
+        }
+        let sample_rate = engine.sample_rate();
+        engine.set_test_tone(false);
+        if self.audio_monitor_input {
+            let _ = engine.set_input_monitor(false);
+        }
+        self.audio_test_tone = false;
+        self.audio_monitor_input = false;
+        let writer = match engine.begin_live_streaming_playback() {
+            Ok(writer) => writer,
+            Err(error) => {
+                self.status = format!("Could not start Sampler input audition: {error}");
+                return false;
+            }
+        };
+
+        let (event_sender, event_receiver) = mpsc::channel();
+        let (result_sender, result_receiver) = mpsc::sync_channel(1);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let read_sample_root_note = self.read_sample_root_note;
+        let resampling_quality = self.live_resampling_quality;
+        let worker = thread::Builder::new()
+            .name("sampler-midi-input".to_owned())
+            .spawn(move || {
+                let result = FlpDocument::parse(&project_bytes)
+                    .map_err(|error| error.to_string())
+                    .and_then(|document| {
+                        stream_sampler_midi_input_to_device(
+                            &document,
+                            &project_path,
+                            SamplerPatternRenderOptions {
+                                pattern_id,
+                                sample_rate,
+                                resampling_quality,
+                                read_sample_root_note,
+                                ..SamplerPatternRenderOptions::default()
+                            },
+                            channel_id,
+                            event_receiver,
+                            &writer,
+                            &worker_cancelled,
+                        )
+                    });
+                writer.finish();
+                let _ = result_sender.send(result);
+            });
+        match worker {
+            Ok(worker) => {
+                self.live_sampler_input = Some(LiveSamplerInputSession {
+                    pattern_id,
+                    channel_id,
+                    sender: event_sender,
+                    receiver: result_receiver,
+                    cancelled,
+                    worker,
+                });
+                self.status =
+                    format!("Preparing live MIDI audition on Sampler channel {channel_id}");
+                true
+            }
+            Err(error) => {
+                engine.stop_project_playback();
+                self.status = format!("Could not start Sampler input worker: {error}");
+                false
+            }
+        }
+    }
+
+    fn stop_live_sampler_input(&mut self) {
+        if let Some(session) = self.live_sampler_input.take() {
+            session.cancelled.store(true, Ordering::Release);
+            self.live_sampler_workers.push(session.worker);
+        }
+    }
+
+    fn handle_live_sampler_input(&mut self, event: MidiInputEvent) {
+        let live_event = match event {
+            MidiInputEvent::NoteOn {
+                channel,
+                key,
+                velocity,
+            } if velocity > 0 => Some(SamplerLiveNoteEvent::NoteOn {
+                channel,
+                key,
+                velocity,
+            }),
+            MidiInputEvent::NoteOn { channel, key, .. }
+            | MidiInputEvent::NoteOff { channel, key, .. } => {
+                Some(SamplerLiveNoteEvent::NoteOff { channel, key })
+            }
+            _ => None,
+        };
+        let Some(live_event) = live_event else {
+            return;
+        };
+        if self.playing {
+            return;
+        }
+        let (Some(pattern_id), Some(channel_id)) =
+            (self.selected_pattern, self.selected_note_channel)
+        else {
+            return;
+        };
+        if self.live_sampler_input.as_ref().is_some_and(|session| {
+            session.pattern_id != pattern_id || session.channel_id != channel_id
+        }) {
+            self.stop_live_sampler_input();
+            if let Some(engine) = &self.audio_engine {
+                engine.stop_project_playback();
+            }
+        }
+        if self.live_sampler_input.is_none()
+            && matches!(live_event, SamplerLiveNoteEvent::NoteOn { .. })
+            && !self.start_live_sampler_input(pattern_id, channel_id)
+        {
+            return;
+        }
+        if let Some(session) = &self.live_sampler_input
+            && session.sender.send(live_event).is_err()
+        {
+            self.stop_live_sampler_input();
+            if let Some(engine) = &self.audio_engine {
+                engine.stop_project_playback();
+            }
+        }
+    }
+
+    fn poll_live_sampler_input(&mut self) {
+        if self.live_sampler_input.as_ref().is_some_and(|session| {
+            self.playing
+                || self.midi_input_connection.is_none()
+                || Some(session.pattern_id) != self.selected_pattern
+                || Some(session.channel_id) != self.selected_note_channel
+        }) {
+            self.stop_live_sampler_input();
+            if let Some(engine) = &self.audio_engine {
+                engine.stop_project_playback();
+            }
+        }
+        let completed = self.live_sampler_input.as_ref().and_then(|session| {
+            match session.receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Disconnected) => {
+                    Some(Err("Sampler input worker stopped unexpectedly".to_owned()))
+                }
+                Err(TryRecvError::Empty) => None,
+            }
+        });
+        if let Some(result) = completed {
+            let panicked = self
+                .live_sampler_input
+                .take()
+                .is_some_and(|session| session.worker.join().is_err());
+            if let Some(engine) = &self.audio_engine {
+                engine.stop_project_playback();
+            }
+            if panicked {
+                self.status = "Sampler input worker panicked".to_owned();
+            } else if let Err(error) = result {
+                self.status = format!("Sampler input audition failed: {error}");
+            }
+        }
+        let mut index = 0;
+        while index < self.live_sampler_workers.len() {
+            if self.live_sampler_workers[index].is_finished() {
+                let worker = self.live_sampler_workers.swap_remove(index);
+                if worker.join().is_err() {
+                    self.status = "A cancelled Sampler input worker panicked".to_owned();
+                }
+            } else {
+                index += 1;
+            }
+        }
+    }
+
     fn poll_midi_input(&mut self, history_snapshot_available: bool) {
         for _ in 0..midi_input::MIDI_INPUT_QUEUE_CAPACITY {
             let message = match self.midi_message_receiver.try_recv() {
@@ -30199,6 +30484,7 @@ impl DawUi {
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             };
             self.forward_midi_input_thru(message.event);
+            self.handle_live_sampler_input(message.event);
             self.midi_activity = Some((describe_event(message.event), message.received_at));
             if let MidiInputEvent::ControlChange { channel, .. }
             | MidiInputEvent::PitchBend { channel, .. } = message.event
@@ -32569,6 +32855,7 @@ impl eframe::App for DawUi {
         self.history_snapshot_available_this_frame =
             frame_snapshot.is_some() || self.pending_history_snapshot.is_some();
         self.poll_midi_input(self.history_snapshot_available_this_frame);
+        self.poll_live_sampler_input();
         self.finish_midi_output_test_note();
         self.service_midi_pattern_preview();
         self.service_midi_playlist_playback();
