@@ -7814,6 +7814,16 @@ impl DawUi {
                     self.paste_selected_playlist_clip();
                     ui.close();
                 }
+                if ui
+                    .add_enabled(
+                        self.view == MainView::Playlist && self.document.is_some(),
+                        egui::Button::new("Duplicate Playlist clips  Ctrl/Cmd+B"),
+                    )
+                    .clicked()
+                {
+                    self.duplicate_selected_playlist_clips();
+                    ui.close();
+                }
                 let can_merge_pattern_clips = self.view == MainView::Playlist
                     && self
                         .selected_arrangement
@@ -14387,6 +14397,122 @@ impl DawUi {
             self.paste_playlist_clip_into_arrangement(arrangement_id, None);
         } else {
             self.status = "No Playlist arrangement is available for paste".to_owned();
+        }
+    }
+
+    fn duplicate_selected_playlist_clips(&mut self) {
+        let Some(document) = self.document.as_ref() else {
+            self.status = "Open a project to duplicate Playlist clips".to_owned();
+            return;
+        };
+        let arrangements = match document.arrangements() {
+            Ok(arrangements) => arrangements,
+            Err(error) => {
+                self.status = format!("Could not inspect Playlist arrangements: {error}");
+                return;
+            }
+        };
+        let arrangement_id = self
+            .selected_arrangement
+            .or_else(|| arrangements.first().map(|arrangement| arrangement.id));
+        let Some(arrangement_id) = arrangement_id else {
+            self.status = "No Playlist arrangement is available to duplicate".to_owned();
+            return;
+        };
+        let mut matching_arrangements = arrangements
+            .iter()
+            .filter(|arrangement| arrangement.id == arrangement_id);
+        let Some(arrangement) = matching_arrangements.next() else {
+            self.status = "The target Playlist arrangement no longer exists".to_owned();
+            return;
+        };
+        if matching_arrangements.next().is_some() {
+            self.status = "The target Playlist arrangement ID is ambiguous".to_owned();
+            return;
+        }
+
+        let has_selection = self.selected_arrangement == Some(arrangement_id)
+            && (!self.selected_playlist_clips.is_empty() || self.selected_clip.is_some());
+        let duplicate_all = !has_selection;
+        let clip_indices = if duplicate_all {
+            (0..arrangement.clips.len()).collect::<Vec<_>>()
+        } else if self.selected_playlist_clips.is_empty() {
+            self.selected_clip
+                .filter(|index| *index < arrangement.clips.len())
+                .into_iter()
+                .collect::<Vec<_>>()
+        } else {
+            self.selected_playlist_clips
+                .iter()
+                .copied()
+                .filter(|index| *index < arrangement.clips.len())
+                .collect::<Vec<_>>()
+        };
+        if clip_indices.is_empty() {
+            self.status = "No Playlist clips are available to duplicate".to_owned();
+            return;
+        }
+
+        let Some(duplicate_position) = clip_indices
+            .iter()
+            .filter_map(|index| arrangement.clips.get(*index))
+            .try_fold(0u32, |right_edge, clip| {
+                clip.position_ticks
+                    .checked_add(clip.length_ticks)
+                    .map(|clip_end| right_edge.max(clip_end))
+            })
+        else {
+            self.status = "A Playlist clip end position would overflow".to_owned();
+            return;
+        };
+        let Some(raw_track_index) = clip_indices
+            .iter()
+            .filter_map(|index| arrangement.clips.get(*index))
+            .map(|clip| clip.raw_track_index)
+            .max()
+        else {
+            self.status = "No Playlist clips are available to duplicate".to_owned();
+            return;
+        };
+        let clipboard = match document.copy_playlist_clip_selection(arrangement_id, &clip_indices) {
+            Ok(clipboard) => clipboard,
+            Err(error) => {
+                self.status = format!("Could not prepare Playlist clip duplicate: {error}");
+                return;
+            }
+        };
+
+        let mut updated = document.clone();
+        match updated.paste_playlist_clip_selection(
+            arrangement_id,
+            &clipboard,
+            duplicate_position,
+            raw_track_index,
+        ) {
+            Ok(inserted_indices) => {
+                self.stop_project_playback();
+                self.document = Some(updated);
+                self.selected_arrangement = Some(arrangement_id);
+                self.selected_clip = inserted_indices.first().copied();
+                self.selected_playlist_clips = inserted_indices.iter().copied().collect();
+                self.playlist_selection_anchor = self.selected_clip;
+                self.active_playlist_clip_drag = None;
+                self.dirty = true;
+                self.status = if duplicate_all {
+                    format!(
+                        "Duplicated all {} Playlist clips to the right",
+                        inserted_indices.len()
+                    )
+                } else {
+                    format!(
+                        "Duplicated {} selected Playlist clips to the right",
+                        inserted_indices.len()
+                    )
+                };
+            }
+            Err(error) => {
+                self.status = format!("Could not duplicate Playlist clips: {error}");
+            }
         }
     }
 
@@ -29490,6 +29616,7 @@ impl eframe::App for DawUi {
             copy_playlist_clip_requested,
             cut_playlist_clip_requested,
             paste_playlist_clip_requested,
+            duplicate_playlist_clips_requested,
             merge_playlist_pattern_clips_requested,
             select_all_playlist_clips_requested,
             deselect_playlist_clips_requested,
@@ -29500,6 +29627,7 @@ impl eframe::App for DawUi {
                     input.consume_key(egui::Modifiers::COMMAND, egui::Key::C),
                     input.consume_key(egui::Modifiers::COMMAND, egui::Key::X),
                     input.consume_key(egui::Modifiers::COMMAND, egui::Key::V),
+                    input.consume_key(egui::Modifiers::COMMAND, egui::Key::B),
                     input.consume_key(egui::Modifiers::COMMAND, egui::Key::G),
                     input.consume_key(egui::Modifiers::COMMAND, egui::Key::A),
                     input.consume_key(egui::Modifiers::COMMAND, egui::Key::D),
@@ -29507,7 +29635,7 @@ impl eframe::App for DawUi {
                 )
             })
         } else {
-            (false, false, false, false, false, false, false)
+            (false, false, false, false, false, false, false, false)
         };
         if copy_playlist_clip_requested {
             self.copy_selected_playlist_clip();
@@ -29515,6 +29643,9 @@ impl eframe::App for DawUi {
             self.cut_selected_playlist_clip();
         } else if paste_playlist_clip_requested {
             self.paste_selected_playlist_clip();
+        }
+        if duplicate_playlist_clips_requested {
+            self.duplicate_selected_playlist_clips();
         }
         if merge_playlist_pattern_clips_requested {
             self.merge_selected_playlist_pattern_clips();
