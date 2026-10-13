@@ -900,12 +900,12 @@ fn take_mixer_insert_peaks(meters: &MixerTrackPeakMeters) -> Vec<MixerInsertPeak
 
 /// Render audio-channel Playlist clips into a WAV using the selected bit depth and channel mode.
 ///
-/// This early render path uses the project's tempo map, clip positions, observed audio source
-/// offsets, and decoded audio-channel volume/pan. Clips with default `-1` offsets use the full
-/// source file. The raw volume/pan mapping is provisional and has not been compared against
-/// native FL Studio output. Unstretched sources follow project Master pitch when their channel
-/// enables it. Tempo-sync and time-stretch modes, Pattern instruments, plug-ins, and Mixer effects
-/// are not rendered.
+/// This early render path uses the project's tempo map, clip positions, decoded audio source
+/// windows, and decoded audio-channel volume/pan. Legacy source offsets use milliseconds; inferred
+/// 88-byte tick windows convert at the project base tempo. The raw volume/pan mapping is
+/// provisional and has not been compared against native FL Studio output. Unstretched sources
+/// follow project Master pitch when their channel enables it. Tempo-sync and time-stretch modes,
+/// Pattern instruments, plug-ins, and Mixer effects are not rendered.
 pub fn render_audio_clips_to_wav(
     document: &FlpDocument,
     project_path: impl AsRef<Path>,
@@ -3486,6 +3486,7 @@ fn prepare_audio_clip_render(
     if ppq == 0 {
         return Err("project PPQ must be greater than zero".to_owned());
     }
+    let base_tempo_bpm = document.metadata().tempo_bpm().unwrap_or(140.0);
     let tempo_map = PlaylistTempoMap::for_arrangement(document, options.arrangement_id)?;
     let pan_law = project_pan_law(document);
     let master_pitch_cents = document.metadata().master_pitch_cents();
@@ -3654,7 +3655,8 @@ fn prepare_audio_clip_render(
                 audio.channels.len()
             ));
         }
-        let source_bounds = sample_source_bounds(clip, audio, *clip_index)?;
+        let source_bounds =
+            sample_source_bounds_at_project_tempo(clip, audio, *clip_index, ppq, base_tempo_bpm)?;
         let absolute_start_tick = u64::from(clip.position_ticks);
         let absolute_end_tick = absolute_start_tick
             .checked_add(u64::from(clip.length_ticks))
@@ -5482,7 +5484,77 @@ fn sample_source_bounds(
     audio: &DecodedAudio,
     clip_index: usize,
 ) -> Result<SampleBounds, String> {
+    sample_source_bounds_with_timing(clip, audio, clip_index, None)
+}
+
+fn sample_source_bounds_at_project_tempo(
+    clip: &PlaylistClip,
+    audio: &DecodedAudio,
+    clip_index: usize,
+    ppq: u16,
+    base_tempo_bpm: f64,
+) -> Result<SampleBounds, String> {
+    if clip.source_window_ticks().is_none() {
+        return sample_source_bounds(clip, audio, clip_index);
+    }
+    sample_source_bounds_with_timing(clip, audio, clip_index, Some((ppq, base_tempo_bpm)))
+}
+
+fn sample_source_bounds_with_timing(
+    clip: &PlaylistClip,
+    audio: &DecodedAudio,
+    clip_index: usize,
+    timing: Option<(u16, f64)>,
+) -> Result<SampleBounds, String> {
     let frames = audio.frame_count();
+    if let Some((start_tick, end_tick)) = clip.source_window_ticks() {
+        if start_tick == 0 && end_tick == 0 {
+            if frames == 0 {
+                return Err(format!("Playlist clip {clip_index} references empty audio"));
+            }
+            return Ok(SampleBounds {
+                start: 0,
+                end: frames,
+            });
+        }
+        let Some((ppq, base_tempo_bpm)) = timing else {
+            if clip.uses_full_source_window() {
+                if frames == 0 {
+                    return Err(format!("Playlist clip {clip_index} references empty audio"));
+                }
+                return Ok(SampleBounds {
+                    start: 0,
+                    end: frames,
+                });
+            }
+            return Err(format!(
+                "Playlist clip {clip_index} tick source window needs project timing"
+            ));
+        };
+        if ppq == 0 || !base_tempo_bpm.is_finite() || base_tempo_bpm <= 0.0 {
+            return Err(format!(
+                "Playlist clip {clip_index} tick source window has invalid project timing"
+            ));
+        }
+        let ticks_to_frame = |ticks: u32| -> Result<usize, String> {
+            let frame = f64::from(ticks) * 60.0 * f64::from(audio.sample_rate)
+                / (f64::from(ppq) * base_tempo_bpm);
+            if !frame.is_finite() || frame < 0.0 || frame > usize::MAX as f64 {
+                return Err(format!(
+                    "Playlist clip {clip_index} tick source window is out of range"
+                ));
+            }
+            Ok(frame.round() as usize)
+        };
+        let start = ticks_to_frame(start_tick)?.min(frames);
+        let end = ticks_to_frame(end_tick)?.min(frames);
+        if start >= end {
+            return Err(format!(
+                "Playlist clip {clip_index} tick source window is empty or outside the audio"
+            ));
+        }
+        return Ok(SampleBounds { start, end });
+    }
     if clip.uses_full_source_window() {
         if frames == 0 {
             return Err(format!("Playlist clip {clip_index} references empty audio"));
