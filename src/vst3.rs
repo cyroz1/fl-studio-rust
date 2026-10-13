@@ -2551,7 +2551,10 @@ fn scheduled_pattern_events(
     }
     let mut events = Vec::new();
     let mut note_count = 0usize;
-    for note in notes.iter().filter(|note| note.channel_id == channel_id) {
+    for note in notes
+        .iter()
+        .filter(|note| note.channel_id == channel_id && !note.is_muted())
+    {
         if note.key > 127 {
             return Err(format!(
                 "pattern channel {channel_id} contains key {} outside the MIDI note range",

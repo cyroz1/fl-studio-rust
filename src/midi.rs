@@ -1697,6 +1697,9 @@ fn tracks_for_notes(
     }
     let mut grouped = BTreeMap::<u16, Vec<MidiExportNote>>::new();
     for note in notes {
+        if note.is_muted() {
+            continue;
+        }
         let track_notes = grouped.entry(note.channel_id).or_default();
         if track_notes.len() >= MAX_EXPORTED_NOTES {
             return Err(MidiError::InvalidExport(

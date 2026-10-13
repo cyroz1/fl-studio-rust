@@ -3874,6 +3874,9 @@ pub(crate) fn schedule_playlist_pattern_notes<'a>(
                 .checked_mul(loop_length)
                 .ok_or_else(|| "pattern repeat position overflow".to_owned())?;
             for (note_index, note) in pattern.notes.iter().enumerate() {
+                if note.is_muted() {
+                    continue;
+                }
                 let relative_start = repeat_start
                     .checked_add(u64::from(note.position))
                     .ok_or_else(|| "repeated pattern note position overflow".to_owned())?;
@@ -4331,6 +4334,7 @@ fn prepare_sampler_pattern(
         .notes
         .iter()
         .enumerate()
+        .filter(|(_, note)| !note.is_muted())
         .flat_map(|(note_index, note)| {
             channel_router
                 .targets_for_note(note.channel_id, note_index as u64, note.key)

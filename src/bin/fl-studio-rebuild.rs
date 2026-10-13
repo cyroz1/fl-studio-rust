@@ -1265,6 +1265,7 @@ enum PianoRollSelectionCommand {
     All,
     Invert,
     Clear,
+    Muted,
     RandomOne,
     RandomMore,
     Odd,
@@ -2951,6 +2952,9 @@ struct DawUi {
     piano_roll_time_selection_drag: Option<PianoRollTimeSelectionDrag>,
     piano_roll_pitch_selection_drag: Option<PianoRollPitchSelectionDrag>,
     piano_roll_select_mode: bool,
+    piano_roll_mute_mode: bool,
+    last_piano_roll_mute_note: Option<(u16, u16, usize)>,
+    last_piano_roll_delete_note: Option<(u16, u16, usize)>,
     piano_roll_selection_drag: Option<PianoRollSelectionDrag>,
     piano_roll_zoom_mode: bool,
     piano_roll_zoom_drag: Option<PianoRollZoomDrag>,
@@ -3580,6 +3584,9 @@ impl DawUi {
             piano_roll_time_selection_drag: None,
             piano_roll_pitch_selection_drag: None,
             piano_roll_select_mode: false,
+            piano_roll_mute_mode: false,
+            last_piano_roll_mute_note: None,
+            last_piano_roll_delete_note: None,
             piano_roll_selection_drag: None,
             piano_roll_zoom_mode: false,
             piano_roll_zoom_drag: None,
@@ -17962,6 +17969,14 @@ impl DawUi {
                 PianoRollSelectionCommand::Stacked => {
                     piano_roll_overlap_note_selection(pattern, pattern_id, channel_id, true)
                 }
+                PianoRollSelectionCommand::Muted => pattern
+                    .notes
+                    .iter()
+                    .filter(|note| note.channel_id == channel_id)
+                    .enumerate()
+                    .filter(|(_, note)| note.is_muted())
+                    .map(|(note_index, _)| (pattern_id, channel_id, note_index))
+                    .collect(),
                 _ => Vec::new(),
             })
             .unwrap_or_default();
@@ -17984,6 +17999,10 @@ impl DawUi {
                     )
                 }
                 PianoRollSelectionCommand::Clear => "Note selection cleared".to_owned(),
+                PianoRollSelectionCommand::Muted => {
+                    self.selected_piano_notes.extend(special_note_ids);
+                    format!("Selected {} muted notes", self.selected_piano_notes.len())
+                }
                 PianoRollSelectionCommand::Odd => {
                     self.selected_piano_notes.extend(special_note_ids);
                     format!(
@@ -18059,6 +18078,87 @@ impl DawUi {
         self.piano_roll_selection_drag = None;
         self.active_note_drag = None;
         self.status = status;
+    }
+
+    fn set_piano_roll_notes_muted(
+        &mut self,
+        pattern_id: u16,
+        note_ids: &[(u16, usize)],
+        muted: bool,
+    ) {
+        let note_ids = note_ids.iter().copied().collect::<BTreeSet<_>>();
+        if note_ids.is_empty() {
+            self.status = "No Piano roll notes to update".to_owned();
+            return;
+        }
+        let Some(document) = self.document.as_ref() else {
+            self.status = "No project is open".to_owned();
+            return;
+        };
+        let mut updated = document.clone();
+        let result = note_ids.iter().try_for_each(|(channel_id, note_index)| {
+            updated.edit_pattern_note(
+                pattern_id,
+                *channel_id,
+                *note_index,
+                PatternNoteEdit {
+                    muted: Some(muted),
+                    ..PatternNoteEdit::default()
+                },
+            )
+        });
+        match result {
+            Ok(()) => {
+                let count = note_ids.len();
+                self.document = Some(updated);
+                self.dirty = true;
+                self.status = format!(
+                    "{} {count} Piano roll note{}",
+                    if muted { "Muted" } else { "Unmuted" },
+                    if count == 1 { "" } else { "s" }
+                );
+            }
+            Err(error) => {
+                self.status = format!("Could not change Piano roll note mute state: {error}");
+            }
+        }
+    }
+
+    fn set_piano_roll_selection_muted(&mut self, muted: bool) {
+        let Some((pattern_id, channel_id)) = self.selected_pattern.zip(self.selected_note_channel)
+        else {
+            self.status = "Choose a Piano roll pattern and channel first".to_owned();
+            return;
+        };
+        let mut note_ids = self
+            .selected_piano_notes
+            .iter()
+            .filter(|(selected_pattern, _, _)| *selected_pattern == pattern_id)
+            .map(|(_, channel_id, note_index)| (*channel_id, *note_index))
+            .collect::<BTreeSet<_>>();
+        if note_ids.is_empty()
+            && let Some(pattern) = self.document.as_ref().and_then(|document| {
+                document
+                    .patterns()
+                    .ok()?
+                    .into_iter()
+                    .find(|pattern| pattern.id == pattern_id)
+            })
+        {
+            note_ids.extend(
+                pattern
+                    .notes
+                    .iter()
+                    .filter(|note| note.channel_id == channel_id)
+                    .enumerate()
+                    .map(|(note_index, _)| (channel_id, note_index)),
+            );
+        }
+        self.set_piano_roll_notes_muted(
+            pattern_id,
+            &note_ids.into_iter().collect::<Vec<_>>(),
+            muted,
+        );
     }
 
     fn select_time_around_piano_roll_selection(&mut self) {
@@ -18672,15 +18772,14 @@ impl DawUi {
             .filter(|channel| channel.kind() == Some(0) && channel.enabled() != Some(false))
             .map(|channel| channel.id())
             .collect();
-        let has_sampler_notes = self
-            .selected_pattern
-            .and_then(|pattern_id| patterns.iter().find(|pattern| pattern.id == pattern_id))
-            .is_some_and(|pattern| {
-                pattern
-                    .notes
-                    .iter()
-                    .any(|note| sampler_channel_ids.contains(&note.channel_id))
-            });
+        let has_sampler_notes =
+            self.selected_pattern
+                .and_then(|pattern_id| patterns.iter().find(|pattern| pattern.id == pattern_id))
+                .is_some_and(|pattern| {
+                    pattern.notes.iter().any(|note| {
+                        !note.is_muted() && sampler_channel_ids.contains(&note.channel_id)
+                    })
+                });
         let mut add_note_requested = false;
         let mut open_midi_requested = false;
         let mut export_midi_requested = false;
@@ -18713,12 +18812,22 @@ impl DawUi {
         let mut quick_quantize_start_requested = false;
         let mut discard_note_lengths_requested = false;
         let mut open_pattern_time_signature_dialog = false;
+        let mut note_mute_requested = None;
         let mut note_nudge_requested = None;
         let mut note_rotation_requested = None;
         if ui.memory(|memory| memory.focused().is_none()) {
             delete_selection_requested = ui.input_mut(|input| {
                 input.consume_key(egui::Modifiers::NONE, egui::Key::Delete)
                     || input.consume_key(egui::Modifiers::NONE, egui::Key::Backspace)
+            });
+            note_mute_requested = ui.input_mut(|input| {
+                if input.consume_key(egui::Modifiers::ALT | egui::Modifiers::SHIFT, egui::Key::M) {
+                    Some(false)
+                } else if input.consume_key(egui::Modifiers::ALT, egui::Key::M) {
+                    Some(true)
+                } else {
+                    None
+                }
             });
             open_pattern_time_signature_dialog = ui.input_mut(|input| {
                 input.consume_key(
@@ -18809,6 +18918,8 @@ impl DawUi {
                 ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Z));
             let select_playback =
                 ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Y));
+            let select_mute =
+                ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::T));
             let cycle_event_target =
                 ui.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::F));
             if select_all_notes {
@@ -18848,30 +18959,44 @@ impl DawUi {
                 self.piano_roll_zoom_mode = false;
                 self.piano_roll_playback_mode = false;
                 self.piano_roll_stamp_mode = false;
+                self.piano_roll_mute_mode = false;
             } else if select_paint {
                 self.piano_roll_paint_mode = true;
                 self.piano_roll_select_mode = false;
                 self.piano_roll_zoom_mode = false;
                 self.piano_roll_playback_mode = false;
                 self.piano_roll_stamp_mode = false;
+                self.piano_roll_mute_mode = false;
             } else if select_select {
                 self.piano_roll_paint_mode = false;
                 self.piano_roll_select_mode = true;
                 self.piano_roll_zoom_mode = false;
                 self.piano_roll_playback_mode = false;
                 self.piano_roll_stamp_mode = false;
+                self.piano_roll_mute_mode = false;
             } else if select_zoom {
                 self.piano_roll_paint_mode = false;
                 self.piano_roll_select_mode = false;
                 self.piano_roll_zoom_mode = true;
                 self.piano_roll_playback_mode = false;
                 self.piano_roll_stamp_mode = false;
+                self.piano_roll_mute_mode = false;
             } else if select_playback {
                 self.piano_roll_paint_mode = false;
                 self.piano_roll_select_mode = false;
                 self.piano_roll_zoom_mode = false;
                 self.piano_roll_playback_mode = true;
                 self.piano_roll_stamp_mode = false;
+                self.piano_roll_mute_mode = false;
+            } else if select_mute {
+                self.piano_roll_mute_mode = !self.piano_roll_mute_mode;
+                if self.piano_roll_mute_mode {
+                    self.piano_roll_paint_mode = false;
+                    self.piano_roll_select_mode = false;
+                    self.piano_roll_zoom_mode = false;
+                    self.piano_roll_playback_mode = false;
+                    self.piano_roll_stamp_mode = false;
+                }
             }
         }
         if let Some((tick_delta, semitone_delta)) = note_nudge_requested
@@ -19038,6 +19163,7 @@ impl DawUi {
                         && !self.piano_roll_select_mode
                         && !self.piano_roll_zoom_mode
                         && !self.piano_roll_playback_mode
+                        && !self.piano_roll_mute_mode
                         && !self.piano_roll_stamp_mode,
                     "Draw",
                 )
@@ -19048,6 +19174,7 @@ impl DawUi {
                 self.piano_roll_select_mode = false;
                 self.piano_roll_zoom_mode = false;
                 self.piano_roll_playback_mode = false;
+                self.piano_roll_mute_mode = false;
                 self.piano_roll_stamp_mode = false;
             }
             if ui
@@ -19060,6 +19187,7 @@ impl DawUi {
                     self.piano_roll_select_mode = false;
                     self.piano_roll_zoom_mode = false;
                     self.piano_roll_playback_mode = false;
+                    self.piano_roll_mute_mode = false;
                     self.piano_roll_stamp_mode = false;
                 }
             }
@@ -19071,6 +19199,21 @@ impl DawUi {
                 self.piano_roll_select_mode = !self.piano_roll_select_mode;
                 if self.piano_roll_select_mode {
                     self.piano_roll_paint_mode = false;
+                    self.piano_roll_zoom_mode = false;
+                    self.piano_roll_playback_mode = false;
+                    self.piano_roll_mute_mode = false;
+                    self.piano_roll_stamp_mode = false;
+                }
+            }
+            if ui
+                .selectable_label(self.piano_roll_mute_mode, "Mute (T)")
+                .on_hover_text("Click or drag across notes to toggle mute")
+                .clicked()
+            {
+                self.piano_roll_mute_mode = !self.piano_roll_mute_mode;
+                if self.piano_roll_mute_mode {
+                    self.piano_roll_paint_mode = false;
+                    self.piano_roll_select_mode = false;
                     self.piano_roll_zoom_mode = false;
                     self.piano_roll_playback_mode = false;
                     self.piano_roll_stamp_mode = false;
@@ -19087,6 +19230,7 @@ impl DawUi {
                         self.piano_roll_select_mode = false;
                         self.piano_roll_zoom_mode = false;
                         self.piano_roll_playback_mode = false;
+                        self.piano_roll_mute_mode = false;
                     }
                     ui.close();
                 }
@@ -19103,6 +19247,7 @@ impl DawUi {
                         self.piano_roll_paint_mode = false;
                         self.piano_roll_select_mode = false;
                         self.piano_roll_playback_mode = false;
+                        self.piano_roll_mute_mode = false;
                         self.piano_roll_stamp_mode = false;
                     }
                 }
@@ -19115,11 +19260,33 @@ impl DawUi {
                         self.piano_roll_paint_mode = false;
                         self.piano_roll_select_mode = false;
                         self.piano_roll_zoom_mode = false;
+                        self.piano_roll_mute_mode = false;
                         self.piano_roll_stamp_mode = false;
                     }
                 }
             });
             ui.menu_button("Edit", |ui| {
+                if ui
+                    .add_enabled(
+                        channel_note_count > 0,
+                        egui::Button::new("Mute notes (Alt+M)"),
+                    )
+                    .clicked()
+                {
+                    note_mute_requested = Some(true);
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        channel_note_count > 0,
+                        egui::Button::new("Unmute notes (Alt+Shift+M)"),
+                    )
+                    .clicked()
+                {
+                    note_mute_requested = Some(false);
+                    ui.close();
+                }
+                ui.separator();
                 if ui
                     .checkbox(
                         &mut self.piano_roll_nudge_notes_with_mouse_wheel,
@@ -19150,6 +19317,16 @@ impl DawUi {
             ui.menu_button("Selection", |ui| {
                 if ui.button("Select all notes (Ctrl/Cmd+A)").clicked() {
                     self.apply_piano_roll_selection_command(PianoRollSelectionCommand::All);
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        channel_note_count > 0,
+                        egui::Button::new("Select muted notes"),
+                    )
+                    .clicked()
+                {
+                    self.apply_piano_roll_selection_command(PianoRollSelectionCommand::Muted);
                     ui.close();
                 }
                 if ui
@@ -20223,6 +20400,9 @@ impl DawUi {
             note_rotation_requested = None;
             group_selected_notes_requested = false;
             ungroup_selected_notes_requested = false;
+        }
+        if let Some(muted) = note_mute_requested {
+            self.set_piano_roll_selection_muted(muted);
         }
         if group_selected_notes_requested {
             self.set_selected_piano_roll_note_group(true);
@@ -21749,6 +21929,10 @@ impl DawUi {
             self.status = format!("Note {note_index} was not found in channel {channel_id}");
             return;
         };
+        if note.is_muted() {
+            self.status = "Muted Piano roll notes do not preview".to_owned();
+            return;
+        }
         note.position = 0;
         note.length = note.length.max(1);
         let ppq = document.header().ppq();
@@ -23449,6 +23633,7 @@ impl DawUi {
         let grid_width = (max_tick as f32 * tick_scale + 160.0).clamp(min_grid_width, 30000.0);
         let grid_height = f32::from(key_high - key_low + 1) * key_height;
         let mut notes_to_add = Vec::new();
+        let mut notes_to_delete = BTreeSet::new();
         let pending_scroll_offset = self.piano_roll_pending_scroll_offset.take();
         let active_event_target = self.piano_roll_event_target;
         let (
@@ -23887,7 +24072,13 @@ impl DawUi {
                 painter.rect_filled(
                     note_rect,
                     egui::CornerRadius::same(2),
-                    if selected {
+                    if note.is_muted() {
+                        if selected {
+                            Color32::from_rgb(112, 83, 91)
+                        } else {
+                            Color32::from_rgb(74, 78, 85)
+                        }
+                    } else if selected {
                         channel_color.gamma_multiply(1.3)
                     } else if ghost {
                         Color32::from_rgb(99, 112, 136)
@@ -23895,6 +24086,15 @@ impl DawUi {
                         channel_color
                     },
                 );
+                if note.is_muted() {
+                    painter.line_segment(
+                        [
+                            egui::pos2(note_rect.left() + 2.0, note_rect.center().y),
+                            egui::pos2(note_rect.right() - 2.0, note_rect.center().y),
+                        ],
+                        Stroke::new(1.0, Color32::from_white_alpha(150)),
+                    );
+                }
                 if note.is_slide_note() {
                     let marker_color = if selected { Color32::WHITE } else { TEXT };
                     painter.add(egui::Shape::convex_polygon(
@@ -23941,6 +24141,7 @@ impl DawUi {
                 let wheel_target_hovered = response.hovered()
                     && !self.piano_roll_zoom_mode
                     && !self.piano_roll_playback_mode
+                    && !self.piano_roll_mute_mode
                     && (!ghost || self.piano_roll_editable_ghost_channels)
                     && self.piano_roll_mouse_wheel_action.is_some();
                 mouse_wheel_target_hovered |= wheel_target_hovered;
@@ -23984,6 +24185,48 @@ impl DawUi {
                 }
                 let audition_gesture = response.clicked()
                     || (ui.input(|input| input.pointer.primary_down()) && response.hovered());
+                let mute_gesture = response.clicked()
+                    || (ui.input(|input| input.pointer.primary_down()) && response.hovered());
+                let delete_gesture = response.clicked_by(PointerButton::Secondary)
+                    || (ui.input(|input| input.pointer.secondary_down()) && response.hovered());
+                if self.piano_roll_mute_mode
+                    && delete_gesture
+                    && (!ghost || self.piano_roll_editable_ghost_channels)
+                    && self.last_piano_roll_delete_note != Some(note_id)
+                {
+                    self.last_piano_roll_delete_note = Some(note_id);
+                    notes_to_delete.extend(
+                        piano_roll_note_group_members(
+                            pattern,
+                            pattern.id,
+                            note.channel_id,
+                            *channel_index,
+                        )
+                        .into_iter()
+                        .map(|(_, channel_id, note_index)| (channel_id, note_index)),
+                    );
+                }
+                if self.piano_roll_mute_mode
+                    && mute_gesture
+                    && (!ghost || self.piano_roll_editable_ghost_channels)
+                    && self.last_piano_roll_mute_note != Some(note_id)
+                {
+                    self.last_piano_roll_mute_note = Some(note_id);
+                    let targets = piano_roll_note_group_members(
+                        pattern,
+                        pattern.id,
+                        note.channel_id,
+                        *channel_index,
+                    )
+                    .into_iter()
+                    .map(|(_, channel_id, note_index)| (channel_id, note_index))
+                    .collect::<Vec<_>>();
+                    self.set_piano_roll_notes_muted(
+                        pattern.id,
+                        &targets,
+                        !note.is_muted(),
+                    );
+                }
                 if self.piano_roll_playback_mode
                     && audition_gesture
                     && self.last_piano_roll_audition != Some(note_id)
@@ -23994,6 +24237,7 @@ impl DawUi {
                 if response.clicked()
                     && !self.piano_roll_zoom_mode
                     && !self.piano_roll_playback_mode
+                    && !self.piano_roll_mute_mode
                 {
                     let additive = modifiers.shift || modifiers.command;
                     if !additive
@@ -24043,6 +24287,7 @@ impl DawUi {
                 if response.is_pointer_button_down_on()
                     && !self.piano_roll_zoom_mode
                     && !self.piano_roll_playback_mode
+                    && !self.piano_roll_mute_mode
                     && self.active_note_drag.is_none()
                     && !modifiers.command
                     && !modifiers.shift
@@ -24112,6 +24357,7 @@ impl DawUi {
                 if response.dragged()
                     && !self.piano_roll_zoom_mode
                     && !self.piano_roll_playback_mode
+                    && !self.piano_roll_mute_mode
                     && let Some(drag) = self.active_note_drag.as_ref().filter(|drag| {
                         drag.pattern_id == pattern.id
                             && drag.channel_id == note.channel_id
@@ -24476,6 +24722,7 @@ impl DawUi {
             if self.piano_roll_stamp_mode
                 && !self.piano_roll_select_mode
                 && !self.piano_roll_zoom_mode
+                && !self.piano_roll_mute_mode
                 && grid_response.clicked_by(PointerButton::Primary)
                 && let (Some(pointer), Some(channel_id)) = (
                     grid_response.interact_pointer_pos(),
@@ -24510,7 +24757,10 @@ impl DawUi {
                 }
             }
             if self.piano_roll_paint_mode
-                && !(self.piano_roll_select_mode || self.piano_roll_zoom_mode || modifiers.command)
+                && !(self.piano_roll_select_mode
+                    || self.piano_roll_zoom_mode
+                    || self.piano_roll_mute_mode
+                    || modifiers.command)
                 && ui.input(|input| input.pointer.primary_down())
                 && let (Some(pointer), Some(channel_id)) = (
                     grid_response.interact_pointer_pos(),
@@ -24537,6 +24787,7 @@ impl DawUi {
                 && !self.piano_roll_stamp_mode
                 && !self.piano_roll_select_mode
                 && !self.piano_roll_zoom_mode
+                && !self.piano_roll_mute_mode
                 && !modifiers.command
                 && grid_response.double_clicked()
                 && let (Some(pointer), Some(channel_id)) = (
@@ -24573,6 +24824,10 @@ impl DawUi {
         if !ui.input(|input| input.pointer.primary_down()) {
             self.last_painted_note = None;
             self.last_piano_roll_audition = None;
+            self.last_piano_roll_mute_note = None;
+        }
+        if !ui.input(|input| input.pointer.secondary_down()) {
+            self.last_piano_roll_delete_note = None;
         }
         if !ui.input(|input| input.pointer.primary_down()) {
             self.active_note_drag = None;
@@ -24617,6 +24872,49 @@ impl DawUi {
                         };
                     }
                     Err(error) => self.status = error.to_string(),
+                }
+            }
+        }
+        if !notes_to_delete.is_empty()
+            && let Some(document) = self.document.as_ref()
+        {
+            let mut updated = document.clone();
+            let mut by_channel = BTreeMap::<u16, Vec<usize>>::new();
+            for (channel_id, note_index) in notes_to_delete {
+                by_channel.entry(channel_id).or_default().push(note_index);
+            }
+            let result =
+                by_channel
+                    .into_iter()
+                    .try_fold(0usize, |deleted, (channel_id, note_indices)| {
+                        let removed = updated.delete_pattern_note_selection(
+                            pattern.id,
+                            channel_id,
+                            &note_indices,
+                        )?;
+                        deleted.checked_add(removed).ok_or(FlpError::LengthOverflow)
+                    });
+            match result {
+                Ok(deleted) => {
+                    if deleted > 0 {
+                        self.document = Some(updated);
+                        self.selected_piano_notes.clear();
+                        self.selected_note = None;
+                        self.active_note_drag = None;
+                        self.stop_project_playback();
+                        self.dirty = true;
+                    }
+                    self.status = if deleted == 0 {
+                        "No Piano roll notes to delete".to_owned()
+                    } else {
+                        format!(
+                            "Deleted {deleted} Piano roll note{}",
+                            if deleted == 1 { "" } else { "s" }
+                        )
+                    };
+                }
+                Err(error) => {
+                    self.status = format!("Could not delete Piano roll notes: {error}");
                 }
             }
         }
@@ -25500,6 +25798,7 @@ impl DawUi {
         let mut velocity = note.velocity;
         let mut flags = note.flags;
         let mut slide_note = note.is_slide_note();
+        let mut muted_note = note.is_muted();
         let mut group = note.group;
         let mut fine_pitch = note.fine_pitch;
         let mut release = note.release;
@@ -25514,6 +25813,7 @@ impl DawUi {
         let mut velocity_changed = false;
         let mut flags_changed = false;
         let mut slide_changed = false;
+        let mut muted_changed = false;
         let mut group_changed = false;
         ui.separator();
         ui.horizontal(|ui| {
@@ -25569,6 +25869,10 @@ impl DawUi {
                         "Stores FL Studio's slide-note flag. Glide rendering for native instruments is not implemented yet.",
                     )
                     .changed();
+                muted_changed = ui
+                    .checkbox(&mut muted_note, "Muted")
+                    .on_hover_text("Muted Piano roll notes are excluded from supported playback and export")
+                    .changed();
                 group_changed = ui
                     .add(
                         egui::DragValue::new(&mut group)
@@ -25615,6 +25919,7 @@ impl DawUi {
                 || velocity_changed
                 || flags_changed
                 || slide_changed
+                || muted_changed
                 || group_changed
                 || fine_pitch_changed
                 || release_changed
@@ -25630,6 +25935,7 @@ impl DawUi {
                 velocity: velocity_changed.then_some(velocity),
                 flags: flags_changed.then_some(flags),
                 slide: slide_changed.then_some(slide_note),
+                muted: muted_changed.then_some(muted_note),
                 group: group_changed.then_some(group),
                 fine_pitch: fine_pitch_changed.then_some(fine_pitch),
                 release: release_changed.then_some(release),

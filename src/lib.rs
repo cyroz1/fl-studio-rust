@@ -1108,6 +1108,12 @@ pub const PATTERN_NOTE_DEFAULT_RELEASE: u8 = 64;
 /// FL Studio score-note flag for slide notes.
 pub const PATTERN_NOTE_SLIDE_FLAG: u16 = 1 << 3;
 
+/// Candidate FL Studio score-note flag for muted notes.
+///
+/// Image-Line documents the note mute behavior but not its FLP bit assignment;
+/// this low-bit mapping is inferred and still needs comparison with a native save.
+pub const PATTERN_NOTE_MUTED_FLAG: u16 = 1 << 0;
+
 /// Candidate Playlist item flag for an individually muted clip.
 ///
 /// An independent FLP parser corroborates the bit mapping. Image-Line's manual
@@ -1119,6 +1125,7 @@ pub struct PatternNoteEdit {
     pub position: Option<u32>,
     pub flags: Option<u16>,
     pub slide: Option<bool>,
+    pub muted: Option<bool>,
     pub length: Option<u32>,
     pub key: Option<u16>,
     pub group: Option<u16>,
@@ -2703,6 +2710,11 @@ impl PatternNote {
         self.flags & PATTERN_NOTE_SLIDE_FLAG != 0
     }
 
+    /// Whether this note carries the candidate FL Studio mute flag.
+    pub fn is_muted(&self) -> bool {
+        self.flags & PATTERN_NOTE_MUTED_FLAG != 0
+    }
+
     /// The note's fine-pitch offset in cents.
     ///
     /// FL Studio stores this as an unsigned byte centered at 120. Values 0 through 240 map to
@@ -2765,6 +2777,13 @@ impl PatternNote {
                 self.flags |= PATTERN_NOTE_SLIDE_FLAG;
             } else {
                 self.flags &= !PATTERN_NOTE_SLIDE_FLAG;
+            }
+        }
+        if let Some(value) = edit.muted {
+            if value {
+                self.flags |= PATTERN_NOTE_MUTED_FLAG;
+            } else {
+                self.flags &= !PATTERN_NOTE_MUTED_FLAG;
             }
         }
         if let Some(value) = edit.length {
