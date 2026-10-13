@@ -5630,15 +5630,12 @@ impl PlaylistPerformanceRuntime {
     ) -> Result<(), String> {
         let track_ids = self.queued_by_track.keys().copied().collect::<Vec<_>>();
         for track_id in track_ids {
-            loop {
-                let Some(queued_launch) = self
-                    .queued_by_track
-                    .get(&track_id)
-                    .and_then(|queue| queue.front())
-                    .copied()
-                else {
-                    break;
-                };
+            while let Some(queued_launch) = self
+                .queued_by_track
+                .get(&track_id)
+                .and_then(|queue| queue.front())
+                .copied()
+            {
                 let active_boundary = self
                     .active_by_track
                     .get(&track_id)
