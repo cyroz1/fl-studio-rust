@@ -19,8 +19,8 @@ use flp_rebuild::audio::{
 };
 use flp_rebuild::media::{
     AudioWaveform, DecodedAudio, SamplePathResolver, WaveformPeak, decode_audio_file,
-    decode_audio_preview, decode_audio_waveform, summarize_audio_waveform,
-    write_audio_range_to_wav_with_processing,
+    decode_audio_preview, decode_audio_preview_from_position, decode_audio_waveform,
+    summarize_audio_waveform, write_audio_range_to_wav_with_processing,
 };
 use flp_rebuild::midi::{MidiChannelMapping, MidiFile};
 use flp_rebuild::plugins::{PluginCandidate, PluginFormat, scan_installed_plugins};
@@ -2984,6 +2984,7 @@ struct PendingBrowserIndex {
 
 struct PendingBrowserPreview {
     path: PathBuf,
+    start_fraction: Option<f64>,
     receiver: Receiver<Result<Vec<f32>, String>>,
     worker: thread::JoinHandle<()>,
 }
@@ -3459,7 +3460,7 @@ struct DawUi {
     browser_preview_looping: bool,
     browser_preview_volume: f32,
     browser_preview_pending: Option<PendingBrowserPreview>,
-    browser_preview_queued: Option<(PathBuf, bool)>,
+    browser_preview_queued: Option<(PathBuf, bool, Option<f64>)>,
     browser_preview_cancelled: bool,
     browser_preview_path: Option<PathBuf>,
     browser_preview_error: Option<String>,
@@ -9075,7 +9076,7 @@ impl DawUi {
                 Err(error) => self.status = format!("Could not read {}: {error}", path.display()),
             },
             Some("wav" | "wave" | "mp3" | "m4a" | "ogg" | "flac" | "aif" | "aiff" | "wv") => {
-                self.request_browser_preview(path, self.browser_full_sample);
+                self.request_browser_preview(path, self.browser_full_sample, None);
             }
             _ => self.status = format!("Selected {}", path.display()),
         }
@@ -10023,22 +10024,35 @@ impl DawUi {
         }
     }
 
-    fn request_browser_preview(&mut self, path: PathBuf, full_sample: bool) {
+    fn request_browser_preview(
+        &mut self,
+        path: PathBuf,
+        full_sample: bool,
+        start_fraction: Option<f64>,
+    ) {
         self.browser_preview_error = None;
         self.browser_preview_path = None;
+        let start_fraction = start_fraction
+            .filter(|fraction| fraction.is_finite())
+            .map(|fraction| fraction.clamp(0.0, 1.0));
         if let Some(engine) = self.audio_engine.as_ref() {
             engine.stop_browser_preview();
         }
         if self.browser_preview_pending.is_some() {
-            self.browser_preview_queued = Some((path, full_sample));
+            self.browser_preview_queued = Some((path, full_sample, start_fraction));
             self.browser_preview_cancelled = true;
             return;
         }
         self.browser_preview_cancelled = false;
-        self.begin_browser_preview_load(path, full_sample);
+        self.begin_browser_preview_load(path, full_sample, start_fraction);
     }
 
-    fn begin_browser_preview_load(&mut self, path: PathBuf, full_sample: bool) {
+    fn begin_browser_preview_load(
+        &mut self,
+        path: PathBuf,
+        full_sample: bool,
+        start_fraction: Option<f64>,
+    ) {
         if self.audio_engine.is_none() {
             match AudioEngine::start(&self.audio_settings) {
                 Ok(engine) => self.audio_engine = Some(engine),
@@ -10066,8 +10080,17 @@ impl DawUi {
         let worker = match thread::Builder::new()
             .name("browser-sample-preview".to_owned())
             .spawn(move || {
-                let result =
-                    decode_audio_preview(&worker_path, output_sample_rate, maximum_seconds);
+                let result = start_fraction.map_or_else(
+                    || decode_audio_preview(&worker_path, output_sample_rate, maximum_seconds),
+                    |fraction| {
+                        decode_audio_preview_from_position(
+                            &worker_path,
+                            output_sample_rate,
+                            maximum_seconds,
+                            fraction,
+                        )
+                    },
+                );
                 let _ = sender.send(result);
             }) {
             Ok(worker) => worker,
@@ -10079,6 +10102,7 @@ impl DawUi {
         };
         self.browser_preview_pending = Some(PendingBrowserPreview {
             path,
+            start_fraction,
             receiver,
             worker,
         });
@@ -10113,9 +10137,9 @@ impl DawUi {
             && let Some(pending) = self.browser_preview_pending.take()
         {
             let _ = pending.worker.join();
-            if let Some((path, full_sample)) = self.browser_preview_queued.take() {
+            if let Some((path, full_sample, start_fraction)) = self.browser_preview_queued.take() {
                 self.browser_preview_cancelled = false;
-                self.begin_browser_preview_load(path, full_sample);
+                self.begin_browser_preview_load(path, full_sample, start_fraction);
                 return;
             }
             if self.browser_preview_cancelled {
@@ -10133,7 +10157,16 @@ impl DawUi {
                     };
                     match start_result {
                         Ok(()) => {
-                            self.status = format!("Previewing {}", pending.path.display());
+                            self.status = pending.start_fraction.map_or_else(
+                                || format!("Previewing {}", pending.path.display()),
+                                |fraction| {
+                                    format!(
+                                        "Previewing {} from {:.0}%",
+                                        pending.path.display(),
+                                        fraction * 100.0
+                                    )
+                                },
+                            );
                             self.browser_preview_path = Some(pending.path);
                         }
                         Err(error) => {
@@ -10458,7 +10491,7 @@ impl DawUi {
             self.stop_browser_preview();
         }
         if play_to_end {
-            self.request_browser_preview(path.clone(), true);
+            self.request_browser_preview(path.clone(), true, None);
         }
         if edit_sample {
             self.request_sample_editor(path, ui.ctx());
@@ -11347,6 +11380,19 @@ impl DawUi {
                         };
                         let clicked = response.clicked();
                         let double_clicked = response.double_clicked();
+                        let start_fraction = if clicked
+                            && !entry.is_directory
+                            && browser_file_kind(&entry.path) == Some(BrowserFileKind::Audio)
+                            && ui.input(|input| input.modifiers.shift)
+                        {
+                            response.interact_pointer_pos().map(|pointer| {
+                                ((pointer.x - response.rect.left())
+                                    / response.rect.width().max(1.0))
+                                .clamp(0.0, 1.0) as f64
+                            })
+                        } else {
+                            None
+                        };
                         let hover_text = tags.map_or_else(
                             || entry.path.display().to_string(),
                             |tags| format!("{}\nTags: {tags}", entry.path.display()),
@@ -11384,10 +11430,22 @@ impl DawUi {
                                 .clicked();
                         let edit_tags_clicked = !entry.is_directory
                             && ui.small_button("#").on_hover_text("Edit tags").clicked();
-                        (clicked, double_clicked, favorite_clicked, edit_tags_clicked)
+                        (
+                            clicked,
+                            double_clicked,
+                            start_fraction,
+                            favorite_clicked,
+                            edit_tags_clicked,
+                        )
                     });
                     let row_rect = row.response.rect;
-                    let (clicked, double_clicked, favorite_clicked, edit_tags_clicked) = row.inner;
+                    let (
+                        clicked,
+                        double_clicked,
+                        start_fraction,
+                        favorite_clicked,
+                        edit_tags_clicked,
+                    ) = row.inner;
                     if step_sample_path.as_ref() == Some(&entry.path)
                         || next_match_path.as_ref() == Some(&entry.path)
                     {
@@ -11401,7 +11459,7 @@ impl DawUi {
                         if !entry.is_directory
                             && browser_file_kind(&entry.path) == Some(BrowserFileKind::Audio)
                         {
-                            preview = Some(entry.path.clone());
+                            preview = Some((entry.path.clone(), start_fraction));
                         }
                     }
                     if favorite_clicked {
@@ -11415,8 +11473,8 @@ impl DawUi {
         if let Some(path) = favorite {
             self.toggle_browser_favorite(path);
         }
-        if let Some(path) = preview {
-            self.request_browser_preview(path, self.browser_full_sample);
+        if let Some((path, start_fraction)) = preview {
+            self.request_browser_preview(path, self.browser_full_sample, start_fraction);
         }
         if let Some(path) = activate {
             self.activate_browser_path(path);
@@ -11590,6 +11648,18 @@ impl DawUi {
                         );
                         let clicked = response.clicked();
                         let double_clicked = response.double_clicked();
+                        let start_fraction = if clicked
+                            && browser_file_kind(&path) == Some(BrowserFileKind::Audio)
+                            && ui.input(|input| input.modifiers.shift)
+                        {
+                            response.interact_pointer_pos().map(|pointer| {
+                                ((pointer.x - response.rect.left())
+                                    / response.rect.width().max(1.0))
+                                .clamp(0.0, 1.0) as f64
+                            })
+                        } else {
+                            None
+                        };
                         response
                             .on_hover_text(path.display().to_string())
                             .context_menu(|ui| {
@@ -11616,19 +11686,24 @@ impl DawUi {
                                     ui.close();
                                 }
                             });
-                        (clicked, double_clicked, ui.small_button("×").clicked())
+                        (
+                            clicked,
+                            double_clicked,
+                            start_fraction,
+                            ui.small_button("×").clicked(),
+                        )
                     });
                     if step_sample_path.as_ref() == Some(&path) {
                         ui.scroll_to_rect(row.response.rect, Some(egui::Align::Center));
                     }
-                    let (clicked, double_clicked, remove_clicked) = row.inner;
+                    let (clicked, double_clicked, start_fraction, remove_clicked) = row.inner;
                     if clicked {
                         self.browser_selected = Some(path.clone());
                     }
                     if double_clicked {
                         activate = Some(path.clone());
                     } else if clicked && browser_file_kind(&path) == Some(BrowserFileKind::Audio) {
-                        preview = Some(path.clone());
+                        preview = Some((path.clone(), start_fraction));
                     }
                     if remove_clicked {
                         remove = Some(path);
@@ -11638,8 +11713,8 @@ impl DawUi {
         if let Some(path) = remove {
             self.toggle_browser_favorite(path);
         }
-        if let Some(path) = preview {
-            self.request_browser_preview(path, self.browser_full_sample);
+        if let Some((path, start_fraction)) = preview {
+            self.request_browser_preview(path, self.browser_full_sample, start_fraction);
         }
         if let Some(path) = activate {
             self.activate_browser_path(path);

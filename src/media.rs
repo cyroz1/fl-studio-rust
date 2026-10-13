@@ -552,10 +552,51 @@ pub fn decode_audio_preview(
     })
 }
 
+/// Decode a Browser preview starting at a normalized position in the full source sample.
+/// The returned preview is bounded by `maximum_seconds`, like `decode_audio_preview`.
+pub fn decode_audio_preview_from_position(
+    path: impl AsRef<Path>,
+    output_sample_rate: u32,
+    maximum_seconds: Option<f64>,
+    start_fraction: f64,
+) -> Result<Vec<f32>, String> {
+    if !(8_000..=384_000).contains(&output_sample_rate) {
+        return Err("Browser preview output rate must be between 8 kHz and 384 kHz".into());
+    }
+    if maximum_seconds.is_some_and(|seconds| !seconds.is_finite() || seconds <= 0.0) {
+        return Err("Browser preview duration must be finite and greater than zero".into());
+    }
+    if !start_fraction.is_finite() || !(0.0..=1.0).contains(&start_fraction) {
+        return Err("Browser preview start position must be between 0 and 1".into());
+    }
+    let path = path.as_ref();
+    let audio = decode_audio_file_for_preview(path, None)?;
+    if audio.frame_count() == 0 {
+        return Err(format!("sample {} has no audio frames", path.display()));
+    }
+    let start_frame = ((audio.frame_count() - 1) as f64 * start_fraction).round() as usize;
+    decoded_audio_to_stereo_samples_from(&audio, output_sample_rate, maximum_seconds, start_frame)
+        .map_err(|error| {
+            format!(
+                "could not prepare sample preview {}: {error}",
+                path.display()
+            )
+        })
+}
+
 fn decoded_audio_to_stereo_samples(
     audio: &DecodedAudio,
     output_sample_rate: u32,
     maximum_seconds: Option<f64>,
+) -> Result<Vec<f32>, String> {
+    decoded_audio_to_stereo_samples_from(audio, output_sample_rate, maximum_seconds, 0)
+}
+
+fn decoded_audio_to_stereo_samples_from(
+    audio: &DecodedAudio,
+    output_sample_rate: u32,
+    maximum_seconds: Option<f64>,
+    start_frame: usize,
 ) -> Result<Vec<f32>, String> {
     if audio.channels.is_empty() || audio.channels.len() > 2 || audio.sample_rate == 0 {
         return Err("only mono and stereo samples with a valid rate can be previewed".into());
@@ -569,7 +610,11 @@ fn decoded_audio_to_stereo_samples(
     {
         return Err("sample has no complete audio frames".into());
     }
-    let duration = source_frames as f64 / f64::from(audio.sample_rate);
+    if start_frame >= source_frames {
+        return Err("sample preview start position is outside the source".into());
+    }
+    let remaining_frames = source_frames - start_frame;
+    let duration = remaining_frames as f64 / f64::from(audio.sample_rate);
     let duration = maximum_seconds.map_or(duration, |maximum| duration.min(maximum));
     let output_frames_f64 = (duration * f64::from(output_sample_rate)).ceil();
     let maximum_output_frames = MAX_DECODED_SAMPLE_BYTES / (2 * std::mem::size_of::<f32>());
@@ -592,7 +637,8 @@ fn decoded_audio_to_stereo_samples(
         .map_err(|error| format!("could not allocate sample preview: {error}"))?;
     let source_step = f64::from(audio.sample_rate) / f64::from(output_sample_rate);
     for frame in 0..output_frames {
-        let position = (frame as f64 * source_step).min((source_frames - 1) as f64);
+        let position =
+            (start_frame as f64 + frame as f64 * source_step).min((source_frames - 1) as f64);
         let first = position.floor() as usize;
         let second = (first + 1).min(source_frames - 1);
         let fraction = (position - first as f64) as f32;
