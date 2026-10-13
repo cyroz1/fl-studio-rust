@@ -14317,7 +14317,7 @@ impl DawUi {
         let mut channel_swing_edits = Vec::new();
         let mut layer_edits = Vec::new();
         let mut layer_flag_edits = Vec::new();
-        let mut step_toggles = Vec::new();
+        let mut step_toggles = Vec::<(u16, Vec<usize>, u32)>::new();
         let mut dropped_samples = Vec::new();
         let mut new_sampler_sample = None;
         ui.horizontal(|ui| {
@@ -15010,24 +15010,30 @@ impl DawUi {
                                             .saturating_add((step as u64).saturating_mul(step_ticks));
                                         let position = tick.min(u64::from(u32::MAX)) as u32;
                                         let step_end = tick.saturating_add(step_ticks);
-                                        let active_note = channel_notes
+                                        let active_notes = channel_notes
                                             .iter()
                                             .enumerate()
-                                            .find_map(|(index, note)| {
+                                            .filter_map(|(index, note)| {
                                                 let note_tick = u64::from(note.position);
                                                 (note_tick >= tick && note_tick < step_end)
                                                     .then_some(index)
-                                            });
+                                            })
+                                            .collect::<Vec<_>>();
+                                        let label = if active_notes.len() > 1 {
+                                            format!("{:02}×{}", step + 1, active_notes.len())
+                                        } else {
+                                            format!("{:02}", step + 1)
+                                        };
                                         if ui
                                             .selectable_label(
-                                                active_note.is_some(),
-                                                format!("{:02}", step + 1),
+                                                !active_notes.is_empty(),
+                                                label,
                                             )
                                             .clicked()
                                         {
                                             step_toggles.push((
                                                 channel.id(),
-                                                active_note,
+                                                active_notes,
                                                 position,
                                             ));
                                         }
@@ -15190,34 +15196,33 @@ impl DawUi {
                 if !zipped && let Some(pattern) = &selected_pattern {
                     ui.horizontal_wrapped(|ui| {
                         ui.small("Steps");
-                        let mut channel_note_index = 0usize;
                         for step in 0..steps_per_bar {
                             let tick = u64::from(self.step_sequencer_bar)
                                 .saturating_mul(measure_ticks)
                                 .saturating_add((step as u64).saturating_mul(step_ticks));
                             let position = tick.min(u64::from(u32::MAX)) as u32;
                             let step_end = tick.saturating_add(step_ticks);
-                            let mut active_note = None;
-                            for note in pattern
+                            let active_notes = pattern
                                 .notes
                                 .iter()
                                 .filter(|note| note.channel_id == channel.id())
-                            {
-                                let note_tick = u64::from(note.position);
-                                if note_tick >= tick && note_tick < step_end {
-                                    active_note = Some(channel_note_index);
-                                    break;
-                                }
-                                channel_note_index += 1;
-                            }
-                            let active = active_note.is_some();
+                                .enumerate()
+                                .filter_map(|(index, note)| {
+                                    let note_tick = u64::from(note.position);
+                                    (note_tick >= tick && note_tick < step_end).then_some(index)
+                                })
+                                .collect::<Vec<_>>();
+                            let label = if active_notes.len() > 1 {
+                                format!("{:02}×{}", step + 1, active_notes.len())
+                            } else {
+                                format!("{:02}", step + 1)
+                            };
                             if ui
-                                .selectable_label(active, format!("{:02}", step + 1))
+                                .selectable_label(!active_notes.is_empty(), label)
                                 .clicked()
                             {
-                                step_toggles.push((channel.id(), active_note, position));
+                                step_toggles.push((channel.id(), active_notes, position));
                             }
-                            channel_note_index = 0;
                         }
                     });
                 }
@@ -15482,10 +15487,16 @@ impl DawUi {
             let results = if let Some(document) = self.document.as_mut() {
                 step_toggles
                     .into_iter()
-                    .map(|(channel_id, note_index, position)| {
-                        let removing = note_index.is_some();
-                        let result = if let Some(note_index) = note_index {
-                            document.delete_pattern_note(pattern_id, channel_id, note_index)
+                    .map(|(channel_id, note_indices, position)| {
+                        let removing_count = note_indices.len();
+                        let result = if removing_count > 0 {
+                            document
+                                .delete_pattern_note_selection(
+                                    pattern_id,
+                                    channel_id,
+                                    &note_indices,
+                                )
+                                .map(|_| ())
                         } else {
                             document.add_pattern_note(
                                 pattern_id,
@@ -15501,7 +15512,7 @@ impl DawUi {
                         };
                         (
                             channel_id,
-                            removing,
+                            removing_count,
                             result.map_err(|error| error.to_string()),
                         )
                     })
@@ -15509,13 +15520,15 @@ impl DawUi {
             } else {
                 Vec::new()
             };
-            for (channel_id, removing, result) in results {
+            for (channel_id, removing_count, result) in results {
                 match result {
                     Ok(()) => {
                         self.stop_project_playback();
                         self.dirty = true;
-                        self.status = if removing {
-                            format!("Removed step from pattern {pattern_id}, channel {channel_id}")
+                        self.status = if removing_count > 0 {
+                            format!(
+                                "Removed {removing_count} note(s) from step in pattern {pattern_id}, channel {channel_id}"
+                            )
                         } else {
                             format!("Added step to pattern {pattern_id}, channel {channel_id}")
                         };
