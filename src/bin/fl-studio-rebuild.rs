@@ -14209,6 +14209,24 @@ impl DawUi {
                                     paste_clip_after_requested = Some(clip_index);
                                     ui.close();
                                 }
+                                if let Some(track_id) = clip.playlist_track_id() {
+                                    let can_stop_performance_track = self.performance_mode_active
+                                        && self.playing
+                                        && self.performance_launch_sender.is_some();
+                                    if ui
+                                        .add_enabled(
+                                            can_stop_performance_track,
+                                            egui::Button::new("Stop launched clip on this track"),
+                                        )
+                                        .on_hover_text(
+                                            "Stops this track's launched clip at the next safe audio tick.",
+                                        )
+                                        .clicked()
+                                    {
+                                        self.queue_performance_track_stop(track_id);
+                                        ui.close();
+                                    }
+                                }
                                 if is_audio_clip {
                                     if ui.button("Make unique").clicked() {
                                         make_audio_clip_unique_requested = Some(clip_index);
