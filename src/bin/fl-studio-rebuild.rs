@@ -13457,6 +13457,53 @@ impl DawUi {
                                         },
                                     ));
                                 }
+                                let mut selected_position_sync = track.position_sync;
+                                let mut requested_position_sync = None;
+                                ui.horizontal(|ui| {
+                                    ui.label("Position Sync");
+                                    egui::ComboBox::from_id_salt((
+                                        "playlist-track-position-sync",
+                                        arrangement.id,
+                                        track_id,
+                                    ))
+                                    .selected_text(
+                                        track
+                                            .position_sync
+                                            .map(playlist_track_sync_label)
+                                            .unwrap_or("Unknown"),
+                                    )
+                                    .show_ui(ui, |ui| {
+                                        for (sync, label) in [
+                                            (PlaylistTrackSync::Off, "Off"),
+                                            (PlaylistTrackSync::QuarterBeat, "1/4 beat"),
+                                            (PlaylistTrackSync::HalfBeat, "1/2 beat"),
+                                            (PlaylistTrackSync::Beat, "1 beat"),
+                                            (PlaylistTrackSync::TwoBeats, "2 beats"),
+                                            (PlaylistTrackSync::FourBeats, "4 beats"),
+                                            (PlaylistTrackSync::Auto, "Auto"),
+                                        ] {
+                                            if ui
+                                                .selectable_value(
+                                                    &mut selected_position_sync,
+                                                    Some(sync),
+                                                    label,
+                                                )
+                                                .changed()
+                                            {
+                                                requested_position_sync = Some(sync);
+                                            }
+                                        }
+                                    });
+                                });
+                                if let Some(position_sync) = requested_position_sync {
+                                    playlist_track_edits_requested.push((
+                                        track_id,
+                                        PlaylistTrackEdit {
+                                            position_sync: Some(position_sync),
+                                            ..PlaylistTrackEdit::default()
+                                        },
+                                    ));
+                                }
                                 let mut tolerant = track.tolerant.unwrap_or(true);
                                 if ui
                                     .checkbox(&mut tolerant, "Tolerant")
@@ -15268,6 +15315,11 @@ impl DawUi {
                         format!(
                             "Set Playlist track {track_id} Trigger Sync to {}",
                             playlist_track_sync_label(trigger_sync)
+                        )
+                    } else if let Some(position_sync) = edit.position_sync {
+                        format!(
+                            "Set Playlist track {track_id} Position Sync to {}",
+                            playlist_track_sync_label(position_sync)
                         )
                     } else if let Some(tolerant) = edit.tolerant {
                         format!(
@@ -43762,6 +43814,7 @@ mod tests {
                 enabled: Some(true),
                 grouped: Some(matches!(id, 2 | 3)),
                 trigger_sync: None,
+                position_sync: None,
                 tolerant: None,
                 state_bytes: vec![0; 70],
             })

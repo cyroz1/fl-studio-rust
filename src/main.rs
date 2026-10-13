@@ -788,6 +788,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                     enabled: parse_optional_bool(enabled, "Playlist track enabled state")?,
                     grouped: parse_optional_bool(grouped, "Playlist track grouping state")?,
                     trigger_sync: None,
+                    position_sync: None,
                     tolerant: None,
                 },
             )
@@ -801,6 +802,17 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u16(arrangement_id, "arrangement id")?,
                 parse_u32(track_id, "Playlist track id")?,
                 parse_playlist_track_sync(trigger_sync)?,
+            )
+        }
+        [command, input, output, arrangement_id, track_id, position_sync]
+            if command == "set-playlist-track-position-sync" =>
+        {
+            set_playlist_track_position_sync(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(arrangement_id, "arrangement id")?,
+                parse_u32(track_id, "Playlist track id")?,
+                parse_playlist_track_sync(position_sync)?,
             )
         }
         [command, input, output, arrangement_id, track_id, tolerant]
@@ -3616,6 +3628,37 @@ fn set_playlist_track_trigger_sync(
     println!(
         "set Playlist track {track_id} Trigger Sync to {} in arrangement {arrangement_id} in {}",
         playlist_track_sync_cli_label(trigger_sync),
+        output.display()
+    );
+    Ok(())
+}
+
+fn set_playlist_track_position_sync(
+    input: &Path,
+    output: &Path,
+    arrangement_id: u16,
+    track_id: u32,
+    position_sync: PlaylistTrackSync,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .edit_playlist_track_in_arrangement(
+            arrangement_id,
+            track_id,
+            PlaylistTrackEdit {
+                position_sync: Some(position_sync),
+                ..PlaylistTrackEdit::default()
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "set Playlist track {track_id} Position Sync to {} in arrangement {arrangement_id} in {}",
+        playlist_track_sync_cli_label(position_sync),
         output.display()
     );
     Ok(())

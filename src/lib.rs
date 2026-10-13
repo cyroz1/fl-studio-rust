@@ -1797,6 +1797,8 @@ pub struct PlaylistTrack {
     pub grouped: Option<bool>,
     /// Trigger timing for Performance Mode clips on this track.
     pub trigger_sync: Option<PlaylistTrackSync>,
+    /// Position within the clip used when a Performance Mode clip starts on this track.
+    pub position_sync: Option<PlaylistTrackSync>,
     /// Whether a slightly missed trigger boundary launches immediately on this track.
     pub tolerant: Option<bool>,
     /// Raw 70-byte `0xEE` state payload.
@@ -1809,6 +1811,7 @@ pub struct PlaylistTrackEdit {
     pub enabled: Option<bool>,
     pub grouped: Option<bool>,
     pub trigger_sync: Option<PlaylistTrackSync>,
+    pub position_sync: Option<PlaylistTrackSync>,
     pub tolerant: Option<bool>,
 }
 
@@ -5331,6 +5334,7 @@ impl FlpDocument {
             })
             .filter(|value| !value.is_empty());
         let trigger_sync = i32::from_le_bytes(event.payload[30..34].try_into().ok()?);
+        let position_sync = i32::from_le_bytes(event.payload[42..46].try_into().ok()?);
         let tolerant = match i32::from_le_bytes(event.payload[38..42].try_into().ok()?) {
             0 => Some(false),
             1 => Some(true),
@@ -5351,12 +5355,13 @@ impl FlpDocument {
                 _ => None,
             },
             trigger_sync: PlaylistTrackSync::from_raw(trigger_sync),
+            position_sync: PlaylistTrackSync::from_raw(position_sync),
             tolerant,
             state_bytes: event.payload.clone(),
         })
     }
 
-    /// Edits the observed mute, grouping, Trigger Sync, or Tolerant fields of a Playlist track.
+    /// Edits the observed mute, grouping, Trigger Sync, Position Sync, or Tolerant fields.
     /// This unscoped form reports an error when the track ID occurs in multiple arrangements.
     pub fn edit_playlist_track(
         &mut self,
@@ -5367,6 +5372,7 @@ impl FlpDocument {
         if edit.enabled.is_none()
             && edit.grouped.is_none()
             && edit.trigger_sync.is_none()
+            && edit.position_sync.is_none()
             && edit.tolerant.is_none()
         {
             return Ok(());
@@ -5386,6 +5392,7 @@ impl FlpDocument {
         if edit.enabled.is_none()
             && edit.grouped.is_none()
             && edit.trigger_sync.is_none()
+            && edit.position_sync.is_none()
             && edit.tolerant.is_none()
         {
             return Ok(());
@@ -5486,6 +5493,13 @@ impl FlpDocument {
                 &mut self.events[event_index],
                 30,
                 &trigger_sync.raw().to_le_bytes(),
+            )?;
+        }
+        if let Some(position_sync) = edit.position_sync {
+            write_event_payload_bytes(
+                &mut self.events[event_index],
+                42,
+                &position_sync.raw().to_le_bytes(),
             )?;
         }
         if let Some(tolerant) = edit.tolerant {
@@ -15819,6 +15833,7 @@ mod tests {
                     enabled: Some(false),
                     grouped: Some(true),
                     trigger_sync: None,
+                    position_sync: None,
                     tolerant: None,
                 },
             )
