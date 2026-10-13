@@ -2353,6 +2353,11 @@ enum PlaylistClipDragKind {
     Move,
     Resize,
     Slip,
+    SlipTicks {
+        source_start_tick: u32,
+        source_end_tick: u32,
+        source_length_ticks: u32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -12927,17 +12932,44 @@ impl DawUi {
                                 clip.position_ticks,
                                 clip.position_ticks.saturating_add(clip.length_ticks),
                             );
-                            let source_window_can_slip = source_window_ms
-                                .zip(sample_length_ms)
-                                .is_some_and(|((start_ms, end_ms), sample_length_ms)| {
-                                    start_ms >= 0.0
-                                        && end_ms > start_ms
-                                        && end_ms <= sample_length_ms
-                                        && end_ms - start_ms < sample_length_ms
+                            let tempo_supported =
+                                ppq > 0 && self.tempo_bpm.is_finite() && self.tempo_bpm > 0.0;
+                            let sample_length_ticks = sample_length_ms.and_then(|length_ms| {
+                                let ticks = f64::from(length_ms) * f64::from(ppq)
+                                    * self.tempo_bpm
+                                    / 60_000.0;
+                                (tempo_supported
+                                    && ticks.is_finite()
+                                    && ticks > 0.0
+                                    && ticks <= f64::from(u32::MAX))
+                                .then_some(ticks.floor() as u32)
+                            });
+                            let modern_window_matches_timeline = clip
+                                .source_window_ticks()
+                                .is_some_and(|(start, end)| {
+                                    end > start
+                                        && end.checked_sub(start) == Some(clip.length_ticks)
                                 });
-                            let tempo_supported = self.tempo_bpm.is_finite() && self.tempo_bpm > 0.0;
+                            let modern_window_within_sample = clip
+                                .source_window_ticks()
+                                .zip(sample_length_ticks)
+                                .is_some_and(|((_, end), sample_ticks)| end <= sample_ticks);
+                            let source_window_can_slip = if clip.has_opaque_record_tail() {
+                                modern_window_matches_timeline
+                                    && modern_window_within_sample
+                                    && clip.length_ticks
+                                        < sample_length_ticks.unwrap_or_default()
+                            } else {
+                                source_window_ms
+                                    .zip(sample_length_ms)
+                                    .is_some_and(|((start_ms, end_ms), sample_length_ms)| {
+                                        start_ms >= 0.0
+                                            && end_ms > start_ms
+                                            && end_ms <= sample_length_ms
+                                            && end_ms - start_ms < sample_length_ms
+                                    })
+                            };
                             let can_slip_clip = is_audio_clip
-                                && !clip.has_opaque_record_tail()
                                 && source_window_can_slip
                                 && scale_supported
                                 && !tempo_automation_overlaps_clip
@@ -12945,7 +12977,19 @@ impl DawUi {
                             let slip_unavailable_reason = if !is_audio_clip {
                                 "Slip applies to Audio Clips"
                             } else if clip.has_opaque_record_tail() {
-                                "Slip editing for this FL Studio clip format is not available yet"
+                                if sample_length_ms.is_none() {
+                                    "Wait for the source waveform to load so its duration is known"
+                                } else if !tempo_supported {
+                                    "Slip requires a positive project tempo and PPQ"
+                                } else if sample_length_ticks.is_none() {
+                                    "The sample duration is outside the supported source tick range"
+                                } else if !modern_window_matches_timeline {
+                                    "Slip requires an explicit source tick window matching the clip length"
+                                } else if !modern_window_within_sample {
+                                    "This Audio Clip source window extends beyond the sample"
+                                } else {
+                                    "This clip uses the entire sample and has no room to slip"
+                                }
                             } else if sample_length_ms.is_none() {
                                 "Wait for the source waveform to load so its duration is known"
                             } else if source_window_ms.is_none() {
@@ -13372,7 +13416,18 @@ impl DawUi {
                                             kind: if resize {
                                                 PlaylistClipDragKind::Resize
                                             } else if slip_requested {
-                                                PlaylistClipDragKind::Slip
+                                                if clip.has_opaque_record_tail() {
+                                                    let (source_start_tick, source_end_tick) =
+                                                        clip.source_window_ticks().unwrap_or_default();
+                                                    PlaylistClipDragKind::SlipTicks {
+                                                        source_start_tick,
+                                                        source_end_tick,
+                                                        source_length_ticks: sample_length_ticks
+                                                            .unwrap_or_default(),
+                                                    }
+                                                } else {
+                                                    PlaylistClipDragKind::Slip
+                                                }
                                             } else {
                                                 PlaylistClipDragKind::Move
                                             },
@@ -13439,6 +13494,12 @@ impl DawUi {
                                                 && edit.end_offset.is_none_or(|value| {
                                                     value == edited_clip.end_offset
                                                 })
+                                                && edit.source_window_ticks.is_none_or(|value| {
+                                                    value
+                                                        == edited_clip
+                                                            .source_window_ticks()
+                                                            .unwrap_or_default()
+                                                })
                                         })
                                 });
                                 if !unchanged {
@@ -13451,6 +13512,27 @@ impl DawUi {
                                                 .unwrap_or(clip.start_offset);
                                             let delta_ms = f64::from(target_start_ms)
                                                 - f64::from(clip.start_offset);
+                                            document.slip_playlist_audio_clip(
+                                                arrangement.id,
+                                                clip_index,
+                                                delta_ms,
+                                                drag.source_length_ms,
+                                            )
+                                        }
+                                        PlaylistClipDragKind::SlipTicks {
+                                            source_start_tick,
+                                            ..
+                                        } => {
+                                            let target_start_tick = edits[0]
+                                                .1
+                                                .source_window_ticks
+                                                .map(|(start, _)| start)
+                                                .unwrap_or(source_start_tick);
+                                            let delta_ms = (i64::from(target_start_tick)
+                                                - i64::from(source_start_tick))
+                                                as f64
+                                                * 60_000.0
+                                                / (f64::from(ppq) * drag.tempo_bpm);
                                             document.slip_playlist_audio_clip(
                                                 arrangement.id,
                                                 clip_index,
@@ -13495,7 +13577,8 @@ impl DawUi {
                                                 PlaylistClipDragKind::Resize => {
                                                     format!("Resized Playlist clip {}", clip_index + 1)
                                                 }
-                                                PlaylistClipDragKind::Slip => {
+                                                PlaylistClipDragKind::Slip
+                                                | PlaylistClipDragKind::SlipTicks { .. } => {
                                                     format!("Slip-edited Audio Clip {}", clip_index + 1)
                                                 }
                                             };
@@ -36080,6 +36163,27 @@ fn playlist_clip_drag_edit(
             PlaylistClipEdit {
                 start_offset: Some(start_offset),
                 end_offset: Some(start_offset + window_length_ms),
+                ..PlaylistClipEdit::default()
+            }
+        }
+        PlaylistClipDragKind::SlipTicks {
+            source_start_tick,
+            source_end_tick,
+            source_length_ticks,
+        } => {
+            let tick_delta = if snap {
+                snap_signed_tick_delta(tick_delta, snap_ticks)
+            } else {
+                tick_delta
+            };
+            let window_length_ticks = source_end_tick.saturating_sub(source_start_tick);
+            let max_start_tick = source_length_ticks.saturating_sub(window_length_ticks);
+            let next_start_tick = i64::from(source_start_tick)
+                .saturating_add(tick_delta)
+                .clamp(0, i64::from(max_start_tick)) as u32;
+            let next_end_tick = next_start_tick.saturating_add(window_length_ticks);
+            PlaylistClipEdit {
+                source_window_ticks: Some((next_start_tick, next_end_tick)),
                 ..PlaylistClipEdit::default()
             }
         }

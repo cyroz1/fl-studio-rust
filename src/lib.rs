@@ -7115,7 +7115,9 @@ impl FlpDocument {
                     "the Audio Clip has no decoded source tick window",
                 ));
             };
-            if source_end_tick.checked_sub(source_start_tick) != Some(clip.length_ticks) {
+            if source_end_tick <= source_start_tick
+                || source_end_tick.checked_sub(source_start_tick) != Some(clip.length_ticks)
+            {
                 return Err(FlpError::UnsupportedEdit(
                     "splitting an 88-byte Audio Clip requires a source tick window matching its timeline length",
                 ));
@@ -8295,7 +8297,8 @@ impl FlpDocument {
     }
 
     /// Slips the source window inside one Playlist Audio Clip while keeping its timeline bounds.
-    /// The requested offset is in milliseconds; `source_length_ms` bounds the window to the file.
+    /// The requested offset and source length are in milliseconds. 88-byte records also require
+    /// an explicit tick window matching the clip length and map the requested offset at base tempo.
     /// Clips under Playlist tempo automation or with non-default scale are rejected.
     pub fn slip_playlist_audio_clip(
         &mut self,
@@ -8358,11 +8361,6 @@ impl FlpDocument {
                 "Playlist Audio Clips with a non-default or invalid scale cannot be slip-edited",
             ));
         }
-        if clip.has_opaque_record_tail() {
-            return Err(FlpError::UnsupportedEdit(
-                "slipping this Playlist record version requires decoding its opaque tail",
-            ));
-        }
         let (source_start_ms, source_end_ms) =
             if clip.start_offset == -1.0 && clip.end_offset == -1.0 {
                 (0.0, source_length_ms)
@@ -8409,6 +8407,113 @@ impl FlpDocument {
         }) {
             return Err(FlpError::UnsupportedEdit(
                 "slip-editing an Audio Clip across Playlist tempo automation is unsupported",
+            ));
+        }
+        if clip.record_size == 88 {
+            let Some((source_start_tick, source_end_tick)) = clip.source_window_ticks() else {
+                return Err(FlpError::UnsupportedEdit(
+                    "slipping an 88-byte Audio Clip requires a source tick window",
+                ));
+            };
+            if source_end_tick.checked_sub(source_start_tick) != Some(clip.length_ticks) {
+                return Err(FlpError::UnsupportedEdit(
+                    "slipping an 88-byte Audio Clip requires a source tick window matching its timeline length",
+                ));
+            }
+            let ppq = f64::from(self.header.ppq);
+            let tempo_bpm = self.metadata.tempo_bpm().unwrap_or(140.0);
+            if ppq == 0.0 || !tempo_bpm.is_finite() || tempo_bpm <= 0.0 {
+                return Err(FlpError::UnsupportedEdit(
+                    "slipping an 88-byte Audio Clip requires a valid project tempo and PPQ",
+                ));
+            }
+            let source_length_ticks = f64::from(source_length_ms) * ppq * tempo_bpm / 60_000.0;
+            if !source_length_ticks.is_finite()
+                || source_length_ticks <= 0.0
+                || source_length_ticks > f64::from(u32::MAX)
+            {
+                return Err(FlpError::UnsupportedEdit(
+                    "the sample length cannot be represented as source ticks",
+                ));
+            }
+            let source_length_ticks = source_length_ticks.floor() as u32;
+            if source_end_tick > source_length_ticks {
+                return Err(FlpError::UnsupportedEdit(
+                    "the Audio Clip source tick window extends beyond the sample",
+                ));
+            }
+            if delta_ms == 0.0 {
+                return Ok(());
+            }
+            let delta_ticks = delta_ms * ppq * tempo_bpm / 60_000.0;
+            if !delta_ticks.is_finite()
+                || delta_ticks < i64::MIN as f64
+                || delta_ticks > i64::MAX as f64
+            {
+                return Err(FlpError::UnsupportedEdit(
+                    "the slip distance cannot be represented as source ticks",
+                ));
+            }
+            let delta_ticks = delta_ticks.round() as i64;
+            let max_start_tick = source_length_ticks.checked_sub(clip.length_ticks).ok_or(
+                FlpError::UnsupportedEdit("the Audio Clip window is longer than the sample"),
+            )?;
+            let next_start_tick = i64::from(source_start_tick)
+                .checked_add(delta_ticks)
+                .filter(|tick| (0..=i64::from(max_start_tick)).contains(tick))
+                .ok_or(FlpError::UnsupportedEdit(
+                    "the slipped source tick window must remain within the sample",
+                ))? as u32;
+            if next_start_tick == source_start_tick {
+                return Ok(());
+            }
+            let next_end_tick = next_start_tick
+                .checked_add(clip.length_ticks)
+                .ok_or(FlpError::LengthOverflow)?;
+
+            let record_size = clip.record_size;
+            let record_start = clip
+                .source_record_index
+                .checked_mul(record_size)
+                .ok_or(FlpError::LengthOverflow)?;
+            let record_end = record_start
+                .checked_add(record_size)
+                .ok_or(FlpError::LengthOverflow)?;
+            let event_index = clip.source_event_index;
+            let event = self
+                .events
+                .get(event_index)
+                .ok_or(FlpError::UnsupportedEdit(
+                    "the Playlist Audio Clip event no longer exists",
+                ))?;
+            if event.opcode != 0xE9
+                || !matches!(event.encoding, PayloadEncoding::Data { .. })
+                || record_end > event.payload.len()
+                || !event.payload.len().is_multiple_of(record_size)
+            {
+                return Err(FlpError::UnsupportedEdit(
+                    "the Playlist Audio Clip record does not fit its event payload",
+                ));
+            }
+
+            let mut candidate = self.clone();
+            write_event_payload_bytes(
+                &mut candidate.events[event_index],
+                record_start + 24,
+                &next_start_tick.to_le_bytes(),
+            )?;
+            write_event_payload_bytes(
+                &mut candidate.events[event_index],
+                record_start + 28,
+                &next_end_tick.to_le_bytes(),
+            )?;
+            candidate.refresh_event_offsets()?;
+            *self = candidate;
+            return Ok(());
+        }
+        if clip.has_opaque_record_tail() {
+            return Err(FlpError::UnsupportedEdit(
+                "slipping this Playlist record version requires decoding its opaque tail",
             ));
         }
         if delta_ms == 0.0 {
