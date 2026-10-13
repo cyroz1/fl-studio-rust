@@ -32,7 +32,7 @@ use flp_rebuild::sample_render::{
     PlaylistPerformanceLaunch, PlaylistPerformanceStream, PlaylistRenderOptions,
     PlaylistRenderRange, PlaylistRenderSummary, PlaylistStreamMonitor, PlaylistTempoMap,
     ResamplingQuality, SamplerPatternRenderOptions, SamplerPatternRenderSummary, WavChannelMode,
-    WavDitherMode, WavSampleFormat, playlist_performance_sampler_clip_indices,
+    WavDitherMode, WavSampleFormat, playlist_performance_clip_indices,
     playlist_performance_static_document, render_audio_clips_to_file,
     render_playlist_mixer_stems_with_vst3_cancellable,
     render_playlist_with_vst3_to_file_from_frame_cancellable,
@@ -7475,7 +7475,7 @@ impl DawUi {
             return;
         };
         let performance_clip_indices =
-            match playlist_performance_sampler_clip_indices(document, arrangement_id, start_tick) {
+            match playlist_performance_clip_indices(document, arrangement_id, start_tick) {
                 Ok(clip_indices) => clip_indices,
                 Err(error) => {
                     self.status = format!("Could not prepare Performance Mode clips: {error}");
@@ -7483,7 +7483,7 @@ impl DawUi {
                 }
             };
         if performance_clip_indices.is_empty() {
-            self.status = "Add a supported Sampler Pattern Clip before the Start marker".into();
+            self.status = "Add a supported Audio Clip or Sampler Pattern Clip before Start".into();
             return;
         }
         if self.audio_engine.is_none() {
@@ -7629,7 +7629,7 @@ impl DawUi {
                 });
                 self.stop_midi_pattern_preview();
                 self.status = format!(
-                    "Preparing Performance Mode from Start at tick {start_tick}; launch Sampler Pattern Clips at the next bar"
+                    "Preparing Performance Mode from Start at tick {start_tick}; launch Audio or Sampler clips at the next bar"
                 );
                 self.start_midi_clock(false);
             }
@@ -14179,6 +14179,45 @@ impl DawUi {
                                         join_clip_requested = Some((clip_index, next_clip_index));
                                         ui.close();
                                     }
+                                    let performance_clip_supported =
+                                        performance_zone_end_tick.is_some_and(|zone_end_tick| {
+                                            self.document
+                                                .as_ref()
+                                                .and_then(|document| {
+                                                    playlist_performance_clip_indices(
+                                                        document,
+                                                        arrangement.id,
+                                                        zone_end_tick,
+                                                    )
+                                                    .ok()
+                                                })
+                                                .is_some_and(|indices| {
+                                                    indices.contains(&clip_index)
+                                                })
+                                        });
+                                    let can_launch_performance_clip = self.performance_mode_active
+                                        && self.playing
+                                        && self.performance_launch_sender.is_some()
+                                        && performance_clip_supported;
+                                    let launch_button = ui.add_enabled(
+                                        can_launch_performance_clip,
+                                        egui::Button::new("Launch at next bar"),
+                                    );
+                                    if launch_button
+                                        .on_disabled_hover_text(if !self.performance_mode_active {
+                                            "Enable Performance Mode and start playback from the Start marker first."
+                                        } else if !self.playing
+                                            || self.performance_launch_sender.is_none()
+                                        {
+                                            "Start Performance Mode playback before launching a clip."
+                                        } else {
+                                            "Requires an enabled sample-backed Audio Clip with decoded default scale before Start; all non-muted media clips on its Playlist track must also be supported."
+                                        })
+                                        .clicked()
+                                    {
+                                        performance_clip_launch_requested = Some(clip_index);
+                                        ui.close();
+                                    }
                                 } else if is_pattern_clip {
                                     let selected_pattern_context_indices = self
                                         .selected_playlist_pattern_clip_indices(arrangement.id)
@@ -14188,7 +14227,7 @@ impl DawUi {
                             self.document
                                 .as_ref()
                                 .and_then(|document| {
-                                    playlist_performance_sampler_clip_indices(
+                                    playlist_performance_clip_indices(
                                         document,
                                         arrangement.id,
                                         zone_end_tick,
@@ -14212,7 +14251,7 @@ impl DawUi {
                         } else if !self.playing || self.performance_launch_sender.is_none() {
                             "Start Performance Mode playback before launching a clip."
                         } else {
-                            "Requires this enabled Playlist track to contain only supported, unmuted Pattern Clips before Start, using enabled Sampler channels, default scale, and no Pattern controllers."
+                            "Requires a supported, unmuted Pattern Clip before Start, using enabled Sampler channels, default scale, and no Pattern controllers; all non-muted media clips on its Playlist track must also be supported."
                         })
                         .clicked()
                     {

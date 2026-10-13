@@ -930,18 +930,114 @@ pub fn playlist_performance_sampler_clip_indices(
         .collect())
 }
 
+/// Return enabled Audio Clips before the Start marker that can be launched in Performance Mode.
+pub fn playlist_performance_audio_clip_indices(
+    document: &FlpDocument,
+    arrangement_id: u16,
+    performance_zone_end_tick: u32,
+) -> Result<BTreeSet<usize>, String> {
+    let arrangement = document
+        .arrangements()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|arrangement| arrangement.id == arrangement_id)
+        .ok_or_else(|| format!("arrangement {arrangement_id} was not found"))?;
+    let channels = document
+        .channels()
+        .into_iter()
+        .map(|channel| (channel.id(), channel))
+        .collect::<HashMap<_, _>>();
+    let disabled_tracks = document
+        .playlist_tracks()
+        .into_iter()
+        .filter(|track| track.enabled == Some(false))
+        .map(|track| track.id)
+        .collect::<BTreeSet<_>>();
+
+    Ok(arrangement
+        .clips
+        .iter()
+        .enumerate()
+        .filter_map(|(index, clip)| {
+            let PlaylistClipTarget::Channel { id } = clip.target() else {
+                return None;
+            };
+            let track_id = clip.playlist_track_id()?;
+            let channel = channels.get(&id)?;
+            (clip.position_ticks < performance_zone_end_tick
+                && clip.length_ticks > 0
+                && !clip.is_muted()
+                && !disabled_tracks.contains(&track_id)
+                && clip
+                    .scale
+                    .is_some_and(|scale| scale.is_finite() && (scale - 1.0).abs() <= 1e-9)
+                && channel.kind() == Some(4)
+                && channel.enabled() != Some(false)
+                && channel.sample_path().is_some())
+            .then_some(index)
+        })
+        .collect())
+}
+
+/// Return supported Audio and Sampler Pattern Clips that can launch before the Start marker.
+pub fn playlist_performance_clip_indices(
+    document: &FlpDocument,
+    arrangement_id: u16,
+    performance_zone_end_tick: u32,
+) -> Result<BTreeSet<usize>, String> {
+    let mut clip_indices = playlist_performance_sampler_clip_indices(
+        document,
+        arrangement_id,
+        performance_zone_end_tick,
+    )?;
+    clip_indices.extend(playlist_performance_audio_clip_indices(
+        document,
+        arrangement_id,
+        performance_zone_end_tick,
+    )?);
+    let arrangement = document
+        .arrangements()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|arrangement| arrangement.id == arrangement_id)
+        .ok_or_else(|| format!("arrangement {arrangement_id} was not found"))?;
+    let candidate_track_ids = clip_indices
+        .iter()
+        .filter_map(|index| arrangement.clips.get(*index)?.playlist_track_id())
+        .collect::<BTreeSet<_>>();
+    let eligible_track_ids = candidate_track_ids
+        .into_iter()
+        .filter(|track_id| {
+            arrangement.clips.iter().enumerate().all(|(index, clip)| {
+                clip.playlist_track_id() != Some(*track_id)
+                    || clip.is_muted()
+                    || !matches!(
+                        clip.target(),
+                        PlaylistClipTarget::Pattern { .. } | PlaylistClipTarget::Channel { .. }
+                    )
+                    || clip_indices.contains(&index)
+            })
+        })
+        .collect::<BTreeSet<_>>();
+    clip_indices.retain(|index| {
+        arrangement
+            .clips
+            .get(*index)
+            .and_then(PlaylistClip::playlist_track_id)
+            .is_some_and(|track_id| eligible_track_ids.contains(&track_id))
+    });
+    Ok(clip_indices)
+}
+
 /// Return a copy of an arrangement with supported Performance Zone clips removed from static
-/// playback. Other Pattern Clips and tempo automation remain on the normal song timeline.
+/// playback. Other clips and tempo automation remain on the normal song timeline.
 pub fn playlist_performance_static_document(
     document: &FlpDocument,
     arrangement_id: u16,
     performance_zone_end_tick: u32,
 ) -> Result<(FlpDocument, BTreeSet<usize>), String> {
-    let performance_clip_indices = playlist_performance_sampler_clip_indices(
-        document,
-        arrangement_id,
-        performance_zone_end_tick,
-    )?;
+    let performance_clip_indices =
+        playlist_performance_clip_indices(document, arrangement_id, performance_zone_end_tick)?;
     let mut static_document = document.clone();
     for clip_index in performance_clip_indices.iter().rev().copied() {
         static_document
@@ -1334,11 +1430,11 @@ pub fn stream_playlist_with_vst3_to_device_with_monitor(
     )
 }
 
-/// Stream normal arrangement audio while accepting quantized Sampler Pattern Clip launches.
+/// Stream arrangement audio while accepting quantized Audio and Sampler Clip launches.
 ///
-/// The arrangement must contain supported Pattern Clips before the named Start marker. Launches
-/// replace notes from the same Playlist track and repeat at the clip's tick length. Audio Clips,
-/// VST3 Pattern Clip launching, scenes, and controller-driven launch remain unsupported.
+/// The arrangement must contain supported clips before the named Start marker. Launches replace
+/// content from the same Playlist track and repeat at the clip's tick length. VST3 Pattern Clip
+/// launching, scenes, and controller-driven launch remain unsupported.
 pub fn stream_playlist_performance_with_vst3_to_device(
     document: &FlpDocument,
     project_path: impl AsRef<Path>,
@@ -1355,12 +1451,22 @@ pub fn stream_playlist_performance_with_vst3_to_device(
         performance.performance_zone_end_tick,
     )?;
     if performance_clip_indices.is_empty() {
-        return Err(
-            "arrangement has no supported Sampler Pattern Clips before the Start marker".into(),
-        );
+        return Err("arrangement has no supported clips before the Start marker".into());
     }
-    let audio = prepare_audio_clip_render(
-        &static_document,
+    let mut performance_sampler_clip_indices = playlist_performance_sampler_clip_indices(
+        document,
+        options.arrangement_id,
+        performance.performance_zone_end_tick,
+    )?;
+    let mut performance_audio_clip_indices = playlist_performance_audio_clip_indices(
+        document,
+        options.arrangement_id,
+        performance.performance_zone_end_tick,
+    )?;
+    performance_sampler_clip_indices.retain(|index| performance_clip_indices.contains(index));
+    performance_audio_clip_indices.retain(|index| performance_clip_indices.contains(index));
+    let mut audio = prepare_audio_clip_render(
+        document,
         project_path,
         AudioClipRenderOptions {
             arrangement_id: options.arrangement_id,
@@ -1383,12 +1489,19 @@ pub fn stream_playlist_performance_with_vst3_to_device(
         performance.performance_zone_end_tick,
         performance.start_frame,
         performance.launches,
-        &performance_clip_indices,
-        &sampler,
+        PlaylistPerformanceSources {
+            sampler_clip_indices: &performance_sampler_clip_indices,
+            audio_clip_indices: &performance_audio_clip_indices,
+            sampler: &sampler,
+            audio: &audio,
+        },
     )?;
+    audio
+        .clips
+        .retain(|clip| !performance_audio_clip_indices.contains(&clip.clip_index));
     sampler
         .notes
-        .retain(|note| !performance_clip_indices.contains(&note.clip_index));
+        .retain(|note| !performance_sampler_clip_indices.contains(&note.clip_index));
 
     let static_frames = audio.summary.frames.max(sampler.summary.frames);
     if let Some(processor) = vst3_processor.as_mut() {
@@ -3552,7 +3665,14 @@ fn stream_prepared_playlist_render_with_performance(
                     parallel_mixer.as_ref(),
                 )?;
                 if let Some(performance) = performance.as_mut() {
-                    performance.update(block_start, frame_count, &mut sampler_engine)?;
+                    performance.update(
+                        block_start,
+                        frame_count,
+                        &mut sampler_engine,
+                        &audio_mix_context,
+                        block,
+                        meter_buses.as_deref_mut(),
+                    )?;
                 }
                 let sampler_samples = &mut sampler_block[..sample_count];
                 if let Some(meter_buses) = meter_buses.as_deref_mut() {
@@ -4284,6 +4404,7 @@ fn prepare_audio_clip_render(
         output_frames = output_frames.max(end_frame);
         clips.push(PreparedClip {
             clip_index: *clip_index,
+            playlist_track_id: clip.playlist_track_id(),
             channel_id: *channel_id,
             mixer_track: *mixer_track,
             path: path.clone(),
@@ -4929,6 +5050,26 @@ struct ActivePerformanceSamplerClip {
     next_loop_tick: u64,
 }
 
+#[derive(Clone)]
+struct PerformanceAudioClip {
+    track_id: u32,
+    length_ticks: u64,
+    source_duration_frames: u64,
+    template: PreparedClip,
+}
+
+struct ActivePerformanceAudioClip {
+    clip_index: usize,
+    next_loop_tick: u64,
+}
+
+struct PlaylistPerformanceSources<'a> {
+    sampler_clip_indices: &'a BTreeSet<usize>,
+    audio_clip_indices: &'a BTreeSet<usize>,
+    sampler: &'a PreparedSamplerArrangement,
+    audio: &'a PreparedAudioClipRender,
+}
+
 struct PlaylistPerformanceRuntime {
     performance_zone_end_tick: u32,
     start_frame: u64,
@@ -4936,7 +5077,10 @@ struct PlaylistPerformanceRuntime {
     tempo_map: PlaylistTempoMap,
     launches: Receiver<PlaylistPerformanceLaunch>,
     clips_by_index: HashMap<usize, PerformanceSamplerClip>,
+    audio_clips_by_index: HashMap<usize, PerformanceAudioClip>,
     active_by_track: BTreeMap<u32, ActivePerformanceSamplerClip>,
+    active_audio_by_track: BTreeMap<u32, ActivePerformanceAudioClip>,
+    active_audio_playbacks: Vec<PreparedClip>,
 }
 
 impl PlaylistPerformanceRuntime {
@@ -4946,8 +5090,7 @@ impl PlaylistPerformanceRuntime {
         performance_zone_end_tick: u32,
         start_frame: u64,
         launches: Receiver<PlaylistPerformanceLaunch>,
-        performance_clip_indices: &BTreeSet<usize>,
-        sampler: &PreparedSamplerArrangement,
+        sources: PlaylistPerformanceSources<'_>,
     ) -> Result<Self, String> {
         let arrangement = document
             .arrangements()
@@ -4955,9 +5098,10 @@ impl PlaylistPerformanceRuntime {
             .into_iter()
             .find(|arrangement| arrangement.id == options.arrangement_id)
             .ok_or_else(|| format!("arrangement {} was not found", options.arrangement_id))?;
-        let unresolved_performance_clips = sampler
+        let unresolved_performance_clips = sources
+            .sampler
             .unresolved_clip_indices
-            .intersection(performance_clip_indices)
+            .intersection(sources.sampler_clip_indices)
             .copied()
             .collect::<Vec<_>>();
         if !unresolved_performance_clips.is_empty() {
@@ -4971,7 +5115,7 @@ impl PlaylistPerformanceRuntime {
             ));
         }
         let mut clips_by_index = HashMap::new();
-        for &clip_index in performance_clip_indices {
+        for &clip_index in sources.sampler_clip_indices {
             let clip = arrangement.clips.get(clip_index).ok_or_else(|| {
                 format!("Performance Pattern Clip {} disappeared", clip_index + 1)
             })?;
@@ -4989,7 +5133,8 @@ impl PlaylistPerformanceRuntime {
                 )
             })?;
             let source_start_tick = u64::from(clip.position_ticks);
-            let notes = sampler
+            let notes = sources
+                .sampler
                 .notes
                 .iter()
                 .filter(|note| note.clip_index == clip_index)
@@ -5010,6 +5155,63 @@ impl PlaylistPerformanceRuntime {
                 },
             );
         }
+        let mut audio_clips_by_index = HashMap::new();
+        for &clip_index in sources.audio_clip_indices {
+            let clip = arrangement
+                .clips
+                .get(clip_index)
+                .ok_or_else(|| format!("Performance Audio Clip {} disappeared", clip_index + 1))?;
+            let length_ticks = u64::from(clip.length_ticks);
+            if length_ticks == 0 {
+                return Err(format!(
+                    "Performance Audio Clip {} has no timeline length",
+                    clip_index + 1
+                ));
+            }
+            let track_id = clip.playlist_track_id().ok_or_else(|| {
+                format!(
+                    "Performance Audio Clip {} has no Playlist track",
+                    clip_index + 1
+                )
+            })?;
+            let template = sources
+                .audio
+                .clips
+                .iter()
+                .find(|prepared| prepared.clip_index == clip_index)
+                .ok_or_else(|| {
+                    format!(
+                        "Performance Audio Clip {} could not be prepared for playback",
+                        clip_index + 1
+                    )
+                })?
+                .clone();
+            let source = sources
+                .audio
+                .decoded_by_path
+                .get(&template.path)
+                .ok_or_else(|| {
+                    format!(
+                        "Performance Audio Clip {} has no decoded sample",
+                        clip_index + 1
+                    )
+                })?;
+            let source_duration_frames = source_duration_to_frames(
+                template.source_bounds.end - template.source_bounds.start,
+                source.sample_rate,
+                options.sample_rate,
+                template.pitch_ratio,
+            )?;
+            audio_clips_by_index.insert(
+                clip_index,
+                PerformanceAudioClip {
+                    track_id,
+                    length_ticks,
+                    source_duration_frames,
+                    template,
+                },
+            );
+        }
         Ok(Self {
             performance_zone_end_tick,
             start_frame,
@@ -5017,7 +5219,10 @@ impl PlaylistPerformanceRuntime {
             tempo_map: PlaylistTempoMap::for_arrangement(document, options.arrangement_id)?,
             launches,
             clips_by_index,
+            audio_clips_by_index,
             active_by_track: BTreeMap::new(),
+            active_audio_by_track: BTreeMap::new(),
+            active_audio_playbacks: Vec::new(),
         })
     }
 
@@ -5026,14 +5231,11 @@ impl PlaylistPerformanceRuntime {
         block_start: u64,
         frame_count: usize,
         sampler_engine: &mut SamplerVoiceEngine<'_>,
+        audio_context: &PreparedAudioClipMixContext<'_>,
+        audio_output: &mut [f32],
+        meter_buses: Option<&mut [f32]>,
     ) -> Result<(), String> {
         while let Ok(launch) = self.launches.try_recv() {
-            let clip = self.clips_by_index.get(&launch.clip_index).ok_or_else(|| {
-                format!(
-                    "Pattern Clip {} is not a supported Performance Mode Sampler clip",
-                    launch.clip_index + 1
-                )
-            })?;
             if launch.start_tick < u64::from(self.performance_zone_end_tick)
                 || launch.start_frame < self.start_frame
             {
@@ -5041,16 +5243,39 @@ impl PlaylistPerformanceRuntime {
                     "Performance Mode launch must start at or after the Start marker".into(),
                 );
             }
-            let track_id = clip.track_id;
+            let (track_id, is_sampler_clip) =
+                if let Some(clip) = self.clips_by_index.get(&launch.clip_index) {
+                    (clip.track_id, true)
+                } else if let Some(clip) = self.audio_clips_by_index.get(&launch.clip_index) {
+                    (clip.track_id, false)
+                } else {
+                    return Err(format!(
+                        "Playlist Clip {} is not supported in Performance Mode",
+                        launch.clip_index + 1
+                    ));
+                };
             sampler_engine.remove_queued_track_notes_from(track_id, launch.start_frame);
             sampler_engine.release_track_at(track_id, launch.start_frame);
-            self.active_by_track.insert(
-                track_id,
-                ActivePerformanceSamplerClip {
-                    clip_index: launch.clip_index,
-                    next_loop_tick: launch.start_tick,
-                },
-            );
+            self.active_by_track.remove(&track_id);
+            self.active_audio_by_track.remove(&track_id);
+            self.stop_audio_track_at(track_id, launch.start_frame);
+            if is_sampler_clip {
+                self.active_by_track.insert(
+                    track_id,
+                    ActivePerformanceSamplerClip {
+                        clip_index: launch.clip_index,
+                        next_loop_tick: launch.start_tick,
+                    },
+                );
+            } else {
+                self.active_audio_by_track.insert(
+                    track_id,
+                    ActivePerformanceAudioClip {
+                        clip_index: launch.clip_index,
+                        next_loop_tick: launch.start_tick,
+                    },
+                );
+            }
         }
 
         let horizon_frame = block_start
@@ -5102,8 +5327,69 @@ impl PlaylistPerformanceRuntime {
                     .ok_or_else(|| "Performance Mode loop tick overflow".to_owned())?;
             }
         }
+        for active in self.active_audio_by_track.values_mut() {
+            let clip = self
+                .audio_clips_by_index
+                .get(&active.clip_index)
+                .ok_or_else(|| "active Performance Mode Audio Clip disappeared".to_owned())?;
+            loop {
+                let loop_start_tick = active.next_loop_tick;
+                let loop_frame = self
+                    .tempo_map
+                    .frame_at_tick(loop_start_tick, self.sample_rate)?;
+                if loop_frame > horizon_frame {
+                    break;
+                }
+                let loop_end_tick = loop_start_tick
+                    .checked_add(clip.length_ticks)
+                    .ok_or_else(|| "Performance Mode audio loop tick overflow".to_owned())?;
+                let loop_end_frame = self
+                    .tempo_map
+                    .frame_at_tick(loop_end_tick, self.sample_rate)?;
+                let timeline_duration_frames = loop_end_frame.saturating_sub(loop_frame);
+                let duration_frames = clip.source_duration_frames.min(timeline_duration_frames);
+                if duration_frames > 0 {
+                    let mut playback = clip.template.clone();
+                    playback.start_frame = loop_frame;
+                    playback.duration_frames = duration_frames;
+                    self.active_audio_playbacks.push(playback);
+                }
+                active.next_loop_tick = loop_end_tick;
+            }
+        }
+        self.active_audio_playbacks
+            .retain(|clip| clip.start_frame.saturating_add(clip.duration_frames) > block_start);
         sampler_engine.queue_live_notes(queued_notes);
+        let dynamic_audio_context = PreparedAudioClipMixContext {
+            clips: &self.active_audio_playbacks,
+            decoded_by_path: audio_context.decoded_by_path,
+            sample_rate: audio_context.sample_rate,
+            resampling_quality: audio_context.resampling_quality,
+            cancelled: audio_context.cancelled,
+        };
+        mix_prepared_audio_clip_block(
+            &dynamic_audio_context,
+            block_start,
+            audio_output,
+            meter_buses,
+            None,
+        )?;
         Ok(())
+    }
+
+    fn stop_audio_track_at(&mut self, track_id: u32, stop_frame: u64) {
+        self.active_audio_playbacks.retain_mut(|clip| {
+            if clip.playlist_track_id != Some(track_id) {
+                return true;
+            }
+            if clip.start_frame >= stop_frame {
+                return false;
+            }
+            if clip.start_frame.saturating_add(clip.duration_frames) > stop_frame {
+                clip.duration_frames = stop_frame.saturating_sub(clip.start_frame);
+            }
+            clip.duration_frames > 0
+        });
     }
 }
 
@@ -6068,6 +6354,7 @@ struct SampleBounds {
 #[derive(Clone, Debug)]
 struct PreparedClip {
     clip_index: usize,
+    playlist_track_id: Option<u32>,
     channel_id: u16,
     mixer_track: Option<i8>,
     path: PathBuf,
@@ -7760,6 +8047,7 @@ mod tests {
             )]),
             clips: vec![PreparedClip {
                 clip_index: 0,
+                playlist_track_id: None,
                 channel_id: 4,
                 mixer_track: None,
                 path,
@@ -8101,6 +8389,7 @@ mod tests {
             );
             PreparedClip {
                 clip_index,
+                playlist_track_id: None,
                 channel_id: u16::try_from(clip_index).unwrap(),
                 mixer_track: Some(mixer_track),
                 path: path.clone(),
@@ -8179,6 +8468,7 @@ mod tests {
         };
         let clip = PreparedClip {
             clip_index: 0,
+            playlist_track_id: None,
             channel_id: 0,
             mixer_track: None,
             path: PathBuf::new(),
@@ -8226,6 +8516,7 @@ mod tests {
         };
         let clip = PreparedClip {
             clip_index: 0,
+            playlist_track_id: None,
             channel_id: 0,
             mixer_track: None,
             path: PathBuf::new(),
@@ -8253,6 +8544,7 @@ mod tests {
         };
         let clip = PreparedClip {
             clip_index: 0,
+            playlist_track_id: None,
             channel_id: 1,
             mixer_track: None,
             path: PathBuf::new(),
@@ -8287,6 +8579,7 @@ mod tests {
         };
         let clip = PreparedClip {
             clip_index: 0,
+            playlist_track_id: None,
             channel_id: 3,
             mixer_track: None,
             path: path.clone(),
