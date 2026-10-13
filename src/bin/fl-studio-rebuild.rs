@@ -2393,6 +2393,7 @@ struct PlaylistClipDragTarget {
     start_position_ticks: u32,
     start_length_ticks: u32,
     start_track_index: u16,
+    audio_resize_ticks: Option<(u32, u32, u32)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2403,6 +2404,17 @@ struct PlaylistClipDragContext {
     ppq: u16,
     snap: bool,
     max_track_index: u16,
+}
+
+#[derive(Clone, Copy)]
+struct PlaylistAudioResizeContext<'a> {
+    channel_kinds: &'a BTreeMap<u16, Option<u8>>,
+    audio_waveform_paths: &'a BTreeMap<u16, PathBuf>,
+    audio_waveforms: &'a BTreeMap<PathBuf, Arc<AudioWaveform>>,
+    arrangement_clips: &'a [PlaylistClip],
+    tempo_channel_ids: &'a BTreeSet<u16>,
+    ppq: u16,
+    tempo_bpm: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -12884,23 +12896,16 @@ impl DawUi {
                                 clip.target(),
                                 flp_rebuild::PlaylistClipTarget::Pattern { .. }
                             );
-                            let sample_length_ms = match clip.target() {
-                                flp_rebuild::PlaylistClipTarget::Channel { id }
-                                    if is_audio_clip => self
-                                        .audio_waveform_paths
-                                        .get(&id)
-                                        .and_then(|path| self.audio_waveforms.get(path))
-                                        .filter(|waveform| waveform.sample_rate > 0)
-                                        .map(|waveform| {
-                                            (waveform.frame_count as f64 * 1_000.0
-                                                / f64::from(waveform.sample_rate))
-                                                as f32
-                                        })
-                                        .filter(|length_ms| {
-                                            length_ms.is_finite() && *length_ms > 0.0
-                                        }),
-                                _ => None,
-                            };
+                            let sample_length_ms = is_audio_clip
+                                .then(|| {
+                                    playlist_clip_sample_length_ms(
+                                        clip,
+                                        &channel_kinds,
+                                        &self.audio_waveform_paths,
+                                        &self.audio_waveforms,
+                                    )
+                                })
+                                .flatten();
                             let full_source_length_ms = clip
                                 .uses_full_source_window()
                                 .then_some(sample_length_ms)
@@ -12947,16 +12952,11 @@ impl DawUi {
                             );
                             let tempo_supported =
                                 ppq > 0 && self.tempo_bpm.is_finite() && self.tempo_bpm > 0.0;
-                            let sample_length_ticks = sample_length_ms.and_then(|length_ms| {
-                                let ticks = f64::from(length_ms) * f64::from(ppq)
-                                    * self.tempo_bpm
-                                    / 60_000.0;
-                                (tempo_supported
-                                    && ticks.is_finite()
-                                    && ticks > 0.0
-                                    && ticks <= f64::from(u32::MAX))
-                                .then_some(ticks.floor() as u32)
-                            });
+                            let sample_length_ticks = playlist_audio_duration_ticks(
+                                sample_length_ms,
+                                ppq,
+                                self.tempo_bpm,
+                            );
                             let modern_window_matches_timeline = clip
                                 .source_window_ticks()
                                 .is_some_and(|(start, end)| {
@@ -13028,14 +13028,14 @@ impl DawUi {
                                 && source_window_supported
                                 && scale_supported
                                 && !tempo_automation_overlaps;
-                            let can_resize_audio_ticks = is_audio_clip
-                                && clip.has_opaque_record_tail()
-                                && modern_window_matches_timeline
-                                && modern_window_within_sample
-                                && sample_length_ticks.is_some()
-                                && scale_supported
-                                && !tempo_automation_overlaps_clip
-                                && tempo_supported;
+                            let audio_resize_ticks = playlist_audio_clip_resize_ticks(
+                                clip,
+                                sample_length_ticks,
+                                scale_supported,
+                                tempo_automation_overlaps_clip,
+                            );
+                            let can_resize_audio_ticks =
+                                is_audio_clip && audio_resize_ticks.is_some();
                             let can_resize_clip =
                                 clip.can_resize_timeline_length() || can_resize_audio_ticks;
                             let can_split_pattern_clip = context_split_position.is_some_and(
@@ -13060,9 +13060,9 @@ impl DawUi {
                                     slip_unavailable_reason
                                 }
                             } else if clip.has_opaque_record_tail() && is_audio_clip {
-                                "Drag to move. Shift-drag either edge to trim or extend this Audio Clip's explicit source tick window."
+                                "Drag to move. Shift-drag either edge to trim or extend this Audio Clip's explicit source tick window. Eligible selected clips can resize together from the right edge."
                             } else if clip.has_opaque_record_tail() {
-                                "Drag to move. Shift-drag the right edge to resize this Pattern Clip; its full source window will be kept in sync."
+                                "Drag to move. Shift-drag the right edge to resize this Pattern Clip; its full source window will be kept in sync. Eligible selected clips can share the right-edge resize."
                             } else {
                                 "Drag to move. Shift-drag the right edge to resize. Hold Alt to ignore the 1/16 grid."
                             };
@@ -13392,10 +13392,18 @@ impl DawUi {
                                 let resize = resize_requested && can_resize_edge;
                                 let slip_requested =
                                     self.playlist_slip_tool_active && is_audio_clip && !resize;
+                                let audio_resize_context = PlaylistAudioResizeContext {
+                                    channel_kinds: &channel_kinds,
+                                    audio_waveform_paths: &self.audio_waveform_paths,
+                                    audio_waveforms: &self.audio_waveforms,
+                                    arrangement_clips: &arrangement.clips,
+                                    tempo_channel_ids: &tempo_channel_ids,
+                                    ppq,
+                                    tempo_bpm: self.tempo_bpm,
+                                };
                                 let preserve_selected_group_resize = resize
                                     && resize_edge_requested
                                         == Some(PlaylistClipResizeEdge::Right)
-                                    && !can_resize_audio_ticks
                                     && self.selected_arrangement == Some(arrangement.id)
                                     && self.selected_playlist_clips.len() > 1
                                     && self.selected_playlist_clips.iter().all(
@@ -13403,7 +13411,14 @@ impl DawUi {
                                             arrangement
                                                 .clips
                                                 .get(*selected_index)
-                                                .is_some_and(PlaylistClip::can_resize_timeline_length)
+                                                .is_some_and(|selected_clip| {
+                                                    selected_clip.can_resize_timeline_length()
+                                                        || playlist_audio_clip_resize_ticks_from_project(
+                                                            selected_clip,
+                                                            audio_resize_context,
+                                                        )
+                                                        .is_some()
+                                                })
                                         },
                                     );
                                 let preserve_selected_group = (!resize
@@ -13431,6 +13446,11 @@ impl DawUi {
                                                 start_position_ticks: target_clip.position_ticks,
                                                 start_length_ticks: target_clip.length_ticks,
                                                 start_track_index: target_clip.track_index?,
+                                                audio_resize_ticks:
+                                                    playlist_audio_clip_resize_ticks_from_project(
+                                                        target_clip,
+                                                        audio_resize_context,
+                                                    ),
                                             })
                                         })
                                         .collect::<Option<Vec<_>>>()
@@ -13440,6 +13460,7 @@ impl DawUi {
                                         start_position_ticks: clip.position_ticks,
                                         start_length_ticks: clip.length_ticks,
                                         start_track_index: clip.track_index.unwrap_or(row),
+                                        audio_resize_ticks,
                                     }])
                                 };
                                 self.selected_arrangement = Some(arrangement.id);
@@ -13537,8 +13558,14 @@ impl DawUi {
                                             max_track_index: last_track.min(499),
                                         },
                                     )
-                                } else if drag.kind == PlaylistClipDragKind::Resize
-                                    && group_targets.len() > 1
+                                } else if matches!(
+                                    drag.kind,
+                                    PlaylistClipDragKind::Resize
+                                        | PlaylistClipDragKind::ResizeAudioTicks {
+                                            edge: PlaylistClipResizeEdge::Right,
+                                            ..
+                                        }
+                                ) && group_targets.len() > 1
                                 {
                                     playlist_clip_group_resize_edits(
                                         drag,
@@ -13642,7 +13669,11 @@ impl DawUi {
                                             }
                                             Ok(())
                                         }
-                                        PlaylistClipDragKind::Resize => {
+                                        PlaylistClipDragKind::Resize
+                                        | PlaylistClipDragKind::ResizeAudioTicks {
+                                            edge: PlaylistClipResizeEdge::Right,
+                                            ..
+                                        } => {
                                             for (edited_index, edit) in &edits {
                                                 document.edit_playlist_clip(
                                                     arrangement.id,
@@ -13652,7 +13683,10 @@ impl DawUi {
                                             }
                                             Ok(())
                                         }
-                                        PlaylistClipDragKind::ResizeAudioTicks { .. } => {
+                                        PlaylistClipDragKind::ResizeAudioTicks {
+                                            edge: PlaylistClipResizeEdge::Left,
+                                            ..
+                                        } => {
                                             document.edit_playlist_clip(
                                                 arrangement.id,
                                                 clip_index,
@@ -35881,6 +35915,91 @@ fn playlist_tempo_overlaps_range(
     })
 }
 
+fn playlist_clip_sample_length_ms(
+    clip: &PlaylistClip,
+    channel_kinds: &BTreeMap<u16, Option<u8>>,
+    audio_waveform_paths: &BTreeMap<u16, PathBuf>,
+    audio_waveforms: &BTreeMap<PathBuf, Arc<AudioWaveform>>,
+) -> Option<f32> {
+    let PlaylistClipTarget::Channel { id } = clip.target() else {
+        return None;
+    };
+    if channel_kinds.get(&id).copied().flatten() != Some(4) {
+        return None;
+    }
+    audio_waveform_paths
+        .get(&id)
+        .and_then(|path| audio_waveforms.get(path))
+        .filter(|waveform| waveform.sample_rate > 0)
+        .map(|waveform| {
+            (waveform.frame_count as f64 * 1_000.0 / f64::from(waveform.sample_rate)) as f32
+        })
+        .filter(|length_ms| length_ms.is_finite() && *length_ms > 0.0)
+}
+
+fn playlist_audio_duration_ticks(
+    sample_length_ms: Option<f32>,
+    ppq: u16,
+    tempo_bpm: f64,
+) -> Option<u32> {
+    if ppq == 0 || !tempo_bpm.is_finite() || tempo_bpm <= 0.0 {
+        return None;
+    }
+    let sample_length_ms = sample_length_ms?;
+    let ticks = f64::from(sample_length_ms) * f64::from(ppq) * tempo_bpm / 60_000.0;
+    (ticks.is_finite() && ticks > 0.0 && ticks <= f64::from(u32::MAX))
+        .then_some(ticks.floor() as u32)
+}
+
+fn playlist_audio_clip_resize_ticks(
+    clip: &PlaylistClip,
+    sample_length_ticks: Option<u32>,
+    scale_supported: bool,
+    tempo_automation_overlaps_clip: bool,
+) -> Option<(u32, u32, u32)> {
+    if !clip.has_opaque_record_tail() || !scale_supported || tempo_automation_overlaps_clip {
+        return None;
+    }
+    let (source_start_tick, source_end_tick) = clip.source_window_ticks()?;
+    let sample_length_ticks = sample_length_ticks?;
+    (source_end_tick > source_start_tick
+        && source_end_tick.checked_sub(source_start_tick) == Some(clip.length_ticks)
+        && source_end_tick <= sample_length_ticks)
+        .then_some((source_start_tick, source_end_tick, sample_length_ticks))
+}
+
+fn playlist_audio_clip_resize_ticks_from_project(
+    clip: &PlaylistClip,
+    context: PlaylistAudioResizeContext<'_>,
+) -> Option<(u32, u32, u32)> {
+    let sample_length_ms = playlist_clip_sample_length_ms(
+        clip,
+        context.channel_kinds,
+        context.audio_waveform_paths,
+        context.audio_waveforms,
+    );
+    let sample_length_ticks =
+        playlist_audio_duration_ticks(sample_length_ms, context.ppq, context.tempo_bpm);
+    let scale_supported = clip
+        .scale
+        .is_none_or(|scale| scale.is_finite() && scale > 0.0 && (scale - 1.0).abs() <= 1e-9);
+    let tempo_automation_overlaps_clip = playlist_tempo_overlaps_range(
+        context.arrangement_clips,
+        context.tempo_channel_ids,
+        clip.position_ticks,
+        clip.position_ticks.saturating_add(clip.length_ticks),
+    );
+    playlist_audio_clip_resize_ticks(
+        clip,
+        sample_length_ticks,
+        scale_supported,
+        tempo_automation_overlaps_clip,
+    )
+    .filter(|_| {
+        matches!(clip.target(), PlaylistClipTarget::Channel { id } if context.channel_kinds.get(&id).copied().flatten() == Some(4))
+    })
+}
+
 fn playlist_clip_split_position(
     pointer: egui::Pos2,
     clip_rect: egui::Rect,
@@ -36453,16 +36572,37 @@ fn playlist_clip_group_resize_edits(
         .max()
         .unwrap_or(drag.start_length_ticks);
     let minimum_delta = 1 - i64::from(minimum_length);
-    let maximum_delta = i64::from(u32::MAX) - i64::from(maximum_length);
+    let maximum_delta = targets
+        .iter()
+        .map(|target| {
+            let maximum_target_length = target.audio_resize_ticks.map_or(
+                u32::MAX,
+                |(source_start_tick, _, sample_length_ticks)| {
+                    sample_length_ticks.saturating_sub(source_start_tick)
+                },
+            );
+            i64::from(maximum_target_length) - i64::from(target.start_length_ticks)
+        })
+        .min()
+        .unwrap_or_else(|| i64::from(u32::MAX) - i64::from(maximum_length));
     let delta = requested_delta.clamp(minimum_delta, maximum_delta);
 
     targets
         .iter()
         .map(|target| {
+            let length_ticks = (i64::from(target.start_length_ticks) + delta) as u32;
             (
                 target.clip_index,
                 PlaylistClipEdit {
-                    length_ticks: Some((i64::from(target.start_length_ticks) + delta) as u32),
+                    length_ticks: Some(length_ticks),
+                    source_window_ticks: target.audio_resize_ticks.map(
+                        |(source_start_tick, _, _)| {
+                            (
+                                source_start_tick,
+                                source_start_tick.saturating_add(length_ticks),
+                            )
+                        },
+                    ),
                     ..PlaylistClipEdit::default()
                 },
             )
