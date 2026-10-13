@@ -14309,6 +14309,7 @@ impl DawUi {
             );
         }
         let mut channel_color_edits = Vec::<(Vec<u16>, [u8; 3])>::new();
+        let mut channel_color_gradient_edits = Vec::<(Vec<u16>, [u8; 3], [u8; 3])>::new();
         let mut channel_order_edits = Vec::new();
         let mut channel_sort = None;
         let mut level_edits = Vec::new();
@@ -14816,6 +14817,29 @@ impl DawUi {
                                 } else {
                                     self.selected_rack_channels.iter().copied().collect()
                                 };
+                                let gradient_channel_ids = channels
+                                    .iter()
+                                    .map(ChannelSummary::id)
+                                    .filter(|id| selected_ids.contains(id))
+                                    .collect::<Vec<_>>();
+                                let gradient_endpoint_color = |channel_id| {
+                                    channels
+                                        .iter()
+                                        .find(|selected_channel| selected_channel.id() == channel_id)
+                                        .and_then(ChannelSummary::color)
+                                        .map(|[r, g, b, _]| [r, g, b])
+                                        .unwrap_or([PANEL_LIGHT.r(), PANEL_LIGHT.g(), PANEL_LIGHT.b()])
+                                };
+                                let gradient_start_rgb = gradient_channel_ids
+                                    .first()
+                                    .copied()
+                                    .map(gradient_endpoint_color)
+                                    .unwrap_or([PANEL_LIGHT.r(), PANEL_LIGHT.g(), PANEL_LIGHT.b()]);
+                                let gradient_end_rgb = gradient_channel_ids
+                                    .last()
+                                    .copied()
+                                    .map(gradient_endpoint_color)
+                                    .unwrap_or(gradient_start_rgb);
                                 ui.menu_button("Color selected channels", |ui| {
                                     ui.small(format!("{} channel(s)", selected_ids.len()));
                                     let mut color = channel.color().map_or(PANEL_LIGHT, |[r, g, b, _]| {
@@ -14835,6 +14859,23 @@ impl DawUi {
                                         ));
                                     }
                                 });
+                                if ui
+                                    .add_enabled(
+                                        gradient_channel_ids.len() > 1,
+                                        egui::Button::new("Interpolate color gradient"),
+                                    )
+                                    .on_hover_text(
+                                        "Blend RGB from the first to last selected Channel Rack row",
+                                    )
+                                    .clicked()
+                                {
+                                    channel_color_gradient_edits.push((
+                                        gradient_channel_ids,
+                                        gradient_start_rgb,
+                                        gradient_end_rgb,
+                                    ));
+                                    ui.close();
+                                }
                                 if matches!(channel.kind(), Some(0 | 2)) {
                                     let swing_is_valid = channel
                                         .swing_mix_raw()
@@ -15338,6 +15379,22 @@ impl DawUi {
                 }
                 Some(Err(error)) => {
                     self.status = format!("Could not change channel color: {error}");
+                }
+                None => {}
+            }
+        }
+        for (channel_ids, start_rgb, end_rgb) in channel_color_gradient_edits {
+            let result = self.document.as_mut().map(|document| {
+                document.set_channel_color_gradient(&channel_ids, start_rgb, end_rgb)
+            });
+            match result {
+                Some(Ok(())) => {
+                    self.dirty = true;
+                    self.status =
+                        format!("Applied RGB gradient to {} channel(s)", channel_ids.len());
+                }
+                Some(Err(error)) => {
+                    self.status = format!("Could not apply channel color gradient: {error}");
                 }
                 None => {}
             }

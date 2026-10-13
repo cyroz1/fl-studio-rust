@@ -12782,6 +12782,45 @@ impl FlpDocument {
         Ok(())
     }
 
+    /// Interpolates a linear RGB gradient across channels in the supplied order and applies it
+    /// as one transactional edit. At least two distinct channel IDs are required.
+    pub fn set_channel_color_gradient(
+        &mut self,
+        channel_ids: &[u16],
+        start_rgb: [u8; 3],
+        end_rgb: [u8; 3],
+    ) -> Result<(), FlpError> {
+        if channel_ids.len() < 2 {
+            return Err(FlpError::UnsupportedEdit(
+                "a channel color gradient requires at least two channels",
+            ));
+        }
+
+        let mut candidate = self.clone();
+        let mut updated_ids = HashSet::with_capacity(channel_ids.len());
+        let final_index = channel_ids.len() - 1;
+        for (index, &channel_id) in channel_ids.iter().enumerate() {
+            if !updated_ids.insert(channel_id) {
+                return Err(FlpError::UnsupportedEdit(
+                    "a channel color gradient requires unique channel IDs",
+                ));
+            }
+            let progress = index as f64 / final_index as f64;
+            let interpolate = |start: u8, end: u8| {
+                (f64::from(start) * (1.0 - progress) + f64::from(end) * progress).round() as u8
+            };
+            let rgb = [
+                interpolate(start_rgb[0], end_rgb[0]),
+                interpolate(start_rgb[1], end_rgb[1]),
+                interpolate(start_rgb[2], end_rgb[2]),
+            ];
+            candidate.set_channel_color_in_place(channel_id, rgb)?;
+        }
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
     fn set_channel_color_in_place(
         &mut self,
         channel_id: u16,
