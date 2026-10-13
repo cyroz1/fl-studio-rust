@@ -11537,6 +11537,7 @@ impl DawUi {
 
         let mut create_pattern_clip_requested = false;
         let mut playlist_track_edits_requested = Vec::new();
+        let mut auto_name_playlist_track_requested = None;
         let mut solo_playlist_track_requested = None;
         let mut delete_clip_requested = None;
         let mut muted_clip_requested = None;
@@ -12123,6 +12124,25 @@ impl DawUi {
                         .find(|track| track.id == track_id)
                         .and_then(|track| track.name.as_deref())
                         .unwrap_or("Track");
+                    let track_auto_name = arrangement
+                        .clips
+                        .iter()
+                        .filter(|clip| clip.track_index == Some(row))
+                        .filter_map(|clip| {
+                            let PlaylistClipTarget::Pattern { id } = clip.target() else {
+                                return None;
+                            };
+                            let pattern = patterns.iter().find(|pattern| pattern.id == id)?;
+                            let name = pattern
+                                .name
+                                .as_deref()
+                                .filter(|name| !name.trim().is_empty())
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| format!("Pattern {id}"));
+                            Some((clip.position_ticks, name))
+                        })
+                        .min_by_key(|(position, _)| *position)
+                        .map(|(_, name)| name);
                     ui.horizontal(|ui| {
                         let (label_rect, _) = ui.allocate_exact_size(
                             Vec2::new(label_width, row_height),
@@ -12301,6 +12321,24 @@ impl DawUi {
                             if ui.button("Rename…").clicked() {
                                 self.playlist_track_name_editor =
                                     Some((track_id, track_name.to_owned()));
+                                ui.close();
+                            }
+                            if ui
+                                .add_enabled(
+                                    track_auto_name.is_some(),
+                                    egui::Button::new("Auto name"),
+                                )
+                                .on_hover_text(if track_auto_name.is_some() {
+                                    "Use the earliest Pattern Clip's name on this track"
+                                } else {
+                                    "Add a Pattern Clip to this track to auto-name it"
+                                })
+                                .clicked()
+                            {
+                                if let Some(name) = &track_auto_name {
+                                    auto_name_playlist_track_requested =
+                                        Some((track_id, name.clone()));
+                                }
                                 ui.close();
                             }
                             if let Some(track) = track_state {
@@ -13946,6 +13984,25 @@ impl DawUi {
         }
         if !playlist_clip_list_changed {
             self.selected_clip_editor(ui, arrangement.id, &arrangement.clips);
+        }
+        if let Some((track_id, name)) = auto_name_playlist_track_requested {
+            match self
+                .document
+                .as_mut()
+                .map(|document| document.rename_playlist_track(track_id, &name))
+            {
+                Some(Ok(())) => {
+                    self.dirty = true;
+                    ui.ctx().request_repaint();
+                    self.status = format!("Auto-named Playlist track {track_id}");
+                }
+                Some(Err(error)) => {
+                    self.status = format!("Could not auto-name Playlist track {track_id}: {error}");
+                }
+                None => {
+                    self.status = "Open a project to auto-name Playlist tracks".to_owned();
+                }
+            }
         }
         self.show_playlist_track_name_editor(ui.ctx());
     }
