@@ -11971,6 +11971,51 @@ impl DawUi {
                 }
             })
         };
+        if !ui.ctx().egui_wants_keyboard_input()
+            && let Some(muted) = ui.input_mut(|input| {
+                if input.consume_key(egui::Modifiers::ALT | egui::Modifiers::SHIFT, egui::Key::M) {
+                    Some(false)
+                } else if input.consume_key(egui::Modifiers::ALT, egui::Key::M) {
+                    Some(true)
+                } else {
+                    None
+                }
+            })
+        {
+            let selected_clip_indices = if self.selected_arrangement == Some(arrangement.id) {
+                if self.selected_playlist_clips.is_empty() {
+                    self.selected_clip.into_iter().collect::<Vec<_>>()
+                } else {
+                    self.selected_playlist_clips
+                        .iter()
+                        .copied()
+                        .collect::<Vec<_>>()
+                }
+            } else {
+                Vec::new()
+            };
+            let clip_edits = selected_clip_indices
+                .into_iter()
+                .filter_map(|index| {
+                    arrangement
+                        .clips
+                        .get(index)
+                        .filter(|clip| clip.is_muted() != muted)
+                        .map(|_| (index, muted))
+                })
+                .collect::<Vec<_>>();
+            if clip_edits.is_empty() {
+                self.status = if muted {
+                    "Select Playlist clips to mute, or all selected clips are already muted"
+                        .to_owned()
+                } else {
+                    "Select Playlist clips to unmute, or all selected clips are already unmuted"
+                        .to_owned()
+                };
+            } else {
+                muted_clip_requested = Some(clip_edits);
+            }
+        }
         if let Some((direction, extend)) = track_navigation {
             let current = self
                 .selected_playlist_track
