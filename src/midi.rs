@@ -38,6 +38,8 @@ pub struct MidiNote {
     key: u8,
     velocity: u8,
     pan: u8,
+    mod_x: u8,
+    mod_y: u8,
     pitch_bend_offset_cents: i16,
     start_tick: u64,
     end_tick: Option<u64>,
@@ -47,6 +49,8 @@ pub struct MidiNote {
 #[derive(Clone, Copy)]
 struct MidiChannelNoteState {
     pan: u8,
+    mod_x: u8,
+    mod_y: u8,
     pitch_bend_value: u16,
     pitch_bend_sensitivity_semitones: u8,
     pitch_bend_sensitivity_cents: u8,
@@ -58,6 +62,8 @@ impl Default for MidiChannelNoteState {
     fn default() -> Self {
         Self {
             pan: 64,
+            mod_x: 64,
+            mod_y: 64,
             pitch_bend_value: 8192,
             pitch_bend_sensitivity_semitones: 2,
             pitch_bend_sensitivity_cents: 0,
@@ -1212,9 +1218,9 @@ impl MidiTrack {
 
     /// Pairs note-on and note-off messages in channel/key order. Notes without an
     /// ending message remain present with `end_tick == None`. The current MIDI
-    /// CC 10 pan and pitch bend are snapshotted when each note starts. A track
-    /// without CC 10 uses the MIDI center value 64; a track without RPN 0 pitch
-    /// sensitivity assumes a two-semitone range.
+    /// CC 10 pan, CC 74 Mod X, CC 71 Mod Y, and pitch bend are snapshotted when
+    /// each note starts. Missing CC values use MIDI center 64; a track without
+    /// RPN 0 pitch sensitivity assumes a two-semitone range.
     pub fn notes(&self) -> Vec<MidiNote> {
         let mut notes = Vec::new();
         let mut active: BTreeMap<(u8, u8), VecDeque<usize>> = BTreeMap::new();
@@ -1235,6 +1241,8 @@ impl MidiTrack {
                     let state = channel_state.entry(channel).or_default();
                     match key {
                         10 => state.pan = data[1],
+                        74 => state.mod_x = data[1].min(127),
+                        71 => state.mod_y = data[1].min(127),
                         101 => state.rpn_msb = data[1],
                         100 => state.rpn_lsb = data[1],
                         6 if (state.rpn_msb, state.rpn_lsb) == (0, 0) => {
@@ -1258,6 +1266,8 @@ impl MidiTrack {
                         key,
                         velocity: data[1],
                         pan: state.pan,
+                        mod_x: state.mod_x,
+                        mod_y: state.mod_y,
                         pitch_bend_offset_cents: midi_pitch_bend_offset_cents(
                             state.pitch_bend_value,
                             state.pitch_bend_sensitivity_semitones,
@@ -1309,6 +1319,16 @@ impl MidiNote {
     /// MIDI CC 10 pan value (0–127) active when the note started.
     pub fn pan(&self) -> u8 {
         self.pan
+    }
+
+    /// MIDI CC 74 value active when the note started.
+    pub fn mod_x(&self) -> u8 {
+        self.mod_x
+    }
+
+    /// MIDI CC 71 value active when the note started.
+    pub fn mod_y(&self) -> u8 {
+        self.mod_y
     }
 
     /// Pitch bend offset in cents active when the note started.
@@ -1734,6 +1754,16 @@ pub fn fl_note_modulation_to_midi_value(value: u8) -> u8 {
     ((u16::from(value) * 127 + 127) / 255) as u8
 }
 
+/// Maps MIDI CC 71/74 values to FL Studio's 0–255 note Mod X/Y range.
+pub fn midi_modulation_to_fl_note_value(value: u8) -> u8 {
+    let value = value.min(127);
+    if value <= 64 {
+        ((u16::from(value) * 128 + 32) / 64) as u8
+    } else {
+        (128 + (u16::from(value - 64) * 127 + 31) / 63) as u8
+    }
+}
+
 fn meta_event_bytes(meta_type: u8, data: &[u8]) -> Result<Vec<u8>, MidiError> {
     let length = u32::try_from(data.len()).map_err(|_| MidiError::LengthOverflow)?;
     if u64::from(length) > MAX_VLQ {
@@ -2088,6 +2118,27 @@ mod tests {
         assert_eq!(super::fl_note_modulation_to_midi_value(0), 0);
         assert_eq!(super::fl_note_modulation_to_midi_value(128), 64);
         assert_eq!(super::fl_note_modulation_to_midi_value(255), 127);
+        assert_eq!(super::midi_modulation_to_fl_note_value(0), 0);
+        assert_eq!(super::midi_modulation_to_fl_note_value(64), 128);
+        assert_eq!(super::midi_modulation_to_fl_note_value(127), 255);
+    }
+
+    #[test]
+    fn notes_snapshot_modulation_controllers_at_note_on() {
+        let input = midi_fixture(&[
+            0x00, 0xB0, 74, 127, // Mod X / brightness.
+            0x00, 0xB0, 71, 0, // Mod Y / timbre.
+            0x00, 0x90, 60, 100, // Note on.
+            0x60, 0xB0, 74, 0, // Later Mod X change does not affect the held note.
+            0x00, 0x80, 60, 64, // Note off.
+            0x00, 0xFF, 0x2F, 0x00,
+        ]);
+        let midi = MidiFile::parse(&input).expect("fixture should parse");
+        let note = midi.tracks()[0].notes().remove(0);
+
+        assert_eq!(note.mod_x(), 127);
+        assert_eq!(note.mod_y(), 0);
+        assert_eq!(note.end_tick(), Some(96));
     }
 
     #[test]

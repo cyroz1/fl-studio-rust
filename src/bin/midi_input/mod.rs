@@ -7,8 +7,9 @@ use std::time::{Duration, Instant};
 
 use flp_rebuild::PatternNote;
 use flp_rebuild::midi::{
-    midi_pan_to_fl_note_pan, midi_pitch_bend_cents_to_fl_note_fine_pitch,
-    midi_pitch_bend_offset_cents, midi_release_velocity_to_fl_note_release,
+    midi_modulation_to_fl_note_value, midi_pan_to_fl_note_pan,
+    midi_pitch_bend_cents_to_fl_note_fine_pitch, midi_pitch_bend_offset_cents,
+    midi_release_velocity_to_fl_note_release,
 };
 use midir::{Ignore, MidiInput, MidiInputConnection as MidirInputConnection};
 
@@ -84,6 +85,8 @@ pub enum MidiInputEvent {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MidiInputChannelState {
     pan: u8,
+    mod_x: u8,
+    mod_y: u8,
     pitch_bend_value: u16,
     pitch_bend_sensitivity_semitones: u8,
     pitch_bend_sensitivity_cents: u8,
@@ -95,6 +98,8 @@ impl Default for MidiInputChannelState {
     fn default() -> Self {
         Self {
             pan: 64,
+            mod_x: 64,
+            mod_y: 64,
             pitch_bend_value: 8192,
             pitch_bend_sensitivity_semitones: 2,
             pitch_bend_sensitivity_cents: 0,
@@ -113,9 +118,21 @@ impl MidiInputChannelState {
                 ..
             } => self.pan = value.min(127),
             MidiInputEvent::ControlChange {
+                controller: 74,
+                value,
+                ..
+            } => self.mod_x = value.min(127),
+            MidiInputEvent::ControlChange {
+                controller: 71,
+                value,
+                ..
+            } => self.mod_y = value.min(127),
+            MidiInputEvent::ControlChange {
                 controller: 121, ..
             } => {
                 self.pan = 64;
+                self.mod_x = 64;
+                self.mod_y = 64;
                 self.pitch_bend_sensitivity_semitones = 2;
                 self.pitch_bend_sensitivity_cents = 0;
                 self.rpn_msb = 127;
@@ -154,6 +171,14 @@ impl MidiInputChannelState {
 
     fn raw_pan(self) -> u8 {
         self.pan
+    }
+
+    fn note_mod_x(self) -> u8 {
+        midi_modulation_to_fl_note_value(self.mod_x)
+    }
+
+    fn note_mod_y(self) -> u8 {
+        midi_modulation_to_fl_note_value(self.mod_y)
     }
 
     fn note_fine_pitch(self) -> u8 {
@@ -420,6 +445,8 @@ struct ActiveMidiNote {
     start_tick: u32,
     velocity: u8,
     pan: u8,
+    mod_x: u8,
+    mod_y: u8,
     fine_pitch: u8,
 }
 
@@ -565,6 +592,8 @@ impl MidiPatternRecorder {
                         start_tick: tick,
                         velocity: fixed_velocity.unwrap_or(velocity).min(127),
                         pan: channel_state.raw_pan(),
+                        mod_x: channel_state.note_mod_x(),
+                        mod_y: channel_state.note_mod_y(),
                         fine_pitch: channel_state.note_fine_pitch(),
                     });
             }
@@ -695,6 +724,8 @@ impl MidiPatternRecorder {
             key: u16::from(key),
             midi_channel,
             pan: midi_pan_to_fl_note_pan(active_note.pan),
+            mod_x: active_note.mod_x,
+            mod_y: active_note.mod_y,
             velocity: active_note.velocity,
             fine_pitch: active_note.fine_pitch,
             ..PatternNote::default()
@@ -831,7 +862,7 @@ mod tests {
     }
 
     #[test]
-    fn records_channel_pan_at_each_note_on() {
+    fn records_channel_expression_at_each_note_on() {
         let started_at = Instant::now();
         let mut recorder = MidiPatternRecorder::new(
             MidiPatternRecorderSettings {
@@ -862,11 +893,43 @@ mod tests {
             },
         ));
         recorder.record(message(
+            110,
+            MidiInputEvent::ControlChange {
+                channel: 0,
+                controller: 74,
+                value: 0,
+            },
+        ));
+        recorder.record(message(
+            120,
+            MidiInputEvent::ControlChange {
+                channel: 0,
+                controller: 71,
+                value: 127,
+            },
+        ));
+        recorder.record(message(
             200,
             MidiInputEvent::NoteOn {
                 channel: 0,
                 key: 60,
                 velocity: 90,
+            },
+        ));
+        recorder.record(message(
+            250,
+            MidiInputEvent::ControlChange {
+                channel: 0,
+                controller: 74,
+                value: 127,
+            },
+        ));
+        recorder.record(message(
+            275,
+            MidiInputEvent::ControlChange {
+                channel: 0,
+                controller: 71,
+                value: 0,
             },
         ));
         recorder.record(message(
@@ -905,7 +968,11 @@ mod tests {
         let result = recorder.finish(None, started_at + Duration::from_millis(700));
         assert_eq!(result.notes.len(), 2);
         assert_eq!(result.notes[0].pan, 0);
+        assert_eq!(result.notes[0].mod_x, 0);
+        assert_eq!(result.notes[0].mod_y, 255);
         assert_eq!(result.notes[1].pan, 128);
+        assert_eq!(result.notes[1].mod_x, 255);
+        assert_eq!(result.notes[1].mod_y, 0);
     }
 
     #[test]

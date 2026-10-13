@@ -11114,6 +11114,8 @@ impl FlpDocument {
                 key: u16::from(midi_note.key()),
                 midi_channel: midi_note.channel(),
                 pan: midi::midi_pan_to_fl_note_pan(midi_note.pan()),
+                mod_x: midi::midi_modulation_to_fl_note_value(midi_note.mod_x()),
+                mod_y: midi::midi_modulation_to_fl_note_value(midi_note.mod_y()),
                 fine_pitch: midi::midi_pitch_bend_cents_to_fl_note_fine_pitch(
                     midi_note.pitch_bend_offset_cents(),
                 ),
@@ -22568,9 +22570,13 @@ mod tests {
                 0x00, 0xB9, 38, 0, 0x00, 0xB9, 101, 127, // Deselect RPN 0,0.
                 0x00, 0xB9, 100, 127, 0x00, 0xE9, 0,
                 96, // +600 cents at the 12-semitone midpoint.
+                0x00, 0xB9, 74, 127, // Mod X is high for the first note.
+                0x00, 0xB9, 71, 0, // Mod Y is low for the first note.
                 0x00, 0x99, 0x3C, 0x64, // Channel 9, key 60, velocity 100 at tick 0.
                 0x83, 0x60, 0x89, 0x3C, 0x20, // Note off at tick 480.
                 0x00, 0xB0, 10, 127, // Channel 0 pan is hard right.
+                0x00, 0xB0, 74, 0, // Mod X is low for the second note.
+                0x00, 0xB0, 71, 127, // Mod Y is high for the second note.
                 0x00, 0xE0, 0, 32, // -100 cents at the default two-semitone range.
                 0x00, 0x90, 0x43, 0x50, // Channel 0, key 67, velocity 80 at tick 480.
                 0x81, 0x70, 0x80, 0x43, 0x00, // Note off at tick 720.
@@ -22598,6 +22604,8 @@ mod tests {
         assert_eq!(notes[1].midi_channel, 9);
         assert_eq!(notes[1].release, 32);
         assert_eq!(notes[1].pan, 0);
+        assert_eq!(notes[1].mod_x, 255);
+        assert_eq!(notes[1].mod_y, 0);
         assert_eq!(notes[1].fine_pitch, 180);
         assert_eq!(
             (notes[2].position, notes[2].length, notes[2].key),
@@ -22607,6 +22615,8 @@ mod tests {
         assert_eq!(notes[2].midi_channel, 0);
         assert_eq!(notes[2].release, 0);
         assert_eq!(notes[2].pan, 128);
+        assert_eq!(notes[2].mod_x, 0);
+        assert_eq!(notes[2].mod_y, 255);
         assert_eq!(notes[2].fine_pitch, 110);
         assert_eq!(
             document.events().last().unwrap().wire_bytes(),
