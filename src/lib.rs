@@ -1797,6 +1797,8 @@ pub struct PlaylistTrack {
     pub grouped: Option<bool>,
     /// Trigger timing for Performance Mode clips on this track.
     pub trigger_sync: Option<PlaylistTrackSync>,
+    /// Whether a slightly missed trigger boundary launches immediately on this track.
+    pub tolerant: Option<bool>,
     /// Raw 70-byte `0xEE` state payload.
     pub state_bytes: Vec<u8>,
 }
@@ -1807,6 +1809,7 @@ pub struct PlaylistTrackEdit {
     pub enabled: Option<bool>,
     pub grouped: Option<bool>,
     pub trigger_sync: Option<PlaylistTrackSync>,
+    pub tolerant: Option<bool>,
 }
 
 /// Mixer insert fields recognized from the observed `0x9A`, `0x93`, `0x95`
@@ -5328,6 +5331,11 @@ impl FlpDocument {
             })
             .filter(|value| !value.is_empty());
         let trigger_sync = i32::from_le_bytes(event.payload[30..34].try_into().ok()?);
+        let tolerant = match i32::from_le_bytes(event.payload[38..42].try_into().ok()?) {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        };
         Some(PlaylistTrack {
             id,
             state_byte,
@@ -5343,11 +5351,12 @@ impl FlpDocument {
                 _ => None,
             },
             trigger_sync: PlaylistTrackSync::from_raw(trigger_sync),
+            tolerant,
             state_bytes: event.payload.clone(),
         })
     }
 
-    /// Edits the observed mute, grouping, or Trigger Sync fields of a Playlist track in place.
+    /// Edits the observed mute, grouping, Trigger Sync, or Tolerant fields of a Playlist track.
     /// This unscoped form reports an error when the track ID occurs in multiple arrangements.
     pub fn edit_playlist_track(
         &mut self,
@@ -5355,7 +5364,11 @@ impl FlpDocument {
         edit: PlaylistTrackEdit,
     ) -> Result<(), FlpError> {
         Self::validate_playlist_track_edit(track_id, edit)?;
-        if edit.enabled.is_none() && edit.grouped.is_none() && edit.trigger_sync.is_none() {
+        if edit.enabled.is_none()
+            && edit.grouped.is_none()
+            && edit.trigger_sync.is_none()
+            && edit.tolerant.is_none()
+        {
             return Ok(());
         }
         let event_index = self.playlist_track_event_index(None, track_id)?;
@@ -5370,7 +5383,11 @@ impl FlpDocument {
         edit: PlaylistTrackEdit,
     ) -> Result<(), FlpError> {
         Self::validate_playlist_track_edit(track_id, edit)?;
-        if edit.enabled.is_none() && edit.grouped.is_none() && edit.trigger_sync.is_none() {
+        if edit.enabled.is_none()
+            && edit.grouped.is_none()
+            && edit.trigger_sync.is_none()
+            && edit.tolerant.is_none()
+        {
             return Ok(());
         }
         let event_index = self.playlist_track_event_index(Some(arrangement_id), track_id)?;
@@ -5469,6 +5486,13 @@ impl FlpDocument {
                 &mut self.events[event_index],
                 30,
                 &trigger_sync.raw().to_le_bytes(),
+            )?;
+        }
+        if let Some(tolerant) = edit.tolerant {
+            write_event_payload_bytes(
+                &mut self.events[event_index],
+                38,
+                &i32::from(tolerant).to_le_bytes(),
             )?;
         }
         Ok(())
@@ -15795,6 +15819,7 @@ mod tests {
                     enabled: Some(false),
                     grouped: Some(true),
                     trigger_sync: None,
+                    tolerant: None,
                 },
             )
             .expect("mute and group fields should be editable");

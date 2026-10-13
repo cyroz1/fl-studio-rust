@@ -13457,6 +13457,22 @@ impl DawUi {
                                         },
                                     ));
                                 }
+                                let mut tolerant = track.tolerant.unwrap_or(true);
+                                if ui
+                                    .checkbox(&mut tolerant, "Tolerant")
+                                    .on_hover_text(
+                                        "Launch immediately if the sync boundary was missed slightly, truncating the clip's start",
+                                    )
+                                    .changed()
+                                {
+                                    playlist_track_edits_requested.push((
+                                        track_id,
+                                        PlaylistTrackEdit {
+                                            tolerant: Some(tolerant),
+                                            ..PlaylistTrackEdit::default()
+                                        },
+                                    ));
+                                }
                             } else {
                                 ui.weak("Track state is unavailable in this project");
                             }
@@ -15118,24 +15134,46 @@ impl DawUi {
                         .find(|track| track.id == track_id)
                         .and_then(|track| track.trigger_sync)
                 });
+            let clip_tolerant = arrangement
+                .clips
+                .get(clip_index)
+                .and_then(|clip| clip.playlist_track_id())
+                .and_then(|track_id| tracks.iter().find(|track| track.id == track_id))
+                .and_then(|track| track.tolerant)
+                .unwrap_or(true);
             let launch_position = self
                 .audio_engine
                 .as_ref()
                 .zip(self.playlist_tempo_map.as_ref())
                 .and_then(|(engine, tempo_map)| {
                     let sample_rate = engine.sample_rate();
-                    let safe_device_frame = engine
-                        .project_playback_position_frames()
-                        .saturating_add(u64::from(sample_rate) / 8);
-                    let tick = tempo_map.tick_at_frame(safe_device_frame, sample_rate)?;
-                    let target_tick = playlist_performance_trigger_tick(
-                        tick,
+                    let current_device_frame = engine.project_playback_position_frames();
+                    let safe_device_frame =
+                        current_device_frame.saturating_add(u64::from(sample_rate) / 8);
+                    let current_tick =
+                        tempo_map.tick_at_frame(current_device_frame, sample_rate)?;
+                    let safe_tick = tempo_map.tick_at_frame(safe_device_frame, sample_rate)?;
+                    let mut target_tick = playlist_performance_trigger_tick(
+                        safe_tick,
                         ppq,
                         project_time_signature,
                         &signature_changes,
                         clip_trigger_sync,
                         clip_length_ticks,
                     )?;
+                    if clip_tolerant && clip_trigger_sync != Some(PlaylistTrackSync::Off) {
+                        let boundary_from_current = playlist_performance_trigger_tick(
+                            current_tick,
+                            ppq,
+                            project_time_signature,
+                            &signature_changes,
+                            clip_trigger_sync,
+                            clip_length_ticks,
+                        )?;
+                        if f64::from(boundary_from_current) < safe_tick.ceil() {
+                            target_tick = u32::try_from(safe_tick.ceil() as u64).ok()?;
+                        }
+                    }
                     let target_frame = tempo_map
                         .frame_at_tick(u64::from(target_tick), sample_rate)
                         .ok()?;
@@ -15230,6 +15268,11 @@ impl DawUi {
                         format!(
                             "Set Playlist track {track_id} Trigger Sync to {}",
                             playlist_track_sync_label(trigger_sync)
+                        )
+                    } else if let Some(tolerant) = edit.tolerant {
+                        format!(
+                            "{} Tolerant launch on Playlist track {track_id}",
+                            if tolerant { "Enabled" } else { "Disabled" }
                         )
                     } else {
                         "Updated Playlist track".to_owned()
@@ -43719,6 +43762,7 @@ mod tests {
                 enabled: Some(true),
                 grouped: Some(matches!(id, 2 | 3)),
                 trigger_sync: None,
+                tolerant: None,
                 state_bytes: vec![0; 70],
             })
             .collect::<Vec<_>>();
