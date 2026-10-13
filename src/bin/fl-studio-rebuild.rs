@@ -2352,6 +2352,25 @@ impl PianoRollChordStamp {
     }
 }
 
+fn apply_piano_roll_chord_inversion(pitches: &mut Vec<u16>, inversion: u8) -> bool {
+    pitches.sort_unstable();
+    if usize::from(inversion) >= pitches.len() && inversion != 0 {
+        return false;
+    }
+    for _ in 0..inversion {
+        let Some(raised_pitch) = pitches.first().and_then(|pitch| pitch.checked_add(12)) else {
+            return false;
+        };
+        if raised_pitch > 127 {
+            return false;
+        }
+        pitches.remove(0);
+        pitches.push(raised_pitch);
+    }
+    pitches.sort_unstable();
+    true
+}
+
 fn scale_chord_pitches_from_top(
     top_key: u16,
     scale: PianoRollScale,
@@ -3135,6 +3154,7 @@ struct DawUi {
     piano_roll_stamp_mode: bool,
     piano_roll_stamp_only_one: bool,
     piano_roll_chord_stamp: PianoRollChordStamp,
+    piano_roll_chord_inversion: u8,
     last_piano_roll_audition: Option<(u16, u16, usize)>,
     piano_roll_zoom: f32,
     piano_roll_vertical_zoom: f32,
@@ -3792,6 +3812,7 @@ impl DawUi {
             piano_roll_stamp_mode: false,
             piano_roll_stamp_only_one: true,
             piano_roll_chord_stamp: PianoRollChordStamp::Major,
+            piano_roll_chord_inversion: 0,
             last_piano_roll_audition: None,
             piano_roll_zoom: 0.10,
             piano_roll_vertical_zoom: 1.0,
@@ -21864,6 +21885,7 @@ impl DawUi {
                 }
             });
             if self.piano_roll_stamp_mode {
+                let stamp_before_selection = self.piano_roll_chord_stamp;
                 egui::ComboBox::from_id_salt("piano-roll-chord-stamp")
                     .selected_text(format!("Chord: {}", self.piano_roll_chord_stamp.label()))
                     .show_ui(ui, |ui| {
@@ -21885,6 +21907,51 @@ impl DawUi {
                             ui.separator();
                         }
                     });
+                if self.piano_roll_chord_stamp != stamp_before_selection {
+                    self.piano_roll_chord_inversion = 0;
+                }
+                if self.piano_roll_chord_stamp.top_down_note_count().is_some() {
+                    self.piano_roll_chord_inversion = 0;
+                    ui.label("Inversion: clicked pitch stays highest");
+                } else {
+                    let max_inversion = self
+                        .piano_roll_chord_stamp
+                        .pitches(60, self.piano_roll_scale, self.piano_roll_scale_root)
+                        .len()
+                        .saturating_sub(1)
+                        .min(6) as u8;
+                    self.piano_roll_chord_inversion =
+                        self.piano_roll_chord_inversion.min(max_inversion);
+                    let inversion_label = match self.piano_roll_chord_inversion {
+                        0 => "Root position",
+                        1 => "1st inversion",
+                        2 => "2nd inversion",
+                        3 => "3rd inversion",
+                        4 => "4th inversion",
+                        5 => "5th inversion",
+                        _ => "6th inversion",
+                    };
+                    egui::ComboBox::from_id_salt("piano-roll-chord-inversion")
+                        .selected_text(format!("Voicing: {inversion_label}"))
+                        .show_ui(ui, |ui| {
+                            for inversion in 0..=max_inversion {
+                                let label = match inversion {
+                                    0 => "Root position",
+                                    1 => "1st inversion",
+                                    2 => "2nd inversion",
+                                    3 => "3rd inversion",
+                                    4 => "4th inversion",
+                                    5 => "5th inversion",
+                                    _ => "6th inversion",
+                                };
+                                ui.selectable_value(
+                                    &mut self.piano_roll_chord_inversion,
+                                    inversion,
+                                    label,
+                                );
+                            }
+                        });
+                }
             }
             if selected_note_count > 0 {
                 ui.small(format!("{selected_note_count} selected"));
@@ -26530,7 +26597,7 @@ impl DawUi {
                     note_from_grid_position(pointer, grid_geometry, channel_id)
             {
                 root_note.length = snap_ticks.max(1);
-                let chord_pitches = self.piano_roll_chord_stamp.pitches(
+                let mut chord_pitches = self.piano_roll_chord_stamp.pitches(
                     root_note.key,
                     self.piano_roll_scale,
                     self.piano_roll_scale_root,
@@ -26543,6 +26610,11 @@ impl DawUi {
                     self.status =
                         "Top-down chord needs more MIDI pitch range below the clicked note"
                             .to_owned();
+                } else if !apply_piano_roll_chord_inversion(
+                    &mut chord_pitches,
+                    self.piano_roll_chord_inversion,
+                ) {
+                    self.status = "Chord inversion exceeds the MIDI pitch range".to_owned();
                 } else {
                     notes_to_add.extend(chord_pitches.into_iter().map(|key| {
                         let mut note = root_note.clone();

@@ -116,6 +116,8 @@ The File menu keeps up to 50 recent projects across launches, shows the first te
 
 In the Piano roll, Draw (P) adds a note with a left-click in empty grid space, lets you drag to reposition it before release, and uses Shift-drag to set its length; hold Alt to bypass snap. Paint (B) adds snap-length notes while dragging across empty cells; hold Shift while painting to replace overlapping notes in the selected channel and keep the pass monophonic. Draw and Paint modes also erase notes on right-click or right-drag.
 
+Piano roll Chord Stamp mode offers root position and selectable inversions for manual and scale-derived chords. Each inversion raises the lowest voice by an octave; top-down stamps keep the clicked pitch as their highest voice.
+
 The Piano roll **View** menu can snap dragged notes to the nearest pitch in the selected scale or the current automatic detection. The scale is held constant for the full drag; equal-distance pitches resolve downward.
 
 In Audio settings, **Snap recorded notes to selected scale** moves incoming MIDI note pitches to the nearest note in the selected Piano roll scale before the take is saved. The scale is captured when recording starts; timing, velocity, and note properties are preserved.
