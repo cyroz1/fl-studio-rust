@@ -820,19 +820,14 @@ fn run(args: Vec<String>) -> Result<(), String> {
         [command, input, output, arrangement_id, clip_index, source_start_tick, source_end_tick, length]
             if command == "edit-audio-clip-window-ticks" =>
         {
-            edit_clip_properties(
+            edit_audio_clip_window_ticks(
                 Path::new(input),
                 Path::new(output),
                 parse_u16(arrangement_id, "arrangement id")?,
                 parse_usize(clip_index, "clip index")?,
-                PlaylistClipEdit {
-                    source_window_ticks: Some((
-                        parse_u32(source_start_tick, "source start tick")?,
-                        parse_u32(source_end_tick, "source end tick")?,
-                    )),
-                    length_ticks: parse_optional_u32(length, "timeline length ticks")?,
-                    ..PlaylistClipEdit::default()
-                },
+                parse_u32(source_start_tick, "source start tick")?,
+                parse_u32(source_end_tick, "source end tick")?,
+                parse_optional_u32(length, "timeline length ticks")?,
             )
         }
         [command, input, output, arrangement_id, clip_index, position, raw_track_index]
@@ -3461,6 +3456,64 @@ fn edit_clip_properties(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "updated arrangement {arrangement_id} clip {clip_index} properties in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn edit_audio_clip_window_ticks(
+    input: &Path,
+    output: &Path,
+    arrangement_id: u16,
+    clip_index: usize,
+    source_start_tick: u32,
+    source_end_tick: u32,
+    length_ticks: Option<u32>,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .edit_playlist_clip(
+            arrangement_id,
+            clip_index,
+            PlaylistClipEdit {
+                source_window_ticks: Some((source_start_tick, source_end_tick)),
+                length_ticks,
+                ..PlaylistClipEdit::default()
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    let sample_path = playlist_audio_clip_sample_path(&document, arrangement_id, clip_index)?;
+    let sample_file = SamplePathResolver::new(input)
+        .resolve(&sample_path)
+        .map_err(|error| format!("cannot validate Audio Clip source duration: {error}"))?;
+    let audio = decode_audio_file(&sample_file).map_err(|error| {
+        format!("cannot decode Audio Clip sample for source-window validation: {error}")
+    })?;
+    let ppq = document.header().ppq();
+    let tempo_bpm = document.metadata().tempo_bpm().unwrap_or(140.0);
+    if ppq == 0 || !tempo_bpm.is_finite() || tempo_bpm <= 0.0 || audio.sample_rate == 0 {
+        return Err("Audio Clip source duration cannot be mapped to project ticks".to_owned());
+    }
+    let duration_milliseconds =
+        (audio.frame_count() as f64 * 1_000.0 / f64::from(audio.sample_rate)) as f32;
+    let duration_ticks = f64::from(duration_milliseconds) * f64::from(ppq) * tempo_bpm / 60_000.0;
+    if !duration_ticks.is_finite() || duration_ticks <= 0.0 || duration_ticks > f64::from(u32::MAX)
+    {
+        return Err("Audio Clip sample duration is outside the supported tick range".to_owned());
+    }
+    let maximum_source_tick = duration_ticks.floor() as u32;
+    if source_end_tick > maximum_source_tick {
+        return Err(format!(
+            "Audio Clip source end tick {source_end_tick} exceeds the sample duration of {maximum_source_tick} ticks"
+        ));
+    }
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "updated arrangement {arrangement_id} Audio Clip {clip_index} source window to ticks {source_start_tick}..{source_end_tick} in {}",
         output.display()
     );
     Ok(())
