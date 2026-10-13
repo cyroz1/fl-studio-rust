@@ -2404,6 +2404,13 @@ struct PianoRollZoomDrag {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+struct PianoRollSliceDrag {
+    pattern_id: u16,
+    start: egui::Pos2,
+    current: egui::Pos2,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct PianoRollTimeSelectionDrag {
     pattern_id: u16,
     start_tick: u32,
@@ -2952,6 +2959,8 @@ struct DawUi {
     piano_roll_time_selection_drag: Option<PianoRollTimeSelectionDrag>,
     piano_roll_pitch_selection_drag: Option<PianoRollPitchSelectionDrag>,
     piano_roll_select_mode: bool,
+    piano_roll_slice_mode: bool,
+    piano_roll_slice_drag: Option<PianoRollSliceDrag>,
     piano_roll_delete_mode: bool,
     piano_roll_mute_mode: bool,
     last_piano_roll_mute_note: Option<(u16, u16, usize)>,
@@ -3585,6 +3594,8 @@ impl DawUi {
             piano_roll_time_selection_drag: None,
             piano_roll_pitch_selection_drag: None,
             piano_roll_select_mode: false,
+            piano_roll_slice_mode: false,
+            piano_roll_slice_drag: None,
             piano_roll_delete_mode: false,
             piano_roll_mute_mode: false,
             last_piano_roll_mute_note: None,
@@ -18914,6 +18925,8 @@ impl DawUi {
                 ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::P));
             let select_paint =
                 ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::B));
+            let select_slice =
+                ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::C));
             let select_delete =
                 ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::D));
             let select_select =
@@ -18963,6 +18976,8 @@ impl DawUi {
                 self.piano_roll_zoom_mode = false;
                 self.piano_roll_playback_mode = false;
                 self.piano_roll_stamp_mode = false;
+                self.piano_roll_slice_mode = false;
+                self.piano_roll_slice_drag = None;
                 self.piano_roll_delete_mode = false;
                 self.piano_roll_mute_mode = false;
             } else if select_paint {
@@ -18971,8 +18986,22 @@ impl DawUi {
                 self.piano_roll_zoom_mode = false;
                 self.piano_roll_playback_mode = false;
                 self.piano_roll_stamp_mode = false;
+                self.piano_roll_slice_mode = false;
+                self.piano_roll_slice_drag = None;
                 self.piano_roll_delete_mode = false;
                 self.piano_roll_mute_mode = false;
+            } else if select_slice {
+                self.piano_roll_slice_mode = !self.piano_roll_slice_mode;
+                self.piano_roll_slice_drag = None;
+                if self.piano_roll_slice_mode {
+                    self.piano_roll_paint_mode = false;
+                    self.piano_roll_select_mode = false;
+                    self.piano_roll_zoom_mode = false;
+                    self.piano_roll_playback_mode = false;
+                    self.piano_roll_stamp_mode = false;
+                    self.piano_roll_delete_mode = false;
+                    self.piano_roll_mute_mode = false;
+                }
             } else if select_delete {
                 self.piano_roll_delete_mode = !self.piano_roll_delete_mode;
                 if self.piano_roll_delete_mode {
@@ -18981,6 +19010,8 @@ impl DawUi {
                     self.piano_roll_zoom_mode = false;
                     self.piano_roll_playback_mode = false;
                     self.piano_roll_stamp_mode = false;
+                    self.piano_roll_slice_mode = false;
+                    self.piano_roll_slice_drag = None;
                     self.piano_roll_mute_mode = false;
                 }
             } else if select_select {
@@ -18989,6 +19020,8 @@ impl DawUi {
                 self.piano_roll_zoom_mode = false;
                 self.piano_roll_playback_mode = false;
                 self.piano_roll_stamp_mode = false;
+                self.piano_roll_slice_mode = false;
+                self.piano_roll_slice_drag = None;
                 self.piano_roll_delete_mode = false;
                 self.piano_roll_mute_mode = false;
             } else if select_zoom {
@@ -18997,6 +19030,8 @@ impl DawUi {
                 self.piano_roll_zoom_mode = true;
                 self.piano_roll_playback_mode = false;
                 self.piano_roll_stamp_mode = false;
+                self.piano_roll_slice_mode = false;
+                self.piano_roll_slice_drag = None;
                 self.piano_roll_delete_mode = false;
                 self.piano_roll_mute_mode = false;
             } else if select_playback {
@@ -19005,6 +19040,8 @@ impl DawUi {
                 self.piano_roll_zoom_mode = false;
                 self.piano_roll_playback_mode = true;
                 self.piano_roll_stamp_mode = false;
+                self.piano_roll_slice_mode = false;
+                self.piano_roll_slice_drag = None;
                 self.piano_roll_delete_mode = false;
                 self.piano_roll_mute_mode = false;
             } else if select_mute {
@@ -19015,6 +19052,8 @@ impl DawUi {
                     self.piano_roll_zoom_mode = false;
                     self.piano_roll_playback_mode = false;
                     self.piano_roll_stamp_mode = false;
+                    self.piano_roll_slice_mode = false;
+                    self.piano_roll_slice_drag = None;
                     self.piano_roll_delete_mode = false;
                 }
             }
@@ -19183,6 +19222,7 @@ impl DawUi {
                         && !self.piano_roll_select_mode
                         && !self.piano_roll_zoom_mode
                         && !self.piano_roll_playback_mode
+                        && !self.piano_roll_slice_mode
                         && !self.piano_roll_delete_mode
                         && !self.piano_roll_mute_mode
                         && !self.piano_roll_stamp_mode,
@@ -19195,6 +19235,8 @@ impl DawUi {
                 self.piano_roll_select_mode = false;
                 self.piano_roll_zoom_mode = false;
                 self.piano_roll_playback_mode = false;
+                self.piano_roll_slice_mode = false;
+                self.piano_roll_slice_drag = None;
                 self.piano_roll_delete_mode = false;
                 self.piano_roll_mute_mode = false;
                 self.piano_roll_stamp_mode = false;
@@ -19206,6 +19248,25 @@ impl DawUi {
             {
                 self.piano_roll_paint_mode = !self.piano_roll_paint_mode;
                 if self.piano_roll_paint_mode {
+                    self.piano_roll_select_mode = false;
+                    self.piano_roll_zoom_mode = false;
+                    self.piano_roll_playback_mode = false;
+                    self.piano_roll_slice_mode = false;
+                    self.piano_roll_slice_drag = None;
+                    self.piano_roll_delete_mode = false;
+                    self.piano_roll_mute_mode = false;
+                    self.piano_roll_stamp_mode = false;
+                }
+            }
+            if ui
+                .selectable_label(self.piano_roll_slice_mode, "Slice (C)")
+                .on_hover_text("Drag a cut line across notes to split them")
+                .clicked()
+            {
+                self.piano_roll_slice_mode = !self.piano_roll_slice_mode;
+                self.piano_roll_slice_drag = None;
+                if self.piano_roll_slice_mode {
+                    self.piano_roll_paint_mode = false;
                     self.piano_roll_select_mode = false;
                     self.piano_roll_zoom_mode = false;
                     self.piano_roll_playback_mode = false;
@@ -19225,6 +19286,8 @@ impl DawUi {
                     self.piano_roll_select_mode = false;
                     self.piano_roll_zoom_mode = false;
                     self.piano_roll_playback_mode = false;
+                    self.piano_roll_slice_mode = false;
+                    self.piano_roll_slice_drag = None;
                     self.piano_roll_mute_mode = false;
                     self.piano_roll_stamp_mode = false;
                 }
@@ -19239,6 +19302,8 @@ impl DawUi {
                     self.piano_roll_paint_mode = false;
                     self.piano_roll_zoom_mode = false;
                     self.piano_roll_playback_mode = false;
+                    self.piano_roll_slice_mode = false;
+                    self.piano_roll_slice_drag = None;
                     self.piano_roll_delete_mode = false;
                     self.piano_roll_mute_mode = false;
                     self.piano_roll_stamp_mode = false;
@@ -19255,6 +19320,8 @@ impl DawUi {
                     self.piano_roll_select_mode = false;
                     self.piano_roll_zoom_mode = false;
                     self.piano_roll_playback_mode = false;
+                    self.piano_roll_slice_mode = false;
+                    self.piano_roll_slice_drag = None;
                     self.piano_roll_delete_mode = false;
                     self.piano_roll_stamp_mode = false;
                 }
@@ -19270,6 +19337,8 @@ impl DawUi {
                         self.piano_roll_select_mode = false;
                         self.piano_roll_zoom_mode = false;
                         self.piano_roll_playback_mode = false;
+                        self.piano_roll_slice_mode = false;
+                        self.piano_roll_slice_drag = None;
                         self.piano_roll_delete_mode = false;
                         self.piano_roll_mute_mode = false;
                     }
@@ -19288,6 +19357,8 @@ impl DawUi {
                         self.piano_roll_paint_mode = false;
                         self.piano_roll_select_mode = false;
                         self.piano_roll_playback_mode = false;
+                        self.piano_roll_slice_mode = false;
+                        self.piano_roll_slice_drag = None;
                         self.piano_roll_delete_mode = false;
                         self.piano_roll_mute_mode = false;
                         self.piano_roll_stamp_mode = false;
@@ -19302,6 +19373,8 @@ impl DawUi {
                         self.piano_roll_paint_mode = false;
                         self.piano_roll_select_mode = false;
                         self.piano_roll_zoom_mode = false;
+                        self.piano_roll_slice_mode = false;
+                        self.piano_roll_slice_drag = None;
                         self.piano_roll_delete_mode = false;
                         self.piano_roll_mute_mode = false;
                         self.piano_roll_stamp_mode = false;
@@ -23555,6 +23628,12 @@ impl DawUi {
         }) {
             self.piano_roll_pitch_selection_drag = None;
         }
+        if self
+            .piano_roll_slice_drag
+            .is_some_and(|drag| drag.pattern_id != pattern.id)
+        {
+            self.piano_roll_slice_drag = None;
+        }
         let touch_gesture = ui.input(|input| input.multi_touch());
         let any_touches = ui.input(|input| input.any_touches());
         let input_time = ui.input(|input| input.time);
@@ -23581,6 +23660,7 @@ impl DawUi {
             self.piano_roll_time_selection_drag = None;
             self.piano_roll_controller_stroke = None;
             self.piano_roll_zoom_drag = None;
+            self.piano_roll_slice_drag = None;
             if let Some((zoom, offset)) = touch_pan_zoom_scroll_offset(
                 viewport,
                 self.piano_roll_grid_scroll_offset,
@@ -24101,7 +24181,13 @@ impl DawUi {
                     continue;
                 }
                 note_rects.push(note_rect);
-                note_selection_rects.push((note.channel_id, *channel_index, note_rect));
+                note_selection_rects.push((
+                    note.channel_id,
+                    *channel_index,
+                    note_rect,
+                    note.position,
+                    note.length,
+                ));
                 let selected = self.selected_piano_notes.contains(&(
                     pattern.id,
                     note.channel_id,
@@ -24184,6 +24270,7 @@ impl DawUi {
                 let wheel_target_hovered = response.hovered()
                     && !self.piano_roll_zoom_mode
                     && !self.piano_roll_playback_mode
+                    && !self.piano_roll_slice_mode
                     && !self.piano_roll_delete_mode
                     && !self.piano_roll_mute_mode
                     && (!ghost || self.piano_roll_editable_ghost_channels)
@@ -24286,6 +24373,7 @@ impl DawUi {
                     && !self.piano_roll_playback_mode
                     && !self.piano_roll_mute_mode
                     && (!self.piano_roll_delete_mode || modifiers.command)
+                    && (!self.piano_roll_slice_mode || modifiers.command)
                 {
                     let additive = modifiers.shift || modifiers.command;
                     if !additive
@@ -24335,6 +24423,7 @@ impl DawUi {
                 if response.is_pointer_button_down_on()
                     && !self.piano_roll_zoom_mode
                     && !self.piano_roll_playback_mode
+                    && !self.piano_roll_slice_mode
                     && !self.piano_roll_delete_mode
                     && !self.piano_roll_mute_mode
                     && self.active_note_drag.is_none()
@@ -24406,6 +24495,7 @@ impl DawUi {
                 if response.dragged()
                     && !self.piano_roll_zoom_mode
                     && !self.piano_roll_playback_mode
+                    && !self.piano_roll_slice_mode
                     && !self.piano_roll_delete_mode
                     && !self.piano_roll_mute_mode
                     && let Some(drag) = self.active_note_drag.as_ref().filter(|drag| {
@@ -24494,6 +24584,104 @@ impl DawUi {
                     self.active_note_drag = None;
                 }
                 *channel_index += 1;
+            }
+            let grid_body_rect = egui::Rect::from_min_max(
+                egui::pos2(grid_rect.left() + keyboard_width, grid_rect.top()),
+                grid_rect.right_bottom(),
+            );
+            let slice_response = ui.interact(
+                grid_body_rect,
+                Id::new(("piano-roll-slice-tool", pattern.id)),
+                if self.piano_roll_slice_mode
+                    && !scroll_modifiers.command
+                    && !suppress_piano_roll_touch_edits
+                {
+                    Sense::click_and_drag()
+                } else {
+                    Sense::hover()
+                },
+            );
+            if self.piano_roll_slice_mode
+                && !scroll_modifiers.command
+                && slice_response.drag_started_by(PointerButton::Primary)
+                && let Some(origin) = ui
+                    .input(|input| input.pointer.press_origin())
+                    .or_else(|| slice_response.interact_pointer_pos())
+                && grid_body_rect.contains(origin)
+            {
+                self.piano_roll_slice_drag = Some(PianoRollSliceDrag {
+                    pattern_id: pattern.id,
+                    start: origin,
+                    current: origin,
+                });
+            }
+            if let Some(mut drag) = self
+                .piano_roll_slice_drag
+                .filter(|drag| drag.pattern_id == pattern.id)
+            {
+                if let Some(pointer) = ui.input(|input| input.pointer.interact_pos()) {
+                    drag.current = egui::pos2(
+                        pointer.x.clamp(grid_body_rect.left(), grid_body_rect.right()),
+                        pointer.y.clamp(grid_body_rect.top(), grid_body_rect.bottom()),
+                    );
+                }
+                painter.line_segment(
+                    [drag.start, drag.current],
+                    Stroke::new(2.0, Color32::from_rgb(255, 156, 88)),
+                );
+                if slice_response.drag_stopped_by(PointerButton::Primary) {
+                    let note_cuts = note_selection_rects
+                        .iter()
+                        .filter_map(
+                            |(channel_id, note_index, note_rect, note_start, note_length)| {
+                                if Some(*channel_id) != self.selected_note_channel
+                                    && !self.piano_roll_editable_ghost_channels
+                                {
+                                    return None;
+                                }
+                                let cut_x = piano_roll_slice_line_cut_x(
+                                    drag.start,
+                                    drag.current,
+                                    *note_rect,
+                                )?;
+                                let cut_tick = piano_roll_time_tick_at_x(
+                                    cut_x,
+                                    grid_rect.left() + keyboard_width,
+                                    tick_scale,
+                                    snap_ticks,
+                                );
+                                let note_end =
+                                    u64::from(*note_start) + u64::from(*note_length);
+                                (u64::from(cut_tick) > u64::from(*note_start)
+                                    && u64::from(cut_tick) < note_end)
+                                    .then_some((*channel_id, *note_index, cut_tick))
+                            },
+                        )
+                        .collect::<Vec<_>>();
+                    if note_cuts.is_empty() {
+                        self.status = "Slice line did not cross any notes".to_owned();
+                    } else if let Some(document) = self.document.as_ref() {
+                        let mut updated = document.clone();
+                        match updated.slice_pattern_notes_at_positions(pattern.id, &note_cuts) {
+                            Ok(created) => {
+                                if created > 0 {
+                                    self.document = Some(updated);
+                                    self.stop_project_playback();
+                                    self.dirty = true;
+                                }
+                                self.status = format!("Sliced {created} notes in pattern {}", pattern.id);
+                            }
+                            Err(error) => {
+                                self.status = format!("Could not slice notes: {error}");
+                            }
+                        }
+                    } else {
+                        self.status = "No project is open".to_owned();
+                    }
+                    self.piano_roll_slice_drag = None;
+                } else {
+                    self.piano_roll_slice_drag = Some(drag);
+                }
             }
             if ruler_response.drag_started_by(PointerButton::Primary)
                 && ui.input(|input| input.modifiers.command)
@@ -24737,11 +24925,11 @@ impl DawUi {
                 if grid_response.drag_stopped_by(PointerButton::Primary) {
                     let enclosed_note_indices = note_selection_rects
                         .iter()
-                        .filter(|(channel_id, _, note_rect)| {
+                        .filter(|(channel_id, _, note_rect, _, _)| {
                             *channel_id == selection.channel_id
                                 && note_rect.intersects(selection_rect)
                         })
-                        .map(|(_, channel_note_index, _)| *channel_note_index)
+                        .map(|(_, channel_note_index, _, _, _)| *channel_note_index)
                         .collect::<Vec<_>>();
                     update_piano_roll_box_selection(
                         pattern,
@@ -24772,6 +24960,7 @@ impl DawUi {
             if self.piano_roll_stamp_mode
                 && !self.piano_roll_select_mode
                 && !self.piano_roll_zoom_mode
+                && !self.piano_roll_slice_mode
                 && !self.piano_roll_delete_mode
                 && !self.piano_roll_mute_mode
                 && grid_response.clicked_by(PointerButton::Primary)
@@ -24810,6 +24999,7 @@ impl DawUi {
             if self.piano_roll_paint_mode
                 && !(self.piano_roll_select_mode
                     || self.piano_roll_zoom_mode
+                    || self.piano_roll_slice_mode
                     || self.piano_roll_delete_mode
                     || self.piano_roll_mute_mode
                     || modifiers.command)
@@ -24839,6 +25029,7 @@ impl DawUi {
                 && !self.piano_roll_stamp_mode
                 && !self.piano_roll_select_mode
                 && !self.piano_roll_zoom_mode
+                && !self.piano_roll_slice_mode
                 && !self.piano_roll_delete_mode
                 && !self.piano_roll_mute_mode
                 && !modifiers.command
@@ -32063,6 +32254,46 @@ fn piano_roll_time_tick_at_x(
         .round()
         .clamp(0.0, u32::MAX as f32) as i64;
     snap_note_tick(tick, snap_ticks, 0)
+}
+
+fn piano_roll_slice_line_cut_x(
+    start: egui::Pos2,
+    end: egui::Pos2,
+    rect: egui::Rect,
+) -> Option<f32> {
+    let dx = end.x - start.x;
+    let dy = end.y - start.y;
+    if dx.abs() <= f32::EPSILON && dy.abs() <= f32::EPSILON {
+        return None;
+    }
+    let mut first_t = 0.0f32;
+    let mut last_t = 1.0f32;
+    for (p, q) in [
+        (-dx, start.x - rect.left()),
+        (dx, rect.right() - start.x),
+        (-dy, start.y - rect.top()),
+        (dy, rect.bottom() - start.y),
+    ] {
+        if p == 0.0 {
+            if q < 0.0 {
+                return None;
+            }
+            continue;
+        }
+        let t = q / p;
+        if p < 0.0 {
+            if t > last_t {
+                return None;
+            }
+            first_t = first_t.max(t);
+        } else {
+            if t < first_t {
+                return None;
+            }
+            last_t = last_t.min(t);
+        }
+    }
+    (first_t <= last_t).then_some(start.x + dx * ((first_t + last_t) * 0.5))
 }
 
 fn piano_roll_time_range_from_drag(

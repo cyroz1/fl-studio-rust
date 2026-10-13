@@ -11112,6 +11112,77 @@ impl FlpDocument {
         )
     }
 
+    /// Splits notes at individual ticks, preserving all note properties and opaque events.
+    /// Each note index is zero-based within its channel's notes in the Pattern.
+    pub fn slice_pattern_notes_at_positions(
+        &mut self,
+        pattern_id: u16,
+        note_cuts: &[(u16, usize, u32)],
+    ) -> Result<usize, FlpError> {
+        if note_cuts.is_empty() {
+            return Ok(0);
+        }
+        let patterns = self.patterns()?;
+        let pattern = patterns
+            .iter()
+            .find(|pattern| pattern.id == pattern_id)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested pattern does not exist",
+            ))?;
+        let mut remaining_cuts = note_cuts
+            .iter()
+            .map(|(channel_id, note_index, tick)| ((*channel_id, *note_index), *tick))
+            .collect::<HashMap<_, _>>();
+        let mut channel_note_indices = HashMap::<u16, usize>::new();
+        let mut edits_by_channel = BTreeMap::<u16, HashMap<usize, PatternNoteEdit>>::new();
+        let mut right_segments = Vec::new();
+        for note in &pattern.notes {
+            let note_index = channel_note_indices.entry(note.channel_id).or_default();
+            let current_index = *note_index;
+            *note_index += 1;
+            let Some(position_ticks) = remaining_cuts.remove(&(note.channel_id, current_index))
+            else {
+                continue;
+            };
+            let cut = u64::from(position_ticks);
+            let start = u64::from(note.position);
+            let end = start + u64::from(note.length);
+            if cut <= start || cut >= end {
+                continue;
+            }
+            let left_length = u32::try_from(cut - start).map_err(|_| FlpError::LengthOverflow)?;
+            let right_length = u32::try_from(end - cut).map_err(|_| FlpError::LengthOverflow)?;
+            edits_by_channel.entry(note.channel_id).or_default().insert(
+                current_index,
+                PatternNoteEdit {
+                    length: Some(left_length),
+                    ..PatternNoteEdit::default()
+                },
+            );
+            let mut right = note.clone();
+            right.position = position_ticks;
+            right.length = right_length;
+            right_segments.push(right);
+        }
+        if !remaining_cuts.is_empty() {
+            return Err(FlpError::UnsupportedEdit(
+                "a requested Pattern note index does not exist",
+            ));
+        }
+        if right_segments.is_empty() {
+            return Ok(0);
+        }
+
+        let mut updated = self.clone();
+        for (channel_id, edits) in edits_by_channel {
+            updated.edit_pattern_notes_batch(pattern_id, channel_id, &edits)?;
+        }
+        let created = right_segments.len();
+        updated.add_pattern_notes(pattern_id, &right_segments)?;
+        *self = updated;
+        Ok(created)
+    }
+
     fn slice_pattern_notes_in_scope(
         &mut self,
         pattern_id: u16,
