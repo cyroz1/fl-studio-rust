@@ -169,7 +169,7 @@ impl MidiInputChannelState {
         }
     }
 
-    fn raw_pan(self) -> u8 {
+    pub fn raw_pan(self) -> u8 {
         self.pan
     }
 

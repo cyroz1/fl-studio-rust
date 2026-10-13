@@ -556,11 +556,32 @@ impl Default for SamplerPatternRenderOptions {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SamplerLiveNoteEvent {
-    NoteOn { channel: u8, key: u8, velocity: u8 },
-    NoteOff { channel: u8, key: u8 },
-    PitchBend { channel: u8, cents: i16 },
-    Sustain { channel: u8, down: bool },
-    ResetControllers { channel: u8, pitch_bend_cents: i16 },
+    NoteOn {
+        channel: u8,
+        key: u8,
+        velocity: u8,
+    },
+    NoteOff {
+        channel: u8,
+        key: u8,
+    },
+    PitchBend {
+        channel: u8,
+        cents: i16,
+    },
+    Pan {
+        channel: u8,
+        value: u8,
+    },
+    Sustain {
+        channel: u8,
+        down: bool,
+    },
+    ResetControllers {
+        channel: u8,
+        pan: u8,
+        pitch_bend_cents: i16,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3427,7 +3448,7 @@ pub fn stream_sampler_midi_input_to_device(
                             channel_id,
                             key: note_key,
                             velocity,
-                            pan: 64,
+                            pan: engine.live_midi_pan(midi_channel),
                             fine_pitch_offset_cents: 0,
                         }) {
                             engine.set_voice_input_midi_channel(slot_index, midi_channel);
@@ -3442,14 +3463,19 @@ pub fn stream_sampler_midi_input_to_device(
                 Ok(SamplerLiveNoteEvent::PitchBend { channel, cents }) => {
                     engine.apply_live_pitch_bend(channel, cents);
                 }
+                Ok(SamplerLiveNoteEvent::Pan { channel, value }) => {
+                    engine.apply_live_pan(channel, value);
+                }
                 Ok(SamplerLiveNoteEvent::Sustain { channel, down }) => {
                     engine.set_live_sustain(channel, down);
                 }
                 Ok(SamplerLiveNoteEvent::ResetControllers {
                     channel,
+                    pan,
                     pitch_bend_cents,
                 }) => {
                     engine.set_live_sustain(channel, false);
+                    engine.apply_live_pan(channel, pan);
                     engine.apply_live_pitch_bend(channel, pitch_bend_cents);
                 }
                 Err(TryRecvError::Empty) => break,
@@ -4766,6 +4792,7 @@ struct SamplerVoiceEngine<'a> {
     resampling_quality: ResamplingQuality,
     voices_stolen: usize,
     pitch_bend_cents: [i16; 16],
+    live_midi_pan: [u8; 16],
     sustain_down: [bool; 16],
 }
 
@@ -4832,6 +4859,7 @@ impl<'a> SamplerVoiceEngine<'a> {
             resampling_quality,
             voices_stolen: 0,
             pitch_bend_cents: [0; 16],
+            live_midi_pan: [64; 16],
             sustain_down: [false; 16],
         }
     }
@@ -5034,6 +5062,27 @@ impl<'a> SamplerVoiceEngine<'a> {
         for voice in self.voices.iter_mut().filter_map(Option::as_mut) {
             if voice.input_midi_channel == Some(channel) {
                 voice.source_step = voice.base_source_step * ratio;
+            }
+        }
+    }
+
+    fn live_midi_pan(&self, channel: u8) -> u8 {
+        self.live_midi_pan[usize::from(channel & 0x0F)]
+    }
+
+    fn apply_live_pan(&mut self, channel: u8, value: u8) {
+        let channel = channel & 0x0F;
+        let pan = value.min(127);
+        self.live_midi_pan[usize::from(channel)] = pan;
+        let sources_by_channel = self.sources_by_channel;
+        let pan_law = self.pan_law;
+        for voice in self.voices.iter_mut().filter_map(Option::as_mut) {
+            if voice.input_midi_channel == Some(channel)
+                && let Some(source) = sources_by_channel.get(&voice.channel_id)
+            {
+                let effective_pan = sampler_note_pan(source.pan, pan);
+                (voice.left_gain, voice.right_gain) =
+                    channel_pan_gains(effective_pan, source.audio.channels.len() == 1, pan_law);
             }
         }
     }

@@ -30334,6 +30334,9 @@ impl DawUi {
         let initial_pitch_bend_cents = self
             .midi_input_channel_state
             .map(MidiInputChannelState::pitch_bend_offset_cents);
+        let initial_pan = self
+            .midi_input_channel_state
+            .map(MidiInputChannelState::raw_pan);
         let initial_sustain_channels = self
             .midi_live_sampler_sustain_channels
             .iter()
@@ -30370,6 +30373,12 @@ impl DawUi {
                     let _ = event_sender.send(SamplerLiveNoteEvent::PitchBend {
                         channel: channel as u8,
                         cents,
+                    });
+                }
+                for (channel, value) in initial_pan.into_iter().enumerate() {
+                    let _ = event_sender.send(SamplerLiveNoteEvent::Pan {
+                        channel: channel as u8,
+                        value,
                     });
                 }
                 for channel in initial_sustain_channels {
@@ -30501,6 +30510,11 @@ impl DawUi {
             ),
             MidiInputEvent::ControlChange {
                 channel,
+                controller: 10,
+                value,
+            } => (SamplerLiveNoteEvent::Pan { channel, value }, None),
+            MidiInputEvent::ControlChange {
+                channel,
                 controller: 64,
                 value,
             } => (
@@ -30517,6 +30531,7 @@ impl DawUi {
             } => (
                 SamplerLiveNoteEvent::ResetControllers {
                     channel,
+                    pan: self.midi_input_channel_state[usize::from(channel & 0x0F)].raw_pan(),
                     pitch_bend_cents: self.midi_input_channel_state[usize::from(channel & 0x0F)]
                         .pitch_bend_offset_cents(),
                 },
