@@ -35319,9 +35319,6 @@ fn playlist_audio_clip_joinable(
     right: &PlaylistClip,
     channel_kinds: &BTreeMap<u16, Option<u8>>,
 ) -> bool {
-    if left.has_opaque_record_tail() || right.has_opaque_record_tail() {
-        return false;
-    }
     let (
         PlaylistClipTarget::Channel {
             id: left_channel_id,
@@ -35344,13 +35341,32 @@ fn playlist_audio_clip_joinable(
         || left.unknown_word != right.unknown_word
         || left.item_flags != right.item_flags
         || left.header_bytes != right.header_bytes
-        || left.clip_id != right.clip_id
-        || left.reserved != right.reserved
         || left.scale != right.scale
         || left.trailing_bytes != right.trailing_bytes
         || left.length_ticks == 0
         || right.length_ticks == 0
     {
+        return false;
+    }
+    if left.has_opaque_record_tail() {
+        let (
+            Some((left_source_start, left_source_end)),
+            Some((right_source_start, right_source_end)),
+        ) = (left.source_window_ticks(), right.source_window_ticks())
+        else {
+            return false;
+        };
+        if left_source_end.checked_sub(left_source_start) != Some(left.length_ticks)
+            || right_source_end.checked_sub(right_source_start) != Some(right.length_ticks)
+            || left_source_end != right_source_start
+            || left.reserved.len() != 72
+            || right.reserved.len() != 72
+            || left.reserved[..8] != right.reserved[..8]
+            || left.reserved[20..] != right.reserved[20..]
+        {
+            return false;
+        }
+    } else if left.reserved != right.reserved {
         return false;
     }
     if left
@@ -35367,15 +35383,19 @@ fn playlist_audio_clip_joinable(
             .position_ticks
             .checked_add(right.length_ticks)
             .is_none()
-        || !left.start_offset.is_finite()
-        || !left.end_offset.is_finite()
-        || !right.start_offset.is_finite()
-        || !right.end_offset.is_finite()
-        || left.start_offset < 0.0
-        || right.start_offset < 0.0
-        || left.end_offset <= left.start_offset
-        || right.end_offset <= right.start_offset
-        || left.end_offset.to_bits() != right.start_offset.to_bits()
+    {
+        return false;
+    }
+    if !left.has_opaque_record_tail()
+        && (!left.start_offset.is_finite()
+            || !left.end_offset.is_finite()
+            || !right.start_offset.is_finite()
+            || !right.end_offset.is_finite()
+            || left.start_offset < 0.0
+            || right.start_offset < 0.0
+            || left.end_offset <= left.start_offset
+            || right.end_offset <= right.start_offset
+            || left.end_offset.to_bits() != right.start_offset.to_bits())
     {
         return false;
     }

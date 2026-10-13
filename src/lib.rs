@@ -7232,9 +7232,10 @@ impl FlpDocument {
         Ok(clip_index.saturating_add(1))
     }
 
-    /// Joins two contiguous, un-stretched Audio Clips that play adjacent source windows.
-    /// The left record is kept and extended; the right record is removed. Both clips must be
-    /// in the same Playlist data event and have matching opaque clip fields, excluding their IDs.
+    /// Joins two contiguous Audio Clips that play adjacent source windows.
+    /// Legacy records require millisecond windows; 88-byte records require explicit tick windows
+    /// whose spans match the timeline lengths. The left record and ID are kept; other opaque
+    /// fields must match byte-for-byte.
     pub fn join_adjacent_playlist_audio_clips(
         &mut self,
         arrangement_id: u16,
@@ -7314,11 +7315,7 @@ impl FlpDocument {
                 "joined Audio Clips must use the same Playlist record event and layout",
             ));
         }
-        if left_clip.has_opaque_record_tail() || right_clip.has_opaque_record_tail() {
-            return Err(FlpError::UnsupportedEdit(
-                "joining this Playlist record version requires decoding its opaque tail",
-            ));
-        }
+        let record_size = left_clip.record_size;
         if left_clip.pattern_base != right_clip.pattern_base
             || left_clip.item_index != right_clip.item_index
             || left_clip.track_index != right_clip.track_index
@@ -7326,10 +7323,14 @@ impl FlpDocument {
             || left_clip.unknown_word != right_clip.unknown_word
             || left_clip.item_flags != right_clip.item_flags
             || left_clip.header_bytes != right_clip.header_bytes
-            || left_clip.reserved != right_clip.reserved
             || left_clip.scale != right_clip.scale
             || left_clip.trailing_bytes != right_clip.trailing_bytes
         {
+            return Err(FlpError::UnsupportedEdit(
+                "joined Audio Clips must have matching clip properties",
+            ));
+        }
+        if !left_clip.has_opaque_record_tail() && left_clip.reserved != right_clip.reserved {
             return Err(FlpError::UnsupportedEdit(
                 "joined Audio Clips must have matching clip properties",
             ));
@@ -7357,20 +7358,45 @@ impl FlpDocument {
                 "joined Audio Clips must touch on the Playlist timeline",
             ));
         }
-        if !left_clip.start_offset.is_finite()
-            || !left_clip.end_offset.is_finite()
-            || !right_clip.start_offset.is_finite()
-            || !right_clip.end_offset.is_finite()
-            || left_clip.start_offset < 0.0
-            || right_clip.start_offset < 0.0
-            || left_clip.end_offset <= left_clip.start_offset
-            || right_clip.end_offset <= right_clip.start_offset
-            || left_clip.end_offset.to_bits() != right_clip.start_offset.to_bits()
-        {
-            return Err(FlpError::UnsupportedEdit(
-                "joined Audio Clips must have contiguous, supported sample windows",
-            ));
-        }
+        let modern_source_end_tick = if record_size == 88 {
+            let (
+                Some((left_source_start, left_source_end)),
+                Some((right_source_start, right_source_end)),
+            ) = (
+                left_clip.source_window_ticks(),
+                right_clip.source_window_ticks(),
+            )
+            else {
+                return Err(FlpError::UnsupportedEdit(
+                    "joined 88-byte Audio Clips need decoded source tick windows",
+                ));
+            };
+            if left_source_end.checked_sub(left_source_start) != Some(left_clip.length_ticks)
+                || right_source_end.checked_sub(right_source_start) != Some(right_clip.length_ticks)
+                || left_source_end != right_source_start
+            {
+                return Err(FlpError::UnsupportedEdit(
+                    "joined 88-byte Audio Clips need matching timeline and contiguous source tick windows",
+                ));
+            }
+            Some(right_source_end)
+        } else {
+            if !left_clip.start_offset.is_finite()
+                || !left_clip.end_offset.is_finite()
+                || !right_clip.start_offset.is_finite()
+                || !right_clip.end_offset.is_finite()
+                || left_clip.start_offset < 0.0
+                || right_clip.start_offset < 0.0
+                || left_clip.end_offset <= left_clip.start_offset
+                || right_clip.end_offset <= right_clip.start_offset
+                || left_clip.end_offset.to_bits() != right_clip.start_offset.to_bits()
+            {
+                return Err(FlpError::UnsupportedEdit(
+                    "joined Audio Clips must have contiguous, supported sample windows",
+                ));
+            }
+            None
+        };
         let merged_end_ticks = right_clip
             .position_ticks
             .checked_add(right_clip.length_ticks)
@@ -7404,7 +7430,6 @@ impl FlpDocument {
             ));
         }
 
-        let record_size = left_clip.record_size;
         let left_record_start = left_clip
             .source_record_index
             .checked_mul(record_size)
@@ -7441,13 +7466,31 @@ impl FlpDocument {
                 "the Playlist Audio Clip records are not distinct",
             ));
         }
+        if record_size == 88 {
+            let mut left_comparison = event.payload[left_record_start..left_record_end].to_vec();
+            let mut right_comparison = event.payload[right_record_start..right_record_end].to_vec();
+            for range in [0..4, 8..12, 24..36] {
+                left_comparison[range.clone()].fill(0);
+                right_comparison[range].fill(0);
+            }
+            if left_comparison != right_comparison {
+                return Err(FlpError::UnsupportedEdit(
+                    "joined 88-byte Audio Clips must match outside position, length, source windows, and clip ID",
+                ));
+            }
+        }
 
         let mut candidate = self.clone();
         let mut payload = event.payload.clone();
         payload[left_record_start + 8..left_record_start + 12]
             .copy_from_slice(&merged_length_ticks.to_le_bytes());
-        payload[left_record_start + 28..left_record_start + 32]
-            .copy_from_slice(&right_clip.end_offset.to_le_bytes());
+        if let Some(source_end_tick) = modern_source_end_tick {
+            payload[left_record_start + 28..left_record_start + 32]
+                .copy_from_slice(&source_end_tick.to_le_bytes());
+        } else {
+            payload[left_record_start + 28..left_record_start + 32]
+                .copy_from_slice(&right_clip.end_offset.to_le_bytes());
+        }
         payload.drain(right_record_start..right_record_end);
         candidate.events[event_index].replace_data_payload(payload)?;
         candidate.refresh_event_offsets()?;
