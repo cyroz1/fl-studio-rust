@@ -11567,6 +11567,15 @@ impl DawUi {
             .copied()
             .filter(|track_id| tracks.iter().any(|track| track.id == *track_id))
             .collect::<Vec<_>>();
+        let selected_track_clip_indices = arrangement
+            .clips
+            .iter()
+            .enumerate()
+            .filter_map(|(index, clip)| {
+                let track_id = u32::from(clip.track_index?).checked_add(1)?;
+                selected_track_ids.contains(&track_id).then_some(index)
+            })
+            .collect::<BTreeSet<_>>();
         let selected_track_solo_range = selected_track_ids
             .first()
             .zip(selected_track_ids.last())
@@ -11620,6 +11629,23 @@ impl DawUi {
                 |ui| {
                     ui.small("Selected Playlist tracks");
                     ui.separator();
+                    if ui
+                        .add_enabled(
+                            !selected_track_clip_indices.is_empty(),
+                            egui::Button::new("Select clips on selected tracks"),
+                        )
+                        .clicked()
+                    {
+                        let selected_count = selected_track_clip_indices.len();
+                        self.set_playlist_clip_selection_to_indices(
+                            arrangement.id,
+                            selected_track_clip_indices.clone(),
+                        );
+                        self.status = format!(
+                            "Selected {selected_count} Playlist clips on selected tracks"
+                        );
+                        ui.close();
+                    }
                     if ui
                         .add_enabled(
                             !selected_track_ids.is_empty(),
@@ -14255,23 +14281,29 @@ impl DawUi {
             .enumerate()
             .filter_map(|(index, clip)| clip.is_muted().then_some(index))
             .collect::<BTreeSet<_>>();
+        let muted_clip_count = muted_clips.len();
+        self.set_playlist_clip_selection_to_indices(arrangement_id, muted_clips);
+        self.status = if muted_clip_count == 0 {
+            "No muted Playlist clips to select".to_owned()
+        } else {
+            format!("Selected {muted_clip_count} muted Playlist clips")
+        };
+    }
+
+    fn set_playlist_clip_selection_to_indices(
+        &mut self,
+        arrangement_id: u16,
+        selection: BTreeSet<usize>,
+    ) {
         let current_clip = (self.selected_arrangement == Some(arrangement_id))
             .then_some(self.selected_clip)
             .flatten()
-            .filter(|index| muted_clips.contains(index));
+            .filter(|index| selection.contains(index));
 
         self.selected_arrangement = Some(arrangement_id);
-        self.selected_clip = current_clip.or_else(|| muted_clips.first().copied());
+        self.selected_clip = current_clip.or_else(|| selection.first().copied());
         self.playlist_selection_anchor = self.selected_clip;
-        self.selected_playlist_clips = muted_clips;
-        self.status = if self.selected_playlist_clips.is_empty() {
-            "No muted Playlist clips to select".to_owned()
-        } else {
-            format!(
-                "Selected {} muted Playlist clips",
-                self.selected_playlist_clips.len()
-            )
-        };
+        self.selected_playlist_clips = selection;
     }
 
     fn deselect_playlist_clips(&mut self) {
