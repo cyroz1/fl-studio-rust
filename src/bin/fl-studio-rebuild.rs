@@ -30515,6 +30515,16 @@ impl DawUi {
             } => (SamplerLiveNoteEvent::Pan { channel, value }, None),
             MidiInputEvent::ControlChange {
                 channel,
+                controller: 120,
+                ..
+            } => (SamplerLiveNoteEvent::AllSoundOff { channel }, None),
+            MidiInputEvent::ControlChange {
+                channel,
+                controller: 123..=127,
+                ..
+            } => (SamplerLiveNoteEvent::AllNotesOff { channel }, None),
+            MidiInputEvent::ControlChange {
+                channel,
                 controller: 64,
                 value,
             } => (
@@ -30539,6 +30549,13 @@ impl DawUi {
             ),
             _ => return,
         };
+        if let SamplerLiveNoteEvent::AllNotesOff { channel }
+        | SamplerLiveNoteEvent::AllSoundOff { channel } = live_event
+        {
+            let channel = channel & 0x0F;
+            self.midi_live_sampler_note_mapping
+                .retain(|(mapped_channel, _), _| *mapped_channel != channel);
+        }
         if self.live_sampler_input.is_none()
             && matches!(live_event, SamplerLiveNoteEvent::NoteOn { .. })
             && !self.start_live_sampler_input(pattern_id, channel_id)

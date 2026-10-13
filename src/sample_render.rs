@@ -573,6 +573,12 @@ pub enum SamplerLiveNoteEvent {
         channel: u8,
         value: u8,
     },
+    AllNotesOff {
+        channel: u8,
+    },
+    AllSoundOff {
+        channel: u8,
+    },
     Sustain {
         channel: u8,
         down: bool,
@@ -3466,6 +3472,12 @@ pub fn stream_sampler_midi_input_to_device(
                 Ok(SamplerLiveNoteEvent::Pan { channel, value }) => {
                     engine.apply_live_pan(channel, value);
                 }
+                Ok(SamplerLiveNoteEvent::AllNotesOff { channel }) => {
+                    engine.release_live_notes(channel);
+                }
+                Ok(SamplerLiveNoteEvent::AllSoundOff { channel }) => {
+                    engine.stop_live_voices(channel);
+                }
                 Ok(SamplerLiveNoteEvent::Sustain { channel, down }) => {
                     engine.set_live_sustain(channel, down);
                 }
@@ -5083,6 +5095,35 @@ impl<'a> SamplerVoiceEngine<'a> {
                 let effective_pan = sampler_note_pan(source.pan, pan);
                 (voice.left_gain, voice.right_gain) =
                     channel_pan_gains(effective_pan, source.audio.channels.len() == 1, pan_law);
+            }
+        }
+    }
+
+    fn release_live_notes(&mut self, channel: u8) {
+        let channel = channel & 0x0F;
+        let sustain_down = self.sustain_down[usize::from(channel)];
+        let release_frames = self.release_frames;
+        for voice in self.voices.iter_mut().filter_map(Option::as_mut) {
+            if voice.input_midi_channel == Some(channel)
+                && !voice.key_released
+                && voice.release_remaining.is_none()
+            {
+                voice.key_released = true;
+                if !sustain_down {
+                    voice.release_remaining = Some(release_frames);
+                }
+            }
+        }
+    }
+
+    fn stop_live_voices(&mut self, channel: u8) {
+        let channel = channel & 0x0F;
+        for voice in &mut self.voices {
+            if voice
+                .as_ref()
+                .is_some_and(|voice| voice.input_midi_channel == Some(channel))
+            {
+                *voice = None;
             }
         }
     }
