@@ -3831,6 +3831,8 @@ impl DawUi {
             record_audio_enabled,
             record_notes_enabled,
         ) = load_midi_device_selections();
+        let (midi_input_thru_snap_to_scale, midi_input_thru_output_channel) =
+            load_midi_thru_preferences();
         let mut audio_settings = AudioSettings::default();
         if let Some(rate) = audio_catalog.default_sample_rate {
             audio_settings.sample_rate = rate;
@@ -4107,8 +4109,8 @@ impl DawUi {
             midi_activity: None,
             midi_input_channel_state: [MidiInputChannelState::default(); 16],
             midi_input_thru_output: false,
-            midi_input_thru_snap_to_scale: false,
-            midi_input_thru_output_channel: None,
+            midi_input_thru_snap_to_scale,
+            midi_input_thru_output_channel,
             midi_input_thru_notes: BTreeMap::new(),
             midi_input_thru_note_mapping: BTreeMap::new(),
             midi_live_sampler_note_mapping: BTreeMap::new(),
@@ -31049,6 +31051,15 @@ impl DawUi {
         }
     }
 
+    fn persist_midi_thru_preferences(&mut self) {
+        if let Err(error) = save_midi_thru_preferences(
+            self.midi_input_thru_snap_to_scale,
+            self.midi_input_thru_output_channel,
+        ) {
+            self.status = format!("Could not save MIDI Thru preferences: {error}");
+        }
+    }
+
     fn connect_selected_midi_input(&mut self) {
         let Some(device_id) = self.midi_selected_input_id.clone() else {
             self.status = "Select a MIDI input device first".to_owned();
@@ -33631,17 +33642,23 @@ impl DawUi {
             )
             .color(MUTED),
         );
-        ui.add_enabled_ui(
-            midi_input_thru_available
-                && self.midi_input_thru_output
-                && self.piano_roll_scale != PianoRollScale::None,
-            |ui| {
-                ui.checkbox(
-                    &mut self.midi_input_thru_snap_to_scale,
-                    "Snap MIDI Thru notes to the selected Piano roll scale",
-                );
-            },
-        );
+        let midi_thru_snap_changed = ui
+            .add_enabled_ui(
+                midi_input_thru_available
+                    && self.midi_input_thru_output
+                    && self.piano_roll_scale != PianoRollScale::None,
+                |ui| {
+                    ui.checkbox(
+                        &mut self.midi_input_thru_snap_to_scale,
+                        "Snap MIDI Thru notes to the selected Piano roll scale",
+                    )
+                },
+            )
+            .inner
+            .changed();
+        if midi_thru_snap_changed {
+            self.persist_midi_thru_preferences();
+        }
         if self.midi_input_thru_snap_to_scale && self.piano_roll_scale != PianoRollScale::None {
             ui.small(format!(
                 "Using {} {} for incoming notes.",
@@ -33649,6 +33666,7 @@ impl DawUi {
                 self.piano_roll_scale.label()
             ));
         }
+        let previous_midi_thru_output_channel = self.midi_input_thru_output_channel;
         ui.add_enabled_ui(
             midi_input_thru_available && self.midi_input_thru_output,
             |ui| {
@@ -33677,6 +33695,9 @@ impl DawUi {
                 });
             },
         );
+        if self.midi_input_thru_output_channel != previous_midi_thru_output_channel {
+            self.persist_midi_thru_preferences();
+        }
         let dropped = self.midi_dropped_messages.load(Ordering::Relaxed);
         if dropped > 0 {
             ui.label(
@@ -37396,6 +37417,12 @@ fn midi_device_selections_file() -> Option<PathBuf> {
         .map(|directory| directory.join("midi-device-selections.txt"))
 }
 
+fn midi_thru_preferences_file() -> Option<PathBuf> {
+    browser_favorites_file()?
+        .parent()
+        .map(|directory| directory.join("midi-thru-preferences.txt"))
+}
+
 fn midi_output_gain_mapping_file() -> Option<PathBuf> {
     midi_control_change_mapping_file("midi-output-gain-mapping.txt")
 }
@@ -37740,6 +37767,55 @@ fn save_midi_device_selections(
         ),
     )
     .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
+fn load_midi_thru_preferences() -> (bool, Option<u8>) {
+    midi_thru_preferences_file()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .map(|contents| parse_midi_thru_preferences(&contents))
+        .unwrap_or((false, None))
+}
+
+fn save_midi_thru_preferences(
+    snap_to_scale: bool,
+    output_channel: Option<u8>,
+) -> Result<(), String> {
+    if output_channel.is_some_and(|channel| channel > 15) {
+        return Err("MIDI Thru output channel must be between 0 and 15".to_owned());
+    }
+    let path = midi_thru_preferences_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the MIDI Thru preferences path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    let output_channel =
+        output_channel.map_or_else(|| "preserve".to_owned(), |value| value.to_string());
+    fs::write(
+        &path,
+        format!(
+            "snap_to_scale={}\noutput_channel={output_channel}\n",
+            u8::from(snap_to_scale)
+        ),
+    )
+    .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
+fn parse_midi_thru_preferences(contents: &str) -> (bool, Option<u8>) {
+    let mut snap_to_scale = false;
+    let mut output_channel = None;
+    for line in contents.lines() {
+        if let Some(enabled) = line.strip_prefix("snap_to_scale=") {
+            snap_to_scale = enabled == "1";
+        } else if let Some(channel) = line.strip_prefix("output_channel=") {
+            output_channel = match channel {
+                "preserve" => None,
+                _ => channel.parse::<u8>().ok().filter(|channel| *channel <= 15),
+            };
+        }
+    }
+    (snap_to_scale, output_channel)
 }
 
 fn encode_midi_device_selections(
