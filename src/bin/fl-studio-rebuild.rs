@@ -30216,6 +30216,36 @@ impl DawUi {
                     self.midi_input_thru_sustain_channels.remove(&channel);
                 }
             }
+            (
+                MidiInputEvent::ControlChange {
+                    controller: 120 | 123..=127,
+                    ..
+                },
+                MidiInputEvent::ControlChange {
+                    channel: output_channel,
+                    ..
+                },
+            ) => {
+                let channel = output_channel & 0x0F;
+                self.midi_input_thru_notes
+                    .retain(|(note_channel, _), _| *note_channel != channel);
+                self.midi_input_thru_note_mapping.retain(|_, mapping| {
+                    mapping.retain(|(note_channel, _)| *note_channel != channel);
+                    !mapping.is_empty()
+                });
+            }
+            (
+                MidiInputEvent::ControlChange {
+                    controller: 121, ..
+                },
+                MidiInputEvent::ControlChange {
+                    channel: output_channel,
+                    ..
+                },
+            ) => {
+                self.midi_input_thru_sustain_channels
+                    .remove(&(output_channel & 0x0F));
+            }
             _ => {}
         }
     }
