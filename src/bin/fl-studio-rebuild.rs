@@ -3551,6 +3551,17 @@ struct PendingSongRender {
     worker: thread::JoinHandle<()>,
     output_path: PathBuf,
     kind: PendingSongRenderKind,
+    track_freeze: Option<PendingPlaylistTrackFreeze>,
+}
+
+struct PendingPlaylistTrackFreeze {
+    arrangement_id: u16,
+    track_id: u32,
+    track_index: u16,
+    expected_audio_clip_count: usize,
+    project_generation: u64,
+    project_path: PathBuf,
+    project_fingerprint: [u8; 16],
 }
 
 #[derive(Clone, Copy)]
@@ -12058,6 +12069,10 @@ impl DawUi {
             .into_iter()
             .map(|channel| (channel.id(), channel.kind()))
             .collect();
+        let has_audio_clip_template = self
+            .document
+            .as_ref()
+            .is_some_and(project_has_audio_clip_template);
         let selected_pattern_id = self
             .selected_pattern
             .filter(|pattern_id| patterns.iter().any(|pattern| pattern.id == *pattern_id))
@@ -12111,6 +12126,7 @@ impl DawUi {
         let mut make_audio_clip_unique_requested = None;
         let mut make_audio_clip_unique_as_sample_requested = None;
         let mut consolidate_audio_clip_requested = None;
+        let mut freeze_playlist_track_requested = None;
         let mut split_clip_requested = None;
         let mut split_selected_audio_clips_requested = None;
         let mut split_pattern_clip_requested = None;
@@ -13032,6 +13048,27 @@ impl DawUi {
                                         Some((track_id, name.clone()));
                                 }
                                 ui.close();
+                            }
+                            if !track_clip_mute_states.is_empty() {
+                                let can_freeze_track = has_audio_clip_template
+                                    && track_state
+                                        .is_none_or(|track| track.enabled != Some(false))
+                                    && track_clip_mute_states
+                                        .iter()
+                                        .any(|(_, muted)| !muted);
+                                if ui
+                                    .add_enabled(
+                                        can_freeze_track,
+                                        egui::Button::new("Freeze track from song start…"),
+                                    )
+                                    .on_hover_text(
+                                        "Render this track from song start, add the Audio Clip here, and mute its existing clips",
+                                    )
+                                    .clicked()
+                                {
+                                    freeze_playlist_track_requested = Some((row, track_id));
+                                    ui.close();
+                                }
                             }
                             if !track_clip_mute_states.is_empty() {
                                 ui.separator();
@@ -15072,6 +15109,10 @@ impl DawUi {
                 start_from_song_start,
                 SelectedAudioClipRenderAction::Consolidate,
             );
+        }
+
+        if let Some((track_index, track_id)) = freeze_playlist_track_requested {
+            self.render_playlist_track_freeze_dialog(arrangement.id, track_index, track_id);
         }
 
         if let Some((clip_index, split_position_ticks)) = split_pattern_clip_requested {
@@ -25165,6 +25206,502 @@ impl DawUi {
         };
     }
 
+    fn finish_playlist_track_freeze(
+        &mut self,
+        output_path: &Path,
+        summary: &PlaylistRenderSummary,
+        freeze: &PendingPlaylistTrackFreeze,
+        history_snapshot_available: bool,
+    ) {
+        if summary.frames == 0 || summary.sample_rate == 0 {
+            self.status = format!(
+                "Rendered {}, but it contains no audio frames to freeze",
+                output_path.display()
+            );
+            return;
+        }
+        if summary.audio_clips_rendered != freeze.expected_audio_clip_count {
+            self.status = format!(
+                "Rendered {}, but left Playlist track {} unchanged because only {} of {} source Audio Clips were rendered",
+                output_path.display(),
+                freeze.track_id,
+                summary.audio_clips_rendered,
+                freeze.expected_audio_clip_count
+            );
+            return;
+        }
+        if summary.audio_clips_skipped_unsupported_scale > 0
+            || summary.pattern_clips_skipped_unsupported_scale > 0
+            || summary.notes_skipped_unresolved_sample > 0
+            || summary.vst3_plugin_channels_unloaded > 0
+        {
+            self.status = format!(
+                "Rendered {}, but left Playlist track {} unchanged because the render skipped unsupported or unavailable sources",
+                output_path.display(),
+                freeze.track_id
+            );
+            return;
+        }
+        let Some(project_path) = self.sample_project_path() else {
+            self.status = format!(
+                "Rendered {}, but could not freeze the track because no project is open",
+                output_path.display()
+            );
+            return;
+        };
+        let Some(document) = self.document.as_ref() else {
+            self.status = format!(
+                "Rendered {}, but could not freeze the track because no project is open",
+                output_path.display()
+            );
+            return;
+        };
+        let current_bytes = match document.encode_lossless() {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.status = format!(
+                    "Rendered {}, but could not verify the project before freezing: {error}",
+                    output_path.display()
+                );
+                return;
+            }
+        };
+        let current_fingerprint: [u8; 16] = Md5::digest(&current_bytes).into();
+        if freeze.project_generation != self.project_generation
+            || project_path != freeze.project_path
+            || current_fingerprint != freeze.project_fingerprint
+        {
+            self.status = format!(
+                "Rendered {}, but did not freeze Playlist track {} because the project changed while rendering",
+                output_path.display(),
+                freeze.track_id
+            );
+            return;
+        }
+        if u32::from(freeze.track_index).saturating_add(1) != freeze.track_id {
+            self.status = format!(
+                "Rendered {}, but could not verify the source Playlist track",
+                output_path.display()
+            );
+            return;
+        }
+        let arrangement = match document.arrangements().map(|arrangements| {
+            arrangements
+                .into_iter()
+                .find(|arrangement| arrangement.id == freeze.arrangement_id)
+        }) {
+            Ok(Some(arrangement)) => arrangement,
+            Ok(None) => {
+                self.status = format!(
+                    "Rendered {}, but its Playlist arrangement no longer exists",
+                    output_path.display()
+                );
+                return;
+            }
+            Err(error) => {
+                self.status = format!(
+                    "Rendered {}, but could not decode its Playlist: {error}",
+                    output_path.display()
+                );
+                return;
+            }
+        };
+        let source_clip_indices = arrangement
+            .clips
+            .iter()
+            .enumerate()
+            .filter_map(|(index, clip)| {
+                (clip.track_index == Some(freeze.track_index)).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if source_clip_indices.is_empty() {
+            self.status = format!(
+                "Rendered {}, but Playlist track {} has no source clips to replace",
+                output_path.display(),
+                freeze.track_id
+            );
+            return;
+        }
+        let length_ticks = match PlaylistTempoMap::for_arrangement(document, freeze.arrangement_id)
+            .and_then(|tempo_map| {
+                tempo_map.ticks_for_audio_frames(0, summary.frames, summary.sample_rate)
+            })
+            .and_then(|ticks| {
+                u32::try_from(ticks)
+                    .map_err(|_| "rendered audio is too long for this Playlist".to_owned())
+            }) {
+            Ok(length_ticks) if length_ticks > 0 => length_ticks,
+            Ok(_) => {
+                self.status = format!(
+                    "Rendered {}, but its duration is shorter than one Playlist tick",
+                    output_path.display()
+                );
+                return;
+            }
+            Err(error) => {
+                self.status = format!(
+                    "Rendered {}, but could not determine its Playlist length: {error}",
+                    output_path.display()
+                );
+                return;
+            }
+        };
+        let undo_snapshot = match self.encode_history_snapshot() {
+            Ok(Some(snapshot)) if snapshot.len() <= HISTORY_LIMIT_BYTES => {
+                (!history_snapshot_available).then_some(snapshot)
+            }
+            Ok(Some(_)) => {
+                self.status = "Undo snapshot exceeds the 64 MiB history limit".to_owned();
+                return;
+            }
+            Ok(None) => {
+                self.status = "Could not capture undo state before track freezing".to_owned();
+                return;
+            }
+            Err(error) => {
+                self.status =
+                    format!("Could not capture undo state before track freezing: {error}");
+                return;
+            }
+        };
+
+        let mut updated = document.clone();
+        let channel_path = output_path.to_string_lossy();
+        let channel_name = format!("Frozen Track {}", freeze.track_id);
+        let channel_id = match updated.create_audio_channel(&channel_path, &channel_name) {
+            Ok(channel_id) => channel_id,
+            Err(error) => {
+                self.status = format!(
+                    "Rendered {}, but could not create its Audio Clip channel: {error}",
+                    output_path.display()
+                );
+                return;
+            }
+        };
+        let new_clip_index = match updated.create_playlist_audio_clip(
+            freeze.arrangement_id,
+            channel_id,
+            0,
+            length_ticks,
+            freeze.track_index,
+        ) {
+            Ok(clip_index) => clip_index,
+            Err(error) => {
+                self.status = format!(
+                    "Rendered {}, but could not place it in the Playlist: {error}",
+                    output_path.display()
+                );
+                return;
+            }
+        };
+        for clip_index in source_clip_indices {
+            if let Err(error) = updated.edit_playlist_clip(
+                freeze.arrangement_id,
+                clip_index,
+                PlaylistClipEdit {
+                    muted: Some(true),
+                    ..PlaylistClipEdit::default()
+                },
+            ) {
+                self.status = format!(
+                    "Rendered {}, but could not mute source clips for Playlist track {}: {error}",
+                    output_path.display(),
+                    freeze.track_id
+                );
+                return;
+            }
+        }
+
+        self.stop_project_playback();
+        self.document = Some(updated);
+        if let Some(snapshot) = undo_snapshot {
+            self.remember_undo_snapshot(snapshot);
+        }
+        self.selected_arrangement = Some(freeze.arrangement_id);
+        self.selected_clip = Some(new_clip_index);
+        self.selected_playlist_clips.clear();
+        self.selected_playlist_clips.insert(new_clip_index);
+        self.playlist_selection_anchor = Some(new_clip_index);
+        self.playlist_clip_context_split = None;
+        self.active_playlist_clip_drag = None;
+        self.dirty = true;
+        self.view = MainView::Playlist;
+        self.refresh_audio_waveform_paths();
+        self.status = format!(
+            "Froze Playlist track {} from song start to {}; source clips muted. Mixer effects and automation were not rendered",
+            freeze.track_id,
+            output_path.display()
+        );
+    }
+
+    fn render_playlist_track_freeze_dialog(
+        &mut self,
+        arrangement_id: u16,
+        track_index: u16,
+        track_id: u32,
+    ) {
+        let Some(project_path) = self.sample_project_path() else {
+            self.status = "Save the project before freezing a Playlist track".to_owned();
+            return;
+        };
+        let Some(document) = self.document.as_ref() else {
+            self.status = "Open a project before freezing a Playlist track".to_owned();
+            return;
+        };
+        if self.pending_song_render.is_some() {
+            self.status = "A Playlist or Mixer stem render is already running".to_owned();
+            return;
+        }
+        if self.playing
+            || self.project_playback_loaded
+            || self.pending_audio_render.is_some()
+            || self.pending_vst3_stream.is_some()
+            || self.pending_sampler_stream.is_some()
+        {
+            self.status =
+                "Stop Song playback or pattern preview before freezing a Playlist track".to_owned();
+            return;
+        }
+
+        let arrangements = match document.arrangements() {
+            Ok(arrangements) => arrangements,
+            Err(error) => {
+                self.status = format!("Could not read the Playlist arrangement: {error}");
+                return;
+            }
+        };
+        let Some(arrangement) = arrangements
+            .iter()
+            .find(|arrangement| arrangement.id == arrangement_id)
+        else {
+            self.status = "The selected Playlist arrangement no longer exists".to_owned();
+            return;
+        };
+        if document
+            .playlist_tracks()
+            .iter()
+            .any(|track| track.id == track_id && track.enabled == Some(false))
+        {
+            self.status = format!("Unmute Playlist track {track_id} before freezing it");
+            return;
+        }
+        let source_clips = arrangement
+            .clips
+            .iter()
+            .filter(|clip| clip.track_index == Some(track_index))
+            .collect::<Vec<_>>();
+        let active_source_clips = source_clips
+            .iter()
+            .copied()
+            .filter(|clip| !clip.is_muted())
+            .collect::<Vec<_>>();
+        if active_source_clips.is_empty() {
+            self.status = format!("Playlist track {track_id} has no unmuted clips to freeze");
+            return;
+        }
+        let channels = document.channels();
+        let patterns = match document.patterns() {
+            Ok(patterns) => patterns,
+            Err(error) => {
+                self.status =
+                    format!("Could not inspect patterns on Playlist track {track_id}: {error}");
+                return;
+            }
+        };
+        let loaded_vst3_channels = self
+            .channel_vst3_instances
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        for clip in &active_source_clips {
+            match clip.target() {
+                PlaylistClipTarget::Channel { id } => {
+                    let Some(channel) = channels.iter().find(|channel| channel.id() == id) else {
+                        self.status = format!(
+                            "Playlist track {track_id} contains a clip with an unknown channel"
+                        );
+                        return;
+                    };
+                    if channel.kind() != Some(4) || channel.enabled() == Some(false) {
+                        self.status = format!(
+                            "Playlist track {track_id} has an active non-Audio Clip channel source that this renderer cannot freeze safely"
+                        );
+                        return;
+                    }
+                }
+                PlaylistClipTarget::Pattern { id } => {
+                    let Some(pattern) = patterns.iter().find(|pattern| pattern.id == id) else {
+                        self.status = format!(
+                            "Playlist track {track_id} contains a clip with an unknown pattern"
+                        );
+                        return;
+                    };
+                    if let Err(reason) = playlist_freeze_pattern_sources_supported(
+                        pattern,
+                        &channels,
+                        &loaded_vst3_channels,
+                    ) {
+                        self.status =
+                            format!("Playlist track {track_id} cannot be frozen safely: {reason}");
+                        return;
+                    }
+                }
+            }
+        }
+        let expected_audio_clip_count = active_source_clips
+            .iter()
+            .filter(|clip| matches!(clip.target(), PlaylistClipTarget::Channel { .. }))
+            .count();
+        if !project_has_audio_clip_template(document) {
+            self.status =
+                "This project needs a recognized Audio Clip template before a track can be frozen"
+                    .to_owned();
+            return;
+        }
+        let project_bytes = match document.encode_lossless() {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.status = format!("Could not verify the project before freezing: {error}");
+                return;
+            }
+        };
+        let project_fingerprint: [u8; 16] = Md5::digest(&project_bytes).into();
+
+        let project_stem = project_path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "FL_Studio_Project".to_owned());
+        let output_format = self.playlist_song_output_format;
+        let file_dialog = rfd::FileDialog::new()
+            .set_title(format!("Freeze Playlist track {track_id} from song start"))
+            .set_file_name(format!(
+                "{project_stem}_track_{track_id}_frozen.{}",
+                output_format.extension()
+            ));
+        let file_dialog = match output_format {
+            PlaylistSongOutputFormat::Wav => file_dialog.add_filter("WAV audio", &["wav"]),
+            PlaylistSongOutputFormat::Flac => file_dialog.add_filter("FLAC audio", &["flac"]),
+            PlaylistSongOutputFormat::Ogg => file_dialog.add_filter("Ogg Vorbis audio", &["ogg"]),
+            PlaylistSongOutputFormat::Mp3 => file_dialog.add_filter("MP3 audio", &["mp3"]),
+        };
+        let Some(output_path) = file_dialog.save_file() else {
+            return;
+        };
+        let options = PlaylistRenderOptions {
+            arrangement_id,
+            sample_rate: self.audio_settings.sample_rate,
+            soloed_playlist_track_range: Some((track_id, track_id)),
+            read_sample_root_note: self.read_sample_root_note,
+            wav_sample_format: self.playlist_render_format,
+            wav_dither_mode: self.playlist_render_dither_mode,
+            wav_save_playlist_markers: false,
+            wav_save_note_markers: false,
+            resampling_quality: self.playlist_render_quality,
+            wav_channel_mode: self.playlist_render_channel_mode,
+            tail_seconds: self.playlist_render_tail_seconds,
+            ..PlaylistRenderOptions::default()
+        };
+        let vst3_processor = self
+            .vst3_host
+            .as_ref()
+            .map(|host| {
+                host.prepare_playlist_stream(
+                    document,
+                    options,
+                    &self.channel_vst3_instances,
+                    self.playlist_render_include_plugin_tails,
+                )
+            })
+            .transpose();
+        let vst3_processor = match vst3_processor {
+            Ok(processor) => processor,
+            Err(error) => {
+                self.status = format!("Could not prepare Playlist VST3 instruments: {error}");
+                return;
+            }
+        };
+        let flac_bits_per_sample = self.playlist_render_flac_bits_per_sample;
+        let ogg_bitrate_kbps = self.playlist_render_ogg_bitrate_kbps;
+        let mp3_bitrate_kbps = self.playlist_render_mp3_bitrate_kbps;
+        let document = document.clone();
+        let output_path_for_worker = output_path.clone();
+        let worker_project_path = project_path.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name("playlist-track-freeze-render".to_owned())
+            .spawn(move || {
+                let result = match output_format {
+                    PlaylistSongOutputFormat::Wav => render_playlist_with_vst3_to_wav_cancellable(
+                        &document,
+                        &worker_project_path,
+                        options,
+                        &output_path_for_worker,
+                        vst3_processor,
+                        &worker_cancelled,
+                    ),
+                    PlaylistSongOutputFormat::Flac => {
+                        render_playlist_with_vst3_to_flac_cancellable(
+                            &document,
+                            &worker_project_path,
+                            options,
+                            &output_path_for_worker,
+                            flac_bits_per_sample,
+                            vst3_processor,
+                            &worker_cancelled,
+                        )
+                    }
+                    PlaylistSongOutputFormat::Ogg => render_playlist_with_vst3_to_ogg_cancellable(
+                        &document,
+                        &worker_project_path,
+                        options,
+                        &output_path_for_worker,
+                        ogg_bitrate_kbps,
+                        vst3_processor,
+                        &worker_cancelled,
+                    ),
+                    PlaylistSongOutputFormat::Mp3 => render_playlist_with_vst3_to_mp3_cancellable(
+                        &document,
+                        &worker_project_path,
+                        options,
+                        &output_path_for_worker,
+                        mp3_bitrate_kbps,
+                        vst3_processor,
+                        &worker_cancelled,
+                    ),
+                };
+                let _ = sender.send(result);
+            });
+        match worker {
+            Ok(worker) => {
+                self.pending_song_render = Some(PendingSongRender {
+                    receiver,
+                    cancelled,
+                    worker,
+                    output_path: output_path.clone(),
+                    kind: PendingSongRenderKind::Mix,
+                    track_freeze: Some(PendingPlaylistTrackFreeze {
+                        arrangement_id,
+                        track_id,
+                        track_index,
+                        expected_audio_clip_count,
+                        project_generation: self.project_generation,
+                        project_path,
+                        project_fingerprint,
+                    }),
+                });
+                self.status = format!(
+                    "Freezing Playlist track {track_id} from song start to {}…",
+                    output_path.display()
+                );
+            }
+            Err(error) => {
+                self.status = format!("Could not start Playlist track freeze worker: {error}");
+            }
+        }
+    }
+
     fn render_playlist_dialog(&mut self) {
         let (Some(project_path), Some(document)) =
             (self.current_path.as_deref(), self.document.as_ref())
@@ -25301,6 +25838,7 @@ impl DawUi {
                     worker,
                     output_path: output_path.clone(),
                     kind: PendingSongRenderKind::Mix,
+                    track_freeze: None,
                 });
                 self.status = format!("Rendering Playlist mix to {}…", output_path.display());
             }
@@ -25407,6 +25945,7 @@ impl DawUi {
                     worker,
                     output_path: output_directory.clone(),
                     kind: PendingSongRenderKind::MixerStems,
+                    track_freeze: None,
                 });
                 self.status = format!("Rendering Mixer stems into {}…", output_directory.display());
             }
@@ -25416,7 +25955,7 @@ impl DawUi {
         }
     }
 
-    fn poll_song_render(&mut self) {
+    fn poll_song_render(&mut self, history_snapshot_available: bool) {
         let completed = self.pending_song_render.as_ref().and_then(|pending| {
             match pending.receiver.try_recv() {
                 Ok(result) => Some(result),
@@ -25434,6 +25973,23 @@ impl DawUi {
         };
         if pending.worker.join().is_err() {
             self.status = "Song render worker panicked".to_owned();
+            return;
+        }
+        if let Some(track_freeze) = pending.track_freeze.as_ref() {
+            match result {
+                Ok(summary) => self.finish_playlist_track_freeze(
+                    &pending.output_path,
+                    &summary,
+                    track_freeze,
+                    history_snapshot_available,
+                ),
+                Err(error) => {
+                    self.status = format!(
+                        "Could not freeze Playlist track {}: {error}",
+                        track_freeze.track_id
+                    );
+                }
+            }
             return;
         }
         match result {
@@ -33851,7 +34407,7 @@ impl eframe::App for DawUi {
         }
         self.poll_audio_clip_export(self.history_snapshot_available_this_frame);
         self.poll_project_audio_render();
-        self.poll_song_render();
+        self.poll_song_render(self.history_snapshot_available_this_frame);
         self.poll_sampler_pattern_render();
         self.poll_vst3_stream();
         self.poll_sampler_stream();
@@ -39085,6 +39641,96 @@ fn project_has_audio_clip_template(document: &FlpDocument) -> bool {
             })
         })
     })
+}
+
+fn playlist_freeze_pattern_sources_supported(
+    pattern: &Pattern,
+    channels: &[ChannelSummary],
+    loaded_vst3_channels: &BTreeSet<u16>,
+) -> Result<(), String> {
+    if !pattern.controllers.is_empty() {
+        return Err(format!(
+            "Pattern {} contains controller points that this renderer does not process",
+            pattern.id
+        ));
+    }
+    let channels_by_id = channels
+        .iter()
+        .map(|channel| (channel.id(), channel))
+        .collect::<BTreeMap<_, _>>();
+    for note in pattern.notes.iter().filter(|note| !note.is_muted()) {
+        let Some(source) = channels_by_id.get(&note.channel_id).copied() else {
+            return Err(format!(
+                "Pattern {} has a note with an unknown source channel",
+                pattern.id
+            ));
+        };
+        let source_accepts_note = source.enabled() != Some(false)
+            && source
+                .keyboard_key_region()
+                .is_none_or(|(low, high)| (low..=high).contains(&note.key));
+        if !source_accepts_note {
+            continue;
+        }
+        match source.channel_type() {
+            Some(ChannelType::Sampler) => {}
+            Some(ChannelType::Instrument) if loaded_vst3_channels.contains(&source.id()) => {}
+            Some(ChannelType::Instrument) => {
+                return Err(format!(
+                    "Pattern {} uses an unloaded instrument channel",
+                    pattern.id
+                ));
+            }
+            Some(ChannelType::Layer) => {
+                let mut child_ids = BTreeSet::new();
+                for child_id in source
+                    .layer_child_ids()
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    .filter(|child_id| child_ids.insert(*child_id))
+                {
+                    let Some(child) = channels_by_id.get(&child_id).copied() else {
+                        return Err(format!(
+                            "Pattern {} uses a Layer with a missing child channel",
+                            pattern.id
+                        ));
+                    };
+                    let child_accepts_note = child.enabled() != Some(false)
+                        && child
+                            .keyboard_key_region()
+                            .is_none_or(|(low, high)| (low..=high).contains(&note.key));
+                    if !child_accepts_note {
+                        continue;
+                    }
+                    if child.channel_type() == Some(ChannelType::Layer) {
+                        return Err(format!(
+                            "Pattern {} uses a nested Layer that this renderer cannot process",
+                            pattern.id
+                        ));
+                    }
+                    match child.channel_type() {
+                        Some(ChannelType::Sampler) => {}
+                        Some(ChannelType::Instrument)
+                            if loaded_vst3_channels.contains(&child.id()) => {}
+                        _ => {
+                            return Err(format!(
+                                "Pattern {} has a Layer child that this renderer cannot process",
+                                pattern.id
+                            ));
+                        }
+                    }
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "Pattern {} uses a channel type that this renderer cannot process",
+                    pattern.id
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn playlist_audio_drop_position_ticks(
