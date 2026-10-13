@@ -5080,6 +5080,7 @@ struct PlaylistPerformanceRuntime {
     sample_rate: u32,
     tempo_map: PlaylistTempoMap,
     launches: Receiver<PlaylistPerformanceLaunch>,
+    pending_launches: Vec<PlaylistPerformanceLaunch>,
     clips_by_index: HashMap<usize, PerformanceSamplerClip>,
     audio_clips_by_index: HashMap<usize, PerformanceAudioClip>,
     active_by_track: BTreeMap<u32, ActivePerformanceSamplerClip>,
@@ -5222,6 +5223,7 @@ impl PlaylistPerformanceRuntime {
             sample_rate: options.sample_rate,
             tempo_map: PlaylistTempoMap::for_arrangement(document, options.arrangement_id)?,
             launches,
+            pending_launches: Vec::new(),
             clips_by_index,
             audio_clips_by_index,
             active_by_track: BTreeMap::new(),
@@ -5240,6 +5242,19 @@ impl PlaylistPerformanceRuntime {
         meter_buses: Option<&mut [f32]>,
     ) -> Result<(), String> {
         while let Ok(launch) = self.launches.try_recv() {
+            self.pending_launches.push(launch);
+        }
+        self.pending_launches
+            .sort_by_key(|launch| launch.start_frame);
+        let block_end = block_start.saturating_add(frame_count as u64);
+        let due_launch_count = self
+            .pending_launches
+            .partition_point(|launch| launch.start_frame <= block_end);
+        let due_launches = self
+            .pending_launches
+            .drain(..due_launch_count)
+            .collect::<Vec<_>>();
+        for launch in due_launches {
             if launch.start_tick < u64::from(self.performance_zone_end_tick)
                 || launch.start_frame < self.start_frame
             {
