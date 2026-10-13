@@ -29,10 +29,10 @@ use flp_rebuild::sample_render::SamplerLiveNoteEvent;
 use flp_rebuild::sample_render::{
     AudioClipRenderOptions, AudioClipRenderSummary, AudioFileRenderOptions, AudioRecordingSummary,
     AudioRenderEncodingOptions, AudioRenderOutput, MP3_BITRATES_KBPS, MixerStemRenderOptions,
-    PlaylistPerformanceLaunch, PlaylistPerformanceStream, PlaylistRenderOptions,
-    PlaylistRenderRange, PlaylistRenderSummary, PlaylistStreamMonitor, PlaylistTempoMap,
-    ResamplingQuality, SamplerPatternRenderOptions, SamplerPatternRenderSummary, WavChannelMode,
-    WavDitherMode, WavSampleFormat, playlist_performance_clip_indices,
+    PlaylistPerformanceCommand, PlaylistPerformanceLaunch, PlaylistPerformanceStream,
+    PlaylistRenderOptions, PlaylistRenderRange, PlaylistRenderSummary, PlaylistStreamMonitor,
+    PlaylistTempoMap, ResamplingQuality, SamplerPatternRenderOptions, SamplerPatternRenderSummary,
+    WavChannelMode, WavDitherMode, WavSampleFormat, playlist_performance_clip_indices,
     playlist_performance_static_document, render_audio_clips_to_file,
     render_playlist_mixer_stems_with_vst3_cancellable,
     render_playlist_with_vst3_to_file_from_frame_cancellable,
@@ -3160,7 +3160,7 @@ struct DawUi {
     history_snapshot_available_this_frame: bool,
     playing: bool,
     performance_mode_active: bool,
-    performance_launch_sender: Option<Sender<PlaylistPerformanceLaunch>>,
+    performance_launch_sender: Option<Sender<PlaylistPerformanceCommand>>,
     project_playback_loaded: bool,
     playlist_playback_loaded: bool,
     playlist_seek_tick: u32,
@@ -7261,6 +7261,48 @@ impl DawUi {
             self.stop_project_playback();
             self.dirty = true;
             self.status = format!("Tempo set to {:.3} BPM", f64::from(milli_bpm) / 1000.0);
+        }
+    }
+
+    fn queue_performance_track_stop(&mut self, track_id: u32) {
+        let stop_position = self
+            .audio_engine
+            .as_ref()
+            .zip(self.playlist_tempo_map.as_ref())
+            .and_then(|(engine, tempo_map)| {
+                let sample_rate = engine.sample_rate();
+                let current_frame = engine.project_playback_position_frames();
+                let safe_frame = current_frame.saturating_add(u64::from(sample_rate) / 8);
+                let safe_tick = tempo_map.tick_at_frame(safe_frame, sample_rate)?;
+                if !safe_tick.is_finite() || safe_tick < 0.0 || safe_tick > f64::from(u32::MAX) {
+                    return None;
+                }
+                let start_tick = safe_tick.ceil() as u32;
+                let start_frame = tempo_map
+                    .frame_at_tick(u64::from(start_tick), sample_rate)
+                    .ok()?;
+                Some((start_tick, start_frame))
+            });
+        match (stop_position, self.performance_launch_sender.as_ref()) {
+            (Some((start_tick, start_frame)), Some(sender)) => {
+                match sender.send(PlaylistPerformanceCommand::StopTrack {
+                    track_id,
+                    start_tick: u64::from(start_tick),
+                    start_frame,
+                }) {
+                    Ok(()) => {
+                        self.status = format!(
+                            "Stopping Performance Mode clip on track {track_id} at tick {start_tick}"
+                        );
+                    }
+                    Err(_) => {
+                        self.status = "Performance Mode audio worker is no longer available".into();
+                    }
+                }
+            }
+            _ => {
+                self.status = "Could not map the Performance Mode stop position".into();
+            }
         }
     }
 
@@ -13311,6 +13353,23 @@ impl DawUi {
                         context_response.context_menu(|ui| {
                             ui.label(track_name);
                             ui.separator();
+                            let can_stop_performance_track = self.performance_mode_active
+                                && self.playing
+                                && self.performance_launch_sender.is_some();
+                            if ui
+                                .add_enabled(
+                                    can_stop_performance_track,
+                                    egui::Button::new("Stop launched clip"),
+                                )
+                                .on_hover_text(
+                                    "Stops this track's launched clip at the next safe audio tick",
+                                )
+                                .clicked()
+                            {
+                                self.queue_performance_track_stop(track_id);
+                                ui.close();
+                            }
+                            ui.separator();
                             if ui.button("Rename…").clicked() {
                                 self.playlist_track_name_editor =
                                     Some((track_id, track_name.to_owned()));
@@ -15237,12 +15296,14 @@ impl DawUi {
                 });
             match (launch_position, self.performance_launch_sender.as_ref()) {
                 (Some((start_tick, start_frame, position_offset_ticks)), Some(sender)) => {
-                    match sender.send(PlaylistPerformanceLaunch {
-                        clip_index,
-                        start_tick: u64::from(start_tick),
-                        start_frame,
-                        position_offset_ticks,
-                    }) {
+                    match sender.send(PlaylistPerformanceCommand::Launch(
+                        PlaylistPerformanceLaunch {
+                            clip_index,
+                            start_tick: u64::from(start_tick),
+                            start_frame,
+                            position_offset_ticks,
+                        },
+                    )) {
                         Ok(()) => {
                             self.status = format!(
                                 "Queued Playlist Clip {} for tick {start_tick} with Position Sync {clip_position_sync_label}",
