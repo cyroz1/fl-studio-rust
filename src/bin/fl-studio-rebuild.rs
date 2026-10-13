@@ -1508,6 +1508,7 @@ enum PianoRollScale {
     MelodicMinor,
     MelodicMinorSharpFive,
     NeapolitanMinor,
+    NeapolitanMinorSharpFour,
     RomanianMinor,
     NeapolitanMajor,
     HungarianMinor,
@@ -1529,7 +1530,7 @@ enum PianoRollScale {
 }
 
 impl PianoRollScale {
-    const ALL: [Self; 66] = [
+    const ALL: [Self; 67] = [
         Self::None,
         Self::Major,
         Self::MajorLocrian,
@@ -1578,6 +1579,7 @@ impl PianoRollScale {
         Self::MelodicMinor,
         Self::MelodicMinorSharpFive,
         Self::NeapolitanMinor,
+        Self::NeapolitanMinorSharpFour,
         Self::RomanianMinor,
         Self::NeapolitanMajor,
         Self::HungarianMinor,
@@ -1648,6 +1650,7 @@ impl PianoRollScale {
             Self::MelodicMinor => "Melodic minor",
             Self::MelodicMinorSharpFive => "Melodic minor #5",
             Self::NeapolitanMinor => "Neapolitan minor",
+            Self::NeapolitanMinorSharpFour => "Neapolitan minor #4",
             Self::RomanianMinor => "Romanian minor",
             Self::NeapolitanMajor => "Neapolitan major",
             Self::HungarianMinor => "Hungarian minor",
@@ -1726,6 +1729,7 @@ impl PianoRollScale {
             Self::MelodicMinor => &[0, 2, 3, 5, 7, 9, 11],
             Self::MelodicMinorSharpFive => &[0, 2, 3, 5, 8, 9, 11],
             Self::NeapolitanMinor => &[0, 1, 3, 5, 7, 8, 11],
+            Self::NeapolitanMinorSharpFour => &[0, 1, 3, 6, 7, 8, 11],
             Self::RomanianMinor => &[0, 2, 3, 6, 7, 8, 10],
             Self::NeapolitanMajor => &[0, 1, 3, 5, 7, 9, 11],
             Self::HungarianMinor => &[0, 2, 3, 6, 7, 8, 11],
@@ -1818,6 +1822,7 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
         PianoRollScale::MelodicMinor,
         PianoRollScale::MelodicMinorSharpFive,
         PianoRollScale::NeapolitanMinor,
+        PianoRollScale::NeapolitanMinorSharpFour,
         PianoRollScale::RomanianMinor,
         PianoRollScale::NeapolitanMajor,
         PianoRollScale::HungarianMinor,
@@ -1901,6 +1906,7 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
                 PianoRollScale::MelodicMinor => 0,
                 PianoRollScale::MelodicMinorSharpFive => -35,
                 PianoRollScale::NeapolitanMinor => -27,
+                PianoRollScale::NeapolitanMinorSharpFour => -37,
                 PianoRollScale::RomanianMinor => -34,
                 PianoRollScale::NeapolitanMajor => -28,
                 PianoRollScale::HungarianMinor => -30,
