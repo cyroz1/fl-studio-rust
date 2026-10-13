@@ -1481,6 +1481,7 @@ enum PianoRollScale {
     LydianAugmented,
     LydianDominant,
     Mixolydian,
+    MixolydianFlatTwo,
     MixolydianFlatSix,
     NaturalMinor,
     Locrian,
@@ -1508,7 +1509,7 @@ enum PianoRollScale {
 }
 
 impl PianoRollScale {
-    const ALL: [Self; 45] = [
+    const ALL: [Self; 46] = [
         Self::None,
         Self::Major,
         Self::HarmonicMajor,
@@ -1530,6 +1531,7 @@ impl PianoRollScale {
         Self::LydianAugmented,
         Self::LydianDominant,
         Self::Mixolydian,
+        Self::MixolydianFlatTwo,
         Self::MixolydianFlatSix,
         Self::NaturalMinor,
         Self::Locrian,
@@ -1579,6 +1581,7 @@ impl PianoRollScale {
             Self::LydianAugmented => "Lydian augmented",
             Self::LydianDominant => "Lydian dominant",
             Self::Mixolydian => "Mixolydian",
+            Self::MixolydianFlatTwo => "Mixolydian b2",
             Self::MixolydianFlatSix => "Mixolydian b6",
             Self::NaturalMinor => "Natural minor",
             Self::Locrian => "Locrian",
@@ -1636,6 +1639,7 @@ impl PianoRollScale {
             Self::LydianAugmented => &[0, 2, 4, 6, 8, 9, 11],
             Self::LydianDominant => &[0, 2, 4, 6, 7, 9, 10],
             Self::Mixolydian => &[0, 2, 4, 5, 7, 9, 10],
+            Self::MixolydianFlatTwo => &[0, 1, 4, 5, 7, 9, 10],
             Self::MixolydianFlatSix => &[0, 2, 4, 5, 7, 8, 10],
             Self::NaturalMinor => &[0, 2, 3, 5, 7, 8, 10],
             Self::Locrian => &[0, 1, 3, 5, 6, 8, 10],
@@ -1707,6 +1711,7 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
         PianoRollScale::LydianAugmented,
         PianoRollScale::LydianDominant,
         PianoRollScale::Mixolydian,
+        PianoRollScale::MixolydianFlatTwo,
         PianoRollScale::MixolydianFlatSix,
         PianoRollScale::NaturalMinor,
         PianoRollScale::Locrian,
@@ -1812,6 +1817,7 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
                 PianoRollScale::LydianAugmented => -15,
                 PianoRollScale::LydianDominant => -12,
                 PianoRollScale::Mixolydian => -5,
+                PianoRollScale::MixolydianFlatTwo => -24,
                 PianoRollScale::MixolydianFlatSix => -16,
                 PianoRollScale::Locrian => -6,
                 PianoRollScale::LocrianNaturalTwo => -17,
@@ -33775,7 +33781,7 @@ mod tests {
 
     #[test]
     fn piano_roll_scales_use_documented_intervals_and_auto_detection() {
-        let cases: [(PianoRollScale, u8, [u16; 8], &'static [u8]); 32] = [
+        let cases: [(PianoRollScale, u8, [u16; 8], &'static [u8]); 33] = [
             (
                 PianoRollScale::Dorian,
                 2,
@@ -33913,6 +33919,12 @@ mod tests {
                 7,
                 [67, 69, 71, 72, 74, 76, 77, 79],
                 &[0, 2, 4, 5, 7, 9, 10],
+            ),
+            (
+                PianoRollScale::MixolydianFlatTwo,
+                0,
+                [60, 61, 64, 65, 67, 69, 70, 72],
+                &[0, 1, 4, 5, 7, 9, 10],
             ),
             (
                 PianoRollScale::Locrian,
