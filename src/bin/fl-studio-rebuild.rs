@@ -13784,6 +13784,13 @@ impl DawUi {
         };
     }
 
+    fn deselect_playlist_clips(&mut self) {
+        self.selected_clip = None;
+        self.selected_playlist_clips.clear();
+        self.playlist_selection_anchor = None;
+        self.status = "Deselected Playlist clips".to_owned();
+    }
+
     fn set_playlist_track_selection(&mut self, track_id: u32, extend: bool, toggle: bool) {
         if extend {
             let anchor = self
@@ -29253,6 +29260,7 @@ impl eframe::App for DawUi {
             paste_playlist_clip_requested,
             merge_playlist_pattern_clips_requested,
             select_all_playlist_clips_requested,
+            deselect_playlist_clips_requested,
         ) = if playlist_clip_shortcuts_enabled {
             ui.input_mut(|input| {
                 (
@@ -29261,10 +29269,11 @@ impl eframe::App for DawUi {
                     input.consume_key(egui::Modifiers::COMMAND, egui::Key::V),
                     input.consume_key(egui::Modifiers::COMMAND, egui::Key::G),
                     input.consume_key(egui::Modifiers::COMMAND, egui::Key::A),
+                    input.consume_key(egui::Modifiers::COMMAND, egui::Key::D),
                 )
             })
         } else {
-            (false, false, false, false, false)
+            (false, false, false, false, false, false)
         };
         if copy_playlist_clip_requested {
             self.copy_selected_playlist_clip();
@@ -29278,6 +29287,9 @@ impl eframe::App for DawUi {
         }
         if select_all_playlist_clips_requested {
             self.select_all_playlist_clips();
+        }
+        if deselect_playlist_clips_requested {
+            self.deselect_playlist_clips();
         }
         let delete_playlist_clip_requested = self.view == MainView::Playlist
             && self.selected_clip.is_some()
