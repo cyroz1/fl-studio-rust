@@ -3050,6 +3050,9 @@ struct DawUi {
     selected_clip: Option<usize>,
     selected_playlist_clips: BTreeSet<usize>,
     playlist_selection_anchor: Option<usize>,
+    selected_playlist_track: Option<u32>,
+    selected_playlist_tracks: BTreeSet<u32>,
+    playlist_track_selection_anchor: Option<u32>,
     playlist_clip_context_split: Option<(u16, usize, u32)>,
     playlist_clip_clipboard: Option<PlaylistClipClipboard>,
     playlist_slip_tool_active: bool,
@@ -3674,6 +3677,9 @@ impl DawUi {
             selected_clip: None,
             selected_playlist_clips: BTreeSet::new(),
             playlist_selection_anchor: None,
+            selected_playlist_track: None,
+            selected_playlist_tracks: BTreeSet::new(),
+            playlist_track_selection_anchor: None,
             playlist_clip_context_split: None,
             playlist_clip_clipboard: None,
             playlist_slip_tool_active: false,
@@ -4562,6 +4568,9 @@ impl DawUi {
                 self.selected_clip = None;
                 self.selected_playlist_clips.clear();
                 self.playlist_selection_anchor = None;
+                self.selected_playlist_track = None;
+                self.selected_playlist_tracks.clear();
+                self.playlist_track_selection_anchor = None;
                 self.playlist_clip_context_split = None;
                 self.playlist_clip_clipboard = None;
                 self.active_playlist_clip_drag = None;
@@ -6650,6 +6659,9 @@ impl DawUi {
         self.selected_clip = None;
         self.selected_playlist_clips.clear();
         self.playlist_selection_anchor = None;
+        self.selected_playlist_track = None;
+        self.selected_playlist_tracks.clear();
+        self.playlist_track_selection_anchor = None;
         self.active_playlist_clip_drag = None;
         self.selected_time_marker = None;
         self.selected_automation_point = None;
@@ -11697,6 +11709,52 @@ impl DawUi {
             .max()
             .unwrap_or(15)
             .max(15);
+        let last_track_id = u32::from(last_track).saturating_add(1);
+        self.selected_playlist_tracks
+            .retain(|track_id| *track_id <= last_track_id);
+        if self
+            .selected_playlist_track
+            .is_some_and(|track_id| track_id > last_track_id)
+        {
+            self.selected_playlist_track =
+                self.selected_playlist_tracks.iter().next_back().copied();
+        }
+        if self
+            .playlist_track_selection_anchor
+            .is_some_and(|track_id| track_id > last_track_id)
+        {
+            self.playlist_track_selection_anchor = self.selected_playlist_track;
+        }
+        let track_navigation = if ui.ctx().egui_wants_keyboard_input() {
+            None
+        } else {
+            ui.input_mut(|input| {
+                let command_alt = egui::Modifiers::COMMAND | egui::Modifiers::ALT;
+                if input.consume_key(command_alt, egui::Key::ArrowUp) {
+                    Some((-1i8, true))
+                } else if input.consume_key(command_alt, egui::Key::ArrowDown) {
+                    Some((1, true))
+                } else if input.consume_key(egui::Modifiers::COMMAND, egui::Key::ArrowUp) {
+                    Some((-1, false))
+                } else if input.consume_key(egui::Modifiers::COMMAND, egui::Key::ArrowDown) {
+                    Some((1, false))
+                } else {
+                    None
+                }
+            })
+        };
+        if let Some((direction, extend)) = track_navigation {
+            let current = self
+                .selected_playlist_track
+                .unwrap_or(1)
+                .clamp(1, last_track_id);
+            let target = if direction < 0 {
+                current.saturating_sub(1)
+            } else {
+                current.saturating_add(1).min(last_track_id)
+            };
+            self.set_playlist_track_selection(target, extend, false);
+        }
         if touch_zoom_out_full && let Some(viewport) = self.playlist_grid_viewport {
             self.timeline_zoom = zoom_to_fit(
                 viewport.width() - label_width - 240.0,
@@ -11846,6 +11904,7 @@ impl DawUi {
                         continue;
                     }
                     let track_state = tracks.iter().find(|track| track.id == track_id);
+                    let track_selected = self.selected_playlist_tracks.contains(&track_id);
                     let track_muted = track_state.is_some_and(|track| track.enabled == Some(false));
                     let track_grouped = track_state.is_some_and(|track| track.grouped == Some(true));
                     let track_group_range = playlist_track_group_range(track_id, &tracks);
@@ -11878,7 +11937,9 @@ impl DawUi {
                         ui.painter().rect_filled(
                             label_rect,
                             0,
-                            if track_effectively_muted {
+                            if track_selected {
+                                BLUE.gamma_multiply(0.55)
+                            } else if track_effectively_muted {
                                 PANEL_DARK
                             } else {
                                 PANEL_LIGHT
@@ -12008,7 +12069,11 @@ impl DawUi {
                             Align2::LEFT_CENTER,
                             format!("{:02}  {group_mark}{track_name}", row + 1),
                             FontId::proportional(11.0),
-                            if track_effectively_muted { MUTED } else { TEXT },
+                            if track_effectively_muted && !track_selected {
+                                MUTED
+                            } else {
+                                TEXT
+                            },
                         );
                         let context_left = if track_is_group_parent {
                             label_rect.left() + 51.0
@@ -12025,7 +12090,17 @@ impl DawUi {
                             Sense::click(),
                         );
                         let context_response = context_response
-                            .on_hover_text("Right-click for track grouping options");
+                            .on_hover_text(
+                                "Click to select · Ctrl/Cmd-click to toggle · Shift-click for a range · Ctrl/Cmd+Up/Down to move · Ctrl/Cmd+Alt/Option+Up/Down to extend",
+                            );
+                        if context_response.clicked_by(PointerButton::Primary) {
+                            let modifiers = ui.input(|input| input.modifiers);
+                            self.set_playlist_track_selection(
+                                track_id,
+                                modifiers.shift,
+                                modifiers.command || modifiers.ctrl,
+                            );
+                        }
                         context_response.context_menu(|ui| {
                             ui.label(track_name);
                             ui.separator();
@@ -13351,6 +13426,47 @@ impl DawUi {
             self.selected_clip = Some(clip_index);
             self.playlist_selection_anchor = Some(clip_index);
         }
+    }
+
+    fn set_playlist_track_selection(&mut self, track_id: u32, extend: bool, toggle: bool) {
+        if extend {
+            let anchor = self
+                .playlist_track_selection_anchor
+                .or(self.selected_playlist_track)
+                .unwrap_or(track_id);
+            self.selected_playlist_tracks.clear();
+            for selected_id in anchor.min(track_id)..=anchor.max(track_id) {
+                self.selected_playlist_tracks.insert(selected_id);
+            }
+            self.playlist_track_selection_anchor = Some(anchor);
+            self.selected_playlist_track = Some(track_id);
+        } else if toggle {
+            if !self.selected_playlist_tracks.remove(&track_id) {
+                self.selected_playlist_tracks.insert(track_id);
+                self.selected_playlist_track = Some(track_id);
+                self.playlist_track_selection_anchor.get_or_insert(track_id);
+            } else {
+                self.selected_playlist_track =
+                    self.selected_playlist_tracks.iter().next_back().copied();
+                if self.selected_playlist_tracks.is_empty() {
+                    self.playlist_track_selection_anchor = None;
+                }
+            }
+        } else {
+            self.selected_playlist_tracks.clear();
+            self.selected_playlist_tracks.insert(track_id);
+            self.selected_playlist_track = Some(track_id);
+            self.playlist_track_selection_anchor = Some(track_id);
+        }
+
+        self.status = match self.selected_playlist_tracks.len() {
+            0 => "No Playlist tracks selected".to_owned(),
+            1 => format!(
+                "Selected Playlist track {}",
+                self.selected_playlist_track.unwrap_or(track_id)
+            ),
+            count => format!("Selected {count} Playlist tracks"),
+        };
     }
 
     fn merge_selected_playlist_pattern_clips(&mut self) -> bool {
