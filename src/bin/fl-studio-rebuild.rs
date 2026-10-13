@@ -15067,8 +15067,21 @@ impl DawUi {
         let mut item_flags = clip.item_flags;
         let mut muted = clip.is_muted();
         let has_opaque_tail = clip.has_opaque_record_tail();
+        let audio_clip_source_window = has_opaque_tail
+            && matches!(
+                clip.target(),
+                flp_rebuild::PlaylistClipTarget::Channel { id }
+                    if self.document.as_ref().is_some_and(|document| {
+                        let channels = document.channels();
+                        let mut matching = channels.iter().filter(|channel| channel.id() == id);
+                        matching.next().is_some_and(|channel| channel.kind() == Some(4))
+                            && matching.next().is_none()
+                    })
+            );
         let mut start_offset = clip.start_offset;
         let mut end_offset = clip.end_offset;
+        let (mut source_start_tick, mut source_end_tick) =
+            clip.source_window_ticks().unwrap_or((0, clip.length_ticks));
         let mut scale = clip.scale.unwrap_or(1.0);
         let mut position_changed = false;
         let mut length_changed = false;
@@ -15079,6 +15092,8 @@ impl DawUi {
         let mut muted_changed = false;
         let mut start_offset_changed = false;
         let mut end_offset_changed = false;
+        let mut source_start_tick_changed = false;
+        let mut source_end_tick_changed = false;
         let mut scale_changed = false;
         let mut duplicate_requested = false;
         ui.separator();
@@ -15164,23 +15179,51 @@ impl DawUi {
                 });
             }
             if has_opaque_tail {
-                if let Some((start, end)) = clip.source_window_ticks() {
+                if audio_clip_source_window {
+                    ui.horizontal_wrapped(|ui| {
+                        source_start_tick_changed = ui
+                            .add(
+                                egui::DragValue::new(&mut source_start_tick)
+                                    .prefix("Source start tick ")
+                                    .speed(1.0),
+                            )
+                            .changed();
+                        source_end_tick_changed = ui
+                            .add(
+                                egui::DragValue::new(&mut source_end_tick)
+                                    .prefix("Source end tick ")
+                                    .speed(1.0),
+                            )
+                            .changed();
+                    });
+                    ui.small(
+                        "Candidate tick bounds map at the project base tempo; clip stretch and tempo automation are unsupported.",
+                    );
+                } else if let Some((start, end)) = clip.source_window_ticks() {
                     ui.label(format!("Source cut window: {start}–{end} ticks (decoded)"));
                 }
                 ui.label("Other clip data is preserved; audio fades, gain, and stretch scale are not decoded yet");
             }
         });
-        let mut clip_edit_succeeded = true;
-        if position_changed
-            || length_changed
-            || item_index_changed
-            || raw_track_index_changed
-            || group_changed
-            || item_flags_changed
-            || muted_changed
-            || start_offset_changed
-            || end_offset_changed
-            || scale_changed
+        let source_window_ticks_changed = source_start_tick_changed || source_end_tick_changed;
+        let source_window_ticks_valid =
+            !source_window_ticks_changed || source_start_tick < source_end_tick;
+        let mut clip_edit_succeeded = source_window_ticks_valid;
+        if !source_window_ticks_valid {
+            self.status = "Audio Clip source end tick must be after its start tick".to_owned();
+        }
+        if source_window_ticks_valid
+            && (position_changed
+                || length_changed
+                || item_index_changed
+                || raw_track_index_changed
+                || group_changed
+                || item_flags_changed
+                || muted_changed
+                || start_offset_changed
+                || end_offset_changed
+                || source_window_ticks_changed
+                || scale_changed)
         {
             let edit = PlaylistClipEdit {
                 position_ticks: position_changed.then_some(position),
@@ -15192,6 +15235,8 @@ impl DawUi {
                 muted: muted_changed.then_some(muted),
                 start_offset: start_offset_changed.then_some(start_offset),
                 end_offset: end_offset_changed.then_some(end_offset),
+                source_window_ticks: source_window_ticks_changed
+                    .then_some((source_start_tick, source_end_tick)),
                 scale: scale_changed.then_some(scale),
             };
             if let Some(document) = self.document.as_mut() {
