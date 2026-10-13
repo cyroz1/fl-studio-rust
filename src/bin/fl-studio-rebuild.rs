@@ -2373,6 +2373,20 @@ enum PlaylistClipDragKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+enum PlaylistClipSlipWindow {
+    Milliseconds {
+        start_ms: f32,
+        end_ms: f32,
+        sample_length_ms: f32,
+    },
+    Ticks {
+        start_tick: u32,
+        end_tick: u32,
+        sample_length_ticks: u32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct ActivePlaylistClipDrag {
     arrangement_id: u16,
     clip_index: usize,
@@ -2387,13 +2401,14 @@ struct ActivePlaylistClipDrag {
     kind: PlaylistClipDragKind,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct PlaylistClipDragTarget {
     clip_index: usize,
     start_position_ticks: u32,
     start_length_ticks: u32,
     start_track_index: u16,
     audio_resize_ticks: Option<(u32, u32, u32)>,
+    audio_slip_window: Option<PlaylistClipSlipWindow>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -13055,7 +13070,7 @@ impl DawUi {
                                 "Drag to move. Resizing and source-window editing are unavailable for this FL Studio clip format."
                             } else if self.playlist_slip_tool_active && is_audio_clip {
                                 if can_slip_clip {
-                                    "Slip tool selected: drag inside to slide the sample source. Eligible selected 2026 Audio Clips can slide together. Hold Alt to ignore the 1/16 grid."
+                                    "Slip tool selected: drag inside to slide the sample source. Compatible selected Audio Clips can slide together while keeping their timeline bounds. Hold Alt to ignore the 1/16 grid."
                                 } else {
                                     slip_unavailable_reason
                                 }
@@ -13439,6 +13454,7 @@ impl DawUi {
                                                 }),
                                             None => false,
                                         };
+                                let group_slip_uses_ticks = clip.has_opaque_record_tail();
                                 let preserve_selected_group_slip = slip_requested
                                     && self.selected_arrangement == Some(arrangement.id)
                                     && self.selected_playlist_clips.len() > 1
@@ -13448,17 +13464,22 @@ impl DawUi {
                                                 .clips
                                                 .get(*selected_index)
                                                 .is_some_and(|selected_clip| {
-                                                    playlist_audio_clip_resize_ticks_from_project(
+                                                    playlist_audio_clip_slip_window_from_project(
                                                         selected_clip,
                                                         audio_resize_context,
                                                     )
-                                                    .is_some_and(
-                                                        |(source_start_tick, source_end_tick, sample_length_ticks)| {
-                                                            source_end_tick
-                                                                .saturating_sub(source_start_tick)
-                                                                < sample_length_ticks
-                                                        },
-                                                    )
+                                                    .is_some_and(|window| {
+                                                        matches!(
+                                                            (group_slip_uses_ticks, window),
+                                                            (
+                                                                true,
+                                                                PlaylistClipSlipWindow::Ticks { .. }
+                                                            ) | (
+                                                                false,
+                                                                PlaylistClipSlipWindow::Milliseconds { .. }
+                                                            )
+                                                        )
+                                                    })
                                                 })
                                         },
                                     );
@@ -13492,6 +13513,11 @@ impl DawUi {
                                                         target_clip,
                                                         audio_resize_context,
                                                     ),
+                                                audio_slip_window:
+                                                    playlist_audio_clip_slip_window_from_project(
+                                                        target_clip,
+                                                        audio_resize_context,
+                                                    ),
                                             })
                                         })
                                         .collect::<Option<Vec<_>>>()
@@ -13502,6 +13528,11 @@ impl DawUi {
                                         start_length_ticks: clip.length_ticks,
                                         start_track_index: clip.track_index.unwrap_or(row),
                                         audio_resize_ticks,
+                                        audio_slip_window:
+                                            playlist_audio_clip_slip_window_from_project(
+                                                clip,
+                                                audio_resize_context,
+                                            ),
                                     }])
                                 };
                                 self.selected_arrangement = Some(arrangement.id);
@@ -13640,8 +13671,11 @@ impl DawUi {
                                             max_track_index: last_track.min(499),
                                         },
                                     )
-                                } else if matches!(drag.kind, PlaylistClipDragKind::SlipTicks { .. })
-                                    && group_targets.len() > 1
+                                } else if matches!(
+                                    drag.kind,
+                                    PlaylistClipDragKind::Slip
+                                        | PlaylistClipDragKind::SlipTicks { .. }
+                                ) && group_targets.len() > 1
                                 {
                                     playlist_clip_group_slip_edits(
                                         drag,
@@ -13701,18 +13735,29 @@ impl DawUi {
                                     let mut updated = self.document.clone();
                                     let result = updated.as_mut().map(|document| match drag.kind {
                                         PlaylistClipDragKind::Slip => {
-                                            let target_start_ms = edits[0]
-                                                .1
-                                                .start_offset
-                                                .unwrap_or(clip.start_offset);
-                                            let delta_ms = f64::from(target_start_ms)
-                                                - f64::from(clip.start_offset);
-                                            document.slip_playlist_audio_clip(
-                                                arrangement.id,
-                                                clip_index,
-                                                delta_ms,
-                                                drag.source_length_ms,
-                                            )
+                                            if group_targets.len() > 1 {
+                                                for (edited_index, edit) in &edits {
+                                                    document.edit_playlist_clip(
+                                                        arrangement.id,
+                                                        *edited_index,
+                                                        edit.clone(),
+                                                    )?;
+                                                }
+                                                Ok(())
+                                            } else {
+                                                let target_start_ms = edits[0]
+                                                    .1
+                                                    .start_offset
+                                                    .unwrap_or(clip.start_offset);
+                                                let delta_ms = f64::from(target_start_ms)
+                                                    - f64::from(clip.start_offset);
+                                                document.slip_playlist_audio_clip(
+                                                    arrangement.id,
+                                                    clip_index,
+                                                    delta_ms,
+                                                    drag.source_length_ms,
+                                                )
+                                            }
                                         }
                                         PlaylistClipDragKind::SlipTicks {
                                             source_start_tick,
@@ -36081,6 +36126,64 @@ fn playlist_audio_clip_resize_ticks_from_project(
     })
 }
 
+fn playlist_audio_clip_slip_window_from_project(
+    clip: &PlaylistClip,
+    context: PlaylistAudioResizeContext<'_>,
+) -> Option<PlaylistClipSlipWindow> {
+    if clip.has_opaque_record_tail() {
+        let (start_tick, end_tick, sample_length_ticks) =
+            playlist_audio_clip_resize_ticks_from_project(clip, context)?;
+        return (end_tick.saturating_sub(start_tick) < sample_length_ticks).then_some(
+            PlaylistClipSlipWindow::Ticks {
+                start_tick,
+                end_tick,
+                sample_length_ticks,
+            },
+        );
+    }
+
+    if context.ppq == 0
+        || !context.tempo_bpm.is_finite()
+        || context.tempo_bpm <= 0.0
+        || clip
+            .scale
+            .is_some_and(|scale| !scale.is_finite() || scale <= 0.0 || (scale - 1.0).abs() > 1e-9)
+        || playlist_tempo_overlaps_range(
+            context.arrangement_clips,
+            context.tempo_channel_ids,
+            clip.position_ticks,
+            clip.position_ticks.saturating_add(clip.length_ticks),
+        )
+    {
+        return None;
+    }
+
+    let sample_length_ms = playlist_clip_sample_length_ms(
+        clip,
+        context.channel_kinds,
+        context.audio_waveform_paths,
+        context.audio_waveforms,
+    )?;
+    let (start_ms, end_ms) = clip
+        .source_window_milliseconds()
+        .map(|(start, end)| (start as f32, end as f32))
+        .or_else(|| {
+            clip.uses_full_source_window()
+                .then_some((0.0, sample_length_ms))
+        })?;
+    (start_ms.is_finite()
+        && end_ms.is_finite()
+        && start_ms >= 0.0
+        && end_ms > start_ms
+        && end_ms <= sample_length_ms
+        && end_ms - start_ms < sample_length_ms)
+        .then_some(PlaylistClipSlipWindow::Milliseconds {
+            start_ms,
+            end_ms,
+            sample_length_ms,
+        })
+}
+
 fn playlist_clip_split_position(
     pointer: egui::Pos2,
     clip_rect: egui::Rect,
@@ -36767,11 +36870,7 @@ fn playlist_clip_group_slip_edits(
     targets: &[PlaylistClipDragTarget],
     context: PlaylistClipDragContext,
 ) -> Vec<(usize, PlaylistClipEdit)> {
-    if targets.is_empty()
-        || targets
-            .iter()
-            .any(|target| target.audio_resize_ticks.is_none())
-    {
+    if targets.is_empty() {
         return Vec::new();
     }
 
@@ -36784,53 +36883,139 @@ fn playlist_clip_group_slip_edits(
         context.snap,
         context.max_track_index,
     );
-    let PlaylistClipDragKind::SlipTicks {
-        source_start_tick, ..
-    } = drag.kind
-    else {
-        return Vec::new();
-    };
-    let anchor_source_start_tick = anchor_edit
-        .source_window_ticks
-        .map(|(start, _)| start)
-        .unwrap_or(source_start_tick);
-    let requested_delta = i64::from(anchor_source_start_tick) - i64::from(source_start_tick);
-    let minimum_delta = targets
-        .iter()
-        .map(|target| {
-            let (source_start_tick, _, _) = target.audio_resize_ticks.unwrap_or_default();
-            -i64::from(source_start_tick)
-        })
-        .max()
-        .unwrap_or_default();
-    let maximum_delta = targets
-        .iter()
-        .map(|target| {
-            let (_, source_end_tick, sample_length_ticks) =
-                target.audio_resize_ticks.unwrap_or_default();
-            i64::from(sample_length_ticks) - i64::from(source_end_tick)
-        })
-        .min()
-        .unwrap_or_default();
-    let delta = requested_delta.clamp(minimum_delta, maximum_delta);
+    match drag.kind {
+        PlaylistClipDragKind::SlipTicks {
+            source_start_tick, ..
+        } => {
+            if targets.iter().any(|target| {
+                !matches!(
+                    target.audio_slip_window,
+                    Some(PlaylistClipSlipWindow::Ticks { .. })
+                )
+            }) {
+                return Vec::new();
+            }
+            let anchor_source_start_tick = anchor_edit
+                .source_window_ticks
+                .map(|(start, _)| start)
+                .unwrap_or(source_start_tick);
+            let requested_delta =
+                i64::from(anchor_source_start_tick) - i64::from(source_start_tick);
+            let minimum_delta = targets
+                .iter()
+                .map(|target| {
+                    let Some(PlaylistClipSlipWindow::Ticks { start_tick, .. }) =
+                        target.audio_slip_window
+                    else {
+                        return 0;
+                    };
+                    -i64::from(start_tick)
+                })
+                .max()
+                .unwrap_or_default();
+            let maximum_delta = targets
+                .iter()
+                .map(|target| {
+                    let Some(PlaylistClipSlipWindow::Ticks {
+                        end_tick,
+                        sample_length_ticks,
+                        ..
+                    }) = target.audio_slip_window
+                    else {
+                        return 0;
+                    };
+                    i64::from(sample_length_ticks) - i64::from(end_tick)
+                })
+                .min()
+                .unwrap_or_default();
+            let delta = requested_delta.clamp(minimum_delta, maximum_delta);
 
-    targets
-        .iter()
-        .map(|target| {
-            let (source_start_tick, source_end_tick, _) =
-                target.audio_resize_ticks.unwrap_or_default();
-            (
-                target.clip_index,
-                PlaylistClipEdit {
-                    source_window_ticks: Some((
-                        (i64::from(source_start_tick) + delta) as u32,
-                        (i64::from(source_end_tick) + delta) as u32,
-                    )),
-                    ..PlaylistClipEdit::default()
-                },
-            )
-        })
-        .collect()
+            targets
+                .iter()
+                .map(|target| {
+                    let Some(PlaylistClipSlipWindow::Ticks {
+                        start_tick,
+                        end_tick,
+                        ..
+                    }) = target.audio_slip_window
+                    else {
+                        return (target.clip_index, PlaylistClipEdit::default());
+                    };
+                    (
+                        target.clip_index,
+                        PlaylistClipEdit {
+                            source_window_ticks: Some((
+                                (i64::from(start_tick) + delta) as u32,
+                                (i64::from(end_tick) + delta) as u32,
+                            )),
+                            ..PlaylistClipEdit::default()
+                        },
+                    )
+                })
+                .collect()
+        }
+        PlaylistClipDragKind::Slip => {
+            if targets.iter().any(|target| {
+                !matches!(
+                    target.audio_slip_window,
+                    Some(PlaylistClipSlipWindow::Milliseconds { .. })
+                )
+            }) {
+                return Vec::new();
+            }
+            let anchor_source_start_ms = anchor_edit
+                .start_offset
+                .unwrap_or(drag.start_source_start_ms);
+            let requested_delta = anchor_source_start_ms - drag.start_source_start_ms;
+            let minimum_delta = targets
+                .iter()
+                .map(|target| {
+                    let Some(PlaylistClipSlipWindow::Milliseconds { start_ms, .. }) =
+                        target.audio_slip_window
+                    else {
+                        return 0.0;
+                    };
+                    -start_ms
+                })
+                .fold(0.0_f32, f32::max);
+            let maximum_delta = targets
+                .iter()
+                .map(|target| {
+                    let Some(PlaylistClipSlipWindow::Milliseconds {
+                        end_ms,
+                        sample_length_ms,
+                        ..
+                    }) = target.audio_slip_window
+                    else {
+                        return 0.0;
+                    };
+                    sample_length_ms - end_ms
+                })
+                .fold(f32::MAX, f32::min);
+            let delta = requested_delta.clamp(minimum_delta, maximum_delta);
+
+            targets
+                .iter()
+                .map(|target| {
+                    let Some(PlaylistClipSlipWindow::Milliseconds {
+                        start_ms, end_ms, ..
+                    }) = target.audio_slip_window
+                    else {
+                        return (target.clip_index, PlaylistClipEdit::default());
+                    };
+                    (
+                        target.clip_index,
+                        PlaylistClipEdit {
+                            start_offset: Some(start_ms + delta),
+                            end_offset: Some(end_ms + delta),
+                            ..PlaylistClipEdit::default()
+                        },
+                    )
+                })
+                .collect()
+        }
+        _ => Vec::new(),
+    }
 }
 
 fn note_from_grid_position(
