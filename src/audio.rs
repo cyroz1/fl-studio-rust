@@ -962,12 +962,20 @@ impl AudioEngine {
     ///
     /// The smaller ring limits the delay between a producer's note event and audible output.
     pub fn begin_live_streaming_playback(&self) -> Result<StreamingAudioWriter, String> {
+        self.begin_live_streaming_playback_from_frame(0)
+    }
+
+    /// Begin a low-latency stream with the device position initialized to a song-frame offset.
+    pub fn begin_live_streaming_playback_from_frame(
+        &self,
+        start_frame: u64,
+    ) -> Result<StreamingAudioWriter, String> {
         if !self.output_active {
             return Err("Start an output device before streaming audio".into());
         }
         let writer = self
             .playback
-            .start_streaming_with_capacity(0, LIVE_STREAM_RING_CAPACITY);
+            .start_streaming_with_capacity(start_frame, LIVE_STREAM_RING_CAPACITY);
         self.request_output_source(AUDIO_SOURCE_STREAM);
         Ok(writer)
     }

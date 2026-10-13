@@ -831,6 +831,126 @@ pub struct PlaylistRenderRange {
     pub minimum_content_frames: u64,
 }
 
+/// A Sampler Pattern Clip launch scheduled on the Playlist timeline.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PlaylistPerformanceLaunch {
+    pub clip_index: usize,
+    pub start_tick: u64,
+    pub start_frame: u64,
+}
+
+/// Runtime inputs for a Performance Mode Playlist stream.
+pub struct PlaylistPerformanceStream {
+    pub performance_zone_end_tick: u32,
+    pub start_frame: u64,
+    pub launches: Receiver<PlaylistPerformanceLaunch>,
+    pub meters: Option<Arc<MixerTrackPeakMeters>>,
+}
+
+/// Return the supported Sampler Pattern Clips that can be launched before the Start marker.
+pub fn playlist_performance_sampler_clip_indices(
+    document: &FlpDocument,
+    arrangement_id: u16,
+    performance_zone_end_tick: u32,
+) -> Result<BTreeSet<usize>, String> {
+    let arrangement = document
+        .arrangements()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|arrangement| arrangement.id == arrangement_id)
+        .ok_or_else(|| format!("arrangement {arrangement_id} was not found"))?;
+    let patterns = document
+        .patterns()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|pattern| (pattern.id, pattern))
+        .collect::<HashMap<_, _>>();
+    let channels = document
+        .channels()
+        .into_iter()
+        .map(|channel| (channel.id(), channel))
+        .collect::<HashMap<_, _>>();
+    let disabled_tracks = document
+        .playlist_tracks()
+        .into_iter()
+        .filter(|track| track.enabled == Some(false))
+        .map(|track| track.id)
+        .collect::<BTreeSet<_>>();
+
+    let candidates = arrangement
+        .clips
+        .iter()
+        .enumerate()
+        .filter_map(|(index, clip)| {
+            let PlaylistClipTarget::Pattern { id } = clip.target() else {
+                return None;
+            };
+            let track_id = clip.playlist_track_id()?;
+            let pattern = patterns.get(&id)?;
+            (clip.position_ticks < performance_zone_end_tick
+                && clip.length_ticks > 0
+                && !clip.is_muted()
+                && !disabled_tracks.contains(&track_id)
+                && clip
+                    .scale
+                    .is_none_or(|scale| scale.is_finite() && (scale - 1.0).abs() <= 1e-9)
+                && pattern.controllers.is_empty()
+                && pattern.notes.iter().all(|note| {
+                    note.is_muted()
+                        || channels.get(&note.channel_id).is_some_and(|channel| {
+                            channel.kind() == Some(0) && channel.enabled() != Some(false)
+                        })
+                }))
+            .then_some(index)
+        })
+        .collect::<BTreeSet<_>>();
+    let eligible_track_ids = candidates
+        .iter()
+        .filter_map(|index| arrangement.clips.get(*index)?.playlist_track_id())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|track_id| {
+            arrangement.clips.iter().enumerate().all(|(index, clip)| {
+                clip.playlist_track_id() != Some(*track_id)
+                    || !matches!(clip.target(), PlaylistClipTarget::Pattern { .. })
+                    || clip.is_muted()
+                    || candidates.contains(&index)
+            })
+        })
+        .collect::<BTreeSet<_>>();
+    Ok(candidates
+        .into_iter()
+        .filter(|index| {
+            arrangement
+                .clips
+                .get(*index)
+                .and_then(PlaylistClip::playlist_track_id)
+                .is_some_and(|track_id| eligible_track_ids.contains(&track_id))
+        })
+        .collect())
+}
+
+/// Return a copy of an arrangement with supported Performance Zone clips removed from static
+/// playback. Other Pattern Clips and tempo automation remain on the normal song timeline.
+pub fn playlist_performance_static_document(
+    document: &FlpDocument,
+    arrangement_id: u16,
+    performance_zone_end_tick: u32,
+) -> Result<(FlpDocument, BTreeSet<usize>), String> {
+    let performance_clip_indices = playlist_performance_sampler_clip_indices(
+        document,
+        arrangement_id,
+        performance_zone_end_tick,
+    )?;
+    let mut static_document = document.clone();
+    for clip_index in performance_clip_indices.iter().rev().copied() {
+        static_document
+            .delete_playlist_clip(arrangement_id, clip_index)
+            .map_err(|error| format!("could not isolate Performance Zone tracks: {error}"))?;
+    }
+    Ok((static_document, performance_clip_indices))
+}
+
 impl Default for PlaylistRenderOptions {
     fn default() -> Self {
         Self {
@@ -1212,6 +1332,133 @@ pub fn stream_playlist_with_vst3_to_device_with_monitor(
         vst3_processor,
         monitor,
     )
+}
+
+/// Stream normal arrangement audio while accepting quantized Sampler Pattern Clip launches.
+///
+/// The arrangement must contain supported Pattern Clips before the named Start marker. Launches
+/// replace notes from the same Playlist track and repeat at the clip's tick length. Audio Clips,
+/// VST3 Pattern Clip launching, scenes, and controller-driven launch remain unsupported.
+pub fn stream_playlist_performance_with_vst3_to_device(
+    document: &FlpDocument,
+    project_path: impl AsRef<Path>,
+    options: PlaylistRenderOptions,
+    writer: &StreamingAudioWriter,
+    cancelled: &AtomicBool,
+    mut vst3_processor: Option<Vst3PlaylistStreamProcessor>,
+    performance: PlaylistPerformanceStream,
+) -> Result<PlaylistRenderSummary, String> {
+    let project_path = project_path.as_ref();
+    let (static_document, performance_clip_indices) = playlist_performance_static_document(
+        document,
+        options.arrangement_id,
+        performance.performance_zone_end_tick,
+    )?;
+    if performance_clip_indices.is_empty() {
+        return Err(
+            "arrangement has no supported Sampler Pattern Clips before the Start marker".into(),
+        );
+    }
+    let audio = prepare_audio_clip_render(
+        &static_document,
+        project_path,
+        AudioClipRenderOptions {
+            arrangement_id: options.arrangement_id,
+            sample_rate: options.sample_rate,
+            wav_sample_format: options.wav_sample_format,
+            wav_dither_mode: options.wav_dither_mode,
+            wav_channel_mode: options.wav_channel_mode,
+            resampling_quality: options.resampling_quality,
+            clip_index: None,
+            start_from_song_start: false,
+            soloed_playlist_track_range: options.soloed_playlist_track_range,
+        },
+        Some(cancelled),
+    )?;
+    let mut sampler =
+        prepare_sampler_arrangement(document, project_path, options, Some(cancelled))?;
+    let runtime = PlaylistPerformanceRuntime::new(
+        document,
+        options,
+        performance.performance_zone_end_tick,
+        performance.start_frame,
+        performance.launches,
+        &performance_clip_indices,
+        &sampler,
+    )?;
+    sampler
+        .notes
+        .retain(|note| !performance_clip_indices.contains(&note.clip_index));
+
+    let static_frames = audio.summary.frames.max(sampler.summary.frames);
+    if let Some(processor) = vst3_processor.as_mut() {
+        let vst3_summary = processor.summary();
+        if static_frames == 0
+            && vst3_summary.plugin_channels_rendered == 0
+            && !vst3_summary.unloaded_plugin_channels.is_empty()
+        {
+            let channel_ids = vst3_summary
+                .unloaded_plugin_channels
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "arrangement has VST3 notes on channel(s) {channel_ids}, but no matching plug-in instance is loaded"
+            ));
+        }
+        processor.extend_to_output_frames(static_frames.max(vst3_summary.frames))?;
+    }
+    let mut source_paths = audio
+        .decoded_by_path
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    source_paths.extend(sampler.source_paths.iter().cloned());
+    let vst3_summary = vst3_processor.as_ref().map(|processor| processor.summary());
+    let summary = PlaylistRenderSummary {
+        frames: static_frames.max(vst3_summary.as_ref().map_or(0, |summary| summary.frames)),
+        sample_rate: options.sample_rate,
+        audio_clips_rendered: audio.summary.clips_rendered,
+        sampler_pattern_clips_rendered: sampler.pattern_clips_rendered,
+        sampler_notes_rendered: sampler.summary.notes_rendered,
+        voices_stolen: 0,
+        source_files: source_paths.len(),
+        audio_clips_skipped_unsupported_scale: audio.summary.clips_skipped_unsupported_scale,
+        pattern_clips_skipped_unsupported_scale: sampler.pattern_clips_skipped_unsupported_scale,
+        notes_skipped_unresolved_sample: sampler.summary.notes_skipped_unresolved_sample,
+        vst3_plugin_channels_rendered: vst3_summary
+            .as_ref()
+            .map_or(0, |summary| summary.plugin_channels_rendered),
+        vst3_notes_rendered: vst3_summary
+            .as_ref()
+            .map_or(0, |summary| summary.notes_scheduled),
+        vst3_plugin_channels_unloaded: vst3_summary
+            .as_ref()
+            .map_or(0, |summary| summary.unloaded_plugin_channels.len()),
+        mixer_master_stem_rendered: false,
+        mixer_current_stem_rendered: false,
+        mixer_insert_peaks: None,
+    };
+    let mut frames_to_skip = performance.start_frame;
+    stream_prepared_playlist_render_with_performance(
+        PreparedPlaylistBlockMix {
+            audio: &audio,
+            sampler: &sampler,
+            options,
+            frames: u64::MAX,
+            master_output: MixerMasterOutput::from_document(&static_document),
+            vst3_processor: vst3_processor.as_mut(),
+        },
+        Some(runtime),
+        performance.meters.as_deref(),
+        cancelled,
+        || writer.is_cancelled(),
+        |block, _meter_buses| {
+            writer.write_stereo_samples(skip_render_block_prefix(block, &mut frames_to_skip))
+        },
+    )?;
+    Ok(summary)
 }
 
 fn stream_playlist_with_vst3_to_device_from_frame_inner(
@@ -3196,7 +3443,25 @@ impl MixerMasterOutput {
 }
 
 fn stream_prepared_playlist_render(
+    render: PreparedPlaylistBlockMix<'_>,
+    meters: Option<&MixerTrackPeakMeters>,
+    cancelled: &AtomicBool,
+    stream_cancelled: impl FnMut() -> bool,
+    write_block: impl FnMut(&[f32], Option<&[f32]>) -> Result<(), String>,
+) -> Result<usize, String> {
+    stream_prepared_playlist_render_with_performance(
+        render,
+        None,
+        meters,
+        cancelled,
+        stream_cancelled,
+        write_block,
+    )
+}
+
+fn stream_prepared_playlist_render_with_performance(
     mut render: PreparedPlaylistBlockMix<'_>,
+    mut performance: Option<PlaylistPerformanceRuntime>,
     meters: Option<&MixerTrackPeakMeters>,
     cancelled: &AtomicBool,
     mut stream_cancelled: impl FnMut() -> bool,
@@ -3286,6 +3551,9 @@ fn stream_prepared_playlist_render(
                     meter_buses.as_deref_mut(),
                     parallel_mixer.as_ref(),
                 )?;
+                if let Some(performance) = performance.as_mut() {
+                    performance.update(block_start, frame_count, &mut sampler_engine)?;
+                }
                 let sampler_samples = &mut sampler_block[..sample_count];
                 if let Some(meter_buses) = meter_buses.as_deref_mut() {
                     sampler_engine.render_block_with_meters(
@@ -3575,6 +3843,10 @@ pub fn stream_sampler_midi_input_to_device(
                     {
                         let note_key = transpose_sampler_note_key(input_key, pitch_offset);
                         if let Some(slot_index) = engine.start_voice(ScheduledSamplerNote {
+                            clip_index: 0,
+                            playlist_track_id: None,
+                            start_tick: 0,
+                            stop_tick: None,
                             start_frame: block_start,
                             stop_frame: Some(u64::MAX),
                             channel_id,
@@ -4277,6 +4549,7 @@ struct PreparedSamplerArrangement {
     pattern_clips_rendered: usize,
     pattern_clips_skipped_unsupported_scale: usize,
     source_paths: std::collections::BTreeSet<PathBuf>,
+    unresolved_clip_indices: BTreeSet<usize>,
 }
 
 fn prepare_sampler_arrangement(
@@ -4377,6 +4650,7 @@ fn prepare_sampler_arrangement(
             pattern_clips_rendered: 0,
             pattern_clips_skipped_unsupported_scale: schedule.clips_skipped_unsupported_scale,
             source_paths: std::collections::BTreeSet::new(),
+            unresolved_clip_indices: BTreeSet::new(),
         });
     }
 
@@ -4387,6 +4661,7 @@ fn prepare_sampler_arrangement(
     let mut mixer_meter_transforms_by_channel =
         HashMap::<u16, Vec<(usize, MixerSourceRouteTransform)>>::new();
     let mut unresolved_sample_channels = std::collections::BTreeSet::new();
+    let mut unresolved_clip_indices = BTreeSet::new();
     let mut notes = Vec::with_capacity(sampler_note_count);
     let mut rendered_pattern_clip_indices = std::collections::BTreeSet::new();
     let mut skipped_unresolved = 0usize;
@@ -4410,6 +4685,7 @@ fn prepare_sampler_arrangement(
         {
             let Some(sample_path) = channel.sample_path() else {
                 unresolved_sample_channels.insert(placed.target_channel_id);
+                unresolved_clip_indices.insert(placed.clip_index);
                 skipped_unresolved += 1;
                 continue;
             };
@@ -4417,6 +4693,7 @@ fn prepare_sampler_arrangement(
                 Ok(path) => path,
                 Err(_) => {
                     unresolved_sample_channels.insert(placed.target_channel_id);
+                    unresolved_clip_indices.insert(placed.clip_index);
                     skipped_unresolved += 1;
                     continue;
                 }
@@ -4486,6 +4763,10 @@ fn prepare_sampler_arrangement(
         let Some(source) = sources_by_channel.get(&placed.target_channel_id) else {
             continue;
         };
+        let playlist_track_id = arrangement
+            .clips
+            .get(placed.clip_index)
+            .and_then(PlaylistClip::playlist_track_id);
         let note_key = transpose_sampler_note_key(
             note.key,
             channels_by_id
@@ -4546,6 +4827,10 @@ fn prepare_sampler_arrangement(
         );
         rendered_pattern_clip_indices.insert(placed.clip_index);
         notes.push(ScheduledSamplerNote {
+            clip_index: placed.clip_index,
+            playlist_track_id,
+            start_tick: placed.start_tick,
+            stop_tick: placed.stop_tick,
             start_frame,
             stop_frame,
             channel_id: placed.target_channel_id,
@@ -4575,6 +4860,7 @@ fn prepare_sampler_arrangement(
         pattern_clips_rendered: rendered_pattern_clip_indices.len(),
         pattern_clips_skipped_unsupported_scale: schedule.clips_skipped_unsupported_scale,
         source_paths: decoded_by_path.keys().cloned().collect(),
+        unresolved_clip_indices,
     })
 }
 
@@ -4611,6 +4897,10 @@ fn validated_sampler_loop_bounds(
 
 #[derive(Clone, Copy)]
 struct ScheduledSamplerNote {
+    clip_index: usize,
+    playlist_track_id: Option<u32>,
+    start_tick: u64,
+    stop_tick: Option<u64>,
     start_frame: u64,
     stop_frame: Option<u64>,
     channel_id: u16,
@@ -4618,6 +4908,203 @@ struct ScheduledSamplerNote {
     velocity: u8,
     pan: u8,
     fine_pitch_offset_cents: i16,
+}
+
+#[derive(Clone)]
+struct PerformanceSamplerClip {
+    track_id: u32,
+    length_ticks: u64,
+    notes: Vec<PerformanceSamplerNote>,
+}
+
+#[derive(Clone, Copy)]
+struct PerformanceSamplerNote {
+    relative_start_tick: u64,
+    relative_stop_tick: Option<u64>,
+    note: ScheduledSamplerNote,
+}
+
+struct ActivePerformanceSamplerClip {
+    clip_index: usize,
+    next_loop_tick: u64,
+}
+
+struct PlaylistPerformanceRuntime {
+    performance_zone_end_tick: u32,
+    start_frame: u64,
+    sample_rate: u32,
+    tempo_map: PlaylistTempoMap,
+    launches: Receiver<PlaylistPerformanceLaunch>,
+    clips_by_index: HashMap<usize, PerformanceSamplerClip>,
+    active_by_track: BTreeMap<u32, ActivePerformanceSamplerClip>,
+}
+
+impl PlaylistPerformanceRuntime {
+    fn new(
+        document: &FlpDocument,
+        options: PlaylistRenderOptions,
+        performance_zone_end_tick: u32,
+        start_frame: u64,
+        launches: Receiver<PlaylistPerformanceLaunch>,
+        performance_clip_indices: &BTreeSet<usize>,
+        sampler: &PreparedSamplerArrangement,
+    ) -> Result<Self, String> {
+        let arrangement = document
+            .arrangements()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|arrangement| arrangement.id == options.arrangement_id)
+            .ok_or_else(|| format!("arrangement {} was not found", options.arrangement_id))?;
+        let unresolved_performance_clips = sampler
+            .unresolved_clip_indices
+            .intersection(performance_clip_indices)
+            .copied()
+            .collect::<Vec<_>>();
+        if !unresolved_performance_clips.is_empty() {
+            return Err(format!(
+                "Performance Mode cannot launch Pattern Clip(s) {} because one or more Sampler samples could not be resolved",
+                unresolved_performance_clips
+                    .iter()
+                    .map(|index| (index + 1).to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        let mut clips_by_index = HashMap::new();
+        for &clip_index in performance_clip_indices {
+            let clip = arrangement.clips.get(clip_index).ok_or_else(|| {
+                format!("Performance Pattern Clip {} disappeared", clip_index + 1)
+            })?;
+            let length_ticks = u64::from(clip.length_ticks);
+            if length_ticks == 0 {
+                return Err(format!(
+                    "Performance Pattern Clip {} has no timeline length",
+                    clip_index + 1
+                ));
+            }
+            let track_id = clip.playlist_track_id().ok_or_else(|| {
+                format!(
+                    "Performance Pattern Clip {} has no Playlist track",
+                    clip_index + 1
+                )
+            })?;
+            let source_start_tick = u64::from(clip.position_ticks);
+            let notes = sampler
+                .notes
+                .iter()
+                .filter(|note| note.clip_index == clip_index)
+                .map(|note| PerformanceSamplerNote {
+                    relative_start_tick: note.start_tick.saturating_sub(source_start_tick),
+                    relative_stop_tick: note
+                        .stop_tick
+                        .map(|tick| tick.saturating_sub(source_start_tick)),
+                    note: *note,
+                })
+                .collect();
+            clips_by_index.insert(
+                clip_index,
+                PerformanceSamplerClip {
+                    track_id,
+                    length_ticks,
+                    notes,
+                },
+            );
+        }
+        Ok(Self {
+            performance_zone_end_tick,
+            start_frame,
+            sample_rate: options.sample_rate,
+            tempo_map: PlaylistTempoMap::for_arrangement(document, options.arrangement_id)?,
+            launches,
+            clips_by_index,
+            active_by_track: BTreeMap::new(),
+        })
+    }
+
+    fn update(
+        &mut self,
+        block_start: u64,
+        frame_count: usize,
+        sampler_engine: &mut SamplerVoiceEngine<'_>,
+    ) -> Result<(), String> {
+        while let Ok(launch) = self.launches.try_recv() {
+            let clip = self.clips_by_index.get(&launch.clip_index).ok_or_else(|| {
+                format!(
+                    "Pattern Clip {} is not a supported Performance Mode Sampler clip",
+                    launch.clip_index + 1
+                )
+            })?;
+            if launch.start_tick < u64::from(self.performance_zone_end_tick)
+                || launch.start_frame < self.start_frame
+            {
+                return Err(
+                    "Performance Mode launch must start at or after the Start marker".into(),
+                );
+            }
+            let track_id = clip.track_id;
+            sampler_engine.remove_queued_track_notes_from(track_id, launch.start_frame);
+            sampler_engine.release_track_at(track_id, launch.start_frame);
+            self.active_by_track.insert(
+                track_id,
+                ActivePerformanceSamplerClip {
+                    clip_index: launch.clip_index,
+                    next_loop_tick: launch.start_tick,
+                },
+            );
+        }
+
+        let horizon_frame = block_start
+            .saturating_add(frame_count as u64)
+            .saturating_add(u64::from(self.sample_rate));
+        let mut queued_notes = Vec::new();
+        for active in self.active_by_track.values_mut() {
+            let clip = self
+                .clips_by_index
+                .get(&active.clip_index)
+                .ok_or_else(|| "active Performance Mode clip disappeared".to_owned())?;
+            loop {
+                let loop_frame = self
+                    .tempo_map
+                    .frame_at_tick(active.next_loop_tick, self.sample_rate)?;
+                if loop_frame > horizon_frame {
+                    break;
+                }
+                for template in &clip.notes {
+                    let start_tick = active
+                        .next_loop_tick
+                        .checked_add(template.relative_start_tick)
+                        .ok_or_else(|| "Performance Mode note start tick overflow".to_owned())?;
+                    let mut note = template.note;
+                    note.start_tick = start_tick;
+                    note.stop_tick = match template.relative_stop_tick {
+                        Some(tick) => {
+                            Some(active.next_loop_tick.checked_add(tick).ok_or_else(|| {
+                                "Performance Mode note end tick overflow".to_owned()
+                            })?)
+                        }
+                        None => None,
+                    };
+                    note.start_frame =
+                        self.tempo_map.frame_at_tick(start_tick, self.sample_rate)?;
+                    note.stop_frame = note
+                        .stop_tick
+                        .map(|tick| {
+                            self.tempo_map
+                                .frame_at_tick(tick, self.sample_rate)
+                                .map(|frame| frame.max(note.start_frame.saturating_add(1)))
+                        })
+                        .transpose()?;
+                    queued_notes.push(note);
+                }
+                active.next_loop_tick = active
+                    .next_loop_tick
+                    .checked_add(clip.length_ticks)
+                    .ok_or_else(|| "Performance Mode loop tick overflow".to_owned())?;
+            }
+        }
+        sampler_engine.queue_live_notes(queued_notes);
+        Ok(())
+    }
 }
 
 fn prepare_sampler_pattern(
@@ -4873,6 +5360,10 @@ fn prepare_sampler_pattern_for_channel(
                 .ok_or_else(|| "Sampler render timeline length overflow".to_owned())?,
         );
         notes.push(ScheduledSamplerNote {
+            clip_index: 0,
+            playlist_track_id: None,
+            start_tick: 0,
+            stop_tick: None,
             start_frame,
             stop_frame,
             channel_id: target_channel_id,
@@ -4919,11 +5410,13 @@ fn prepare_sampler_pattern_for_channel(
 struct SamplerVoiceEngine<'a> {
     sources_by_channel: &'a HashMap<u16, SamplerVoiceSource>,
     notes: &'a [ScheduledSamplerNote],
+    live_notes: Vec<ScheduledSamplerNote>,
     mixer_transforms_by_channel: Option<&'a HashMap<u16, MixerSourceRouteTransform>>,
     mixer_meter_transforms_by_channel:
         Option<&'a HashMap<u16, Vec<(usize, MixerSourceRouteTransform)>>>,
     pan_law: PanLaw,
     next_note: usize,
+    next_live_note: usize,
     voices: Vec<Option<SamplerVoice>>,
     release_frames: usize,
     output_sample_rate: u32,
@@ -4937,6 +5430,7 @@ struct SamplerVoiceEngine<'a> {
 struct SamplerVoice {
     source: Arc<DecodedAudio>,
     channel_id: u16,
+    playlist_track_id: Option<u32>,
     key: u16,
     input_midi_channel: Option<u8>,
     source_position: f64,
@@ -4987,10 +5481,12 @@ impl<'a> SamplerVoiceEngine<'a> {
         Self {
             sources_by_channel,
             notes,
+            live_notes: Vec::new(),
             mixer_transforms_by_channel: None,
             mixer_meter_transforms_by_channel: None,
             pan_law,
             next_note: 0,
+            next_live_note: 0,
             voices: std::iter::repeat_with(|| None).take(voice_limit).collect(),
             release_frames,
             output_sample_rate,
@@ -5024,6 +5520,15 @@ impl<'a> SamplerVoiceEngine<'a> {
             {
                 let note = self.notes[self.next_note];
                 self.next_note += 1;
+                let _ = self.start_voice(note);
+            }
+            while self
+                .live_notes
+                .get(self.next_live_note)
+                .is_some_and(|note| note.start_frame <= frame)
+            {
+                let note = self.live_notes[self.next_live_note];
+                self.next_live_note += 1;
                 let _ = self.start_voice(note);
             }
             let output_frame = &mut output[offset * 2..offset * 2 + 2];
@@ -5158,6 +5663,7 @@ impl<'a> SamplerVoiceEngine<'a> {
         self.voices[slot_index] = Some(SamplerVoice {
             source: Arc::clone(&source.audio),
             channel_id: note.channel_id,
+            playlist_track_id: note.playlist_track_id,
             key: note.key,
             input_midi_channel: None,
             source_position: if source.reverse {
@@ -5180,6 +5686,46 @@ impl<'a> SamplerVoiceEngine<'a> {
             release_remaining: None,
         });
         Some(slot_index)
+    }
+
+    fn queue_live_notes(&mut self, notes: impl IntoIterator<Item = ScheduledSamplerNote>) {
+        self.discard_consumed_live_notes();
+        self.live_notes.extend(notes);
+        self.live_notes.sort_by_key(|note| {
+            (
+                note.start_frame,
+                note.playlist_track_id,
+                note.channel_id,
+                note.key,
+                note.clip_index,
+            )
+        });
+    }
+
+    fn remove_queued_track_notes_from(&mut self, track_id: u32, start_frame: u64) {
+        self.discard_consumed_live_notes();
+        self.live_notes.retain(|note| {
+            note.playlist_track_id != Some(track_id) || note.start_frame < start_frame
+        });
+    }
+
+    fn release_track_at(&mut self, track_id: u32, start_frame: u64) {
+        for voice in self.voices.iter_mut().flatten() {
+            if voice.playlist_track_id == Some(track_id) {
+                voice.stop_frame = Some(
+                    voice
+                        .stop_frame
+                        .map_or(start_frame, |stop| stop.min(start_frame)),
+                );
+            }
+        }
+    }
+
+    fn discard_consumed_live_notes(&mut self) {
+        if self.next_live_note > 0 {
+            self.live_notes.drain(..self.next_live_note);
+            self.next_live_note = 0;
+        }
     }
 
     fn set_voice_input_midi_channel(&mut self, slot_index: usize, channel: u8) {
@@ -7252,6 +7798,10 @@ mod tests {
             },
             pan_law: PanLaw::Circular,
             notes: vec![ScheduledSamplerNote {
+                clip_index: 0,
+                playlist_track_id: None,
+                start_tick: 0,
+                stop_tick: None,
                 start_frame: 0,
                 stop_frame: None,
                 channel_id: 2,
@@ -7298,6 +7848,7 @@ mod tests {
             pattern_clips_rendered: 1,
             pattern_clips_skipped_unsupported_scale: 0,
             source_paths: std::collections::BTreeSet::new(),
+            unresolved_clip_indices: BTreeSet::new(),
         };
         let mut rendered = Vec::new();
 
@@ -7850,6 +8401,10 @@ mod tests {
             },
         )]);
         let notes = [ScheduledSamplerNote {
+            clip_index: 0,
+            playlist_track_id: None,
+            start_tick: 0,
+            stop_tick: None,
             start_frame: 1,
             stop_frame: Some(3),
             channel_id: 7,
@@ -7895,6 +8450,10 @@ mod tests {
         )]);
         let notes = [
             ScheduledSamplerNote {
+                clip_index: 0,
+                playlist_track_id: None,
+                start_tick: 0,
+                stop_tick: None,
                 start_frame: 0,
                 stop_frame: None,
                 channel_id: 7,
@@ -7904,6 +8463,10 @@ mod tests {
                 fine_pitch_offset_cents: 0,
             },
             ScheduledSamplerNote {
+                clip_index: 0,
+                playlist_track_id: None,
+                start_tick: 0,
+                stop_tick: None,
                 start_frame: 4,
                 stop_frame: None,
                 channel_id: 7,
@@ -7954,6 +8517,10 @@ mod tests {
             )),
         )]);
         let notes = [ScheduledSamplerNote {
+            clip_index: 0,
+            playlist_track_id: None,
+            start_tick: 0,
+            stop_tick: None,
             start_frame: 0,
             stop_frame: None,
             channel_id: 7,
@@ -7991,6 +8558,10 @@ mod tests {
             },
         )]);
         let notes = [ScheduledSamplerNote {
+            clip_index: 0,
+            playlist_track_id: None,
+            start_tick: 0,
+            stop_tick: None,
             start_frame: 0,
             stop_frame: None,
             channel_id: 7,
@@ -8025,6 +8596,10 @@ mod tests {
             },
         )]);
         let notes = [ScheduledSamplerNote {
+            clip_index: 0,
+            playlist_track_id: None,
+            start_tick: 0,
+            stop_tick: None,
             start_frame: 0,
             stop_frame: Some(100),
             channel_id: 7,
@@ -8065,6 +8640,10 @@ mod tests {
             },
         )]);
         let notes = [ScheduledSamplerNote {
+            clip_index: 0,
+            playlist_track_id: None,
+            start_tick: 0,
+            stop_tick: None,
             start_frame: 0,
             stop_frame: Some(100),
             channel_id: 7,
@@ -8106,6 +8685,10 @@ mod tests {
             },
         )]);
         let notes = [ScheduledSamplerNote {
+            clip_index: 0,
+            playlist_track_id: None,
+            start_tick: 0,
+            stop_tick: None,
             start_frame: 0,
             stop_frame: Some(100),
             channel_id: 2,
@@ -8142,6 +8725,10 @@ mod tests {
             },
         )]);
         let notes = [ScheduledSamplerNote {
+            clip_index: 0,
+            playlist_track_id: None,
+            start_tick: 0,
+            stop_tick: None,
             start_frame: 0,
             stop_frame: Some(100),
             channel_id: 2,
@@ -8206,6 +8793,10 @@ mod tests {
             },
         )]);
         let notes = [ScheduledSamplerNote {
+            clip_index: 0,
+            playlist_track_id: None,
+            start_tick: 0,
+            stop_tick: None,
             start_frame: 0,
             stop_frame: None,
             channel_id: 7,
@@ -8242,6 +8833,10 @@ mod tests {
             },
         )]);
         let notes = [ScheduledSamplerNote {
+            clip_index: 0,
+            playlist_track_id: None,
+            start_tick: 0,
+            stop_tick: None,
             start_frame: 2,
             stop_frame: None,
             channel_id: 3,
@@ -8301,6 +8896,10 @@ mod tests {
         ]);
         let notes = [
             ScheduledSamplerNote {
+                clip_index: 0,
+                playlist_track_id: None,
+                start_tick: 0,
+                stop_tick: None,
                 start_frame: 0,
                 stop_frame: Some(12),
                 channel_id: 1,
@@ -8310,6 +8909,10 @@ mod tests {
                 fine_pitch_offset_cents: 0,
             },
             ScheduledSamplerNote {
+                clip_index: 0,
+                playlist_track_id: None,
+                start_tick: 0,
+                stop_tick: None,
                 start_frame: 1,
                 stop_frame: Some(12),
                 channel_id: 2,

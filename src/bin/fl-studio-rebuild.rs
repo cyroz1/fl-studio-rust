@@ -29,16 +29,18 @@ use flp_rebuild::sample_render::SamplerLiveNoteEvent;
 use flp_rebuild::sample_render::{
     AudioClipRenderOptions, AudioClipRenderSummary, AudioFileRenderOptions, AudioRecordingSummary,
     AudioRenderEncodingOptions, AudioRenderOutput, MP3_BITRATES_KBPS, MixerStemRenderOptions,
-    PlaylistRenderOptions, PlaylistRenderRange, PlaylistRenderSummary, PlaylistStreamMonitor,
-    PlaylistTempoMap, ResamplingQuality, SamplerPatternRenderOptions, SamplerPatternRenderSummary,
-    WavChannelMode, WavDitherMode, WavSampleFormat, render_audio_clips_to_file,
+    PlaylistPerformanceLaunch, PlaylistPerformanceStream, PlaylistRenderOptions,
+    PlaylistRenderRange, PlaylistRenderSummary, PlaylistStreamMonitor, PlaylistTempoMap,
+    ResamplingQuality, SamplerPatternRenderOptions, SamplerPatternRenderSummary, WavChannelMode,
+    WavDitherMode, WavSampleFormat, playlist_performance_sampler_clip_indices,
+    playlist_performance_static_document, render_audio_clips_to_file,
     render_playlist_mixer_stems_with_vst3_cancellable,
     render_playlist_with_vst3_to_file_from_frame_cancellable,
     render_playlist_with_vst3_to_flac_cancellable, render_playlist_with_vst3_to_mp3_cancellable,
     render_playlist_with_vst3_to_ogg_cancellable, render_playlist_with_vst3_to_wav_cancellable,
-    render_sampler_pattern_to_file, stream_playlist_with_vst3_to_device_with_monitor,
-    stream_sampler_midi_input_to_device, stream_sampler_pattern_to_device,
-    write_input_recording_to_wav,
+    render_sampler_pattern_to_file, stream_playlist_performance_with_vst3_to_device,
+    stream_playlist_with_vst3_to_device_with_monitor, stream_sampler_midi_input_to_device,
+    stream_sampler_pattern_to_device, write_input_recording_to_wav,
 };
 use flp_rebuild::vst3::{
     MAX_REPORTED_TAIL_SECONDS, Vst3HostRuntime, Vst3PatternRenderOptions, Vst3PatternStreamHandle,
@@ -3157,6 +3159,8 @@ struct DawUi {
     history_navigation_during_frame: bool,
     history_snapshot_available_this_frame: bool,
     playing: bool,
+    performance_mode_active: bool,
+    performance_launch_sender: Option<Sender<PlaylistPerformanceLaunch>>,
     project_playback_loaded: bool,
     playlist_playback_loaded: bool,
     playlist_seek_tick: u32,
@@ -3848,6 +3852,8 @@ impl DawUi {
             history_navigation_during_frame: false,
             history_snapshot_available_this_frame: false,
             playing: false,
+            performance_mode_active: false,
+            performance_launch_sender: None,
             project_playback_loaded: false,
             playlist_playback_loaded: false,
             playlist_seek_tick: 0,
@@ -7230,6 +7236,10 @@ impl DawUi {
     }
 
     fn start_project_playback(&mut self) {
+        if self.performance_mode_active {
+            self.start_performance_mode_playback();
+            return;
+        }
         if self.pending_song_render.is_some() {
             self.status = "Stop the Playlist render before starting playback".to_owned();
             return;
@@ -7399,6 +7409,210 @@ impl DawUi {
         }
     }
 
+    fn start_performance_mode_playback(&mut self) {
+        if self.pending_song_render.is_some() {
+            self.status = "Stop the Playlist render before starting playback".to_owned();
+            return;
+        }
+        if self.pending_audio_render.is_some() {
+            self.status = "Project audio is already being prepared".to_owned();
+            return;
+        }
+        let Some(document) = self.document.as_ref() else {
+            self.status = "Open an FL Studio project before playing".to_owned();
+            return;
+        };
+        let Some(project_path) = self.sample_project_path() else {
+            self.status = "Save the project to a file before playing its audio clips".to_owned();
+            return;
+        };
+        let arrangement_id = self.selected_arrangement.unwrap_or(0);
+        let arrangement = match document
+            .arrangements()
+            .map_err(|error| error.to_string())
+            .and_then(|arrangements| {
+                arrangements
+                    .into_iter()
+                    .find(|arrangement| arrangement.id == arrangement_id)
+                    .ok_or_else(|| format!("arrangement {arrangement_id} was not found"))
+            }) {
+            Ok(arrangement) => arrangement,
+            Err(error) => {
+                self.status = format!("Could not find the selected arrangement: {error}");
+                return;
+            }
+        };
+        let Some(start_tick) = playlist_performance_zone_start_tick(&arrangement.time_markers)
+        else {
+            self.status = "Performance Mode needs a non-signature time marker named Start".into();
+            return;
+        };
+        let performance_clip_indices =
+            match playlist_performance_sampler_clip_indices(document, arrangement_id, start_tick) {
+                Ok(clip_indices) => clip_indices,
+                Err(error) => {
+                    self.status = format!("Could not prepare Performance Mode clips: {error}");
+                    return;
+                }
+            };
+        if performance_clip_indices.is_empty() {
+            self.status = "Add a supported Sampler Pattern Clip before the Start marker".into();
+            return;
+        }
+        if self.audio_engine.is_none() {
+            match AudioEngine::start(&self.audio_settings) {
+                Ok(engine) => self.audio_engine = Some(engine),
+                Err(error) => {
+                    self.status = format!("Could not start audio output: {error}");
+                    return;
+                }
+            }
+        }
+        let Some(engine) = self.audio_engine.as_ref() else {
+            self.status = "Audio output is not available".to_owned();
+            return;
+        };
+        if !engine.output_active() {
+            self.status = "Enable an output device in Audio settings before playing".to_owned();
+            return;
+        }
+        if self.audio_test_tone {
+            engine.set_test_tone(false);
+            self.audio_test_tone = false;
+        }
+        if self.audio_monitor_input {
+            let _ = engine.set_input_monitor(false);
+            self.audio_monitor_input = false;
+        }
+        let sample_rate = engine.sample_rate();
+        let options = PlaylistRenderOptions {
+            arrangement_id,
+            sample_rate,
+            resampling_quality: self.live_resampling_quality,
+            tail_seconds: 2,
+            soloed_playlist_track_range: self.soloed_playlist_track_range,
+            read_sample_root_note: self.read_sample_root_note,
+            ..PlaylistRenderOptions::default()
+        };
+        let playlist_tempo_map = match PlaylistTempoMap::for_arrangement(document, arrangement_id) {
+            Ok(tempo_map) => tempo_map,
+            Err(error) => {
+                self.status = format!("Could not prepare Playlist tempo map: {error}");
+                return;
+            }
+        };
+        let start_frame = match playlist_tempo_map.frame_at_tick(u64::from(start_tick), sample_rate)
+        {
+            Ok(frame) => frame,
+            Err(error) => {
+                self.status = format!("Could not map the Performance Mode Start marker: {error}");
+                return;
+            }
+        };
+        let project_bytes = match document.encode_lossless() {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.status = format!("Could not prepare project audio: {error}");
+                return;
+            }
+        };
+        let static_document =
+            match playlist_performance_static_document(document, arrangement_id, start_tick) {
+                Ok((static_document, _)) => static_document,
+                Err(error) => {
+                    self.status =
+                        format!("Could not prepare Performance Mode arrangement: {error}");
+                    return;
+                }
+            };
+        let vst3_processor = self
+            .vst3_host
+            .as_ref()
+            .map(|host| {
+                host.prepare_playlist_stream(
+                    &static_document,
+                    options,
+                    &self.channel_vst3_instances,
+                    true,
+                )
+            })
+            .transpose();
+        let vst3_processor = match vst3_processor {
+            Ok(processor) => processor,
+            Err(error) => {
+                self.status = format!("Could not prepare Playlist VST3 instruments: {error}");
+                return;
+            }
+        };
+        if let Some(session) = self.live_sampler_input.take() {
+            session.cancelled.store(true, Ordering::Release);
+            self.live_sampler_workers.push(session.worker);
+        }
+        self.midi_live_sampler_note_mapping.clear();
+        let writer = match engine.begin_live_streaming_playback_from_frame(start_frame) {
+            Ok(writer) => writer,
+            Err(error) => {
+                self.status = format!("Could not start Playlist audio output: {error}");
+                return;
+            }
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let worker_mixer_meters = Arc::clone(&self.mixer_track_peak_meters);
+        worker_mixer_meters.clear();
+        self.mixer_insert_peak_holds.fill(0.0);
+        let (launch_sender, launch_receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name("performance-audio-render".to_owned())
+            .spawn(move || {
+                let result = FlpDocument::parse(&project_bytes)
+                    .map_err(|error| error.to_string())
+                    .and_then(|document| {
+                        stream_playlist_performance_with_vst3_to_device(
+                            &document,
+                            &project_path,
+                            options,
+                            &writer,
+                            &worker_cancelled,
+                            vst3_processor,
+                            PlaylistPerformanceStream {
+                                performance_zone_end_tick: start_tick,
+                                start_frame,
+                                launches: launch_receiver,
+                                meters: Some(worker_mixer_meters),
+                            },
+                        )
+                    });
+                writer.finish();
+                let _ = sender.send(result);
+            });
+        match worker {
+            Ok(worker) => {
+                self.playing = true;
+                self.project_playback_loaded = true;
+                self.playlist_playback_loaded = true;
+                self.playlist_seek_tick = start_tick;
+                self.playlist_tempo_map = Some(playlist_tempo_map);
+                self.performance_launch_sender = Some(launch_sender);
+                self.pending_audio_render = Some(PendingAudioRender {
+                    receiver,
+                    cancelled,
+                    worker,
+                });
+                self.stop_midi_pattern_preview();
+                self.status = format!(
+                    "Preparing Performance Mode from Start at tick {start_tick}; launch Sampler Pattern Clips at the next bar"
+                );
+                self.start_midi_clock(false);
+            }
+            Err(error) => {
+                self.stop_project_playback();
+                self.status = format!("Could not start Performance Mode audio streaming: {error}");
+            }
+        }
+    }
+
     fn poll_project_audio_render(&mut self) {
         let completed = self.pending_audio_render.as_ref().and_then(|pending| {
             match pending.receiver.try_recv() {
@@ -7561,6 +7775,7 @@ impl DawUi {
     }
 
     fn stop_project_playback(&mut self) {
+        self.performance_launch_sender = None;
         self.stop_midi_playlist_playback();
         self.stop_midi_clock();
         self.stop_midi_pattern_preview();
@@ -12112,6 +12327,8 @@ impl DawUi {
                 ))
             })
             .collect::<Vec<_>>();
+        let performance_zone_end_tick =
+            playlist_performance_zone_start_tick(&arrangement.time_markers);
 
         let waveform_paths = arrangement
             .clips
@@ -12151,6 +12368,7 @@ impl DawUi {
         let mut join_pattern_clip_requested = None;
         let mut join_selected_pattern_clips_requested = None;
         let mut merge_pattern_clips_requested = None;
+        let mut performance_clip_launch_requested = None;
         let mut seek_tick_requested = None;
         let mut dropped_playlist_audio = None;
         let mut playlist_clip_vertical_move = None;
@@ -12189,6 +12407,25 @@ impl DawUi {
             ui.label(format!("{} clips", arrangement.clips.len()));
             ui.separator();
             ui.label(format!("{} PPQ", ppq));
+            ui.separator();
+            let performance_mode_button = ui
+                .add_enabled(
+                    !self.project_playback_loaded,
+                    egui::Button::new("Performance Mode").selected(self.performance_mode_active),
+                )
+                .on_hover_text(if performance_zone_end_tick.is_some() {
+                    "Start playback from the non-signature marker named Start; launch supported Sampler Pattern Clips at the next bar."
+                } else {
+                    "Add a non-signature time marker named Start to define the Performance Zone."
+                });
+            if performance_mode_button.clicked() {
+                self.performance_mode_active = !self.performance_mode_active;
+                self.status = if self.performance_mode_active {
+                    "Performance Mode enabled; playback will start at the Start marker".to_owned()
+                } else {
+                    "Performance Mode disabled".to_owned()
+                };
+            }
             ui.separator();
             ui.label("Waveform");
             egui::ComboBox::from_id_salt("playlist-waveform-mode")
@@ -13919,6 +14156,42 @@ impl DawUi {
                                     let selected_pattern_context_indices = self
                                         .selected_playlist_pattern_clip_indices(arrangement.id)
                                         .filter(|indices| indices.contains(&clip_index));
+                    let performance_clip_supported = performance_zone_end_tick.is_some_and(
+                        |zone_end_tick| {
+                            self.document
+                                .as_ref()
+                                .and_then(|document| {
+                                    playlist_performance_sampler_clip_indices(
+                                        document,
+                                        arrangement.id,
+                                        zone_end_tick,
+                                    )
+                                    .ok()
+                                })
+                                .is_some_and(|indices| indices.contains(&clip_index))
+                        },
+                    );
+                    let can_launch_performance_clip = self.performance_mode_active
+                        && self.playing
+                        && self.performance_launch_sender.is_some()
+                        && performance_clip_supported;
+                    let launch_button = ui.add_enabled(
+                        can_launch_performance_clip,
+                        egui::Button::new("Launch at next bar"),
+                    );
+                    if launch_button
+                        .on_disabled_hover_text(if !self.performance_mode_active {
+                            "Enable Performance Mode and start playback from the Start marker first."
+                        } else if !self.playing || self.performance_launch_sender.is_none() {
+                            "Start Performance Mode playback before launching a clip."
+                        } else {
+                            "Requires this enabled Playlist track to contain only supported, unmuted Pattern Clips before Start, using enabled Sampler channels, default scale, and no Pattern controllers."
+                        })
+                        .clicked()
+                    {
+                        performance_clip_launch_requested = Some(clip_index);
+                        ui.close();
+                    }
                                     let can_consolidate_pattern_clip = !clip.is_muted()
                                         && clip.track_index.is_some()
                                         && self.sample_project_path().is_some()
@@ -14707,6 +14980,53 @@ impl DawUi {
             self.status = format!("Song position set to tick {tick}");
             if restart_playback {
                 self.start_project_playback();
+            }
+        }
+
+        if let Some(clip_index) = performance_clip_launch_requested {
+            let launch_position = self
+                .audio_engine
+                .as_ref()
+                .zip(self.playlist_tempo_map.as_ref())
+                .and_then(|(engine, tempo_map)| {
+                    let sample_rate = engine.sample_rate();
+                    let safe_device_frame = engine
+                        .project_playback_position_frames()
+                        .saturating_add(u64::from(sample_rate) / 8);
+                    let tick = tempo_map.tick_at_frame(safe_device_frame, sample_rate)?;
+                    let target_tick = playlist_next_bar_tick(
+                        tick,
+                        ppq,
+                        project_time_signature,
+                        &signature_changes,
+                    )?;
+                    let target_frame = tempo_map
+                        .frame_at_tick(u64::from(target_tick), sample_rate)
+                        .ok()?;
+                    Some((target_tick, target_frame))
+                });
+            match (launch_position, self.performance_launch_sender.as_ref()) {
+                (Some((start_tick, start_frame)), Some(sender)) => {
+                    match sender.send(PlaylistPerformanceLaunch {
+                        clip_index,
+                        start_tick: u64::from(start_tick),
+                        start_frame,
+                    }) {
+                        Ok(()) => {
+                            self.status = format!(
+                                "Queued Pattern Clip {} for the next bar at tick {start_tick}",
+                                clip_index + 1
+                            );
+                        }
+                        Err(_) => {
+                            self.status =
+                                "Performance Mode audio worker is no longer available".into();
+                        }
+                    }
+                }
+                _ => {
+                    self.status = "Could not map the next Performance Mode bar boundary".into();
+                }
             }
         }
 
@@ -40344,6 +40664,43 @@ fn playlist_audio_drop_position_ticks(
         1
     };
     snap_note_tick(relative_tick, snap_ticks, 0)
+}
+
+fn playlist_performance_zone_start_tick(markers: &[TimeMarker]) -> Option<u32> {
+    markers
+        .iter()
+        .filter(|marker| {
+            !marker.is_signature()
+                && marker
+                    .name()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("Start"))
+        })
+        .map(TimeMarker::position_ticks)
+        .min()
+}
+
+fn playlist_next_bar_tick(
+    tick: f64,
+    ppq: u16,
+    initial_time_signature: Option<(u8, u8)>,
+    signature_changes: &[(u32, u8, u8)],
+) -> Option<u32> {
+    if !tick.is_finite() || tick < 0.0 || tick > f64::from(u32::MAX) {
+        return None;
+    }
+    let current_tick = tick.floor() as u32;
+    let (bar_start, _) =
+        playlist_measure_at_tick(ppq, initial_time_signature, signature_changes, current_tick);
+    let signature =
+        playlist_signature_at_tick(initial_time_signature, signature_changes, current_tick);
+    let next_bar = u64::from(bar_start).saturating_add(playlist_bar_ticks(ppq, signature));
+    let next_signature_marker = signature_changes
+        .iter()
+        .map(|(position, _, _)| *position)
+        .filter(|position| *position > current_tick && u64::from(*position) <= next_bar)
+        .min()
+        .map(u64::from);
+    u32::try_from(next_signature_marker.unwrap_or(next_bar)).ok()
 }
 
 fn playlist_measure_at_tick(
