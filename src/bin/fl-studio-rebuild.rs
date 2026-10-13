@@ -2411,11 +2411,18 @@ struct PianoRollSliceDrag {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct PianoRollDrawLengthDrag {
+struct PianoRollDrawDrag {
     pattern_id: u16,
     channel_id: u16,
     start: egui::Pos2,
     current: egui::Pos2,
+    kind: PianoRollDrawDragKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PianoRollDrawDragKind {
+    Move,
+    Length,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2969,7 +2976,7 @@ struct DawUi {
     piano_roll_select_mode: bool,
     piano_roll_slice_mode: bool,
     piano_roll_slice_drag: Option<PianoRollSliceDrag>,
-    piano_roll_draw_length_drag: Option<PianoRollDrawLengthDrag>,
+    piano_roll_draw_drag: Option<PianoRollDrawDrag>,
     piano_roll_delete_mode: bool,
     piano_roll_mute_mode: bool,
     last_piano_roll_mute_note: Option<(u16, u16, usize)>,
@@ -3605,7 +3612,7 @@ impl DawUi {
             piano_roll_select_mode: false,
             piano_roll_slice_mode: false,
             piano_roll_slice_drag: None,
-            piano_roll_draw_length_drag: None,
+            piano_roll_draw_drag: None,
             piano_roll_delete_mode: false,
             piano_roll_mute_mode: false,
             last_piano_roll_mute_note: None,
@@ -19238,7 +19245,7 @@ impl DawUi {
                         && !self.piano_roll_stamp_mode,
                     "Draw",
                 )
-                .on_hover_text("Click to add notes; Shift-drag to set note length (P)")
+                .on_hover_text("Click to add; drag to reposition; Shift-drag to set length (P)")
                 .clicked()
             {
                 self.piano_roll_paint_mode = false;
@@ -23645,10 +23652,10 @@ impl DawUi {
             self.piano_roll_slice_drag = None;
         }
         if self
-            .piano_roll_draw_length_drag
+            .piano_roll_draw_drag
             .is_some_and(|drag| drag.pattern_id != pattern.id)
         {
-            self.piano_roll_draw_length_drag = None;
+            self.piano_roll_draw_drag = None;
         }
         let touch_gesture = ui.input(|input| input.multi_touch());
         let any_touches = ui.input(|input| input.any_touches());
@@ -23677,7 +23684,7 @@ impl DawUi {
             self.piano_roll_controller_stroke = None;
             self.piano_roll_zoom_drag = None;
             self.piano_roll_slice_drag = None;
-            self.piano_roll_draw_length_drag = None;
+            self.piano_roll_draw_drag = None;
             if let Some((zoom, offset)) = touch_pan_zoom_scroll_offset(
                 viewport,
                 self.piano_roll_grid_scroll_offset,
@@ -24617,7 +24624,7 @@ impl DawUi {
                 && !scroll_modifiers.command
                 && !suppress_piano_roll_touch_edits;
             if !draw_mode_active {
-                self.piano_roll_draw_length_drag = None;
+                self.piano_roll_draw_drag = None;
             }
             let slice_response = ui.interact(
                 grid_body_rect,
@@ -24713,9 +24720,8 @@ impl DawUi {
                     self.piano_roll_slice_drag = Some(drag);
                 }
             }
-            let mut draw_length_note_added = false;
+            let mut draw_note_added = false;
             if draw_mode_active
-                && scroll_modifiers.shift
                 && grid_response.drag_started_by(PointerButton::Primary)
                 && let Some(origin) = ui
                     .input(|input| input.pointer.press_origin())
@@ -24724,15 +24730,20 @@ impl DawUi {
                 && !note_rects.iter().any(|note_rect| note_rect.contains(origin))
                 && let Some(channel_id) = self.selected_note_channel
             {
-                self.piano_roll_draw_length_drag = Some(PianoRollDrawLengthDrag {
+                self.piano_roll_draw_drag = Some(PianoRollDrawDrag {
                     pattern_id: pattern.id,
                     channel_id,
                     start: origin,
                     current: origin,
+                    kind: if scroll_modifiers.shift {
+                        PianoRollDrawDragKind::Length
+                    } else {
+                        PianoRollDrawDragKind::Move
+                    },
                 });
             }
             if let Some(mut drag) = self
-                .piano_roll_draw_length_drag
+                .piano_roll_draw_drag
                 .filter(|drag| drag.pattern_id == pattern.id)
             {
                 if let Some(pointer) = ui.input(|input| input.pointer.interact_pos()) {
@@ -24746,15 +24757,47 @@ impl DawUi {
                     grid_geometry,
                     drag.channel_id,
                 ) {
-                    let end_tick = piano_roll_time_tick_at_x(
-                        drag.current.x,
-                        grid_rect.left() + keyboard_width,
-                        tick_scale,
-                        snap_ticks,
-                    );
-                    note.length = end_tick
-                        .saturating_sub(note.position)
-                        .max(snap_ticks.max(1));
+                    match drag.kind {
+                        PianoRollDrawDragKind::Length => {
+                            let end_tick = piano_roll_time_tick_at_x(
+                                drag.current.x,
+                                grid_rect.left() + keyboard_width,
+                                tick_scale,
+                                snap_ticks,
+                            );
+                            note.length = end_tick
+                                .saturating_sub(note.position)
+                                .max(snap_ticks.max(1));
+                        }
+                        PianoRollDrawDragKind::Move => {
+                            let tick_delta =
+                                ((drag.current.x - drag.start.x) / tick_scale).round() as i64;
+                            note.position = snap_note_tick(
+                                i64::from(note.position).saturating_add(tick_delta),
+                                snap_ticks,
+                                0,
+                            );
+                            let semitones =
+                                ((drag.start.y - drag.current.y) / key_height).round() as i32;
+                            let moved_key = i32::from(note.key)
+                                .saturating_add(semitones)
+                                .clamp(i32::from(key_low), i32::from(key_high))
+                                as u16;
+                            note.key = if self.piano_roll_snap_notes_to_scale {
+                                scale_highlight.map_or(moved_key, |scale| {
+                                    snap_piano_roll_key_to_scale(
+                                        moved_key,
+                                        scale.scale,
+                                        scale.root,
+                                        key_low,
+                                        key_high,
+                                    )
+                                })
+                            } else {
+                                moved_key
+                            };
+                        }
+                    }
                     let row = key_high.saturating_sub(note.key);
                     let note_rect = egui::Rect::from_min_size(
                         egui::pos2(
@@ -24780,13 +24823,13 @@ impl DawUi {
                     );
                     if grid_response.drag_stopped_by(PointerButton::Primary) {
                         notes_to_add.push(note);
-                        draw_length_note_added = true;
-                        self.piano_roll_draw_length_drag = None;
+                        draw_note_added = true;
+                        self.piano_roll_draw_drag = None;
                     } else {
-                        self.piano_roll_draw_length_drag = Some(drag);
+                        self.piano_roll_draw_drag = Some(drag);
                     }
                 } else {
-                    self.piano_roll_draw_length_drag = None;
+                    self.piano_roll_draw_drag = None;
                 }
             }
             if ruler_response.drag_started_by(PointerButton::Primary)
@@ -25140,7 +25183,7 @@ impl DawUi {
                 && !self.piano_roll_delete_mode
                 && !self.piano_roll_mute_mode
                 && !modifiers.command
-                && !draw_length_note_added
+                && !draw_note_added
                 && grid_response.clicked_by(PointerButton::Primary)
                 && let (Some(pointer), Some(channel_id)) = (
                     grid_response.interact_pointer_pos(),
@@ -25186,7 +25229,7 @@ impl DawUi {
             self.piano_roll_selection_drag = None;
             self.piano_roll_pitch_selection_drag = None;
             self.piano_roll_zoom_drag = None;
-            self.piano_roll_draw_length_drag = None;
+            self.piano_roll_draw_drag = None;
         }
         if !notes_to_add.is_empty() {
             for note in &mut notes_to_add {
