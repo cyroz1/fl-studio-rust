@@ -2391,6 +2391,7 @@ struct ActivePlaylistClipDrag {
 struct PlaylistClipDragTarget {
     clip_index: usize,
     start_position_ticks: u32,
+    start_length_ticks: u32,
     start_track_index: u16,
 }
 
@@ -13391,7 +13392,22 @@ impl DawUi {
                                 let resize = resize_requested && can_resize_edge;
                                 let slip_requested =
                                     self.playlist_slip_tool_active && is_audio_clip && !resize;
-                                let preserve_selected_group = !resize
+                                let preserve_selected_group_resize = resize
+                                    && resize_edge_requested
+                                        == Some(PlaylistClipResizeEdge::Right)
+                                    && !can_resize_audio_ticks
+                                    && self.selected_arrangement == Some(arrangement.id)
+                                    && self.selected_playlist_clips.len() > 1
+                                    && self.selected_playlist_clips.iter().all(
+                                        |selected_index| {
+                                            arrangement
+                                                .clips
+                                                .get(*selected_index)
+                                                .is_some_and(PlaylistClip::can_resize_timeline_length)
+                                        },
+                                    );
+                                let preserve_selected_group = (!resize
+                                    || preserve_selected_group_resize)
                                     && !slip_requested
                                     && self.selected_arrangement == Some(arrangement.id)
                                     && self.selected_playlist_clips.contains(&clip_index)
@@ -13413,6 +13429,7 @@ impl DawUi {
                                             Some(PlaylistClipDragTarget {
                                                 clip_index: *target_index,
                                                 start_position_ticks: target_clip.position_ticks,
+                                                start_length_ticks: target_clip.length_ticks,
                                                 start_track_index: target_clip.track_index?,
                                             })
                                         })
@@ -13421,6 +13438,7 @@ impl DawUi {
                                     Some(vec![PlaylistClipDragTarget {
                                         clip_index,
                                         start_position_ticks: clip.position_ticks,
+                                        start_length_ticks: clip.length_ticks,
                                         start_track_index: clip.track_index.unwrap_or(row),
                                     }])
                                 };
@@ -13508,6 +13526,21 @@ impl DawUi {
                                     && group_targets.len() > 1
                                 {
                                     playlist_clip_group_drag_edits(
+                                        drag,
+                                        &group_targets,
+                                        PlaylistClipDragContext {
+                                            pointer,
+                                            tick_scale,
+                                            row_height,
+                                            ppq,
+                                            snap,
+                                            max_track_index: last_track.min(499),
+                                        },
+                                    )
+                                } else if drag.kind == PlaylistClipDragKind::Resize
+                                    && group_targets.len() > 1
+                                {
+                                    playlist_clip_group_resize_edits(
                                         drag,
                                         &group_targets,
                                         PlaylistClipDragContext {
@@ -13609,8 +13642,17 @@ impl DawUi {
                                             }
                                             Ok(())
                                         }
-                                        PlaylistClipDragKind::Resize
-                                        | PlaylistClipDragKind::ResizeAudioTicks { .. } => {
+                                        PlaylistClipDragKind::Resize => {
+                                            for (edited_index, edit) in &edits {
+                                                document.edit_playlist_clip(
+                                                    arrangement.id,
+                                                    *edited_index,
+                                                    edit.clone(),
+                                                )?;
+                                            }
+                                            Ok(())
+                                        }
+                                        PlaylistClipDragKind::ResizeAudioTicks { .. } => {
                                             document.edit_playlist_clip(
                                                 arrangement.id,
                                                 clip_index,
@@ -13636,7 +13678,14 @@ impl DawUi {
                                                 }
                                                 PlaylistClipDragKind::Resize
                                                 | PlaylistClipDragKind::ResizeAudioTicks { .. } => {
-                                                    format!("Resized Playlist clip {}", clip_index + 1)
+                                                    if edits.len() > 1 {
+                                                        format!(
+                                                            "Resized {} Playlist clips",
+                                                            edits.len()
+                                                        )
+                                                    } else {
+                                                        format!("Resized Playlist clip {}", clip_index + 1)
+                                                    }
                                                 }
                                                 PlaylistClipDragKind::Slip
                                                 | PlaylistClipDragKind::SlipTicks { .. } => {
@@ -36366,6 +36415,54 @@ fn playlist_clip_group_drag_edits(
                 PlaylistClipEdit {
                     position_ticks: Some(position_ticks),
                     raw_track_index: Some(499 - track_index),
+                    ..PlaylistClipEdit::default()
+                },
+            )
+        })
+        .collect()
+}
+
+fn playlist_clip_group_resize_edits(
+    drag: ActivePlaylistClipDrag,
+    targets: &[PlaylistClipDragTarget],
+    context: PlaylistClipDragContext,
+) -> Vec<(usize, PlaylistClipEdit)> {
+    if targets.is_empty() {
+        return Vec::new();
+    }
+
+    let anchor_edit = playlist_clip_drag_edit(
+        drag,
+        context.pointer,
+        context.tick_scale,
+        context.row_height,
+        context.ppq,
+        context.snap,
+        context.max_track_index,
+    );
+    let anchor_length = anchor_edit.length_ticks.unwrap_or(drag.start_length_ticks);
+    let requested_delta = i64::from(anchor_length) - i64::from(drag.start_length_ticks);
+    let minimum_length = targets
+        .iter()
+        .map(|target| target.start_length_ticks)
+        .min()
+        .unwrap_or(drag.start_length_ticks);
+    let maximum_length = targets
+        .iter()
+        .map(|target| target.start_length_ticks)
+        .max()
+        .unwrap_or(drag.start_length_ticks);
+    let minimum_delta = 1 - i64::from(minimum_length);
+    let maximum_delta = i64::from(u32::MAX) - i64::from(maximum_length);
+    let delta = requested_delta.clamp(minimum_delta, maximum_delta);
+
+    targets
+        .iter()
+        .map(|target| {
+            (
+                target.clip_index,
+                PlaylistClipEdit {
+                    length_ticks: Some((i64::from(target.start_length_ticks) + delta) as u32),
                     ..PlaylistClipEdit::default()
                 },
             )
