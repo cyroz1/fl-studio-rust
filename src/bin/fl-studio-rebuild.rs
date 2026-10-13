@@ -2183,12 +2183,15 @@ enum PianoRollChordStamp {
     Dominant13,
     ScaleTriad,
     ScaleSeventh,
+    ScaleNinth,
+    ScaleEleventh,
+    ScaleThirteenth,
     TopDownTriad,
     TopDownSeventh,
 }
 
 impl PianoRollChordStamp {
-    const ALL: [Self; 31] = [
+    const ALL: [Self; 34] = [
         Self::Major,
         Self::Minor,
         Self::Diminished,
@@ -2218,6 +2221,9 @@ impl PianoRollChordStamp {
         Self::Dominant13,
         Self::ScaleTriad,
         Self::ScaleSeventh,
+        Self::ScaleNinth,
+        Self::ScaleEleventh,
+        Self::ScaleThirteenth,
         Self::TopDownTriad,
         Self::TopDownSeventh,
     ];
@@ -2253,6 +2259,9 @@ impl PianoRollChordStamp {
             Self::Dominant13 => "Dominant 13",
             Self::ScaleTriad => "Scale triad",
             Self::ScaleSeventh => "Scale seventh",
+            Self::ScaleNinth => "Scale ninth",
+            Self::ScaleEleventh => "Scale eleventh",
+            Self::ScaleThirteenth => "Scale thirteenth",
             Self::TopDownTriad => "Top-down triad",
             Self::TopDownSeventh => "Top-down seventh",
         }
@@ -2290,7 +2299,11 @@ impl PianoRollChordStamp {
             Self::Dominant11 => &[0, 4, 7, 10, 14, 17],
             Self::Minor11 => &[0, 3, 7, 10, 14, 17],
             Self::Dominant13 => &[0, 4, 7, 10, 14, 17, 21],
-            Self::ScaleTriad | Self::ScaleSeventh => &[],
+            Self::ScaleTriad
+            | Self::ScaleSeventh
+            | Self::ScaleNinth
+            | Self::ScaleEleventh
+            | Self::ScaleThirteenth => &[],
             Self::TopDownTriad | Self::TopDownSeventh => unreachable!(),
         };
         if !intervals.is_empty() {
@@ -2301,14 +2314,22 @@ impl PianoRollChordStamp {
                 .collect();
         }
 
-        let scale_intervals = scale.intervals();
-        if scale_intervals.is_empty() {
-            return [0, 4, 7]
-                .into_iter()
-                .filter_map(|interval| root_key.checked_add(interval))
+        if scale == PianoRollScale::None {
+            let intervals: &[u16] = match self {
+                Self::ScaleTriad => &[0, 4, 7],
+                Self::ScaleSeventh => &[0, 4, 7, 11],
+                Self::ScaleNinth => &[0, 4, 7, 11, 14],
+                Self::ScaleEleventh => &[0, 4, 7, 11, 14, 17],
+                Self::ScaleThirteenth => &[0, 4, 7, 11, 14, 17, 21],
+                _ => unreachable!("manual chord stamps return before scale-degree selection"),
+            };
+            return intervals
+                .iter()
+                .filter_map(|interval| root_key.checked_add(*interval))
                 .filter(|key| *key <= 127)
                 .collect();
         }
+        let scale_intervals = scale.intervals();
 
         let snapped_root = (0..=127u16)
             .filter(|key| scale.contains(*key, scale_root))
@@ -2320,10 +2341,13 @@ impl PianoRollChordStamp {
                 (u16::from(scale_root) + u16::from(*interval)) % 12 == snapped_root % 12
             })
             .unwrap_or(0);
-        let degrees: &[usize] = if self == Self::ScaleSeventh {
-            &[0, 2, 4, 6]
-        } else {
-            &[0, 2, 4]
+        let degrees: &[usize] = match self {
+            Self::ScaleTriad => &[0, 2, 4],
+            Self::ScaleSeventh => &[0, 2, 4, 6],
+            Self::ScaleNinth => &[0, 2, 4, 6, 8],
+            Self::ScaleEleventh => &[0, 2, 4, 6, 8, 10],
+            Self::ScaleThirteenth => &[0, 2, 4, 6, 8, 10, 12],
+            _ => unreachable!("manual chord stamps return before scale-degree selection"),
         };
         let scale_anchor = i32::from(snapped_root) - i32::from(scale_intervals[scale_degree]);
         let scale_len = scale_intervals.len();
@@ -21894,8 +21918,8 @@ impl DawUi {
                         for (heading, stamps) in [
                             ("Basic", &all_stamps[..10]),
                             ("Advanced", &all_stamps[10..27]),
-                            ("Scale-derived", &all_stamps[27..29]),
-                            ("Top-down", &all_stamps[29..]),
+                            ("Scale-derived", &all_stamps[27..32]),
+                            ("Top-down", &all_stamps[32..]),
                         ] {
                             ui.weak(heading);
                             for &stamp in stamps {
