@@ -31,7 +31,7 @@ use crate::vst3::Vst3PlaylistStreamProcessor;
 use crate::{
     Arrangement, ChannelNoteRouter, ChannelSummary, FlpDocument, MixerInsertSignalTransform,
     MixerRouteAudibility, MixerSourceRoutePlan, MixerSourceRouteTransform, Pattern, PatternNote,
-    PlaylistClip, PlaylistClipTarget, PlaylistTrackSync,
+    PlaylistClip, PlaylistClipTarget, PlaylistTrackPress, PlaylistTrackSync,
 };
 
 const DEFAULT_SAMPLE_RATE: u32 = 44_100;
@@ -5108,6 +5108,7 @@ struct PlaylistPerformanceRuntime {
     launches: Receiver<PlaylistPerformanceCommand>,
     pending_commands: Vec<PlaylistPerformanceCommand>,
     queued_by_track: BTreeMap<u32, VecDeque<PlaylistPerformanceLaunch>>,
+    press_by_track: HashMap<u32, Option<PlaylistTrackPress>>,
     position_sync_by_track: HashMap<u32, Option<PlaylistTrackSync>>,
     ppq: u16,
     initial_time_signature: Option<(u8, u8)>,
@@ -5250,8 +5251,9 @@ impl PlaylistPerformanceRuntime {
                 },
             );
         }
-        let position_sync_by_track = document
-            .playlist_tracks_in_arrangement(options.arrangement_id)
+        let tracks = document.playlist_tracks_in_arrangement(options.arrangement_id);
+        let press_by_track = tracks.iter().map(|track| (track.id, track.press)).collect();
+        let position_sync_by_track = tracks
             .into_iter()
             .map(|track| (track.id, track.position_sync))
             .collect();
@@ -5275,6 +5277,7 @@ impl PlaylistPerformanceRuntime {
             launches,
             pending_commands: Vec::new(),
             queued_by_track: BTreeMap::new(),
+            press_by_track,
             position_sync_by_track,
             ppq: document.header().ppq(),
             initial_time_signature: document.metadata().time_signature(),
@@ -5285,6 +5288,17 @@ impl PlaylistPerformanceRuntime {
             active_audio_by_track: BTreeMap::new(),
             active_audio_playbacks: Vec::new(),
         })
+    }
+
+    fn active_clip_index_on_track(&self, track_id: u32) -> Option<usize> {
+        self.active_by_track
+            .get(&track_id)
+            .map(|active| active.clip_index)
+            .or_else(|| {
+                self.active_audio_by_track
+                    .get(&track_id)
+                    .map(|active| active.clip_index)
+            })
     }
 
     fn update(
@@ -5315,14 +5329,28 @@ impl PlaylistPerformanceRuntime {
                     self.validate_launch(launch)?;
                     let track_id = self.performance_clip_track_id(launch.clip_index)?;
                     self.queued_by_track.remove(&track_id);
-                    self.activate_launch(launch, sampler_engine)?;
+                    if performance_latch_should_stop(
+                        self.press_by_track.get(&track_id).copied().flatten(),
+                        self.active_clip_index_on_track(track_id),
+                        launch.clip_index,
+                    ) {
+                        self.stop_track_at(track_id, launch.start_frame, sampler_engine);
+                    } else {
+                        self.activate_launch(launch, sampler_engine)?;
+                    }
                 }
                 PlaylistPerformanceCommand::Enqueue(launch) => {
                     self.validate_launch(launch)?;
                     let track_id = self.performance_clip_track_id(launch.clip_index)?;
-                    if self.active_by_track.contains_key(&track_id)
-                        || self.active_audio_by_track.contains_key(&track_id)
-                    {
+                    let active_clip_index = self.active_clip_index_on_track(track_id);
+                    if performance_latch_should_stop(
+                        self.press_by_track.get(&track_id).copied().flatten(),
+                        active_clip_index,
+                        launch.clip_index,
+                    ) {
+                        self.queued_by_track.remove(&track_id);
+                        self.stop_track_at(track_id, launch.start_frame, sampler_engine);
+                    } else if active_clip_index.is_some() {
                         self.queued_by_track
                             .entry(track_id)
                             .or_default()
@@ -5727,6 +5755,14 @@ fn performance_next_loop_boundary(
     first_end_tick
         .checked_add(loops.saturating_mul(period_ticks))
         .ok_or_else(|| "Performance Mode loop tick overflow".to_owned())
+}
+
+fn performance_latch_should_stop(
+    press: Option<PlaylistTrackPress>,
+    active_clip_index: Option<usize>,
+    requested_clip_index: usize,
+) -> bool {
+    press == Some(PlaylistTrackPress::Latch) && active_clip_index == Some(requested_clip_index)
 }
 
 fn performance_position_offset_ticks(
@@ -7831,6 +7867,30 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64};
 
     static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn latched_performance_clip_stops_on_retrigger_only() {
+        assert!(performance_latch_should_stop(
+            Some(PlaylistTrackPress::Latch),
+            Some(4),
+            4
+        ));
+        assert!(!performance_latch_should_stop(
+            Some(PlaylistTrackPress::Latch),
+            Some(5),
+            4
+        ));
+        assert!(!performance_latch_should_stop(
+            Some(PlaylistTrackPress::Latch),
+            None,
+            4
+        ));
+        assert!(!performance_latch_should_stop(
+            Some(PlaylistTrackPress::Retrigger),
+            Some(4),
+            4
+        ));
+    }
 
     #[test]
     fn mixer_master_mute_silences_the_playlist_mix() {

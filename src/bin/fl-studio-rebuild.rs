@@ -13475,7 +13475,7 @@ impl DawUi {
                                 let mut requested_press = None;
                                 ui.horizontal(|ui| {
                                     ui.label("Press").on_hover_text(
-                                        "Saved per-track press mode. Hold and Latch playback behavior is not implemented yet.",
+                                        "Saved per-track press mode. Latch stops the same active clip on a repeated trigger; Hold behavior is not implemented yet.",
                                     );
                                     egui::ComboBox::from_id_salt((
                                         "playlist-track-press",
