@@ -6016,15 +6016,16 @@ impl FlpDocument {
                 "this Playlist record version keeps clip flags, source offsets, and scale in opaque fields",
             ));
         }
+        let mut edits_audio_clip_window = false;
         if let Some((start_tick, end_tick)) = edit.source_window_ticks {
             if record_size != 88 {
                 return Err(FlpError::UnsupportedEdit(
                     "source-window tick editing is only available for 88-byte Playlist records",
                 ));
             }
-            if edit.length_ticks.is_some() || edit.item_index.is_some() {
+            if edit.item_index.is_some() {
                 return Err(FlpError::UnsupportedEdit(
-                    "edit the Audio Clip source window separately from its length or target",
+                    "edit the Audio Clip source window separately from its target",
                 ));
             }
             let is_audio_clip = match clip.target() {
@@ -6043,6 +6044,15 @@ impl FlpDocument {
                     "source-window tick editing applies to 88-byte Audio Clips",
                 ));
             }
+            if edit
+                .length_ticks
+                .is_some_and(|length| end_tick.checked_sub(start_tick) != Some(length))
+            {
+                return Err(FlpError::UnsupportedEdit(
+                    "an Audio Clip's source tick span must match its edited timeline length",
+                ));
+            }
+            edits_audio_clip_window = true;
             debug_assert!(start_tick < end_tick);
         }
         if edit.scale.is_some() && !matches!(record_size, 60 | 80) {
@@ -6059,7 +6069,7 @@ impl FlpDocument {
             writes.push((record_start + 6, value.to_le_bytes().to_vec()));
         }
         if let Some(value) = edit.length_ticks {
-            if !clip.can_resize_timeline_length()
+            if (!clip.can_resize_timeline_length() && !edits_audio_clip_window)
                 || edit
                     .item_index
                     .is_some_and(|item_index| item_index < clip.pattern_base)
@@ -6069,7 +6079,7 @@ impl FlpDocument {
                 ));
             }
             writes.push((record_start + 8, value.to_le_bytes().to_vec()));
-            if record_size == 88 {
+            if record_size == 88 && edit.source_window_ticks.is_none() {
                 writes.push((record_start + 28, value.to_le_bytes().to_vec()));
             }
         }

@@ -2352,6 +2352,10 @@ struct ActiveNoteDrag {
 enum PlaylistClipDragKind {
     Move,
     Resize,
+    ResizeAudioTicks {
+        source_start_tick: u32,
+        sample_length_ticks: u32,
+    },
     Slip,
     SlipTicks {
         source_start_tick: u32,
@@ -13015,6 +13019,16 @@ impl DawUi {
                                 && source_window_supported
                                 && scale_supported
                                 && !tempo_automation_overlaps;
+                            let can_resize_audio_ticks = is_audio_clip
+                                && clip.has_opaque_record_tail()
+                                && modern_window_matches_timeline
+                                && modern_window_within_sample
+                                && sample_length_ticks.is_some()
+                                && scale_supported
+                                && !tempo_automation_overlaps_clip
+                                && tempo_supported;
+                            let can_resize_clip =
+                                clip.can_resize_timeline_length() || can_resize_audio_ticks;
                             let can_split_pattern_clip = context_split_position.is_some_and(
                                 |split_position| {
                                     playlist_pattern_clip_split_supported(
@@ -13028,7 +13042,7 @@ impl DawUi {
                             );
                             let drag_hint = if self.playlist_mute_tool_active {
                                 "Mute tool selected: click to mute or unmute this clip. Press T or select Mute to return to move mode."
-                            } else if !clip.can_resize_timeline_length() {
+                            } else if !can_resize_clip {
                                 "Drag to move. Resizing and source-window editing are unavailable for this FL Studio clip format."
                             } else if self.playlist_slip_tool_active && is_audio_clip {
                                 if can_slip_clip {
@@ -13036,6 +13050,8 @@ impl DawUi {
                                 } else {
                                     slip_unavailable_reason
                                 }
+                            } else if clip.has_opaque_record_tail() && is_audio_clip {
+                                "Drag to move. Shift-drag the right edge to extend or trim this Audio Clip's explicit source tick window."
                             } else if clip.has_opaque_record_tail() {
                                 "Drag to move. Shift-drag the right edge to resize this Pattern Clip; its full source window will be kept in sync."
                             } else {
@@ -13342,8 +13358,7 @@ impl DawUi {
                                 self.active_playlist_clip_drag_targets.clear();
                                 let resize_requested = ui.input(|input| input.modifiers.shift)
                                     && pointer.x >= clip_rect.right() - 8.0;
-                                let resize =
-                                    resize_requested && clip.can_resize_timeline_length();
+                                let resize = resize_requested && can_resize_clip;
                                 let slip_requested =
                                     self.playlist_slip_tool_active && is_audio_clip && !resize;
                                 let preserve_selected_group = !resize
@@ -13414,7 +13429,18 @@ impl DawUi {
                                             source_length_ms: sample_length_ms.unwrap_or_default(),
                                             tempo_bpm: self.tempo_bpm,
                                             kind: if resize {
-                                                PlaylistClipDragKind::Resize
+                                                if can_resize_audio_ticks {
+                                                    PlaylistClipDragKind::ResizeAudioTicks {
+                                                        source_start_tick: clip
+                                                            .source_window_ticks()
+                                                            .unwrap_or_default()
+                                                            .0,
+                                                        sample_length_ticks: sample_length_ticks
+                                                            .unwrap_or_default(),
+                                                    }
+                                                } else {
+                                                    PlaylistClipDragKind::Resize
+                                                }
                                             } else if slip_requested {
                                                 if clip.has_opaque_record_tail() {
                                                     let (source_start_tick, source_end_tick) =
@@ -13550,7 +13576,8 @@ impl DawUi {
                                             }
                                             Ok(())
                                         }
-                                        PlaylistClipDragKind::Resize => {
+                                        PlaylistClipDragKind::Resize
+                                        | PlaylistClipDragKind::ResizeAudioTicks { .. } => {
                                             document.edit_playlist_clip(
                                                 arrangement.id,
                                                 clip_index,
@@ -13574,7 +13601,8 @@ impl DawUi {
                                                         format!("Moved Playlist clip {}", clip_index + 1)
                                                     }
                                                 }
-                                                PlaylistClipDragKind::Resize => {
+                                                PlaylistClipDragKind::Resize
+                                                | PlaylistClipDragKind::ResizeAudioTicks { .. } => {
                                                     format!("Resized Playlist clip {}", clip_index + 1)
                                                 }
                                                 PlaylistClipDragKind::Slip
@@ -36148,6 +36176,26 @@ fn playlist_clip_drag_edit(
             )),
             ..PlaylistClipEdit::default()
         },
+        PlaylistClipDragKind::ResizeAudioTicks {
+            source_start_tick,
+            sample_length_ticks,
+        } => {
+            let max_length_ticks = sample_length_ticks.saturating_sub(source_start_tick);
+            let length_ticks = snap_note_tick(
+                i64::from(drag.start_length_ticks).saturating_add(tick_delta),
+                snap_ticks,
+                1,
+            )
+            .min(max_length_ticks);
+            PlaylistClipEdit {
+                length_ticks: Some(length_ticks),
+                source_window_ticks: Some((
+                    source_start_tick,
+                    source_start_tick.saturating_add(length_ticks),
+                )),
+                ..PlaylistClipEdit::default()
+            }
+        }
         PlaylistClipDragKind::Slip => {
             let tick_delta = if snap {
                 snap_signed_tick_delta(tick_delta, snap_ticks)
