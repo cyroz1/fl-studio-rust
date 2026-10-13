@@ -13539,7 +13539,7 @@ impl DawUi {
                                 let mut requested_press = None;
                                 ui.horizontal(|ui| {
                                     ui.label("Press").on_hover_text(
-                                        "Saved per-track press mode. Hold & stop starts on mouse press and stops on release. Hold & motion starts on press and advances one supported March & wrap clip on release.",
+                                        "Saved per-track press mode. Hold & stop starts on mouse press and stops on release. Hold & motion starts on press and advances one step using the saved Motion mode on release.",
                                     );
                                     egui::ComboBox::from_id_salt((
                                         "playlist-track-press",
@@ -13585,7 +13585,7 @@ impl DawUi {
                                 let mut requested_motion = None;
                                 ui.horizontal(|ui| {
                                     ui.label("Motion").on_hover_text(
-                                        "Saved per-track motion mode. One Shot plays the first pass and stops. Hold & motion with March & wrap advances through supported ungrouped clips; other march and random modes are not implemented yet.",
+                                        "Saved per-track motion mode. One Shot plays the first pass and stops. On Hold & motion release, March modes follow timeline order and Random modes select supported ungrouped clips. Motion during other press modes is not implemented yet.",
                                     );
                                     egui::ComboBox::from_id_salt((
                                         "playlist-track-motion",

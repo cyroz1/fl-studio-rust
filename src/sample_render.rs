@@ -5102,6 +5102,12 @@ struct ActivePerformanceAudioClip {
     first_pass_scheduled: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PerformanceMotionReleaseStep {
+    Launch(usize),
+    Stop,
+}
+
 struct PlaylistPerformanceSources<'a> {
     sampler_clip_indices: &'a BTreeSet<usize>,
     audio_clip_indices: &'a BTreeSet<usize>,
@@ -5488,26 +5494,30 @@ impl PlaylistPerformanceRuntime {
                     {
                         continue;
                     }
-                    let next_clip_index = performance_march_wrap_next_clip_index(
+                    if self.press_by_track.get(&track_id).copied().flatten()
+                        != Some(PlaylistTrackPress::HoldMotion)
+                    {
+                        continue;
+                    }
+                    let step = performance_motion_release_step_with_seed(
+                        self.motion_by_track.get(&track_id).copied().flatten(),
                         clip_index,
                         self.motion_clip_order_by_track
                             .get(&track_id)
                             .map(Vec::as_slice)
                             .unwrap_or_default(),
+                        u64::from(track_id) ^ start_frame.rotate_left(17),
                     );
-                    if self.press_by_track.get(&track_id).copied().flatten()
-                        != Some(PlaylistTrackPress::HoldMotion)
-                        || self.motion_by_track.get(&track_id).copied().flatten()
-                            != Some(PlaylistTrackMotion::MarchWrap)
-                    {
-                        continue;
-                    }
-                    let Some(next_clip_index) = next_clip_index else {
+                    let Some(step) = step else {
                         continue;
                     };
                     self.cancel_pending_track_launches_from(track_id, start_frame);
                     self.queued_by_track.remove(&track_id);
                     stopped_tracks_in_block.insert(track_id, start_frame);
+                    let PerformanceMotionReleaseStep::Launch(next_clip_index) = step else {
+                        self.stop_track_at(track_id, start_frame, sampler_engine);
+                        continue;
+                    };
                     let launch = self.launch_with_position_at(
                         PlaylistPerformanceLaunch {
                             clip_index: next_clip_index,
@@ -5999,15 +6009,57 @@ fn performance_motion_is_one_shot(motion: Option<PlaylistTrackMotion>) -> bool {
     motion == Some(PlaylistTrackMotion::OneShot)
 }
 
-fn performance_march_wrap_next_clip_index(
+fn performance_motion_release_step_with_seed(
+    motion: Option<PlaylistTrackMotion>,
     current_clip_index: usize,
     ordered_clip_indices: &[usize],
-) -> Option<usize> {
+    seed: u64,
+) -> Option<PerformanceMotionReleaseStep> {
     let current_position = ordered_clip_indices
         .iter()
         .position(|clip_index| *clip_index == current_clip_index)?;
-    (!ordered_clip_indices.is_empty())
-        .then(|| ordered_clip_indices[(current_position + 1) % ordered_clip_indices.len()])
+    let next_position = current_position + 1;
+    match motion? {
+        PlaylistTrackMotion::Stay | PlaylistTrackMotion::OneShot => None,
+        PlaylistTrackMotion::MarchWrap => Some(PerformanceMotionReleaseStep::Launch(
+            ordered_clip_indices[next_position % ordered_clip_indices.len()],
+        )),
+        PlaylistTrackMotion::MarchStay => ordered_clip_indices
+            .get(next_position)
+            .copied()
+            .map(PerformanceMotionReleaseStep::Launch),
+        PlaylistTrackMotion::MarchStop => ordered_clip_indices
+            .get(next_position)
+            .copied()
+            .map(PerformanceMotionReleaseStep::Launch)
+            .or(Some(PerformanceMotionReleaseStep::Stop)),
+        PlaylistTrackMotion::Random => Some(PerformanceMotionReleaseStep::Launch(
+            ordered_clip_indices
+                [performance_motion_random_position(seed, ordered_clip_indices.len())],
+        )),
+        PlaylistTrackMotion::ExclusiveRandom => {
+            let alternatives = ordered_clip_indices
+                .iter()
+                .copied()
+                .filter(|clip_index| *clip_index != current_clip_index)
+                .collect::<Vec<_>>();
+            let candidates = if alternatives.is_empty() {
+                ordered_clip_indices
+            } else {
+                &alternatives
+            };
+            Some(PerformanceMotionReleaseStep::Launch(
+                candidates[performance_motion_random_position(seed, candidates.len())],
+            ))
+        }
+    }
+}
+
+fn performance_motion_random_position(seed: u64, candidate_count: usize) -> usize {
+    let mut value = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    ((value ^ (value >> 31)) as usize) % candidate_count
 }
 
 fn performance_motion_transition_tick(
@@ -8189,18 +8241,108 @@ mod tests {
     }
 
     #[test]
-    fn hold_motion_march_wrap_steps_through_track_clips() {
+    fn hold_motion_release_follows_saved_track_motion() {
         assert_eq!(
-            performance_march_wrap_next_clip_index(4, &[4, 9, 12]),
-            Some(9)
+            performance_motion_release_step_with_seed(
+                Some(PlaylistTrackMotion::MarchWrap),
+                4,
+                &[4, 9, 12],
+                1,
+            ),
+            Some(PerformanceMotionReleaseStep::Launch(9))
         );
         assert_eq!(
-            performance_march_wrap_next_clip_index(12, &[4, 9, 12]),
-            Some(4)
+            performance_motion_release_step_with_seed(
+                Some(PlaylistTrackMotion::MarchWrap),
+                12,
+                &[4, 9, 12],
+                1,
+            ),
+            Some(PerformanceMotionReleaseStep::Launch(4))
         );
-        assert_eq!(performance_march_wrap_next_clip_index(4, &[4]), Some(4));
-        assert_eq!(performance_march_wrap_next_clip_index(3, &[4, 9, 12]), None);
-        assert_eq!(performance_march_wrap_next_clip_index(4, &[]), None);
+        assert_eq!(
+            performance_motion_release_step_with_seed(
+                Some(PlaylistTrackMotion::MarchStay),
+                9,
+                &[4, 9, 12],
+                1,
+            ),
+            Some(PerformanceMotionReleaseStep::Launch(12))
+        );
+        assert_eq!(
+            performance_motion_release_step_with_seed(
+                Some(PlaylistTrackMotion::MarchStay),
+                12,
+                &[4, 9, 12],
+                1,
+            ),
+            None
+        );
+        assert_eq!(
+            performance_motion_release_step_with_seed(
+                Some(PlaylistTrackMotion::MarchStop),
+                12,
+                &[4, 9, 12],
+                1,
+            ),
+            Some(PerformanceMotionReleaseStep::Stop)
+        );
+        let random_step = performance_motion_release_step_with_seed(
+            Some(PlaylistTrackMotion::Random),
+            9,
+            &[4, 9, 12],
+            1,
+        );
+        assert!(matches!(
+            random_step,
+            Some(PerformanceMotionReleaseStep::Launch(4 | 9 | 12))
+        ));
+        let exclusive_step = performance_motion_release_step_with_seed(
+            Some(PlaylistTrackMotion::ExclusiveRandom),
+            9,
+            &[4, 9, 12],
+            1,
+        );
+        assert!(matches!(
+            exclusive_step,
+            Some(PerformanceMotionReleaseStep::Launch(4 | 12))
+        ));
+        assert_eq!(
+            performance_motion_release_step_with_seed(
+                Some(PlaylistTrackMotion::Stay),
+                9,
+                &[4, 9, 12],
+                1,
+            ),
+            None
+        );
+        assert_eq!(
+            performance_motion_release_step_with_seed(
+                Some(PlaylistTrackMotion::OneShot),
+                9,
+                &[4, 9, 12],
+                1,
+            ),
+            None
+        );
+        assert_eq!(
+            performance_motion_release_step_with_seed(
+                Some(PlaylistTrackMotion::MarchWrap),
+                3,
+                &[4, 9, 12],
+                1,
+            ),
+            None
+        );
+        assert_eq!(
+            performance_motion_release_step_with_seed(
+                Some(PlaylistTrackMotion::MarchWrap),
+                4,
+                &[],
+                1,
+            ),
+            None
+        );
     }
 
     #[test]
