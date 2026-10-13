@@ -11660,6 +11660,7 @@ impl DawUi {
         let mut join_clip_requested = None;
         let mut join_selected_audio_clips_requested = None;
         let mut join_pattern_clip_requested = None;
+        let mut join_selected_pattern_clips_requested = None;
         let mut merge_pattern_clips_requested = None;
         let mut seek_tick_requested = None;
         let mut dropped_playlist_audio = None;
@@ -13384,6 +13385,34 @@ impl DawUi {
                                             Some(selected_indices);
                                         ui.close();
                                     }
+                                    let selected_pattern_chain_indices = self
+                                        .selected_playlist_pattern_clip_indices(arrangement.id)
+                                        .filter(|indices| indices.contains(&clip_index));
+                                    if let Some(selected_indices) =
+                                        selected_pattern_chain_indices.as_ref()
+                                    {
+                                        let joinable =
+                                            playlist_pattern_clip_selection_joinable(
+                                                &arrangement.clips,
+                                                selected_indices,
+                                                &patterns,
+                                                &tempo_channel_ids,
+                                            );
+                                        let button = ui.add_enabled(
+                                            joinable,
+                                            egui::Button::new("Join selected Pattern Clips"),
+                                        );
+                                        if button
+                                            .on_disabled_hover_text(
+                                                "Select adjacent Pattern Clips with the same pattern, compatible properties, and repeat boundaries.",
+                                            )
+                                            .clicked()
+                                        {
+                                            join_selected_pattern_clips_requested =
+                                                Some(selected_indices.clone());
+                                            ui.close();
+                                        }
+                                    }
                                     let (join_previous_clip, join_next_clip) =
                                         playlist_pattern_clip_join_candidates(
                                             &arrangement.clips,
@@ -13391,7 +13420,10 @@ impl DawUi {
                                             &patterns,
                                             &tempo_channel_ids,
                                         );
-                                    if join_previous_clip.is_some() || join_next_clip.is_some() {
+                                    if selected_pattern_chain_indices.is_some()
+                                        || join_previous_clip.is_some()
+                                        || join_next_clip.is_some()
+                                    {
                                         ui.separator();
                                     }
                                     if let Some(previous_clip_index) = join_previous_clip
@@ -14612,6 +14644,11 @@ impl DawUi {
             }
         }
 
+        if let Some(clip_indices) = join_selected_pattern_clips_requested {
+            playlist_clip_list_changed |=
+                self.join_selected_playlist_pattern_clips(arrangement.id, &clip_indices);
+        }
+
         if let Some(clip_indices) = merge_pattern_clips_requested {
             playlist_clip_list_changed |=
                 self.merge_playlist_pattern_clips(arrangement.id, &clip_indices);
@@ -15191,6 +15228,112 @@ impl DawUi {
             }
             None => {
                 self.status = "Open a project to join selected Playlist Audio Clips".to_owned();
+                false
+            }
+        }
+    }
+
+    fn join_selected_playlist_pattern_clips(
+        &mut self,
+        arrangement_id: u16,
+        clip_indices: &[usize],
+    ) -> bool {
+        let mut clip_indices = clip_indices.to_vec();
+        clip_indices.sort_unstable();
+        clip_indices.dedup();
+        if clip_indices.len() < 2 {
+            self.status = "Select at least two adjacent Pattern Clips to join".to_owned();
+            return false;
+        }
+
+        let result = self.document.as_ref().map(|document| {
+            let mut updated = document.clone();
+            let arrangements = updated.arrangements().map_err(|error| error.to_string())?;
+            let mut matching_arrangements = arrangements
+                .iter()
+                .filter(|arrangement| arrangement.id == arrangement_id);
+            let Some(arrangement) = matching_arrangements.next() else {
+                return Err("The requested Playlist arrangement does not exist".to_owned());
+            };
+            if matching_arrangements.next().is_some() {
+                return Err("The requested Playlist arrangement is ambiguous".to_owned());
+            }
+            let patterns = updated.patterns().map_err(|error| error.to_string())?;
+            let channels = updated.channels();
+            let tempo_channel_ids = channels
+                .iter()
+                .filter(|channel| {
+                    channel.kind() == Some(5)
+                        && channel
+                            .display_name()
+                            .is_some_and(|name| name.eq_ignore_ascii_case("TEMPO"))
+                })
+                .map(ChannelSummary::id)
+                .collect::<BTreeSet<_>>();
+            if !playlist_pattern_clip_selection_joinable(
+                &arrangement.clips,
+                &clip_indices,
+                &patterns,
+                &tempo_channel_ids,
+            ) {
+                return Err(
+                    "Selected Pattern Clips must form a compatible adjacent chain".to_owned(),
+                );
+            }
+
+            let mut selected = clip_indices
+                .iter()
+                .map(|clip_index| (arrangement.clips[*clip_index].position_ticks, *clip_index))
+                .collect::<Vec<_>>();
+            selected.sort_unstable_by_key(|(position_ticks, _)| *position_ticks);
+
+            for pair_index in (0..selected.len() - 1).rev() {
+                let left_clip_index = selected[pair_index].1;
+                let right_clip_index = selected[pair_index + 1].1;
+                let joined_clip_index = updated
+                    .join_adjacent_playlist_pattern_clips(
+                        arrangement_id,
+                        left_clip_index,
+                        right_clip_index,
+                    )
+                    .map_err(|error| error.to_string())?;
+
+                for (selected_index, (_, current_clip_index)) in selected.iter_mut().enumerate() {
+                    if selected_index == pair_index + 1 {
+                        continue;
+                    }
+                    if *current_clip_index > right_clip_index {
+                        *current_clip_index -= 1;
+                    }
+                }
+                selected[pair_index].1 = joined_clip_index;
+                selected.truncate(pair_index + 1);
+            }
+
+            Ok::<_, String>((updated, selected[0].1))
+        });
+
+        match result {
+            Some(Ok((updated, joined_clip_index))) => {
+                self.stop_project_playback();
+                self.document = Some(updated);
+                self.selected_arrangement = Some(arrangement_id);
+                self.selected_clip = Some(joined_clip_index);
+                self.selected_playlist_clips.clear();
+                self.selected_playlist_clips.insert(joined_clip_index);
+                self.playlist_selection_anchor = Some(joined_clip_index);
+                self.playlist_clip_context_split = None;
+                self.active_playlist_clip_drag = None;
+                self.dirty = true;
+                self.status = format!("Joined {} adjacent Pattern Clips", clip_indices.len());
+                true
+            }
+            Some(Err(error)) => {
+                self.status = format!("Could not join selected Pattern Clips: {error}");
+                false
+            }
+            None => {
+                self.status = "Open a project to join selected Playlist Pattern Clips".to_owned();
                 false
             }
         }
@@ -36269,6 +36412,38 @@ fn playlist_pattern_clip_join_candidates(
     };
 
     (previous_clip_index, next_clip_index)
+}
+
+fn playlist_pattern_clip_selection_joinable(
+    clips: &[PlaylistClip],
+    clip_indices: &[usize],
+    patterns: &[Pattern],
+    tempo_channel_ids: &BTreeSet<u16>,
+) -> bool {
+    if clip_indices.len() < 2 {
+        return false;
+    }
+    let mut selected_clips = clip_indices
+        .iter()
+        .filter_map(|clip_index| clips.get(*clip_index).map(|clip| (*clip_index, clip)))
+        .collect::<Vec<_>>();
+    if selected_clips.len() != clip_indices.len() {
+        return false;
+    }
+    selected_clips.sort_by_key(|(_, clip)| clip.position_ticks);
+
+    selected_clips.windows(2).all(|pair| {
+        let [(_, left), (_, right)] = pair else {
+            return false;
+        };
+        playlist_pattern_clip_joinable(left, right, patterns)
+            && !playlist_tempo_overlaps_range(
+                clips,
+                tempo_channel_ids,
+                left.position_ticks,
+                right.position_ticks.saturating_add(right.length_ticks),
+            )
+    })
 }
 
 fn playlist_tempo_overlaps_range(
