@@ -3325,6 +3325,7 @@ struct DawUi {
     midi_input_thru_output_channel: Option<u8>,
     midi_input_thru_notes: BTreeMap<(u8, u8), u8>,
     midi_input_thru_note_mapping: BTreeMap<(u8, u8), VecDeque<(u8, u8)>>,
+    midi_live_sampler_note_mapping: BTreeMap<(u8, u8), VecDeque<u8>>,
     midi_input_thru_sustain_channels: BTreeSet<u8>,
     midi_output_gain_mapping: Option<MidiControlChangeMapping>,
     midi_controller_templates: Vec<MidiControllerTemplate>,
@@ -3980,6 +3981,7 @@ impl DawUi {
             midi_input_thru_output_channel: None,
             midi_input_thru_notes: BTreeMap::new(),
             midi_input_thru_note_mapping: BTreeMap::new(),
+            midi_live_sampler_note_mapping: BTreeMap::new(),
             midi_input_thru_sustain_channels: BTreeSet::new(),
             midi_output_gain_mapping,
             midi_controller_templates,
@@ -7228,6 +7230,7 @@ impl DawUi {
             session.cancelled.store(true, Ordering::Release);
             self.live_sampler_workers.push(session.worker);
         }
+        self.midi_live_sampler_note_mapping.clear();
         let writer = match engine.begin_streaming_playback_from_frame(start_frame) {
             Ok(writer) => writer,
             Err(error) => {
@@ -30371,6 +30374,7 @@ impl DawUi {
     }
 
     fn stop_live_sampler_input(&mut self) {
+        self.midi_live_sampler_note_mapping.clear();
         if let Some(session) = self.live_sampler_input.take() {
             session.cancelled.store(true, Ordering::Release);
             self.live_sampler_workers.push(session.worker);
@@ -30378,25 +30382,6 @@ impl DawUi {
     }
 
     fn handle_live_sampler_input(&mut self, event: MidiInputEvent) {
-        let live_event = match event {
-            MidiInputEvent::NoteOn {
-                channel,
-                key,
-                velocity,
-            } if velocity > 0 => Some(SamplerLiveNoteEvent::NoteOn {
-                channel,
-                key,
-                velocity,
-            }),
-            MidiInputEvent::NoteOn { channel, key, .. }
-            | MidiInputEvent::NoteOff { channel, key, .. } => {
-                Some(SamplerLiveNoteEvent::NoteOff { channel, key })
-            }
-            _ => None,
-        };
-        let Some(live_event) = live_event else {
-            return;
-        };
         if self.playing {
             return;
         }
@@ -30413,6 +30398,62 @@ impl DawUi {
                 engine.stop_project_playback();
             }
         }
+        let (live_event, mapped_note_on) = match event {
+            MidiInputEvent::NoteOn {
+                channel,
+                key,
+                velocity,
+            } if velocity > 0 => {
+                let audition_key = if self.midi_record_snap_to_scale
+                    && self.piano_roll_scale != PianoRollScale::None
+                {
+                    snap_piano_roll_key_to_scale(
+                        u16::from(key),
+                        self.piano_roll_scale,
+                        self.piano_roll_scale_root,
+                        0,
+                        127,
+                    ) as u8
+                } else {
+                    key
+                };
+                (
+                    SamplerLiveNoteEvent::NoteOn {
+                        channel,
+                        key: audition_key,
+                        velocity,
+                    },
+                    Some(((channel & 0x0F, key.min(127)), audition_key)),
+                )
+            }
+            MidiInputEvent::NoteOn { channel, key, .. }
+            | MidiInputEvent::NoteOff { channel, key, .. } => {
+                if self.live_sampler_input.is_none() {
+                    return;
+                }
+                let source_note = (channel & 0x0F, key.min(127));
+                let mapped_key = self
+                    .midi_live_sampler_note_mapping
+                    .get_mut(&source_note)
+                    .and_then(VecDeque::pop_front)
+                    .unwrap_or(key.min(127));
+                let remove_mapping = self
+                    .midi_live_sampler_note_mapping
+                    .get(&source_note)
+                    .is_some_and(VecDeque::is_empty);
+                if remove_mapping {
+                    self.midi_live_sampler_note_mapping.remove(&source_note);
+                }
+                (
+                    SamplerLiveNoteEvent::NoteOff {
+                        channel,
+                        key: mapped_key,
+                    },
+                    None,
+                )
+            }
+            _ => return,
+        };
         if self.live_sampler_input.is_none()
             && matches!(live_event, SamplerLiveNoteEvent::NoteOn { .. })
             && !self.start_live_sampler_input(pattern_id, channel_id)
@@ -30420,8 +30461,15 @@ impl DawUi {
             return;
         }
         if let Some(session) = &self.live_sampler_input
-            && session.sender.send(live_event).is_err()
+            && session.sender.send(live_event).is_ok()
         {
+            if let Some((source_note, audition_key)) = mapped_note_on {
+                self.midi_live_sampler_note_mapping
+                    .entry(source_note)
+                    .or_default()
+                    .push_back(audition_key);
+            }
+        } else if self.live_sampler_input.is_some() {
             self.stop_live_sampler_input();
             if let Some(engine) = &self.audio_engine {
                 engine.stop_project_playback();
@@ -30455,6 +30503,7 @@ impl DawUi {
                 .live_sampler_input
                 .take()
                 .is_some_and(|session| session.worker.join().is_err());
+            self.midi_live_sampler_note_mapping.clear();
             if let Some(engine) = &self.audio_engine {
                 engine.stop_project_playback();
             }
@@ -31004,16 +31053,16 @@ impl DawUi {
             |ui| {
                 ui.checkbox(
                     &mut self.midi_record_snap_to_scale,
-                    "Snap recorded notes to selected scale",
+                    "Snap live Sampler and recorded notes to selected scale",
                 )
                 .on_hover_text(
-                    "Move incoming note pitches to the nearest pitch in the selected Piano roll scale.",
+                    "Move live Sampler audition and recorded pitches to the nearest pitch in the selected Piano roll scale.",
                 );
             },
         );
         if self.midi_record_snap_to_scale && self.piano_roll_scale != PianoRollScale::None {
             ui.small(format!(
-                "Using {} {} for the next recording take.",
+                "Using {} {} for live Sampler audition and the next recording take.",
                 PITCH_CLASSES[usize::from(self.piano_roll_scale_root)],
                 self.piano_roll_scale.label()
             ));
