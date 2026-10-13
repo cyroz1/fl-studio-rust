@@ -12620,6 +12620,15 @@ impl DawUi {
                             } else {
                                 "Drag to move. Shift-drag the right edge to resize. Hold Alt to ignore the 1/16 grid."
                             };
+                            let clip_target = clip.target();
+                            let similar_clip_indices = arrangement
+                                .clips
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(index, candidate)| {
+                                    (candidate.target() == clip_target).then_some(index)
+                                })
+                                .collect::<Vec<_>>();
                             let mute_selection_indices = if self.selected_arrangement
                                 == Some(arrangement.id)
                                 && self.selected_playlist_clips.contains(&clip_index)
@@ -12642,6 +12651,23 @@ impl DawUi {
                                 .collect::<Vec<_>>();
                             let response = response.on_hover_text(drag_hint);
                             response.context_menu(|ui| {
+                                if similar_clip_indices.len() > 1 {
+                                    if ui.button("Select all similar clips").clicked() {
+                                        self.selected_arrangement = Some(arrangement.id);
+                                        self.selected_clip = Some(clip_index);
+                                        self.selected_playlist_clips = similar_clip_indices
+                                            .iter()
+                                            .copied()
+                                            .collect();
+                                        self.playlist_selection_anchor = Some(clip_index);
+                                        self.status = format!(
+                                            "Selected {} similar Playlist clips",
+                                            similar_clip_indices.len()
+                                        );
+                                        ui.close();
+                                    }
+                                    ui.separator();
+                                }
                                 if mute_selection_states.len() > 1 {
                                     if ui.button("Mute all selected clips").clicked() {
                                         muted_clip_requested = Some(
