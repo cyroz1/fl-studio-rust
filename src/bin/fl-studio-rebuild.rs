@@ -13791,6 +13791,55 @@ impl DawUi {
         self.status = "Deselected Playlist clips".to_owned();
     }
 
+    fn invert_playlist_clip_selection(&mut self) {
+        let selection = self
+            .document
+            .as_ref()
+            .and_then(|document| document.arrangements().ok())
+            .and_then(|arrangements| {
+                self.selected_arrangement
+                    .and_then(|arrangement_id| {
+                        arrangements
+                            .iter()
+                            .find(|arrangement| arrangement.id == arrangement_id)
+                    })
+                    .or_else(|| arrangements.first())
+                    .map(|arrangement| (arrangement.id, arrangement.clips.len()))
+            });
+        let Some((arrangement_id, clip_count)) = selection else {
+            self.status = "No Playlist arrangement is available to select".to_owned();
+            return;
+        };
+
+        let prior_clip = self.selected_clip.filter(|index| *index < clip_count);
+        let selected = if self.selected_arrangement == Some(arrangement_id) {
+            if self.selected_playlist_clips.is_empty() {
+                prior_clip.into_iter().collect::<BTreeSet<_>>()
+            } else {
+                self.selected_playlist_clips
+                    .iter()
+                    .copied()
+                    .filter(|index| *index < clip_count)
+                    .collect()
+            }
+        } else {
+            BTreeSet::new()
+        };
+        let inverted = (0..clip_count)
+            .filter(|index| !selected.contains(index))
+            .collect::<BTreeSet<_>>();
+        self.selected_arrangement = Some(arrangement_id);
+        self.selected_clip = prior_clip
+            .filter(|index| inverted.contains(index))
+            .or_else(|| inverted.iter().next_back().copied());
+        self.playlist_selection_anchor = self.selected_clip;
+        self.selected_playlist_clips = inverted;
+        self.status = format!(
+            "Inverted Playlist clip selection: {} selected",
+            self.selected_playlist_clips.len()
+        );
+    }
+
     fn set_playlist_track_selection(&mut self, track_id: u32, extend: bool, toggle: bool) {
         if extend {
             let anchor = self
@@ -29261,6 +29310,7 @@ impl eframe::App for DawUi {
             merge_playlist_pattern_clips_requested,
             select_all_playlist_clips_requested,
             deselect_playlist_clips_requested,
+            invert_playlist_clip_selection_requested,
         ) = if playlist_clip_shortcuts_enabled {
             ui.input_mut(|input| {
                 (
@@ -29270,10 +29320,11 @@ impl eframe::App for DawUi {
                     input.consume_key(egui::Modifiers::COMMAND, egui::Key::G),
                     input.consume_key(egui::Modifiers::COMMAND, egui::Key::A),
                     input.consume_key(egui::Modifiers::COMMAND, egui::Key::D),
+                    input.consume_key(egui::Modifiers::SHIFT, egui::Key::I),
                 )
             })
         } else {
-            (false, false, false, false, false, false)
+            (false, false, false, false, false, false, false)
         };
         if copy_playlist_clip_requested {
             self.copy_selected_playlist_clip();
@@ -29290,6 +29341,9 @@ impl eframe::App for DawUi {
         }
         if deselect_playlist_clips_requested {
             self.deselect_playlist_clips();
+        }
+        if invert_playlist_clip_selection_requested {
+            self.invert_playlist_clip_selection();
         }
         let delete_playlist_clip_requested = self.view == MainView::Playlist
             && self.selected_clip.is_some()
