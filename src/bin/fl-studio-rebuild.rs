@@ -1496,6 +1496,7 @@ enum PianoRollScale {
     LocrianNaturalSix,
     LocrianDoubleFlatSeven,
     LocrianDoubleFlatThreeDoubleFlatSeven,
+    UltraLocrianDoubleFlatThree,
     HarmonicMinor,
     HarmonicMinorFlatFive,
     MelodicMinor,
@@ -1520,7 +1521,7 @@ enum PianoRollScale {
 }
 
 impl PianoRollScale {
-    const ALL: [Self; 57] = [
+    const ALL: [Self; 58] = [
         Self::None,
         Self::Major,
         Self::HarmonicMajor,
@@ -1557,6 +1558,7 @@ impl PianoRollScale {
         Self::LocrianNaturalSix,
         Self::LocrianDoubleFlatSeven,
         Self::LocrianDoubleFlatThreeDoubleFlatSeven,
+        Self::UltraLocrianDoubleFlatThree,
         Self::HarmonicMinor,
         Self::HarmonicMinorFlatFive,
         Self::MelodicMinor,
@@ -1618,6 +1620,7 @@ impl PianoRollScale {
             Self::LocrianNaturalSix => "Locrian natural 6",
             Self::LocrianDoubleFlatSeven => "Locrian bb7",
             Self::LocrianDoubleFlatThreeDoubleFlatSeven => "Locrian bb3 bb7",
+            Self::UltraLocrianDoubleFlatThree => "Ultra Locrian bb3",
             Self::HarmonicMinor => "Harmonic minor",
             Self::HarmonicMinorFlatFive => "Harmonic minor b5",
             Self::MelodicMinor => "Melodic minor",
@@ -1687,6 +1690,7 @@ impl PianoRollScale {
             Self::LocrianNaturalSix => &[0, 1, 3, 5, 6, 9, 10],
             Self::LocrianDoubleFlatSeven => &[0, 1, 3, 5, 6, 8, 9],
             Self::LocrianDoubleFlatThreeDoubleFlatSeven => &[0, 1, 2, 5, 6, 8, 9],
+            Self::UltraLocrianDoubleFlatThree => &[0, 1, 2, 4, 6, 8, 9],
             Self::HarmonicMinor => &[0, 2, 3, 5, 7, 8, 11],
             Self::HarmonicMinorFlatFive => &[0, 2, 3, 5, 6, 8, 11],
             Self::MelodicMinor => &[0, 2, 3, 5, 7, 9, 11],
@@ -1770,6 +1774,7 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
         PianoRollScale::LocrianNaturalSix,
         PianoRollScale::LocrianDoubleFlatSeven,
         PianoRollScale::LocrianDoubleFlatThreeDoubleFlatSeven,
+        PianoRollScale::UltraLocrianDoubleFlatThree,
         PianoRollScale::HarmonicMinor,
         PianoRollScale::HarmonicMinorFlatFive,
         PianoRollScale::MelodicMinor,
@@ -1888,6 +1893,7 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
                 PianoRollScale::LocrianNaturalSix => -18,
                 PianoRollScale::LocrianDoubleFlatSeven => -27,
                 PianoRollScale::LocrianDoubleFlatThreeDoubleFlatSeven => -39,
+                PianoRollScale::UltraLocrianDoubleFlatThree => -40,
                 PianoRollScale::Blues => -7,
                 PianoRollScale::WholeTone => -8,
                 PianoRollScale::WholeHalfDiminished => -9,
