@@ -11512,6 +11512,15 @@ impl DawUi {
         let mut merge_pattern_clips_requested = None;
         let mut seek_tick_requested = None;
         let mut dropped_playlist_audio = None;
+        let mut selected_track_bulk_action = None;
+        let selected_track_count = self.selected_playlist_tracks.len();
+        let has_track_selection = selected_track_count > 0;
+        let selected_track_ids = self
+            .selected_playlist_tracks
+            .iter()
+            .copied()
+            .filter(|track_id| tracks.iter().any(|track| track.id == *track_id))
+            .collect::<Vec<_>>();
         ui.horizontal_wrapped(|ui| {
             ui.label("Arrangement");
             ui.strong(arrangement.name.as_deref().unwrap_or("Arrangement"));
@@ -11553,6 +11562,69 @@ impl DawUi {
                     "Add the selected pattern at the end of the arrangement"
                 })
                 .clicked();
+            ui.menu_button(
+                format!("Tracks ({selected_track_count})"),
+                |ui| {
+                    ui.small("Selected Playlist tracks");
+                    ui.separator();
+                    if ui
+                        .add_enabled(
+                            !selected_track_ids.is_empty(),
+                            egui::Button::new("Mute selected"),
+                        )
+                        .clicked()
+                    {
+                        selected_track_bulk_action = Some(false);
+                        playlist_track_edits_requested.extend(selected_track_ids.iter().map(
+                            |track_id| {
+                                (
+                                    *track_id,
+                                    PlaylistTrackEdit {
+                                        enabled: Some(false),
+                                        ..PlaylistTrackEdit::default()
+                                    },
+                                )
+                            },
+                        ));
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            !selected_track_ids.is_empty(),
+                            egui::Button::new("Unmute selected"),
+                        )
+                        .clicked()
+                    {
+                        selected_track_bulk_action = Some(true);
+                        playlist_track_edits_requested.extend(selected_track_ids.iter().map(
+                            |track_id| {
+                                (
+                                    *track_id,
+                                    PlaylistTrackEdit {
+                                        enabled: Some(true),
+                                        ..PlaylistTrackEdit::default()
+                                    },
+                                )
+                            },
+                        ));
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui
+                        .add_enabled(
+                            has_track_selection,
+                            egui::Button::new("Clear selection"),
+                        )
+                        .clicked()
+                    {
+                        self.selected_playlist_tracks.clear();
+                        self.selected_playlist_track = None;
+                        self.playlist_track_selection_anchor = None;
+                        self.status = "Cleared Playlist track selection".to_owned();
+                        ui.close();
+                    }
+                },
+            );
             let slip_tool = ui
                 .selectable_label(self.playlist_slip_tool_active, "Slip (S)")
                 .on_hover_text(
@@ -13029,6 +13101,7 @@ impl DawUi {
             ui.ctx().request_repaint();
         }
 
+        let mut playlist_track_edit_failures = 0usize;
         for (track_id, edit) in playlist_track_edits_requested {
             let result = self
                 .document
@@ -13058,10 +13131,23 @@ impl DawUi {
                     };
                 }
                 Some(Err(error)) => {
+                    playlist_track_edit_failures += 1;
                     self.status = format!("Could not edit Playlist track {track_id}: {error}");
                 }
-                None => self.status = "Open a project to edit Playlist tracks".to_owned(),
+                None => {
+                    playlist_track_edit_failures += 1;
+                    self.status = "Open a project to edit Playlist tracks".to_owned();
+                }
             }
+        }
+        if let Some(enabled) = selected_track_bulk_action
+            && playlist_track_edit_failures == 0
+        {
+            self.status = format!(
+                "{} {} selected Playlist tracks",
+                if enabled { "Unmuted" } else { "Muted" },
+                selected_track_ids.len()
+            );
         }
 
         let mut playlist_clip_list_changed = false;
