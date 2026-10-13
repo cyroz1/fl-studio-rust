@@ -1519,13 +1519,14 @@ enum PianoRollScale {
     WholeTone,
     WholeHalfDiminished,
     HalfWholeDiminished,
+    HalfDiminishedFlatFour,
     Altered,
     AlteredDominantNaturalSix,
     SuperLocrianDoubleFlatSeven,
 }
 
 impl PianoRollScale {
-    const ALL: [Self; 62] = [
+    const ALL: [Self; 63] = [
         Self::None,
         Self::Major,
         Self::MajorLocrian,
@@ -1585,6 +1586,7 @@ impl PianoRollScale {
         Self::WholeTone,
         Self::WholeHalfDiminished,
         Self::HalfWholeDiminished,
+        Self::HalfDiminishedFlatFour,
         Self::Altered,
         Self::AlteredDominantNaturalSix,
         Self::SuperLocrianDoubleFlatSeven,
@@ -1651,6 +1653,7 @@ impl PianoRollScale {
             Self::WholeTone => "Whole tone",
             Self::WholeHalfDiminished => "Whole-half diminished",
             Self::HalfWholeDiminished => "Half-whole diminished",
+            Self::HalfDiminishedFlatFour => "Half-diminished b4",
             Self::Altered => "Altered",
             Self::AlteredDominantNaturalSix => "Altered dominant natural 6",
             Self::SuperLocrianDoubleFlatSeven => "Super-Locrian bb7",
@@ -1725,6 +1728,7 @@ impl PianoRollScale {
             Self::WholeTone => &[0, 2, 4, 6, 8, 10],
             Self::WholeHalfDiminished => &[0, 2, 3, 5, 6, 8, 9, 11],
             Self::HalfWholeDiminished => &[0, 1, 3, 4, 6, 7, 9, 10],
+            Self::HalfDiminishedFlatFour => &[0, 2, 3, 4, 6, 8, 10],
             Self::Altered => &[0, 1, 3, 4, 6, 8, 10],
             Self::AlteredDominantNaturalSix => &[0, 1, 3, 4, 6, 9, 10],
             Self::SuperLocrianDoubleFlatSeven => &[0, 1, 3, 4, 6, 8, 9],
@@ -1813,6 +1817,7 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
         PianoRollScale::WholeTone,
         PianoRollScale::WholeHalfDiminished,
         PianoRollScale::HalfWholeDiminished,
+        PianoRollScale::HalfDiminishedFlatFour,
         PianoRollScale::Altered,
         PianoRollScale::AlteredDominantNaturalSix,
         PianoRollScale::SuperLocrianDoubleFlatSeven,
@@ -1922,6 +1927,7 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
                 PianoRollScale::WholeTone => -8,
                 PianoRollScale::WholeHalfDiminished => -9,
                 PianoRollScale::HalfWholeDiminished => -10,
+                PianoRollScale::HalfDiminishedFlatFour => -38,
                 PianoRollScale::Altered => -13,
                 PianoRollScale::AlteredDominantNaturalSix => -36,
                 PianoRollScale::SuperLocrianDoubleFlatSeven => -22,
