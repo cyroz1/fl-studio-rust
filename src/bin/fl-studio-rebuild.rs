@@ -1490,6 +1490,7 @@ enum PianoRollScale {
     MixolydianFlatSix,
     NaturalMinor,
     Locrian,
+    LocrianDominant,
     LocrianNaturalTwo,
     LocrianNaturalSix,
     LocrianDoubleFlatSeven,
@@ -1518,7 +1519,7 @@ enum PianoRollScale {
 }
 
 impl PianoRollScale {
-    const ALL: [Self; 55] = [
+    const ALL: [Self; 56] = [
         Self::None,
         Self::Major,
         Self::HarmonicMajor,
@@ -1549,6 +1550,7 @@ impl PianoRollScale {
         Self::MixolydianFlatSix,
         Self::NaturalMinor,
         Self::Locrian,
+        Self::LocrianDominant,
         Self::LocrianNaturalTwo,
         Self::LocrianNaturalSix,
         Self::LocrianDoubleFlatSeven,
@@ -1608,6 +1610,7 @@ impl PianoRollScale {
             Self::MixolydianFlatSix => "Mixolydian b6",
             Self::NaturalMinor => "Natural minor",
             Self::Locrian => "Locrian",
+            Self::LocrianDominant => "Locrian dominant",
             Self::LocrianNaturalTwo => "Locrian natural 2",
             Self::LocrianNaturalSix => "Locrian natural 6",
             Self::LocrianDoubleFlatSeven => "Locrian bb7",
@@ -1675,6 +1678,7 @@ impl PianoRollScale {
             Self::MixolydianFlatSix => &[0, 2, 4, 5, 7, 8, 10],
             Self::NaturalMinor => &[0, 2, 3, 5, 7, 8, 10],
             Self::Locrian => &[0, 1, 3, 5, 6, 8, 10],
+            Self::LocrianDominant => &[0, 1, 4, 5, 6, 8, 10],
             Self::LocrianNaturalTwo => &[0, 2, 3, 5, 6, 8, 10],
             Self::LocrianNaturalSix => &[0, 1, 3, 5, 6, 9, 10],
             Self::LocrianDoubleFlatSeven => &[0, 1, 3, 5, 6, 8, 9],
@@ -1756,6 +1760,7 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
         PianoRollScale::MixolydianFlatSix,
         PianoRollScale::NaturalMinor,
         PianoRollScale::Locrian,
+        PianoRollScale::LocrianDominant,
         PianoRollScale::LocrianNaturalTwo,
         PianoRollScale::LocrianNaturalSix,
         PianoRollScale::LocrianDoubleFlatSeven,
@@ -1872,6 +1877,7 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
                 PianoRollScale::MixolydianFlatTwo => -24,
                 PianoRollScale::MixolydianFlatSix => -16,
                 PianoRollScale::Locrian => -6,
+                PianoRollScale::LocrianDominant => -34,
                 PianoRollScale::LocrianNaturalTwo => -17,
                 PianoRollScale::LocrianNaturalSix => -18,
                 PianoRollScale::LocrianDoubleFlatSeven => -27,
