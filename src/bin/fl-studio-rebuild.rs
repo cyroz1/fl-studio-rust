@@ -12891,7 +12891,17 @@ impl DawUi {
                                 .source_window_milliseconds()
                                 .map(|(start_ms, end_ms)| (start_ms as f32, end_ms as f32))
                                 .or_else(|| full_source_length_ms.map(|length_ms| (0.0, length_ms)));
-                            let source_window_supported = source_window_ms.is_some();
+                            let source_window_supported = if clip.has_opaque_record_tail() {
+                                clip.source_window_ticks().is_some_and(
+                                    |(source_start, source_end)| {
+                                        source_end > source_start
+                                            && source_end.checked_sub(source_start)
+                                                == Some(clip.length_ticks)
+                                    },
+                                )
+                            } else {
+                                source_window_ms.is_some()
+                            };
                             let scale_supported = clip.scale.is_none_or(|scale| {
                                 scale.is_finite() && scale > 0.0 && (scale - 1.0).abs() <= 1e-9
                             });
@@ -12957,7 +12967,6 @@ impl DawUi {
                                 "This clip uses the entire sample and has no room to slip"
                             };
                             let can_split_clip = is_audio_clip
-                                && !clip.has_opaque_record_tail()
                                 && context_split_position.is_some()
                                 && source_window_supported
                                 && scale_supported
@@ -13153,8 +13162,10 @@ impl DawUi {
                                     );
                                     let split_hint = if context_split_position.is_none() {
                                         "Right-click inside the clip, away from its edges"
-                                    } else if clip.has_opaque_record_tail() {
-                                        "Splitting this FL Studio clip format is not available yet"
+                                    } else if clip.has_opaque_record_tail()
+                                        && !source_window_supported
+                                    {
+                                        "Splitting this 2026 Audio Clip requires an explicit source tick window matching its timeline length"
                                     } else if !source_window_supported {
                                         "Wait for the waveform to load so the sample duration is known"
                                     } else if !scale_supported {

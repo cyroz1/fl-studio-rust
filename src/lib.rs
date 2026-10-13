@@ -7016,11 +7016,11 @@ impl FlpDocument {
         Ok(clip_index.saturating_add(1))
     }
 
-    /// Splits one un-stretched Audio Clip at a Playlist tick while preserving its source window.
-    /// The clip is split only when its source offsets can be mapped linearly to timeline time.
-    /// `full_source_length_ms` is needed only for clips whose two offsets are the `-1` sentinel.
-    /// The right-hand clip gets a new ID when the record layout contains one and is inserted
-    /// immediately after the source record.
+    /// Splits one Audio Clip at a Playlist tick while preserving its source window.
+    /// Legacy records need source offsets that map linearly to timeline time; an 88-byte record
+    /// needs an explicit tick window whose span matches the clip length. `full_source_length_ms`
+    /// is needed only for legacy clips whose two offsets are the `-1` sentinel. The right-hand
+    /// clip gets a new ID when the record layout contains one and is inserted after the source.
     pub fn split_playlist_audio_clip(
         &mut self,
         arrangement_id: u16,
@@ -7066,12 +7066,6 @@ impl FlpDocument {
                 "the Playlist clip does not target one unambiguous Audio Clip channel",
             ));
         }
-        if clip.has_opaque_record_tail() {
-            return Err(FlpError::UnsupportedEdit(
-                "splitting this Playlist record version requires decoding its opaque tail",
-            ));
-        }
-
         let relative_split_ticks = split_position_ticks.checked_sub(clip.position_ticks);
         let Some(relative_split_ticks) =
             relative_split_ticks.filter(|ticks| *ticks > 0 && *ticks < clip.length_ticks)
@@ -7114,50 +7108,76 @@ impl FlpDocument {
             ));
         }
 
-        let (source_start_ms, source_end_ms) =
-            if clip.start_offset == -1.0 && clip.end_offset == -1.0 {
-                let Some(source_length_ms) = full_source_length_ms else {
-                    return Err(FlpError::UnsupportedEdit(
-                        "splitting a full-source Audio Clip requires its sample length",
-                    ));
-                };
-                if !source_length_ms.is_finite() || source_length_ms <= 0.0 {
-                    return Err(FlpError::UnsupportedEdit(
-                        "the full sample length must be a positive number of milliseconds",
-                    ));
-                }
-                (0.0, source_length_ms)
-            } else if clip.start_offset.is_finite()
-                && clip.end_offset.is_finite()
-                && clip.start_offset >= 0.0
-                && clip.end_offset > clip.start_offset
-            {
-                (clip.start_offset, clip.end_offset)
-            } else {
+        let record_size = clip.record_size;
+        let (source_start_bytes, split_source_bytes, source_end_bytes) = if record_size == 88 {
+            let Some((source_start_tick, source_end_tick)) = clip.source_window_ticks() else {
                 return Err(FlpError::UnsupportedEdit(
-                    "the Audio Clip has an unsupported source window",
+                    "the Audio Clip has no decoded source tick window",
                 ));
             };
+            if source_end_tick.checked_sub(source_start_tick) != Some(clip.length_ticks) {
+                return Err(FlpError::UnsupportedEdit(
+                    "splitting an 88-byte Audio Clip requires a source tick window matching its timeline length",
+                ));
+            }
+            let split_source_tick = source_start_tick
+                .checked_add(relative_split_ticks)
+                .ok_or(FlpError::LengthOverflow)?;
+            (
+                source_start_tick.to_le_bytes(),
+                split_source_tick.to_le_bytes(),
+                source_end_tick.to_le_bytes(),
+            )
+        } else {
+            let (source_start_ms, source_end_ms) =
+                if clip.start_offset == -1.0 && clip.end_offset == -1.0 {
+                    let Some(source_length_ms) = full_source_length_ms else {
+                        return Err(FlpError::UnsupportedEdit(
+                            "splitting a full-source Audio Clip requires its sample length",
+                        ));
+                    };
+                    if !source_length_ms.is_finite() || source_length_ms <= 0.0 {
+                        return Err(FlpError::UnsupportedEdit(
+                            "the full sample length must be a positive number of milliseconds",
+                        ));
+                    }
+                    (0.0, source_length_ms)
+                } else if clip.start_offset.is_finite()
+                    && clip.end_offset.is_finite()
+                    && clip.start_offset >= 0.0
+                    && clip.end_offset > clip.start_offset
+                {
+                    (clip.start_offset, clip.end_offset)
+                } else {
+                    return Err(FlpError::UnsupportedEdit(
+                        "the Audio Clip has an unsupported source window",
+                    ));
+                };
 
-        let ppq = f64::from(self.header.ppq);
-        let tempo_bpm = self.metadata.tempo_bpm().unwrap_or(140.0);
-        if ppq == 0.0 || !tempo_bpm.is_finite() || tempo_bpm <= 0.0 {
-            return Err(FlpError::UnsupportedEdit(
-                "splitting an Audio Clip requires a valid project tempo and PPQ",
-            ));
-        }
-        let elapsed_source_ms = f64::from(relative_split_ticks) * 60_000.0 / (ppq * tempo_bpm);
-        let split_source_ms = (f64::from(source_start_ms) + elapsed_source_ms) as f32;
-        if !split_source_ms.is_finite()
-            || split_source_ms <= source_start_ms
-            || split_source_ms >= source_end_ms
-        {
-            return Err(FlpError::UnsupportedEdit(
-                "the split point must fall inside the Audio Clip's available source audio",
-            ));
-        }
+            let ppq = f64::from(self.header.ppq);
+            let tempo_bpm = self.metadata.tempo_bpm().unwrap_or(140.0);
+            if ppq == 0.0 || !tempo_bpm.is_finite() || tempo_bpm <= 0.0 {
+                return Err(FlpError::UnsupportedEdit(
+                    "splitting an Audio Clip requires a valid project tempo and PPQ",
+                ));
+            }
+            let elapsed_source_ms = f64::from(relative_split_ticks) * 60_000.0 / (ppq * tempo_bpm);
+            let split_source_ms = (f64::from(source_start_ms) + elapsed_source_ms) as f32;
+            if !split_source_ms.is_finite()
+                || split_source_ms <= source_start_ms
+                || split_source_ms >= source_end_ms
+            {
+                return Err(FlpError::UnsupportedEdit(
+                    "the split point must fall inside the Audio Clip's available source audio",
+                ));
+            }
+            (
+                source_start_ms.to_le_bytes(),
+                split_source_ms.to_le_bytes(),
+                source_end_ms.to_le_bytes(),
+            )
+        };
 
-        let record_size = clip.record_size;
         let record_start = clip
             .source_record_index
             .checked_mul(record_size)
@@ -7188,12 +7208,12 @@ impl FlpDocument {
         let mut left_record = event.payload[record_start..record_end].to_vec();
         let mut right_record = left_record.clone();
         left_record[8..12].copy_from_slice(&left_length.to_le_bytes());
-        left_record[24..28].copy_from_slice(&source_start_ms.to_le_bytes());
-        left_record[28..32].copy_from_slice(&split_source_ms.to_le_bytes());
+        left_record[24..28].copy_from_slice(&source_start_bytes);
+        left_record[28..32].copy_from_slice(&split_source_bytes);
         right_record[0..4].copy_from_slice(&right_position.to_le_bytes());
         right_record[8..12].copy_from_slice(&right_length.to_le_bytes());
-        right_record[24..28].copy_from_slice(&split_source_ms.to_le_bytes());
-        right_record[28..32].copy_from_slice(&source_end_ms.to_le_bytes());
+        right_record[24..28].copy_from_slice(&split_source_bytes);
+        right_record[28..32].copy_from_slice(&source_end_bytes);
         if playlist_record_has_clip_id(record_size) {
             right_record[32..36]
                 .copy_from_slice(&next_playlist_clip_id(arrangement, None)?.to_le_bytes());
