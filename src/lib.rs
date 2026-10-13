@@ -12754,6 +12754,39 @@ impl FlpDocument {
     /// Sets the RGB components of a channel's `0x80` color event while retaining its fourth
     /// byte. Channels without a color event receive one immediately after their kind event.
     pub fn set_channel_color(&mut self, channel_id: u16, rgb: [u8; 3]) -> Result<(), FlpError> {
+        self.set_channel_colors(&[channel_id], rgb)
+    }
+
+    /// Applies one RGB color to several channels as a single transactional edit. Existing `0x80`
+    /// fourth bytes and unrelated event bytes remain untouched.
+    pub fn set_channel_colors(
+        &mut self,
+        channel_ids: &[u16],
+        rgb: [u8; 3],
+    ) -> Result<(), FlpError> {
+        if channel_ids.is_empty() {
+            return Err(FlpError::UnsupportedEdit(
+                "at least one channel is required to set colors",
+            ));
+        }
+
+        let mut candidate = self.clone();
+        let mut updated_ids = HashSet::with_capacity(channel_ids.len());
+        for &channel_id in channel_ids {
+            if updated_ids.insert(channel_id) {
+                candidate.set_channel_color_in_place(channel_id, rgb)?;
+            }
+        }
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    fn set_channel_color_in_place(
+        &mut self,
+        channel_id: u16,
+        rgb: [u8; 3],
+    ) -> Result<(), FlpError> {
         let channels = self.channels();
         let mut matching = channels.iter().filter(|channel| channel.id == channel_id);
         let Some(channel) = matching.next() else {
@@ -12773,9 +12806,8 @@ impl FlpDocument {
             ));
         }
 
-        let mut candidate = self.clone();
         if let Some(event_index) = existing_event {
-            let event = &candidate.events[event_index];
+            let event = &self.events[event_index];
             if event.encoding != PayloadEncoding::Dword || event.payload.len() != 4 {
                 return Err(FlpError::UnsupportedEdit(
                     "the selected channel's 0x80 color event is not a four-byte value",
@@ -12783,7 +12815,7 @@ impl FlpDocument {
             }
             let fourth_byte = event.payload[3];
             let value = u32::from_le_bytes([rgb[0], rgb[1], rgb[2], fourth_byte]);
-            candidate.events[event_index].replace_dword_payload(value)?;
+            self.events[event_index].replace_dword_payload(value)?;
         } else {
             let mut kind_events = channel
                 .event_range()
@@ -12798,20 +12830,18 @@ impl FlpDocument {
                     "the selected channel has multiple 0x15 kind events",
                 ));
             }
-            if candidate.events[kind_index].encoding != PayloadEncoding::Byte
-                || candidate.events[kind_index].payload.len() != 1
+            if self.events[kind_index].encoding != PayloadEncoding::Byte
+                || self.events[kind_index].payload.len() != 1
             {
                 return Err(FlpError::UnsupportedEdit(
                     "the selected channel's 0x15 kind event is not a one-byte value",
                 ));
             }
-            candidate.events.insert(
+            self.events.insert(
                 kind_index + 1,
                 FlpEvent::new_dword(0x80, u32::from_le_bytes([rgb[0], rgb[1], rgb[2], 0])),
             );
         }
-        candidate.refresh_event_offsets()?;
-        *self = candidate;
         Ok(())
     }
 

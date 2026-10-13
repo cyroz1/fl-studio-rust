@@ -14308,7 +14308,7 @@ impl DawUi {
                     .map(|channel| (channel.id(), false)),
             );
         }
-        let mut channel_color_edits = Vec::new();
+        let mut channel_color_edits = Vec::<(Vec<u16>, [u8; 3])>::new();
         let mut channel_order_edits = Vec::new();
         let mut channel_sort = None;
         let mut level_edits = Vec::new();
@@ -14595,7 +14595,7 @@ impl DawUi {
                             .changed()
                             {
                                 channel_color_edits.push((
-                                    channel.id(),
+                                    vec![channel.id()],
                                     [display_color.r(), display_color.g(), display_color.b()],
                                 ));
                             }
@@ -14816,6 +14816,25 @@ impl DawUi {
                                 } else {
                                     self.selected_rack_channels.iter().copied().collect()
                                 };
+                                ui.menu_button("Color selected channels", |ui| {
+                                    ui.small(format!("{} channel(s)", selected_ids.len()));
+                                    let mut color = channel.color().map_or(PANEL_LIGHT, |[r, g, b, _]| {
+                                        Color32::from_rgb(r, g, b)
+                                    });
+                                    if egui::color_picker::color_edit_button_srgba(
+                                        ui,
+                                        &mut color,
+                                        egui::color_picker::Alpha::Opaque,
+                                    )
+                                    .on_hover_text("Apply this color to every selected channel")
+                                    .changed()
+                                    {
+                                        channel_color_edits.push((
+                                            selected_ids.clone(),
+                                            [color.r(), color.g(), color.b()],
+                                        ));
+                                    }
+                                });
                                 if matches!(channel.kind(), Some(0 | 2)) {
                                     let swing_is_valid = channel
                                         .swing_mix_raw()
@@ -15307,15 +15326,15 @@ impl DawUi {
                 None => {}
             }
         }
-        for (channel_id, rgb) in channel_color_edits {
+        for (channel_ids, rgb) in channel_color_edits {
             let result = self
                 .document
                 .as_mut()
-                .map(|document| document.set_channel_color(channel_id, rgb));
+                .map(|document| document.set_channel_colors(&channel_ids, rgb));
             match result {
                 Some(Ok(())) => {
                     self.dirty = true;
-                    self.status = format!("Updated channel {channel_id} color");
+                    self.status = format!("Updated color for {} channel(s)", channel_ids.len());
                 }
                 Some(Err(error)) => {
                     self.status = format!("Could not change channel color: {error}");
