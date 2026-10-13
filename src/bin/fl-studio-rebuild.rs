@@ -19245,7 +19245,9 @@ impl DawUi {
                         && !self.piano_roll_stamp_mode,
                     "Draw",
                 )
-                .on_hover_text("Click to add; drag to reposition; Shift-drag to set length (P)")
+                .on_hover_text(
+                    "Click to add; drag to reposition; Shift-drag length; right-click to erase (P)",
+                )
                 .clicked()
             {
                 self.piano_roll_paint_mode = false;
@@ -19260,7 +19262,7 @@ impl DawUi {
             }
             if ui
                 .selectable_label(self.piano_roll_paint_mode, "Paint")
-                .on_hover_text("Paint notes (B)")
+                .on_hover_text("Paint while dragging; right-click to erase (B)")
                 .clicked()
             {
                 self.piano_roll_paint_mode = !self.piano_roll_paint_mode;
@@ -24344,10 +24346,19 @@ impl DawUi {
                     || (ui.input(|input| input.pointer.primary_down()) && response.hovered());
                 let delete_gesture = response.clicked_by(PointerButton::Secondary)
                     || (ui.input(|input| input.pointer.secondary_down()) && response.hovered());
+                let draw_or_paint_mode = !self.piano_roll_select_mode
+                    && !self.piano_roll_zoom_mode
+                    && !self.piano_roll_playback_mode
+                    && !self.piano_roll_slice_mode
+                    && !self.piano_roll_delete_mode
+                    && !self.piano_roll_mute_mode
+                    && !self.piano_roll_stamp_mode
+                    && !modifiers.command;
                 let delete_note_gesture = (self.piano_roll_mute_mode && delete_gesture)
                     || (self.piano_roll_delete_mode
                         && mute_gesture
-                        && !modifiers.command);
+                        && !modifiers.command)
+                    || (draw_or_paint_mode && delete_gesture);
                 if delete_note_gesture
                     && (!ghost || self.piano_roll_editable_ghost_channels)
                     && self.last_piano_roll_delete_note != Some(note_id)
