@@ -745,7 +745,7 @@ impl ChannelSummary {
         self.keyboard_main_pitch.unwrap_or(false)
     }
 
-    /// Whether the channel uses its root key when project Master pitch changes.
+    /// Whether the channel uses its root key to transpose note input where supported.
     /// Missing Parameters data defaults to disabled.
     pub fn keyboard_add_to_key_enabled(&self) -> bool {
         self.keyboard_add_root.unwrap_or(false)

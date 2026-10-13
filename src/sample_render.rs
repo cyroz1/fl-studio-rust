@@ -28,9 +28,9 @@ use crate::audio::{
 use crate::media::{DecodedAudio, SamplePathResolver, decode_audio_file, wav_sampler_metadata};
 use crate::vst3::Vst3PlaylistStreamProcessor;
 use crate::{
-    Arrangement, ChannelNoteRouter, FlpDocument, MixerInsertSignalTransform, MixerRouteAudibility,
-    MixerSourceRoutePlan, MixerSourceRouteTransform, Pattern, PatternNote, PlaylistClip,
-    PlaylistClipTarget,
+    Arrangement, ChannelNoteRouter, ChannelSummary, FlpDocument, MixerInsertSignalTransform,
+    MixerRouteAudibility, MixerSourceRoutePlan, MixerSourceRouteTransform, Pattern, PatternNote,
+    PlaylistClip, PlaylistClipTarget,
 };
 
 const DEFAULT_SAMPLE_RATE: u32 = 44_100;
@@ -408,9 +408,38 @@ fn resolve_sampler_root_key(
     sample_root_key: Option<u16>,
     read_sample_root_note: bool,
 ) -> u16 {
+    let sample_root_key = sample_root_key.filter(|root_key| *root_key <= 127);
     saved_root_key
         .or(read_sample_root_note.then_some(sample_root_key).flatten())
         .unwrap_or(SAMPLER_ROOT_KEY)
+}
+
+fn resolve_sampler_channel_root_key(
+    channel: &ChannelSummary,
+    sample_root_key: Option<u16>,
+    read_sample_root_note: bool,
+) -> u16 {
+    // Add to Key applies the channel root as a note-input offset. Keep the
+    // sample's embedded or default root key as the source pitch reference.
+    let saved_root_key = (!channel.keyboard_add_to_key_enabled())
+        .then(|| channel.sampler_root_key())
+        .flatten();
+    resolve_sampler_root_key(saved_root_key, sample_root_key, read_sample_root_note)
+}
+
+fn sampler_note_pitch_offset_semitones(
+    channel: &ChannelSummary,
+    sample_root_key: u16,
+    project_master_pitch_cents: Option<i16>,
+) -> i16 {
+    let root_key_offset = if channel.keyboard_add_to_key_enabled() {
+        // A saved root above the sample root moves the incoming note down.
+        i16::from(sample_root_key as u8)
+            - i16::from(channel.sampler_root_key().unwrap_or(sample_root_key) as u8)
+    } else {
+        0
+    };
+    root_key_offset + channel.master_pitch_note_offset_semitones(project_master_pitch_cents)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4104,8 +4133,8 @@ fn prepare_sampler_arrangement(
                 gain: gain * sampler_wav_gain(wave_metadata.gain_db),
                 pan,
                 reverse: channel.sample_reversed(),
-                root_key: resolve_sampler_root_key(
-                    channel.sampler_root_key(),
+                root_key: resolve_sampler_channel_root_key(
+                    channel,
                     wave_metadata.root_key,
                     options.read_sample_root_note,
                 ),
@@ -4131,7 +4160,9 @@ fn prepare_sampler_arrangement(
             channels_by_id
                 .get(&placed.target_channel_id)
                 .map_or(0, |channel| {
-                    channel.master_pitch_note_offset_semitones(
+                    sampler_note_pitch_offset_semitones(
+                        channel,
+                        source.root_key,
                         document.metadata().master_pitch_cents(),
                     )
                 }),
@@ -4404,8 +4435,8 @@ fn prepare_sampler_pattern(
                 gain: gain * sampler_wav_gain(wave_metadata.gain_db),
                 pan,
                 reverse: channel.sample_reversed(),
-                root_key: resolve_sampler_root_key(
-                    channel.sampler_root_key(),
+                root_key: resolve_sampler_channel_root_key(
+                    channel,
                     wave_metadata.root_key,
                     options.read_sample_root_note,
                 ),
@@ -4427,7 +4458,11 @@ fn prepare_sampler_pattern(
         let note_key = transpose_sampler_note_key(
             note.key,
             channels_by_id.get(&target_channel_id).map_or(0, |channel| {
-                channel.master_pitch_note_offset_semitones(document.metadata().master_pitch_cents())
+                sampler_note_pitch_offset_semitones(
+                    channel,
+                    source.root_key,
+                    document.metadata().master_pitch_cents(),
+                )
             }),
         );
         let channel_swing_mix_raw = channels_by_id
