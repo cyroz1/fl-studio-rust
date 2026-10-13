@@ -1473,6 +1473,7 @@ enum PianoRollScale {
     DorianFlatFive,
     Phrygian,
     PhrygianFlatFour,
+    Ultraphrygian,
     PhrygianDominant,
     Lydian,
     LydianSharpTwo,
@@ -1514,7 +1515,7 @@ enum PianoRollScale {
 }
 
 impl PianoRollScale {
-    const ALL: [Self; 51] = [
+    const ALL: [Self; 52] = [
         Self::None,
         Self::Major,
         Self::HarmonicMajor,
@@ -1528,6 +1529,7 @@ impl PianoRollScale {
         Self::DorianFlatFive,
         Self::Phrygian,
         Self::PhrygianFlatFour,
+        Self::Ultraphrygian,
         Self::PhrygianDominant,
         Self::Lydian,
         Self::LydianSharpTwo,
@@ -1583,6 +1585,7 @@ impl PianoRollScale {
             Self::DorianFlatFive => "Dorian b5",
             Self::Phrygian => "Phrygian",
             Self::PhrygianFlatFour => "Phrygian b4",
+            Self::Ultraphrygian => "Ultraphrygian",
             Self::PhrygianDominant => "Phrygian dominant",
             Self::Lydian => "Lydian",
             Self::LydianSharpTwo => "Lydian #2",
@@ -1646,6 +1649,7 @@ impl PianoRollScale {
             Self::DorianFlatFive => &[0, 2, 3, 5, 6, 9, 10],
             Self::Phrygian => &[0, 1, 3, 5, 7, 8, 10],
             Self::PhrygianFlatFour => &[0, 1, 3, 4, 7, 8, 10],
+            Self::Ultraphrygian => &[0, 1, 3, 4, 7, 8, 9],
             Self::PhrygianDominant => &[0, 1, 4, 5, 7, 8, 10],
             Self::Lydian => &[0, 2, 4, 6, 7, 9, 11],
             Self::LydianSharpTwo => &[0, 3, 4, 6, 7, 9, 11],
@@ -1723,6 +1727,7 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
         PianoRollScale::DorianFlatFive,
         PianoRollScale::Phrygian,
         PianoRollScale::PhrygianFlatFour,
+        PianoRollScale::Ultraphrygian,
         PianoRollScale::PhrygianDominant,
         PianoRollScale::Lydian,
         PianoRollScale::LydianSharpTwo,
@@ -1835,6 +1840,7 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
                 PianoRollScale::UkrainianDorianFlatTwo => -33,
                 PianoRollScale::Phrygian => -3,
                 PianoRollScale::PhrygianFlatFour => -24,
+                PianoRollScale::Ultraphrygian => -34,
                 PianoRollScale::PhrygianDominant => -11,
                 PianoRollScale::Lydian => -4,
                 PianoRollScale::LydianSharpTwo => -21,
@@ -33811,7 +33817,7 @@ mod tests {
 
     #[test]
     fn piano_roll_scales_use_documented_intervals_and_auto_detection() {
-        let cases: [(PianoRollScale, u8, [u16; 8], &'static [u8]); 38] = [
+        let cases: [(PianoRollScale, u8, [u16; 8], &'static [u8]); 39] = [
             (
                 PianoRollScale::Dorian,
                 2,
@@ -33955,6 +33961,12 @@ mod tests {
                 0,
                 [60, 61, 63, 64, 67, 68, 70, 72],
                 &[0, 1, 3, 4, 7, 8, 10],
+            ),
+            (
+                PianoRollScale::Ultraphrygian,
+                0,
+                [60, 61, 63, 64, 67, 68, 69, 72],
+                &[0, 1, 3, 4, 7, 8, 9],
             ),
             (
                 PianoRollScale::Lydian,
