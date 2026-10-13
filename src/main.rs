@@ -1126,6 +1126,7 @@ fn parse_scale_name(value: &str) -> Result<&'static [u8], String> {
         "harmonic-major" => Ok(&[0, 2, 4, 5, 7, 8, 11]),
         "double-harmonic-major" => Ok(&[0, 1, 4, 5, 7, 8, 11]),
         "ionian-sharp-5" => Ok(&[0, 2, 4, 5, 8, 9, 11]),
+        "ionian-augmented-sharp-2" => Ok(&[0, 3, 4, 5, 8, 9, 11]),
         "dorian" => Ok(&[0, 2, 3, 5, 7, 9, 10]),
         "dorian-b2" => Ok(&[0, 1, 3, 5, 7, 9, 10]),
         "ukrainian-dorian-b2" => Ok(&[0, 1, 3, 6, 7, 9, 10]),
@@ -1170,7 +1171,7 @@ fn parse_scale_name(value: &str) -> Result<&'static [u8], String> {
         "altered" => Ok(&[0, 1, 3, 4, 6, 8, 10]),
         "altered-dominant-natural-6" => Ok(&[0, 1, 3, 4, 6, 9, 10]),
         "super-locrian-bb7" => Ok(&[0, 1, 3, 4, 6, 8, 9]),
-        _ => Err("scale name must be major, harmonic-major, double-harmonic-major, ionian-sharp-5, dorian, dorian-b2, ukrainian-dorian-b2, dorian-sharp-4, dorian-b5, phrygian, phrygian-b4, phrygian-dominant, lydian, lydian-sharp-2, lydian-sharp-2-sharp-6, lydian-b3, lydian-augmented-sharp-2, lydian-augmented-sharp-3, lydian-augmented, lydian-dominant, mixolydian, mixolydian-b2, mixolydian-b6, natural-minor, locrian, locrian-natural-2, locrian-natural-6, locrian-bb7, harmonic-minor, harmonic-minor-b5, melodic-minor, melodic-minor-sharp-5, neapolitan-minor, neapolitan-major, hungarian-minor, hungarian-major, hungarian-major-mode-2, persian, oriental, blues, major-pentatonic, minor-pentatonic, whole-tone, whole-half-diminished, half-whole-diminished, altered, altered-dominant-natural-6, or super-locrian-bb7".to_owned()),
+        _ => Err("scale name must be major, harmonic-major, double-harmonic-major, ionian-sharp-5, ionian-augmented-sharp-2, dorian, dorian-b2, ukrainian-dorian-b2, dorian-sharp-4, dorian-b5, phrygian, phrygian-b4, phrygian-dominant, lydian, lydian-sharp-2, lydian-sharp-2-sharp-6, lydian-b3, lydian-augmented-sharp-2, lydian-augmented-sharp-3, lydian-augmented, lydian-dominant, mixolydian, mixolydian-b2, mixolydian-b6, natural-minor, locrian, locrian-natural-2, locrian-natural-6, locrian-bb7, harmonic-minor, harmonic-minor-b5, melodic-minor, melodic-minor-sharp-5, neapolitan-minor, neapolitan-major, hungarian-minor, hungarian-major, hungarian-major-mode-2, persian, oriental, blues, major-pentatonic, minor-pentatonic, whole-tone, whole-half-diminished, half-whole-diminished, altered, altered-dominant-natural-6, or super-locrian-bb7".to_owned()),
     }
 }
 
@@ -3867,6 +3868,10 @@ mod tests {
         assert_eq!(
             parse_scale_name("ionian-sharp-5"),
             Ok(&[0, 2, 4, 5, 8, 9, 11][..])
+        );
+        assert_eq!(
+            parse_scale_name("ionian-augmented-sharp-2"),
+            Ok(&[0, 3, 4, 5, 8, 9, 11][..])
         );
         assert_eq!(parse_scale_name("dorian"), Ok(&[0, 2, 3, 5, 7, 9, 10][..]));
         assert_eq!(
