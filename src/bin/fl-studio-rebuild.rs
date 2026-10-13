@@ -2951,6 +2951,7 @@ struct DawUi {
     playlist_grid_viewport: Option<egui::Rect>,
     playlist_grid_scroll_offset: Vec2,
     step_sequencer_bar: u32,
+    step_sequencer_add_note_key: u16,
     selected_graph_channel: Option<u16>,
     selected_rack_channels: BTreeSet<u16>,
     rack_selection_anchor: Option<u16>,
@@ -3574,6 +3575,7 @@ impl DawUi {
             playlist_grid_viewport: None,
             playlist_grid_scroll_offset: Vec2::ZERO,
             step_sequencer_bar: 0,
+            step_sequencer_add_note_key: 60,
             selected_graph_channel: None,
             selected_rack_channels: BTreeSet::new(),
             rack_selection_anchor: None,
@@ -14318,6 +14320,7 @@ impl DawUi {
         let mut layer_edits = Vec::new();
         let mut layer_flag_edits = Vec::new();
         let mut step_toggles = Vec::<(u16, Vec<usize>, u32)>::new();
+        let mut step_note_additions = Vec::<(u16, u32, u16)>::new();
         let mut dropped_samples = Vec::new();
         let mut new_sampler_sample = None;
         ui.horizontal(|ui| {
@@ -15024,19 +15027,34 @@ impl DawUi {
                                         } else {
                                             format!("{:02}", step + 1)
                                         };
-                                        if ui
-                                            .selectable_label(
-                                                !active_notes.is_empty(),
-                                                label,
-                                            )
-                                            .clicked()
-                                        {
+                                        let response = ui.selectable_label(!active_notes.is_empty(), label);
+                                        if response.clicked() {
                                             step_toggles.push((
                                                 channel.id(),
                                                 active_notes,
                                                 position,
                                             ));
                                         }
+                                        response.context_menu(|ui| {
+                                            ui.label("Add another note at this step");
+                                            ui.horizontal(|ui| {
+                                                ui.label("Key");
+                                                ui.add(
+                                                    egui::DragValue::new(
+                                                        &mut self.step_sequencer_add_note_key,
+                                                    )
+                                                    .range(0..=131),
+                                                );
+                                            });
+                                            if ui.button("Add note").clicked() {
+                                                step_note_additions.push((
+                                                    channel.id(),
+                                                    position,
+                                                    self.step_sequencer_add_note_key,
+                                                ));
+                                                ui.close();
+                                            }
+                                        });
                                     }
                                 }
                             if !zipped {
@@ -15217,12 +15235,30 @@ impl DawUi {
                             } else {
                                 format!("{:02}", step + 1)
                             };
-                            if ui
-                                .selectable_label(!active_notes.is_empty(), label)
-                                .clicked()
-                            {
+                            let response = ui.selectable_label(!active_notes.is_empty(), label);
+                            if response.clicked() {
                                 step_toggles.push((channel.id(), active_notes, position));
                             }
+                            response.context_menu(|ui| {
+                                ui.label("Add another note at this step");
+                                ui.horizontal(|ui| {
+                                    ui.label("Key");
+                                    ui.add(
+                                        egui::DragValue::new(
+                                            &mut self.step_sequencer_add_note_key,
+                                        )
+                                        .range(0..=131),
+                                    );
+                                });
+                                if ui.button("Add note").clicked() {
+                                    step_note_additions.push((
+                                        channel.id(),
+                                        position,
+                                        self.step_sequencer_add_note_key,
+                                    ));
+                                    ui.close();
+                                }
+                            });
                         }
                     });
                 }
@@ -15244,7 +15280,7 @@ impl DawUi {
             ui.separator();
             ui.label(
                 egui::RichText::new(
-                    "Click a step to add or remove a C5 note at sixteenth-note resolution. Use the graph editor for note and event values.",
+                    "Click an empty step to add C5 or a populated step to remove all its notes. Right-click a step to add another note at a chosen key.",
                 )
                     .color(MUTED),
             );
@@ -15535,6 +15571,42 @@ impl DawUi {
                     }
                     Err(error) => {
                         self.status = format!("Could not edit step: {error}");
+                    }
+                }
+            }
+        }
+        if let Some(pattern_id) = self.selected_pattern
+            && !step_note_additions.is_empty()
+        {
+            for (channel_id, position, key) in step_note_additions {
+                let result = self.document.as_mut().map_or_else(
+                    || Err("no project is open".to_owned()),
+                    |document| {
+                        document
+                            .add_pattern_note(
+                                pattern_id,
+                                PatternNote {
+                                    position,
+                                    channel_id,
+                                    length: step_ticks.min(u64::from(u32::MAX)) as u32,
+                                    key,
+                                    velocity: 100,
+                                    ..PatternNote::default()
+                                },
+                            )
+                            .map_err(|error| error.to_string())
+                    },
+                );
+                match result {
+                    Ok(()) => {
+                        self.stop_project_playback();
+                        self.dirty = true;
+                        self.status = format!(
+                            "Added key {key} note to step in pattern {pattern_id}, channel {channel_id}"
+                        );
+                    }
+                    Err(error) => {
+                        self.status = format!("Could not add note to step: {error}");
                     }
                 }
             }
