@@ -2349,11 +2349,19 @@ struct ActiveNoteDrag {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlaylistClipResizeEdge {
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PlaylistClipDragKind {
     Move,
     Resize,
     ResizeAudioTicks {
+        edge: PlaylistClipResizeEdge,
         source_start_tick: u32,
+        source_end_tick: u32,
         sample_length_ticks: u32,
     },
     Slip,
@@ -13051,7 +13059,7 @@ impl DawUi {
                                     slip_unavailable_reason
                                 }
                             } else if clip.has_opaque_record_tail() && is_audio_clip {
-                                "Drag to move. Shift-drag the right edge to extend or trim this Audio Clip's explicit source tick window."
+                                "Drag to move. Shift-drag either edge to trim or extend this Audio Clip's explicit source tick window."
                             } else if clip.has_opaque_record_tail() {
                                 "Drag to move. Shift-drag the right edge to resize this Pattern Clip; its full source window will be kept in sync."
                             } else {
@@ -13356,9 +13364,31 @@ impl DawUi {
                                     .or_else(|| response.interact_pointer_pos())
                             {
                                 self.active_playlist_clip_drag_targets.clear();
-                                let resize_requested = ui.input(|input| input.modifiers.shift)
-                                    && pointer.x >= clip_rect.right() - 8.0;
-                                let resize = resize_requested && can_resize_clip;
+                                let resize_edge_requested =
+                                    if ui.input(|input| input.modifiers.shift) {
+                                        let left_distance = (pointer.x - clip_rect.left()).abs();
+                                        let right_distance = (clip_rect.right() - pointer.x).abs();
+                                        let near_left = left_distance <= 8.0;
+                                        let near_right = right_distance <= 8.0;
+                                        match (near_left, near_right) {
+                                            (true, true) if left_distance <= right_distance => {
+                                                Some(PlaylistClipResizeEdge::Left)
+                                            }
+                                            (true, true) => Some(PlaylistClipResizeEdge::Right),
+                                            (true, false) => Some(PlaylistClipResizeEdge::Left),
+                                            (false, true) => Some(PlaylistClipResizeEdge::Right),
+                                            (false, false) => None,
+                                        }
+                                    } else {
+                                        None
+                                    };
+                                let resize_requested = resize_edge_requested.is_some();
+                                let can_resize_edge = match resize_edge_requested {
+                                    Some(PlaylistClipResizeEdge::Left) => can_resize_audio_ticks,
+                                    Some(PlaylistClipResizeEdge::Right) => can_resize_clip,
+                                    None => false,
+                                };
+                                let resize = resize_requested && can_resize_edge;
                                 let slip_requested =
                                     self.playlist_slip_tool_active && is_audio_clip && !resize;
                                 let preserve_selected_group = !resize
@@ -13430,11 +13460,14 @@ impl DawUi {
                                             tempo_bpm: self.tempo_bpm,
                                             kind: if resize {
                                                 if can_resize_audio_ticks {
+                                                    let (source_start_tick, source_end_tick) =
+                                                        clip.source_window_ticks().unwrap_or_default();
                                                     PlaylistClipDragKind::ResizeAudioTicks {
-                                                        source_start_tick: clip
-                                                            .source_window_ticks()
-                                                            .unwrap_or_default()
-                                                            .0,
+                                                        edge: resize_edge_requested.unwrap_or(
+                                                            PlaylistClipResizeEdge::Right,
+                                                        ),
+                                                        source_start_tick,
+                                                        source_end_tick,
                                                         sample_length_ticks: sample_length_ticks
                                                             .unwrap_or_default(),
                                                     }
@@ -36177,25 +36210,52 @@ fn playlist_clip_drag_edit(
             ..PlaylistClipEdit::default()
         },
         PlaylistClipDragKind::ResizeAudioTicks {
+            edge,
             source_start_tick,
+            source_end_tick,
             sample_length_ticks,
-        } => {
-            let max_length_ticks = sample_length_ticks.saturating_sub(source_start_tick);
-            let length_ticks = snap_note_tick(
-                i64::from(drag.start_length_ticks).saturating_add(tick_delta),
-                snap_ticks,
-                1,
-            )
-            .min(max_length_ticks);
-            PlaylistClipEdit {
-                length_ticks: Some(length_ticks),
-                source_window_ticks: Some((
-                    source_start_tick,
-                    source_start_tick.saturating_add(length_ticks),
-                )),
-                ..PlaylistClipEdit::default()
+        } => match edge {
+            PlaylistClipResizeEdge::Right => {
+                let max_length_ticks = sample_length_ticks.saturating_sub(source_start_tick);
+                let length_ticks = snap_note_tick(
+                    i64::from(drag.start_length_ticks).saturating_add(tick_delta),
+                    snap_ticks,
+                    1,
+                )
+                .min(max_length_ticks);
+                PlaylistClipEdit {
+                    length_ticks: Some(length_ticks),
+                    source_window_ticks: Some((
+                        source_start_tick,
+                        source_start_tick.saturating_add(length_ticks),
+                    )),
+                    ..PlaylistClipEdit::default()
+                }
             }
-        }
+            PlaylistClipResizeEdge::Left => {
+                let start_position = i64::from(drag.start_position_ticks);
+                let end_position = start_position + i64::from(drag.start_length_ticks);
+                let minimum_position = 0_i64
+                    .max(start_position - i64::from(source_start_tick))
+                    .max(end_position - i64::from(u32::MAX));
+                let maximum_position = (end_position - 1).min(i64::from(u32::MAX));
+                let position_ticks = i64::from(snap_note_tick(
+                    start_position.saturating_add(tick_delta),
+                    snap_ticks,
+                    0,
+                ))
+                .clamp(minimum_position, maximum_position);
+                let source_delta = position_ticks - start_position;
+                let source_start_tick = (i64::from(source_start_tick) + source_delta) as u32;
+                let length_ticks = (end_position - position_ticks) as u32;
+                PlaylistClipEdit {
+                    position_ticks: Some(position_ticks as u32),
+                    length_ticks: Some(length_ticks),
+                    source_window_ticks: Some((source_start_tick, source_end_tick)),
+                    ..PlaylistClipEdit::default()
+                }
+            }
+        },
         PlaylistClipDragKind::Slip => {
             let tick_delta = if snap {
                 snap_signed_tick_delta(tick_delta, snap_ticks)
