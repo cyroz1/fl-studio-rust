@@ -2624,6 +2624,10 @@ enum AutomationEditAction {
     Delete {
         point_index: usize,
     },
+    Interpolate {
+        first_point_index: usize,
+        last_point_index: usize,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -3277,6 +3281,8 @@ struct DawUi {
     selected_automation_channel: Option<u16>,
     selected_automation_point: Option<usize>,
     automation_add_mode: bool,
+    automation_interpolate_mode: bool,
+    automation_interpolation_anchor: Option<usize>,
     automation_snap: bool,
     automation_visible_beats: f64,
     last_plugin_action: Option<String>,
@@ -3919,6 +3925,8 @@ impl DawUi {
             selected_automation_channel: None,
             selected_automation_point: None,
             automation_add_mode: false,
+            automation_interpolate_mode: false,
+            automation_interpolation_anchor: None,
             automation_snap: true,
             automation_visible_beats: 16.0,
             last_plugin_action: None,
@@ -4810,6 +4818,8 @@ impl DawUi {
                     .and_then(|channels| channels.first().map(AutomationChannel::channel_id));
                 self.selected_automation_point = None;
                 self.automation_add_mode = false;
+                self.automation_interpolate_mode = false;
+                self.automation_interpolation_anchor = None;
                 self.last_plugin_action = None;
                 self.vst3_host = None;
                 self.channel_vst3_instances.clear();
@@ -6882,6 +6892,9 @@ impl DawUi {
         self.active_playlist_clip_drag = None;
         self.selected_time_marker = None;
         self.selected_automation_point = None;
+        self.automation_add_mode = false;
+        self.automation_interpolate_mode = false;
+        self.automation_interpolation_anchor = None;
         self.active_note_drag = None;
         self.selected_piano_notes.clear();
         self.piano_roll_time_selection = None;
@@ -18892,11 +18905,40 @@ impl DawUi {
                 .iter()
                 .find(|channel| channel.channel_id() == channel_id)
                 .is_some_and(|channel| channel.data_event_index().is_some());
+            let can_interpolate = automation_channels
+                .iter()
+                .find(|channel| channel.channel_id() == channel_id)
+                .is_some_and(|channel| {
+                    let points = channel.points();
+                    channel.data_event_index().is_some()
+                        && points.len() >= 3
+                        && points.iter().all(|point| {
+                            point.position_beats().is_finite()
+                                && point.position_beats() >= 0.0
+                                && point.value().is_finite()
+                                && (-0.001..=1.001).contains(&point.value())
+                                && point.tension().is_finite()
+                        })
+                        && points
+                            .windows(2)
+                            .all(|pair| pair[0].position_beats() < pair[1].position_beats())
+                });
             let add = ui.add_enabled_ui(has_blob, |ui| {
                 ui.selectable_label(self.automation_add_mode, "Add point")
             });
             if add.inner.clicked() {
                 self.automation_add_mode = !self.automation_add_mode;
+                self.automation_interpolate_mode = false;
+                self.automation_interpolation_anchor = None;
+                self.selected_automation_point = None;
+            }
+            let interpolate = ui.add_enabled_ui(can_interpolate, |ui| {
+                ui.selectable_label(self.automation_interpolate_mode, "Interpolate")
+            });
+            if interpolate.inner.clicked() {
+                self.automation_interpolate_mode = !self.automation_interpolate_mode;
+                self.automation_add_mode = false;
+                self.automation_interpolation_anchor = None;
                 self.selected_automation_point = None;
             }
             let can_delete = self.selected_automation_point.is_some();
@@ -18913,6 +18955,8 @@ impl DawUi {
         if old_channel_id != Some(channel_id) {
             self.selected_automation_point = None;
             self.automation_add_mode = false;
+            self.automation_interpolate_mode = false;
+            self.automation_interpolation_anchor = None;
             action = None;
         }
         self.selected_automation_channel = Some(channel_id);
@@ -18954,6 +18998,18 @@ impl DawUi {
             }
             if self.automation_add_mode {
                 ui.colored_label(ORANGE, "Click inside the graph to insert a point");
+            } else if self.automation_interpolate_mode {
+                if let Some(anchor) = self.automation_interpolation_anchor {
+                    ui.colored_label(
+                        ORANGE,
+                        format!("Start point {} selected · click an end point", anchor + 1),
+                    );
+                } else {
+                    ui.colored_label(
+                        ORANGE,
+                        "Click two endpoints to linearly interpolate the points between them",
+                    );
+                }
             } else {
                 ui.colored_label(MUTED, "Drag a point to edit its position and value");
             }
@@ -19066,10 +19122,12 @@ impl DawUi {
             let response = ui.interact(
                 hit_rect,
                 Id::new(("automation-point", channel_id, point_index)),
-                if points_are_editable {
-                    Sense::click_and_drag()
-                } else {
+                if !points_are_editable {
                     Sense::hover()
+                } else if self.automation_interpolate_mode {
+                    Sense::click()
+                } else {
+                    Sense::click_and_drag()
                 },
             );
             let selected = selected_index == Some(point_index);
@@ -19085,7 +19143,21 @@ impl DawUi {
             );
             if response.clicked() {
                 interacted_with_point = true;
-                self.selected_automation_point = Some(point_index);
+                if self.automation_interpolate_mode {
+                    self.selected_automation_point = Some(point_index);
+                    if let Some(anchor) = self.automation_interpolation_anchor.take() {
+                        if anchor != point_index {
+                            action = Some(AutomationEditAction::Interpolate {
+                                first_point_index: anchor.min(point_index),
+                                last_point_index: anchor.max(point_index),
+                            });
+                        }
+                    } else {
+                        self.automation_interpolation_anchor = Some(point_index);
+                    }
+                } else {
+                    self.selected_automation_point = Some(point_index);
+                }
             }
             if response.dragged()
                 && let Some(pointer) = response.interact_pointer_pos()
@@ -19155,6 +19227,9 @@ impl DawUi {
                     tension: 0.0,
                 });
             } else {
+                if self.automation_interpolate_mode {
+                    self.automation_interpolation_anchor = None;
+                }
                 self.selected_automation_point = None;
             }
         }
@@ -19162,6 +19237,7 @@ impl DawUi {
         if let Some(action) = action
             && let Some(document) = self.document.as_mut()
         {
+            let mut interpolation_count = None;
             let result = match action {
                 AutomationEditAction::Insert {
                     slot,
@@ -19185,13 +19261,41 @@ impl DawUi {
                 AutomationEditAction::Delete { point_index } => {
                     self.selected_automation_point = None;
                     self.automation_add_mode = false;
+                    self.automation_interpolate_mode = false;
+                    self.automation_interpolation_anchor = None;
                     document.delete_automation_point(channel_id, point_index)
+                }
+                AutomationEditAction::Interpolate {
+                    first_point_index,
+                    last_point_index,
+                } => {
+                    self.selected_automation_point = Some(last_point_index);
+                    self.automation_interpolate_mode = false;
+                    self.automation_interpolation_anchor = None;
+                    document
+                        .interpolate_automation_points(
+                            channel_id,
+                            first_point_index,
+                            last_point_index,
+                        )
+                        .map(|count| interpolation_count = Some(count))
                 }
             };
             match result {
                 Ok(()) => {
-                    self.dirty = true;
-                    self.status = "Automation curve updated".to_owned();
+                    if let Some(count) = interpolation_count {
+                        if count == 0 {
+                            self.status =
+                                "There are no automation points between those endpoints".to_owned();
+                        } else {
+                            self.dirty = true;
+                            self.status =
+                                format!("Linearly interpolated {count} automation point values");
+                        }
+                    } else {
+                        self.dirty = true;
+                        self.status = "Automation curve updated".to_owned();
+                    }
                 }
                 Err(error) => self.status = format!("Could not edit automation: {error}"),
             }

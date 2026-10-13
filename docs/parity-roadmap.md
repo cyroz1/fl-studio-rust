@@ -285,7 +285,7 @@ FL Studio's piano roll is famously deep — the full toolset:
 
 ## 11. Automation system
 
-- `[partial]` Type-5 channel points: read/edit/insert/remove points in existing `0xEA` blobs while preserving unmodified point bytes and opaque header/trailer data; desktop editing is implemented with a straight-line preview, while FL interpolation modes remain incomplete
+- `[partial]` Type-5 channel points: read/edit/insert/remove points in existing `0xEA` blobs while preserving unmodified point bytes and opaque header/trailer data; the Automation editor can linearly interpolate stored values between two selected endpoints while retaining point positions. Its preview uses straight segments; FL interpolation and tension modes remain incomplete
 - `[partial]` Event automation (pattern-scoped): raw candidate `0xDF` points can be edited in the Piano roll Events lane, including snapped Draw with Alt snap bypass, unsnapped Paint, Shift value lock, linear Interpolate, right-drag spline interpolation, and range Erase. Edits retain uninterpreted channel/flags bytes, and interpolation retains point positions. The spline uses a local cubic smoothstep curve because Image-Line does not document the equation; native links, stream creation without an existing template, target mapping, Event Editor recording, Automation Clip conversion, and native save verification remain incomplete ([Image-Line Event Editor manual](https://www.image-line.com/fl-studio-learning/fl-studio-online-manual/html/automation_eventeditor.htm)).
 - `[todo]` "Create automation clip" / "Link to controller" for any parameter
 - `[todo]` Internal controllers: LFO, envelope, formula, peak, X-Y, keyboard

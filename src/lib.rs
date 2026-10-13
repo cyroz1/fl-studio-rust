@@ -12695,6 +12695,100 @@ impl FlpDocument {
         Ok(())
     }
 
+    /// Linearly interpolates the values of the points strictly between two
+    /// existing type-5 automation points. Positions, tension, opaque point
+    /// state, and the automation blob's header and trailer are retained.
+    pub fn interpolate_automation_points(
+        &mut self,
+        channel_id: u16,
+        first_point_index: usize,
+        last_point_index: usize,
+    ) -> Result<usize, FlpError> {
+        let channels = self.channels();
+        let mut matching = channels.iter().filter(|channel| channel.id == channel_id);
+        let Some(channel) = matching.next() else {
+            return Err(FlpError::ChannelNotFound(channel_id));
+        };
+        if matching.next().is_some() {
+            return Err(FlpError::AmbiguousChannelId(channel_id));
+        }
+        if channel.kind != Some(5) {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel is not a type-5 automation channel",
+            ));
+        }
+        let event_index = channel
+            .event_range()
+            .find(|index| self.events[*index].opcode == 0xEA)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the selected automation channel has no existing 0xEA point blob",
+            ))?;
+        let points = decode_automation_points(&self.events[event_index])?;
+        let Some(first) = points.get(first_point_index) else {
+            return Err(FlpError::UnsupportedEdit(
+                "the first automation interpolation point does not exist",
+            ));
+        };
+        let Some(last) = points.get(last_point_index) else {
+            return Err(FlpError::UnsupportedEdit(
+                "the last automation interpolation point does not exist",
+            ));
+        };
+        if first_point_index >= last_point_index {
+            return Err(FlpError::UnsupportedEdit(
+                "automation interpolation endpoints must be in ascending point order",
+            ));
+        }
+        if !first.position_beats.is_finite()
+            || !last.position_beats.is_finite()
+            || last.position_beats <= first.position_beats
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "automation interpolation endpoints must have distinct, finite positions",
+            ));
+        }
+        for pair in points[first_point_index..=last_point_index].windows(2) {
+            if !pair[0].position_beats.is_finite()
+                || !pair[1].position_beats.is_finite()
+                || pair[1].position_beats <= pair[0].position_beats
+            {
+                return Err(FlpError::UnsupportedEdit(
+                    "automation interpolation points must have distinct, increasing positions",
+                ));
+            }
+        }
+        validate_automation_point_value(first.value)?;
+        validate_automation_point_value(last.value)?;
+        let interpolated = last_point_index - first_point_index - 1;
+        if interpolated == 0 {
+            return Ok(0);
+        }
+
+        let mut payload = self.events[event_index].payload.clone();
+        let point_span = last.position_beats - first.position_beats;
+        for (point_index, point) in points
+            .iter()
+            .enumerate()
+            .take(last_point_index)
+            .skip(first_point_index + 1)
+        {
+            let fraction = (point.position_beats - first.position_beats) / point_span;
+            let value = first.value + (last.value - first.value) * fraction;
+            validate_automation_point_value(value)?;
+            let point_offset = FLP_AUTOMATION_POINTS_OFFSET
+                .checked_add(
+                    point_index
+                        .checked_mul(FLP_AUTOMATION_POINT_SIZE)
+                        .ok_or(FlpError::LengthOverflow)?,
+                )
+                .ok_or(FlpError::LengthOverflow)?;
+            payload[point_offset + 8..point_offset + 16].copy_from_slice(&value.to_le_bytes());
+        }
+        self.events[event_index].replace_data_payload(payload)?;
+        self.refresh_event_offsets()?;
+        Ok(interpolated)
+    }
+
     /// Inserts a point into an existing type-5 channel automation blob.
     ///
     /// `point_index` is an insertion slot and may equal the current point count.
