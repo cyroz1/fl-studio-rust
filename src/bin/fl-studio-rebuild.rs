@@ -11512,6 +11512,7 @@ impl DawUi {
         let mut merge_pattern_clips_requested = None;
         let mut seek_tick_requested = None;
         let mut dropped_playlist_audio = None;
+        let mut playlist_clip_vertical_move = None;
         let mut selected_track_bulk_action = None;
         let selected_track_count = self.selected_playlist_tracks.len();
         let has_track_selection = selected_track_count > 0;
@@ -11826,6 +11827,17 @@ impl DawUi {
                 current.saturating_add(1).min(last_track_id)
             };
             self.set_playlist_track_selection(target, extend, false);
+        }
+        if !ui.ctx().egui_wants_keyboard_input() {
+            playlist_clip_vertical_move = ui.input_mut(|input| {
+                if input.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowUp) {
+                    Some(-1i8)
+                } else if input.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowDown) {
+                    Some(1)
+                } else {
+                    None
+                }
+            });
         }
         if touch_zoom_out_full && let Some(viewport) = self.playlist_grid_viewport {
             self.timeline_zoom = zoom_to_fit(
@@ -13148,6 +13160,86 @@ impl DawUi {
                 if enabled { "Unmuted" } else { "Muted" },
                 selected_track_ids.len()
             );
+        }
+
+        if let Some(direction) = playlist_clip_vertical_move {
+            let has_clip_selection = self.selected_arrangement == Some(arrangement.id)
+                && (!self.selected_playlist_clips.is_empty() || self.selected_clip.is_some());
+            let move_all = !has_clip_selection;
+            let clip_indices = if move_all {
+                (0..arrangement.clips.len()).collect::<Vec<_>>()
+            } else if self.selected_playlist_clips.is_empty() {
+                self.selected_clip
+                    .filter(|index| *index < arrangement.clips.len())
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            } else {
+                self.selected_playlist_clips
+                    .iter()
+                    .copied()
+                    .filter(|index| *index < arrangement.clips.len())
+                    .collect::<Vec<_>>()
+            };
+            if clip_indices.is_empty() {
+                self.status = "No Playlist clips are available to move".to_owned();
+            } else {
+                let result = self.document.as_ref().map(|document| {
+                    let mut updated = document.clone();
+                    let mut moved_count = 0usize;
+                    for clip_index in &clip_indices {
+                        let clip = arrangement.clips.get(*clip_index).ok_or_else(|| {
+                            "the selected Playlist clip no longer exists".to_owned()
+                        })?;
+                        let track_index = clip.track_index.ok_or_else(|| {
+                            "the selected Playlist clip has an unsupported track index".to_owned()
+                        })?;
+                        let target_track = if direction < 0 {
+                            track_index.saturating_sub(1)
+                        } else {
+                            track_index.saturating_add(1).min(499)
+                        };
+                        if target_track == track_index {
+                            continue;
+                        }
+                        updated
+                            .edit_playlist_clip(
+                                arrangement.id,
+                                *clip_index,
+                                PlaylistClipEdit {
+                                    raw_track_index: Some(499 - target_track),
+                                    ..PlaylistClipEdit::default()
+                                },
+                            )
+                            .map_err(|error| error.to_string())?;
+                        moved_count += 1;
+                    }
+                    Ok::<_, String>((updated, moved_count))
+                });
+                match result {
+                    Some(Ok((updated, moved_count))) if moved_count > 0 => {
+                        self.document = Some(updated);
+                        self.stop_project_playback();
+                        self.dirty = true;
+                        ui.ctx().request_repaint();
+                        self.status = format!(
+                            "Moved {moved_count}{} Playlist {} {} one track",
+                            if move_all { "" } else { " selected" },
+                            if moved_count == 1 { "clip" } else { "clips" },
+                            if direction < 0 { "up" } else { "down" }
+                        );
+                    }
+                    Some(Ok(_)) => {
+                        self.status = format!(
+                            "Playlist clip(s) are already at the {} track boundary",
+                            if direction < 0 { "top" } else { "bottom" }
+                        );
+                    }
+                    Some(Err(error)) => {
+                        self.status = format!("Could not move Playlist clips: {error}");
+                    }
+                    None => self.status = "Open a project to move Playlist clips".to_owned(),
+                }
+            }
         }
 
         let mut playlist_clip_list_changed = false;
