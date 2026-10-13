@@ -11562,6 +11562,13 @@ impl DawUi {
             .copied()
             .filter(|track_id| tracks.iter().any(|track| track.id == *track_id))
             .collect::<Vec<_>>();
+        let selected_track_solo_range = selected_track_ids
+            .first()
+            .zip(selected_track_ids.last())
+            .and_then(|(&first, &last)| {
+                (last.saturating_sub(first).saturating_add(1) == selected_track_ids.len() as u32)
+                    .then_some((first, last))
+            });
         ui.horizontal_wrapped(|ui| {
             ui.label("Arrangement");
             ui.strong(arrangement.name.as_deref().unwrap_or("Arrangement"));
@@ -11648,6 +11655,21 @@ impl DawUi {
                                 )
                             },
                         ));
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            selected_track_solo_range.is_some(),
+                            egui::Button::new("Solo selected tracks"),
+                        )
+                        .on_hover_text(if selected_track_solo_range.is_some() {
+                            "Solo the selected contiguous Playlist track range"
+                        } else {
+                            "Select a contiguous Playlist track range to solo it"
+                        })
+                        .clicked()
+                    {
+                        solo_playlist_track_requested = selected_track_solo_range;
                         ui.close();
                     }
                     let can_group_selected = selected_track_ids.iter().any(|track_id| {
