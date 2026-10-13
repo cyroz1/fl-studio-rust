@@ -1478,6 +1478,7 @@ enum PianoRollScale {
     Lydian,
     LydianSharpTwo,
     LydianSharpTwoSharpSix,
+    LydianSharpSix,
     LydianFlatThree,
     LydianAugmentedSharpTwo,
     LydianAugmentedSharpThree,
@@ -1515,7 +1516,7 @@ enum PianoRollScale {
 }
 
 impl PianoRollScale {
-    const ALL: [Self; 52] = [
+    const ALL: [Self; 53] = [
         Self::None,
         Self::Major,
         Self::HarmonicMajor,
@@ -1534,6 +1535,7 @@ impl PianoRollScale {
         Self::Lydian,
         Self::LydianSharpTwo,
         Self::LydianSharpTwoSharpSix,
+        Self::LydianSharpSix,
         Self::LydianFlatThree,
         Self::LydianAugmentedSharpTwo,
         Self::LydianAugmentedSharpThree,
@@ -1590,6 +1592,7 @@ impl PianoRollScale {
             Self::Lydian => "Lydian",
             Self::LydianSharpTwo => "Lydian #2",
             Self::LydianSharpTwoSharpSix => "Lydian #2 #6",
+            Self::LydianSharpSix => "Lydian #6",
             Self::LydianFlatThree => "Lydian b3",
             Self::LydianAugmentedSharpTwo => "Lydian augmented #2",
             Self::LydianAugmentedSharpThree => "Lydian augmented #3",
@@ -1654,6 +1657,7 @@ impl PianoRollScale {
             Self::Lydian => &[0, 2, 4, 6, 7, 9, 11],
             Self::LydianSharpTwo => &[0, 3, 4, 6, 7, 9, 11],
             Self::LydianSharpTwoSharpSix => &[0, 3, 4, 6, 7, 10, 11],
+            Self::LydianSharpSix => &[0, 2, 4, 6, 7, 10, 11],
             Self::LydianFlatThree => &[0, 2, 3, 6, 7, 9, 11],
             Self::LydianAugmentedSharpTwo => &[0, 3, 4, 6, 8, 9, 11],
             Self::LydianAugmentedSharpThree => &[0, 2, 5, 6, 8, 9, 11],
@@ -1732,6 +1736,7 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
         PianoRollScale::Lydian,
         PianoRollScale::LydianSharpTwo,
         PianoRollScale::LydianSharpTwoSharpSix,
+        PianoRollScale::LydianSharpSix,
         PianoRollScale::LydianFlatThree,
         PianoRollScale::LydianAugmentedSharpTwo,
         PianoRollScale::LydianAugmentedSharpThree,
@@ -1845,6 +1850,7 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
                 PianoRollScale::Lydian => -4,
                 PianoRollScale::LydianSharpTwo => -21,
                 PianoRollScale::LydianSharpTwoSharpSix => -32,
+                PianoRollScale::LydianSharpSix => -34,
                 PianoRollScale::LydianFlatThree => -25,
                 PianoRollScale::LydianAugmentedSharpTwo => -26,
                 PianoRollScale::LydianAugmentedSharpThree => -37,
