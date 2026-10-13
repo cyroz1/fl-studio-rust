@@ -53,9 +53,10 @@ use flp_rebuild::{
     MixerParameterRecord, PATTERN_NOTE_DEFAULT_FLAGS, PATTERN_NOTE_DEFAULT_RELEASE, Pattern,
     PatternController, PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation,
     PayloadEncoding, PlaylistClip, PlaylistClipEdit, PlaylistClipSelectionClipboard,
-    PlaylistClipTarget, PlaylistTrack, PlaylistTrackEdit, PlaylistTrackSync, ProjectInfoEdit,
-    ProjectSettingsEdit, RandomizerOptions, RiffMachineOptions, RiffMachineQuantizeMode,
-    ScaleLevelsOptions, TimeMarker, TimeMarkerEdit, VstPluginStateMetadata,
+    PlaylistClipTarget, PlaylistTrack, PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress,
+    PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions, RiffMachineOptions,
+    RiffMachineQuantizeMode, ScaleLevelsOptions, TimeMarker, TimeMarkerEdit,
+    VstPluginStateMetadata,
 };
 use md5::{Digest, Md5};
 
@@ -13469,6 +13470,104 @@ impl DawUi {
                                 }
                                 if track_id == 1 {
                                     ui.weak("The first track has no track above it");
+                                }
+                                let mut selected_press = track.press;
+                                let mut requested_press = None;
+                                ui.horizontal(|ui| {
+                                    ui.label("Press").on_hover_text(
+                                        "Saved per-track press mode. Hold and Latch playback behavior is not implemented yet.",
+                                    );
+                                    egui::ComboBox::from_id_salt((
+                                        "playlist-track-press",
+                                        arrangement.id,
+                                        track_id,
+                                    ))
+                                    .selected_text(
+                                        track
+                                            .press
+                                            .map(playlist_track_press_label)
+                                            .unwrap_or("Unknown"),
+                                    )
+                                    .show_ui(ui, |ui| {
+                                        for (press, label) in [
+                                            (PlaylistTrackPress::Retrigger, "Retrigger"),
+                                            (PlaylistTrackPress::HoldStop, "Hold & stop"),
+                                            (PlaylistTrackPress::HoldMotion, "Hold & motion"),
+                                            (PlaylistTrackPress::Latch, "Latch"),
+                                        ] {
+                                            if ui
+                                                .selectable_value(
+                                                    &mut selected_press,
+                                                    Some(press),
+                                                    label,
+                                                )
+                                                .changed()
+                                            {
+                                                requested_press = Some(press);
+                                            }
+                                        }
+                                    });
+                                });
+                                if let Some(press) = requested_press {
+                                    playlist_track_edits_requested.push((
+                                        track_id,
+                                        PlaylistTrackEdit {
+                                            press: Some(press),
+                                            ..PlaylistTrackEdit::default()
+                                        },
+                                    ));
+                                }
+                                let mut selected_motion = track.motion;
+                                let mut requested_motion = None;
+                                ui.horizontal(|ui| {
+                                    ui.label("Motion").on_hover_text(
+                                        "Saved per-track motion mode. One-shot, march, and random clip selection behavior is not implemented yet.",
+                                    );
+                                    egui::ComboBox::from_id_salt((
+                                        "playlist-track-motion",
+                                        arrangement.id,
+                                        track_id,
+                                    ))
+                                    .selected_text(
+                                        track
+                                            .motion
+                                            .map(playlist_track_motion_label)
+                                            .unwrap_or("Unknown"),
+                                    )
+                                    .show_ui(ui, |ui| {
+                                        for (motion, label) in [
+                                            (PlaylistTrackMotion::Stay, "Stay"),
+                                            (PlaylistTrackMotion::OneShot, "One shot"),
+                                            (PlaylistTrackMotion::MarchWrap, "March & wrap"),
+                                            (PlaylistTrackMotion::MarchStay, "March & stay"),
+                                            (PlaylistTrackMotion::MarchStop, "March & stop"),
+                                            (PlaylistTrackMotion::Random, "Random"),
+                                            (
+                                                PlaylistTrackMotion::ExclusiveRandom,
+                                                "Exclusive random",
+                                            ),
+                                        ] {
+                                            if ui
+                                                .selectable_value(
+                                                    &mut selected_motion,
+                                                    Some(motion),
+                                                    label,
+                                                )
+                                                .changed()
+                                            {
+                                                requested_motion = Some(motion);
+                                            }
+                                        }
+                                    });
+                                });
+                                if let Some(motion) = requested_motion {
+                                    playlist_track_edits_requested.push((
+                                        track_id,
+                                        PlaylistTrackEdit {
+                                            motion: Some(motion),
+                                            ..PlaylistTrackEdit::default()
+                                        },
+                                    ));
                                 }
                                 let mut selected_sync = track.trigger_sync;
                                 let mut requested_sync = None;
@@ -41242,6 +41341,27 @@ fn playlist_track_sync_label(sync: PlaylistTrackSync) -> &'static str {
     }
 }
 
+fn playlist_track_press_label(press: PlaylistTrackPress) -> &'static str {
+    match press {
+        PlaylistTrackPress::Retrigger => "Retrigger",
+        PlaylistTrackPress::HoldStop => "Hold & stop",
+        PlaylistTrackPress::HoldMotion => "Hold & motion",
+        PlaylistTrackPress::Latch => "Latch",
+    }
+}
+
+fn playlist_track_motion_label(motion: PlaylistTrackMotion) -> &'static str {
+    match motion {
+        PlaylistTrackMotion::Stay => "Stay",
+        PlaylistTrackMotion::OneShot => "One shot",
+        PlaylistTrackMotion::MarchWrap => "March & wrap",
+        PlaylistTrackMotion::MarchStay => "March & stay",
+        PlaylistTrackMotion::MarchStop => "March & stop",
+        PlaylistTrackMotion::Random => "Random",
+        PlaylistTrackMotion::ExclusiveRandom => "Exclusive random",
+    }
+}
+
 fn playlist_performance_zone_start_tick(markers: &[TimeMarker]) -> Option<u32> {
     markers
         .iter()
@@ -44054,6 +44174,8 @@ mod tests {
                 name: None,
                 enabled: Some(true),
                 grouped: Some(matches!(id, 2 | 3)),
+                press: None,
+                motion: None,
                 trigger_sync: None,
                 queued: None,
                 position_sync: None,

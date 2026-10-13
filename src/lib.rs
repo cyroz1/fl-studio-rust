@@ -1784,6 +1784,75 @@ impl PlaylistTrackSync {
     }
 }
 
+/// Saved Performance Mode behavior for each press of a Playlist clip.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlaylistTrackPress {
+    Retrigger,
+    HoldStop,
+    HoldMotion,
+    Latch,
+}
+
+impl PlaylistTrackPress {
+    fn raw(self) -> i32 {
+        match self {
+            Self::Retrigger => 0,
+            Self::HoldStop => 1,
+            Self::HoldMotion => 2,
+            Self::Latch => 3,
+        }
+    }
+
+    fn from_raw(value: i32) -> Option<Self> {
+        match value {
+            0 => Some(Self::Retrigger),
+            1 => Some(Self::HoldStop),
+            2 => Some(Self::HoldMotion),
+            3 => Some(Self::Latch),
+            _ => None,
+        }
+    }
+}
+
+/// Saved Performance Mode rule for selecting the next clip on a Playlist track.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlaylistTrackMotion {
+    Stay,
+    OneShot,
+    MarchWrap,
+    MarchStay,
+    MarchStop,
+    Random,
+    ExclusiveRandom,
+}
+
+impl PlaylistTrackMotion {
+    fn raw(self) -> i32 {
+        match self {
+            Self::Stay => 0,
+            Self::OneShot => 1,
+            Self::MarchWrap => 2,
+            Self::MarchStay => 3,
+            Self::MarchStop => 4,
+            Self::Random => 5,
+            Self::ExclusiveRandom => 6,
+        }
+    }
+
+    fn from_raw(value: i32) -> Option<Self> {
+        match value {
+            0 => Some(Self::Stay),
+            1 => Some(Self::OneShot),
+            2 => Some(Self::MarchWrap),
+            3 => Some(Self::MarchStay),
+            4 => Some(Self::MarchStop),
+            5 => Some(Self::Random),
+            6 => Some(Self::ExclusiveRandom),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlaylistTrack {
     /// One-based Playlist track identifier stored in the `0xEE` record.
@@ -1795,6 +1864,10 @@ pub struct PlaylistTrack {
     pub enabled: Option<bool>,
     /// Whether this track is grouped with the Playlist track directly above it.
     pub grouped: Option<bool>,
+    /// Saved Performance Mode Press behavior for clips on this track.
+    pub press: Option<PlaylistTrackPress>,
+    /// Saved Performance Mode Motion behavior for clips on this track.
+    pub motion: Option<PlaylistTrackMotion>,
     /// Trigger timing for Performance Mode clips on this track.
     pub trigger_sync: Option<PlaylistTrackSync>,
     /// Whether Performance Mode queues triggered clips for this track.
@@ -1812,6 +1885,8 @@ pub struct PlaylistTrack {
 pub struct PlaylistTrackEdit {
     pub enabled: Option<bool>,
     pub grouped: Option<bool>,
+    pub press: Option<PlaylistTrackPress>,
+    pub motion: Option<PlaylistTrackMotion>,
     pub trigger_sync: Option<PlaylistTrackSync>,
     pub queued: Option<bool>,
     pub position_sync: Option<PlaylistTrackSync>,
@@ -5336,6 +5411,8 @@ impl FlpDocument {
                 decode_project_string(&name_event.payload, self.project_version.as_deref())
             })
             .filter(|value| !value.is_empty());
+        let motion = i32::from_le_bytes(event.payload[22..26].try_into().ok()?);
+        let press = i32::from_le_bytes(event.payload[26..30].try_into().ok()?);
         let trigger_sync = i32::from_le_bytes(event.payload[30..34].try_into().ok()?);
         let queued = match i32::from_le_bytes(event.payload[34..38].try_into().ok()?) {
             0 => Some(false),
@@ -5362,6 +5439,8 @@ impl FlpDocument {
                 1 => Some(true),
                 _ => None,
             },
+            press: PlaylistTrackPress::from_raw(press),
+            motion: PlaylistTrackMotion::from_raw(motion),
             trigger_sync: PlaylistTrackSync::from_raw(trigger_sync),
             queued,
             position_sync: PlaylistTrackSync::from_raw(position_sync),
@@ -5370,7 +5449,7 @@ impl FlpDocument {
         })
     }
 
-    /// Edits the observed mute, grouping, Trigger Sync, Queue, Position Sync, or Tolerant fields.
+    /// Edits observed mute, grouping, Press, Motion, Trigger Sync, Queue, Position Sync, or Tolerant fields.
     /// This unscoped form reports an error when the track ID occurs in multiple arrangements.
     pub fn edit_playlist_track(
         &mut self,
@@ -5380,6 +5459,8 @@ impl FlpDocument {
         Self::validate_playlist_track_edit(track_id, edit)?;
         if edit.enabled.is_none()
             && edit.grouped.is_none()
+            && edit.press.is_none()
+            && edit.motion.is_none()
             && edit.trigger_sync.is_none()
             && edit.queued.is_none()
             && edit.position_sync.is_none()
@@ -5401,6 +5482,8 @@ impl FlpDocument {
         Self::validate_playlist_track_edit(track_id, edit)?;
         if edit.enabled.is_none()
             && edit.grouped.is_none()
+            && edit.press.is_none()
+            && edit.motion.is_none()
             && edit.trigger_sync.is_none()
             && edit.queued.is_none()
             && edit.position_sync.is_none()
@@ -5498,6 +5581,20 @@ impl FlpDocument {
         }
         if let Some(grouped) = edit.grouped {
             write_event_payload_bytes(&mut self.events[event_index], 46, &[u8::from(grouped)])?;
+        }
+        if let Some(motion) = edit.motion {
+            write_event_payload_bytes(
+                &mut self.events[event_index],
+                22,
+                &motion.raw().to_le_bytes(),
+            )?;
+        }
+        if let Some(press) = edit.press {
+            write_event_payload_bytes(
+                &mut self.events[event_index],
+                26,
+                &press.raw().to_le_bytes(),
+            )?;
         }
         if let Some(trigger_sync) = edit.trigger_sync {
             write_event_payload_bytes(
@@ -15813,6 +15910,63 @@ mod tests {
         event_stream.extend_from_slice(payload);
     }
 
+    #[test]
+    fn playlist_track_press_motion_edits_preserve_other_state_bytes() {
+        let mut state = vec![0; 70];
+        state[..4].copy_from_slice(&1_u32.to_le_bytes());
+        state[12] = 1;
+        state[13] = 0xA5;
+        state[22..26].copy_from_slice(&PlaylistTrackMotion::MarchWrap.raw().to_le_bytes());
+        state[26..30].copy_from_slice(&PlaylistTrackPress::Latch.raw().to_le_bytes());
+        state[30..34].copy_from_slice(&PlaylistTrackSync::FourBeats.raw().to_le_bytes());
+        state[34..38].copy_from_slice(&1_i32.to_le_bytes());
+        state[38..42].copy_from_slice(&1_i32.to_le_bytes());
+        state[42..46].copy_from_slice(&PlaylistTrackSync::TwoBeats.raw().to_le_bytes());
+        state[46] = 0;
+        state[69] = 0xC3;
+
+        let mut event_stream = Vec::new();
+        append_data_event(&mut event_stream, 0xEE, &state);
+        let input = flp_fixture(&event_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+
+        let tracks = document.playlist_tracks();
+        let track = &tracks[0];
+        assert_eq!(track.motion, Some(PlaylistTrackMotion::MarchWrap));
+        assert_eq!(track.press, Some(PlaylistTrackPress::Latch));
+        assert_eq!(track.trigger_sync, Some(PlaylistTrackSync::FourBeats));
+        assert_eq!(track.queued, Some(true));
+        assert_eq!(track.tolerant, Some(true));
+        assert_eq!(track.position_sync, Some(PlaylistTrackSync::TwoBeats));
+
+        document
+            .edit_playlist_track(
+                1,
+                PlaylistTrackEdit {
+                    press: Some(PlaylistTrackPress::HoldMotion),
+                    motion: Some(PlaylistTrackMotion::ExclusiveRandom),
+                    ..PlaylistTrackEdit::default()
+                },
+            )
+            .expect("Press and Motion should be editable");
+
+        let mut expected_state = state;
+        expected_state[22..26]
+            .copy_from_slice(&PlaylistTrackMotion::ExclusiveRandom.raw().to_le_bytes());
+        expected_state[26..30].copy_from_slice(&PlaylistTrackPress::HoldMotion.raw().to_le_bytes());
+        let tracks = document.playlist_tracks();
+        let track = &tracks[0];
+        assert_eq!(track.motion, Some(PlaylistTrackMotion::ExclusiveRandom));
+        assert_eq!(track.press, Some(PlaylistTrackPress::HoldMotion));
+        assert_eq!(track.state_bytes, expected_state);
+
+        let encoded = document
+            .encode_lossless()
+            .expect("edited project should encode");
+        let reparsed = FlpDocument::parse(&encoded).expect("edited project should parse");
+        assert_eq!(reparsed.playlist_tracks(), document.playlist_tracks());
+    }
+
     fn channel_key_region_parameters(low: u32, high: u32) -> Vec<u8> {
         let mut parameters = vec![0; 76];
         parameters[68..72].copy_from_slice(&low.to_le_bytes());
@@ -15851,6 +16005,8 @@ mod tests {
                 PlaylistTrackEdit {
                     enabled: Some(false),
                     grouped: Some(true),
+                    press: None,
+                    motion: None,
                     trigger_sync: None,
                     queued: Some(true),
                     position_sync: None,

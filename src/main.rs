@@ -16,8 +16,8 @@ use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions};
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, AutomationPointEdit, ChannelLevelAdjustmentsEdit,
     FlpDocument, FstPreset, PatternControllerEdit, PatternNote, PatternNoteEdit, PlaylistClipEdit,
-    PlaylistTrackEdit, PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions,
-    TimeMarkerEdit,
+    PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit,
+    ProjectSettingsEdit, RandomizerOptions, TimeMarkerEdit,
 };
 
 fn main() -> ExitCode {
@@ -787,6 +787,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 PlaylistTrackEdit {
                     enabled: parse_optional_bool(enabled, "Playlist track enabled state")?,
                     grouped: parse_optional_bool(grouped, "Playlist track grouping state")?,
+                    press: None,
+                    motion: None,
                     trigger_sync: None,
                     queued: None,
                     position_sync: None,
@@ -803,6 +805,28 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u16(arrangement_id, "arrangement id")?,
                 parse_u32(track_id, "Playlist track id")?,
                 parse_playlist_track_sync(trigger_sync)?,
+            )
+        }
+        [command, input, output, arrangement_id, track_id, press]
+            if command == "set-playlist-track-press" =>
+        {
+            set_playlist_track_press(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(arrangement_id, "arrangement id")?,
+                parse_u32(track_id, "Playlist track id")?,
+                parse_playlist_track_press(press)?,
+            )
+        }
+        [command, input, output, arrangement_id, track_id, motion]
+            if command == "set-playlist-track-motion" =>
+        {
+            set_playlist_track_motion(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(arrangement_id, "arrangement id")?,
+                parse_u32(track_id, "Playlist track id")?,
+                parse_playlist_track_motion(motion)?,
             )
         }
         [command, input, output, arrangement_id, track_id, position_sync]
@@ -1111,6 +1135,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild edit-clip <input.flp> <output.flp> <arrangement-id> <clip-index> <position> <length>\n",
             "  flp-rebuild set-clip-muted <input.flp> <output.flp> <arrangement-id> <clip-index> <muted:0|1>\n",
             "  flp-rebuild edit-playlist-track <input.flp> <output.flp> <track-id> <enabled:0|1|-> <grouped:0|1|->\n",
+            "  flp-rebuild set-playlist-track-press <input.flp> <output.flp> <arrangement-id> <track-id> <retrigger|hold-stop|hold-motion|latch>\n",
+            "  flp-rebuild set-playlist-track-motion <input.flp> <output.flp> <arrangement-id> <track-id> <stay|one-shot|march-wrap|march-stay|march-stop|random|exclusive-random>\n",
             "  flp-rebuild set-playlist-track-queued <input.flp> <output.flp> <arrangement-id> <track-id> <queued:0|1>\n",
             "  flp-rebuild rename-playlist-track <input.flp> <output.flp> <track-id> <name>\n",
             "  flp-rebuild edit-clip-properties <input.flp> <output.flp> <arrangement-id> <clip-index> <item-index-raw|-> <track-index-raw|-> <group-raw|-> <flags-raw|-> <start-offset|-> <end-offset|-> <scale|->\n",
@@ -1320,6 +1346,33 @@ fn parse_playlist_track_sync(value: &str) -> Result<PlaylistTrackSync, String> {
     }
 }
 
+fn parse_playlist_track_press(value: &str) -> Result<PlaylistTrackPress, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "retrigger" => Ok(PlaylistTrackPress::Retrigger),
+        "hold-stop" => Ok(PlaylistTrackPress::HoldStop),
+        "hold-motion" => Ok(PlaylistTrackPress::HoldMotion),
+        "latch" => Ok(PlaylistTrackPress::Latch),
+        _ => Err(format!(
+            "Playlist track Press must be retrigger, hold-stop, hold-motion, or latch; got {value:?}"
+        )),
+    }
+}
+
+fn parse_playlist_track_motion(value: &str) -> Result<PlaylistTrackMotion, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "stay" => Ok(PlaylistTrackMotion::Stay),
+        "one-shot" => Ok(PlaylistTrackMotion::OneShot),
+        "march-wrap" => Ok(PlaylistTrackMotion::MarchWrap),
+        "march-stay" => Ok(PlaylistTrackMotion::MarchStay),
+        "march-stop" => Ok(PlaylistTrackMotion::MarchStop),
+        "random" => Ok(PlaylistTrackMotion::Random),
+        "exclusive-random" => Ok(PlaylistTrackMotion::ExclusiveRandom),
+        _ => Err(format!(
+            "Playlist track Motion must be stay, one-shot, march-wrap, march-stay, march-stop, random, or exclusive-random; got {value:?}"
+        )),
+    }
+}
+
 fn playlist_track_sync_cli_label(sync: PlaylistTrackSync) -> &'static str {
     match sync {
         PlaylistTrackSync::Off => "off",
@@ -1329,6 +1382,27 @@ fn playlist_track_sync_cli_label(sync: PlaylistTrackSync) -> &'static str {
         PlaylistTrackSync::TwoBeats => "two-beats",
         PlaylistTrackSync::FourBeats => "four-beats",
         PlaylistTrackSync::Auto => "auto",
+    }
+}
+
+fn playlist_track_press_cli_label(press: PlaylistTrackPress) -> &'static str {
+    match press {
+        PlaylistTrackPress::Retrigger => "retrigger",
+        PlaylistTrackPress::HoldStop => "hold-stop",
+        PlaylistTrackPress::HoldMotion => "hold-motion",
+        PlaylistTrackPress::Latch => "latch",
+    }
+}
+
+fn playlist_track_motion_cli_label(motion: PlaylistTrackMotion) -> &'static str {
+    match motion {
+        PlaylistTrackMotion::Stay => "stay",
+        PlaylistTrackMotion::OneShot => "one-shot",
+        PlaylistTrackMotion::MarchWrap => "march-wrap",
+        PlaylistTrackMotion::MarchStay => "march-stay",
+        PlaylistTrackMotion::MarchStop => "march-stop",
+        PlaylistTrackMotion::Random => "random",
+        PlaylistTrackMotion::ExclusiveRandom => "exclusive-random",
     }
 }
 
@@ -3734,6 +3808,68 @@ fn set_playlist_track_queued(
     println!(
         "{} Queue for Playlist track {track_id} in arrangement {arrangement_id} in {}",
         if queued { "enabled" } else { "disabled" },
+        output.display()
+    );
+    Ok(())
+}
+
+fn set_playlist_track_press(
+    input: &Path,
+    output: &Path,
+    arrangement_id: u16,
+    track_id: u32,
+    press: PlaylistTrackPress,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .edit_playlist_track_in_arrangement(
+            arrangement_id,
+            track_id,
+            PlaylistTrackEdit {
+                press: Some(press),
+                ..PlaylistTrackEdit::default()
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "set Playlist track {track_id} Press to {} in arrangement {arrangement_id} in {}",
+        playlist_track_press_cli_label(press),
+        output.display()
+    );
+    Ok(())
+}
+
+fn set_playlist_track_motion(
+    input: &Path,
+    output: &Path,
+    arrangement_id: u16,
+    track_id: u32,
+    motion: PlaylistTrackMotion,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .edit_playlist_track_in_arrangement(
+            arrangement_id,
+            track_id,
+            PlaylistTrackEdit {
+                motion: Some(motion),
+                ..PlaylistTrackEdit::default()
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "set Playlist track {track_id} Motion to {} in arrangement {arrangement_id} in {}",
+        playlist_track_motion_cli_label(motion),
         output.display()
     );
     Ok(())
