@@ -43,13 +43,13 @@ use flp_rebuild::vst3::{
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, Arrangement, ArticulateOptions, AutomationChannel,
     AutomationPoint, AutomationPointEdit, ChannelGroupSummary, ChannelSortOrder, ChannelSummary,
-    ClawMachineOptions, FlpDocument, FlpError, FstPreset, FstPresetKind, LimitNoteOptions,
-    LimitSnapDirection, MixerInsertEdit, MixerParameterKind, MixerParameterRecord, Pattern,
-    PatternController, PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation,
-    PayloadEncoding, PlaylistClip, PlaylistClipClipboard, PlaylistClipEdit, PlaylistClipTarget,
-    PlaylistTrack, PlaylistTrackEdit, ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions,
-    RiffMachineOptions, RiffMachineQuantizeMode, ScaleLevelsOptions, TimeMarker, TimeMarkerEdit,
-    VstPluginStateMetadata,
+    ChannelType, ClawMachineOptions, FlpDocument, FlpError, FstPreset, FstPresetKind,
+    LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerParameterKind,
+    MixerParameterRecord, Pattern, PatternController, PatternControllerEdit, PatternNote,
+    PatternNoteEdit, PatternNoteRotation, PayloadEncoding, PlaylistClip, PlaylistClipClipboard,
+    PlaylistClipEdit, PlaylistClipTarget, PlaylistTrack, PlaylistTrackEdit, ProjectInfoEdit,
+    ProjectSettingsEdit, RandomizerOptions, RiffMachineOptions, RiffMachineQuantizeMode,
+    ScaleLevelsOptions, TimeMarker, TimeMarkerEdit, VstPluginStateMetadata,
 };
 use md5::{Digest, Md5};
 
@@ -14669,8 +14669,21 @@ impl DawUi {
                                 .find(|state| state.channel_id() == channel.id());
                             let selected = self.selected_rack_channels.contains(&channel.id());
                             let active = self.selected_graph_channel == Some(channel.id());
+                            let (type_icon_rect, type_icon_response) = ui
+                                .allocate_exact_size(Vec2::new(20.0, 22.0), Sense::hover());
+                            let type_icon_color = channel.color().map_or(BLUE_TEXT, |[r, g, b, _]| {
+                                Color32::from_rgb(r, g, b)
+                            });
+                            paint_channel_type_icon(
+                                ui.painter(),
+                                type_icon_rect,
+                                channel.channel_type(),
+                                type_icon_color,
+                            );
+                            type_icon_response
+                                .on_hover_text(channel_type_icon_description(channel.channel_type()));
                             let channel_button = ui.add_sized(
-                                [190.0, 24.0],
+                                [168.0, 24.0],
                                 egui::Button::new(
                                     channel.display_name().unwrap_or("(unnamed channel)"),
                                 )
@@ -29800,6 +29813,116 @@ fn update_channel_rack_selection(
         selected.clear();
         selected.insert(channel_id);
         *anchor = Some(channel_id);
+    }
+}
+
+fn channel_type_icon_description(channel_type: Option<ChannelType>) -> String {
+    match channel_type {
+        Some(ChannelType::Sampler) => "Sampler channel".to_owned(),
+        Some(ChannelType::Native) => "Generator channel".to_owned(),
+        Some(ChannelType::Layer) => "Layer channel".to_owned(),
+        Some(ChannelType::Instrument) => "Instrument channel".to_owned(),
+        Some(ChannelType::Automation) => "Automation channel".to_owned(),
+        Some(ChannelType::Unknown(raw)) => format!("Unknown channel type {raw}"),
+        None => "Unclassified channel".to_owned(),
+    }
+}
+
+fn paint_channel_type_icon(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    channel_type: Option<ChannelType>,
+    color: Color32,
+) {
+    let icon_rect = rect.shrink(2.0);
+    painter.rect_filled(icon_rect, 3.0, PANEL_DARK);
+    painter.rect_stroke(
+        icon_rect,
+        3.0,
+        Stroke::new(1.0, color),
+        egui::StrokeKind::Inside,
+    );
+    let center = icon_rect.center();
+    match channel_type {
+        Some(ChannelType::Sampler) => {
+            for (offset, half_height) in [(-4.5, 3.0), (-1.5, 6.0), (1.5, 4.0), (4.5, 2.0)] {
+                painter.line_segment(
+                    [
+                        egui::pos2(center.x + offset, center.y - half_height),
+                        egui::pos2(center.x + offset, center.y + half_height),
+                    ],
+                    Stroke::new(1.4, color),
+                );
+            }
+        }
+        Some(ChannelType::Native) => {
+            let points = [
+                egui::pos2(center.x - 6.0, center.y),
+                egui::pos2(center.x - 3.0, center.y - 3.0),
+                egui::pos2(center.x, center.y + 3.0),
+                egui::pos2(center.x + 3.0, center.y - 3.0),
+                egui::pos2(center.x + 6.0, center.y),
+            ];
+            for pair in points.windows(2) {
+                painter.line_segment([pair[0], pair[1]], Stroke::new(1.4, color));
+            }
+        }
+        Some(ChannelType::Layer) => {
+            for (offset_x, offset_y) in [(-2.0, -2.0), (2.0, 2.0)] {
+                painter.rect_stroke(
+                    egui::Rect::from_center_size(
+                        center + Vec2::new(offset_x, offset_y),
+                        Vec2::new(9.0, 7.0),
+                    ),
+                    1.0,
+                    Stroke::new(1.2, color),
+                    egui::StrokeKind::Inside,
+                );
+            }
+        }
+        Some(ChannelType::Instrument) => {
+            for (offset, half_height) in [(-4.5, 2.0), (-1.5, 4.0), (1.5, 3.0), (4.5, 2.0)] {
+                painter.line_segment(
+                    [
+                        egui::pos2(center.x + offset, center.y - half_height),
+                        egui::pos2(center.x + offset, center.y + half_height),
+                    ],
+                    Stroke::new(1.4, color),
+                );
+            }
+        }
+        Some(ChannelType::Automation) => {
+            let points = [
+                egui::pos2(center.x - 5.0, center.y + 4.0),
+                egui::pos2(center.x - 1.0, center.y + 1.0),
+                egui::pos2(center.x + 2.0, center.y - 4.0),
+                egui::pos2(center.x + 5.0, center.y - 2.0),
+            ];
+            for pair in points.windows(2) {
+                painter.line_segment([pair[0], pair[1]], Stroke::new(1.4, color));
+            }
+            for point in [points[0], points[2], points[3]] {
+                painter.circle_filled(point, 1.5, color);
+            }
+        }
+        Some(ChannelType::Unknown(raw)) => {
+            painter.text(
+                center,
+                Align2::CENTER_CENTER,
+                format!("{raw:X}"),
+                FontId::proportional(9.0),
+                color,
+            );
+        }
+        None => {
+            painter.text(
+                center,
+                Align2::CENTER_CENTER,
+                "?",
+                FontId::proportional(11.0),
+                color,
+            );
+        }
     }
 }
 
