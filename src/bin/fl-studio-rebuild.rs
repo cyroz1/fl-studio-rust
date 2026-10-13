@@ -12901,7 +12901,16 @@ impl DawUi {
                                     }
                                 }
                                 ui.separator();
-                                if ui.button("Delete clip").clicked() {
+                                let delete_label = if self.selected_arrangement
+                                    == Some(arrangement.id)
+                                    && self.selected_playlist_clips.contains(&clip_index)
+                                    && self.selected_playlist_clips.len() > 1
+                                {
+                                    "Delete selected clips"
+                                } else {
+                                    "Delete clip"
+                                };
+                                if ui.button(delete_label).clicked() {
                                     delete_clip_requested = Some(clip_index);
                                     ui.close();
                                 }
@@ -13382,20 +13391,20 @@ impl DawUi {
 
         let mut playlist_clip_list_changed = false;
         if let Some(clip_index) = delete_clip_requested {
-            let deleted = self.document.as_mut().is_some_and(|document| {
-                document
-                    .delete_playlist_clip(arrangement.id, clip_index)
-                    .is_ok()
-            });
-            if deleted {
-                self.stop_project_playback();
-                self.selected_clip = None;
-                self.active_playlist_clip_drag = None;
-                self.dirty = true;
-                self.status = format!("Deleted Playlist clip {}", clip_index + 1);
-                playlist_clip_list_changed = true;
+            let clip_indices = if self.selected_arrangement == Some(arrangement.id)
+                && self.selected_playlist_clips.contains(&clip_index)
+                && self.selected_playlist_clips.len() > 1
+            {
+                self.selected_playlist_clips
+                    .iter()
+                    .copied()
+                    .filter(|index| *index < arrangement.clips.len())
+                    .collect::<Vec<_>>()
             } else {
-                self.status = "Could not delete the selected Playlist clip".to_owned();
+                vec![clip_index]
+            };
+            if self.delete_playlist_clips(arrangement.id, &clip_indices) {
+                playlist_clip_list_changed = true;
             }
         }
 
@@ -13869,24 +13878,63 @@ impl DawUi {
             self.status = "No Playlist arrangement is selected".to_owned();
             return;
         };
-        let result = self
-            .document
-            .as_mut()
-            .map(|document| document.delete_playlist_clip(arrangement_id, clip_index));
+        let clip_indices = if self.selected_arrangement == Some(arrangement_id)
+            && self.selected_playlist_clips.contains(&clip_index)
+            && self.selected_playlist_clips.len() > 1
+        {
+            self.selected_playlist_clips
+                .iter()
+                .copied()
+                .collect::<Vec<_>>()
+        } else {
+            vec![clip_index]
+        };
+        self.delete_playlist_clips(arrangement_id, &clip_indices);
+    }
+
+    fn delete_playlist_clips(&mut self, arrangement_id: u16, clip_indices: &[usize]) -> bool {
+        let mut clip_indices = clip_indices.to_vec();
+        clip_indices.sort_unstable();
+        clip_indices.dedup();
+        if clip_indices.is_empty() {
+            self.status = "No Playlist clips are selected".to_owned();
+            return false;
+        }
+
+        let result = self.document.as_ref().map(|document| {
+            let mut updated = document.clone();
+            for clip_index in clip_indices.iter().rev() {
+                updated
+                    .delete_playlist_clip(arrangement_id, *clip_index)
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok::<_, String>(updated)
+        });
         match result {
-            Some(Ok(())) => {
+            Some(Ok(updated)) => {
+                self.document = Some(updated);
                 self.stop_project_playback();
                 self.selected_clip = None;
                 self.selected_playlist_clips.clear();
                 self.playlist_selection_anchor = None;
                 self.active_playlist_clip_drag = None;
+                self.active_playlist_clip_drag_targets.clear();
                 self.dirty = true;
-                self.status = format!("Deleted Playlist clip {}", clip_index + 1);
+                self.status = if clip_indices.len() == 1 {
+                    format!("Deleted Playlist clip {}", clip_indices[0] + 1)
+                } else {
+                    format!("Deleted {} selected Playlist clips", clip_indices.len())
+                };
+                true
             }
             Some(Err(error)) => {
-                self.status = format!("Could not delete Playlist clip: {error}");
+                self.status = format!("Could not delete Playlist clips: {error}");
+                false
             }
-            None => self.status = "Open a project to delete a Playlist clip".to_owned(),
+            None => {
+                self.status = "Open a project to delete Playlist clips".to_owned();
+                false
+            }
         }
     }
 
