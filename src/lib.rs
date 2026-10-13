@@ -2647,6 +2647,14 @@ pub struct PlaylistClipClipboard {
     raw_record: Vec<u8>,
 }
 
+/// Lossless clipboard for a set of Playlist clips with their relative layout.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlaylistClipSelectionClipboard {
+    clips: Vec<(PlaylistClipClipboard, u32, u16)>,
+    origin_position_ticks: u32,
+    origin_raw_track_index: u16,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PlaylistClipEdit {
     pub position_ticks: Option<u32>,
@@ -6509,6 +6517,84 @@ impl FlpDocument {
         })
     }
 
+    /// Copies selected Playlist clips as complete records while retaining their relative timing
+    /// and track spacing.
+    pub fn copy_playlist_clip_selection(
+        &self,
+        arrangement_id: u16,
+        clip_indices: &[usize],
+    ) -> Result<PlaylistClipSelectionClipboard, FlpError> {
+        if clip_indices.is_empty() {
+            return Err(FlpError::UnsupportedEdit(
+                "at least one Playlist clip must be selected",
+            ));
+        }
+
+        let arrangements = self.arrangements()?;
+        let mut matching_arrangements = arrangements
+            .iter()
+            .filter(|arrangement| arrangement.id == arrangement_id);
+        let Some(arrangement) = matching_arrangements.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested arrangement does not exist",
+            ));
+        };
+        if matching_arrangements.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested arrangement id is ambiguous",
+            ));
+        }
+
+        let mut clip_indices = clip_indices.to_vec();
+        clip_indices.sort_unstable();
+        clip_indices.dedup();
+        let clips = clip_indices
+            .iter()
+            .map(|index| {
+                arrangement
+                    .clips
+                    .get(*index)
+                    .ok_or(FlpError::UnsupportedEdit(
+                        "a selected Playlist clip does not exist",
+                    ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let origin_position_ticks =
+            clips
+                .iter()
+                .map(|clip| clip.position_ticks)
+                .min()
+                .ok_or(FlpError::UnsupportedEdit(
+                    "at least one Playlist clip must be selected",
+                ))?;
+        let origin_raw_track_index = clips.iter().map(|clip| clip.raw_track_index).max().ok_or(
+            FlpError::UnsupportedEdit("at least one Playlist clip must be selected"),
+        )?;
+        if clips.iter().any(|clip| clip.raw_track_index > 499) {
+            return Err(FlpError::UnsupportedEdit(
+                "a selected Playlist clip has an unsupported track index",
+            ));
+        }
+
+        let clips = clip_indices
+            .iter()
+            .zip(clips)
+            .map(|(index, clip)| {
+                Ok((
+                    self.copy_playlist_clip(arrangement_id, *index)?,
+                    clip.position_ticks,
+                    clip.raw_track_index,
+                ))
+            })
+            .collect::<Result<Vec<_>, FlpError>>()?;
+
+        Ok(PlaylistClipSelectionClipboard {
+            clips,
+            origin_position_ticks,
+            origin_raw_track_index,
+        })
+    }
+
     /// Pastes a copied clip record into an arrangement, updating its position, track, and clip ID
     /// when present. A paste into an empty arrangement can reuse the copied ID.
     /// The complete record is appended to the arrangement's final clip event, or a new clip event
@@ -6641,6 +6727,55 @@ impl FlpDocument {
         candidate.refresh_event_offsets()?;
         *self = candidate;
         Ok(insertion_clip_index)
+    }
+
+    /// Pastes a copied Playlist selection as complete records, preserving its relative timing
+    /// and track spacing. All clips are inserted transactionally.
+    pub fn paste_playlist_clip_selection(
+        &mut self,
+        arrangement_id: u16,
+        clipboard: &PlaylistClipSelectionClipboard,
+        position_ticks: u32,
+        raw_track_index: u16,
+    ) -> Result<Vec<usize>, FlpError> {
+        if clipboard.clips.is_empty() {
+            return Err(FlpError::UnsupportedEdit(
+                "the copied Playlist selection is empty",
+            ));
+        }
+        if raw_track_index > 499 {
+            return Err(FlpError::UnsupportedEdit(
+                "Playlist track index must be between 0 and 499",
+            ));
+        }
+
+        let mut candidate = self.clone();
+        let mut inserted_indices = Vec::with_capacity(clipboard.clips.len());
+        for (clip, source_position, source_track_index) in &clipboard.clips {
+            let position_offset = source_position
+                .checked_sub(clipboard.origin_position_ticks)
+                .ok_or(FlpError::LengthOverflow)?;
+            let pasted_position = position_ticks
+                .checked_add(position_offset)
+                .ok_or(FlpError::LengthOverflow)?;
+            let track_offset =
+                i32::from(*source_track_index) - i32::from(clipboard.origin_raw_track_index);
+            let pasted_track = i32::from(raw_track_index) + track_offset;
+            if !(0..=499).contains(&pasted_track) {
+                return Err(FlpError::UnsupportedEdit(
+                    "the copied Playlist selection does not fit on the target tracks",
+                ));
+            }
+            inserted_indices.push(candidate.paste_playlist_clip(
+                arrangement_id,
+                clip,
+                pasted_position,
+                pasted_track as u16,
+            )?);
+        }
+
+        *self = candidate;
+        Ok(inserted_indices)
     }
 
     /// Duplicates one clip's complete stored record into the same Playlist event, assigning a new

@@ -46,10 +46,11 @@ use flp_rebuild::{
     ChannelType, ClawMachineOptions, FlpDocument, FlpError, FstPreset, FstPresetKind,
     LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerParameterKind,
     MixerParameterRecord, Pattern, PatternController, PatternControllerEdit, PatternNote,
-    PatternNoteEdit, PatternNoteRotation, PayloadEncoding, PlaylistClip, PlaylistClipClipboard,
-    PlaylistClipEdit, PlaylistClipTarget, PlaylistTrack, PlaylistTrackEdit, ProjectInfoEdit,
-    ProjectSettingsEdit, RandomizerOptions, RiffMachineOptions, RiffMachineQuantizeMode,
-    ScaleLevelsOptions, TimeMarker, TimeMarkerEdit, VstPluginStateMetadata,
+    PatternNoteEdit, PatternNoteRotation, PayloadEncoding, PlaylistClip, PlaylistClipEdit,
+    PlaylistClipSelectionClipboard, PlaylistClipTarget, PlaylistTrack, PlaylistTrackEdit,
+    ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions, RiffMachineOptions,
+    RiffMachineQuantizeMode, ScaleLevelsOptions, TimeMarker, TimeMarkerEdit,
+    VstPluginStateMetadata,
 };
 use md5::{Digest, Md5};
 
@@ -3071,7 +3072,7 @@ struct DawUi {
     selected_playlist_tracks: BTreeSet<u32>,
     playlist_track_selection_anchor: Option<u32>,
     playlist_clip_context_split: Option<(u16, usize, u32)>,
-    playlist_clip_clipboard: Option<PlaylistClipClipboard>,
+    playlist_clip_clipboard: Option<PlaylistClipSelectionClipboard>,
     playlist_slip_tool_active: bool,
     playlist_mute_tool_active: bool,
     soloed_playlist_track_range: Option<(u32, u32)>,
@@ -7776,7 +7777,11 @@ impl DawUi {
                 if ui
                     .add_enabled(
                         can_copy_playlist_clip,
-                        egui::Button::new("Copy Playlist clip  Ctrl/Cmd+C"),
+                        egui::Button::new(if self.selected_playlist_clips.len() > 1 {
+                            "Copy selected Playlist clips  Ctrl/Cmd+C"
+                        } else {
+                            "Copy Playlist clip  Ctrl/Cmd+C"
+                        }),
                     )
                     .clicked()
                 {
@@ -7786,7 +7791,11 @@ impl DawUi {
                 if ui
                     .add_enabled(
                         can_copy_playlist_clip,
-                        egui::Button::new("Cut Playlist clip  Ctrl/Cmd+X"),
+                        egui::Button::new(if self.selected_playlist_clips.len() > 1 {
+                            "Cut selected Playlist clips  Ctrl/Cmd+X"
+                        } else {
+                            "Cut Playlist clip  Ctrl/Cmd+X"
+                        }),
                     )
                     .clicked()
                 {
@@ -7798,7 +7807,7 @@ impl DawUi {
                         self.view == MainView::Playlist
                             && self.document.is_some()
                             && self.playlist_clip_clipboard.is_some(),
-                        egui::Button::new("Paste Playlist clip  Ctrl/Cmd+V"),
+                        egui::Button::new("Paste Playlist clips  Ctrl/Cmd+V"),
                     )
                     .clicked()
                 {
@@ -12729,11 +12738,25 @@ impl DawUi {
                                     ui.close();
                                 }
                                 ui.separator();
-                                if ui.button("Copy clip").clicked() {
+                                if ui
+                                    .button(if mute_selection_states.len() > 1 {
+                                        "Copy selected clips"
+                                    } else {
+                                        "Copy clip"
+                                    })
+                                    .clicked()
+                                {
                                     copy_clip_requested = Some(clip_index);
                                     ui.close();
                                 }
-                                if ui.button("Cut clip").clicked() {
+                                if ui
+                                    .button(if mute_selection_states.len() > 1 {
+                                        "Cut selected clips"
+                                    } else {
+                                        "Cut clip"
+                                    })
+                                    .clicked()
+                                {
                                     cut_clip_requested = Some(clip_index);
                                     ui.close();
                                 }
@@ -13655,23 +13678,41 @@ impl DawUi {
             }
         }
         if playlist_clip_list_changed {
-            let selected_clip = self.selected_clip.filter(|index| {
-                self.document
-                    .as_ref()
-                    .and_then(|document| document.arrangements().ok())
-                    .and_then(|arrangements| {
-                        arrangements
-                            .into_iter()
-                            .find(|item| item.id == arrangement.id)
+            let clip_count = self
+                .document
+                .as_ref()
+                .and_then(|document| document.arrangements().ok())
+                .and_then(|arrangements| {
+                    arrangements
+                        .into_iter()
+                        .find(|item| item.id == arrangement.id)
+                })
+                .map(|item| item.clips.len());
+            if let Some(clip_count) = clip_count {
+                let had_explicit_selection = !self.selected_playlist_clips.is_empty();
+                self.selected_playlist_clips
+                    .retain(|index| *index < clip_count);
+                let selected_clip = self
+                    .selected_clip
+                    .filter(|index| {
+                        *index < clip_count
+                            && (!had_explicit_selection
+                                || self.selected_playlist_clips.contains(index))
                     })
-                    .is_some_and(|item| *index < item.clips.len())
-            });
-            self.selected_clip = selected_clip;
-            self.selected_playlist_clips.clear();
-            if let Some(index) = selected_clip {
-                self.selected_playlist_clips.insert(index);
-                self.playlist_selection_anchor = Some(index);
+                    .or_else(|| self.selected_playlist_clips.first().copied());
+                self.selected_clip = selected_clip;
+                if self.selected_playlist_clips.is_empty()
+                    && let Some(index) = selected_clip
+                {
+                    self.selected_playlist_clips.insert(index);
+                }
+                self.playlist_selection_anchor = self
+                    .playlist_selection_anchor
+                    .filter(|index| *index < clip_count)
+                    .or(selected_clip);
             } else {
+                self.selected_clip = None;
+                self.selected_playlist_clips.clear();
                 self.playlist_selection_anchor = None;
             }
         }
@@ -14038,21 +14079,54 @@ impl DawUi {
         Some((arrangement_id, clip_index))
     }
 
-    fn copy_playlist_clip_to_clipboard(&mut self, arrangement_id: u16, clip_index: usize) -> bool {
+    fn playlist_clip_indices_for_action(
+        &self,
+        arrangement_id: u16,
+        clip_index: usize,
+    ) -> Vec<usize> {
+        if self.selected_arrangement == Some(arrangement_id)
+            && self.selected_playlist_clips.contains(&clip_index)
+            && self.selected_playlist_clips.len() > 1
+        {
+            self.selected_playlist_clips.iter().copied().collect()
+        } else {
+            vec![clip_index]
+        }
+    }
+
+    fn copy_playlist_clip_selection_to_clipboard(
+        &mut self,
+        arrangement_id: u16,
+        clip_indices: &[usize],
+    ) -> bool {
         let result = self
             .document
             .as_ref()
-            .map(|document| document.copy_playlist_clip(arrangement_id, clip_index));
+            .map(|document| document.copy_playlist_clip_selection(arrangement_id, clip_indices));
         match result {
             Some(Ok(clipboard)) => {
+                let mut clip_indices = clip_indices.to_vec();
+                clip_indices.sort_unstable();
+                clip_indices.dedup();
                 self.playlist_clip_clipboard = Some(clipboard);
                 self.selected_arrangement = Some(arrangement_id);
-                self.selected_clip = Some(clip_index);
-                self.status = format!("Copied Playlist clip {}", clip_index + 1);
+                if !self
+                    .selected_clip
+                    .is_some_and(|index| clip_indices.contains(&index))
+                {
+                    self.selected_clip = clip_indices.first().copied();
+                }
+                self.selected_playlist_clips = clip_indices.iter().copied().collect();
+                self.playlist_selection_anchor = self.selected_clip;
+                self.status = if clip_indices.len() == 1 {
+                    format!("Copied Playlist clip {}", clip_indices[0] + 1)
+                } else {
+                    format!("Copied {} selected Playlist clips", clip_indices.len())
+                };
                 true
             }
             Some(Err(error)) => {
-                self.status = format!("Could not copy Playlist clip: {error}");
+                self.status = format!("Could not copy Playlist clips: {error}");
                 false
             }
             None => {
@@ -14062,6 +14136,11 @@ impl DawUi {
         }
     }
 
+    fn copy_playlist_clip_to_clipboard(&mut self, arrangement_id: u16, clip_index: usize) -> bool {
+        let clip_indices = self.playlist_clip_indices_for_action(arrangement_id, clip_index);
+        self.copy_playlist_clip_selection_to_clipboard(arrangement_id, &clip_indices)
+    }
+
     fn copy_selected_playlist_clip(&mut self) {
         if let Some((arrangement_id, clip_index)) = self.selected_playlist_clip_location() {
             self.copy_playlist_clip_to_clipboard(arrangement_id, clip_index);
@@ -14069,31 +14148,47 @@ impl DawUi {
     }
 
     fn cut_playlist_clip_to_clipboard(&mut self, arrangement_id: u16, clip_index: usize) -> bool {
-        if !self.copy_playlist_clip_to_clipboard(arrangement_id, clip_index) {
+        let clip_indices = self.playlist_clip_indices_for_action(arrangement_id, clip_index);
+        let Some(document) = self.document.as_ref() else {
+            self.status = "Open a project to cut Playlist clips".to_owned();
             return false;
-        }
-        let result = self
-            .document
-            .as_mut()
-            .map(|document| document.delete_playlist_clip(arrangement_id, clip_index));
-        match result {
-            Some(Ok(())) => {
+        };
+        let clipboard = match document.copy_playlist_clip_selection(arrangement_id, &clip_indices) {
+            Ok(clipboard) => clipboard,
+            Err(error) => {
+                self.status = format!("Could not cut Playlist clips: {error}");
+                return false;
+            }
+        };
+        let mut updated = document.clone();
+        let mut descending_indices = clip_indices.clone();
+        descending_indices.sort_unstable();
+        descending_indices.dedup();
+        let delete_result = descending_indices
+            .iter()
+            .rev()
+            .try_for_each(|index| updated.delete_playlist_clip(arrangement_id, *index));
+        match delete_result {
+            Ok(()) => {
+                let count = descending_indices.len();
                 self.stop_project_playback();
+                self.document = Some(updated);
+                self.playlist_clip_clipboard = Some(clipboard);
                 self.selected_arrangement = Some(arrangement_id);
                 self.selected_clip = None;
                 self.selected_playlist_clips.clear();
                 self.playlist_selection_anchor = None;
                 self.active_playlist_clip_drag = None;
                 self.dirty = true;
-                self.status = format!("Cut Playlist clip {}", clip_index + 1);
+                self.status = if count == 1 {
+                    format!("Cut Playlist clip {}", descending_indices[0] + 1)
+                } else {
+                    format!("Cut {count} selected Playlist clips")
+                };
                 true
             }
-            Some(Err(error)) => {
-                self.status = format!("Could not cut Playlist clip: {error}");
-                false
-            }
-            None => {
-                self.status = "Open a project to cut Playlist clips".to_owned();
+            Err(error) => {
+                self.status = format!("Could not cut Playlist clips: {error}");
                 false
             }
         }
@@ -14165,23 +14260,26 @@ impl DawUi {
         };
 
         let mut updated = document.clone();
-        match updated.paste_playlist_clip(
+        match updated.paste_playlist_clip_selection(
             arrangement_id,
             &clipboard,
             position_ticks,
             raw_track_index,
         ) {
-            Ok(clip_index) => {
+            Ok(clip_indices) => {
                 self.stop_project_playback();
                 self.document = Some(updated);
                 self.selected_arrangement = Some(arrangement_id);
-                self.selected_clip = Some(clip_index);
-                self.selected_playlist_clips.clear();
-                self.selected_playlist_clips.insert(clip_index);
-                self.playlist_selection_anchor = Some(clip_index);
+                self.selected_clip = clip_indices.first().copied();
+                self.selected_playlist_clips = clip_indices.iter().copied().collect();
+                self.playlist_selection_anchor = self.selected_clip;
                 self.active_playlist_clip_drag = None;
                 self.dirty = true;
-                self.status = format!("Pasted Playlist clip {}", clip_index + 1);
+                self.status = if clip_indices.len() == 1 {
+                    format!("Pasted Playlist clip {}", clip_indices[0] + 1)
+                } else {
+                    format!("Pasted {} Playlist clips", clip_indices.len())
+                };
                 true
             }
             Err(error) => {
