@@ -3071,6 +3071,7 @@ struct DawUi {
     selected_playlist_track: Option<u32>,
     selected_playlist_tracks: BTreeSet<u32>,
     playlist_track_selection_anchor: Option<u32>,
+    playlist_track_name_editor: Option<(u32, String)>,
     playlist_clip_context_split: Option<(u16, usize, u32)>,
     playlist_clip_clipboard: Option<PlaylistClipSelectionClipboard>,
     playlist_slip_tool_active: bool,
@@ -3699,6 +3700,7 @@ impl DawUi {
             selected_playlist_track: None,
             selected_playlist_tracks: BTreeSet::new(),
             playlist_track_selection_anchor: None,
+            playlist_track_name_editor: None,
             playlist_clip_context_split: None,
             playlist_clip_clipboard: None,
             playlist_slip_tool_active: false,
@@ -4528,6 +4530,7 @@ impl DawUi {
                 self.project_generation = self.project_generation.wrapping_add(1);
                 self.piano_roll_hidden_ghost_channels.clear();
                 self.soloed_playlist_track_range = None;
+                self.playlist_track_name_editor = None;
                 self.collapsed_playlist_groups.clear();
                 self.clear_history();
                 self.history_reset_during_frame = true;
@@ -12295,6 +12298,11 @@ impl DawUi {
                         context_response.context_menu(|ui| {
                             ui.label(track_name);
                             ui.separator();
+                            if ui.button("Rename…").clicked() {
+                                self.playlist_track_name_editor =
+                                    Some((track_id, track_name.to_owned()));
+                                ui.close();
+                            }
                             if let Some(track) = track_state {
                                 let mut grouped = track.grouped == Some(true);
                                 if ui
@@ -13938,6 +13946,59 @@ impl DawUi {
         }
         if !playlist_clip_list_changed {
             self.selected_clip_editor(ui, arrangement.id, &arrangement.clips);
+        }
+        self.show_playlist_track_name_editor(ui.ctx());
+    }
+
+    fn show_playlist_track_name_editor(&mut self, context: &egui::Context) {
+        let Some((track_id, mut name)) = self.playlist_track_name_editor.take() else {
+            return;
+        };
+        let mut open = true;
+        let mut submit = false;
+        let mut cancel = false;
+        egui::Window::new("Rename Playlist Track")
+            .id(Id::new("playlist-track-name-editor"))
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(context, |ui| {
+                ui.label(format!("Playlist track {track_id}"));
+                let response = ui.text_edit_singleline(&mut name);
+                if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                    submit = true;
+                }
+                ui.horizontal(|ui| {
+                    submit |= ui.button("Rename").clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+        if submit {
+            match self
+                .document
+                .as_mut()
+                .map(|document| document.rename_playlist_track(track_id, &name))
+            {
+                Some(Ok(())) => {
+                    self.dirty = true;
+                    context.request_repaint();
+                    self.status = if name.is_empty() {
+                        format!("Reset Playlist track {track_id} name")
+                    } else {
+                        format!("Renamed Playlist track {track_id}")
+                    };
+                    return;
+                }
+                Some(Err(error)) => {
+                    self.status = format!("Could not rename Playlist track {track_id}: {error}");
+                }
+                None => {
+                    self.status = "Open a project to rename Playlist tracks".to_owned();
+                }
+            }
+        }
+        if open && !cancel {
+            self.playlist_track_name_editor = Some((track_id, name));
         }
     }
 

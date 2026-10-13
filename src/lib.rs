@@ -5273,6 +5273,81 @@ impl FlpDocument {
         Ok(())
     }
 
+    /// Renames an existing Playlist track while preserving its other events and state bytes.
+    pub fn rename_playlist_track(&mut self, track_id: u32, name: &str) -> Result<(), FlpError> {
+        if track_id == 0 || track_id > 500 {
+            return Err(FlpError::UnsupportedEdit(
+                "Playlist track id must be between 1 and 500",
+            ));
+        }
+        if name.contains('\0') {
+            return Err(FlpError::UnsupportedEdit(
+                "Playlist track names cannot contain a null character",
+            ));
+        }
+
+        let mut candidate = self.clone();
+        let mut matching_events =
+            candidate
+                .events
+                .iter()
+                .enumerate()
+                .filter_map(|(index, event)| {
+                    if event.opcode != 0xEE || event.payload.len() != 70 {
+                        return None;
+                    }
+                    let id = u32::from_le_bytes([
+                        event.payload[0],
+                        event.payload[1],
+                        event.payload[2],
+                        event.payload[3],
+                    ]);
+                    (id == track_id).then_some(index)
+                });
+        let Some(event_index) = matching_events.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested Playlist track does not exist",
+            ));
+        };
+        if matching_events.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested Playlist track id is ambiguous",
+            ));
+        }
+
+        let has_state_byte = candidate
+            .events
+            .get(event_index + 1)
+            .is_some_and(|event| event.opcode == 0x2B && event.encoding == PayloadEncoding::Byte);
+        let name_event_index = event_index + if has_state_byte { 2 } else { 1 };
+        if candidate
+            .events
+            .get(name_event_index)
+            .is_some_and(|event| event.opcode == 0xEF)
+        {
+            let event = &candidate.events[name_event_index];
+            if !matches!(event.encoding, PayloadEncoding::Data { .. }) {
+                return Err(FlpError::UnsupportedEdit(
+                    "the Playlist track name is not a length-prefixed string",
+                ));
+            }
+            let replacement = replace_project_string_payload(
+                &event.payload,
+                name,
+                candidate.project_strings_use_utf16(),
+            )?;
+            candidate.events[name_event_index].replace_data_payload(replacement)?;
+        } else {
+            let payload = encode_project_string(name, candidate.project_strings_use_utf16())?;
+            candidate
+                .events
+                .insert(name_event_index, FlpEvent::new_data(0xEF, payload)?);
+        }
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
     /// Returns Mixer insert summaries for the observed adjacent `0x9A`, `0x93`, `0x95`
     /// record signature. This is intentionally read-only; the unparsed insert and effect data
     /// remains available byte-for-byte through `events()`.
@@ -11907,7 +11982,7 @@ impl FlpDocument {
             .iter()
             .find(|event| {
                 PROJECT_INFO_STRING_EVENTS.contains(&event.opcode)
-                    || matches!(event.opcode, 0xC1 | 0xCB | 0xCD | 0xF1)
+                    || matches!(event.opcode, 0xC1 | 0xCB | 0xCD | 0xEF | 0xF1)
             })
             .is_some_and(|event| project_string_is_utf16(&event.payload, None))
     }
