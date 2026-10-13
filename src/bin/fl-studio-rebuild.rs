@@ -25029,11 +25029,12 @@ impl DawUi {
                 && !self.piano_roll_stamp_mode
                 && !self.piano_roll_select_mode
                 && !self.piano_roll_zoom_mode
+                && !self.piano_roll_playback_mode
                 && !self.piano_roll_slice_mode
                 && !self.piano_roll_delete_mode
                 && !self.piano_roll_mute_mode
                 && !modifiers.command
-                && grid_response.double_clicked()
+                && grid_response.clicked_by(PointerButton::Primary)
                 && let (Some(pointer), Some(channel_id)) = (
                     grid_response.interact_pointer_pos(),
                     self.selected_note_channel,
