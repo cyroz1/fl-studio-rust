@@ -1465,6 +1465,7 @@ enum PianoRollScale {
     HarmonicMajor,
     DoubleHarmonicMajor,
     IonianSharpFive,
+    IonianSharpTwo,
     IonianAugmentedSharpTwo,
     Dorian,
     DorianFlatTwo,
@@ -1519,12 +1520,13 @@ enum PianoRollScale {
 }
 
 impl PianoRollScale {
-    const ALL: [Self; 56] = [
+    const ALL: [Self; 57] = [
         Self::None,
         Self::Major,
         Self::HarmonicMajor,
         Self::DoubleHarmonicMajor,
         Self::IonianSharpFive,
+        Self::IonianSharpTwo,
         Self::IonianAugmentedSharpTwo,
         Self::Dorian,
         Self::DorianFlatTwo,
@@ -1585,6 +1587,7 @@ impl PianoRollScale {
             Self::HarmonicMajor => "Harmonic major",
             Self::DoubleHarmonicMajor => "Double harmonic major",
             Self::IonianSharpFive => "Ionian #5",
+            Self::IonianSharpTwo => "Ionian #2",
             Self::IonianAugmentedSharpTwo => "Ionian augmented #2",
             Self::Dorian => "Dorian",
             Self::DorianFlatTwo => "Dorian b2",
@@ -1653,6 +1656,7 @@ impl PianoRollScale {
             Self::HarmonicMajor => &[0, 2, 4, 5, 7, 8, 11],
             Self::DoubleHarmonicMajor => &[0, 1, 4, 5, 7, 8, 11],
             Self::IonianSharpFive => &[0, 2, 4, 5, 8, 9, 11],
+            Self::IonianSharpTwo => &[0, 3, 4, 5, 7, 9, 11],
             Self::IonianAugmentedSharpTwo => &[0, 3, 4, 5, 8, 9, 11],
             Self::Dorian => &[0, 2, 3, 5, 7, 9, 10],
             Self::DorianFlatTwo => &[0, 1, 3, 5, 7, 9, 10],
@@ -1735,6 +1739,7 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
         PianoRollScale::HarmonicMajor,
         PianoRollScale::DoubleHarmonicMajor,
         PianoRollScale::IonianSharpFive,
+        PianoRollScale::IonianSharpTwo,
         PianoRollScale::IonianAugmentedSharpTwo,
         PianoRollScale::Dorian,
         PianoRollScale::DorianFlatTwo,
@@ -1838,6 +1843,7 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
                 PianoRollScale::HarmonicMajor => 0,
                 PianoRollScale::DoubleHarmonicMajor => -29,
                 PianoRollScale::IonianSharpFive => -20,
+                PianoRollScale::IonianSharpTwo => -34,
                 PianoRollScale::IonianAugmentedSharpTwo => -30,
                 PianoRollScale::DorianFlatTwo => -14,
                 PianoRollScale::DorianSharpFour => -19,
