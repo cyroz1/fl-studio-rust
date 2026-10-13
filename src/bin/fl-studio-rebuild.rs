@@ -11538,6 +11538,7 @@ impl DawUi {
         let mut create_pattern_clip_requested = false;
         let mut playlist_track_edits_requested = Vec::new();
         let mut auto_name_playlist_track_requested = None;
+        let mut playlist_track_clips_mute_action = None;
         let mut solo_playlist_track_requested = None;
         let mut delete_clip_requested = None;
         let mut muted_clip_requested = None;
@@ -12124,6 +12125,13 @@ impl DawUi {
                         .find(|track| track.id == track_id)
                         .and_then(|track| track.name.as_deref())
                         .unwrap_or("Track");
+                    let track_clip_mute_states = arrangement
+                        .clips
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, clip)| clip.track_index == Some(row))
+                        .map(|(clip_index, clip)| (clip_index, clip.is_muted()))
+                        .collect::<Vec<_>>();
                     let track_auto_name = arrangement
                         .clips
                         .iter()
@@ -12340,6 +12348,41 @@ impl DawUi {
                                         Some((track_id, name.clone()));
                                 }
                                 ui.close();
+                            }
+                            if !track_clip_mute_states.is_empty() {
+                                ui.separator();
+                                if ui
+                                    .add_enabled(
+                                        track_clip_mute_states.iter().any(|(_, muted)| !muted),
+                                        egui::Button::new("Mute all clips"),
+                                    )
+                                    .clicked()
+                                {
+                                    muted_clip_requested = Some(
+                                        track_clip_mute_states
+                                            .iter()
+                                            .map(|(index, _)| (*index, true))
+                                            .collect(),
+                                    );
+                                    playlist_track_clips_mute_action = Some((track_id, true));
+                                    ui.close();
+                                }
+                                if ui
+                                    .add_enabled(
+                                        track_clip_mute_states.iter().any(|(_, muted)| *muted),
+                                        egui::Button::new("Unmute all clips"),
+                                    )
+                                    .clicked()
+                                {
+                                    muted_clip_requested = Some(
+                                        track_clip_mute_states
+                                            .iter()
+                                            .map(|(index, _)| (*index, false))
+                                            .collect(),
+                                    );
+                                    playlist_track_clips_mute_action = Some((track_id, false));
+                                    ui.close();
+                                }
                             }
                             if let Some(track) = track_state {
                                 let mut grouped = track.grouped == Some(true);
@@ -13698,23 +13741,36 @@ impl DawUi {
         }
 
         if let Some(clip_edits) = muted_clip_requested {
-            let result = self.document.as_mut().map(|document| {
-                clip_edits.iter().try_for_each(|(clip_index, muted)| {
-                    document.edit_playlist_clip(
-                        arrangement.id,
-                        *clip_index,
-                        PlaylistClipEdit {
-                            muted: Some(*muted),
-                            ..PlaylistClipEdit::default()
-                        },
-                    )
-                })
+            let result = self.document.as_ref().map(|document| {
+                let mut updated = document.clone();
+                for (clip_index, muted) in &clip_edits {
+                    updated
+                        .edit_playlist_clip(
+                            arrangement.id,
+                            *clip_index,
+                            PlaylistClipEdit {
+                                muted: Some(*muted),
+                                ..PlaylistClipEdit::default()
+                            },
+                        )
+                        .map_err(|error| error.to_string())?;
+                }
+                Ok::<_, String>(updated)
             });
             match result {
-                Some(Ok(())) => {
+                Some(Ok(updated)) => {
+                    self.document = Some(updated);
                     self.stop_project_playback();
                     self.dirty = true;
-                    self.status = if clip_edits.len() == 1 {
+                    ui.ctx().request_repaint();
+                    self.status = if let Some((track_id, muted)) = playlist_track_clips_mute_action
+                    {
+                        format!(
+                            "{} {} Playlist clips on track {track_id}",
+                            if muted { "Muted" } else { "Unmuted" },
+                            clip_edits.len()
+                        )
+                    } else if clip_edits.len() == 1 {
                         format!(
                             "{} Playlist clip {}",
                             if clip_edits[0].1 { "Muted" } else { "Unmuted" },
