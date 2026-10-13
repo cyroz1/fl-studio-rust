@@ -12301,11 +12301,10 @@ impl DawUi {
             self.empty_project_view(ui);
             return;
         }
-        let (arrangements, tracks, channels, ppq, patterns, project_time_signature, base_tempo_bpm) = {
+        let (arrangements, channels, ppq, patterns, project_time_signature, base_tempo_bpm) = {
             let document = self.document.as_ref().expect("document checked above");
             (
                 document.arrangements().unwrap_or_default(),
-                document.playlist_tracks(),
                 document.channels(),
                 document.header().ppq().max(1),
                 document.patterns().unwrap_or_default(),
@@ -12344,7 +12343,7 @@ impl DawUi {
             empty_view(ui, "This project has no decoded Playlist arrangement");
             return;
         };
-        let performance_tracks = self
+        let tracks = self
             .document
             .as_ref()
             .map(|document| document.playlist_tracks_in_arrangement(arrangement.id))
@@ -13410,6 +13409,53 @@ impl DawUi {
                                 }
                                 if track_id == 1 {
                                     ui.weak("The first track has no track above it");
+                                }
+                                let mut selected_sync = track.trigger_sync;
+                                let mut requested_sync = None;
+                                ui.horizontal(|ui| {
+                                    ui.label("Trigger Sync");
+                                    egui::ComboBox::from_id_salt((
+                                        "playlist-track-trigger-sync",
+                                        arrangement.id,
+                                        track_id,
+                                    ))
+                                    .selected_text(
+                                        track
+                                            .trigger_sync
+                                            .map(playlist_track_sync_label)
+                                            .unwrap_or("Unknown"),
+                                    )
+                                    .show_ui(ui, |ui| {
+                                        for (sync, label) in [
+                                            (PlaylistTrackSync::Off, "Off"),
+                                            (PlaylistTrackSync::QuarterBeat, "1/4 beat"),
+                                            (PlaylistTrackSync::HalfBeat, "1/2 beat"),
+                                            (PlaylistTrackSync::Beat, "1 beat"),
+                                            (PlaylistTrackSync::TwoBeats, "2 beats"),
+                                            (PlaylistTrackSync::FourBeats, "4 beats"),
+                                            (PlaylistTrackSync::Auto, "Auto"),
+                                        ] {
+                                            if ui
+                                                .selectable_value(
+                                                    &mut selected_sync,
+                                                    Some(sync),
+                                                    label,
+                                                )
+                                                .changed()
+                                            {
+                                                requested_sync = Some(sync);
+                                            }
+                                        }
+                                    });
+                                });
+                                if let Some(trigger_sync) = requested_sync {
+                                    playlist_track_edits_requested.push((
+                                        track_id,
+                                        PlaylistTrackEdit {
+                                            trigger_sync: Some(trigger_sync),
+                                            ..PlaylistTrackEdit::default()
+                                        },
+                                    ));
                                 }
                             } else {
                                 ui.weak("Track state is unavailable in this project");
@@ -15067,7 +15113,7 @@ impl DawUi {
                 .get(clip_index)
                 .and_then(|clip| clip.playlist_track_id())
                 .and_then(|track_id| {
-                    performance_tracks
+                    tracks
                         .iter()
                         .find(|track| track.id == track_id)
                         .and_then(|track| track.trigger_sync)
@@ -15158,10 +15204,9 @@ impl DawUi {
 
         let mut playlist_track_edit_failures = 0usize;
         for (track_id, edit) in playlist_track_edits_requested {
-            let result = self
-                .document
-                .as_mut()
-                .map(|document| document.edit_playlist_track(track_id, edit));
+            let result = self.document.as_mut().map(|document| {
+                document.edit_playlist_track_in_arrangement(arrangement.id, track_id, edit)
+            });
             match result {
                 Some(Ok(())) => {
                     if edit.enabled.is_some() {
@@ -15181,6 +15226,11 @@ impl DawUi {
                         } else {
                             format!("Ungrouped Playlist track {track_id}")
                         }
+                    } else if let Some(trigger_sync) = edit.trigger_sync {
+                        format!(
+                            "Set Playlist track {track_id} Trigger Sync to {}",
+                            playlist_track_sync_label(trigger_sync)
+                        )
                     } else {
                         "Updated Playlist track".to_owned()
                     };
@@ -15228,7 +15278,8 @@ impl DawUi {
                     let mut updated = document.clone();
                     for track_id in &groupable_track_ids {
                         updated
-                            .edit_playlist_track(
+                            .edit_playlist_track_in_arrangement(
+                                arrangement.id,
                                 *track_id,
                                 PlaylistTrackEdit {
                                     grouped: Some(grouped),
@@ -40900,6 +40951,18 @@ fn playlist_audio_drop_position_ticks(
         1
     };
     snap_note_tick(relative_tick, snap_ticks, 0)
+}
+
+fn playlist_track_sync_label(sync: PlaylistTrackSync) -> &'static str {
+    match sync {
+        PlaylistTrackSync::Off => "Off",
+        PlaylistTrackSync::QuarterBeat => "1/4 beat",
+        PlaylistTrackSync::HalfBeat => "1/2 beat",
+        PlaylistTrackSync::Beat => "1 beat",
+        PlaylistTrackSync::TwoBeats => "2 beats",
+        PlaylistTrackSync::FourBeats => "4 beats",
+        PlaylistTrackSync::Auto => "Auto",
+    }
 }
 
 fn playlist_performance_zone_start_tick(markers: &[TimeMarker]) -> Option<u32> {

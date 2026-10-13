@@ -16,7 +16,8 @@ use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions};
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, AutomationPointEdit, ChannelLevelAdjustmentsEdit,
     FlpDocument, FstPreset, PatternControllerEdit, PatternNote, PatternNoteEdit, PlaylistClipEdit,
-    PlaylistTrackEdit, ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions, TimeMarkerEdit,
+    PlaylistTrackEdit, PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions,
+    TimeMarkerEdit,
 };
 
 fn main() -> ExitCode {
@@ -786,7 +787,19 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 PlaylistTrackEdit {
                     enabled: parse_optional_bool(enabled, "Playlist track enabled state")?,
                     grouped: parse_optional_bool(grouped, "Playlist track grouping state")?,
+                    trigger_sync: None,
                 },
+            )
+        }
+        [command, input, output, arrangement_id, track_id, trigger_sync]
+            if command == "set-playlist-track-trigger-sync" =>
+        {
+            set_playlist_track_trigger_sync(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(arrangement_id, "arrangement id")?,
+                parse_u32(track_id, "Playlist track id")?,
+                parse_playlist_track_sync(trigger_sync)?,
             )
         }
         [command, input, output, track_id, name] if command == "rename-playlist-track" => {
@@ -1252,6 +1265,33 @@ fn parse_optional_bool(value: &str, description: &str) -> Result<Option<bool>, S
         "0" | "false" => Ok(Some(false)),
         "1" | "true" => Ok(Some(true)),
         _ => Err(format!("{description} must be 0, 1, true, false, or -")),
+    }
+}
+
+fn parse_playlist_track_sync(value: &str) -> Result<PlaylistTrackSync, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "off" => Ok(PlaylistTrackSync::Off),
+        "quarter-beat" => Ok(PlaylistTrackSync::QuarterBeat),
+        "half-beat" => Ok(PlaylistTrackSync::HalfBeat),
+        "beat" => Ok(PlaylistTrackSync::Beat),
+        "two-beats" => Ok(PlaylistTrackSync::TwoBeats),
+        "four-beats" => Ok(PlaylistTrackSync::FourBeats),
+        "auto" => Ok(PlaylistTrackSync::Auto),
+        _ => Err(format!(
+            "Playlist Trigger Sync must be off, quarter-beat, half-beat, beat, two-beats, four-beats, or auto; got {value:?}"
+        )),
+    }
+}
+
+fn playlist_track_sync_cli_label(sync: PlaylistTrackSync) -> &'static str {
+    match sync {
+        PlaylistTrackSync::Off => "off",
+        PlaylistTrackSync::QuarterBeat => "quarter-beat",
+        PlaylistTrackSync::HalfBeat => "half-beat",
+        PlaylistTrackSync::Beat => "beat",
+        PlaylistTrackSync::TwoBeats => "two-beats",
+        PlaylistTrackSync::FourBeats => "four-beats",
+        PlaylistTrackSync::Auto => "auto",
     }
 }
 
@@ -3535,6 +3575,37 @@ fn edit_playlist_track(
     fs::write(output, bytes)
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!("updated Playlist track {track_id} in {}", output.display());
+    Ok(())
+}
+
+fn set_playlist_track_trigger_sync(
+    input: &Path,
+    output: &Path,
+    arrangement_id: u16,
+    track_id: u32,
+    trigger_sync: PlaylistTrackSync,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .edit_playlist_track_in_arrangement(
+            arrangement_id,
+            track_id,
+            PlaylistTrackEdit {
+                trigger_sync: Some(trigger_sync),
+                ..PlaylistTrackEdit::default()
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "set Playlist track {track_id} Trigger Sync to {} in arrangement {arrangement_id} in {}",
+        playlist_track_sync_cli_label(trigger_sync),
+        output.display()
+    );
     Ok(())
 }
 

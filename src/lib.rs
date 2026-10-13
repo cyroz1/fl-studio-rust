@@ -1758,6 +1758,18 @@ pub enum PlaylistTrackSync {
 }
 
 impl PlaylistTrackSync {
+    fn raw(self) -> i32 {
+        match self {
+            Self::Off => 0,
+            Self::QuarterBeat => 1,
+            Self::HalfBeat => 2,
+            Self::Beat => 3,
+            Self::TwoBeats => 4,
+            Self::FourBeats => 5,
+            Self::Auto => 6,
+        }
+    }
+
     fn from_raw(value: i32) -> Option<Self> {
         match value {
             0 => Some(Self::Off),
@@ -1794,6 +1806,7 @@ pub struct PlaylistTrack {
 pub struct PlaylistTrackEdit {
     pub enabled: Option<bool>,
     pub grouped: Option<bool>,
+    pub trigger_sync: Option<PlaylistTrackSync>,
 }
 
 /// Mixer insert fields recognized from the observed `0x9A`, `0x93`, `0x95`
@@ -5334,10 +5347,37 @@ impl FlpDocument {
         })
     }
 
-    /// Edits the observed mute and grouping fields of an existing Playlist track in place.
-    /// All other track and project event bytes are preserved.
+    /// Edits the observed mute, grouping, or Trigger Sync fields of a Playlist track in place.
+    /// This unscoped form reports an error when the track ID occurs in multiple arrangements.
     pub fn edit_playlist_track(
         &mut self,
+        track_id: u32,
+        edit: PlaylistTrackEdit,
+    ) -> Result<(), FlpError> {
+        Self::validate_playlist_track_edit(track_id, edit)?;
+        if edit.enabled.is_none() && edit.grouped.is_none() && edit.trigger_sync.is_none() {
+            return Ok(());
+        }
+        let event_index = self.playlist_track_event_index(None, track_id)?;
+        self.write_playlist_track_edit(event_index, edit)
+    }
+
+    /// Edits one Playlist track in a specific arrangement while preserving all other state bytes.
+    pub fn edit_playlist_track_in_arrangement(
+        &mut self,
+        arrangement_id: u16,
+        track_id: u32,
+        edit: PlaylistTrackEdit,
+    ) -> Result<(), FlpError> {
+        Self::validate_playlist_track_edit(track_id, edit)?;
+        if edit.enabled.is_none() && edit.grouped.is_none() && edit.trigger_sync.is_none() {
+            return Ok(());
+        }
+        let event_index = self.playlist_track_event_index(Some(arrangement_id), track_id)?;
+        self.write_playlist_track_edit(event_index, edit)
+    }
+
+    fn validate_playlist_track_edit(
         track_id: u32,
         edit: PlaylistTrackEdit,
     ) -> Result<(), FlpError> {
@@ -5351,21 +5391,54 @@ impl FlpDocument {
                 "the first Playlist track cannot be grouped with a track above it",
             ));
         }
-        if edit.enabled.is_none() && edit.grouped.is_none() {
-            return Ok(());
-        }
+        Ok(())
+    }
 
-        let mut matching_events = self.events.iter().enumerate().filter_map(|(index, event)| {
-            if event.opcode != 0xEE || event.payload.len() != 70 {
-                return None;
+    fn playlist_track_event_index(
+        &self,
+        arrangement_id: Option<u16>,
+        track_id: u32,
+    ) -> Result<usize, FlpError> {
+        let (start, end) = if let Some(arrangement_id) = arrangement_id {
+            let has_arrangement_markers = self
+                .events
+                .iter()
+                .any(|event| event.opcode == 0x63 && event.payload.len() == 2);
+            if !has_arrangement_markers {
+                if arrangement_id != 0 {
+                    return Err(FlpError::UnsupportedEdit(
+                        "the requested Playlist arrangement does not exist",
+                    ));
+                }
+                (0, self.events.len())
+            } else {
+                let Some(marker_index) = self.events.iter().position(|event| {
+                    event.opcode == 0x63
+                        && event.payload.len() == 2
+                        && u16::from_le_bytes([event.payload[0], event.payload[1]])
+                            == arrangement_id
+                }) else {
+                    return Err(FlpError::UnsupportedEdit(
+                        "the requested Playlist arrangement does not exist",
+                    ));
+                };
+                let start = marker_index + 1;
+                let end = self.events[start..]
+                    .iter()
+                    .position(|event| {
+                        event.opcode == 0x62 || (event.opcode == 0x63 && event.payload.len() == 2)
+                    })
+                    .map_or(self.events.len(), |offset| start + offset);
+                (start, end)
             }
-            let id = u32::from_le_bytes([
-                event.payload[0],
-                event.payload[1],
-                event.payload[2],
-                event.payload[3],
-            ]);
-            (id == track_id).then_some(index)
+        } else {
+            (0, self.events.len())
+        };
+        let mut matching_events = (start..end).filter(|index| {
+            let event = &self.events[*index];
+            event.opcode == 0xEE
+                && event.payload.len() == 70
+                && u32::from_le_bytes(event.payload[..4].try_into().unwrap()) == track_id
         });
         let Some(event_index) = matching_events.next() else {
             return Err(FlpError::UnsupportedEdit(
@@ -5377,12 +5450,26 @@ impl FlpDocument {
                 "the requested Playlist track id is ambiguous",
             ));
         }
+        Ok(event_index)
+    }
 
+    fn write_playlist_track_edit(
+        &mut self,
+        event_index: usize,
+        edit: PlaylistTrackEdit,
+    ) -> Result<(), FlpError> {
         if let Some(enabled) = edit.enabled {
             write_event_payload_bytes(&mut self.events[event_index], 12, &[u8::from(enabled)])?;
         }
         if let Some(grouped) = edit.grouped {
             write_event_payload_bytes(&mut self.events[event_index], 46, &[u8::from(grouped)])?;
+        }
+        if let Some(trigger_sync) = edit.trigger_sync {
+            write_event_payload_bytes(
+                &mut self.events[event_index],
+                30,
+                &trigger_sync.raw().to_le_bytes(),
+            )?;
         }
         Ok(())
     }
@@ -15707,6 +15794,7 @@ mod tests {
                 PlaylistTrackEdit {
                     enabled: Some(false),
                     grouped: Some(true),
+                    trigger_sync: None,
                 },
             )
             .expect("mute and group fields should be editable");
