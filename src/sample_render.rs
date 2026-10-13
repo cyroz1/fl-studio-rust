@@ -31,7 +31,7 @@ use crate::vst3::Vst3PlaylistStreamProcessor;
 use crate::{
     Arrangement, ChannelNoteRouter, ChannelSummary, FlpDocument, MixerInsertSignalTransform,
     MixerRouteAudibility, MixerSourceRoutePlan, MixerSourceRouteTransform, Pattern, PatternNote,
-    PlaylistClip, PlaylistClipTarget, PlaylistTrackPress, PlaylistTrackSync,
+    PlaylistClip, PlaylistClipTarget, PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync,
 };
 
 const DEFAULT_SAMPLE_RATE: u32 = 44_100;
@@ -5074,6 +5074,7 @@ struct ActivePerformanceSamplerClip {
     initial_offset_ticks: u64,
     first_loop_end_tick: u64,
     loop_period_ticks: u64,
+    first_pass_scheduled: bool,
 }
 
 #[derive(Clone)]
@@ -5091,6 +5092,7 @@ struct ActivePerformanceAudioClip {
     initial_offset_ticks: u64,
     first_loop_end_tick: u64,
     loop_period_ticks: u64,
+    first_pass_scheduled: bool,
 }
 
 struct PlaylistPerformanceSources<'a> {
@@ -5108,6 +5110,7 @@ struct PlaylistPerformanceRuntime {
     launches: Receiver<PlaylistPerformanceCommand>,
     pending_commands: Vec<PlaylistPerformanceCommand>,
     queued_by_track: BTreeMap<u32, VecDeque<PlaylistPerformanceLaunch>>,
+    motion_by_track: HashMap<u32, Option<PlaylistTrackMotion>>,
     press_by_track: HashMap<u32, Option<PlaylistTrackPress>>,
     position_sync_by_track: HashMap<u32, Option<PlaylistTrackSync>>,
     ppq: u16,
@@ -5252,6 +5255,10 @@ impl PlaylistPerformanceRuntime {
             );
         }
         let tracks = document.playlist_tracks_in_arrangement(options.arrangement_id);
+        let motion_by_track = tracks
+            .iter()
+            .map(|track| (track.id, track.motion))
+            .collect();
         let press_by_track = tracks.iter().map(|track| (track.id, track.press)).collect();
         let position_sync_by_track = tracks
             .into_iter()
@@ -5277,6 +5284,7 @@ impl PlaylistPerformanceRuntime {
             launches,
             pending_commands: Vec::new(),
             queued_by_track: BTreeMap::new(),
+            motion_by_track,
             press_by_track,
             position_sync_by_track,
             ppq: document.header().ppq(),
@@ -5388,6 +5396,12 @@ impl PlaylistPerformanceRuntime {
                 .clips_by_index
                 .get(&active.clip_index)
                 .ok_or_else(|| "active Performance Mode clip disappeared".to_owned())?;
+            let one_shot = performance_motion_is_one_shot(
+                self.motion_by_track.get(&clip.track_id).copied().flatten(),
+            );
+            if one_shot && active.first_pass_scheduled {
+                continue;
+            }
             loop {
                 let loop_offset_ticks = active.initial_offset_ticks.min(clip.length_ticks);
                 let loop_length_ticks = clip.length_ticks.saturating_sub(loop_offset_ticks);
@@ -5405,6 +5419,9 @@ impl PlaylistPerformanceRuntime {
                 if loop_frame > horizon_frame {
                     break;
                 }
+                let loop_end_frame = self
+                    .tempo_map
+                    .frame_at_tick(loop_end_tick, self.sample_rate)?;
                 for template in &clip.notes {
                     let (relative_start_tick, relative_stop_tick) = if loop_offset_ticks == 0 {
                         (template.relative_start_tick, template.relative_stop_tick)
@@ -5428,6 +5445,9 @@ impl PlaylistPerformanceRuntime {
                     } else {
                         continue;
                     };
+                    if one_shot && relative_start_tick >= loop_length_ticks {
+                        continue;
+                    }
                     let start_tick = active
                         .next_loop_tick
                         .checked_add(relative_start_tick)
@@ -5452,10 +5472,25 @@ impl PlaylistPerformanceRuntime {
                                 .map(|frame| frame.max(note.start_frame.saturating_add(1)))
                         })
                         .transpose()?;
+                    if one_shot {
+                        if note.start_frame >= loop_end_frame {
+                            continue;
+                        }
+                        note.stop_frame = Some(
+                            note.stop_frame
+                                .unwrap_or(loop_end_frame)
+                                .min(loop_end_frame)
+                                .max(note.start_frame.saturating_add(1)),
+                        );
+                    }
                     queued_notes.push(note);
                 }
                 active.next_loop_tick = loop_end_tick;
                 active.initial_offset_ticks = 0;
+                if one_shot {
+                    active.first_pass_scheduled = true;
+                    break;
+                }
             }
         }
         for active in self.active_audio_by_track.values_mut() {
@@ -5463,6 +5498,12 @@ impl PlaylistPerformanceRuntime {
                 .audio_clips_by_index
                 .get(&active.clip_index)
                 .ok_or_else(|| "active Performance Mode Audio Clip disappeared".to_owned())?;
+            let one_shot = performance_motion_is_one_shot(
+                self.motion_by_track.get(&clip.track_id).copied().flatten(),
+            );
+            if one_shot && active.first_pass_scheduled {
+                continue;
+            }
             loop {
                 let loop_start_tick = active.next_loop_tick;
                 let loop_offset_ticks = active.initial_offset_ticks.min(clip.length_ticks);
@@ -5515,7 +5556,40 @@ impl PlaylistPerformanceRuntime {
                 }
                 active.next_loop_tick = loop_end_tick;
                 active.initial_offset_ticks = 0;
+                if one_shot {
+                    active.first_pass_scheduled = true;
+                    break;
+                }
             }
+        }
+        let mut completed_one_shot_tracks = Vec::new();
+        for (&track_id, active) in &self.active_by_track {
+            if performance_motion_is_one_shot(
+                self.motion_by_track.get(&track_id).copied().flatten(),
+            ) && active.first_pass_scheduled
+                && self
+                    .tempo_map
+                    .frame_at_tick(active.first_loop_end_tick, self.sample_rate)?
+                    <= block_end
+            {
+                completed_one_shot_tracks.push(track_id);
+            }
+        }
+        for (&track_id, active) in &self.active_audio_by_track {
+            if performance_motion_is_one_shot(
+                self.motion_by_track.get(&track_id).copied().flatten(),
+            ) && active.first_pass_scheduled
+                && self
+                    .tempo_map
+                    .frame_at_tick(active.first_loop_end_tick, self.sample_rate)?
+                    <= block_end
+            {
+                completed_one_shot_tracks.push(track_id);
+            }
+        }
+        for track_id in completed_one_shot_tracks {
+            self.active_by_track.remove(&track_id);
+            self.active_audio_by_track.remove(&track_id);
         }
         self.active_audio_playbacks
             .retain(|clip| clip.start_frame.saturating_add(clip.duration_frames) > block_start);
@@ -5601,6 +5675,7 @@ impl PlaylistPerformanceRuntime {
                     initial_offset_ticks: launch.position_offset_ticks,
                     first_loop_end_tick,
                     loop_period_ticks: length_ticks,
+                    first_pass_scheduled: false,
                 },
             );
         } else {
@@ -5612,6 +5687,7 @@ impl PlaylistPerformanceRuntime {
                     initial_offset_ticks: launch.position_offset_ticks,
                     first_loop_end_tick,
                     loop_period_ticks: length_ticks,
+                    first_pass_scheduled: false,
                 },
             );
         }
@@ -5674,7 +5750,8 @@ impl PlaylistPerformanceRuntime {
                             .map(|active| (active.first_loop_end_tick, active.loop_period_ticks))
                     });
                 let boundary_tick = if let Some((first_end_tick, period_ticks)) = active_boundary {
-                    performance_next_loop_boundary(
+                    performance_motion_transition_tick(
+                        self.motion_by_track.get(&track_id).copied().flatten(),
                         first_end_tick,
                         period_ticks,
                         queued_launch.start_tick,
@@ -5763,6 +5840,23 @@ fn performance_latch_should_stop(
     requested_clip_index: usize,
 ) -> bool {
     press == Some(PlaylistTrackPress::Latch) && active_clip_index == Some(requested_clip_index)
+}
+
+fn performance_motion_is_one_shot(motion: Option<PlaylistTrackMotion>) -> bool {
+    motion == Some(PlaylistTrackMotion::OneShot)
+}
+
+fn performance_motion_transition_tick(
+    motion: Option<PlaylistTrackMotion>,
+    first_end_tick: u64,
+    period_ticks: u64,
+    earliest_tick: u64,
+) -> Result<u64, String> {
+    if performance_motion_is_one_shot(motion) {
+        Ok(earliest_tick.max(first_end_tick))
+    } else {
+        performance_next_loop_boundary(first_end_tick, period_ticks, earliest_tick)
+    }
 }
 
 fn performance_position_offset_ticks(
@@ -7890,6 +7984,35 @@ mod tests {
             Some(4),
             4
         ));
+    }
+
+    #[test]
+    fn performance_one_shot_motion_plays_once() {
+        assert!(performance_motion_is_one_shot(Some(
+            PlaylistTrackMotion::OneShot
+        )));
+        assert!(!performance_motion_is_one_shot(Some(
+            PlaylistTrackMotion::Stay
+        )));
+        assert!(!performance_motion_is_one_shot(Some(
+            PlaylistTrackMotion::MarchWrap
+        )));
+        assert!(!performance_motion_is_one_shot(None));
+        assert_eq!(
+            performance_motion_transition_tick(Some(PlaylistTrackMotion::OneShot), 384, 384, 200)
+                .unwrap(),
+            384
+        );
+        assert_eq!(
+            performance_motion_transition_tick(Some(PlaylistTrackMotion::OneShot), 384, 384, 500)
+                .unwrap(),
+            500
+        );
+        assert_eq!(
+            performance_motion_transition_tick(Some(PlaylistTrackMotion::Stay), 384, 384, 500)
+                .unwrap(),
+            768
+        );
     }
 
     #[test]
