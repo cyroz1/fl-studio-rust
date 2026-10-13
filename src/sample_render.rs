@@ -5407,9 +5407,9 @@ impl PlaylistPerformanceRuntime {
                             .end
                             .saturating_sub(playback.source_bounds.start);
                         let source_offset_frames =
-                            (u128::from(source_frames as u64) * u128::from(loop_offset_ticks)
+                            (source_frames as u128 * u128::from(loop_offset_ticks)
                                 / u128::from(clip.length_ticks))
-                            .min(u128::from(usize::MAX)) as usize;
+                            .min(usize::MAX as u128) as usize;
                         playback.source_bounds.start = playback
                             .source_bounds
                             .start
