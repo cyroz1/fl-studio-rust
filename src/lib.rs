@@ -11008,7 +11008,8 @@ impl FlpDocument {
     /// Imports the note events from one Standard MIDI File track into an existing FLP
     /// pattern and channel. Note times are converted through the MIDI tempo map or
     /// SMPTE clock, then expressed against the existing FLP tempo. MIDI CC 10 pan
-    /// is captured at each note-on and mapped to the FL note-pan range.
+    /// is captured at each note-on and mapped to the FL note-pan range. MIDI
+    /// time-signature events are imported as Pattern-scoped markers.
     pub fn import_midi_track(
         &mut self,
         midi: &midi::MidiFile,
@@ -11052,9 +11053,6 @@ impl FlpDocument {
                 )
             })?;
         let midi_notes = track.notes();
-        if midi_notes.is_empty() {
-            return Ok(0);
-        }
 
         let mut imported = Vec::with_capacity(midi_notes.len());
         for midi_note in &midi_notes {
@@ -11128,8 +11126,75 @@ impl FlpDocument {
             });
         }
 
+        let signature_tracks: Vec<usize> = if midi.format() == 1 {
+            (0..midi.tracks().len()).collect()
+        } else {
+            vec![track_index]
+        };
+        let mut signatures = Vec::new();
+        for signature_track_index in signature_tracks {
+            let signature_track =
+                midi.tracks()
+                    .get(signature_track_index)
+                    .ok_or(FlpError::UnsupportedEdit(
+                        "the requested MIDI signature track does not exist",
+                    ))?;
+            for event in signature_track.events() {
+                let midi::MidiEventKind::Meta {
+                    meta_type: 0x58,
+                    data,
+                } = event.kind()
+                else {
+                    continue;
+                };
+                if data.len() != 4 {
+                    return Err(FlpError::UnsupportedEdit(
+                        "MIDI time-signature events must have a four-byte payload",
+                    ));
+                }
+                let numerator = data[0];
+                if numerator == 0 {
+                    return Err(FlpError::UnsupportedEdit(
+                        "MIDI time-signature numerator must be positive",
+                    ));
+                }
+                let denominator = 1u16
+                    .checked_shl(u32::from(data[1]))
+                    .filter(|denominator| *denominator <= u16::from(u8::MAX))
+                    .ok_or(FlpError::UnsupportedEdit(
+                        "MIDI time-signature denominator exceeds the FL Studio range",
+                    ))? as u8;
+                signatures.push((event.absolute_tick(), numerator, denominator));
+            }
+        }
+        signatures.sort_by_key(|(tick, _, _)| *tick);
+
+        let mut imported_signatures = Vec::with_capacity(signatures.len());
+        for (tick, numerator, denominator) in signatures {
+            let elapsed_microseconds = midi
+                .elapsed_microseconds_at_tick(tick, track_index, default_microseconds_per_quarter)
+                .map_err(|_| {
+                    FlpError::UnsupportedEdit("could not convert MIDI time-signature position")
+                })?;
+            let position = scale_midi_microseconds_to_project_ticks(
+                elapsed_microseconds,
+                project_tempo_milli_bpm,
+                self.header.ppq,
+            )?;
+            imported_signatures.push((position, numerator, denominator));
+        }
+
+        if imported.is_empty() && imported_signatures.is_empty() {
+            return Ok(0);
+        }
+
         let mut candidate = self.clone();
-        candidate.add_pattern_notes(pattern_id, &imported)?;
+        if !imported.is_empty() {
+            candidate.add_pattern_notes(pattern_id, &imported)?;
+        }
+        for (position, numerator, denominator) in imported_signatures {
+            candidate.set_pattern_time_signature(pattern_id, position, numerator, denominator)?;
+        }
         *self = candidate;
         Ok(imported.len())
     }
