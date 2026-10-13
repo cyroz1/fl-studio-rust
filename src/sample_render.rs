@@ -1,6 +1,6 @@
 //! Offline rendering for Playlist clips that reference FLP audio channels.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -31,7 +31,7 @@ use crate::vst3::Vst3PlaylistStreamProcessor;
 use crate::{
     Arrangement, ChannelNoteRouter, ChannelSummary, FlpDocument, MixerInsertSignalTransform,
     MixerRouteAudibility, MixerSourceRoutePlan, MixerSourceRouteTransform, Pattern, PatternNote,
-    PlaylistClip, PlaylistClipTarget,
+    PlaylistClip, PlaylistClipTarget, PlaylistTrackSync,
 };
 
 const DEFAULT_SAMPLE_RATE: u32 = 44_100;
@@ -844,6 +844,7 @@ pub struct PlaylistPerformanceLaunch {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PlaylistPerformanceCommand {
     Launch(PlaylistPerformanceLaunch),
+    Enqueue(PlaylistPerformanceLaunch),
     StopTrack {
         track_id: u32,
         start_tick: u64,
@@ -854,7 +855,7 @@ pub enum PlaylistPerformanceCommand {
 impl PlaylistPerformanceCommand {
     fn start_frame(self) -> u64 {
         match self {
-            Self::Launch(launch) => launch.start_frame,
+            Self::Launch(launch) | Self::Enqueue(launch) => launch.start_frame,
             Self::StopTrack { start_frame, .. } => start_frame,
         }
     }
@@ -5055,6 +5056,7 @@ struct ScheduledSamplerNote {
 #[derive(Clone)]
 struct PerformanceSamplerClip {
     track_id: u32,
+    source_start_tick: u32,
     length_ticks: u64,
     notes: Vec<PerformanceSamplerNote>,
 }
@@ -5070,11 +5072,14 @@ struct ActivePerformanceSamplerClip {
     clip_index: usize,
     next_loop_tick: u64,
     initial_offset_ticks: u64,
+    first_loop_end_tick: u64,
+    loop_period_ticks: u64,
 }
 
 #[derive(Clone)]
 struct PerformanceAudioClip {
     track_id: u32,
+    source_start_tick: u32,
     length_ticks: u64,
     source_duration_frames: u64,
     template: PreparedClip,
@@ -5084,6 +5089,8 @@ struct ActivePerformanceAudioClip {
     clip_index: usize,
     next_loop_tick: u64,
     initial_offset_ticks: u64,
+    first_loop_end_tick: u64,
+    loop_period_ticks: u64,
 }
 
 struct PlaylistPerformanceSources<'a> {
@@ -5100,6 +5107,11 @@ struct PlaylistPerformanceRuntime {
     tempo_map: PlaylistTempoMap,
     launches: Receiver<PlaylistPerformanceCommand>,
     pending_commands: Vec<PlaylistPerformanceCommand>,
+    queued_by_track: BTreeMap<u32, VecDeque<PlaylistPerformanceLaunch>>,
+    position_sync_by_track: HashMap<u32, Option<PlaylistTrackSync>>,
+    ppq: u16,
+    initial_time_signature: Option<(u8, u8)>,
+    signature_changes: Vec<(u32, u8, u8)>,
     clips_by_index: HashMap<usize, PerformanceSamplerClip>,
     audio_clips_by_index: HashMap<usize, PerformanceAudioClip>,
     active_by_track: BTreeMap<u32, ActivePerformanceSamplerClip>,
@@ -5174,6 +5186,7 @@ impl PlaylistPerformanceRuntime {
                 clip_index,
                 PerformanceSamplerClip {
                     track_id,
+                    source_start_tick: clip.position_ticks,
                     length_ticks,
                     notes,
                 },
@@ -5230,12 +5243,30 @@ impl PlaylistPerformanceRuntime {
                 clip_index,
                 PerformanceAudioClip {
                     track_id,
+                    source_start_tick: clip.position_ticks,
                     length_ticks,
                     source_duration_frames,
                     template,
                 },
             );
         }
+        let position_sync_by_track = document
+            .playlist_tracks_in_arrangement(options.arrangement_id)
+            .into_iter()
+            .map(|track| (track.id, track.position_sync))
+            .collect();
+        let signature_changes = arrangement
+            .time_markers
+            .iter()
+            .filter(|marker| marker.is_signature())
+            .filter_map(|marker| {
+                Some((
+                    marker.position_ticks(),
+                    marker.numerator()?.max(1),
+                    marker.denominator()?.max(1),
+                ))
+            })
+            .collect();
         Ok(Self {
             performance_zone_end_tick,
             start_frame,
@@ -5243,6 +5274,11 @@ impl PlaylistPerformanceRuntime {
             tempo_map: PlaylistTempoMap::for_arrangement(document, options.arrangement_id)?,
             launches,
             pending_commands: Vec::new(),
+            queued_by_track: BTreeMap::new(),
+            position_sync_by_track,
+            ppq: document.header().ppq(),
+            initial_time_signature: document.metadata().time_signature(),
+            signature_changes,
             clips_by_index,
             audio_clips_by_index,
             active_by_track: BTreeMap::new(),
@@ -5276,45 +5312,24 @@ impl PlaylistPerformanceRuntime {
         for command in due_commands {
             match command {
                 PlaylistPerformanceCommand::Launch(launch) => {
-                    if launch.start_tick < u64::from(self.performance_zone_end_tick)
-                        || launch.start_frame < self.start_frame
+                    self.validate_launch(launch)?;
+                    let track_id = self.performance_clip_track_id(launch.clip_index)?;
+                    self.queued_by_track.remove(&track_id);
+                    self.activate_launch(launch, sampler_engine)?;
+                }
+                PlaylistPerformanceCommand::Enqueue(launch) => {
+                    self.validate_launch(launch)?;
+                    let track_id = self.performance_clip_track_id(launch.clip_index)?;
+                    if self.active_by_track.contains_key(&track_id)
+                        || self.active_audio_by_track.contains_key(&track_id)
                     {
-                        return Err(
-                            "Performance Mode launch must start at or after the Start marker"
-                                .into(),
-                        );
-                    }
-                    let (track_id, is_sampler_clip) = if let Some(clip) =
-                        self.clips_by_index.get(&launch.clip_index)
-                    {
-                        (clip.track_id, true)
-                    } else if let Some(clip) = self.audio_clips_by_index.get(&launch.clip_index) {
-                        (clip.track_id, false)
+                        self.queued_by_track
+                            .entry(track_id)
+                            .or_default()
+                            .push_back(launch);
                     } else {
-                        return Err(format!(
-                            "Playlist Clip {} is not supported in Performance Mode",
-                            launch.clip_index + 1
-                        ));
-                    };
-                    self.stop_track_at(track_id, launch.start_frame, sampler_engine);
-                    if is_sampler_clip {
-                        self.active_by_track.insert(
-                            track_id,
-                            ActivePerformanceSamplerClip {
-                                clip_index: launch.clip_index,
-                                next_loop_tick: launch.start_tick,
-                                initial_offset_ticks: launch.position_offset_ticks,
-                            },
-                        );
-                    } else {
-                        self.active_audio_by_track.insert(
-                            track_id,
-                            ActivePerformanceAudioClip {
-                                clip_index: launch.clip_index,
-                                next_loop_tick: launch.start_tick,
-                                initial_offset_ticks: launch.position_offset_ticks,
-                            },
-                        );
+                        let launch = self.launch_with_position_at(launch, launch.start_tick)?;
+                        self.activate_launch(launch, sampler_engine)?;
                     }
                 }
                 PlaylistPerformanceCommand::StopTrack {
@@ -5329,6 +5344,7 @@ impl PlaylistPerformanceRuntime {
                             "Performance Mode stop must start at or after the Start marker".into(),
                         );
                     }
+                    self.queued_by_track.remove(&track_id);
                     self.stop_track_at(track_id, start_frame, sampler_engine);
                 }
             }
@@ -5337,6 +5353,7 @@ impl PlaylistPerformanceRuntime {
         let horizon_frame = block_start
             .saturating_add(frame_count as u64)
             .saturating_add(u64::from(self.sample_rate));
+        self.apply_queued_transitions(horizon_frame, sampler_engine)?;
         let mut queued_notes = Vec::new();
         for active in self.active_by_track.values_mut() {
             let clip = self
@@ -5492,6 +5509,181 @@ impl PlaylistPerformanceRuntime {
         Ok(())
     }
 
+    fn validate_launch(&self, launch: PlaylistPerformanceLaunch) -> Result<(), String> {
+        if launch.start_tick < u64::from(self.performance_zone_end_tick)
+            || launch.start_frame < self.start_frame
+        {
+            return Err("Performance Mode launch must start at or after the Start marker".into());
+        }
+        self.performance_clip_track_id(launch.clip_index)
+            .map(|_| ())
+    }
+
+    fn performance_clip_track_id(&self, clip_index: usize) -> Result<u32, String> {
+        self.clips_by_index
+            .get(&clip_index)
+            .map(|clip| clip.track_id)
+            .or_else(|| {
+                self.audio_clips_by_index
+                    .get(&clip_index)
+                    .map(|clip| clip.track_id)
+            })
+            .ok_or_else(|| {
+                format!(
+                    "Playlist Clip {} is not supported in Performance Mode",
+                    clip_index + 1
+                )
+            })
+    }
+
+    fn activate_launch(
+        &mut self,
+        launch: PlaylistPerformanceLaunch,
+        sampler_engine: &mut SamplerVoiceEngine<'_>,
+    ) -> Result<(), String> {
+        let is_sampler_clip = self.clips_by_index.contains_key(&launch.clip_index);
+        let (track_id, length_ticks) =
+            if let Some(clip) = self.clips_by_index.get(&launch.clip_index) {
+                (clip.track_id, clip.length_ticks)
+            } else if let Some(clip) = self.audio_clips_by_index.get(&launch.clip_index) {
+                (clip.track_id, clip.length_ticks)
+            } else {
+                return Err(format!(
+                    "Playlist Clip {} is not supported in Performance Mode",
+                    launch.clip_index + 1
+                ));
+            };
+        let offset_ticks = launch.position_offset_ticks.min(length_ticks);
+        let first_loop_length = if offset_ticks >= length_ticks {
+            length_ticks
+        } else {
+            length_ticks - offset_ticks
+        };
+        let first_loop_end_tick = launch
+            .start_tick
+            .checked_add(first_loop_length)
+            .ok_or_else(|| "Performance Mode loop tick overflow".to_owned())?;
+        self.stop_track_at(track_id, launch.start_frame, sampler_engine);
+        if is_sampler_clip {
+            self.active_by_track.insert(
+                track_id,
+                ActivePerformanceSamplerClip {
+                    clip_index: launch.clip_index,
+                    next_loop_tick: launch.start_tick,
+                    initial_offset_ticks: launch.position_offset_ticks,
+                    first_loop_end_tick,
+                    loop_period_ticks: length_ticks,
+                },
+            );
+        } else {
+            self.active_audio_by_track.insert(
+                track_id,
+                ActivePerformanceAudioClip {
+                    clip_index: launch.clip_index,
+                    next_loop_tick: launch.start_tick,
+                    initial_offset_ticks: launch.position_offset_ticks,
+                    first_loop_end_tick,
+                    loop_period_ticks: length_ticks,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn launch_with_position_at(
+        &self,
+        mut launch: PlaylistPerformanceLaunch,
+        start_tick: u64,
+    ) -> Result<PlaylistPerformanceLaunch, String> {
+        let (track_id, source_start_tick, length_ticks) =
+            if let Some(clip) = self.clips_by_index.get(&launch.clip_index) {
+                (clip.track_id, clip.source_start_tick, clip.length_ticks)
+            } else if let Some(clip) = self.audio_clips_by_index.get(&launch.clip_index) {
+                (clip.track_id, clip.source_start_tick, clip.length_ticks)
+            } else {
+                return Err(format!(
+                    "Playlist Clip {} is not supported in Performance Mode",
+                    launch.clip_index + 1
+                ));
+            };
+        launch.position_offset_ticks = performance_position_offset_ticks(
+            start_tick,
+            u64::from(source_start_tick),
+            length_ticks,
+            self.ppq,
+            self.initial_time_signature,
+            &self.signature_changes,
+            self.position_sync_by_track
+                .get(&track_id)
+                .copied()
+                .flatten(),
+        );
+        launch.start_tick = start_tick;
+        launch.start_frame = self.tempo_map.frame_at_tick(start_tick, self.sample_rate)?;
+        Ok(launch)
+    }
+
+    fn apply_queued_transitions(
+        &mut self,
+        horizon_frame: u64,
+        sampler_engine: &mut SamplerVoiceEngine<'_>,
+    ) -> Result<(), String> {
+        let track_ids = self.queued_by_track.keys().copied().collect::<Vec<_>>();
+        for track_id in track_ids {
+            loop {
+                let Some(queued_launch) = self
+                    .queued_by_track
+                    .get(&track_id)
+                    .and_then(|queue| queue.front())
+                    .copied()
+                else {
+                    break;
+                };
+                let active_boundary = self
+                    .active_by_track
+                    .get(&track_id)
+                    .map(|active| (active.first_loop_end_tick, active.loop_period_ticks))
+                    .or_else(|| {
+                        self.active_audio_by_track
+                            .get(&track_id)
+                            .map(|active| (active.first_loop_end_tick, active.loop_period_ticks))
+                    });
+                let boundary_tick = if let Some((first_end_tick, period_ticks)) = active_boundary {
+                    performance_next_loop_boundary(
+                        first_end_tick,
+                        period_ticks,
+                        queued_launch.start_tick,
+                    )?
+                } else {
+                    queued_launch.start_tick
+                };
+                let start_frame = self
+                    .tempo_map
+                    .frame_at_tick(boundary_tick, self.sample_rate)?;
+                if start_frame > horizon_frame {
+                    break;
+                }
+                let mut queued_launch = self
+                    .queued_by_track
+                    .get_mut(&track_id)
+                    .and_then(|queue| queue.pop_front())
+                    .expect("the queued launch was present above");
+                queued_launch.start_tick = boundary_tick;
+                queued_launch.start_frame = start_frame;
+                queued_launch = self.launch_with_position_at(queued_launch, boundary_tick)?;
+                self.activate_launch(queued_launch, sampler_engine)?;
+            }
+            if self
+                .queued_by_track
+                .get(&track_id)
+                .is_some_and(|queue| queue.is_empty())
+            {
+                self.queued_by_track.remove(&track_id);
+            }
+        }
+        Ok(())
+    }
+
     fn stop_audio_track_at(&mut self, track_id: u32, stop_frame: u64) {
         self.active_audio_playbacks.retain_mut(|clip| {
             if clip.playlist_track_id != Some(track_id) {
@@ -5519,6 +5711,127 @@ impl PlaylistPerformanceRuntime {
         self.active_audio_by_track.remove(&track_id);
         self.stop_audio_track_at(track_id, stop_frame);
     }
+}
+
+fn performance_next_loop_boundary(
+    first_end_tick: u64,
+    period_ticks: u64,
+    earliest_tick: u64,
+) -> Result<u64, String> {
+    if period_ticks == 0 {
+        return Err("Performance Mode clip has no loop length".to_owned());
+    }
+    if earliest_tick <= first_end_tick {
+        return Ok(first_end_tick);
+    }
+    let loops = earliest_tick
+        .saturating_sub(first_end_tick)
+        .div_ceil(period_ticks);
+    first_end_tick
+        .checked_add(loops.saturating_mul(period_ticks))
+        .ok_or_else(|| "Performance Mode loop tick overflow".to_owned())
+}
+
+fn performance_position_offset_ticks(
+    song_tick: u64,
+    clip_start_tick: u64,
+    clip_length_ticks: u64,
+    ppq: u16,
+    initial_time_signature: Option<(u8, u8)>,
+    signature_changes: &[(u32, u8, u8)],
+    position_sync: Option<PlaylistTrackSync>,
+) -> u64 {
+    if clip_length_ticks == 0 {
+        return 0;
+    }
+    match position_sync {
+        None | Some(PlaylistTrackSync::Off) => return 0,
+        Some(PlaylistTrackSync::Auto) => {
+            return song_tick.saturating_sub(clip_start_tick) % clip_length_ticks;
+        }
+        _ => {}
+    }
+    let Some(position_sync) = position_sync else {
+        return 0;
+    };
+    let (bar_start_tick, signature) = performance_signature_and_bar_start(
+        song_tick,
+        initial_time_signature,
+        signature_changes,
+        ppq,
+    );
+    let bar_ticks = performance_bar_ticks(ppq, signature);
+    let beat_ticks = performance_bar_ticks(ppq, (1, signature.1));
+    let interval_ticks = match position_sync {
+        PlaylistTrackSync::Off => return 0,
+        PlaylistTrackSync::QuarterBeat => beat_ticks.div_ceil(4),
+        PlaylistTrackSync::HalfBeat => beat_ticks.div_ceil(2),
+        PlaylistTrackSync::Beat => beat_ticks,
+        PlaylistTrackSync::TwoBeats => beat_ticks.saturating_mul(2),
+        PlaylistTrackSync::FourBeats => beat_ticks.saturating_mul(4),
+        PlaylistTrackSync::Auto => unreachable!("Auto is handled above"),
+    }
+    .max(1);
+    let phase_in_bar = song_tick.saturating_sub(bar_start_tick);
+    let grid_count = bar_ticks.div_ceil(interval_ticks).max(1);
+    let lower_index = (phase_in_bar / interval_ticks).min(grid_count - 1);
+    let upper_index = (lower_index + 1) % grid_count;
+    let lower_tick = lower_index.saturating_mul(interval_ticks);
+    let upper_tick = upper_index.saturating_mul(interval_ticks);
+    let lower_distance = phase_in_bar.abs_diff(lower_tick);
+    let upper_distance = if upper_tick >= phase_in_bar {
+        upper_tick - phase_in_bar
+    } else {
+        bar_ticks
+            .saturating_sub(phase_in_bar)
+            .saturating_add(upper_tick)
+    };
+    if upper_distance < lower_distance {
+        upper_tick % clip_length_ticks
+    } else {
+        lower_tick % clip_length_ticks
+    }
+}
+
+fn performance_signature_and_bar_start(
+    song_tick: u64,
+    initial_time_signature: Option<(u8, u8)>,
+    signature_changes: &[(u32, u8, u8)],
+    ppq: u16,
+) -> (u64, (u8, u8)) {
+    let mut signature = initial_time_signature.unwrap_or((4, 4));
+    signature.0 = signature.0.max(1);
+    signature.1 = signature.1.max(1);
+    let mut segment_start_tick = 0u64;
+    let mut changes = signature_changes.to_vec();
+    changes.sort_by_key(|(position, _, _)| *position);
+    let mut change_index = 0;
+    while let Some((position, _, _)) = changes.get(change_index).copied() {
+        let position = u64::from(position);
+        if position > song_tick {
+            break;
+        }
+        segment_start_tick = position;
+        while changes
+            .get(change_index)
+            .is_some_and(|(change_position, _, _)| u64::from(*change_position) == position)
+        {
+            let (_, numerator, denominator) = changes[change_index];
+            signature = (numerator.max(1), denominator.max(1));
+            change_index += 1;
+        }
+    }
+    let bar_ticks = performance_bar_ticks(ppq, signature);
+    let completed_bars = song_tick.saturating_sub(segment_start_tick) / bar_ticks;
+    (
+        segment_start_tick.saturating_add(completed_bars.saturating_mul(bar_ticks)),
+        signature,
+    )
+}
+
+fn performance_bar_ticks(ppq: u16, signature: (u8, u8)) -> u64 {
+    (u64::from(ppq.max(1)) * u64::from(signature.0.max(1)) * 4 / u64::from(signature.1.max(1)))
+        .max(1)
 }
 
 fn prepare_sampler_pattern(

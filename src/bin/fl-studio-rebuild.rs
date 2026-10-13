@@ -12444,6 +12444,7 @@ impl DawUi {
         let mut join_selected_pattern_clips_requested = None;
         let mut merge_pattern_clips_requested = None;
         let mut performance_clip_launch_requested = None;
+        let mut performance_clip_queue_requested = None;
         let mut seek_tick_requested = None;
         let mut dropped_playlist_audio = None;
         let mut playlist_clip_vertical_move = None;
@@ -13520,7 +13521,7 @@ impl DawUi {
                                 if ui
                                     .checkbox(&mut queued, "Queue")
                                     .on_hover_text(
-                                        "Save the per-track Queue setting; ordered Queue playback is not implemented yet",
+                                        "Queue launches on this track in request order. An idle track starts at the next safe audio tick; otherwise queued clips start when the playing clip reaches its next cycle boundary.",
                                     )
                                     .changed()
                                 {
@@ -14402,11 +14403,24 @@ impl DawUi {
                                         {
                                             "Start Performance Mode playback before launching a clip."
                                         } else {
-                                            "Uses this Playlist track's saved Trigger Sync, Tolerant, and Position Sync settings. Requires a supported, unmuted Audio Clip before Start; all non-muted media clips on its track must also be supported."
+                                            "Uses this Playlist track's Queue, Trigger Sync, Tolerant, and Position Sync settings. Requires a supported, unmuted Audio Clip before Start; all non-muted media clips on its track must also be supported."
                                         })
                                         .clicked()
                                     {
                                         performance_clip_launch_requested = Some(clip_index);
+                                        ui.close();
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            can_launch_performance_clip,
+                                            egui::Button::new("Queue this clip"),
+                                        )
+                                        .on_hover_text(
+                                            "Adds this clip to the track's launch order. An idle track starts at the next safe audio tick; otherwise it starts when the playing clip reaches its next cycle boundary.",
+                                        )
+                                        .clicked()
+                                    {
+                                        performance_clip_queue_requested = Some(clip_index);
                                         ui.close();
                                     }
                                 } else if is_pattern_clip {
@@ -14442,11 +14456,24 @@ impl DawUi {
                         } else if !self.playing || self.performance_launch_sender.is_none() {
                             "Start Performance Mode playback before launching a clip."
                         } else {
-                            "Uses this Playlist track's saved Trigger Sync, Tolerant, and Position Sync settings. Requires a supported, unmuted Pattern Clip before Start, using enabled Sampler channels, default scale, and no Pattern controllers; all non-muted media clips on its track must also be supported."
+                            "Uses this Playlist track's Queue, Trigger Sync, Tolerant, and Position Sync settings. Requires a supported, unmuted Pattern Clip before Start, using enabled Sampler channels, default scale, and no Pattern controllers; all non-muted media clips on its track must also be supported."
                         })
                         .clicked()
                     {
                         performance_clip_launch_requested = Some(clip_index);
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            can_launch_performance_clip,
+                            egui::Button::new("Queue this clip"),
+                        )
+                        .on_hover_text(
+                            "Adds this clip to the track's launch order. An idle track starts at the next safe audio tick; otherwise it starts when the playing clip reaches its next cycle boundary.",
+                        )
+                        .clicked()
+                    {
+                        performance_clip_queue_requested = Some(clip_index);
                         ui.close();
                     }
                                     let can_consolidate_pattern_clip = !clip.is_muted()
@@ -15240,7 +15267,10 @@ impl DawUi {
             }
         }
 
-        if let Some(clip_index) = performance_clip_launch_requested {
+        let performance_clip_launch_action = performance_clip_queue_requested
+            .map(|clip_index| (clip_index, true))
+            .or_else(|| performance_clip_launch_requested.map(|clip_index| (clip_index, false)));
+        if let Some((clip_index, explicit_queue)) = performance_clip_launch_action {
             let clip_length_ticks = arrangement
                 .clips
                 .get(clip_index)
@@ -15263,6 +15293,8 @@ impl DawUi {
                 .map(playlist_track_sync_label)
                 .unwrap_or("Off");
             let clip_tolerant = clip_track.and_then(|track| track.tolerant).unwrap_or(true);
+            let queue_launch =
+                explicit_queue || clip_track.is_some_and(|track| track.queued.unwrap_or(false));
             let launch_position = self
                 .audio_engine
                 .as_ref()
@@ -15275,27 +15307,32 @@ impl DawUi {
                     let current_tick =
                         tempo_map.tick_at_frame(current_device_frame, sample_rate)?;
                     let safe_tick = tempo_map.tick_at_frame(safe_device_frame, sample_rate)?;
-                    let mut target_tick = playlist_performance_trigger_tick(
-                        safe_tick,
-                        ppq,
-                        project_time_signature,
-                        &signature_changes,
-                        clip_trigger_sync,
-                        clip_length_ticks,
-                    )?;
-                    if clip_tolerant && clip_trigger_sync != Some(PlaylistTrackSync::Off) {
-                        let boundary_from_current = playlist_performance_trigger_tick(
-                            current_tick,
+                    let target_tick = if queue_launch {
+                        u32::try_from(safe_tick.ceil() as u64).ok()?
+                    } else {
+                        let mut target_tick = playlist_performance_trigger_tick(
+                            safe_tick,
                             ppq,
                             project_time_signature,
                             &signature_changes,
                             clip_trigger_sync,
                             clip_length_ticks,
                         )?;
-                        if f64::from(boundary_from_current) < safe_tick.ceil() {
-                            target_tick = u32::try_from(safe_tick.ceil() as u64).ok()?;
+                        if clip_tolerant && clip_trigger_sync != Some(PlaylistTrackSync::Off) {
+                            let boundary_from_current = playlist_performance_trigger_tick(
+                                current_tick,
+                                ppq,
+                                project_time_signature,
+                                &signature_changes,
+                                clip_trigger_sync,
+                                clip_length_ticks,
+                            )?;
+                            if f64::from(boundary_from_current) < safe_tick.ceil() {
+                                target_tick = u32::try_from(safe_tick.ceil() as u64).ok()?;
+                            }
                         }
-                    }
+                        target_tick
+                    };
                     let target_frame = tempo_map
                         .frame_at_tick(u64::from(target_tick), sample_rate)
                         .ok()?;
@@ -15312,19 +15349,30 @@ impl DawUi {
                 });
             match (launch_position, self.performance_launch_sender.as_ref()) {
                 (Some((start_tick, start_frame, position_offset_ticks)), Some(sender)) => {
-                    match sender.send(PlaylistPerformanceCommand::Launch(
-                        PlaylistPerformanceLaunch {
-                            clip_index,
-                            start_tick: u64::from(start_tick),
-                            start_frame,
-                            position_offset_ticks,
-                        },
-                    )) {
+                    let launch = PlaylistPerformanceLaunch {
+                        clip_index,
+                        start_tick: u64::from(start_tick),
+                        start_frame,
+                        position_offset_ticks,
+                    };
+                    let command = if queue_launch {
+                        PlaylistPerformanceCommand::Enqueue(launch)
+                    } else {
+                        PlaylistPerformanceCommand::Launch(launch)
+                    };
+                    match sender.send(command) {
                         Ok(()) => {
-                            self.status = format!(
-                                "Queued Playlist Clip {} for tick {start_tick} with Position Sync {clip_position_sync_label}",
-                                clip_index + 1,
-                            );
+                            self.status = if queue_launch {
+                                format!(
+                                    "Added Playlist Clip {} to the track queue; Position Sync {clip_position_sync_label} is applied when it starts",
+                                    clip_index + 1,
+                                )
+                            } else {
+                                format!(
+                                    "Queued Playlist Clip {} for tick {start_tick} with Position Sync {clip_position_sync_label}",
+                                    clip_index + 1,
+                                )
+                            };
                         }
                         Err(_) => {
                             self.status =
