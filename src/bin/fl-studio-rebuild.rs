@@ -11656,6 +11656,7 @@ impl DawUi {
         let mut make_audio_clip_unique_as_sample_requested = None;
         let mut consolidate_audio_clip_requested = None;
         let mut split_clip_requested = None;
+        let mut split_selected_audio_clips_requested = None;
         let mut split_pattern_clip_requested = None;
         let mut split_selected_pattern_clips_requested = None;
         let mut join_clip_requested = None;
@@ -13254,6 +13255,18 @@ impl DawUi {
                                             ui.close();
                                         }
                                     });
+                                    let selected_audio_clip_indices =
+                                        (self.selected_arrangement == Some(arrangement.id)
+                                            && self
+                                                .selected_playlist_clips
+                                                .contains(&clip_index)
+                                            && self.selected_playlist_clips.len() > 1)
+                                            .then(|| {
+                                                self.selected_playlist_clips
+                                                    .iter()
+                                                    .copied()
+                                                    .collect::<Vec<_>>()
+                                            });
                                     let split_button = ui.add_enabled(
                                         can_split_clip,
                                         egui::Button::new("Split audio at cursor"),
@@ -13284,18 +13297,65 @@ impl DawUi {
                                         ui.close();
                                     }
 
-                                    let selected_audio_clip_indices =
-                                        (self.selected_arrangement == Some(arrangement.id)
-                                            && self
-                                                .selected_playlist_clips
-                                                .contains(&clip_index)
-                                            && self.selected_playlist_clips.len() > 1)
-                                            .then(|| {
-                                                self.selected_playlist_clips
-                                                    .iter()
-                                                    .copied()
-                                                    .collect::<Vec<_>>()
+                                    if let Some(selected_indices) =
+                                        selected_audio_clip_indices.as_ref()
+                                    {
+                                        let full_source_lengths = selected_indices
+                                            .iter()
+                                            .filter_map(|selected_index| {
+                                                arrangement.clips.get(*selected_index).map(|clip| {
+                                                    (
+                                                        *selected_index,
+                                                        clip.uses_full_source_window().then(|| {
+                                                            playlist_clip_sample_length_ms(
+                                                                clip,
+                                                                &channel_kinds,
+                                                                &self.audio_waveform_paths,
+                                                                &self.audio_waveforms,
+                                                            )
+                                                        }).flatten(),
+                                                    )
+                                                })
+                                            })
+                                            .collect::<BTreeMap<_, _>>();
+                                        let selection_can_split = context_split_position
+                                            .is_some_and(|split_position_ticks| {
+                                                playlist_audio_clip_selection_split_supported(
+                                                    &arrangement.clips,
+                                                    selected_indices,
+                                                    &PlaylistAudioSplitContext {
+                                                        full_source_lengths_ms:
+                                                            &full_source_lengths,
+                                                        split_position_ticks,
+                                                        channel_kinds: &channel_kinds,
+                                                        tempo_channel_ids: &tempo_channel_ids,
+                                                        ppq,
+                                                        tempo_bpm: self.tempo_bpm,
+                                                    },
+                                                )
                                             });
+                                        let button = ui.add_enabled(
+                                            selection_can_split,
+                                            egui::Button::new(
+                                                "Split selected Audio Clips at cursor",
+                                            ),
+                                        );
+                                        if button
+                                            .on_disabled_hover_text(
+                                                "Every selected Audio Clip must contain this split point, use a supported source window and default scale, and avoid tempo automation.",
+                                            )
+                                            .clicked()
+                                            && let Some(split_position_ticks) =
+                                                context_split_position
+                                        {
+                                            split_selected_audio_clips_requested = Some((
+                                                selected_indices.clone(),
+                                                split_position_ticks,
+                                            ));
+                                            ui.close();
+                                        }
+                                    }
+
                                     if let Some(selected_indices) =
                                         selected_audio_clip_indices.as_ref()
                                     {
@@ -14624,6 +14684,14 @@ impl DawUi {
             }
         }
 
+        if let Some((clip_indices, split_position_ticks)) = split_selected_audio_clips_requested {
+            playlist_clip_list_changed |= self.split_selected_playlist_audio_clips(
+                arrangement.id,
+                &clip_indices,
+                split_position_ticks,
+            );
+        }
+
         if let Some((left_clip_index, right_clip_index)) = join_clip_requested {
             if let Some(document) = self.document.as_mut() {
                 match document.join_adjacent_playlist_audio_clips(
@@ -15273,6 +15341,165 @@ impl DawUi {
             }
             None => {
                 self.status = "Open a project to join selected Playlist Audio Clips".to_owned();
+                false
+            }
+        }
+    }
+
+    fn split_selected_playlist_audio_clips(
+        &mut self,
+        arrangement_id: u16,
+        clip_indices: &[usize],
+        split_position_ticks: u32,
+    ) -> bool {
+        let mut clip_indices = clip_indices.to_vec();
+        clip_indices.sort_unstable();
+        clip_indices.dedup();
+        if clip_indices.len() < 2 {
+            self.status = "Select at least two Audio Clips to split together".to_owned();
+            return false;
+        }
+
+        let result = self.document.as_ref().map(|document| {
+            let mut updated = document.clone();
+            let arrangements = updated.arrangements().map_err(|error| error.to_string())?;
+            let mut matching_arrangements = arrangements
+                .iter()
+                .filter(|arrangement| arrangement.id == arrangement_id);
+            let Some(arrangement) = matching_arrangements.next() else {
+                return Err("The requested Playlist arrangement does not exist".to_owned());
+            };
+            if matching_arrangements.next().is_some() {
+                return Err("The requested Playlist arrangement is ambiguous".to_owned());
+            }
+
+            let channels = updated.channels();
+            let channel_kinds = channels
+                .iter()
+                .map(|channel| (channel.id(), channel.kind()))
+                .collect::<BTreeMap<_, _>>();
+            let tempo_channel_ids = channels
+                .iter()
+                .filter(|channel| {
+                    channel.kind() == Some(5)
+                        && channel
+                            .display_name()
+                            .is_some_and(|name| name.eq_ignore_ascii_case("TEMPO"))
+                })
+                .map(ChannelSummary::id)
+                .collect::<BTreeSet<_>>();
+            let full_source_lengths = clip_indices
+                .iter()
+                .filter_map(|clip_index| {
+                    arrangement.clips.get(*clip_index).map(|clip| {
+                        (
+                            *clip_index,
+                            clip.uses_full_source_window()
+                                .then(|| {
+                                    playlist_clip_sample_length_ms(
+                                        clip,
+                                        &channel_kinds,
+                                        &self.audio_waveform_paths,
+                                        &self.audio_waveforms,
+                                    )
+                                })
+                                .flatten(),
+                        )
+                    })
+                })
+                .collect::<BTreeMap<_, _>>();
+            let ppq = updated.header().ppq();
+            let tempo_bpm = updated.metadata().tempo_bpm().unwrap_or(140.0);
+            let split_context = PlaylistAudioSplitContext {
+                full_source_lengths_ms: &full_source_lengths,
+                split_position_ticks,
+                channel_kinds: &channel_kinds,
+                tempo_channel_ids: &tempo_channel_ids,
+                ppq,
+                tempo_bpm,
+            };
+            if !playlist_audio_clip_selection_split_supported(
+                &arrangement.clips,
+                &clip_indices,
+                &split_context,
+            ) {
+                return Err(
+                    "Every selected Audio Clip must support the requested split point".to_owned(),
+                );
+            }
+
+            let mut split_indices = Vec::with_capacity(clip_indices.len().saturating_mul(2));
+            for clip_index in clip_indices.iter().rev() {
+                for current_index in &mut split_indices {
+                    if *current_index > *clip_index {
+                        *current_index += 1;
+                    }
+                }
+                let full_source_length_ms = split_context
+                    .full_source_lengths_ms
+                    .get(clip_index)
+                    .copied()
+                    .flatten();
+                let right_clip_index = updated
+                    .split_playlist_audio_clip(
+                        arrangement_id,
+                        *clip_index,
+                        split_position_ticks,
+                        full_source_length_ms,
+                    )
+                    .map_err(|error| error.to_string())?;
+                split_indices.push(*clip_index);
+                split_indices.push(right_clip_index);
+            }
+
+            let arrangements = updated.arrangements().map_err(|error| error.to_string())?;
+            let mut matching_arrangements = arrangements
+                .iter()
+                .filter(|arrangement| arrangement.id == arrangement_id);
+            let Some(arrangement) = matching_arrangements.next() else {
+                return Err("The updated Playlist arrangement no longer exists".to_owned());
+            };
+            if matching_arrangements.next().is_some() {
+                return Err("The updated Playlist arrangement is ambiguous".to_owned());
+            }
+            split_indices.sort_unstable_by_key(|clip_index| {
+                arrangement
+                    .clips
+                    .get(*clip_index)
+                    .map(|clip| (clip.position_ticks, *clip_index))
+                    .unwrap_or((u32::MAX, *clip_index))
+            });
+
+            Ok::<_, String>((updated, split_indices))
+        });
+
+        match result {
+            Some(Ok((updated, split_indices))) => {
+                let Some(active_clip_index) = split_indices.first().copied() else {
+                    self.status = "No selected Audio Clips were split".to_owned();
+                    return false;
+                };
+                self.stop_project_playback();
+                self.document = Some(updated);
+                self.selected_arrangement = Some(arrangement_id);
+                self.selected_clip = Some(active_clip_index);
+                self.selected_playlist_clips = split_indices.into_iter().collect();
+                self.playlist_selection_anchor = Some(active_clip_index);
+                self.playlist_clip_context_split = None;
+                self.active_playlist_clip_drag = None;
+                self.dirty = true;
+                self.status = format!(
+                    "Split {} selected Audio Clips at tick {split_position_ticks}",
+                    clip_indices.len()
+                );
+                true
+            }
+            Some(Err(error)) => {
+                self.status = format!("Could not split selected Audio Clips: {error}");
+                false
+            }
+            None => {
+                self.status = "Open a project to split selected Playlist Audio Clips".to_owned();
                 false
             }
         }
@@ -36363,6 +36590,107 @@ fn playlist_audio_clip_selection_joinable(
                 right.position_ticks.saturating_add(right.length_ticks),
             )
     })
+}
+
+struct PlaylistAudioSplitContext<'a> {
+    full_source_lengths_ms: &'a BTreeMap<usize, Option<f32>>,
+    split_position_ticks: u32,
+    channel_kinds: &'a BTreeMap<u16, Option<u8>>,
+    tempo_channel_ids: &'a BTreeSet<u16>,
+    ppq: u16,
+    tempo_bpm: f64,
+}
+
+fn playlist_audio_clip_selection_split_supported(
+    clips: &[PlaylistClip],
+    clip_indices: &[usize],
+    context: &PlaylistAudioSplitContext<'_>,
+) -> bool {
+    clip_indices.len() >= 2
+        && clip_indices.iter().all(|clip_index| {
+            let Some(clip) = clips.get(*clip_index) else {
+                return false;
+            };
+            playlist_audio_clip_split_supported(*clip_index, clip, clips, context)
+        })
+}
+
+fn playlist_audio_clip_split_supported(
+    clip_index: usize,
+    clip: &PlaylistClip,
+    clips: &[PlaylistClip],
+    context: &PlaylistAudioSplitContext<'_>,
+) -> bool {
+    let PlaylistClipTarget::Channel { id } = clip.target() else {
+        return false;
+    };
+    if context.channel_kinds.get(&id).copied().flatten() != Some(4)
+        || clip
+            .scale
+            .is_some_and(|scale| !scale.is_finite() || scale <= 0.0 || (scale - 1.0).abs() > 1e-9)
+    {
+        return false;
+    }
+    let Some(relative_split_ticks) = context
+        .split_position_ticks
+        .checked_sub(clip.position_ticks)
+        .filter(|ticks| *ticks > 0 && *ticks < clip.length_ticks)
+    else {
+        return false;
+    };
+    if clips.iter().any(|candidate| {
+        let PlaylistClipTarget::Channel { id } = candidate.target() else {
+            return false;
+        };
+        context.tempo_channel_ids.contains(&id)
+            && candidate.position_ticks <= context.split_position_ticks
+            && candidate
+                .position_ticks
+                .saturating_add(candidate.length_ticks)
+                > clip.position_ticks
+    }) {
+        return false;
+    }
+
+    if clip.record_size == 88 {
+        return clip
+            .source_window_ticks()
+            .is_some_and(|(source_start, source_end)| {
+                source_end > source_start
+                    && source_end.checked_sub(source_start) == Some(clip.length_ticks)
+                    && source_start
+                        .checked_add(relative_split_ticks)
+                        .is_some_and(|split_source| {
+                            split_source > source_start && split_source < source_end
+                        })
+            });
+    }
+
+    let source_window = clip.source_window_milliseconds().or_else(|| {
+        clip.uses_full_source_window()
+            .then(|| {
+                context
+                    .full_source_lengths_ms
+                    .get(&clip_index)
+                    .copied()
+                    .flatten()
+            })
+            .flatten()
+            .filter(|length_ms| length_ms.is_finite() && *length_ms > 0.0)
+            .map(|length_ms| (0.0, f64::from(length_ms)))
+    });
+    let Some((source_start_ms, source_end_ms)) = source_window else {
+        return false;
+    };
+    if context.ppq == 0 || !context.tempo_bpm.is_finite() || context.tempo_bpm <= 0.0 {
+        return false;
+    }
+    let split_source_ms = (source_start_ms
+        + f64::from(relative_split_ticks) * 60_000.0 / (f64::from(context.ppq) * context.tempo_bpm))
+        as f32;
+    split_source_ms.is_finite()
+        && split_source_ms > source_start_ms as f32
+        && split_source_ms < source_end_ms as f32
 }
 
 fn playlist_pattern_clip_split_supported(
