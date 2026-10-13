@@ -13888,6 +13888,32 @@ impl DawUi {
                                 clip.target(),
                                 flp_rebuild::PlaylistClipTarget::Pattern { .. }
                             );
+                            let can_trigger_performance_clip = self.performance_mode_active
+                                && self.playing
+                                && self.performance_launch_sender.is_some()
+                                && !self.playlist_mute_tool_active;
+                            if response.clicked_by(PointerButton::Primary)
+                                && can_trigger_performance_clip
+                                && performance_zone_end_tick.is_some_and(|zone_end_tick| {
+                                    self.document
+                                        .as_ref()
+                                        .and_then(|document| {
+                                            playlist_performance_clip_indices(
+                                                document,
+                                                arrangement.id,
+                                                zone_end_tick,
+                                            )
+                                            .ok()
+                                        })
+                                        .is_some_and(|indices| indices.contains(&clip_index))
+                                })
+                            {
+                                if ui.input(|input| input.modifiers.shift) {
+                                    performance_clip_queue_requested = Some(clip_index);
+                                } else {
+                                    performance_clip_launch_requested = Some(clip_index);
+                                }
+                            }
                             let sample_length_ms = is_audio_clip
                                 .then(|| {
                                     playlist_clip_sample_length_ms(
@@ -14043,6 +14069,8 @@ impl DawUi {
                             );
                             let drag_hint = if self.playlist_mute_tool_active {
                                 "Mute tool selected: click to mute or unmute this clip. Press T or select Mute to return to move mode."
+                            } else if can_trigger_performance_clip {
+                                "Performance Mode: supported clips trigger on click, or queue in request order with Shift-click. The track Queue setting also queues normal clicks."
                             } else if !can_resize_clip {
                                 "Drag to move. Resizing and source-window editing are unavailable for this FL Studio clip format."
                             } else if self.playlist_slip_tool_active && is_audio_clip {
@@ -14387,9 +14415,7 @@ impl DawUi {
                                                     indices.contains(&clip_index)
                                                 })
                                         });
-                                    let can_launch_performance_clip = self.performance_mode_active
-                                        && self.playing
-                                        && self.performance_launch_sender.is_some()
+                                    let can_launch_performance_clip = can_trigger_performance_clip
                                         && performance_clip_supported;
                                     let launch_button = ui.add_enabled(
                                         can_launch_performance_clip,
@@ -14427,55 +14453,58 @@ impl DawUi {
                                     let selected_pattern_context_indices = self
                                         .selected_playlist_pattern_clip_indices(arrangement.id)
                                         .filter(|indices| indices.contains(&clip_index));
-                    let performance_clip_supported = performance_zone_end_tick.is_some_and(
-                        |zone_end_tick| {
-                            self.document
-                                .as_ref()
-                                .and_then(|document| {
-                                    playlist_performance_clip_indices(
-                                        document,
-                                        arrangement.id,
-                                        zone_end_tick,
-                                    )
-                                    .ok()
-                                })
-                                .is_some_and(|indices| indices.contains(&clip_index))
-                        },
-                    );
-                    let can_launch_performance_clip = self.performance_mode_active
-                        && self.playing
-                        && self.performance_launch_sender.is_some()
-                        && performance_clip_supported;
-                    let launch_button = ui.add_enabled(
-                        can_launch_performance_clip,
-                        egui::Button::new("Launch with track settings"),
-                    );
-                    if launch_button
-                        .on_disabled_hover_text(if !self.performance_mode_active {
-                            "Enable Performance Mode and start playback from the Start marker first."
-                        } else if !self.playing || self.performance_launch_sender.is_none() {
-                            "Start Performance Mode playback before launching a clip."
-                        } else {
-                            "Uses this Playlist track's Queue, Trigger Sync, Tolerant, and Position Sync settings. Requires a supported, unmuted Pattern Clip before Start, using enabled Sampler channels, default scale, and no Pattern controllers; all non-muted media clips on its track must also be supported."
-                        })
-                        .clicked()
-                    {
-                        performance_clip_launch_requested = Some(clip_index);
-                        ui.close();
-                    }
-                    if ui
-                        .add_enabled(
-                            can_launch_performance_clip,
-                            egui::Button::new("Queue this clip"),
-                        )
-                        .on_hover_text(
-                            "Adds this clip to the track's launch order. An idle track starts at the next safe audio tick; otherwise it starts when the playing clip reaches its next cycle boundary.",
-                        )
-                        .clicked()
-                    {
-                        performance_clip_queue_requested = Some(clip_index);
-                        ui.close();
-                    }
+                                    let performance_clip_supported =
+                                        performance_zone_end_tick.is_some_and(|zone_end_tick| {
+                                            self.document
+                                                .as_ref()
+                                                .and_then(|document| {
+                                                    playlist_performance_clip_indices(
+                                                        document,
+                                                        arrangement.id,
+                                                        zone_end_tick,
+                                                    )
+                                                    .ok()
+                                                })
+                                                .is_some_and(|indices| {
+                                                    indices.contains(&clip_index)
+                                                })
+                                        });
+                                    let can_launch_performance_clip = can_trigger_performance_clip
+                                        && performance_clip_supported;
+                                    let launch_button = ui.add_enabled(
+                                        can_launch_performance_clip,
+                                        egui::Button::new("Launch with track settings"),
+                                    );
+                                    if launch_button
+                                        .on_disabled_hover_text(
+                                            if !self.performance_mode_active {
+                                                "Enable Performance Mode and start playback from the Start marker first."
+                                            } else if !self.playing
+                                                || self.performance_launch_sender.is_none()
+                                            {
+                                                "Start Performance Mode playback before launching a clip."
+                                            } else {
+                                                "Uses this Playlist track's Queue, Trigger Sync, Tolerant, and Position Sync settings. Requires a supported, unmuted Pattern Clip before Start, using enabled Sampler channels, default scale, and no Pattern controllers; all non-muted media clips on its track must also be supported."
+                                            },
+                                        )
+                                        .clicked()
+                                    {
+                                        performance_clip_launch_requested = Some(clip_index);
+                                        ui.close();
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            can_launch_performance_clip,
+                                            egui::Button::new("Queue this clip"),
+                                        )
+                                        .on_hover_text(
+                                            "Adds this clip to the track's launch order. An idle track starts at the next safe audio tick; otherwise it starts when the playing clip reaches its next cycle boundary.",
+                                        )
+                                        .clicked()
+                                    {
+                                        performance_clip_queue_requested = Some(clip_index);
+                                        ui.close();
+                                    }
                                     let can_consolidate_pattern_clip = !clip.is_muted()
                                         && clip.track_index.is_some()
                                         && self.sample_project_path().is_some()
