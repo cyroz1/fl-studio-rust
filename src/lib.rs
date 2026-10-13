@@ -1797,6 +1797,8 @@ pub struct PlaylistTrack {
     pub grouped: Option<bool>,
     /// Trigger timing for Performance Mode clips on this track.
     pub trigger_sync: Option<PlaylistTrackSync>,
+    /// Whether Performance Mode queues triggered clips for this track.
+    pub queued: Option<bool>,
     /// Position within the clip used when a Performance Mode clip starts on this track.
     pub position_sync: Option<PlaylistTrackSync>,
     /// Whether a slightly missed trigger boundary launches immediately on this track.
@@ -1811,6 +1813,7 @@ pub struct PlaylistTrackEdit {
     pub enabled: Option<bool>,
     pub grouped: Option<bool>,
     pub trigger_sync: Option<PlaylistTrackSync>,
+    pub queued: Option<bool>,
     pub position_sync: Option<PlaylistTrackSync>,
     pub tolerant: Option<bool>,
 }
@@ -5334,6 +5337,11 @@ impl FlpDocument {
             })
             .filter(|value| !value.is_empty());
         let trigger_sync = i32::from_le_bytes(event.payload[30..34].try_into().ok()?);
+        let queued = match i32::from_le_bytes(event.payload[34..38].try_into().ok()?) {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        };
         let position_sync = i32::from_le_bytes(event.payload[42..46].try_into().ok()?);
         let tolerant = match i32::from_le_bytes(event.payload[38..42].try_into().ok()?) {
             0 => Some(false),
@@ -5355,13 +5363,14 @@ impl FlpDocument {
                 _ => None,
             },
             trigger_sync: PlaylistTrackSync::from_raw(trigger_sync),
+            queued,
             position_sync: PlaylistTrackSync::from_raw(position_sync),
             tolerant,
             state_bytes: event.payload.clone(),
         })
     }
 
-    /// Edits the observed mute, grouping, Trigger Sync, Position Sync, or Tolerant fields.
+    /// Edits the observed mute, grouping, Trigger Sync, Queue, Position Sync, or Tolerant fields.
     /// This unscoped form reports an error when the track ID occurs in multiple arrangements.
     pub fn edit_playlist_track(
         &mut self,
@@ -5372,6 +5381,7 @@ impl FlpDocument {
         if edit.enabled.is_none()
             && edit.grouped.is_none()
             && edit.trigger_sync.is_none()
+            && edit.queued.is_none()
             && edit.position_sync.is_none()
             && edit.tolerant.is_none()
         {
@@ -5392,6 +5402,7 @@ impl FlpDocument {
         if edit.enabled.is_none()
             && edit.grouped.is_none()
             && edit.trigger_sync.is_none()
+            && edit.queued.is_none()
             && edit.position_sync.is_none()
             && edit.tolerant.is_none()
         {
@@ -5493,6 +5504,13 @@ impl FlpDocument {
                 &mut self.events[event_index],
                 30,
                 &trigger_sync.raw().to_le_bytes(),
+            )?;
+        }
+        if let Some(queued) = edit.queued {
+            write_event_payload_bytes(
+                &mut self.events[event_index],
+                34,
+                &i32::from(queued).to_le_bytes(),
             )?;
         }
         if let Some(position_sync) = edit.position_sync {
@@ -15803,7 +15821,7 @@ mod tests {
     }
 
     #[test]
-    fn playlist_track_mute_and_group_edits_preserve_other_state_bytes() {
+    fn playlist_track_mute_group_and_queue_edits_preserve_other_state_bytes() {
         let mut event_stream = Vec::new();
         let mut original_tracks = Vec::new();
         for track_id in 1_u32..=2 {
@@ -15824,6 +15842,7 @@ mod tests {
         assert_eq!(tracks.len(), 2);
         assert_eq!(tracks[1].enabled, Some(true));
         assert_eq!(tracks[1].grouped, Some(false));
+        assert_eq!(tracks[1].queued, Some(false));
         assert_eq!(tracks[1].state_bytes, original_tracks[1]);
 
         document
@@ -15833,6 +15852,7 @@ mod tests {
                     enabled: Some(false),
                     grouped: Some(true),
                     trigger_sync: None,
+                    queued: Some(true),
                     position_sync: None,
                     tolerant: None,
                 },
@@ -15842,8 +15862,10 @@ mod tests {
         assert_eq!(tracks[0].state_bytes, original_tracks[0]);
         assert_eq!(tracks[1].enabled, Some(false));
         assert_eq!(tracks[1].grouped, Some(true));
+        assert_eq!(tracks[1].queued, Some(true));
         let mut expected_state = original_tracks[1].clone();
         expected_state[12] = 0;
+        expected_state[34..38].copy_from_slice(&1_i32.to_le_bytes());
         expected_state[46] = 1;
         assert_eq!(tracks[1].state_bytes, expected_state);
 

@@ -13516,6 +13516,22 @@ impl DawUi {
                                         },
                                     ));
                                 }
+                                let mut queued = track.queued.unwrap_or(false);
+                                if ui
+                                    .checkbox(&mut queued, "Queue")
+                                    .on_hover_text(
+                                        "Save the per-track Queue setting; ordered Queue playback is not implemented yet",
+                                    )
+                                    .changed()
+                                {
+                                    playlist_track_edits_requested.push((
+                                        track_id,
+                                        PlaylistTrackEdit {
+                                            queued: Some(queued),
+                                            ..PlaylistTrackEdit::default()
+                                        },
+                                    ));
+                                }
                                 let mut selected_position_sync = track.position_sync;
                                 let mut requested_position_sync = None;
                                 ui.horizontal(|ui| {
@@ -43944,6 +43960,7 @@ mod tests {
                 enabled: Some(true),
                 grouped: Some(matches!(id, 2 | 3)),
                 trigger_sync: None,
+                queued: None,
                 position_sync: None,
                 tolerant: None,
                 state_bytes: vec![0; 70],

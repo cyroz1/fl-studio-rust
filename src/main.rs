@@ -788,6 +788,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                     enabled: parse_optional_bool(enabled, "Playlist track enabled state")?,
                     grouped: parse_optional_bool(grouped, "Playlist track grouping state")?,
                     trigger_sync: None,
+                    queued: None,
                     position_sync: None,
                     tolerant: None,
                 },
@@ -824,6 +825,17 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u16(arrangement_id, "arrangement id")?,
                 parse_u32(track_id, "Playlist track id")?,
                 parse_bool(tolerant, "Playlist track Tolerant state")?,
+            )
+        }
+        [command, input, output, arrangement_id, track_id, queued]
+            if command == "set-playlist-track-queued" =>
+        {
+            set_playlist_track_queued(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(arrangement_id, "arrangement id")?,
+                parse_u32(track_id, "Playlist track id")?,
+                parse_bool(queued, "Playlist track Queue state")?,
             )
         }
         [command, input, output, track_id, name] if command == "rename-playlist-track" => {
@@ -1099,6 +1111,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild edit-clip <input.flp> <output.flp> <arrangement-id> <clip-index> <position> <length>\n",
             "  flp-rebuild set-clip-muted <input.flp> <output.flp> <arrangement-id> <clip-index> <muted:0|1>\n",
             "  flp-rebuild edit-playlist-track <input.flp> <output.flp> <track-id> <enabled:0|1|-> <grouped:0|1|->\n",
+            "  flp-rebuild set-playlist-track-queued <input.flp> <output.flp> <arrangement-id> <track-id> <queued:0|1>\n",
             "  flp-rebuild rename-playlist-track <input.flp> <output.flp> <track-id> <name>\n",
             "  flp-rebuild edit-clip-properties <input.flp> <output.flp> <arrangement-id> <clip-index> <item-index-raw|-> <track-index-raw|-> <group-raw|-> <flags-raw|-> <start-offset|-> <end-offset|-> <scale|->\n",
             "  flp-rebuild edit-audio-clip-window-ticks <input.flp> <output.flp> <arrangement-id> <clip-index> <source-start-tick> <source-end-tick> <timeline-length|->\n",
@@ -3690,6 +3703,37 @@ fn set_playlist_track_tolerant(
     println!(
         "{} Tolerant launch for Playlist track {track_id} in arrangement {arrangement_id} in {}",
         if tolerant { "enabled" } else { "disabled" },
+        output.display()
+    );
+    Ok(())
+}
+
+fn set_playlist_track_queued(
+    input: &Path,
+    output: &Path,
+    arrangement_id: u16,
+    track_id: u32,
+    queued: bool,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .edit_playlist_track_in_arrangement(
+            arrangement_id,
+            track_id,
+            PlaylistTrackEdit {
+                queued: Some(queued),
+                ..PlaylistTrackEdit::default()
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "{} Queue for Playlist track {track_id} in arrangement {arrangement_id} in {}",
+        if queued { "enabled" } else { "disabled" },
         output.display()
     );
     Ok(())
