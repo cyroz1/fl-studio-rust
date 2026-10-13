@@ -817,6 +817,24 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 },
             )
         }
+        [command, input, output, arrangement_id, clip_index, source_start_tick, source_end_tick, length]
+            if command == "edit-audio-clip-window-ticks" =>
+        {
+            edit_clip_properties(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(arrangement_id, "arrangement id")?,
+                parse_usize(clip_index, "clip index")?,
+                PlaylistClipEdit {
+                    source_window_ticks: Some((
+                        parse_u32(source_start_tick, "source start tick")?,
+                        parse_u32(source_end_tick, "source end tick")?,
+                    )),
+                    length_ticks: parse_optional_u32(length, "timeline length ticks")?,
+                    ..PlaylistClipEdit::default()
+                },
+            )
+        }
         [command, input, output, arrangement_id, clip_index, position, raw_track_index]
             if command == "duplicate-clip" =>
         {
@@ -1051,6 +1069,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild edit-playlist-track <input.flp> <output.flp> <track-id> <enabled:0|1|-> <grouped:0|1|->\n",
             "  flp-rebuild rename-playlist-track <input.flp> <output.flp> <track-id> <name>\n",
             "  flp-rebuild edit-clip-properties <input.flp> <output.flp> <arrangement-id> <clip-index> <item-index-raw|-> <track-index-raw|-> <group-raw|-> <flags-raw|-> <start-offset|-> <end-offset|-> <scale|->\n",
+            "  flp-rebuild edit-audio-clip-window-ticks <input.flp> <output.flp> <arrangement-id> <clip-index> <source-start-tick> <source-end-tick> <timeline-length|->\n",
             "  flp-rebuild duplicate-clip <input.flp> <output.flp> <arrangement-id> <clip-index> <position|-> <track-index-raw|->\n",
             "  flp-rebuild split-audio-clip <input.flp> <output.flp> <arrangement-id> <clip-index> <split-position-ticks> <source-length-ms|->\n",
             "  flp-rebuild split-pattern-clip <input.flp> <output.flp> <arrangement-id> <clip-index> <split-position-ticks>\n",
