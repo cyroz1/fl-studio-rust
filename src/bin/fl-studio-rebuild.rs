@@ -19263,7 +19263,9 @@ impl DawUi {
             }
             if ui
                 .selectable_label(self.piano_roll_paint_mode, "Paint")
-                .on_hover_text("Paint while dragging; right-click to erase (B)")
+                .on_hover_text(
+                    "Paint while dragging; Shift replaces overlapping notes; right-click erases (B)",
+                )
                 .clicked()
             {
                 self.piano_roll_paint_mode = !self.piano_roll_paint_mode;
@@ -23784,6 +23786,7 @@ impl DawUi {
         let grid_height = f32::from(key_high - key_low + 1) * key_height;
         let mut notes_to_add = Vec::new();
         let mut notes_to_delete = BTreeSet::new();
+        let mut monophonic_paint = false;
         let pending_scroll_offset = self.piano_roll_pending_scroll_offset.take();
         let active_event_target = self.piano_roll_event_target;
         let (
@@ -25172,11 +25175,13 @@ impl DawUi {
                     grid_response.interact_pointer_pos(),
                     self.selected_note_channel,
                 )
-                && !note_rects
-                    .iter()
-                    .any(|note_rect| note_rect.contains(pointer))
+                && (scroll_modifiers.shift
+                    || !note_rects
+                        .iter()
+                        .any(|note_rect| note_rect.contains(pointer)))
                 && let Some(mut note) = note_from_grid_position(pointer, grid_geometry, channel_id)
             {
+                monophonic_paint |= scroll_modifiers.shift;
                 note.length = snap_ticks.max(1);
                 let note_key = (pattern.id, channel_id, note.key, note.position);
                 let already_exists = pattern.notes.iter().any(|existing| {
@@ -25184,7 +25189,9 @@ impl DawUi {
                         && existing.key == note.key
                         && existing.position == note.position
                 });
-                if !already_exists && self.last_painted_note != Some(note_key) {
+                if (scroll_modifiers.shift || !already_exists)
+                    && self.last_painted_note != Some(note_key)
+                {
                     self.last_painted_note = Some(note_key);
                     notes_to_add.push(note);
                 }
@@ -25260,15 +25267,82 @@ impl DawUi {
             let stamped_chord = self.piano_roll_stamp_mode;
             let only_one = self.piano_roll_stamp_only_one;
             let channel_id = notes_to_add[0].channel_id;
-            let first_note_index = pattern
-                .notes
-                .iter()
-                .filter(|existing| existing.channel_id == channel_id)
-                .count();
             let added_count = notes_to_add.len();
             if let Some(document) = &mut self.document {
-                match document.add_pattern_notes(pattern.id, &notes_to_add) {
-                    Ok(()) => {
+                let mut updated = document.clone();
+                let result: Result<(usize, usize), FlpError> = (|| {
+                    let mut removed_count = 0usize;
+                    if monophonic_paint {
+                        let mut targets = BTreeSet::<(u16, usize)>::new();
+                        for painted_note in &notes_to_add {
+                            let painted_start = u64::from(painted_note.position);
+                            let painted_end = painted_start + u64::from(painted_note.length);
+                            for (note_index, existing) in pattern
+                                .notes
+                                .iter()
+                                .filter(|existing| existing.channel_id == painted_note.channel_id)
+                                .enumerate()
+                            {
+                                let existing_start = u64::from(existing.position);
+                                let existing_end = existing_start + u64::from(existing.length);
+                                if existing_start < painted_end && painted_start < existing_end {
+                                    targets.extend(
+                                        piano_roll_note_group_members(
+                                            pattern,
+                                            pattern.id,
+                                            existing.channel_id,
+                                            note_index,
+                                        )
+                                        .into_iter()
+                                        .map(
+                                            |(_, member_channel, member_index)| {
+                                                (member_channel, member_index)
+                                            },
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                        let mut by_channel = BTreeMap::<u16, Vec<usize>>::new();
+                        for (target_channel, note_index) in targets {
+                            by_channel
+                                .entry(target_channel)
+                                .or_default()
+                                .push(note_index);
+                        }
+                        for (target_channel, note_indices) in by_channel {
+                            let removed = updated.delete_pattern_note_selection(
+                                pattern.id,
+                                target_channel,
+                                &note_indices,
+                            )?;
+                            if target_channel == channel_id {
+                                removed_count = removed_count
+                                    .checked_add(removed)
+                                    .ok_or(FlpError::LengthOverflow)?;
+                            }
+                        }
+                    }
+                    let first_note_index = updated
+                        .patterns()?
+                        .into_iter()
+                        .find(|updated_pattern| updated_pattern.id == pattern.id)
+                        .map(|updated_pattern| {
+                            updated_pattern
+                                .notes
+                                .iter()
+                                .filter(|existing| existing.channel_id == channel_id)
+                                .count()
+                        })
+                        .ok_or(FlpError::UnsupportedEdit(
+                            "the target pattern could not be read after note replacement",
+                        ))?;
+                    updated.add_pattern_notes(pattern.id, &notes_to_add)?;
+                    Ok((first_note_index, removed_count))
+                })();
+                match result {
+                    Ok((first_note_index, removed_count)) => {
+                        *document = updated;
                         self.selected_piano_notes.clear();
                         self.selected_piano_notes.extend(
                             (first_note_index..first_note_index + added_count)
@@ -25282,13 +25356,34 @@ impl DawUi {
                         }
                         self.status = if stamped_chord {
                             format!("Stamped {} notes in pattern {}", added_count, pattern.id)
+                        } else if self.piano_roll_paint_mode && monophonic_paint {
+                            let painted = format!(
+                                "painted {} monophonic note{} in pattern {}",
+                                added_count,
+                                if added_count == 1 { "" } else { "s" },
+                                pattern.id
+                            );
+                            if removed_count == 0 {
+                                painted
+                            } else {
+                                format!(
+                                    "Replaced {removed_count} overlapping note{} and {painted}",
+                                    if removed_count == 1 { "" } else { "s" }
+                                )
+                            }
                         } else if self.piano_roll_paint_mode {
                             format!("Painted note in pattern {}", pattern.id)
                         } else {
                             format!("Added note to pattern {}", pattern.id)
                         };
                     }
-                    Err(error) => self.status = error.to_string(),
+                    Err(error) => {
+                        self.status = if monophonic_paint {
+                            format!("Could not paint monophonic notes: {error}")
+                        } else {
+                            error.to_string()
+                        }
+                    }
                 }
             }
         }
