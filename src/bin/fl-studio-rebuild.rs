@@ -11724,6 +11724,36 @@ impl DawUi {
                     }
                 },
             );
+            ui.menu_button("Select", |ui| {
+                if ui.button("Select all clips (Ctrl/Cmd+A)").clicked() {
+                    self.select_all_playlist_clips();
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        arrangement.clips.iter().any(PlaylistClip::is_muted),
+                        egui::Button::new("Select muted clips"),
+                    )
+                    .clicked()
+                {
+                    self.select_muted_playlist_clips(arrangement.id, &arrangement.clips);
+                    ui.close();
+                }
+                if ui.button("Invert selection (Shift+I)").clicked() {
+                    self.invert_playlist_clip_selection();
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        !self.selected_playlist_clips.is_empty() || self.selected_clip.is_some(),
+                        egui::Button::new("Deselect clips (Ctrl/Cmd+D)"),
+                    )
+                    .clicked()
+                {
+                    self.deselect_playlist_clips();
+                    ui.close();
+                }
+            });
             let slip_tool = ui
                 .selectable_label(self.playlist_slip_tool_active, "Slip (S)")
                 .on_hover_text(
@@ -14216,6 +14246,31 @@ impl DawUi {
             "The Playlist arrangement has no clips to select".to_owned()
         } else {
             format!("Selected all {clip_count} Playlist clips")
+        };
+    }
+
+    fn select_muted_playlist_clips(&mut self, arrangement_id: u16, clips: &[PlaylistClip]) {
+        let muted_clips = clips
+            .iter()
+            .enumerate()
+            .filter_map(|(index, clip)| clip.is_muted().then_some(index))
+            .collect::<BTreeSet<_>>();
+        let current_clip = (self.selected_arrangement == Some(arrangement_id))
+            .then_some(self.selected_clip)
+            .flatten()
+            .filter(|index| muted_clips.contains(index));
+
+        self.selected_arrangement = Some(arrangement_id);
+        self.selected_clip = current_clip.or_else(|| muted_clips.first().copied());
+        self.playlist_selection_anchor = self.selected_clip;
+        self.selected_playlist_clips = muted_clips;
+        self.status = if self.selected_playlist_clips.is_empty() {
+            "No muted Playlist clips to select".to_owned()
+        } else {
+            format!(
+                "Selected {} muted Playlist clips",
+                self.selected_playlist_clips.len()
+            )
         };
     }
 
