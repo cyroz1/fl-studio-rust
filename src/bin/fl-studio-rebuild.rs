@@ -2365,8 +2365,12 @@ enum PlaylistClipDragKind {
         sample_length_ticks: u32,
     },
     ResizeAudioMilliseconds {
+        edge: PlaylistClipResizeEdge,
         source_start_ms: f32,
         source_end_ms: f32,
+        sample_length_ms: f32,
+        stored_start_offset: f32,
+        stored_end_offset: f32,
     },
     Slip,
     SlipTicks {
@@ -2412,7 +2416,7 @@ struct PlaylistClipDragTarget {
     start_length_ticks: u32,
     start_track_index: u16,
     audio_resize_ticks: Option<(u32, u32, u32)>,
-    audio_resize_milliseconds: Option<(f32, f32, f32)>,
+    audio_resize_milliseconds: Option<(f32, f32, f32, f32, f32)>,
     audio_slip_window: Option<PlaylistClipSlipWindow>,
 }
 
@@ -13082,7 +13086,7 @@ impl DawUi {
                             } else if clip.has_opaque_record_tail() && is_audio_clip {
                                 "Drag to move. Shift-drag either edge to trim or extend this Audio Clip's explicit source tick window. Eligible selected Audio Clips can trim or extend together from either edge."
                             } else if is_audio_clip {
-                                "Drag to move. Shift-drag the right edge to resize. Eligible legacy Audio Clips can trim or extend from the left edge when the sample is loaded, the source window matches the timeline at base tempo, scale is default, and no Playlist tempo automation overlaps; selected eligible clips share the same trim change."
+                                "Drag to move. Shift-drag either edge to trim or extend eligible legacy Audio Clips when the sample is loaded, the source window matches the timeline at base tempo, scale is default, and no Playlist tempo automation overlaps; selected eligible clips share the same trim change."
                             } else if clip.has_opaque_record_tail() {
                                 "Drag to move. Shift-drag the right edge to resize this Pattern Clip; its full source window will be kept in sync. Eligible selected clips can share the right-edge resize."
                             } else {
@@ -13614,14 +13618,24 @@ impl DawUi {
                                                         sample_length_ticks: sample_length_ticks
                                                             .unwrap_or_default(),
                                                     }
-                                                } else if matches!(
-                                                    resize_edge_requested,
-                                                    Some(PlaylistClipResizeEdge::Left)
-                                                ) && let Some((source_start_ms, source_end_ms, _)) = audio_resize_milliseconds
-                                                {
-                                                    PlaylistClipDragKind::ResizeAudioMilliseconds {
+                                                } else if let (
+                                                    Some(edge),
+                                                    Some((
                                                         source_start_ms,
                                                         source_end_ms,
+                                                        sample_length_ms,
+                                                        stored_start_offset,
+                                                        stored_end_offset,
+                                                    )),
+                                                ) = (resize_edge_requested, audio_resize_milliseconds)
+                                                {
+                                                    PlaylistClipDragKind::ResizeAudioMilliseconds {
+                                                        edge,
+                                                        source_start_ms,
+                                                        source_end_ms,
+                                                        sample_length_ms,
+                                                        stored_start_offset,
+                                                        stored_end_offset,
                                                     }
                                                 } else {
                                                     PlaylistClipDragKind::Resize
@@ -13678,6 +13692,10 @@ impl DawUi {
                                             edge: PlaylistClipResizeEdge::Right,
                                             ..
                                         }
+                                        | PlaylistClipDragKind::ResizeAudioMilliseconds {
+                                            edge: PlaylistClipResizeEdge::Right,
+                                            ..
+                                        }
                                 ) && group_targets.len() > 1
                                 {
                                     playlist_clip_group_resize_edits(
@@ -13697,7 +13715,10 @@ impl DawUi {
                                     PlaylistClipDragKind::ResizeAudioTicks {
                                         edge: PlaylistClipResizeEdge::Left,
                                         ..
-                                    } | PlaylistClipDragKind::ResizeAudioMilliseconds { .. }
+                                    } | PlaylistClipDragKind::ResizeAudioMilliseconds {
+                                        edge: PlaylistClipResizeEdge::Left,
+                                        ..
+                                    }
                                 ) && group_targets.len() > 1
                                 {
                                     playlist_clip_group_left_resize_edits(
@@ -36172,7 +36193,7 @@ fn playlist_audio_clip_resize_ticks_from_project(
 fn playlist_audio_clip_resize_milliseconds_from_project(
     clip: &PlaylistClip,
     context: PlaylistAudioResizeContext<'_>,
-) -> Option<(f32, f32, f32)> {
+) -> Option<(f32, f32, f32, f32, f32)> {
     if clip.has_opaque_record_tail()
         || clip.length_ticks == 0
         || context.ppq == 0
@@ -36221,7 +36242,13 @@ fn playlist_audio_clip_resize_milliseconds_from_project(
         return None;
     }
 
-    Some((source_start_ms, source_end_ms, sample_length_ms))
+    Some((
+        source_start_ms,
+        source_end_ms,
+        sample_length_ms,
+        clip.start_offset,
+        clip.end_offset,
+    ))
 }
 
 fn playlist_audio_clip_slip_window_from_project(
@@ -36707,35 +36734,84 @@ fn playlist_clip_drag_edit(
             }
         },
         PlaylistClipDragKind::ResizeAudioMilliseconds {
+            edge,
             source_start_ms,
             source_end_ms,
+            sample_length_ms,
+            stored_start_offset,
+            stored_end_offset,
         } => {
-            let requested_position = i64::from(snap_note_tick(
-                i64::from(drag.start_position_ticks).saturating_add(tick_delta),
-                snap_ticks,
-                0,
-            ));
-            let requested_delta = requested_position - i64::from(drag.start_position_ticks);
             let milliseconds_per_tick =
                 60_000.0 / (f64::from(ppq.max(1)) * drag.tempo_bpm.max(f64::MIN_POSITIVE));
-            let source_minimum_delta = (-f64::from(source_start_ms) / milliseconds_per_tick)
-                .ceil()
-                .clamp(i64::MIN as f64, i64::MAX as f64)
-                as i64;
-            let minimum_delta = (-i64::from(drag.start_position_ticks))
-                .max(i64::from(drag.start_length_ticks) - i64::from(u32::MAX))
-                .max(source_minimum_delta);
-            let maximum_delta = (i64::from(drag.start_length_ticks) - 1)
-                .min(i64::from(u32::MAX) - i64::from(drag.start_position_ticks));
-            let delta = requested_delta.clamp(minimum_delta, maximum_delta);
-            let source_start_ms =
-                (f64::from(source_start_ms) + delta as f64 * milliseconds_per_tick) as f32;
-            PlaylistClipEdit {
-                position_ticks: Some((i64::from(drag.start_position_ticks) + delta) as u32),
-                length_ticks: Some((i64::from(drag.start_length_ticks) - delta) as u32),
-                start_offset: Some(source_start_ms.max(0.0)),
-                end_offset: Some(source_end_ms),
-                ..PlaylistClipEdit::default()
+            match edge {
+                PlaylistClipResizeEdge::Right => {
+                    let max_sample_length =
+                        ((f64::from(sample_length_ms) - f64::from(source_start_ms))
+                            / milliseconds_per_tick)
+                            .floor()
+                            .clamp(0.0, f64::from(u32::MAX)) as u32;
+                    let max_length = max_sample_length.max(drag.start_length_ticks);
+                    let length_ticks = snap_note_tick(
+                        i64::from(drag.start_length_ticks).saturating_add(tick_delta),
+                        snap_ticks,
+                        1,
+                    )
+                    .min(max_length);
+                    if length_ticks == drag.start_length_ticks {
+                        return PlaylistClipEdit {
+                            length_ticks: Some(drag.start_length_ticks),
+                            start_offset: Some(stored_start_offset),
+                            end_offset: Some(stored_end_offset),
+                            ..PlaylistClipEdit::default()
+                        };
+                    }
+                    let end_offset = (f64::from(source_start_ms)
+                        + f64::from(length_ticks) * milliseconds_per_tick)
+                        .min(f64::from(sample_length_ms))
+                        as f32;
+                    PlaylistClipEdit {
+                        length_ticks: Some(length_ticks),
+                        start_offset: Some(source_start_ms),
+                        end_offset: Some(end_offset),
+                        ..PlaylistClipEdit::default()
+                    }
+                }
+                PlaylistClipResizeEdge::Left => {
+                    let requested_position = i64::from(snap_note_tick(
+                        i64::from(drag.start_position_ticks).saturating_add(tick_delta),
+                        snap_ticks,
+                        0,
+                    ));
+                    let requested_delta = requested_position - i64::from(drag.start_position_ticks);
+                    let source_minimum_delta = (-f64::from(source_start_ms) / milliseconds_per_tick)
+                        .ceil()
+                        .clamp(i64::MIN as f64, i64::MAX as f64)
+                        as i64;
+                    let minimum_delta = (-i64::from(drag.start_position_ticks))
+                        .max(i64::from(drag.start_length_ticks) - i64::from(u32::MAX))
+                        .max(source_minimum_delta);
+                    let maximum_delta = (i64::from(drag.start_length_ticks) - 1)
+                        .min(i64::from(u32::MAX) - i64::from(drag.start_position_ticks));
+                    let delta = requested_delta.clamp(minimum_delta, maximum_delta);
+                    if delta == 0 {
+                        return PlaylistClipEdit {
+                            position_ticks: Some(drag.start_position_ticks),
+                            length_ticks: Some(drag.start_length_ticks),
+                            start_offset: Some(stored_start_offset),
+                            end_offset: Some(stored_end_offset),
+                            ..PlaylistClipEdit::default()
+                        };
+                    }
+                    let source_start_ms =
+                        (f64::from(source_start_ms) + delta as f64 * milliseconds_per_tick) as f32;
+                    PlaylistClipEdit {
+                        position_ticks: Some((i64::from(drag.start_position_ticks) + delta) as u32),
+                        length_ticks: Some((i64::from(drag.start_length_ticks) - delta) as u32),
+                        start_offset: Some(source_start_ms.max(0.0)),
+                        end_offset: Some(source_end_ms),
+                        ..PlaylistClipEdit::default()
+                    }
+                }
             }
         }
         PlaylistClipDragKind::Slip => {
@@ -36886,15 +36962,26 @@ fn playlist_clip_group_resize_edits(
         .max()
         .unwrap_or(drag.start_length_ticks);
     let minimum_delta = 1 - i64::from(minimum_length);
+    let milliseconds_per_tick =
+        60_000.0 / (f64::from(context.ppq.max(1)) * drag.tempo_bpm.max(f64::MIN_POSITIVE));
     let maximum_delta = targets
         .iter()
         .map(|target| {
-            let maximum_target_length = target.audio_resize_ticks.map_or(
-                u32::MAX,
-                |(source_start_tick, _, sample_length_ticks)| {
-                    sample_length_ticks.saturating_sub(source_start_tick)
-                },
-            );
+            let maximum_target_length = if let Some((source_start_tick, _, sample_length_ticks)) =
+                target.audio_resize_ticks
+            {
+                sample_length_ticks.saturating_sub(source_start_tick)
+            } else if let Some((source_start_ms, _, sample_length_ms, _, _)) =
+                target.audio_resize_milliseconds
+            {
+                (((f64::from(sample_length_ms) - f64::from(source_start_ms))
+                    / milliseconds_per_tick)
+                    .floor()
+                    .clamp(0.0, f64::from(u32::MAX)) as u32)
+                    .max(target.start_length_ticks)
+            } else {
+                u32::MAX
+            };
             i64::from(maximum_target_length) - i64::from(target.start_length_ticks)
         })
         .min()
@@ -36905,10 +36992,24 @@ fn playlist_clip_group_resize_edits(
         .iter()
         .map(|target| {
             let length_ticks = (i64::from(target.start_length_ticks) + delta) as u32;
+            let legacy_source_window = target.audio_resize_milliseconds.map(
+                |(source_start_ms, _, sample_length_ms, stored_start_offset, stored_end_offset)| {
+                    if delta == 0 {
+                        return (stored_start_offset, stored_end_offset);
+                    }
+                    let source_end_ms = (f64::from(source_start_ms)
+                        + f64::from(length_ticks) * milliseconds_per_tick)
+                        .min(f64::from(sample_length_ms))
+                        as f32;
+                    (source_start_ms, source_end_ms)
+                },
+            );
             (
                 target.clip_index,
                 PlaylistClipEdit {
                     length_ticks: Some(length_ticks),
+                    start_offset: legacy_source_window.map(|(start, _)| start),
+                    end_offset: legacy_source_window.map(|(_, end)| end),
                     source_window_ticks: target.audio_resize_ticks.map(
                         |(source_start_tick, _, _)| {
                             (
@@ -37006,7 +37107,8 @@ fn playlist_clip_group_left_resize_edits(
     let minimum_delta = targets
         .iter()
         .map(|target| {
-            let (source_start_ms, _, _) = target.audio_resize_milliseconds.unwrap_or_default();
+            let (source_start_ms, _, _, _, _) =
+                target.audio_resize_milliseconds.unwrap_or_default();
             let source_delta = (-f64::from(source_start_ms) / milliseconds_per_tick)
                 .ceil()
                 .clamp(i64::MIN as f64, i64::MAX as f64) as i64;
@@ -37030,17 +37132,22 @@ fn playlist_clip_group_left_resize_edits(
     targets
         .iter()
         .map(|target| {
-            let (source_start_ms, source_end_ms, _) =
+            let (source_start_ms, source_end_ms, _, stored_start_offset, stored_end_offset) =
                 target.audio_resize_milliseconds.unwrap_or_default();
             let position_ticks = (i64::from(target.start_position_ticks) + delta) as u32;
             let length_ticks = (i64::from(target.start_length_ticks) - delta) as u32;
+            let (next_start_offset, next_end_offset) = if delta == 0 {
+                (stored_start_offset, stored_end_offset)
+            } else {
+                ((source_start_ms + source_delta_ms).max(0.0), source_end_ms)
+            };
             (
                 target.clip_index,
                 PlaylistClipEdit {
                     position_ticks: Some(position_ticks),
                     length_ticks: Some(length_ticks),
-                    start_offset: Some((source_start_ms + source_delta_ms).max(0.0)),
-                    end_offset: Some(source_end_ms),
+                    start_offset: Some(next_start_offset),
+                    end_offset: Some(next_end_offset),
                     ..PlaylistClipEdit::default()
                 },
             )
