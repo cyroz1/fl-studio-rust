@@ -6067,7 +6067,10 @@ impl PlaylistPerformanceRuntime {
             let start_tick = if end_frame < block_start {
                 let block_start_tick = self
                     .tempo_map
-                    .tick_at_frame(block_start, self.sample_rate)?;
+                    .tick_at_frame(block_start, self.sample_rate)
+                    .ok_or_else(|| {
+                        "could not map the start of a Performance Mode audio block".to_owned()
+                    })?;
                 first_end_tick.max(block_start_tick.ceil().max(0.0) as u64)
             } else {
                 first_end_tick
