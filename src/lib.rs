@@ -762,6 +762,34 @@ impl ChannelSummary {
             .unwrap_or_default()
     }
 
+    /// Effective continuous pitch offset for renderers that honor Add to Key.
+    /// When Add to Key is enabled, the project pitch is represented by a note
+    /// transposition instead of continuous tuning.
+    pub fn master_pitch_render_offset_cents(&self, project_master_pitch_cents: Option<i16>) -> i16 {
+        if self.keyboard_add_to_key_enabled() {
+            0
+        } else {
+            self.master_pitch_offset_cents(project_master_pitch_cents)
+        }
+    }
+
+    /// Semitone note transposition for renderers that honor Add to Key.
+    /// Fractional semitone project pitches round to the nearest MIDI note.
+    pub fn master_pitch_note_offset_semitones(
+        &self,
+        project_master_pitch_cents: Option<i16>,
+    ) -> i16 {
+        if !self.keyboard_add_to_key_enabled() {
+            return 0;
+        }
+        let cents = self.master_pitch_offset_cents(project_master_pitch_cents);
+        if cents >= 0 {
+            (cents + 50) / 100
+        } else {
+            (cents - 50) / 100
+        }
+    }
+
     /// Raw four-byte channel color value, in little-endian RGBA byte order.
     pub fn color(&self) -> Option<[u8; 4]> {
         self.color.map(u32::to_le_bytes)

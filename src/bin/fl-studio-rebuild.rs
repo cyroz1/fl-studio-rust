@@ -351,7 +351,21 @@ fn project_channel_master_pitch_offset_cents(document: &FlpDocument, channel_id:
         .into_iter()
         .find(|channel| channel.id() == channel_id)
         .map_or(0, |channel| {
-            channel.master_pitch_offset_cents(project_master_pitch_cents)
+            channel.master_pitch_render_offset_cents(project_master_pitch_cents)
+        })
+}
+
+fn project_channel_master_pitch_note_offset_semitones(
+    document: &FlpDocument,
+    channel_id: u16,
+) -> i16 {
+    let project_master_pitch_cents = document.metadata().master_pitch_cents();
+    document
+        .channels()
+        .into_iter()
+        .find(|channel| channel.id() == channel_id)
+        .map_or(0, |channel| {
+            channel.master_pitch_note_offset_semitones(project_master_pitch_cents)
         })
 }
 const FL_GENRES: &[&str] = &[
@@ -21650,6 +21664,8 @@ impl DawUi {
         let global_swing_mix_raw = document.metadata().global_swing_mix();
         let channel_swing_mix_raw = project_channel_swing_mix_raw(document, channel_id);
         let pitch_offset_cents = project_channel_master_pitch_offset_cents(document, channel_id);
+        let note_pitch_offset_semitones =
+            project_channel_master_pitch_note_offset_semitones(document, channel_id);
         let selected_format = self.playlist_song_output_format;
         let output_format = self.audio_render_output();
         let Some(path) = add_audio_render_file_filter(
@@ -21686,6 +21702,7 @@ impl DawUi {
                         global_swing_mix_raw,
                         channel_swing_mix_raw,
                         pitch_offset_cents,
+                        note_pitch_offset_semitones,
                     },
                     &path,
                     AudioFileRenderOptions {
@@ -21742,6 +21759,8 @@ impl DawUi {
             .find(|channel| channel.id() == channel_id)
             .is_some_and(|channel| channel.kind() == Some(0));
         let pitch_offset_cents = project_channel_master_pitch_offset_cents(document, channel_id);
+        let note_pitch_offset_semitones =
+            project_channel_master_pitch_note_offset_semitones(document, channel_id);
         let instance_id = self.channel_vst3_instances.get(&channel_id).copied();
         let sampler_project = if instance_id.is_none() && is_sampler {
             let Some(project_path) = self.sample_project_path() else {
@@ -21848,6 +21867,7 @@ impl DawUi {
                             global_swing_mix_raw: 0,
                             channel_swing_mix_raw: 128,
                             pitch_offset_cents,
+                            note_pitch_offset_semitones,
                         },
                     )
                 });
@@ -21983,6 +22003,8 @@ impl DawUi {
         let global_swing_mix_raw = document.metadata().global_swing_mix();
         let channel_swing_mix_raw = project_channel_swing_mix_raw(document, channel_id);
         let pitch_offset_cents = project_channel_master_pitch_offset_cents(document, channel_id);
+        let note_pitch_offset_semitones =
+            project_channel_master_pitch_note_offset_semitones(document, channel_id);
 
         if self.audio_engine.is_none() {
             match AudioEngine::start(&self.audio_settings) {
@@ -22029,6 +22051,7 @@ impl DawUi {
                         global_swing_mix_raw,
                         channel_swing_mix_raw,
                         pitch_offset_cents,
+                        note_pitch_offset_semitones,
                     },
                 )
             });

@@ -165,8 +165,10 @@ pub struct Vst3PatternRenderOptions {
     pub tail_seconds: f64,
     pub global_swing_mix_raw: u8,
     pub channel_swing_mix_raw: u16,
-    /// Effective project Master pitch for this channel, in cents; use zero when disabled.
+    /// Effective continuous project Master pitch for this channel, in cents.
     pub pitch_offset_cents: i16,
+    /// Effective project Master pitch as a note transposition when Add to Key is enabled.
+    pub note_pitch_offset_semitones: i16,
 }
 
 /// One normalized VST3 parameter value at a pattern-relative beat position.
@@ -1464,7 +1466,10 @@ impl Vst3HostRuntime {
             };
             let channel = channels_by_id.get(&channel_id);
             let pitch_offset_cents = channel.map_or(0, |channel| {
-                channel.master_pitch_offset_cents(project_master_pitch_cents)
+                channel.master_pitch_render_offset_cents(project_master_pitch_cents)
+            });
+            let note_pitch_offset_semitones = channel.map_or(0, |channel| {
+                channel.master_pitch_note_offset_semitones(project_master_pitch_cents)
             });
             let (gain, pan) = channel_gain_pan(
                 channel.and_then(|channel| channel.volume()),
@@ -1508,6 +1513,7 @@ impl Vst3HostRuntime {
                     &tempo_map,
                     source_frames as u64,
                     pitch_offset_cents,
+                    note_pitch_offset_semitones,
                 )?;
                 (render, latency_frames)
             };
@@ -1613,6 +1619,7 @@ fn prepare_playlist_pattern_render(
     tempo_map: &PlaylistTempoMap,
     total_frames: u64,
     pitch_offset_cents: i16,
+    note_pitch_offset_semitones: i16,
 ) -> Result<PreparedPatternRender, String> {
     if notes.is_empty() {
         return Err("VST3 Playlist channel has no notes to render".to_owned());
@@ -1632,8 +1639,12 @@ fn prepare_playlist_pattern_render(
             "VST3 Playlist supports mono or stereo output buses; the instrument has {output_channels} channels"
         ));
     }
-    let (events, note_count) =
+    if !(-12..=12).contains(&note_pitch_offset_semitones) {
+        return Err("VST3 note pitch offset must be between -12 and 12 semitones".to_owned());
+    }
+    let (mut events, note_count) =
         scheduled_playlist_midi_events_with_tempo_map(notes, tempo_map, sample_rate)?;
+    transpose_scheduled_note_events(&mut events, note_pitch_offset_semitones);
     let supports_note_pan = plugin_supports_note_pan(plugin);
     let last_event_frame = events
         .iter()
@@ -1763,9 +1774,13 @@ fn prepare_pattern_render_with_automation(
         global_swing_mix_raw,
         channel_swing_mix_raw,
         pitch_offset_cents,
+        note_pitch_offset_semitones,
     } = options;
     if !(-1200..=1200).contains(&pitch_offset_cents) {
         return Err("VST3 pitch offset must be between -1200 and 1200 cents".to_owned());
+    }
+    if !(-12..=12).contains(&note_pitch_offset_semitones) {
+        return Err("VST3 note pitch offset must be between -12 and 12 semitones".to_owned());
     }
     if ppq == 0 {
         return Err("project PPQ must be greater than zero".to_owned());
@@ -1793,7 +1808,7 @@ fn prepare_pattern_render_with_automation(
     let parameter_automation =
         prepare_parameter_automation(parameter_automation, sample_rate, tempo_bpm)?;
 
-    let (events, note_count) = scheduled_pattern_events(
+    let (mut events, note_count) = scheduled_pattern_events(
         notes,
         channel_id,
         ppq,
@@ -1802,6 +1817,7 @@ fn prepare_pattern_render_with_automation(
         global_swing_mix_raw,
         channel_swing_mix_raw,
     )?;
+    transpose_scheduled_note_events(&mut events, note_pitch_offset_semitones);
     let supports_note_pan = plugin_supports_note_pan(plugin);
     if note_count == 0 {
         return Err(format!(
@@ -1846,6 +1862,19 @@ fn note_expressions_support_pan(expressions: &[NoteExpressionInfo]) -> bool {
     expressions
         .iter()
         .any(|expression| expression.kind == NoteExpressionType::Pan)
+}
+
+fn transpose_scheduled_note_events(events: &mut [ScheduledMidiEvent], semitones: i16) {
+    if semitones == 0 {
+        return;
+    }
+    for scheduled in events {
+        let note = match &mut scheduled.event {
+            MidiEvent::NoteOn { note, .. } | MidiEvent::NoteOff { note, .. } => note,
+            _ => continue,
+        };
+        *note = (i16::from(*note) + semitones).clamp(0, 127) as u8;
+    }
 }
 
 fn next_vst3_note_expression_id() -> i32 {

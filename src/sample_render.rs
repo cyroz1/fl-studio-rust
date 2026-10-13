@@ -4110,9 +4110,9 @@ fn prepare_sampler_arrangement(
                     options.read_sample_root_note,
                 ),
                 fine_tune_cents: wave_metadata.fine_tune_cents.unwrap_or_default()
-                    + f64::from(
-                        channel.master_pitch_offset_cents(document.metadata().master_pitch_cents()),
-                    ),
+                    + f64::from(channel.master_pitch_render_offset_cents(
+                        document.metadata().master_pitch_cents(),
+                    )),
                 loop_bounds,
                 ping_pong_loop: channel.sampler_ping_pong_loop_enabled(),
             });
@@ -4126,6 +4126,16 @@ fn prepare_sampler_arrangement(
         let Some(source) = sources_by_channel.get(&placed.target_channel_id) else {
             continue;
         };
+        let note_key = transpose_sampler_note_key(
+            note.key,
+            channels_by_id
+                .get(&placed.target_channel_id)
+                .map_or(0, |channel| {
+                    channel.master_pitch_note_offset_semitones(
+                        document.metadata().master_pitch_cents(),
+                    )
+                }),
+        );
         if source.audio.frame_count() == 0 {
             return Err(format!(
                 "Sampler channel {} references an empty sample",
@@ -4145,7 +4155,7 @@ fn prepare_sampler_arrangement(
             / sampler_source_step(
                 source.audio.sample_rate,
                 options.sample_rate,
-                note.key,
+                note_key,
                 source.root_key,
                 source.fine_tune_cents + f64::from(note.fine_pitch_offset_cents()),
             ))
@@ -4177,7 +4187,7 @@ fn prepare_sampler_arrangement(
             start_frame,
             stop_frame,
             channel_id: placed.target_channel_id,
-            key: note.key,
+            key: note_key,
             velocity: note.velocity,
             pan: note.pan,
             fine_pitch_offset_cents: note.fine_pitch_offset_cents(),
@@ -4400,9 +4410,9 @@ fn prepare_sampler_pattern(
                     options.read_sample_root_note,
                 ),
                 fine_tune_cents: wave_metadata.fine_tune_cents.unwrap_or_default()
-                    + f64::from(
-                        channel.master_pitch_offset_cents(document.metadata().master_pitch_cents()),
-                    ),
+                    + f64::from(channel.master_pitch_render_offset_cents(
+                        document.metadata().master_pitch_cents(),
+                    )),
                 loop_bounds,
                 ping_pong_loop: channel.sampler_ping_pong_loop_enabled(),
             });
@@ -4414,6 +4424,12 @@ fn prepare_sampler_pattern(
         let Some(source) = sources_by_channel.get(&target_channel_id) else {
             continue;
         };
+        let note_key = transpose_sampler_note_key(
+            note.key,
+            channels_by_id.get(&target_channel_id).map_or(0, |channel| {
+                channel.master_pitch_note_offset_semitones(document.metadata().master_pitch_cents())
+            }),
+        );
         let channel_swing_mix_raw = channels_by_id
             .get(&note.channel_id)
             .map_or(128, |channel| channel.swing_mix());
@@ -4449,7 +4465,7 @@ fn prepare_sampler_pattern(
             / sampler_source_step(
                 source.audio.sample_rate,
                 options.sample_rate,
-                note.key,
+                note_key,
                 source.root_key,
                 source.fine_tune_cents + f64::from(note.fine_pitch_offset_cents()),
             ))
@@ -4480,7 +4496,7 @@ fn prepare_sampler_pattern(
             start_frame,
             stop_frame,
             channel_id: target_channel_id,
-            key: note.key,
+            key: note_key,
             velocity: note.velocity,
             pan: note.pan,
             fine_pitch_offset_cents: note.fine_pitch_offset_cents(),
@@ -4858,6 +4874,11 @@ fn sampler_wav_gain(gain_db: Option<i8>) -> f32 {
 fn audio_clip_master_pitch_ratio(pitch_offset_cents: i16) -> f64 {
     2.0f64.powf(f64::from(pitch_offset_cents) / 1_200.0)
 }
+
+fn transpose_sampler_note_key(key: u16, semitones: i16) -> u16 {
+    (i32::from(key) + i32::from(semitones)).clamp(0, 127) as u16
+}
+
 fn sampler_source_step(
     source_rate: u32,
     output_rate: u32,
