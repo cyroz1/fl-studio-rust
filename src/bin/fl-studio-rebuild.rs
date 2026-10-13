@@ -1516,6 +1516,7 @@ enum PianoRollScale {
     HungarianMinor,
     HungarianMajor,
     HungarianMajorModeTwo,
+    ChromaticHypophrygianInverse,
     Persian,
     Oriental,
     Blues,
@@ -1532,7 +1533,7 @@ enum PianoRollScale {
 }
 
 impl PianoRollScale {
-    const ALL: [Self; 69] = [
+    const ALL: [Self; 70] = [
         Self::None,
         Self::Major,
         Self::MajorLocrian,
@@ -1589,6 +1590,7 @@ impl PianoRollScale {
         Self::HungarianMinor,
         Self::HungarianMajor,
         Self::HungarianMajorModeTwo,
+        Self::ChromaticHypophrygianInverse,
         Self::Persian,
         Self::Oriental,
         Self::Blues,
@@ -1662,6 +1664,7 @@ impl PianoRollScale {
             Self::HungarianMinor => "Hungarian minor",
             Self::HungarianMajor => "Hungarian major",
             Self::HungarianMajorModeTwo => "Hungarian major mode II",
+            Self::ChromaticHypophrygianInverse => "Chromatic Hypophrygian Inverse",
             Self::Persian => "Persian",
             Self::Oriental => "Oriental",
             Self::Blues => "Blues",
@@ -1743,6 +1746,7 @@ impl PianoRollScale {
             Self::HungarianMinor => &[0, 2, 3, 6, 7, 8, 11],
             Self::HungarianMajor => &[0, 3, 4, 6, 7, 9, 10],
             Self::HungarianMajorModeTwo => &[0, 1, 3, 4, 6, 7, 9],
+            Self::ChromaticHypophrygianInverse => &[0, 1, 2, 5, 6, 7, 9],
             Self::Persian => &[0, 1, 4, 5, 6, 8, 11],
             Self::Oriental => &[0, 1, 4, 5, 6, 9, 10],
             Self::Blues => &[0, 3, 5, 6, 7, 10],
@@ -1838,6 +1842,7 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
         PianoRollScale::HungarianMinor,
         PianoRollScale::HungarianMajor,
         PianoRollScale::HungarianMajorModeTwo,
+        PianoRollScale::ChromaticHypophrygianInverse,
         PianoRollScale::Persian,
         PianoRollScale::Oriental,
         PianoRollScale::Blues,
@@ -1922,6 +1927,7 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
                 PianoRollScale::HungarianMinor => -30,
                 PianoRollScale::HungarianMajor => -32,
                 PianoRollScale::HungarianMajorModeTwo => -38,
+                PianoRollScale::ChromaticHypophrygianInverse => -38,
                 PianoRollScale::Persian => -31,
                 PianoRollScale::Oriental => -35,
                 PianoRollScale::MajorPentatonic => 0,
