@@ -11576,6 +11576,7 @@ impl DawUi {
                 selected_track_ids.contains(&track_id).then_some(index)
             })
             .collect::<BTreeSet<_>>();
+        let stacked_clip_indices = Self::stacked_playlist_clip_indices(&arrangement.clips);
         let selected_track_solo_range = selected_track_ids
             .first()
             .zip(selected_track_ids.last())
@@ -11763,6 +11764,21 @@ impl DawUi {
                     .clicked()
                 {
                     self.select_muted_playlist_clips(arrangement.id, &arrangement.clips);
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        !stacked_clip_indices.is_empty(),
+                        egui::Button::new("Select stacked clips"),
+                    )
+                    .clicked()
+                {
+                    let selected_count = stacked_clip_indices.len();
+                    self.set_playlist_clip_selection_to_indices(
+                        arrangement.id,
+                        stacked_clip_indices.clone(),
+                    );
+                    self.status = format!("Selected {selected_count} stacked Playlist clips");
                     ui.close();
                 }
                 if ui.button("Invert selection (Shift+I)").clicked() {
@@ -14333,6 +14349,34 @@ impl DawUi {
         } else {
             format!("Selected {muted_clip_count} muted Playlist clips")
         };
+    }
+
+    fn stacked_playlist_clip_indices(clips: &[PlaylistClip]) -> BTreeSet<usize> {
+        let mut clips_by_bounds = BTreeMap::<(u32, u64), Vec<usize>>::new();
+        for (index, clip) in clips.iter().enumerate() {
+            if clip.length_ticks == 0 || clip.track_index.is_none() {
+                continue;
+            }
+            let end_tick = u64::from(clip.position_ticks) + u64::from(clip.length_ticks);
+            clips_by_bounds
+                .entry((clip.position_ticks, end_tick))
+                .or_default()
+                .push(index);
+        }
+
+        let mut selected = BTreeSet::new();
+        for stack in clips_by_bounds.values().filter(|stack| stack.len() > 1) {
+            let lowest_clip = stack.iter().copied().max_by_key(|index| {
+                (
+                    clips[*index].track_index.unwrap_or_default(),
+                    std::cmp::Reverse(*index),
+                )
+            });
+            if let Some(lowest_clip) = lowest_clip {
+                selected.extend(stack.iter().copied().filter(|index| *index != lowest_clip));
+            }
+        }
+        selected
     }
 
     fn set_playlist_clip_selection_to_indices(
