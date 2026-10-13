@@ -622,7 +622,29 @@ impl MidiPatternRecorder {
                     self.notes.push(note);
                 }
             }
+            MidiInputEvent::ControlChange {
+                channel,
+                controller: 120 | 123..=127,
+                ..
+            } => self.finish_channel_notes(channel, tick),
             _ => {}
+        }
+    }
+
+    fn finish_channel_notes(&mut self, channel: u8, end_tick: u32) {
+        let active_keys = self
+            .active_notes
+            .keys()
+            .copied()
+            .filter(|(active_channel, _)| *active_channel == channel)
+            .collect::<Vec<_>>();
+        for (active_channel, key) in active_keys {
+            if let Some(active) = self.active_notes.remove(&(active_channel, key)) {
+                for active_note in active {
+                    let note = self.make_note(active_note, end_tick, active_channel, key, None);
+                    self.notes.push(note);
+                }
+            }
         }
     }
 
