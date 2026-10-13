@@ -35445,7 +35445,7 @@ fn playlist_audio_clip_joinable(
             || left.reserved.len() != 72
             || right.reserved.len() != 72
             || left.reserved[..8] != right.reserved[..8]
-            || left.reserved[20..] != right.reserved[20..]
+            || left.reserved[16..] != right.reserved[16..]
         {
             return false;
         }

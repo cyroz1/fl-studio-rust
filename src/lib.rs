@@ -7471,13 +7471,13 @@ impl FlpDocument {
         if record_size == 88 {
             let mut left_comparison = event.payload[left_record_start..left_record_end].to_vec();
             let mut right_comparison = event.payload[right_record_start..right_record_end].to_vec();
-            for range in [0..4, 8..12, 24..36] {
+            for range in [0..4, 8..12, 24..32] {
                 left_comparison[range.clone()].fill(0);
                 right_comparison[range].fill(0);
             }
             if left_comparison != right_comparison {
                 return Err(FlpError::UnsupportedEdit(
-                    "joined 88-byte Audio Clips must match outside position, length, source windows, and clip ID",
+                    "joined 88-byte Audio Clips must match outside position, length, and source windows",
                 ));
             }
         }
