@@ -5108,6 +5108,13 @@ enum PerformanceMotionReleaseStep {
     Stop,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PerformanceMotionPassAction {
+    Loop,
+    Advance,
+    Stop,
+}
+
 struct PlaylistPerformanceSources<'a> {
     sampler_clip_indices: &'a BTreeSet<usize>,
     audio_clip_indices: &'a BTreeSet<usize>,
@@ -5553,16 +5560,24 @@ impl PlaylistPerformanceRuntime {
             .saturating_add(frame_count as u64)
             .saturating_add(u64::from(self.sample_rate));
         self.apply_queued_transitions(horizon_frame, sampler_engine)?;
+        self.apply_automatic_motion_transitions(block_start, horizon_frame, sampler_engine)?;
         let mut queued_notes = Vec::new();
         for active in self.active_by_track.values_mut() {
             let clip = self
                 .clips_by_index
                 .get(&active.clip_index)
                 .ok_or_else(|| "active Performance Mode clip disappeared".to_owned())?;
-            let one_shot = performance_motion_is_one_shot(
+            let pass_action = performance_motion_pass_action(
                 self.motion_by_track.get(&clip.track_id).copied().flatten(),
+                self.press_by_track.get(&clip.track_id).copied().flatten(),
+                active.clip_index,
+                self.motion_clip_order_by_track
+                    .get(&clip.track_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default(),
             );
-            if one_shot && active.first_pass_scheduled {
+            let single_pass = pass_action != PerformanceMotionPassAction::Loop;
+            if single_pass && active.first_pass_scheduled {
                 continue;
             }
             loop {
@@ -5608,7 +5623,7 @@ impl PlaylistPerformanceRuntime {
                     } else {
                         continue;
                     };
-                    if one_shot && relative_start_tick >= loop_length_ticks {
+                    if single_pass && relative_start_tick >= loop_length_ticks {
                         continue;
                     }
                     let start_tick = active
@@ -5635,7 +5650,7 @@ impl PlaylistPerformanceRuntime {
                                 .map(|frame| frame.max(note.start_frame.saturating_add(1)))
                         })
                         .transpose()?;
-                    if one_shot {
+                    if single_pass {
                         if note.start_frame >= loop_end_frame {
                             continue;
                         }
@@ -5650,7 +5665,7 @@ impl PlaylistPerformanceRuntime {
                 }
                 active.next_loop_tick = loop_end_tick;
                 active.initial_offset_ticks = 0;
-                if one_shot {
+                if single_pass {
                     active.first_pass_scheduled = true;
                     break;
                 }
@@ -5661,10 +5676,17 @@ impl PlaylistPerformanceRuntime {
                 .audio_clips_by_index
                 .get(&active.clip_index)
                 .ok_or_else(|| "active Performance Mode Audio Clip disappeared".to_owned())?;
-            let one_shot = performance_motion_is_one_shot(
+            let pass_action = performance_motion_pass_action(
                 self.motion_by_track.get(&clip.track_id).copied().flatten(),
+                self.press_by_track.get(&clip.track_id).copied().flatten(),
+                active.clip_index,
+                self.motion_clip_order_by_track
+                    .get(&clip.track_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default(),
             );
-            if one_shot && active.first_pass_scheduled {
+            let single_pass = pass_action != PerformanceMotionPassAction::Loop;
+            if single_pass && active.first_pass_scheduled {
                 continue;
             }
             loop {
@@ -5719,38 +5741,52 @@ impl PlaylistPerformanceRuntime {
                 }
                 active.next_loop_tick = loop_end_tick;
                 active.initial_offset_ticks = 0;
-                if one_shot {
+                if single_pass {
                     active.first_pass_scheduled = true;
                     break;
                 }
             }
         }
-        let mut completed_one_shot_tracks = Vec::new();
+        let mut completed_stop_tracks = Vec::new();
         for (&track_id, active) in &self.active_by_track {
-            if performance_motion_is_one_shot(
+            if performance_motion_pass_action(
                 self.motion_by_track.get(&track_id).copied().flatten(),
-            ) && active.first_pass_scheduled
+                self.press_by_track.get(&track_id).copied().flatten(),
+                active.clip_index,
+                self.motion_clip_order_by_track
+                    .get(&track_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default(),
+            ) == PerformanceMotionPassAction::Stop
+                && active.first_pass_scheduled
                 && self
                     .tempo_map
                     .frame_at_tick(active.first_loop_end_tick, self.sample_rate)?
                     <= block_end
             {
-                completed_one_shot_tracks.push(track_id);
+                completed_stop_tracks.push(track_id);
             }
         }
         for (&track_id, active) in &self.active_audio_by_track {
-            if performance_motion_is_one_shot(
+            if performance_motion_pass_action(
                 self.motion_by_track.get(&track_id).copied().flatten(),
-            ) && active.first_pass_scheduled
+                self.press_by_track.get(&track_id).copied().flatten(),
+                active.clip_index,
+                self.motion_clip_order_by_track
+                    .get(&track_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default(),
+            ) == PerformanceMotionPassAction::Stop
+                && active.first_pass_scheduled
                 && self
                     .tempo_map
                     .frame_at_tick(active.first_loop_end_tick, self.sample_rate)?
                     <= block_end
             {
-                completed_one_shot_tracks.push(track_id);
+                completed_stop_tracks.push(track_id);
             }
         }
-        for track_id in completed_one_shot_tracks {
+        for track_id in completed_stop_tracks {
             self.active_by_track.remove(&track_id);
             self.active_audio_by_track.remove(&track_id);
         }
@@ -5903,16 +5939,40 @@ impl PlaylistPerformanceRuntime {
                 .and_then(|queue| queue.front())
                 .copied()
             {
-                let active_boundary = self
+                let active_state = self
                     .active_by_track
                     .get(&track_id)
-                    .map(|active| (active.first_loop_end_tick, active.loop_period_ticks))
+                    .map(|active| {
+                        (
+                            active.clip_index,
+                            active.first_loop_end_tick,
+                            active.loop_period_ticks,
+                        )
+                    })
                     .or_else(|| {
-                        self.active_audio_by_track
-                            .get(&track_id)
-                            .map(|active| (active.first_loop_end_tick, active.loop_period_ticks))
+                        self.active_audio_by_track.get(&track_id).map(|active| {
+                            (
+                                active.clip_index,
+                                active.first_loop_end_tick,
+                                active.loop_period_ticks,
+                            )
+                        })
                     });
-                let boundary_tick = if let Some((first_end_tick, period_ticks)) = active_boundary {
+                if let Some((clip_index, first_end_tick, _)) = active_state
+                    && queued_launch.start_tick > first_end_tick
+                    && performance_motion_pass_action(
+                        self.motion_by_track.get(&track_id).copied().flatten(),
+                        self.press_by_track.get(&track_id).copied().flatten(),
+                        clip_index,
+                        self.motion_clip_order_by_track
+                            .get(&track_id)
+                            .map(Vec::as_slice)
+                            .unwrap_or_default(),
+                    ) == PerformanceMotionPassAction::Advance
+                {
+                    break;
+                }
+                let boundary_tick = if let Some((_, first_end_tick, period_ticks)) = active_state {
                     performance_motion_transition_tick(
                         self.motion_by_track.get(&track_id).copied().flatten(),
                         first_end_tick,
@@ -5944,6 +6004,98 @@ impl PlaylistPerformanceRuntime {
                 .is_some_and(|queue| queue.is_empty())
             {
                 self.queued_by_track.remove(&track_id);
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_automatic_motion_transitions(
+        &mut self,
+        block_start: u64,
+        horizon_frame: u64,
+        sampler_engine: &mut SamplerVoiceEngine<'_>,
+    ) -> Result<(), String> {
+        let track_ids = self
+            .active_by_track
+            .keys()
+            .chain(self.active_audio_by_track.keys())
+            .copied()
+            .collect::<BTreeSet<_>>();
+        for track_id in track_ids {
+            let active = self
+                .active_by_track
+                .get(&track_id)
+                .map(|active| {
+                    (
+                        active.clip_index,
+                        active.first_loop_end_tick,
+                        active.first_pass_scheduled,
+                    )
+                })
+                .or_else(|| {
+                    self.active_audio_by_track.get(&track_id).map(|active| {
+                        (
+                            active.clip_index,
+                            active.first_loop_end_tick,
+                            active.first_pass_scheduled,
+                        )
+                    })
+                });
+            let Some((clip_index, first_end_tick, first_pass_scheduled)) = active else {
+                continue;
+            };
+            let ordered_clip_indices = self
+                .motion_clip_order_by_track
+                .get(&track_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let motion = self.motion_by_track.get(&track_id).copied().flatten();
+            let press = self.press_by_track.get(&track_id).copied().flatten();
+            if !first_pass_scheduled
+                || performance_motion_pass_action(motion, press, clip_index, ordered_clip_indices)
+                    != PerformanceMotionPassAction::Advance
+            {
+                continue;
+            }
+
+            let end_frame = self
+                .tempo_map
+                .frame_at_tick(first_end_tick, self.sample_rate)?;
+            if end_frame > horizon_frame {
+                continue;
+            }
+            let start_tick = if end_frame < block_start {
+                let block_start_tick = self
+                    .tempo_map
+                    .tick_at_frame(block_start, self.sample_rate)?;
+                first_end_tick.max(block_start_tick.ceil().max(0.0) as u64)
+            } else {
+                first_end_tick
+            };
+            let start_frame = self.tempo_map.frame_at_tick(start_tick, self.sample_rate)?;
+            let step = performance_motion_release_step_with_seed(
+                motion,
+                clip_index,
+                ordered_clip_indices,
+                u64::from(track_id) ^ start_frame.rotate_left(17),
+            );
+            match step {
+                Some(PerformanceMotionReleaseStep::Launch(next_clip_index)) => {
+                    let launch = self.launch_with_position_at(
+                        PlaylistPerformanceLaunch {
+                            clip_index: next_clip_index,
+                            start_tick,
+                            start_frame,
+                            position_offset_ticks: 0,
+                        },
+                        start_tick,
+                    )?;
+                    self.activate_launch(launch, sampler_engine)?;
+                }
+                Some(PerformanceMotionReleaseStep::Stop) => {
+                    self.stop_track_at(track_id, start_frame, sampler_engine);
+                }
+                None => {}
             }
         }
         Ok(())
@@ -6052,6 +6204,30 @@ fn performance_motion_release_step_with_seed(
                 candidates[performance_motion_random_position(seed, candidates.len())],
             ))
         }
+    }
+}
+
+fn performance_motion_pass_action(
+    motion: Option<PlaylistTrackMotion>,
+    press: Option<PlaylistTrackPress>,
+    current_clip_index: usize,
+    ordered_clip_indices: &[usize],
+) -> PerformanceMotionPassAction {
+    if performance_motion_is_one_shot(motion) {
+        return PerformanceMotionPassAction::Stop;
+    }
+    if press == Some(PlaylistTrackPress::HoldMotion) {
+        return PerformanceMotionPassAction::Loop;
+    }
+    match performance_motion_release_step_with_seed(
+        motion,
+        current_clip_index,
+        ordered_clip_indices,
+        0,
+    ) {
+        Some(PerformanceMotionReleaseStep::Launch(_)) => PerformanceMotionPassAction::Advance,
+        Some(PerformanceMotionReleaseStep::Stop) => PerformanceMotionPassAction::Stop,
+        None => PerformanceMotionPassAction::Loop,
     }
 }
 
@@ -8342,6 +8518,73 @@ mod tests {
                 1,
             ),
             None
+        );
+    }
+
+    #[test]
+    fn motion_modes_advance_after_pass_except_stay_and_hold_motion() {
+        assert_eq!(
+            performance_motion_pass_action(
+                Some(PlaylistTrackMotion::MarchWrap),
+                Some(PlaylistTrackPress::Retrigger),
+                4,
+                &[4, 9, 12],
+            ),
+            PerformanceMotionPassAction::Advance
+        );
+        assert_eq!(
+            performance_motion_pass_action(
+                Some(PlaylistTrackMotion::MarchWrap),
+                Some(PlaylistTrackPress::HoldMotion),
+                4,
+                &[4, 9, 12],
+            ),
+            PerformanceMotionPassAction::Loop
+        );
+        assert_eq!(
+            performance_motion_pass_action(
+                Some(PlaylistTrackMotion::MarchStay),
+                Some(PlaylistTrackPress::Retrigger),
+                12,
+                &[4, 9, 12],
+            ),
+            PerformanceMotionPassAction::Loop
+        );
+        assert_eq!(
+            performance_motion_pass_action(
+                Some(PlaylistTrackMotion::MarchStop),
+                Some(PlaylistTrackPress::Retrigger),
+                12,
+                &[4, 9, 12],
+            ),
+            PerformanceMotionPassAction::Stop
+        );
+        assert_eq!(
+            performance_motion_pass_action(
+                Some(PlaylistTrackMotion::Random),
+                Some(PlaylistTrackPress::Latch),
+                9,
+                &[4, 9, 12],
+            ),
+            PerformanceMotionPassAction::Advance
+        );
+        assert_eq!(
+            performance_motion_pass_action(
+                Some(PlaylistTrackMotion::Stay),
+                Some(PlaylistTrackPress::Retrigger),
+                4,
+                &[4, 9, 12],
+            ),
+            PerformanceMotionPassAction::Loop
+        );
+        assert_eq!(
+            performance_motion_pass_action(
+                Some(PlaylistTrackMotion::OneShot),
+                Some(PlaylistTrackPress::HoldMotion),
+                4,
+                &[4, 9, 12],
+            ),
+            PerformanceMotionPassAction::Stop
         );
     }
 
