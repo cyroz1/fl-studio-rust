@@ -3161,6 +3161,7 @@ struct DawUi {
     history_snapshot_available_this_frame: bool,
     playing: bool,
     performance_mode_active: bool,
+    held_performance_clip: Option<(u16, u32, usize)>,
     performance_launch_sender: Option<Sender<PlaylistPerformanceCommand>>,
     project_playback_loaded: bool,
     playlist_playback_loaded: bool,
@@ -3883,6 +3884,7 @@ impl DawUi {
             history_snapshot_available_this_frame: false,
             playing: false,
             performance_mode_active: false,
+            held_performance_clip: None,
             performance_launch_sender: None,
             project_playback_loaded: false,
             playlist_playback_loaded: false,
@@ -7847,6 +7849,7 @@ impl DawUi {
     }
 
     fn stop_project_playback(&mut self) {
+        self.held_performance_clip = None;
         self.performance_launch_sender = None;
         self.stop_midi_playlist_playback();
         self.stop_midi_clock();
@@ -12446,6 +12449,7 @@ impl DawUi {
         let mut merge_pattern_clips_requested = None;
         let mut performance_clip_launch_requested = None;
         let mut performance_clip_queue_requested = None;
+        let mut performance_hold_release_requested = None;
         let mut seek_tick_requested = None;
         let mut dropped_playlist_audio = None;
         let mut playlist_clip_vertical_move = None;
@@ -13475,7 +13479,7 @@ impl DawUi {
                                 let mut requested_press = None;
                                 ui.horizontal(|ui| {
                                     ui.label("Press").on_hover_text(
-                                        "Saved per-track press mode. Latch stops the same active clip on a repeated trigger; Hold behavior is not implemented yet.",
+                                        "Saved per-track press mode. Hold & stop starts on mouse press and stops on release; Hold & motion is not implemented yet.",
                                     );
                                     egui::ComboBox::from_id_salt((
                                         "playlist-track-press",
@@ -13991,7 +13995,29 @@ impl DawUi {
                                 && self.playing
                                 && self.performance_launch_sender.is_some()
                                 && !self.playlist_mute_tool_active;
-                            if response.clicked_by(PointerButton::Primary)
+                            let clip_track_id = clip.playlist_track_id();
+                            let clip_press = clip_track_id.and_then(|track_id| {
+                                tracks
+                                    .iter()
+                                    .find(|track| track.id == track_id)
+                                    .and_then(|track| track.press)
+                            });
+                            let hold_stop_press = clip_press == Some(PlaylistTrackPress::HoldStop);
+                            let (primary_pressed, primary_released, shift_pressed) = ui.input(|input| {
+                                (
+                                    input.pointer.button_pressed(PointerButton::Primary),
+                                    input.pointer.button_released(PointerButton::Primary),
+                                    input.modifiers.shift,
+                                )
+                            });
+                            let performance_press_started = if hold_stop_press && !shift_pressed {
+                                primary_pressed
+                                    && (response.is_pointer_button_down_on()
+                                        || response.clicked_by(PointerButton::Primary))
+                            } else {
+                                response.clicked_by(PointerButton::Primary)
+                            };
+                            if performance_press_started
                                 && can_trigger_performance_clip
                                 && performance_zone_end_tick.is_some_and(|zone_end_tick| {
                                     self.document
@@ -14007,10 +14033,20 @@ impl DawUi {
                                         .is_some_and(|indices| indices.contains(&clip_index))
                                 })
                             {
-                                if ui.input(|input| input.modifiers.shift) {
+                                if shift_pressed {
                                     performance_clip_queue_requested = Some(clip_index);
                                 } else {
                                     performance_clip_launch_requested = Some(clip_index);
+                                    if hold_stop_press
+                                        && let Some(track_id) = clip_track_id
+                                    {
+                                        if primary_released {
+                                            performance_hold_release_requested = Some(track_id);
+                                        } else {
+                                            self.held_performance_clip =
+                                                Some((arrangement.id, track_id, clip_index));
+                                        }
+                                    }
                                 }
                             }
                             let sample_length_ms = is_audio_clip
@@ -15530,6 +15566,10 @@ impl DawUi {
                     self.status = "Could not map Performance Mode launch timing or position".into();
                 }
             }
+        }
+
+        if let Some(track_id) = performance_hold_release_requested {
+            self.queue_performance_track_stop(track_id);
         }
 
         if let Some(soloed_range) = solo_playlist_track_requested {
@@ -35691,6 +35731,12 @@ impl eframe::App for DawUi {
         // system theme. Keep its widget visuals on the app palette as well.
         *ui.visuals_mut() = app_visuals();
         self.guard_window_close(ui.ctx());
+        if ui.input(|input| input.pointer.button_released(PointerButton::Primary))
+            && let Some((_, track_id, _)) = self.held_performance_clip.take()
+            && self.performance_launch_sender.is_some()
+        {
+            self.queue_performance_track_stop(track_id);
+        }
         let history_navigation_requested = ui.input(|input| {
             input.modifiers.command
                 && (input.key_pressed(egui::Key::Z) || input.key_pressed(egui::Key::Y))

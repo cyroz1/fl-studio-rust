@@ -5309,6 +5309,29 @@ impl PlaylistPerformanceRuntime {
             })
     }
 
+    fn cancel_pending_track_launches_from(&mut self, track_id: u32, start_frame: u64) {
+        let clip_track_ids = self
+            .clips_by_index
+            .iter()
+            .map(|(clip_index, clip)| (*clip_index, clip.track_id))
+            .chain(
+                self.audio_clips_by_index
+                    .iter()
+                    .map(|(clip_index, clip)| (*clip_index, clip.track_id)),
+            )
+            .collect::<HashMap<_, _>>();
+        self.pending_commands.retain(|command| match *command {
+            PlaylistPerformanceCommand::Launch(launch)
+            | PlaylistPerformanceCommand::Enqueue(launch) => !performance_launch_cancelled_by_stop(
+                clip_track_ids.get(&launch.clip_index).copied(),
+                launch.start_frame,
+                track_id,
+                start_frame,
+            ),
+            PlaylistPerformanceCommand::StopTrack { .. } => true,
+        });
+    }
+
     fn update(
         &mut self,
         block_start: u64,
@@ -5331,11 +5354,25 @@ impl PlaylistPerformanceRuntime {
             .pending_commands
             .drain(..due_command_count)
             .collect::<Vec<_>>();
+        let mut stopped_tracks_in_block = BTreeMap::new();
         for command in due_commands {
             match command {
                 PlaylistPerformanceCommand::Launch(launch) => {
                     self.validate_launch(launch)?;
                     let track_id = self.performance_clip_track_id(launch.clip_index)?;
+                    if stopped_tracks_in_block
+                        .get(&track_id)
+                        .is_some_and(|stop_frame| {
+                            performance_launch_cancelled_by_stop(
+                                Some(track_id),
+                                launch.start_frame,
+                                track_id,
+                                *stop_frame,
+                            )
+                        })
+                    {
+                        continue;
+                    }
                     self.queued_by_track.remove(&track_id);
                     if performance_latch_should_stop(
                         self.press_by_track.get(&track_id).copied().flatten(),
@@ -5350,6 +5387,19 @@ impl PlaylistPerformanceRuntime {
                 PlaylistPerformanceCommand::Enqueue(launch) => {
                     self.validate_launch(launch)?;
                     let track_id = self.performance_clip_track_id(launch.clip_index)?;
+                    if stopped_tracks_in_block
+                        .get(&track_id)
+                        .is_some_and(|stop_frame| {
+                            performance_launch_cancelled_by_stop(
+                                Some(track_id),
+                                launch.start_frame,
+                                track_id,
+                                *stop_frame,
+                            )
+                        })
+                    {
+                        continue;
+                    }
                     let active_clip_index = self.active_clip_index_on_track(track_id);
                     if performance_latch_should_stop(
                         self.press_by_track.get(&track_id).copied().flatten(),
@@ -5381,7 +5431,9 @@ impl PlaylistPerformanceRuntime {
                         );
                     }
                     self.queued_by_track.remove(&track_id);
+                    self.cancel_pending_track_launches_from(track_id, start_frame);
                     self.stop_track_at(track_id, start_frame, sampler_engine);
+                    stopped_tracks_in_block.insert(track_id, start_frame);
                 }
             }
         }
@@ -5857,6 +5909,15 @@ fn performance_motion_transition_tick(
     } else {
         performance_next_loop_boundary(first_end_tick, period_ticks, earliest_tick)
     }
+}
+
+fn performance_launch_cancelled_by_stop(
+    launch_track_id: Option<u32>,
+    launch_frame: u64,
+    track_id: u32,
+    stop_frame: u64,
+) -> bool {
+    launch_track_id == Some(track_id) && launch_frame >= stop_frame
 }
 
 fn performance_position_offset_ticks(
@@ -8013,6 +8074,15 @@ mod tests {
                 .unwrap(),
             768
         );
+    }
+
+    #[test]
+    fn track_stop_cancels_later_performance_launches_on_that_track() {
+        assert!(performance_launch_cancelled_by_stop(Some(7), 101, 7, 100));
+        assert!(performance_launch_cancelled_by_stop(Some(7), 100, 7, 100));
+        assert!(!performance_launch_cancelled_by_stop(Some(7), 99, 7, 100));
+        assert!(!performance_launch_cancelled_by_stop(Some(8), 101, 7, 100));
+        assert!(!performance_launch_cancelled_by_stop(None, 101, 7, 100));
     }
 
     #[test]
