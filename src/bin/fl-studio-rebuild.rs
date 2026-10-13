@@ -11522,7 +11522,7 @@ impl DawUi {
             self.empty_project_view(ui);
             return;
         }
-        let (arrangements, tracks, channels, ppq, patterns, project_time_signature) = {
+        let (arrangements, tracks, channels, ppq, patterns, project_time_signature, base_tempo_bpm) = {
             let document = self.document.as_ref().expect("document checked above");
             (
                 document.arrangements().unwrap_or_default(),
@@ -11531,6 +11531,7 @@ impl DawUi {
                 document.header().ppq().max(1),
                 document.patterns().unwrap_or_default(),
                 document.metadata().time_signature(),
+                document.metadata().tempo_bpm().unwrap_or(140.0),
             )
         };
         let tempo_channel_ids = channels
@@ -12721,6 +12722,8 @@ impl DawUi {
                                         clip,
                                         &waveform,
                                         self.playlist_waveform_mode,
+                                        ppq,
+                                        base_tempo_bpm,
                                     );
                                 } else if self.waveform_loads.contains_key(path) {
                                     clip_painter.text(
@@ -34964,6 +34967,8 @@ fn draw_audio_clip_waveform(
     clip: &PlaylistClip,
     waveform: &AudioWaveform,
     mode: PlaylistWaveformMode,
+    ppq: u16,
+    base_tempo_bpm: f64,
 ) {
     if waveform.peaks.is_empty() || waveform.frame_count == 0 || waveform.sample_rate == 0 {
         return;
@@ -34974,7 +34979,24 @@ fn draw_audio_clip_waveform(
         (frame.is_finite() && frame >= 0.0 && frame <= u64::MAX as f64)
             .then_some(frame.round() as u64)
     };
-    let source_window = if clip.uses_full_source_window() {
+    let source_window = if let Some((start_tick, end_tick)) = clip.source_window_ticks() {
+        if start_tick == 0 && end_tick == 0 {
+            Some((0, full_frame_count))
+        } else if ppq == 0 || !base_tempo_bpm.is_finite() || base_tempo_bpm <= 0.0 {
+            None
+        } else {
+            let ticks_to_frames = |ticks: u32| {
+                let frames = f64::from(ticks) * 60.0 * f64::from(waveform.sample_rate)
+                    / (f64::from(ppq) * base_tempo_bpm);
+                (frames.is_finite() && frames >= 0.0 && frames <= u64::MAX as f64)
+                    .then_some(frames.round() as u64)
+            };
+            ticks_to_frames(start_tick)
+                .zip(ticks_to_frames(end_tick))
+                .map(|(start, end)| (start.min(full_frame_count), end.min(full_frame_count)))
+                .filter(|(start, end)| start < end)
+        }
+    } else if clip.uses_full_source_window() {
         Some((0, full_frame_count))
     } else {
         clip.source_window_milliseconds()
