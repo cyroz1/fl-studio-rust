@@ -2354,6 +2354,23 @@ struct ActivePlaylistClipDrag {
     kind: PlaylistClipDragKind,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PlaylistClipDragTarget {
+    clip_index: usize,
+    start_position_ticks: u32,
+    start_track_index: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PlaylistClipDragContext {
+    pointer: egui::Pos2,
+    tick_scale: f32,
+    row_height: f32,
+    ppq: u16,
+    snap: bool,
+    max_track_index: u16,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct PianoRollSelectionDrag {
     pattern_id: u16,
@@ -3061,6 +3078,7 @@ struct DawUi {
     collapsed_playlist_groups: BTreeSet<(u16, u32)>,
     hide_collapsed_playlist_groups: bool,
     active_playlist_clip_drag: Option<ActivePlaylistClipDrag>,
+    active_playlist_clip_drag_targets: Vec<PlaylistClipDragTarget>,
     selected_time_marker: Option<usize>,
     selected_pattern_time_signature: Option<usize>,
     selected_pattern_time_signature_pattern: Option<u16>,
@@ -3688,6 +3706,7 @@ impl DawUi {
             collapsed_playlist_groups: BTreeSet::new(),
             hide_collapsed_playlist_groups,
             active_playlist_clip_drag: None,
+            active_playlist_clip_drag_targets: Vec::new(),
             selected_time_marker: None,
             selected_pattern_time_signature: None,
             selected_pattern_time_signature_pattern: None,
@@ -11739,6 +11758,7 @@ impl DawUi {
         {
             self.playlist_touch_gesture_active = true;
             self.active_playlist_clip_drag = None;
+            self.active_playlist_clip_drag_targets.clear();
             if let Some((zoom, offset)) = touch_pan_zoom_scroll_offset(
                 viewport,
                 self.playlist_grid_scroll_offset,
@@ -12893,24 +12913,68 @@ impl DawUi {
                                     .input(|input| input.pointer.press_origin())
                                     .or_else(|| response.interact_pointer_pos())
                             {
+                                self.active_playlist_clip_drag_targets.clear();
                                 let resize_requested = ui.input(|input| input.modifiers.shift)
                                     && pointer.x >= clip_rect.right() - 8.0;
                                 let resize =
                                     resize_requested && clip.can_resize_timeline_length();
-                                self.selected_arrangement = Some(arrangement.id);
-                                self.selected_clip = Some(clip_index);
-                                self.selected_playlist_clips.clear();
-                                self.selected_playlist_clips.insert(clip_index);
-                                self.playlist_selection_anchor = Some(clip_index);
                                 let slip_requested =
                                     self.playlist_slip_tool_active && is_audio_clip && !resize;
+                                let preserve_selected_group = !resize
+                                    && !slip_requested
+                                    && self.selected_arrangement == Some(arrangement.id)
+                                    && self.selected_playlist_clips.contains(&clip_index)
+                                    && self.selected_playlist_clips.len() > 1;
+                                let drag_target_indices = if preserve_selected_group {
+                                    self.selected_playlist_clips
+                                        .iter()
+                                        .copied()
+                                        .filter(|index| *index < arrangement.clips.len())
+                                        .collect::<Vec<_>>()
+                                } else {
+                                    vec![clip_index]
+                                };
+                                let drag_targets = if preserve_selected_group {
+                                    drag_target_indices
+                                        .iter()
+                                        .map(|target_index| {
+                                            let target_clip = arrangement.clips.get(*target_index)?;
+                                            Some(PlaylistClipDragTarget {
+                                                clip_index: *target_index,
+                                                start_position_ticks: target_clip.position_ticks,
+                                                start_track_index: target_clip.track_index?,
+                                            })
+                                        })
+                                        .collect::<Option<Vec<_>>>()
+                                } else {
+                                    Some(vec![PlaylistClipDragTarget {
+                                        clip_index,
+                                        start_position_ticks: clip.position_ticks,
+                                        start_track_index: clip.track_index.unwrap_or(row),
+                                    }])
+                                };
+                                self.selected_arrangement = Some(arrangement.id);
+                                self.selected_clip = Some(clip_index);
+                                if !preserve_selected_group {
+                                    self.selected_playlist_clips.clear();
+                                    self.selected_playlist_clips.insert(clip_index);
+                                    self.playlist_selection_anchor = Some(clip_index);
+                                }
                                 if resize_requested && !resize {
                                     self.status = "Resizing this FL Studio clip format is not available yet".to_owned();
                                 } else if slip_requested && !can_slip_clip {
                                     self.status = slip_unavailable_reason.to_owned();
+                                } else if drag_targets.is_none() {
+                                    self.status = "Cannot move the selected clips because one has an unsupported track index".to_owned();
                                 } else {
                                     let (start_source_start_ms, start_source_end_ms) =
                                         source_window_ms.unwrap_or_default();
+                                    self.active_playlist_clip_drag_targets = if preserve_selected_group
+                                    {
+                                        drag_targets.unwrap_or_default()
+                                    } else {
+                                        Vec::new()
+                                    };
                                     self.active_playlist_clip_drag =
                                         Some(ActivePlaylistClipDrag {
                                             arrangement_id: arrangement.id,
@@ -12941,35 +13005,66 @@ impl DawUi {
                                 && let Some(drag) = clip_drag
                                 && let Some(pointer) = response.interact_pointer_pos()
                             {
-                                let edit = playlist_clip_drag_edit(
-                                    drag,
-                                    pointer,
-                                    tick_scale,
-                                    row_height,
-                                    ppq,
-                                    !ui.input(|input| input.modifiers.alt),
-                                    last_track.min(499),
-                                );
-                                let unchanged = edit
-                                    .position_ticks
-                                    .is_none_or(|value| value == clip.position_ticks)
-                                    && edit
-                                        .length_ticks
-                                        .is_none_or(|value| value == clip.length_ticks)
-                                    && edit
-                                        .raw_track_index
-                                        .is_none_or(|value| value == clip.raw_track_index)
-                                    && edit
-                                        .start_offset
-                                        .is_none_or(|value| value == clip.start_offset)
-                                    && edit
-                                        .end_offset
-                                        .is_none_or(|value| value == clip.end_offset);
+                                let group_targets =
+                                    self.active_playlist_clip_drag_targets.clone();
+                                let snap = !ui.input(|input| input.modifiers.alt);
+                                let edits = if drag.kind == PlaylistClipDragKind::Move
+                                    && group_targets.len() > 1
+                                {
+                                    playlist_clip_group_drag_edits(
+                                        drag,
+                                        &group_targets,
+                                        PlaylistClipDragContext {
+                                            pointer,
+                                            tick_scale,
+                                            row_height,
+                                            ppq,
+                                            snap,
+                                            max_track_index: last_track.min(499),
+                                        },
+                                    )
+                                } else {
+                                    vec![(
+                                        clip_index,
+                                        playlist_clip_drag_edit(
+                                            drag,
+                                            pointer,
+                                            tick_scale,
+                                            row_height,
+                                            ppq,
+                                            snap,
+                                            last_track.min(499),
+                                        ),
+                                    )]
+                                };
+                                let unchanged = edits.iter().all(|(edited_index, edit)| {
+                                    arrangement
+                                        .clips
+                                        .get(*edited_index)
+                                        .is_none_or(|edited_clip| {
+                                            edit.position_ticks.is_none_or(|value| {
+                                                value == edited_clip.position_ticks
+                                            })
+                                                && edit.length_ticks.is_none_or(|value| {
+                                                    value == edited_clip.length_ticks
+                                                })
+                                                && edit.raw_track_index.is_none_or(|value| {
+                                                    value == edited_clip.raw_track_index
+                                                })
+                                                && edit.start_offset.is_none_or(|value| {
+                                                    value == edited_clip.start_offset
+                                                })
+                                                && edit.end_offset.is_none_or(|value| {
+                                                    value == edited_clip.end_offset
+                                                })
+                                        })
+                                });
                                 if !unchanged {
                                     let mut updated = self.document.clone();
                                     let result = updated.as_mut().map(|document| match drag.kind {
                                         PlaylistClipDragKind::Slip => {
-                                            let target_start_ms = edit
+                                            let target_start_ms = edits[0]
+                                                .1
                                                 .start_offset
                                                 .unwrap_or(clip.start_offset);
                                             let delta_ms = f64::from(target_start_ms)
@@ -12981,12 +13076,21 @@ impl DawUi {
                                                 drag.source_length_ms,
                                             )
                                         }
-                                        PlaylistClipDragKind::Move
-                                        | PlaylistClipDragKind::Resize => {
+                                        PlaylistClipDragKind::Move => {
+                                            for (edited_index, edit) in &edits {
+                                                document.edit_playlist_clip(
+                                                    arrangement.id,
+                                                    *edited_index,
+                                                    edit.clone(),
+                                                )?;
+                                            }
+                                            Ok(())
+                                        }
+                                        PlaylistClipDragKind::Resize => {
                                             document.edit_playlist_clip(
                                                 arrangement.id,
                                                 clip_index,
-                                                edit,
+                                                edits[0].1.clone(),
                                             )
                                         }
                                     });
@@ -12997,7 +13101,14 @@ impl DawUi {
                                             self.dirty = true;
                                             self.status = match drag.kind {
                                                 PlaylistClipDragKind::Move => {
-                                                    format!("Moved Playlist clip {}", clip_index + 1)
+                                                    if group_targets.len() > 1 {
+                                                        format!(
+                                                            "Moved {} Playlist clips",
+                                                            group_targets.len()
+                                                        )
+                                                    } else {
+                                                        format!("Moved Playlist clip {}", clip_index + 1)
+                                                    }
                                                 }
                                                 PlaylistClipDragKind::Resize => {
                                                     format!("Resized Playlist clip {}", clip_index + 1)
@@ -13021,6 +13132,7 @@ impl DawUi {
                             }
                             if response.drag_stopped() && clip_drag.is_some() {
                                 self.active_playlist_clip_drag = None;
+                                self.active_playlist_clip_drag_targets.clear();
                             }
                             if response.clicked() {
                                 if self.playlist_mute_tool_active {
@@ -34054,6 +34166,81 @@ fn playlist_clip_drag_edit(
             }
         }
     }
+}
+
+fn playlist_clip_group_drag_edits(
+    drag: ActivePlaylistClipDrag,
+    targets: &[PlaylistClipDragTarget],
+    context: PlaylistClipDragContext,
+) -> Vec<(usize, PlaylistClipEdit)> {
+    if targets.is_empty() {
+        return Vec::new();
+    }
+
+    let anchor_edit = playlist_clip_drag_edit(
+        drag,
+        context.pointer,
+        context.tick_scale,
+        context.row_height,
+        context.ppq,
+        context.snap,
+        context.max_track_index,
+    );
+    let anchor_position = anchor_edit
+        .position_ticks
+        .unwrap_or(drag.start_position_ticks);
+    let requested_tick_delta = i64::from(anchor_position) - i64::from(drag.start_position_ticks);
+    let min_start_position = targets
+        .iter()
+        .map(|target| target.start_position_ticks)
+        .min()
+        .unwrap_or(drag.start_position_ticks);
+    let max_start_position = targets
+        .iter()
+        .map(|target| target.start_position_ticks)
+        .max()
+        .unwrap_or(drag.start_position_ticks);
+    let tick_delta = requested_tick_delta.clamp(
+        -i64::from(min_start_position),
+        i64::from(u32::MAX - max_start_position),
+    );
+
+    let anchor_track = anchor_edit
+        .raw_track_index
+        .map(|raw_track_index| 499 - raw_track_index)
+        .unwrap_or(drag.start_track_index);
+    let requested_track_delta = i32::from(anchor_track) - i32::from(drag.start_track_index);
+    let min_start_track = targets
+        .iter()
+        .map(|target| target.start_track_index)
+        .min()
+        .unwrap_or(drag.start_track_index);
+    let max_start_track = targets
+        .iter()
+        .map(|target| target.start_track_index)
+        .max()
+        .unwrap_or(drag.start_track_index);
+    let max_track_index = context.max_track_index.min(499).max(max_start_track);
+    let track_delta = requested_track_delta.clamp(
+        -i32::from(min_start_track),
+        i32::from(max_track_index - max_start_track),
+    );
+
+    targets
+        .iter()
+        .map(|target| {
+            let position_ticks = (i64::from(target.start_position_ticks) + tick_delta) as u32;
+            let track_index = (i32::from(target.start_track_index) + track_delta) as u16;
+            (
+                target.clip_index,
+                PlaylistClipEdit {
+                    position_ticks: Some(position_ticks),
+                    raw_track_index: Some(499 - track_index),
+                    ..PlaylistClipEdit::default()
+                },
+            )
+        })
+        .collect()
 }
 
 fn note_from_grid_position(
