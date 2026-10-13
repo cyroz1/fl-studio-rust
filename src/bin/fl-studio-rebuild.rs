@@ -20225,6 +20225,7 @@ impl DawUi {
         let mut export_midi_requested = false;
         let mut render_requested = false;
         let mut preview_requested = false;
+        let mut chord_preview_requested = false;
         let mut sampler_preview_requested = false;
         let mut quantize_requested = false;
         let mut legato_requested = false;
@@ -21952,6 +21953,16 @@ impl DawUi {
                             }
                         });
                 }
+                if ui
+                    .add_enabled(
+                        self.selected_pattern.is_some() && self.selected_note_channel.is_some(),
+                        egui::Button::new("Preview C5"),
+                    )
+                    .on_hover_text("Audition this chord stamp and voicing at C5")
+                    .clicked()
+                {
+                    chord_preview_requested = true;
+                }
             }
             if selected_note_count > 0 {
                 ui.small(format!("{selected_note_count} selected"));
@@ -21965,6 +21976,11 @@ impl DawUi {
             self.selected_note = None;
             self.piano_roll_selection_drag = None;
             self.piano_roll_pitch_selection_drag = None;
+        }
+        if chord_preview_requested {
+            self.preview_piano_roll_chord_stamp(
+                self.piano_roll_snap.ticks(ppq, time_signature).max(1),
+            );
         }
         if selection_pattern_before_toolbar != self.selected_pattern
             || selection_channel_before_toolbar != self.selected_note_channel
@@ -23493,6 +23509,287 @@ impl DawUi {
                 );
             }
             Err(error) => self.status = format!("Could not render pattern channel: {error}"),
+        }
+    }
+
+    fn preview_piano_roll_chord_stamp(&mut self, note_length: u32) {
+        let (Some(pattern_id), Some(channel_id)) =
+            (self.selected_pattern, self.selected_note_channel)
+        else {
+            self.status = "Select a pattern and channel before previewing a chord".to_owned();
+            return;
+        };
+        let Some(document) = self.document.as_ref() else {
+            self.status = "Open a project before previewing a chord".to_owned();
+            return;
+        };
+        let patterns = match document.patterns() {
+            Ok(patterns) => patterns,
+            Err(error) => {
+                self.status = format!("Could not decode chord preview notes: {error}");
+                return;
+            }
+        };
+        let Some(pattern) = patterns
+            .into_iter()
+            .find(|pattern| pattern.id == pattern_id)
+        else {
+            self.status = format!("Pattern {pattern_id} was not found");
+            return;
+        };
+        let mut pitches = self.piano_roll_chord_stamp.pitches(
+            60,
+            self.piano_roll_scale,
+            self.piano_roll_scale_root,
+        );
+        if self
+            .piano_roll_chord_stamp
+            .top_down_note_count()
+            .is_some_and(|expected| pitches.len() < expected)
+        {
+            self.status = "Top-down chord needs more MIDI pitch range below C5".to_owned();
+            return;
+        }
+        if !apply_piano_roll_chord_inversion(&mut pitches, self.piano_roll_chord_inversion) {
+            self.status = "Chord inversion exceeds the MIDI pitch range".to_owned();
+            return;
+        }
+        if pitches.is_empty() {
+            self.status = "The selected chord stamp has no playable notes".to_owned();
+            return;
+        }
+        let notes = pitches
+            .into_iter()
+            .map(|key| PatternNote {
+                position: 0,
+                flags: PATTERN_NOTE_DEFAULT_FLAGS,
+                channel_id,
+                length: note_length.max(1),
+                key,
+                group: 0,
+                fine_pitch: 120,
+                reserved: 0,
+                release: PATTERN_NOTE_DEFAULT_RELEASE,
+                midi_channel: 0,
+                pan: 64,
+                velocity: 100,
+                mod_x: 128,
+                mod_y: 128,
+            })
+            .collect::<Vec<_>>();
+        let channel = document
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id() == channel_id);
+        let is_sampler = channel
+            .as_ref()
+            .is_some_and(|channel| channel.kind() == Some(0));
+        let instance_id = self.channel_vst3_instances.get(&channel_id).copied();
+        if instance_id.is_none() && !is_sampler {
+            self.status =
+                "Select a Sampler channel or load a VST3 instrument to preview this chord"
+                    .to_owned();
+            return;
+        }
+        let sampler_project = if instance_id.is_none() {
+            let Some(project_path) = self.sample_project_path() else {
+                self.status = "Save the project before previewing its Sampler chord".to_owned();
+                return;
+            };
+            let mut preview_document = document.clone();
+            let mut channel_indices = BTreeMap::<u16, usize>::new();
+            let mut removals = BTreeMap::<u16, Vec<usize>>::new();
+            for pattern_note in &pattern.notes {
+                let channel_note_index =
+                    channel_indices.entry(pattern_note.channel_id).or_default();
+                removals
+                    .entry(pattern_note.channel_id)
+                    .or_default()
+                    .push(*channel_note_index);
+                *channel_note_index += 1;
+            }
+            for (remove_channel, mut indices) in removals {
+                indices.sort_unstable_by(|left, right| right.cmp(left));
+                for remove_index in indices {
+                    if let Err(error) = preview_document.delete_pattern_note(
+                        pattern_id,
+                        remove_channel,
+                        remove_index,
+                    ) {
+                        self.status = format!("Could not isolate the chord preview: {error}");
+                        return;
+                    }
+                }
+            }
+            if let Err(error) = preview_document.add_pattern_notes(pattern_id, &notes) {
+                self.status = format!("Could not prepare the chord preview: {error}");
+                return;
+            }
+            let project_bytes = match preview_document.encode_lossless() {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    self.status = format!("Could not encode the chord preview: {error}");
+                    return;
+                }
+            };
+            Some((project_path, project_bytes))
+        } else {
+            None
+        };
+        let ppq = document.header().ppq();
+        let tempo_bpm = document.metadata().tempo_bpm().unwrap_or(self.tempo_bpm);
+        let pitch_offset_cents = project_channel_master_pitch_offset_cents(document, channel_id);
+        let note_pitch_offset_semitones =
+            project_channel_master_pitch_note_offset_semitones(document, channel_id);
+
+        if self.audio_engine.is_none() {
+            match AudioEngine::start(&self.audio_settings) {
+                Ok(engine) => self.audio_engine = Some(engine),
+                Err(error) => {
+                    self.status = format!("Could not start audio output: {error}");
+                    return;
+                }
+            }
+        }
+        let Some(engine) = self.audio_engine.as_ref() else {
+            self.status = "Audio output is not available".to_owned();
+            return;
+        };
+        if !engine.output_active() {
+            self.status = "Enable an output device before previewing a chord".to_owned();
+            return;
+        }
+        let device_rate = engine.sample_rate();
+        self.stop_project_playback();
+        if let Some(engine) = &self.audio_engine {
+            engine.set_test_tone(false);
+            if self.audio_monitor_input {
+                let _ = engine.set_input_monitor(false);
+            }
+        }
+        self.audio_test_tone = false;
+        self.audio_monitor_input = false;
+
+        if let Some(instance_id) = instance_id {
+            let prepared = self
+                .vst3_host
+                .as_ref()
+                .ok_or_else(|| "VST3 host is not initialized".to_owned())
+                .and_then(|host| {
+                    host.prepare_pattern_channel_stream(
+                        instance_id,
+                        &notes,
+                        Vst3PatternRenderOptions {
+                            channel_id,
+                            ppq,
+                            tempo_bpm,
+                            tail_seconds: 1.0,
+                            global_swing_mix_raw: 0,
+                            channel_swing_mix_raw: 128,
+                            pitch_offset_cents,
+                            note_pitch_offset_semitones,
+                        },
+                    )
+                });
+            let prepared = match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    self.status = format!("Could not prepare the chord preview: {error}");
+                    return;
+                }
+            };
+            let writer = match self
+                .audio_engine
+                .as_ref()
+                .ok_or_else(|| "Audio output is not available".to_owned())
+                .and_then(AudioEngine::begin_streaming_playback)
+            {
+                Ok(writer) => writer,
+                Err(error) => {
+                    self.status = format!("Could not start the chord preview: {error}");
+                    return;
+                }
+            };
+            match prepared.start(writer, device_rate) {
+                Ok(stream) => {
+                    self.pending_vst3_stream = Some(stream);
+                    self.playing = true;
+                    self.project_playback_loaded = true;
+                    self.status = format!(
+                        "Auditioning {} at C5 on channel {channel_id}",
+                        self.piano_roll_chord_stamp.label()
+                    );
+                }
+                Err(error) => {
+                    self.stop_project_playback();
+                    self.status = format!("Could not start the chord preview: {error}");
+                }
+            }
+            return;
+        }
+
+        let Some((project_path, project_bytes)) = sampler_project else {
+            self.status = "Could not prepare the Sampler chord preview".to_owned();
+            return;
+        };
+        let writer = match self
+            .audio_engine
+            .as_ref()
+            .ok_or_else(|| "Audio output is not available".to_owned())
+            .and_then(AudioEngine::begin_streaming_playback)
+        {
+            Ok(writer) => writer,
+            Err(error) => {
+                self.status = format!("Could not start the Sampler chord preview: {error}");
+                return;
+            }
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let read_sample_root_note = self.read_sample_root_note;
+        let resampling_quality = self.live_resampling_quality;
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name("sampler-chord-preview".to_owned())
+            .spawn(move || {
+                let result = FlpDocument::parse(&project_bytes)
+                    .map_err(|error| error.to_string())
+                    .and_then(|document| {
+                        stream_sampler_pattern_to_device(
+                            &document,
+                            &project_path,
+                            SamplerPatternRenderOptions {
+                                pattern_id,
+                                sample_rate: device_rate,
+                                resampling_quality,
+                                read_sample_root_note,
+                                ..SamplerPatternRenderOptions::default()
+                            },
+                            &writer,
+                            &worker_cancelled,
+                        )
+                    });
+                writer.finish();
+                let _ = sender.send(result);
+            });
+        match worker {
+            Ok(worker) => {
+                self.pending_sampler_stream = Some(PendingSamplerStream {
+                    receiver,
+                    cancelled,
+                    worker,
+                });
+                self.playing = true;
+                self.project_playback_loaded = true;
+                self.status = format!(
+                    "Auditioning {} at C5 on channel {channel_id}",
+                    self.piano_roll_chord_stamp.label()
+                );
+            }
+            Err(error) => {
+                self.stop_project_playback();
+                self.status = format!("Could not start the Sampler chord preview: {error}");
+            }
         }
     }
 
