@@ -2417,6 +2417,7 @@ struct PianoRollDrawDrag {
     start: egui::Pos2,
     current: egui::Pos2,
     kind: PianoRollDrawDragKind,
+    unsnapped: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -19246,7 +19247,7 @@ impl DawUi {
                     "Draw",
                 )
                 .on_hover_text(
-                    "Click to add; drag to reposition; Shift-drag length; right-click to erase (P)",
+                    "Click to add; drag to move; Shift-drag for length; Alt bypasses snap; right-click erases (P)",
                 )
                 .clicked()
             {
@@ -24751,6 +24752,7 @@ impl DawUi {
                     } else {
                         PianoRollDrawDragKind::Move
                     },
+                    unsnapped: scroll_modifiers.alt,
                 });
             }
             if let Some(mut drag) = self
@@ -24763,10 +24765,12 @@ impl DawUi {
                         pointer.y.clamp(grid_body_rect.top(), grid_body_rect.bottom()),
                     );
                 }
-                if let Some(mut note) = note_from_grid_position(
+                let draw_snap_ticks = if drag.unsnapped { 0 } else { snap_ticks };
+                if let Some(mut note) = note_from_grid_position_with_snap(
                     drag.start,
                     grid_geometry,
                     drag.channel_id,
+                    draw_snap_ticks,
                 ) {
                     match drag.kind {
                         PianoRollDrawDragKind::Length => {
@@ -24774,18 +24778,18 @@ impl DawUi {
                                 drag.current.x,
                                 grid_rect.left() + keyboard_width,
                                 tick_scale,
-                                snap_ticks,
+                                draw_snap_ticks,
                             );
                             note.length = end_tick
                                 .saturating_sub(note.position)
-                                .max(snap_ticks.max(1));
+                                .max(draw_snap_ticks.max(1));
                         }
                         PianoRollDrawDragKind::Move => {
                             let tick_delta =
                                 ((drag.current.x - drag.start.x) / tick_scale).round() as i64;
                             note.position = snap_note_tick(
                                 i64::from(note.position).saturating_add(tick_delta),
-                                snap_ticks,
+                                draw_snap_ticks,
                                 0,
                             );
                             let semitones =
@@ -25185,6 +25189,7 @@ impl DawUi {
                     notes_to_add.push(note);
                 }
             }
+            let draw_snap_ticks = if modifiers.alt { 0 } else { snap_ticks };
             if !self.piano_roll_paint_mode
                 && !self.piano_roll_stamp_mode
                 && !self.piano_roll_select_mode
@@ -25203,7 +25208,12 @@ impl DawUi {
                 && !note_rects
                     .iter()
                     .any(|note_rect| note_rect.contains(pointer))
-                && let Some(note) = note_from_grid_position(pointer, grid_geometry, channel_id)
+                && let Some(note) = note_from_grid_position_with_snap(
+                    pointer,
+                    grid_geometry,
+                    channel_id,
+                    draw_snap_ticks,
+                )
             {
                 notes_to_add.push(note);
             }
@@ -35963,6 +35973,16 @@ fn note_from_grid_position(
     grid: PianoRollGrid,
     channel_id: u16,
 ) -> Option<PatternNote> {
+    let snap_ticks = grid.snap_ticks;
+    note_from_grid_position_with_snap(pointer, grid, channel_id, snap_ticks)
+}
+
+fn note_from_grid_position_with_snap(
+    pointer: egui::Pos2,
+    grid: PianoRollGrid,
+    channel_id: u16,
+    snap_ticks: u32,
+) -> Option<PatternNote> {
     let grid_left = grid.rect.left() + grid.keyboard_width;
     if !grid.rect.contains(pointer)
         || pointer.x < grid_left
@@ -35978,7 +35998,7 @@ fn note_from_grid_position(
         .saturating_sub(row)
         .clamp(grid.key_low, grid.key_high);
     Some(PatternNote {
-        position: snap_note_tick(ticks_from_start, grid.snap_ticks, 0),
+        position: snap_note_tick(ticks_from_start, snap_ticks, 0),
         channel_id,
         length: u32::from(grid.ppq).max(1),
         key,
