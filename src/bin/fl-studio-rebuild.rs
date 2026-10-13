@@ -14317,7 +14317,7 @@ impl DawUi {
                                         && performance_clip_supported;
                                     let launch_button = ui.add_enabled(
                                         can_launch_performance_clip,
-                                        egui::Button::new("Launch with track sync"),
+                                        egui::Button::new("Launch with track settings"),
                                     );
                                     if launch_button
                                         .on_disabled_hover_text(if !self.performance_mode_active {
@@ -14327,7 +14327,7 @@ impl DawUi {
                                         {
                                             "Start Performance Mode playback before launching a clip."
                                         } else {
-                                            "Uses this Playlist track's saved Trigger Sync setting. Requires a supported, unmuted Audio Clip before Start; all non-muted media clips on its track must also be supported."
+                                            "Uses this Playlist track's saved Trigger Sync, Tolerant, and Position Sync settings. Requires a supported, unmuted Audio Clip before Start; all non-muted media clips on its track must also be supported."
                                         })
                                         .clicked()
                                     {
@@ -14359,7 +14359,7 @@ impl DawUi {
                         && performance_clip_supported;
                     let launch_button = ui.add_enabled(
                         can_launch_performance_clip,
-                        egui::Button::new("Launch with track sync"),
+                        egui::Button::new("Launch with track settings"),
                     );
                     if launch_button
                         .on_disabled_hover_text(if !self.performance_mode_active {
@@ -14367,7 +14367,7 @@ impl DawUi {
                         } else if !self.playing || self.performance_launch_sender.is_none() {
                             "Start Performance Mode playback before launching a clip."
                         } else {
-                            "Uses this Playlist track's saved Trigger Sync setting. Requires a supported, unmuted Pattern Clip before Start, using enabled Sampler channels, default scale, and no Pattern controllers; all non-muted media clips on its track must also be supported."
+                            "Uses this Playlist track's saved Trigger Sync, Tolerant, and Position Sync settings. Requires a supported, unmuted Pattern Clip before Start, using enabled Sampler channels, default scale, and no Pattern controllers; all non-muted media clips on its track must also be supported."
                         })
                         .clicked()
                     {
@@ -15171,23 +15171,23 @@ impl DawUi {
                 .get(clip_index)
                 .map(|clip| clip.length_ticks)
                 .unwrap_or(0);
-            let clip_trigger_sync = arrangement
+            let clip_source_start_tick = arrangement
                 .clips
                 .get(clip_index)
-                .and_then(|clip| clip.playlist_track_id())
-                .and_then(|track_id| {
-                    tracks
-                        .iter()
-                        .find(|track| track.id == track_id)
-                        .and_then(|track| track.trigger_sync)
-                });
-            let clip_tolerant = arrangement
+                .map(|clip| clip.position_ticks)
+                .unwrap_or(0);
+            let clip_track_id = arrangement
                 .clips
                 .get(clip_index)
-                .and_then(|clip| clip.playlist_track_id())
-                .and_then(|track_id| tracks.iter().find(|track| track.id == track_id))
-                .and_then(|track| track.tolerant)
-                .unwrap_or(true);
+                .and_then(|clip| clip.playlist_track_id());
+            let clip_track =
+                clip_track_id.and_then(|track_id| tracks.iter().find(|track| track.id == track_id));
+            let clip_trigger_sync = clip_track.and_then(|track| track.trigger_sync);
+            let clip_position_sync = clip_track.and_then(|track| track.position_sync);
+            let clip_position_sync_label = clip_position_sync
+                .map(playlist_track_sync_label)
+                .unwrap_or("Off");
+            let clip_tolerant = clip_track.and_then(|track| track.tolerant).unwrap_or(true);
             let launch_position = self
                 .audio_engine
                 .as_ref()
@@ -15224,19 +15224,29 @@ impl DawUi {
                     let target_frame = tempo_map
                         .frame_at_tick(u64::from(target_tick), sample_rate)
                         .ok()?;
-                    Some((target_tick, target_frame))
+                    let position_offset_ticks = playlist_performance_position_offset_ticks(
+                        target_tick,
+                        clip_source_start_tick,
+                        clip_length_ticks,
+                        ppq,
+                        project_time_signature,
+                        &signature_changes,
+                        clip_position_sync,
+                    );
+                    Some((target_tick, target_frame, position_offset_ticks))
                 });
             match (launch_position, self.performance_launch_sender.as_ref()) {
-                (Some((start_tick, start_frame)), Some(sender)) => {
+                (Some((start_tick, start_frame, position_offset_ticks)), Some(sender)) => {
                     match sender.send(PlaylistPerformanceLaunch {
                         clip_index,
                         start_tick: u64::from(start_tick),
                         start_frame,
+                        position_offset_ticks,
                     }) {
                         Ok(()) => {
                             self.status = format!(
-                                "Queued Playlist Clip {} for tick {start_tick} using its track sync",
-                                clip_index + 1
+                                "Queued Playlist Clip {} for tick {start_tick} with Position Sync {clip_position_sync_label}",
+                                clip_index + 1,
                             );
                         }
                         Err(_) => {
@@ -15246,7 +15256,7 @@ impl DawUi {
                     }
                 }
                 _ => {
-                    self.status = "Could not map the Performance Mode trigger-sync boundary".into();
+                    self.status = "Could not map Performance Mode launch timing or position".into();
                 }
             }
         }
@@ -41128,6 +41138,65 @@ fn playlist_performance_trigger_tick(
         target_tick = next_signature_marker;
     }
     u32::try_from(target_tick).ok()
+}
+
+fn playlist_performance_position_offset_ticks(
+    song_tick: u32,
+    clip_start_tick: u32,
+    clip_length_ticks: u32,
+    ppq: u16,
+    initial_time_signature: Option<(u8, u8)>,
+    signature_changes: &[(u32, u8, u8)],
+    position_sync: Option<PlaylistTrackSync>,
+) -> u64 {
+    let clip_length = u64::from(clip_length_ticks);
+    if clip_length == 0 {
+        return 0;
+    }
+    let Some(position_sync) = position_sync else {
+        return 0;
+    };
+    let clip_phase = u64::from(song_tick.saturating_sub(clip_start_tick)) % clip_length;
+    if position_sync == PlaylistTrackSync::Auto {
+        return clip_phase;
+    }
+    let (bar_start_tick, _) =
+        playlist_measure_at_tick(ppq, initial_time_signature, signature_changes, song_tick);
+    let signature =
+        playlist_signature_at_tick(initial_time_signature, signature_changes, song_tick);
+    let (_, denominator) = signature;
+    let bar_ticks = playlist_bar_ticks(ppq, signature);
+    let beat_ticks = playlist_bar_ticks(ppq, (1, denominator));
+    let interval_ticks = match position_sync {
+        PlaylistTrackSync::Off => return 0,
+        PlaylistTrackSync::QuarterBeat => beat_ticks.div_ceil(4),
+        PlaylistTrackSync::HalfBeat => beat_ticks.div_ceil(2),
+        PlaylistTrackSync::Beat => beat_ticks,
+        PlaylistTrackSync::TwoBeats => beat_ticks.saturating_mul(2),
+        PlaylistTrackSync::FourBeats => beat_ticks.saturating_mul(4),
+        PlaylistTrackSync::Auto => unreachable!("Auto is handled above"),
+    }
+    .max(1);
+    let bar_length = bar_ticks.max(1);
+    let phase_in_bar = u64::from(song_tick.saturating_sub(bar_start_tick));
+    let grid_count = bar_length.div_ceil(interval_ticks).max(1);
+    let lower_index = (phase_in_bar / interval_ticks).min(grid_count - 1);
+    let upper_index = (lower_index + 1) % grid_count;
+    let lower_tick = lower_index.saturating_mul(interval_ticks);
+    let upper_tick = upper_index.saturating_mul(interval_ticks);
+    let lower_distance = phase_in_bar.abs_diff(lower_tick);
+    let upper_distance = if upper_tick >= phase_in_bar {
+        upper_tick - phase_in_bar
+    } else {
+        bar_length
+            .saturating_sub(phase_in_bar)
+            .saturating_add(upper_tick)
+    };
+    if upper_distance < lower_distance {
+        upper_tick % clip_length
+    } else {
+        lower_tick % clip_length
+    }
 }
 
 fn playlist_next_bar_tick(

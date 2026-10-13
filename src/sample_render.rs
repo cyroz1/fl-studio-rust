@@ -837,6 +837,8 @@ pub struct PlaylistPerformanceLaunch {
     pub clip_index: usize,
     pub start_tick: u64,
     pub start_frame: u64,
+    /// Playback phase within the source clip, in project ticks.
+    pub position_offset_ticks: u64,
 }
 
 /// Runtime inputs for a Performance Mode Playlist stream.
@@ -5048,6 +5050,7 @@ struct PerformanceSamplerNote {
 struct ActivePerformanceSamplerClip {
     clip_index: usize,
     next_loop_tick: u64,
+    initial_offset_ticks: u64,
 }
 
 #[derive(Clone)]
@@ -5061,6 +5064,7 @@ struct PerformanceAudioClip {
 struct ActivePerformanceAudioClip {
     clip_index: usize,
     next_loop_tick: u64,
+    initial_offset_ticks: u64,
 }
 
 struct PlaylistPerformanceSources<'a> {
@@ -5265,6 +5269,7 @@ impl PlaylistPerformanceRuntime {
                     ActivePerformanceSamplerClip {
                         clip_index: launch.clip_index,
                         next_loop_tick: launch.start_tick,
+                        initial_offset_ticks: launch.position_offset_ticks,
                     },
                 );
             } else {
@@ -5273,6 +5278,7 @@ impl PlaylistPerformanceRuntime {
                     ActivePerformanceAudioClip {
                         clip_index: launch.clip_index,
                         next_loop_tick: launch.start_tick,
+                        initial_offset_ticks: launch.position_offset_ticks,
                     },
                 );
             }
@@ -5288,6 +5294,16 @@ impl PlaylistPerformanceRuntime {
                 .get(&active.clip_index)
                 .ok_or_else(|| "active Performance Mode clip disappeared".to_owned())?;
             loop {
+                let loop_offset_ticks = active.initial_offset_ticks.min(clip.length_ticks);
+                let loop_length_ticks = clip.length_ticks.saturating_sub(loop_offset_ticks);
+                if loop_length_ticks == 0 {
+                    active.initial_offset_ticks = 0;
+                    continue;
+                }
+                let loop_end_tick = active
+                    .next_loop_tick
+                    .checked_add(loop_length_ticks)
+                    .ok_or_else(|| "Performance Mode loop tick overflow".to_owned())?;
                 let loop_frame = self
                     .tempo_map
                     .frame_at_tick(active.next_loop_tick, self.sample_rate)?;
@@ -5295,13 +5311,35 @@ impl PlaylistPerformanceRuntime {
                     break;
                 }
                 for template in &clip.notes {
+                    let (relative_start_tick, relative_stop_tick) = if loop_offset_ticks == 0 {
+                        (template.relative_start_tick, template.relative_stop_tick)
+                    } else if template.relative_start_tick >= loop_offset_ticks {
+                        (
+                            template.relative_start_tick - loop_offset_ticks,
+                            template
+                                .relative_stop_tick
+                                .map(|tick| tick.saturating_sub(loop_offset_ticks)),
+                        )
+                    } else if template
+                        .relative_stop_tick
+                        .is_some_and(|stop| stop > loop_offset_ticks)
+                    {
+                        (
+                            0,
+                            template
+                                .relative_stop_tick
+                                .map(|tick| tick - loop_offset_ticks),
+                        )
+                    } else {
+                        continue;
+                    };
                     let start_tick = active
                         .next_loop_tick
-                        .checked_add(template.relative_start_tick)
+                        .checked_add(relative_start_tick)
                         .ok_or_else(|| "Performance Mode note start tick overflow".to_owned())?;
                     let mut note = template.note;
                     note.start_tick = start_tick;
-                    note.stop_tick = match template.relative_stop_tick {
+                    note.stop_tick = match relative_stop_tick {
                         Some(tick) => {
                             Some(active.next_loop_tick.checked_add(tick).ok_or_else(|| {
                                 "Performance Mode note end tick overflow".to_owned()
@@ -5321,10 +5359,8 @@ impl PlaylistPerformanceRuntime {
                         .transpose()?;
                     queued_notes.push(note);
                 }
-                active.next_loop_tick = active
-                    .next_loop_tick
-                    .checked_add(clip.length_ticks)
-                    .ok_or_else(|| "Performance Mode loop tick overflow".to_owned())?;
+                active.next_loop_tick = loop_end_tick;
+                active.initial_offset_ticks = 0;
             }
         }
         for active in self.active_audio_by_track.values_mut() {
@@ -5334,6 +5370,12 @@ impl PlaylistPerformanceRuntime {
                 .ok_or_else(|| "active Performance Mode Audio Clip disappeared".to_owned())?;
             loop {
                 let loop_start_tick = active.next_loop_tick;
+                let loop_offset_ticks = active.initial_offset_ticks.min(clip.length_ticks);
+                let loop_length_ticks = clip.length_ticks.saturating_sub(loop_offset_ticks);
+                if loop_length_ticks == 0 {
+                    active.initial_offset_ticks = 0;
+                    continue;
+                }
                 let loop_frame = self
                     .tempo_map
                     .frame_at_tick(loop_start_tick, self.sample_rate)?;
@@ -5341,20 +5383,43 @@ impl PlaylistPerformanceRuntime {
                     break;
                 }
                 let loop_end_tick = loop_start_tick
-                    .checked_add(clip.length_ticks)
+                    .checked_add(loop_length_ticks)
                     .ok_or_else(|| "Performance Mode audio loop tick overflow".to_owned())?;
                 let loop_end_frame = self
                     .tempo_map
                     .frame_at_tick(loop_end_tick, self.sample_rate)?;
                 let timeline_duration_frames = loop_end_frame.saturating_sub(loop_frame);
-                let duration_frames = clip.source_duration_frames.min(timeline_duration_frames);
+                let source_offset_output_frames = (u128::from(clip.source_duration_frames)
+                    * u128::from(loop_offset_ticks)
+                    / u128::from(clip.length_ticks))
+                .min(u128::from(u64::MAX)) as u64;
+                let duration_frames = clip
+                    .source_duration_frames
+                    .saturating_sub(source_offset_output_frames)
+                    .min(timeline_duration_frames);
                 if duration_frames > 0 {
                     let mut playback = clip.template.clone();
                     playback.start_frame = loop_frame;
                     playback.duration_frames = duration_frames;
+                    if loop_offset_ticks > 0 {
+                        let source_frames = playback
+                            .source_bounds
+                            .end
+                            .saturating_sub(playback.source_bounds.start);
+                        let source_offset_frames =
+                            (u128::from(source_frames as u64) * u128::from(loop_offset_ticks)
+                                / u128::from(clip.length_ticks))
+                            .min(u128::from(usize::MAX)) as usize;
+                        playback.source_bounds.start = playback
+                            .source_bounds
+                            .start
+                            .saturating_add(source_offset_frames)
+                            .min(playback.source_bounds.end.saturating_sub(1));
+                    }
                     self.active_audio_playbacks.push(playback);
                 }
                 active.next_loop_tick = loop_end_tick;
+                active.initial_offset_ticks = 0;
             }
         }
         self.active_audio_playbacks
