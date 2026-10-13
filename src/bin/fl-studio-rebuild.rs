@@ -3313,7 +3313,9 @@ struct DawUi {
     midi_activity: Option<(String, Instant)>,
     midi_input_channel_state: [MidiInputChannelState; 16],
     midi_input_thru_output: bool,
+    midi_input_thru_snap_to_scale: bool,
     midi_input_thru_notes: BTreeMap<(u8, u8), u8>,
+    midi_input_thru_note_mapping: BTreeMap<(u8, u8), VecDeque<u8>>,
     midi_input_thru_sustain_channels: BTreeSet<u8>,
     midi_output_gain_mapping: Option<MidiControlChangeMapping>,
     midi_controller_templates: Vec<MidiControllerTemplate>,
@@ -3952,7 +3954,9 @@ impl DawUi {
             midi_activity: None,
             midi_input_channel_state: [MidiInputChannelState::default(); 16],
             midi_input_thru_output: false,
+            midi_input_thru_snap_to_scale: false,
             midi_input_thru_notes: BTreeMap::new(),
+            midi_input_thru_note_mapping: BTreeMap::new(),
             midi_input_thru_sustain_channels: BTreeSet::new(),
             midi_output_gain_mapping,
             midi_controller_templates,
@@ -29875,6 +29879,7 @@ impl DawUi {
     fn stop_midi_input_thru(&mut self) {
         self.midi_input_thru_output = false;
         let active_notes = std::mem::take(&mut self.midi_input_thru_notes);
+        self.midi_input_thru_note_mapping.clear();
         let sustain_channels = std::mem::take(&mut self.midi_input_thru_sustain_channels);
         let Some(connection) = self.midi_output_connection.as_mut() else {
             return;
@@ -29895,7 +29900,48 @@ impl DawUi {
         if !self.midi_input_thru_output {
             return;
         }
-        let Some((bytes, length)) = midi_input_thru_message(event) else {
+        let mut output_event = event;
+        match event {
+            MidiInputEvent::NoteOn {
+                channel,
+                key,
+                velocity,
+            } if self.midi_input_thru_snap_to_scale
+                && self.piano_roll_scale != PianoRollScale::None =>
+            {
+                let output_key = snap_piano_roll_key_to_scale(
+                    u16::from(key),
+                    self.piano_roll_scale,
+                    self.piano_roll_scale_root,
+                    0,
+                    127,
+                ) as u8;
+                output_event = MidiInputEvent::NoteOn {
+                    channel,
+                    key: output_key,
+                    velocity,
+                };
+            }
+            MidiInputEvent::NoteOff {
+                channel,
+                key,
+                velocity,
+            } => {
+                let output_key = self
+                    .midi_input_thru_note_mapping
+                    .get(&(channel & 0x0F, key.min(127)))
+                    .and_then(VecDeque::front)
+                    .copied()
+                    .unwrap_or(key);
+                output_event = MidiInputEvent::NoteOff {
+                    channel,
+                    key: output_key,
+                    velocity,
+                };
+            }
+            _ => {}
+        }
+        let Some((bytes, length)) = midi_input_thru_message(output_event) else {
             return;
         };
         let result = self
@@ -29914,16 +29960,44 @@ impl DawUi {
                 return;
             }
         }
-        match event {
-            MidiInputEvent::NoteOn { channel, key, .. } => {
+        match (event, output_event) {
+            (
+                MidiInputEvent::NoteOn { channel, key, .. },
+                MidiInputEvent::NoteOn {
+                    key: output_key, ..
+                },
+            ) => {
                 let count = self
                     .midi_input_thru_notes
-                    .entry((channel & 0x0F, key.min(127)))
+                    .entry((channel & 0x0F, output_key.min(127)))
                     .or_default();
                 *count = count.saturating_add(1).min(MIDI_THRU_NOTE_STACK_LIMIT);
+                let mapping = self
+                    .midi_input_thru_note_mapping
+                    .entry((channel & 0x0F, key.min(127)))
+                    .or_default();
+                if mapping.len() < usize::from(MIDI_THRU_NOTE_STACK_LIMIT) {
+                    mapping.push_back(output_key);
+                }
             }
-            MidiInputEvent::NoteOff { channel, key, .. } => {
-                let note = (channel & 0x0F, key.min(127));
+            (
+                MidiInputEvent::NoteOff { channel, key, .. },
+                MidiInputEvent::NoteOff {
+                    key: output_key, ..
+                },
+            ) => {
+                let source_note = (channel & 0x0F, key.min(127));
+                let remove_mapping = self
+                    .midi_input_thru_note_mapping
+                    .get_mut(&source_note)
+                    .is_some_and(|mapping| {
+                        mapping.pop_front();
+                        mapping.is_empty()
+                    });
+                if remove_mapping {
+                    self.midi_input_thru_note_mapping.remove(&source_note);
+                }
+                let note = (channel & 0x0F, output_key.min(127));
                 let remove = self
                     .midi_input_thru_notes
                     .get_mut(&note)
@@ -29939,11 +30013,14 @@ impl DawUi {
                     self.midi_input_thru_notes.remove(&note);
                 }
             }
-            MidiInputEvent::ControlChange {
-                channel,
-                controller: 64,
-                value,
-            } => {
+            (
+                MidiInputEvent::ControlChange {
+                    channel,
+                    controller: 64,
+                    value,
+                },
+                _,
+            ) => {
                 let channel = channel & 0x0F;
                 if value >= 64 {
                     self.midi_input_thru_sustain_channels.insert(channel);
@@ -30569,6 +30646,24 @@ impl DawUi {
             )
             .color(MUTED),
         );
+        ui.add_enabled_ui(
+            midi_input_thru_available
+                && self.midi_input_thru_output
+                && self.piano_roll_scale != PianoRollScale::None,
+            |ui| {
+                ui.checkbox(
+                    &mut self.midi_input_thru_snap_to_scale,
+                    "Snap MIDI Thru notes to the selected Piano roll scale",
+                );
+            },
+        );
+        if self.midi_input_thru_snap_to_scale && self.piano_roll_scale != PianoRollScale::None {
+            ui.small(format!(
+                "Using {} {} for incoming notes.",
+                PITCH_CLASSES[usize::from(self.piano_roll_scale_root)],
+                self.piano_roll_scale.label()
+            ));
+        }
         let dropped = self.midi_dropped_messages.load(Ordering::Relaxed);
         if dropped > 0 {
             ui.label(
