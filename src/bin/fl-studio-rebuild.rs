@@ -13753,6 +13753,37 @@ impl DawUi {
         }
     }
 
+    fn select_all_playlist_clips(&mut self) {
+        let selection = self
+            .document
+            .as_ref()
+            .and_then(|document| document.arrangements().ok())
+            .and_then(|arrangements| {
+                self.selected_arrangement
+                    .and_then(|arrangement_id| {
+                        arrangements
+                            .iter()
+                            .find(|arrangement| arrangement.id == arrangement_id)
+                    })
+                    .or_else(|| arrangements.first())
+                    .map(|arrangement| (arrangement.id, arrangement.clips.len()))
+            });
+        let Some((arrangement_id, clip_count)) = selection else {
+            self.status = "No Playlist arrangement is available to select".to_owned();
+            return;
+        };
+
+        self.selected_arrangement = Some(arrangement_id);
+        self.selected_playlist_clips = (0..clip_count).collect();
+        self.selected_clip = (clip_count > 0).then_some(0);
+        self.playlist_selection_anchor = self.selected_clip;
+        self.status = if clip_count == 0 {
+            "The Playlist arrangement has no clips to select".to_owned()
+        } else {
+            format!("Selected all {clip_count} Playlist clips")
+        };
+    }
+
     fn set_playlist_track_selection(&mut self, track_id: u32, extend: bool, toggle: bool) {
         if extend {
             let anchor = self
@@ -29221,6 +29252,7 @@ impl eframe::App for DawUi {
             cut_playlist_clip_requested,
             paste_playlist_clip_requested,
             merge_playlist_pattern_clips_requested,
+            select_all_playlist_clips_requested,
         ) = if playlist_clip_shortcuts_enabled {
             ui.input_mut(|input| {
                 (
@@ -29228,10 +29260,11 @@ impl eframe::App for DawUi {
                     input.consume_key(egui::Modifiers::COMMAND, egui::Key::X),
                     input.consume_key(egui::Modifiers::COMMAND, egui::Key::V),
                     input.consume_key(egui::Modifiers::COMMAND, egui::Key::G),
+                    input.consume_key(egui::Modifiers::COMMAND, egui::Key::A),
                 )
             })
         } else {
-            (false, false, false, false)
+            (false, false, false, false, false)
         };
         if copy_playlist_clip_requested {
             self.copy_selected_playlist_clip();
@@ -29242,6 +29275,9 @@ impl eframe::App for DawUi {
         }
         if merge_playlist_pattern_clips_requested {
             self.merge_selected_playlist_pattern_clips();
+        }
+        if select_all_playlist_clips_requested {
+            self.select_all_playlist_clips();
         }
         let delete_playlist_clip_requested = self.view == MainView::Playlist
             && self.selected_clip.is_some()
