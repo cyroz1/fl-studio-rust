@@ -53,9 +53,9 @@ use flp_rebuild::{
     MixerParameterRecord, PATTERN_NOTE_DEFAULT_FLAGS, PATTERN_NOTE_DEFAULT_RELEASE, Pattern,
     PatternController, PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation,
     PayloadEncoding, PlaylistClip, PlaylistClipEdit, PlaylistClipSelectionClipboard,
-    PlaylistClipTarget, PlaylistTrack, PlaylistTrackEdit, ProjectInfoEdit, ProjectSettingsEdit,
-    RandomizerOptions, RiffMachineOptions, RiffMachineQuantizeMode, ScaleLevelsOptions, TimeMarker,
-    TimeMarkerEdit, VstPluginStateMetadata,
+    PlaylistClipTarget, PlaylistTrack, PlaylistTrackEdit, PlaylistTrackSync, ProjectInfoEdit,
+    ProjectSettingsEdit, RandomizerOptions, RiffMachineOptions, RiffMachineQuantizeMode,
+    ScaleLevelsOptions, TimeMarker, TimeMarkerEdit, VstPluginStateMetadata,
 };
 use md5::{Digest, Md5};
 
@@ -12344,6 +12344,11 @@ impl DawUi {
             empty_view(ui, "This project has no decoded Playlist arrangement");
             return;
         };
+        let performance_tracks = self
+            .document
+            .as_ref()
+            .map(|document| document.playlist_tracks_in_arrangement(arrangement.id))
+            .unwrap_or_default();
         let signature_changes = arrangement
             .time_markers
             .iter()
@@ -14203,7 +14208,7 @@ impl DawUi {
                                         && performance_clip_supported;
                                     let launch_button = ui.add_enabled(
                                         can_launch_performance_clip,
-                                        egui::Button::new("Launch at next bar"),
+                                        egui::Button::new("Launch with track sync"),
                                     );
                                     if launch_button
                                         .on_disabled_hover_text(if !self.performance_mode_active {
@@ -14213,7 +14218,7 @@ impl DawUi {
                                         {
                                             "Start Performance Mode playback before launching a clip."
                                         } else {
-                                            "Requires an enabled sample-backed Audio Clip with decoded default scale before Start; all non-muted media clips on its Playlist track must also be supported."
+                                            "Uses this Playlist track's saved Trigger Sync setting. Requires a supported, unmuted Audio Clip before Start; all non-muted media clips on its track must also be supported."
                                         })
                                         .clicked()
                                     {
@@ -14245,7 +14250,7 @@ impl DawUi {
                         && performance_clip_supported;
                     let launch_button = ui.add_enabled(
                         can_launch_performance_clip,
-                        egui::Button::new("Launch at next bar"),
+                        egui::Button::new("Launch with track sync"),
                     );
                     if launch_button
                         .on_disabled_hover_text(if !self.performance_mode_active {
@@ -14253,7 +14258,7 @@ impl DawUi {
                         } else if !self.playing || self.performance_launch_sender.is_none() {
                             "Start Performance Mode playback before launching a clip."
                         } else {
-                            "Requires a supported, unmuted Pattern Clip before Start, using enabled Sampler channels, default scale, and no Pattern controllers; all non-muted media clips on its Playlist track must also be supported."
+                            "Uses this Playlist track's saved Trigger Sync setting. Requires a supported, unmuted Pattern Clip before Start, using enabled Sampler channels, default scale, and no Pattern controllers; all non-muted media clips on its track must also be supported."
                         })
                         .clicked()
                     {
@@ -15052,6 +15057,21 @@ impl DawUi {
         }
 
         if let Some(clip_index) = performance_clip_launch_requested {
+            let clip_length_ticks = arrangement
+                .clips
+                .get(clip_index)
+                .map(|clip| clip.length_ticks)
+                .unwrap_or(0);
+            let clip_trigger_sync = arrangement
+                .clips
+                .get(clip_index)
+                .and_then(|clip| clip.playlist_track_id())
+                .and_then(|track_id| {
+                    performance_tracks
+                        .iter()
+                        .find(|track| track.id == track_id)
+                        .and_then(|track| track.trigger_sync)
+                });
             let launch_position = self
                 .audio_engine
                 .as_ref()
@@ -15062,11 +15082,13 @@ impl DawUi {
                         .project_playback_position_frames()
                         .saturating_add(u64::from(sample_rate) / 8);
                     let tick = tempo_map.tick_at_frame(safe_device_frame, sample_rate)?;
-                    let target_tick = playlist_next_bar_tick(
+                    let target_tick = playlist_performance_trigger_tick(
                         tick,
                         ppq,
                         project_time_signature,
                         &signature_changes,
+                        clip_trigger_sync,
+                        clip_length_ticks,
                     )?;
                     let target_frame = tempo_map
                         .frame_at_tick(u64::from(target_tick), sample_rate)
@@ -15082,7 +15104,7 @@ impl DawUi {
                     }) {
                         Ok(()) => {
                             self.status = format!(
-                                "Queued Pattern Clip {} for the next bar at tick {start_tick}",
+                                "Queued Playlist Clip {} for tick {start_tick} using its track sync",
                                 clip_index + 1
                             );
                         }
@@ -15093,7 +15115,7 @@ impl DawUi {
                     }
                 }
                 _ => {
-                    self.status = "Could not map the next Performance Mode bar boundary".into();
+                    self.status = "Could not map the Performance Mode trigger-sync boundary".into();
                 }
             }
         }
@@ -40893,6 +40915,63 @@ fn playlist_performance_zone_start_tick(markers: &[TimeMarker]) -> Option<u32> {
         .min()
 }
 
+fn playlist_performance_trigger_tick(
+    tick: f64,
+    ppq: u16,
+    initial_time_signature: Option<(u8, u8)>,
+    signature_changes: &[(u32, u8, u8)],
+    trigger_sync: Option<PlaylistTrackSync>,
+    clip_length_ticks: u32,
+) -> Option<u32> {
+    let Some(trigger_sync) = trigger_sync else {
+        return playlist_next_bar_tick(tick, ppq, initial_time_signature, signature_changes);
+    };
+    if !tick.is_finite() || tick < 0.0 || tick > f64::from(u32::MAX) {
+        return None;
+    }
+    let current_tick = tick.floor() as u32;
+    let safe_tick = tick.ceil() as u64;
+    if trigger_sync == PlaylistTrackSync::Off {
+        return u32::try_from(safe_tick).ok();
+    }
+
+    let (_, denominator) =
+        playlist_signature_at_tick(initial_time_signature, signature_changes, current_tick);
+    let beat_ticks = playlist_bar_ticks(ppq, (1, denominator));
+    let four_beats = beat_ticks.saturating_mul(4).max(1);
+    let interval_ticks = match trigger_sync {
+        PlaylistTrackSync::Off => 1,
+        PlaylistTrackSync::QuarterBeat => beat_ticks.div_ceil(4),
+        PlaylistTrackSync::HalfBeat => beat_ticks.div_ceil(2),
+        PlaylistTrackSync::Beat => beat_ticks,
+        PlaylistTrackSync::TwoBeats => beat_ticks.saturating_mul(2),
+        PlaylistTrackSync::FourBeats => four_beats,
+        PlaylistTrackSync::Auto => u64::from(clip_length_ticks).min(four_beats).max(1),
+    }
+    .max(1);
+    let phase_start = signature_changes
+        .iter()
+        .filter(|(position, _, _)| *position <= current_tick)
+        .map(|(position, _, _)| u64::from(*position))
+        .max()
+        .unwrap_or(0);
+    let elapsed = safe_tick.saturating_sub(phase_start);
+    let intervals = elapsed.div_ceil(interval_ticks);
+    let mut target_tick = phase_start.saturating_add(intervals.saturating_mul(interval_ticks));
+    if target_tick < safe_tick {
+        target_tick = target_tick.saturating_add(interval_ticks);
+    }
+    if let Some(next_signature_marker) = signature_changes
+        .iter()
+        .map(|(position, _, _)| u64::from(*position))
+        .filter(|position| *position > u64::from(current_tick) && *position < target_tick)
+        .min()
+    {
+        target_tick = next_signature_marker;
+    }
+    u32::try_from(target_tick).ok()
+}
+
 fn playlist_next_bar_tick(
     tick: f64,
     ppq: u16,
@@ -43576,6 +43655,7 @@ mod tests {
                 name: None,
                 enabled: Some(true),
                 grouped: Some(matches!(id, 2 | 3)),
+                trigger_sync: None,
                 state_bytes: vec![0; 70],
             })
             .collect::<Vec<_>>();

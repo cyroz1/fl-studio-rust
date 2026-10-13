@@ -1746,6 +1746,32 @@ fn scale_note_level(level: u8, options: ScaleLevelsOptions) -> u8 {
         .clamp(0.0, 127.0) as u8
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlaylistTrackSync {
+    Off,
+    QuarterBeat,
+    HalfBeat,
+    Beat,
+    TwoBeats,
+    FourBeats,
+    Auto,
+}
+
+impl PlaylistTrackSync {
+    fn from_raw(value: i32) -> Option<Self> {
+        match value {
+            0 => Some(Self::Off),
+            1 => Some(Self::QuarterBeat),
+            2 => Some(Self::HalfBeat),
+            3 => Some(Self::Beat),
+            4 => Some(Self::TwoBeats),
+            5 => Some(Self::FourBeats),
+            6 => Some(Self::Auto),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlaylistTrack {
     /// One-based Playlist track identifier stored in the `0xEE` record.
@@ -1757,6 +1783,8 @@ pub struct PlaylistTrack {
     pub enabled: Option<bool>,
     /// Whether this track is grouped with the Playlist track directly above it.
     pub grouped: Option<bool>,
+    /// Trigger timing for Performance Mode clips on this track.
+    pub trigger_sync: Option<PlaylistTrackSync>,
     /// Raw 70-byte `0xEE` state payload.
     pub state_bytes: Vec<u8>,
 }
@@ -5225,48 +5253,85 @@ impl FlpDocument {
 
     /// Returns Playlist tracks from the observed `0xEE`, `0x2B`, `0xEF` event sequence.
     pub fn playlist_tracks(&self) -> Vec<PlaylistTrack> {
-        let mut tracks = Vec::new();
-        for (event_index, event) in self.events.iter().enumerate() {
-            if event.opcode != 0xEE || event.payload.len() != 70 {
-                continue;
-            }
-            let id = u32::from_le_bytes([
-                event.payload[0],
-                event.payload[1],
-                event.payload[2],
-                event.payload[3],
-            ]);
-            let next_event = self.events.get(event_index + 1);
-            let state_byte = next_event
-                .filter(|next| next.opcode == 0x2B && next.payload.len() == 1)
-                .map(|next| next.payload[0]);
-            let name_event_index = event_index + if state_byte.is_some() { 2 } else { 1 };
-            let name = self
-                .events
-                .get(name_event_index)
-                .filter(|name_event| name_event.opcode == 0xEF)
-                .and_then(|name_event| {
-                    decode_project_string(&name_event.payload, self.project_version.as_deref())
-                })
-                .filter(|value| !value.is_empty());
-            tracks.push(PlaylistTrack {
-                id,
-                state_byte,
-                name,
-                enabled: match event.payload[12] {
-                    0 => Some(false),
-                    1 => Some(true),
-                    _ => None,
-                },
-                grouped: match event.payload[46] {
-                    0 => Some(false),
-                    1 => Some(true),
-                    _ => None,
-                },
-                state_bytes: event.payload.clone(),
-            });
+        self.events
+            .iter()
+            .enumerate()
+            .filter_map(|(event_index, _)| self.playlist_track_at(event_index, self.events.len()))
+            .collect()
+    }
+
+    /// Returns Playlist tracks from one arrangement's track-state block.
+    /// Projects without arrangement markers have one implicit arrangement (ID 0).
+    pub fn playlist_tracks_in_arrangement(&self, arrangement_id: u16) -> Vec<PlaylistTrack> {
+        let has_arrangement_markers = self
+            .events
+            .iter()
+            .any(|event| event.opcode == 0x63 && event.payload.len() == 2);
+        if !has_arrangement_markers {
+            return if arrangement_id == 0 {
+                self.playlist_tracks()
+            } else {
+                Vec::new()
+            };
         }
-        tracks
+
+        let Some(marker_index) = self.events.iter().position(|event| {
+            event.opcode == 0x63
+                && event.payload.len() == 2
+                && u16::from_le_bytes([event.payload[0], event.payload[1]]) == arrangement_id
+        }) else {
+            return Vec::new();
+        };
+        let start = marker_index + 1;
+        let end = self.events[start..]
+            .iter()
+            .position(|event| {
+                event.opcode == 0x62 || (event.opcode == 0x63 && event.payload.len() == 2)
+            })
+            .map_or(self.events.len(), |offset| start + offset);
+
+        (start..end)
+            .filter_map(|event_index| self.playlist_track_at(event_index, end))
+            .collect()
+    }
+
+    fn playlist_track_at(&self, event_index: usize, region_end: usize) -> Option<PlaylistTrack> {
+        let event = self.events.get(event_index)?;
+        if event.opcode != 0xEE || event.payload.len() != 70 {
+            return None;
+        }
+        let id = u32::from_le_bytes(event.payload[..4].try_into().ok()?);
+        let next_event = self.events.get(event_index + 1);
+        let state_byte = next_event
+            .filter(|next| next.opcode == 0x2B && next.payload.len() == 1)
+            .map(|next| next.payload[0]);
+        let name_event_index = event_index + if state_byte.is_some() { 2 } else { 1 };
+        let name = (name_event_index < region_end)
+            .then(|| self.events.get(name_event_index))
+            .flatten()
+            .filter(|name_event| name_event.opcode == 0xEF)
+            .and_then(|name_event| {
+                decode_project_string(&name_event.payload, self.project_version.as_deref())
+            })
+            .filter(|value| !value.is_empty());
+        let trigger_sync = i32::from_le_bytes(event.payload[30..34].try_into().ok()?);
+        Some(PlaylistTrack {
+            id,
+            state_byte,
+            name,
+            enabled: match event.payload[12] {
+                0 => Some(false),
+                1 => Some(true),
+                _ => None,
+            },
+            grouped: match event.payload[46] {
+                0 => Some(false),
+                1 => Some(true),
+                _ => None,
+            },
+            trigger_sync: PlaylistTrackSync::from_raw(trigger_sync),
+            state_bytes: event.payload.clone(),
+        })
     }
 
     /// Edits the observed mute and grouping fields of an existing Playlist track in place.
