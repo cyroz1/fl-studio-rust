@@ -11553,6 +11553,7 @@ impl DawUi {
         let mut playlist_clip_vertical_move = None;
         let mut playlist_clip_horizontal_move = None;
         let mut selected_track_bulk_action = None;
+        let mut selected_track_bulk_group_action = None;
         let selected_track_count = self.selected_playlist_tracks.len();
         let has_track_selection = selected_track_count > 0;
         let selected_track_ids = self
@@ -11647,6 +11648,37 @@ impl DawUi {
                                 )
                             },
                         ));
+                        ui.close();
+                    }
+                    let can_group_selected = selected_track_ids.iter().any(|track_id| {
+                        *track_id > 1
+                            && tracks.iter().any(|track| {
+                                track.id == *track_id && track.grouped.is_some()
+                            })
+                    });
+                    if ui
+                        .add_enabled(
+                            can_group_selected,
+                            egui::Button::new("Group selected with above"),
+                        )
+                        .clicked()
+                    {
+                        selected_track_bulk_group_action = Some(true);
+                        ui.close();
+                    }
+                    let can_ungroup_selected = selected_track_ids.iter().any(|track_id| {
+                        tracks.iter().any(|track| {
+                            track.id == *track_id && track.grouped == Some(true)
+                        })
+                    });
+                    if ui
+                        .add_enabled(
+                            can_ungroup_selected,
+                            egui::Button::new("Ungroup selected"),
+                        )
+                        .clicked()
+                    {
+                        selected_track_bulk_group_action = Some(false);
                         ui.close();
                     }
                     ui.separator();
@@ -13354,6 +13386,77 @@ impl DawUi {
                 if enabled { "Unmuted" } else { "Muted" },
                 selected_track_ids.len()
             );
+        }
+
+        if let Some(grouped) = selected_track_bulk_group_action {
+            let groupable_track_ids = selected_track_ids
+                .iter()
+                .copied()
+                .filter(|track_id| !grouped || *track_id > 1)
+                .filter(|track_id| {
+                    tracks.iter().any(|track| {
+                        track.id == *track_id
+                            && track.grouped.is_some_and(|current| current != grouped)
+                    })
+                })
+                .collect::<Vec<_>>();
+            if groupable_track_ids.is_empty() {
+                self.status = if grouped {
+                    "No selected Playlist tracks can be grouped with the track above".to_owned()
+                } else {
+                    "No selected Playlist tracks are grouped with the track above".to_owned()
+                };
+            } else {
+                let result = self.document.as_ref().map(|document| {
+                    let mut updated = document.clone();
+                    for track_id in &groupable_track_ids {
+                        updated
+                            .edit_playlist_track(
+                                *track_id,
+                                PlaylistTrackEdit {
+                                    grouped: Some(grouped),
+                                    ..PlaylistTrackEdit::default()
+                                },
+                            )
+                            .map_err(|error| error.to_string())?;
+                    }
+                    Ok::<_, String>(updated)
+                });
+                match result {
+                    Some(Ok(updated)) => {
+                        self.document = Some(updated);
+                        self.dirty = true;
+                        ui.ctx().request_repaint();
+                        self.status = if grouped {
+                            format!(
+                                "Grouped {} selected Playlist {} with above",
+                                groupable_track_ids.len(),
+                                if groupable_track_ids.len() == 1 {
+                                    "track"
+                                } else {
+                                    "tracks"
+                                }
+                            )
+                        } else {
+                            format!(
+                                "Ungrouped {} selected Playlist {}",
+                                groupable_track_ids.len(),
+                                if groupable_track_ids.len() == 1 {
+                                    "track"
+                                } else {
+                                    "tracks"
+                                }
+                            )
+                        };
+                    }
+                    Some(Err(error)) => {
+                        self.status = format!("Could not update selected Playlist groups: {error}");
+                    }
+                    None => {
+                        self.status = "Open a project to update Playlist track groups".to_owned();
+                    }
+                }
+            }
         }
 
         if let Some(direction) = playlist_clip_vertical_move {
