@@ -7309,6 +7309,66 @@ impl DawUi {
         }
     }
 
+    fn queue_performance_hold_release(
+        &mut self,
+        arrangement_id: u16,
+        track_id: u32,
+        clip_index: usize,
+    ) {
+        let press = self.document.as_ref().and_then(|document| {
+            document
+                .playlist_tracks_in_arrangement(arrangement_id)
+                .into_iter()
+                .find(|track| track.id == track_id)
+                .and_then(|track| track.press)
+        });
+        if press != Some(PlaylistTrackPress::HoldMotion) {
+            self.queue_performance_track_stop(track_id);
+            return;
+        }
+
+        let motion_position = self
+            .audio_engine
+            .as_ref()
+            .zip(self.playlist_tempo_map.as_ref())
+            .and_then(|(engine, tempo_map)| {
+                let sample_rate = engine.sample_rate();
+                let current_frame = engine.project_playback_position_frames();
+                let safe_frame = current_frame.saturating_add(u64::from(sample_rate) / 8);
+                let safe_tick = tempo_map.tick_at_frame(safe_frame, sample_rate)?;
+                if !safe_tick.is_finite() || safe_tick < 0.0 || safe_tick > f64::from(u32::MAX) {
+                    return None;
+                }
+                let start_tick = safe_tick.ceil() as u32;
+                let start_frame = tempo_map
+                    .frame_at_tick(u64::from(start_tick), sample_rate)
+                    .ok()?;
+                Some((u64::from(start_tick), start_frame))
+            });
+        match (motion_position, self.performance_launch_sender.as_ref()) {
+            (Some((start_tick, start_frame)), Some(sender)) => {
+                match sender.send(PlaylistPerformanceCommand::AdvanceMotion {
+                    clip_index,
+                    track_id,
+                    start_tick,
+                    start_frame,
+                }) {
+                    Ok(()) => {
+                        self.status = format!(
+                            "Advancing Performance Mode motion on track {track_id} at tick {start_tick}"
+                        );
+                    }
+                    Err(_) => {
+                        self.status = "Performance Mode audio worker is no longer available".into();
+                    }
+                }
+            }
+            _ => {
+                self.status = "Could not map Performance Mode motion timing".into();
+            }
+        }
+    }
+
     fn start_project_playback(&mut self) {
         if self.performance_mode_active {
             self.start_performance_mode_playback();
@@ -13479,7 +13539,7 @@ impl DawUi {
                                 let mut requested_press = None;
                                 ui.horizontal(|ui| {
                                     ui.label("Press").on_hover_text(
-                                        "Saved per-track press mode. Hold & stop starts on mouse press and stops on release; Hold & motion is not implemented yet.",
+                                        "Saved per-track press mode. Hold & stop starts on mouse press and stops on release. Hold & motion starts on press and advances one supported March & wrap clip on release.",
                                     );
                                     egui::ComboBox::from_id_salt((
                                         "playlist-track-press",
@@ -13525,7 +13585,7 @@ impl DawUi {
                                 let mut requested_motion = None;
                                 ui.horizontal(|ui| {
                                     ui.label("Motion").on_hover_text(
-                                        "Saved per-track motion mode. One Shot plays the clip's first pass and stops; march and random selection are not implemented yet.",
+                                        "Saved per-track motion mode. One Shot plays the first pass and stops. Hold & motion with March & wrap advances through supported ungrouped clips; other march and random modes are not implemented yet.",
                                     );
                                     egui::ComboBox::from_id_salt((
                                         "playlist-track-motion",
@@ -14002,7 +14062,10 @@ impl DawUi {
                                     .find(|track| track.id == track_id)
                                     .and_then(|track| track.press)
                             });
-                            let hold_stop_press = clip_press == Some(PlaylistTrackPress::HoldStop);
+                            let hold_press = matches!(
+                                clip_press,
+                                Some(PlaylistTrackPress::HoldStop | PlaylistTrackPress::HoldMotion)
+                            );
                             let (primary_pressed, primary_released, shift_pressed) = ui.input(|input| {
                                 (
                                     input.pointer.button_pressed(PointerButton::Primary),
@@ -14010,10 +14073,10 @@ impl DawUi {
                                     input.modifiers.shift,
                                 )
                             });
-                            let performance_press_started = if hold_stop_press && !shift_pressed {
+                            let performance_press_started = if hold_press && !shift_pressed {
                                 primary_pressed
                                     && (response.is_pointer_button_down_on()
-                                        || response.clicked_by(PointerButton::Primary))
+                                        || primary_released)
                             } else {
                                 response.clicked_by(PointerButton::Primary)
                             };
@@ -14037,11 +14100,15 @@ impl DawUi {
                                     performance_clip_queue_requested = Some(clip_index);
                                 } else {
                                     performance_clip_launch_requested = Some(clip_index);
-                                    if hold_stop_press
+                                    if hold_press
                                         && let Some(track_id) = clip_track_id
                                     {
                                         if primary_released {
-                                            performance_hold_release_requested = Some(track_id);
+                                            performance_hold_release_requested = Some((
+                                                arrangement.id,
+                                                track_id,
+                                                clip_index,
+                                            ));
                                         } else {
                                             self.held_performance_clip =
                                                 Some((arrangement.id, track_id, clip_index));
@@ -15568,8 +15635,8 @@ impl DawUi {
             }
         }
 
-        if let Some(track_id) = performance_hold_release_requested {
-            self.queue_performance_track_stop(track_id);
+        if let Some((arrangement_id, track_id, clip_index)) = performance_hold_release_requested {
+            self.queue_performance_hold_release(arrangement_id, track_id, clip_index);
         }
 
         if let Some(soloed_range) = solo_playlist_track_requested {
@@ -35732,10 +35799,10 @@ impl eframe::App for DawUi {
         *ui.visuals_mut() = app_visuals();
         self.guard_window_close(ui.ctx());
         if ui.input(|input| input.pointer.button_released(PointerButton::Primary))
-            && let Some((_, track_id, _)) = self.held_performance_clip.take()
+            && let Some((arrangement_id, track_id, clip_index)) = self.held_performance_clip.take()
             && self.performance_launch_sender.is_some()
         {
-            self.queue_performance_track_stop(track_id);
+            self.queue_performance_hold_release(arrangement_id, track_id, clip_index);
         }
         let history_navigation_requested = ui.input(|input| {
             input.modifiers.command

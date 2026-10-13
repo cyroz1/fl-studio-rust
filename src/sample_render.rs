@@ -845,6 +845,12 @@ pub struct PlaylistPerformanceLaunch {
 pub enum PlaylistPerformanceCommand {
     Launch(PlaylistPerformanceLaunch),
     Enqueue(PlaylistPerformanceLaunch),
+    AdvanceMotion {
+        clip_index: usize,
+        track_id: u32,
+        start_tick: u64,
+        start_frame: u64,
+    },
     StopTrack {
         track_id: u32,
         start_tick: u64,
@@ -856,6 +862,7 @@ impl PlaylistPerformanceCommand {
     fn start_frame(self) -> u64 {
         match self {
             Self::Launch(launch) | Self::Enqueue(launch) => launch.start_frame,
+            Self::AdvanceMotion { start_frame, .. } => start_frame,
             Self::StopTrack { start_frame, .. } => start_frame,
         }
     }
@@ -5111,6 +5118,7 @@ struct PlaylistPerformanceRuntime {
     pending_commands: Vec<PlaylistPerformanceCommand>,
     queued_by_track: BTreeMap<u32, VecDeque<PlaylistPerformanceLaunch>>,
     motion_by_track: HashMap<u32, Option<PlaylistTrackMotion>>,
+    motion_clip_order_by_track: HashMap<u32, Vec<usize>>,
     press_by_track: HashMap<u32, Option<PlaylistTrackPress>>,
     position_sync_by_track: HashMap<u32, Option<PlaylistTrackSync>>,
     ppq: u16,
@@ -5259,6 +5267,32 @@ impl PlaylistPerformanceRuntime {
             .iter()
             .map(|track| (track.id, track.motion))
             .collect();
+        let mut motion_clip_order_by_track = BTreeMap::<u32, Vec<(u32, usize)>>::new();
+        for (&clip_index, clip) in &clips_by_index {
+            motion_clip_order_by_track
+                .entry(clip.track_id)
+                .or_default()
+                .push((clip.source_start_tick, clip_index));
+        }
+        for (&clip_index, clip) in &audio_clips_by_index {
+            motion_clip_order_by_track
+                .entry(clip.track_id)
+                .or_default()
+                .push((clip.source_start_tick, clip_index));
+        }
+        let motion_clip_order_by_track = motion_clip_order_by_track
+            .into_iter()
+            .map(|(track_id, mut clips)| {
+                clips.sort_unstable();
+                (
+                    track_id,
+                    clips
+                        .into_iter()
+                        .map(|(_, clip_index)| clip_index)
+                        .collect(),
+                )
+            })
+            .collect();
         let press_by_track = tracks.iter().map(|track| (track.id, track.press)).collect();
         let position_sync_by_track = tracks
             .into_iter()
@@ -5285,6 +5319,7 @@ impl PlaylistPerformanceRuntime {
             pending_commands: Vec::new(),
             queued_by_track: BTreeMap::new(),
             motion_by_track,
+            motion_clip_order_by_track,
             press_by_track,
             position_sync_by_track,
             ppq: document.header().ppq(),
@@ -5325,6 +5360,16 @@ impl PlaylistPerformanceRuntime {
             | PlaylistPerformanceCommand::Enqueue(launch) => !performance_launch_cancelled_by_stop(
                 clip_track_ids.get(&launch.clip_index).copied(),
                 launch.start_frame,
+                track_id,
+                start_frame,
+            ),
+            PlaylistPerformanceCommand::AdvanceMotion {
+                track_id: launch_track_id,
+                start_frame: launch_frame,
+                ..
+            } => !performance_launch_cancelled_by_stop(
+                Some(launch_track_id),
+                launch_frame,
                 track_id,
                 start_frame,
             ),
@@ -5417,6 +5462,62 @@ impl PlaylistPerformanceRuntime {
                         let launch = self.launch_with_position_at(launch, launch.start_tick)?;
                         self.activate_launch(launch, sampler_engine)?;
                     }
+                }
+                PlaylistPerformanceCommand::AdvanceMotion {
+                    clip_index,
+                    track_id,
+                    start_tick,
+                    start_frame,
+                } => {
+                    if start_tick < u64::from(self.performance_zone_end_tick)
+                        || start_frame < self.start_frame
+                    {
+                        return Err(
+                            "Performance Mode motion step must start at or after the Start marker"
+                                .into(),
+                        );
+                    }
+                    if self.performance_clip_track_id(clip_index)? != track_id {
+                        return Err(
+                            "Performance Mode motion step clip is on a different track".into()
+                        );
+                    }
+                    if stopped_tracks_in_block
+                        .get(&track_id)
+                        .is_some_and(|stop_frame| start_frame >= *stop_frame)
+                    {
+                        continue;
+                    }
+                    let next_clip_index = performance_march_wrap_next_clip_index(
+                        clip_index,
+                        self.motion_clip_order_by_track
+                            .get(&track_id)
+                            .map(Vec::as_slice)
+                            .unwrap_or_default(),
+                    );
+                    if self.press_by_track.get(&track_id).copied().flatten()
+                        != Some(PlaylistTrackPress::HoldMotion)
+                        || self.motion_by_track.get(&track_id).copied().flatten()
+                            != Some(PlaylistTrackMotion::MarchWrap)
+                    {
+                        continue;
+                    }
+                    let Some(next_clip_index) = next_clip_index else {
+                        continue;
+                    };
+                    self.cancel_pending_track_launches_from(track_id, start_frame);
+                    self.queued_by_track.remove(&track_id);
+                    stopped_tracks_in_block.insert(track_id, start_frame);
+                    let launch = self.launch_with_position_at(
+                        PlaylistPerformanceLaunch {
+                            clip_index: next_clip_index,
+                            start_tick,
+                            start_frame,
+                            position_offset_ticks: 0,
+                        },
+                        start_tick,
+                    )?;
+                    self.activate_launch(launch, sampler_engine)?;
                 }
                 PlaylistPerformanceCommand::StopTrack {
                     track_id,
@@ -5896,6 +5997,17 @@ fn performance_latch_should_stop(
 
 fn performance_motion_is_one_shot(motion: Option<PlaylistTrackMotion>) -> bool {
     motion == Some(PlaylistTrackMotion::OneShot)
+}
+
+fn performance_march_wrap_next_clip_index(
+    current_clip_index: usize,
+    ordered_clip_indices: &[usize],
+) -> Option<usize> {
+    let current_position = ordered_clip_indices
+        .iter()
+        .position(|clip_index| *clip_index == current_clip_index)?;
+    (!ordered_clip_indices.is_empty())
+        .then(|| ordered_clip_indices[(current_position + 1) % ordered_clip_indices.len()])
 }
 
 fn performance_motion_transition_tick(
@@ -8074,6 +8186,21 @@ mod tests {
                 .unwrap(),
             768
         );
+    }
+
+    #[test]
+    fn hold_motion_march_wrap_steps_through_track_clips() {
+        assert_eq!(
+            performance_march_wrap_next_clip_index(4, &[4, 9, 12]),
+            Some(9)
+        );
+        assert_eq!(
+            performance_march_wrap_next_clip_index(12, &[4, 9, 12]),
+            Some(4)
+        );
+        assert_eq!(performance_march_wrap_next_clip_index(4, &[4]), Some(4));
+        assert_eq!(performance_march_wrap_next_clip_index(3, &[4, 9, 12]), None);
+        assert_eq!(performance_march_wrap_next_clip_index(4, &[]), None);
     }
 
     #[test]
