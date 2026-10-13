@@ -11541,6 +11541,7 @@ impl DawUi {
         let mut seek_tick_requested = None;
         let mut dropped_playlist_audio = None;
         let mut playlist_clip_vertical_move = None;
+        let mut playlist_clip_horizontal_move = None;
         let mut selected_track_bulk_action = None;
         let selected_track_count = self.selected_playlist_tracks.len();
         let has_track_selection = selected_track_count > 0;
@@ -11867,6 +11868,19 @@ impl DawUi {
                     None
                 }
             });
+            let has_clip_selection = self.selected_arrangement == Some(arrangement.id)
+                && (!self.selected_playlist_clips.is_empty() || self.selected_clip.is_some());
+            if has_clip_selection {
+                playlist_clip_horizontal_move = ui.input_mut(|input| {
+                    if input.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowLeft) {
+                        Some(-1i8)
+                    } else if input.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowRight) {
+                        Some(1)
+                    } else {
+                        None
+                    }
+                });
+            }
         }
         if touch_zoom_out_full && let Some(viewport) = self.playlist_grid_viewport {
             self.timeline_zoom = zoom_to_fit(
@@ -13408,6 +13422,77 @@ impl DawUi {
                         self.status = format!("Could not move Playlist clips: {error}");
                     }
                     None => self.status = "Open a project to move Playlist clips".to_owned(),
+                }
+            }
+        }
+
+        if let Some(direction) = playlist_clip_horizontal_move {
+            let clip_indices = if self.selected_playlist_clips.is_empty() {
+                self.selected_clip
+                    .filter(|index| *index < arrangement.clips.len())
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            } else {
+                self.selected_playlist_clips
+                    .iter()
+                    .copied()
+                    .filter(|index| *index < arrangement.clips.len())
+                    .collect::<Vec<_>>()
+            };
+            if clip_indices.is_empty() {
+                self.status = "No Playlist clips are selected to shift".to_owned();
+            } else {
+                let snap_ticks = (u32::from(ppq) / 4).max(1);
+                let result = self.document.as_ref().map(|document| {
+                    let mut updated = document.clone();
+                    for clip_index in &clip_indices {
+                        let clip = arrangement.clips.get(*clip_index).ok_or_else(|| {
+                            "a selected Playlist clip no longer exists".to_owned()
+                        })?;
+                        let position_ticks = if direction < 0 {
+                            clip.position_ticks.checked_sub(snap_ticks).ok_or_else(|| {
+                                "the selected Playlist clips cannot move before tick zero"
+                                    .to_owned()
+                            })?
+                        } else {
+                            clip.position_ticks.checked_add(snap_ticks).ok_or_else(|| {
+                                "the selected Playlist clip position would overflow".to_owned()
+                            })?
+                        };
+                        updated
+                            .edit_playlist_clip(
+                                arrangement.id,
+                                *clip_index,
+                                PlaylistClipEdit {
+                                    position_ticks: Some(position_ticks),
+                                    ..PlaylistClipEdit::default()
+                                },
+                            )
+                            .map_err(|error| error.to_string())?;
+                    }
+                    Ok::<_, String>(updated)
+                });
+                match result {
+                    Some(Ok(updated)) => {
+                        self.document = Some(updated);
+                        self.stop_project_playback();
+                        self.dirty = true;
+                        ui.ctx().request_repaint();
+                        self.status = format!(
+                            "Shifted {} selected Playlist {} {} by one sixteenth note",
+                            clip_indices.len(),
+                            if clip_indices.len() == 1 {
+                                "clip"
+                            } else {
+                                "clips"
+                            },
+                            if direction < 0 { "left" } else { "right" }
+                        );
+                    }
+                    Some(Err(error)) => {
+                        self.status = format!("Could not shift Playlist clips: {error}");
+                    }
+                    None => self.status = "Open a project to shift Playlist clips".to_owned(),
                 }
             }
         }
