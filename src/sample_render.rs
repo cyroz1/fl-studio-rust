@@ -559,6 +559,8 @@ pub enum SamplerLiveNoteEvent {
     NoteOn { channel: u8, key: u8, velocity: u8 },
     NoteOff { channel: u8, key: u8 },
     PitchBend { channel: u8, cents: i16 },
+    Sustain { channel: u8, down: bool },
+    ResetControllers { channel: u8, pitch_bend_cents: i16 },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3440,6 +3442,16 @@ pub fn stream_sampler_midi_input_to_device(
                 Ok(SamplerLiveNoteEvent::PitchBend { channel, cents }) => {
                     engine.apply_live_pitch_bend(channel, cents);
                 }
+                Ok(SamplerLiveNoteEvent::Sustain { channel, down }) => {
+                    engine.set_live_sustain(channel, down);
+                }
+                Ok(SamplerLiveNoteEvent::ResetControllers {
+                    channel,
+                    pitch_bend_cents,
+                }) => {
+                    engine.set_live_sustain(channel, false);
+                    engine.apply_live_pitch_bend(channel, pitch_bend_cents);
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return Ok(()),
             }
@@ -4754,6 +4766,7 @@ struct SamplerVoiceEngine<'a> {
     resampling_quality: ResamplingQuality,
     voices_stolen: usize,
     pitch_bend_cents: [i16; 16],
+    sustain_down: [bool; 16],
 }
 
 struct SamplerVoice {
@@ -4764,6 +4777,7 @@ struct SamplerVoice {
     source_position: f64,
     source_step: f64,
     base_source_step: f64,
+    key_released: bool,
     loop_bounds: Option<SampleBounds>,
     ping_pong_loop: bool,
     stop_frame: Option<u64>,
@@ -4818,6 +4832,7 @@ impl<'a> SamplerVoiceEngine<'a> {
             resampling_quality,
             voices_stolen: 0,
             pitch_bend_cents: [0; 16],
+            sustain_down: [false; 16],
         }
     }
 
@@ -4986,6 +5001,7 @@ impl<'a> SamplerVoiceEngine<'a> {
             },
             source_step,
             base_source_step: source_step,
+            key_released: false,
             loop_bounds: source.loop_bounds,
             ping_pong_loop: source.ping_pong_loop,
             stop_frame: note.stop_frame,
@@ -5022,7 +5038,26 @@ impl<'a> SamplerVoiceEngine<'a> {
         }
     }
 
+    fn set_live_sustain(&mut self, channel: u8, down: bool) {
+        let channel = channel & 0x0F;
+        let channel_index = usize::from(channel);
+        let was_down = self.sustain_down[channel_index];
+        self.sustain_down[channel_index] = down;
+        if was_down && !down {
+            for voice in self.voices.iter_mut().filter_map(Option::as_mut) {
+                if voice.input_midi_channel == Some(channel)
+                    && voice.key_released
+                    && voice.release_remaining.is_none()
+                {
+                    voice.release_remaining = Some(self.release_frames);
+                }
+            }
+        }
+    }
+
     fn release_note(&mut self, channel_id: u16, key: u16, midi_channel: u8) {
+        let midi_channel = midi_channel & 0x0F;
+        let sustain_down = self.sustain_down[usize::from(midi_channel)];
         let voice = self
             .voices
             .iter_mut()
@@ -5030,12 +5065,16 @@ impl<'a> SamplerVoiceEngine<'a> {
             .filter(|voice| {
                 voice.channel_id == channel_id
                     && voice.key == key
-                    && voice.input_midi_channel == Some(midi_channel & 0x0F)
+                    && voice.input_midi_channel == Some(midi_channel)
+                    && !voice.key_released
                     && voice.release_remaining.is_none()
             })
             .min_by_key(|voice| voice.started_frame);
         if let Some(voice) = voice {
-            voice.release_remaining = Some(self.release_frames);
+            voice.key_released = true;
+            if !sustain_down {
+                voice.release_remaining = Some(self.release_frames);
+            }
         }
     }
 }

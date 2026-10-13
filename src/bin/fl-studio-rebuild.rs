@@ -3326,6 +3326,7 @@ struct DawUi {
     midi_input_thru_notes: BTreeMap<(u8, u8), u8>,
     midi_input_thru_note_mapping: BTreeMap<(u8, u8), VecDeque<(u8, u8)>>,
     midi_live_sampler_note_mapping: BTreeMap<(u8, u8), VecDeque<u8>>,
+    midi_live_sampler_sustain_channels: BTreeSet<u8>,
     midi_input_thru_sustain_channels: BTreeSet<u8>,
     midi_output_gain_mapping: Option<MidiControlChangeMapping>,
     midi_controller_templates: Vec<MidiControllerTemplate>,
@@ -3982,6 +3983,7 @@ impl DawUi {
             midi_input_thru_notes: BTreeMap::new(),
             midi_input_thru_note_mapping: BTreeMap::new(),
             midi_live_sampler_note_mapping: BTreeMap::new(),
+            midi_live_sampler_sustain_channels: BTreeSet::new(),
             midi_input_thru_sustain_channels: BTreeSet::new(),
             midi_output_gain_mapping,
             midi_controller_templates,
@@ -28755,6 +28757,7 @@ impl DawUi {
                 self.midi_input_devices = devices;
                 self.midi_input_error = None;
                 if connected_device_missing {
+                    self.stop_live_sampler_input_for_device_change();
                     self.stop_midi_input_thru();
                     self.midi_output_gain_learning = false;
                     self.midi_play_pause_learning = false;
@@ -28800,6 +28803,7 @@ impl DawUi {
         self.midi_output_gain_learning = false;
         self.midi_play_pause_learning = false;
         self.midi_play_pause_cc_active = false;
+        self.stop_live_sampler_input_for_device_change();
         self.stop_midi_input_thru();
         let previous_connection = self.midi_input_connection.take();
         drop(previous_connection);
@@ -28826,6 +28830,7 @@ impl DawUi {
     }
 
     fn disconnect_midi_input(&mut self) {
+        self.stop_live_sampler_input_for_device_change();
         self.stop_midi_input_thru();
         self.midi_output_gain_learning = false;
         self.midi_play_pause_learning = false;
@@ -30329,6 +30334,11 @@ impl DawUi {
         let initial_pitch_bend_cents = self
             .midi_input_channel_state
             .map(MidiInputChannelState::pitch_bend_offset_cents);
+        let initial_sustain_channels = self
+            .midi_live_sampler_sustain_channels
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
         let worker = thread::Builder::new()
             .name("sampler-midi-input".to_owned())
             .spawn(move || {
@@ -30362,6 +30372,12 @@ impl DawUi {
                         cents,
                     });
                 }
+                for channel in initial_sustain_channels {
+                    let _ = event_sender.send(SamplerLiveNoteEvent::Sustain {
+                        channel,
+                        down: true,
+                    });
+                }
                 self.live_sampler_input = Some(LiveSamplerInputSession {
                     pattern_id,
                     channel_id,
@@ -30387,6 +30403,15 @@ impl DawUi {
         if let Some(session) = self.live_sampler_input.take() {
             session.cancelled.store(true, Ordering::Release);
             self.live_sampler_workers.push(session.worker);
+        }
+    }
+
+    fn stop_live_sampler_input_for_device_change(&mut self) {
+        let was_auditioning = self.live_sampler_input.is_some();
+        self.stop_live_sampler_input();
+        self.midi_live_sampler_sustain_channels.clear();
+        if was_auditioning && let Some(engine) = &self.audio_engine {
+            engine.stop_project_playback();
         }
     }
 
@@ -30464,12 +30489,35 @@ impl DawUi {
             MidiInputEvent::PitchBend { channel, .. }
             | MidiInputEvent::ControlChange {
                 channel,
-                controller: 6 | 38 | 100 | 101 | 121,
+                controller: 6 | 38 | 100 | 101,
                 ..
             } => (
                 SamplerLiveNoteEvent::PitchBend {
                     channel,
                     cents: self.midi_input_channel_state[usize::from(channel & 0x0F)]
+                        .pitch_bend_offset_cents(),
+                },
+                None,
+            ),
+            MidiInputEvent::ControlChange {
+                channel,
+                controller: 64,
+                value,
+            } => (
+                SamplerLiveNoteEvent::Sustain {
+                    channel,
+                    down: value >= 64,
+                },
+                None,
+            ),
+            MidiInputEvent::ControlChange {
+                channel,
+                controller: 121,
+                ..
+            } => (
+                SamplerLiveNoteEvent::ResetControllers {
+                    channel,
+                    pitch_bend_cents: self.midi_input_channel_state[usize::from(channel & 0x0F)]
                         .pitch_bend_offset_cents(),
                 },
                 None,
@@ -30500,6 +30548,9 @@ impl DawUi {
     }
 
     fn poll_live_sampler_input(&mut self) {
+        if self.midi_input_connection.is_none() {
+            self.midi_live_sampler_sustain_channels.clear();
+        }
         if self.live_sampler_input.as_ref().is_some_and(|session| {
             self.playing
                 || self.midi_input_connection.is_none()
@@ -30561,6 +30612,25 @@ impl DawUi {
                 && let Some(state) = self.midi_input_channel_state.get_mut(usize::from(channel))
             {
                 state.update(message.event);
+            }
+            match message.event {
+                MidiInputEvent::ControlChange {
+                    channel,
+                    controller: 64,
+                    value,
+                } if value >= 64 => {
+                    self.midi_live_sampler_sustain_channels
+                        .insert(channel & 0x0F);
+                }
+                MidiInputEvent::ControlChange {
+                    channel,
+                    controller: 64 | 121,
+                    ..
+                } => {
+                    self.midi_live_sampler_sustain_channels
+                        .remove(&(channel & 0x0F));
+                }
+                _ => {}
             }
             self.handle_live_sampler_input(message.event);
             self.handle_midi_control_change(message, history_snapshot_available);
