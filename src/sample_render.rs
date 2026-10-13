@@ -558,6 +558,7 @@ impl Default for SamplerPatternRenderOptions {
 pub enum SamplerLiveNoteEvent {
     NoteOn { channel: u8, key: u8, velocity: u8 },
     NoteOff { channel: u8, key: u8 },
+    PitchBend { channel: u8, cents: i16 },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3426,9 +3427,8 @@ pub fn stream_sampler_midi_input_to_device(
                             velocity,
                             pan: 64,
                             fine_pitch_offset_cents: 0,
-                        }) && let Some(voice) = engine.voices[slot_index].as_mut()
-                        {
-                            voice.input_midi_channel = Some(midi_channel & 0x0F);
+                        }) {
+                            engine.set_voice_input_midi_channel(slot_index, midi_channel);
                         }
                     }
                 }
@@ -3436,6 +3436,9 @@ pub fn stream_sampler_midi_input_to_device(
                     let input_key = u16::from(key.min(127));
                     let note_key = transpose_sampler_note_key(input_key, pitch_offset);
                     engine.release_note(channel_id, note_key, channel);
+                }
+                Ok(SamplerLiveNoteEvent::PitchBend { channel, cents }) => {
+                    engine.apply_live_pitch_bend(channel, cents);
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return Ok(()),
@@ -4750,6 +4753,7 @@ struct SamplerVoiceEngine<'a> {
     output_sample_rate: u32,
     resampling_quality: ResamplingQuality,
     voices_stolen: usize,
+    pitch_bend_cents: [i16; 16],
 }
 
 struct SamplerVoice {
@@ -4759,6 +4763,7 @@ struct SamplerVoice {
     input_midi_channel: Option<u8>,
     source_position: f64,
     source_step: f64,
+    base_source_step: f64,
     loop_bounds: Option<SampleBounds>,
     ping_pong_loop: bool,
     stop_frame: Option<u64>,
@@ -4812,6 +4817,7 @@ impl<'a> SamplerVoiceEngine<'a> {
             output_sample_rate,
             resampling_quality,
             voices_stolen: 0,
+            pitch_bend_cents: [0; 16],
         }
     }
 
@@ -4979,6 +4985,7 @@ impl<'a> SamplerVoiceEngine<'a> {
                 0.0
             },
             source_step,
+            base_source_step: source_step,
             loop_bounds: source.loop_bounds,
             ping_pong_loop: source.ping_pong_loop,
             stop_frame: note.stop_frame,
@@ -4991,6 +4998,28 @@ impl<'a> SamplerVoiceEngine<'a> {
             release_remaining: None,
         });
         Some(slot_index)
+    }
+
+    fn set_voice_input_midi_channel(&mut self, slot_index: usize, channel: u8) {
+        let channel = channel & 0x0F;
+        let pitch_bend_cents = self.pitch_bend_cents[usize::from(channel)];
+        if let Some(voice) = self.voices[slot_index].as_mut() {
+            voice.input_midi_channel = Some(channel);
+            voice.source_step =
+                voice.base_source_step * audio_clip_master_pitch_ratio(pitch_bend_cents);
+        }
+    }
+
+    fn apply_live_pitch_bend(&mut self, channel: u8, cents: i16) {
+        let channel = channel & 0x0F;
+        let cents = cents.clamp(-1200, 1200);
+        self.pitch_bend_cents[usize::from(channel)] = cents;
+        let ratio = audio_clip_master_pitch_ratio(cents);
+        for voice in self.voices.iter_mut().filter_map(Option::as_mut) {
+            if voice.input_midi_channel == Some(channel) {
+                voice.source_step = voice.base_source_step * ratio;
+            }
+        }
     }
 
     fn release_note(&mut self, channel_id: u16, key: u16, midi_channel: u8) {

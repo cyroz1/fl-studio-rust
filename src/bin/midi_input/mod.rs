@@ -181,13 +181,16 @@ impl MidiInputChannelState {
         midi_modulation_to_fl_note_value(self.mod_y)
     }
 
-    fn note_fine_pitch(self) -> u8 {
-        let cents = midi_pitch_bend_offset_cents(
+    pub fn pitch_bend_offset_cents(self) -> i16 {
+        midi_pitch_bend_offset_cents(
             self.pitch_bend_value,
             self.pitch_bend_sensitivity_semitones,
             self.pitch_bend_sensitivity_cents,
-        );
-        midi_pitch_bend_cents_to_fl_note_fine_pitch(cents)
+        )
+    }
+
+    fn note_fine_pitch(self) -> u8 {
+        midi_pitch_bend_cents_to_fl_note_fine_pitch(self.pitch_bend_offset_cents())
     }
 }
 

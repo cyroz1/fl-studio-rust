@@ -30326,6 +30326,9 @@ impl DawUi {
         let worker_cancelled = Arc::clone(&cancelled);
         let read_sample_root_note = self.read_sample_root_note;
         let resampling_quality = self.live_resampling_quality;
+        let initial_pitch_bend_cents = self
+            .midi_input_channel_state
+            .map(MidiInputChannelState::pitch_bend_offset_cents);
         let worker = thread::Builder::new()
             .name("sampler-midi-input".to_owned())
             .spawn(move || {
@@ -30353,6 +30356,12 @@ impl DawUi {
             });
         match worker {
             Ok(worker) => {
+                for (channel, cents) in initial_pitch_bend_cents.into_iter().enumerate() {
+                    let _ = event_sender.send(SamplerLiveNoteEvent::PitchBend {
+                        channel: channel as u8,
+                        cents,
+                    });
+                }
                 self.live_sampler_input = Some(LiveSamplerInputSession {
                     pattern_id,
                     channel_id,
@@ -30452,6 +30461,19 @@ impl DawUi {
                     None,
                 )
             }
+            MidiInputEvent::PitchBend { channel, .. }
+            | MidiInputEvent::ControlChange {
+                channel,
+                controller: 6 | 38 | 100 | 101 | 121,
+                ..
+            } => (
+                SamplerLiveNoteEvent::PitchBend {
+                    channel,
+                    cents: self.midi_input_channel_state[usize::from(channel & 0x0F)]
+                        .pitch_bend_offset_cents(),
+                },
+                None,
+            ),
             _ => return,
         };
         if self.live_sampler_input.is_none()
@@ -30533,7 +30555,6 @@ impl DawUi {
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             };
             self.forward_midi_input_thru(message.event);
-            self.handle_live_sampler_input(message.event);
             self.midi_activity = Some((describe_event(message.event), message.received_at));
             if let MidiInputEvent::ControlChange { channel, .. }
             | MidiInputEvent::PitchBend { channel, .. } = message.event
@@ -30541,6 +30562,7 @@ impl DawUi {
             {
                 state.update(message.event);
             }
+            self.handle_live_sampler_input(message.event);
             self.handle_midi_control_change(message, history_snapshot_available);
             if let MidiInputEvent::Transport(command) = message.event {
                 self.handle_midi_transport(command, message, history_snapshot_available);
