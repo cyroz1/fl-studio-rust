@@ -2796,6 +2796,12 @@ struct BrowserTagEditor {
     tags: String,
 }
 
+struct BrowserBulkTagEditor {
+    paths: Vec<PathBuf>,
+    add_tags: String,
+    remove_tags: String,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum BrowserTagLogic {
     #[default]
@@ -3447,6 +3453,7 @@ struct DawUi {
     browser_favorites: BTreeSet<PathBuf>,
     browser_tags: BTreeMap<PathBuf, BTreeSet<String>>,
     browser_tag_editor: Option<BrowserTagEditor>,
+    browser_bulk_tag_editor: Option<BrowserBulkTagEditor>,
     browser_tag_logic: BrowserTagLogic,
     browser_selected_tags: BTreeSet<String>,
     browser_saved_searches: Vec<SavedBrowserSearch>,
@@ -4113,6 +4120,7 @@ impl DawUi {
             browser_favorites: load_browser_favorites(),
             browser_tags: load_browser_tags(),
             browser_tag_editor: None,
+            browser_bulk_tag_editor: None,
             browser_tag_logic: BrowserTagLogic::default(),
             browser_selected_tags: BTreeSet::new(),
             browser_saved_searches: load_browser_saved_searches(),
@@ -9600,6 +9608,56 @@ impl DawUi {
         }
     }
 
+    fn open_browser_bulk_tag_editor(&mut self, paths: Vec<PathBuf>) {
+        let paths = paths
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if paths.len() > 1 {
+            self.browser_bulk_tag_editor = Some(BrowserBulkTagEditor {
+                paths,
+                add_tags: String::new(),
+                remove_tags: String::new(),
+            });
+        }
+    }
+
+    fn save_browser_bulk_tag_editor(&mut self, editor: BrowserBulkTagEditor) {
+        let add_tags = parse_browser_tag_input(&editor.add_tags);
+        let remove_tags = parse_browser_tag_input(&editor.remove_tags)
+            .into_iter()
+            .map(|tag| tag.to_lowercase())
+            .collect::<BTreeSet<_>>();
+        if add_tags.is_empty() && remove_tags.is_empty() {
+            self.status = "Enter tags to add or remove".to_owned();
+            return;
+        }
+
+        let previous = self.browser_tags.clone();
+        for path in &editor.paths {
+            let mut tags = self.browser_tags.remove(path).unwrap_or_default();
+            tags.retain(|tag| !remove_tags.contains(&tag.to_lowercase()));
+            for tag in &add_tags {
+                if !tags
+                    .iter()
+                    .any(|existing| existing.to_lowercase() == tag.to_lowercase())
+                {
+                    tags.insert(tag.clone());
+                }
+            }
+            if !tags.is_empty() {
+                self.browser_tags.insert(path.clone(), tags);
+            }
+        }
+        if let Err(error) = save_browser_tags(&self.browser_tags) {
+            self.browser_tags = previous;
+            self.status = format!("Could not save Browser tags: {error}");
+        } else {
+            self.status = format!("Updated tags for {} Browser files", editor.paths.len());
+        }
+    }
+
     fn browser_tag_editor_dialog(&mut self, context: &egui::Context) {
         let Some(mut editor) = self.browser_tag_editor.take() else {
             return;
@@ -9632,6 +9690,55 @@ impl DawUi {
             self.save_browser_tag_editor(editor);
         } else if open && !cancel {
             self.browser_tag_editor = Some(editor);
+        }
+    }
+
+    fn browser_bulk_tag_editor_dialog(&mut self, context: &egui::Context) {
+        let Some(mut editor) = self.browser_bulk_tag_editor.take() else {
+            return;
+        };
+        let mut open = true;
+        let mut apply = false;
+        let mut cancel = false;
+        egui::Window::new("Bulk Browser tags")
+            .id(Id::new("browser-bulk-tag-editor"))
+            .open(&mut open)
+            .resizable(false)
+            .show(context, |ui| {
+                ui.label(format!("{} filtered files", editor.paths.len()));
+                ui.label("Add tags");
+                ui.add(
+                    egui::TextEdit::singleline(&mut editor.add_tags)
+                        .hint_text("Kick, 808, C#")
+                        .desired_width(360.0),
+                );
+                ui.label("Remove tags");
+                ui.add(
+                    egui::TextEdit::singleline(&mut editor.remove_tags)
+                        .hint_text("Old tag, draft")
+                        .desired_width(360.0),
+                );
+                ui.small("Comma-separated. Other tags on each file stay unchanged.");
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            !editor.add_tags.trim().is_empty()
+                                || !editor.remove_tags.trim().is_empty(),
+                            egui::Button::new("Apply"),
+                        )
+                        .clicked()
+                    {
+                        apply = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if apply {
+            self.save_browser_bulk_tag_editor(editor);
+        } else if open && !cancel {
+            self.browser_bulk_tag_editor = Some(editor);
         }
     }
 
@@ -11328,10 +11435,16 @@ impl DawUi {
             })
             .cloned()
             .collect::<Vec<_>>();
+        let bulk_tag_paths = entries
+            .iter()
+            .filter(|entry| !entry.is_directory)
+            .map(|entry| entry.path.clone())
+            .collect::<Vec<_>>();
         let sample_target = self.selected_sample_channel();
         let mut advance_search_result =
             ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F3));
-        ui.horizontal(|ui| {
+        let mut edit_filtered_tags = false;
+        ui.horizontal_wrapped(|ui| {
             ui.small(if recursive_results {
                 format!("{} recursive matches", entries.len())
             } else {
@@ -11344,7 +11457,19 @@ impl DawUi {
             {
                 advance_search_result = true;
             }
+            if ui
+                .add_enabled(
+                    bulk_tag_paths.len() > 1,
+                    egui::Button::new(format!("Tag {} files…", bulk_tag_paths.len())),
+                )
+                .clicked()
+            {
+                edit_filtered_tags = true;
+            }
         });
+        if edit_filtered_tags {
+            self.open_browser_bulk_tag_editor(bulk_tag_paths);
+        }
         let next_match_path = if advance_search_result && !entries.is_empty() {
             let next_index = self
                 .browser_selected
@@ -11651,6 +11776,23 @@ impl DawUi {
             })
             .cloned()
             .collect::<Vec<_>>();
+        let bulk_tag_paths = favorites.clone();
+        let mut edit_filtered_tags = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.small(format!("{} favorites", favorites.len()));
+            if ui
+                .add_enabled(
+                    bulk_tag_paths.len() > 1,
+                    egui::Button::new(format!("Tag {} files…", bulk_tag_paths.len())),
+                )
+                .clicked()
+            {
+                edit_filtered_tags = true;
+            }
+        });
+        if edit_filtered_tags {
+            self.open_browser_bulk_tag_editor(bulk_tag_paths);
+        }
         let mut activate = None;
         let mut preview = None;
         let mut remove = None;
@@ -34692,6 +34834,7 @@ impl eframe::App for DawUi {
         self.channel_group_dialog(ui.ctx());
         self.playlist_render_options_dialog(ui.ctx());
         self.browser_tag_editor_dialog(ui.ctx());
+        self.browser_bulk_tag_editor_dialog(ui.ctx());
         self.browser_search_save_dialog(ui.ctx());
         self.browser_tab_customize_dialog(ui.ctx());
         self.browser_fst_details_dialog(ui.ctx());
@@ -37433,6 +37576,17 @@ fn browser_filter_matches(path: &Path, filter: BrowserFilter) -> bool {
             | (BrowserFilter::Projects, Some(BrowserFileKind::Project))
             | (BrowserFilter::Presets, Some(BrowserFileKind::Preset))
     )
+}
+
+fn parse_browser_tag_input(value: &str) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    value
+        .split(',')
+        .map(|tag| tag.replace(['\t', '\n', '\r'], " "))
+        .map(|tag| tag.trim().to_owned())
+        .filter(|tag| !tag.is_empty())
+        .filter(|tag| seen.insert(tag.to_lowercase()))
+        .collect()
 }
 
 fn browser_tag_selection_matches(
