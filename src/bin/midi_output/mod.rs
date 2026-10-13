@@ -456,6 +456,8 @@ mod tests {
             velocity: 96,
             release_velocity: 32,
             pan: 64,
+            mod_x: 64,
+            mod_y: 64,
             start_tick: 48,
             end_tick: 144,
             fine_pitch_offset_cents: 0,
@@ -468,6 +470,14 @@ mod tests {
                 super::ScheduledMidiTickMessage {
                     tick: 96,
                     bytes: vec![0xB2, 10, 64],
+                },
+                super::ScheduledMidiTickMessage {
+                    tick: 96,
+                    bytes: vec![0xB2, 74, 64],
+                },
+                super::ScheduledMidiTickMessage {
+                    tick: 96,
+                    bytes: vec![0xB2, 71, 64],
                 },
                 super::ScheduledMidiTickMessage {
                     tick: 96,
@@ -490,6 +500,8 @@ mod tests {
                 velocity: 96,
                 release_velocity: 12,
                 pan: 64,
+                mod_x: 64,
+                mod_y: 64,
                 start_tick: 0,
                 end_tick: 96,
                 fine_pitch_offset_cents: 0,
@@ -500,6 +512,8 @@ mod tests {
                 velocity: 80,
                 release_velocity: 24,
                 pan: 64,
+                mod_x: 64,
+                mod_y: 64,
                 start_tick: 96,
                 end_tick: 144,
                 fine_pitch_offset_cents: 0,
@@ -513,7 +527,9 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(at_tick[0].bytes, [0x80, 60, 12]);
         assert_eq!(at_tick[1].bytes, [0xB0, 10, 64]);
-        assert_eq!(at_tick[2].bytes, [0x90, 60, 80]);
+        assert_eq!(at_tick[2].bytes, [0xB0, 74, 64]);
+        assert_eq!(at_tick[3].bytes, [0xB0, 71, 64]);
+        assert_eq!(at_tick[4].bytes, [0x90, 60, 80]);
     }
 
     #[test]
@@ -524,6 +540,8 @@ mod tests {
             velocity: 100,
             release_velocity: 0,
             pan: 64,
+            mod_x: 64,
+            mod_y: 64,
             start_tick: 48,
             end_tick: 144,
             fine_pitch_offset_cents: 700,
@@ -552,7 +570,7 @@ mod tests {
                 .filter(|message| message.bytes[0] & 0xF0 == 0xB0)
                 .map(|message| message.bytes[1])
                 .collect::<Vec<_>>(),
-            [101, 100, 6, 38, 101, 100, 10]
+            [101, 100, 6, 38, 101, 100, 10, 74, 71]
         );
         assert_eq!(messages.last().unwrap().tick, 144);
     }

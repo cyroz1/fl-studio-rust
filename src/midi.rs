@@ -111,6 +111,10 @@ pub struct MidiExportNote {
     pub release_velocity: u8,
     /// MIDI channel pan value in the range 0–127.
     pub pan: u8,
+    /// MIDI CC 74 value for FL Studio note Mod X (filter cutoff / brightness).
+    pub mod_x: u8,
+    /// MIDI CC 71 value for FL Studio note Mod Y (filter resonance / timbre).
+    pub mod_y: u8,
     pub start_tick: u64,
     pub end_tick: u64,
     /// Fine pitch from equal temperament, expressed in cents from -1200 to +1200.
@@ -147,6 +151,8 @@ struct PendingMidiExportNote {
     end_tick: u64,
     fine_pitch_offset_cents: i16,
     pan: u8,
+    mod_x: u8,
+    mod_y: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -158,6 +164,8 @@ struct AssignedMidiExportNote {
     end_tick: u64,
     fine_pitch_offset_cents: i16,
     pan: u8,
+    mod_x: u8,
+    mod_y: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -166,6 +174,8 @@ struct ActiveMidiExportNote {
     track_index: usize,
     fine_pitch_offset_cents: i16,
     pan: u8,
+    mod_x: u8,
+    mod_y: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -174,6 +184,8 @@ struct EndedMidiExportNote {
     track_index: usize,
     fine_pitch_offset_cents: i16,
     pan: u8,
+    mod_x: u8,
+    mod_y: u8,
 }
 
 struct MidiExportOptions<'a> {
@@ -835,6 +847,16 @@ impl MidiFile {
                 });
                 events.push(TimedMidiBytes {
                     tick: assigned.start_tick,
+                    order: 4,
+                    bytes: vec![0xB0 | assigned.channel, 74, assigned.mod_x],
+                });
+                events.push(TimedMidiBytes {
+                    tick: assigned.start_tick,
+                    order: 4,
+                    bytes: vec![0xB0 | assigned.channel, 71, assigned.mod_y],
+                });
+                events.push(TimedMidiBytes {
+                    tick: assigned.start_tick,
                     order: 5,
                     bytes: vec![0x90 | assigned.channel, note.key, velocity],
                 });
@@ -920,6 +942,8 @@ fn assign_export_note_channels(
                 end_tick: note.end_tick.max(note.start_tick.saturating_add(1)),
                 fine_pitch_offset_cents: note.fine_pitch_offset_cents,
                 pan: note.pan.min(127),
+                mod_x: note.mod_x.min(127),
+                mod_y: note.mod_y.min(127),
             });
         }
     }
@@ -951,6 +975,8 @@ fn assign_export_note_channels(
                                 track_index: voice.track_index,
                                 fine_pitch_offset_cents: voice.fine_pitch_offset_cents,
                                 pan: voice.pan,
+                                mod_x: voice.mod_x,
+                                mod_y: voice.mod_y,
                             });
                         }
                         Some(previous_end) if voice.end_tick == previous_end => {
@@ -959,6 +985,8 @@ fn assign_export_note_channels(
                                 track_index: voice.track_index,
                                 fine_pitch_offset_cents: voice.fine_pitch_offset_cents,
                                 pan: voice.pan,
+                                mod_x: voice.mod_x,
+                                mod_y: voice.mod_y,
                             });
                         }
                         None => last_ended[channel].push(EndedMidiExportNote {
@@ -966,6 +994,8 @@ fn assign_export_note_channels(
                             track_index: voice.track_index,
                             fine_pitch_offset_cents: voice.fine_pitch_offset_cents,
                             pan: voice.pan,
+                            mod_x: voice.mod_x,
+                            mod_y: voice.mod_y,
                         }),
                         _ => {}
                     }
@@ -981,14 +1011,24 @@ fn assign_export_note_channels(
                 .iter()
                 .all(|voice| voice.fine_pitch_offset_cents == note.fine_pitch_offset_cents);
             let active_pan_matches = active[channel].iter().all(|voice| voice.pan == note.pan);
+            let active_mod_x_matches = active[channel]
+                .iter()
+                .all(|voice| voice.mod_x == note.mod_x);
+            let active_mod_y_matches = active[channel]
+                .iter()
+                .all(|voice| voice.mod_y == note.mod_y);
             let channel_state_change_is_ordered = last_ended[channel].iter().all(|previous| {
                 previous.end_tick != note.start_tick
                     || (previous.fine_pitch_offset_cents == note.fine_pitch_offset_cents
-                        && previous.pan == note.pan)
+                        && previous.pan == note.pan
+                        && previous.mod_x == note.mod_x
+                        && previous.mod_y == note.mod_y)
                     || previous.track_index == note.track_index
             });
             active_pitch_matches
                 && active_pan_matches
+                && active_mod_x_matches
+                && active_mod_y_matches
                 && (!active[channel].is_empty() || channel_state_change_is_ordered)
         };
 
@@ -1003,7 +1043,7 @@ fn assign_export_note_channels(
             channel
         } else {
             return Err(MidiError::InvalidExport(
-                "simultaneous notes with independent pan or pitch need a free MIDI channel, but none is available under this channel mapping",
+                "simultaneous notes with independent pan, modulation, or pitch need a free MIDI channel, but none is available under this channel mapping",
             ));
         };
 
@@ -1012,6 +1052,8 @@ fn assign_export_note_channels(
             track_index: note.track_index,
             fine_pitch_offset_cents: note.fine_pitch_offset_cents,
             pan: note.pan,
+            mod_x: note.mod_x,
+            mod_y: note.mod_y,
         });
         assigned[note.track_index].push(AssignedMidiExportNote {
             track_index: note.track_index,
@@ -1021,6 +1063,8 @@ fn assign_export_note_channels(
             end_tick: note.end_tick,
             fine_pitch_offset_cents: note.fine_pitch_offset_cents,
             pan: note.pan,
+            mod_x: note.mod_x,
+            mod_y: note.mod_y,
         });
     }
 
@@ -1677,10 +1721,17 @@ fn export_note(note: &PatternNote, start_tick: u64, end_tick: u64) -> MidiExport
         velocity: note.velocity,
         release_velocity: fl_note_release_to_midi_velocity(note.release),
         pan: fl_note_pan_to_midi_value(note.pan),
+        mod_x: fl_note_modulation_to_midi_value(note.mod_x),
+        mod_y: fl_note_modulation_to_midi_value(note.mod_y),
         start_tick,
         end_tick,
         fine_pitch_offset_cents: note.fine_pitch_offset_cents(),
     }
+}
+
+/// Maps FL Studio's 0–255 note modulation range to a MIDI controller's 0–127 range.
+pub fn fl_note_modulation_to_midi_value(value: u8) -> u8 {
+    ((u16::from(value) * 127 + 127) / 255) as u8
 }
 
 fn meta_event_bytes(meta_type: u8, data: &[u8]) -> Result<Vec<u8>, MidiError> {
@@ -2033,6 +2084,13 @@ mod tests {
     }
 
     #[test]
+    fn fl_note_modulation_maps_to_midi_controller_range() {
+        assert_eq!(super::fl_note_modulation_to_midi_value(0), 0);
+        assert_eq!(super::fl_note_modulation_to_midi_value(128), 64);
+        assert_eq!(super::fl_note_modulation_to_midi_value(255), 127);
+    }
+
+    #[test]
     fn midi_pitch_bend_cents_map_to_fl_fine_pitch_steps() {
         assert_eq!(super::midi_pitch_bend_cents_to_fl_note_fine_pitch(-1200), 0);
         assert_eq!(super::midi_pitch_bend_cents_to_fl_note_fine_pitch(-5), 119);
@@ -2068,6 +2126,8 @@ mod tests {
             velocity: 96,
             release_velocity: 127,
             pan: 64,
+            mod_x: 64,
+            mod_y: 64,
             start_tick: 0,
             end_tick: 240,
             fine_pitch_offset_cents: 0,
@@ -2080,6 +2140,8 @@ mod tests {
             velocity: 128,
             release_velocity: 32,
             pan: 64,
+            mod_x: 64,
+            mod_y: 64,
             start_tick: 120,
             end_tick: 480,
             fine_pitch_offset_cents: 0,
@@ -2126,6 +2188,8 @@ mod tests {
             velocity: 100,
             release_velocity: 0,
             pan: 0,
+            mod_x: 64,
+            mod_y: 64,
             start_tick: 0,
             end_tick: 24,
             fine_pitch_offset_cents: 0,
@@ -2136,6 +2200,8 @@ mod tests {
             velocity: 90,
             release_velocity: 0,
             pan: 127,
+            mod_x: 64,
+            mod_y: 64,
             start_tick: 12,
             end_tick: 36,
             fine_pitch_offset_cents: 0,
@@ -2168,8 +2234,110 @@ mod tests {
         assert!(matches!(
             events_at_second_onset[1].kind(),
             super::MidiEventKind::ChannelVoice { status, data }
+                if *status == 0xB1 && data == &[74, 64]
+        ));
+        assert!(matches!(
+            events_at_second_onset[2].kind(),
+            super::MidiEventKind::ChannelVoice { status, data }
+                if *status == 0xB1 && data == &[71, 64]
+        ));
+        assert!(matches!(
+            events_at_second_onset[3].kind(),
+            super::MidiEventKind::ChannelVoice { status, data }
                 if *status == 0x91 && data == &[64, 90]
         ));
+    }
+
+    #[test]
+    fn exports_note_mod_x_and_mod_y_as_midi_controllers() {
+        let mut track = MidiExportTrack::new("Modulation", Some(0));
+        track.notes.push(MidiExportNote {
+            channel: 0,
+            key: 60,
+            velocity: 100,
+            release_velocity: 0,
+            pan: 64,
+            mod_x: 91,
+            mod_y: 37,
+            start_tick: 0,
+            end_tick: 24,
+            fine_pitch_offset_cents: 0,
+        });
+
+        let bytes = MidiFile::encode_export_tracks(
+            &[track],
+            96,
+            120.0,
+            None,
+            MidiChannelMapping::PreserveNoteChannels,
+        )
+        .expect("valid note modulation should serialize");
+        let midi = MidiFile::parse(&bytes).expect("encoded MIDI should parse");
+        let events = midi.tracks()[1]
+            .events()
+            .iter()
+            .filter_map(|event| match event.kind() {
+                super::MidiEventKind::ChannelVoice { status, data }
+                    if *status == 0xB0 && data.len() == 2 =>
+                {
+                    Some((data[0], data[1]))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(events, [(10, 64), (74, 91), (71, 37)]);
+    }
+
+    #[test]
+    fn overlapping_notes_with_different_modulation_use_a_spare_midi_channel() {
+        let mut track = MidiExportTrack::new("Modulation", Some(0));
+        track.notes.push(MidiExportNote {
+            channel: 0,
+            key: 60,
+            velocity: 100,
+            release_velocity: 0,
+            pan: 64,
+            mod_x: 20,
+            mod_y: 30,
+            start_tick: 0,
+            end_tick: 24,
+            fine_pitch_offset_cents: 0,
+        });
+        track.notes.push(MidiExportNote {
+            channel: 0,
+            key: 64,
+            velocity: 100,
+            release_velocity: 0,
+            pan: 64,
+            mod_x: 100,
+            mod_y: 110,
+            start_tick: 12,
+            end_tick: 36,
+            fine_pitch_offset_cents: 0,
+        });
+
+        let bytes = MidiFile::encode_export_tracks(
+            &[track],
+            96,
+            120.0,
+            None,
+            MidiChannelMapping::PreserveNoteChannels,
+        )
+        .expect("overlapping note modulation should use an available channel");
+        let midi = MidiFile::parse(&bytes).expect("encoded MIDI should parse");
+        let notes = midi.tracks()[1].notes();
+        assert_eq!(notes[0].channel(), 0);
+        assert_eq!(notes[1].channel(), 1);
+        assert!(midi.tracks()[1].events().iter().any(|event| {
+            event.absolute_tick() == 12
+                && matches!(event.kind(), super::MidiEventKind::ChannelVoice { status, data }
+                    if *status == 0xB1 && data == &[74, 100])
+        }));
+        assert!(midi.tracks()[1].events().iter().any(|event| {
+            event.absolute_tick() == 12
+                && matches!(event.kind(), super::MidiEventKind::ChannelVoice { status, data }
+                    if *status == 0xB1 && data == &[71, 110])
+        }));
     }
 
     #[test]
@@ -2181,6 +2349,8 @@ mod tests {
             velocity: 100,
             release_velocity: 0,
             pan: 64,
+            mod_x: 64,
+            mod_y: 64,
             start_tick: u64::from(super::MAX_VLQ as u32) + 17,
             end_tick: u64::from(super::MAX_VLQ as u32) + 200,
             fine_pitch_offset_cents: 0,
@@ -2211,6 +2381,8 @@ mod tests {
             velocity: 100,
             release_velocity: 0,
             pan: 64,
+            mod_x: 64,
+            mod_y: 64,
             start_tick: 0,
             end_tick: 24,
             fine_pitch_offset_cents: 0,
@@ -2237,6 +2409,8 @@ mod tests {
             velocity: 100,
             release_velocity: 0,
             pan: 64,
+            mod_x: 64,
+            mod_y: 64,
             start_tick: 0,
             end_tick: 24,
             fine_pitch_offset_cents: 0,
@@ -2248,6 +2422,8 @@ mod tests {
             velocity: 100,
             release_velocity: 0,
             pan: 64,
+            mod_x: 64,
+            mod_y: 64,
             start_tick: 0,
             end_tick: 24,
             fine_pitch_offset_cents: 0,
@@ -2276,6 +2452,8 @@ mod tests {
             velocity: 100,
             release_velocity: 0,
             pan: 64,
+            mod_x: 64,
+            mod_y: 64,
             start_tick: 0,
             end_tick: 24,
             fine_pitch_offset_cents: 100,
@@ -2286,6 +2464,8 @@ mod tests {
             velocity: 100,
             release_velocity: 0,
             pan: 64,
+            mod_x: 64,
+            mod_y: 64,
             start_tick: 0,
             end_tick: 24,
             fine_pitch_offset_cents: 0,
@@ -2297,6 +2477,8 @@ mod tests {
             velocity: 100,
             release_velocity: 0,
             pan: 64,
+            mod_x: 64,
+            mod_y: 64,
             start_tick: 0,
             end_tick: 24,
             fine_pitch_offset_cents: 0,
@@ -2375,6 +2557,8 @@ mod tests {
             velocity: 100,
             release_velocity: 0,
             pan: 64,
+            mod_x: 64,
+            mod_y: 64,
             start_tick: 0,
             end_tick: 24,
             fine_pitch_offset_cents: 100,
@@ -2385,6 +2569,8 @@ mod tests {
             velocity: 100,
             release_velocity: 0,
             pan: 64,
+            mod_x: 64,
+            mod_y: 64,
             start_tick: 12,
             end_tick: 36,
             fine_pitch_offset_cents: 100,
@@ -2436,6 +2622,8 @@ mod tests {
             velocity: 100,
             release_velocity: 0,
             pan: 64,
+            mod_x: 64,
+            mod_y: 64,
             start_tick: 0,
             end_tick: 24,
             fine_pitch_offset_cents: 100,
@@ -2447,6 +2635,8 @@ mod tests {
             velocity: 100,
             release_velocity: 0,
             pan: 64,
+            mod_x: 64,
+            mod_y: 64,
             start_tick: 24,
             end_tick: 48,
             fine_pitch_offset_cents: 0,
@@ -2477,6 +2667,8 @@ mod tests {
                 velocity: 100,
                 release_velocity: 0,
                 pan: 64,
+                mod_x: 64,
+                mod_y: 64,
                 start_tick: 0,
                 end_tick: 24,
                 fine_pitch_offset_cents: (index as i16 - 8) * 100,
@@ -2502,6 +2694,8 @@ mod tests {
             velocity: 100,
             release_velocity: 0,
             pan: 64,
+            mod_x: 64,
+            mod_y: 64,
             start_tick: 0,
             end_tick: 1,
             fine_pitch_offset_cents: 0,
