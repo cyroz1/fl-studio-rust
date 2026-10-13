@@ -1522,11 +1522,12 @@ enum PianoRollScale {
     HalfDiminishedFlatFour,
     Altered,
     AlteredDominantNaturalSix,
+    AlteredDominantDoubleFlatThree,
     SuperLocrianDoubleFlatSeven,
 }
 
 impl PianoRollScale {
-    const ALL: [Self; 63] = [
+    const ALL: [Self; 64] = [
         Self::None,
         Self::Major,
         Self::MajorLocrian,
@@ -1589,6 +1590,7 @@ impl PianoRollScale {
         Self::HalfDiminishedFlatFour,
         Self::Altered,
         Self::AlteredDominantNaturalSix,
+        Self::AlteredDominantDoubleFlatThree,
         Self::SuperLocrianDoubleFlatSeven,
     ];
 
@@ -1656,6 +1658,7 @@ impl PianoRollScale {
             Self::HalfDiminishedFlatFour => "Half-diminished b4",
             Self::Altered => "Altered",
             Self::AlteredDominantNaturalSix => "Altered dominant natural 6",
+            Self::AlteredDominantDoubleFlatThree => "Altered dominant bb3",
             Self::SuperLocrianDoubleFlatSeven => "Super-Locrian bb7",
         }
     }
@@ -1731,6 +1734,7 @@ impl PianoRollScale {
             Self::HalfDiminishedFlatFour => &[0, 2, 3, 4, 6, 8, 10],
             Self::Altered => &[0, 1, 3, 4, 6, 8, 10],
             Self::AlteredDominantNaturalSix => &[0, 1, 3, 4, 6, 9, 10],
+            Self::AlteredDominantDoubleFlatThree => &[0, 1, 2, 4, 6, 8, 10],
             Self::SuperLocrianDoubleFlatSeven => &[0, 1, 3, 4, 6, 8, 9],
         }
     }
@@ -1820,6 +1824,7 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
         PianoRollScale::HalfDiminishedFlatFour,
         PianoRollScale::Altered,
         PianoRollScale::AlteredDominantNaturalSix,
+        PianoRollScale::AlteredDominantDoubleFlatThree,
         PianoRollScale::SuperLocrianDoubleFlatSeven,
     ];
     let mut best: Option<((usize, usize, usize, i8), DetectedPianoRollScale)> = None;
@@ -1930,6 +1935,7 @@ fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
                 PianoRollScale::HalfDiminishedFlatFour => -38,
                 PianoRollScale::Altered => -13,
                 PianoRollScale::AlteredDominantNaturalSix => -36,
+                PianoRollScale::AlteredDominantDoubleFlatThree => -40,
                 PianoRollScale::SuperLocrianDoubleFlatSeven => -22,
                 PianoRollScale::None => unreachable!("None is not a detection candidate"),
             };
