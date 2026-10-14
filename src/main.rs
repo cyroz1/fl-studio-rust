@@ -168,6 +168,53 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_f32(value, "controller value")?,
             )
         }
+        [command, input, output, pattern_id, channel, flags, points]
+            if command == "draw-pattern-controller-points" =>
+        {
+            let points = parse_pattern_controller_points(points)?;
+            draw_pattern_controller_points(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                (
+                    parse_u8(channel, "controller channel")?,
+                    parse_u8(flags, "controller flags")?,
+                ),
+                &points,
+            )
+        }
+        [command, input, output, pattern_id, channel, flags, start_tick, end_tick]
+            if command == "linearize-pattern-controllers" =>
+        {
+            edit_pattern_controller_range(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                (
+                    parse_u8(channel, "controller channel")?,
+                    parse_u8(flags, "controller flags")?,
+                ),
+                parse_u32(start_tick, "controller range start")?,
+                parse_u32(end_tick, "controller range end")?,
+                PatternControllerRangeOperation::Linear,
+            )
+        }
+        [command, input, output, pattern_id, channel, flags, start_tick, end_tick]
+            if command == "spline-pattern-controllers" =>
+        {
+            edit_pattern_controller_range(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                (
+                    parse_u8(channel, "controller channel")?,
+                    parse_u8(flags, "controller flags")?,
+                ),
+                parse_u32(start_tick, "controller range start")?,
+                parse_u32(end_tick, "controller range end")?,
+                PatternControllerRangeOperation::Spline,
+            )
+        }
         [command, input, output, pattern_id, controller_index]
             if command == "delete-pattern-controller" =>
         {
@@ -176,6 +223,22 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 Path::new(output),
                 parse_u16(pattern_id, "pattern id")?,
                 parse_usize(controller_index, "Pattern controller index")?,
+            )
+        }
+        [command, input, output, pattern_id, channel, flags, start_tick, end_tick]
+            if command == "delete-pattern-controller-range" =>
+        {
+            edit_pattern_controller_range(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                (
+                    parse_u8(channel, "controller channel")?,
+                    parse_u8(flags, "controller flags")?,
+                ),
+                parse_u32(start_tick, "controller range start")?,
+                parse_u32(end_tick, "controller range end")?,
+                PatternControllerRangeOperation::Delete,
             )
         }
         [command, path] if command == "playlist" => list_playlist(Path::new(path), 0, 16),
@@ -2292,6 +2355,10 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild edit-pattern-controller <input.flp> <output.flp> <pattern-id> <controller-index> <position-ticks|-> <value|->\n",
             "  flp-rebuild duplicate-pattern-controller <input.flp> <output.flp> <pattern-id> <template-index> <position-ticks> <value>\n",
             "  flp-rebuild delete-pattern-controller <input.flp> <output.flp> <pattern-id> <controller-index>\n",
+            "  flp-rebuild draw-pattern-controller-points <input.flp> <output.flp> <pattern-id> <channel:0..255> <flags:0..255> <points:tick:value,...>\n",
+            "  flp-rebuild linearize-pattern-controllers <input.flp> <output.flp> <pattern-id> <channel:0..255> <flags:0..255> <start-tick> <end-tick>\n",
+            "  flp-rebuild spline-pattern-controllers <input.flp> <output.flp> <pattern-id> <channel:0..255> <flags:0..255> <start-tick> <end-tick>\n",
+            "  flp-rebuild delete-pattern-controller-range <input.flp> <output.flp> <pattern-id> <channel:0..255> <flags:0..255> <start-tick> <end-tick>\n",
             "  flp-rebuild playlist <file.flp> [start] [count]\n",
             "  flp-rebuild notes <file.flp> <pattern-id> [start] [count]\n",
             "  flp-rebuild events <file.flp> [start] [count]\n",
@@ -2460,6 +2527,23 @@ fn parse_note_specs(channel_id: u16, value: &str) -> Result<Vec<PatternNote>, St
         });
     }
     Ok(notes)
+}
+
+fn parse_pattern_controller_points(value: &str) -> Result<Vec<(u32, f32)>, String> {
+    let mut points = Vec::new();
+    for point in value.split(',') {
+        let mut fields = point.split(':');
+        let position = fields.next().unwrap_or_default();
+        let value = fields.next().unwrap_or_default();
+        if position.is_empty() || value.is_empty() || fields.next().is_some() {
+            return Err("controller points must be comma-separated tick:value pairs".to_owned());
+        }
+        points.push((
+            parse_u32(position, "controller position")?,
+            parse_f32(value, "controller value")?,
+        ));
+    }
+    Ok(points)
 }
 
 fn parse_note_cuts(value: &str) -> Result<Vec<(u16, usize, u32)>, String> {
@@ -4600,6 +4684,82 @@ fn duplicate_pattern_controller(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "duplicated controller point {template_controller_index} as point {controller_index} in pattern {pattern_id} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn draw_pattern_controller_points(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    stream: (u8, u8),
+    points: &[(u32, f32)],
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let added = document
+        .draw_pattern_controller_points(pattern_id, stream, points)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "drew {} controller points in pattern {pattern_id}, channel {}, flags {} (added {added}) to {}",
+        points.len(),
+        stream.0,
+        stream.1,
+        output.display()
+    );
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum PatternControllerRangeOperation {
+    Linear,
+    Spline,
+    Delete,
+}
+
+fn edit_pattern_controller_range(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    stream: (u8, u8),
+    start_tick: u32,
+    end_tick: u32,
+    operation: PatternControllerRangeOperation,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let changed = match operation {
+        PatternControllerRangeOperation::Linear => {
+            document.linearize_pattern_controller_range(pattern_id, stream, start_tick, end_tick)
+        }
+        PatternControllerRangeOperation::Spline => {
+            document.spline_pattern_controller_range(pattern_id, stream, start_tick, end_tick)
+        }
+        PatternControllerRangeOperation::Delete => {
+            document.delete_pattern_controller_range(pattern_id, stream, start_tick, end_tick)
+        }
+    }
+    .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    let operation = match operation {
+        PatternControllerRangeOperation::Linear => "linearized",
+        PatternControllerRangeOperation::Spline => "spline-interpolated",
+        PatternControllerRangeOperation::Delete => "deleted",
+    };
+    println!(
+        "{operation} {changed} raw controller points in pattern {pattern_id}, channel {}, flags {}, ticks {}..={} to {}",
+        stream.0,
+        stream.1,
+        start_tick.min(end_tick),
+        start_tick.max(end_tick),
         output.display()
     );
     Ok(())
