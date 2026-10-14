@@ -13813,6 +13813,28 @@ impl DawUi {
                             );
                         }
 
+                        let can_trigger_performance_scene = self.performance_mode_active
+                            && self.playing
+                            && self.performance_launch_sender.is_some()
+                            && !self.playlist_mute_tool_active
+                            && !suppress_playlist_touch_edits;
+                        let scene_region_response = ui.interact(
+                            grid_rect,
+                            Id::new(("playlist-performance-scene", arrangement.id, track_id)),
+                            if can_trigger_performance_scene {
+                                Sense::click()
+                            } else {
+                                Sense::hover()
+                            },
+                        );
+                        let scene_region_response = if can_trigger_performance_scene {
+                            scene_region_response.on_hover_text(
+                                "Click a blank marker or bar region to launch its scene; Shift-click queues it.",
+                            )
+                        } else {
+                            scene_region_response
+                        };
+
                         let lane_drop_response = ui.interact(
                             grid_rect,
                             Id::new(("playlist-audio-drop", arrangement.id, track_id)),
@@ -14111,9 +14133,8 @@ impl DawUi {
                                     performance_clip_queue_requested = Some(clip_index);
                                 } else if control_pressed {
                                     performance_scene_launch_requested =
-                                        Some((clip_index, false));
-                                    performance_scene_hold_requested =
-                                        Some((clip_index, primary_released));
+                                        Some((clip.position_ticks, false, Some(clip_index)));
+                                    performance_scene_hold_requested = Some(primary_released);
                                 } else {
                                     performance_clip_launch_requested = Some(clip_index);
                                     if hold_press
@@ -14288,7 +14309,7 @@ impl DawUi {
                             let drag_hint = if self.playlist_mute_tool_active {
                                 "Mute tool selected: click to mute or unmute this clip. Press T or select Mute to return to move mode."
                             } else if can_trigger_performance_clip {
-                                "Performance Mode: supported clips trigger on click, Shift-click queues a clip, and Ctrl/Cmd-click launches its scene. The track Queue setting also queues normal clicks."
+                                "Performance Mode: supported clips trigger on click, Shift-click queues a clip, Ctrl/Cmd-click launches its scene, and blank marker/bar cells launch or queue scenes. The track Queue setting also queues normal clicks."
                             } else if !can_resize_clip {
                                 "Drag to move. Resizing and source-window editing are unavailable for this FL Studio clip format."
                             } else if self.playlist_slip_tool_active && is_audio_clip {
@@ -14696,7 +14717,7 @@ impl DawUi {
                                         .clicked()
                                     {
                                         performance_scene_launch_requested =
-                                            Some((clip_index, false));
+                                            Some((clip.position_ticks, false, Some(clip_index)));
                                         ui.close();
                                     }
                                     if ui
@@ -14710,7 +14731,7 @@ impl DawUi {
                                         .clicked()
                                     {
                                         performance_scene_launch_requested =
-                                            Some((clip_index, true));
+                                            Some((clip.position_ticks, true, Some(clip_index)));
                                         ui.close();
                                     }
                                 } else if is_pattern_clip {
@@ -14780,7 +14801,7 @@ impl DawUi {
                                         .clicked()
                                     {
                                         performance_scene_launch_requested =
-                                            Some((clip_index, false));
+                                            Some((clip.position_ticks, false, Some(clip_index)));
                                         ui.close();
                                     }
                                     if ui
@@ -14794,7 +14815,7 @@ impl DawUi {
                                         .clicked()
                                     {
                                         performance_scene_launch_requested =
-                                            Some((clip_index, true));
+                                            Some((clip.position_ticks, true, Some(clip_index)));
                                         ui.close();
                                     }
                                     let can_consolidate_pattern_clip = !clip.is_muted()
@@ -15528,6 +15549,67 @@ impl DawUi {
                                 }
                             }
                         }
+                        if can_trigger_performance_scene {
+                            let (primary_pressed, primary_released, shift_pressed) =
+                                ui.input(|input| {
+                                    (
+                                        input.pointer.button_pressed(PointerButton::Primary),
+                                        input.pointer.button_released(PointerButton::Primary),
+                                        input.modifiers.shift,
+                                    )
+                                });
+                            let row_uses_hold_press = !shift_pressed
+                                && track_state.is_some_and(|track| {
+                                    matches!(
+                                        track.press,
+                                        Some(
+                                            PlaylistTrackPress::HoldStop
+                                                | PlaylistTrackPress::HoldMotion
+                                        )
+                                    )
+                                });
+                            let scene_press_started = if row_uses_hold_press {
+                                primary_pressed
+                                    && scene_region_response.is_pointer_button_down_on()
+                            } else {
+                                scene_region_response.clicked_by(PointerButton::Primary)
+                            };
+                            if scene_press_started
+                                && let Some(pointer) =
+                                    scene_region_response.interact_pointer_pos()
+                            {
+                                let clicked_tick = ((pointer.x - grid_rect.left()).max(0.0)
+                                    / tick_scale.max(0.001))
+                                    .floor()
+                                    .clamp(0.0, u32::MAX as f32)
+                                    as u32;
+                                let clicked_on_clip = arrangement.clips.iter().any(|clip| {
+                                    if clip.track_index != Some(row) {
+                                        return false;
+                                    }
+                                    let left = grid_rect.left()
+                                        + clip.position_ticks as f32 * tick_scale;
+                                    let width = (clip.length_ticks as f32 * tick_scale).max(4.0);
+                                    egui::Rect::from_min_size(
+                                        egui::pos2(left, grid_rect.top() + 3.0),
+                                        Vec2::new(width, row_height - 6.0),
+                                    )
+                                    .contains(pointer)
+                                });
+                                if !clicked_on_clip
+                                    && performance_zone_end_tick
+                                        .is_some_and(|zone_end_tick| clicked_tick < zone_end_tick)
+                                {
+                                    performance_scene_launch_requested = Some((
+                                        clicked_tick,
+                                        shift_pressed,
+                                        None,
+                                    ));
+                                    performance_scene_hold_requested =
+                                        (!shift_pressed).then_some(primary_released);
+                                }
+                            }
+                        }
                         for (marker_index, marker) in arrangement.time_markers.iter().enumerate() {
                             let x = grid_rect.left() + marker.position_ticks() as f32 * tick_scale;
                             if !(grid_rect.left()..=grid_rect.right()).contains(&x) {
@@ -15597,7 +15679,8 @@ impl DawUi {
             .collect::<Vec<_>>();
         let mut performance_scene_summary = None;
         let performance_scene_requested = performance_scene_launch_requested.is_some();
-        if let Some((selected_clip_index, explicit_queue)) = performance_scene_launch_requested
+        if let Some((scene_tick, explicit_queue, source_clip_index)) =
+            performance_scene_launch_requested
             && let Some(zone_end_tick) = performance_zone_end_tick
             && let Some(supported_clip_indices) = self.document.as_ref().and_then(|document| {
                 playlist_performance_clip_indices(document, arrangement.id, zone_end_tick).ok()
@@ -15606,7 +15689,7 @@ impl DawUi {
                 playlist_performance_scene_clip_indices(
                     &arrangement,
                     &supported_clip_indices,
-                    selected_clip_index,
+                    scene_tick,
                     zone_end_tick,
                     ppq,
                     project_time_signature,
@@ -15636,7 +15719,7 @@ impl DawUi {
                 self.status =
                     "Could not find supported clips in this Performance Mode scene".into();
             } else {
-                if let Some((_, release_requested)) = performance_scene_hold_requested {
+                if let Some(release_requested) = performance_scene_hold_requested {
                     for &clip_index in &scene_clip_indices {
                         let track_id = arrangement
                             .clips
@@ -15673,7 +15756,8 @@ impl DawUi {
                     }
                 }
                 performance_scene_summary = Some((
-                    selected_clip_index,
+                    source_clip_index,
+                    scene_group_start_tick,
                     scene_clip_indices.len(),
                     explicit_queue,
                 ));
@@ -15807,20 +15891,22 @@ impl DawUi {
                 }
             }
         }
-        if let Some((selected_clip_index, scene_clip_count, explicit_queue)) =
+        if let Some((source_clip_index, scene_group_start_tick, scene_clip_count, explicit_queue)) =
             performance_scene_summary
             && scene_commands_sent == scene_clip_count
             && !scene_command_failed
         {
+            let scene_source = source_clip_index.map_or_else(
+                || format!("scene at tick {scene_group_start_tick}"),
+                |clip_index| format!("scene from Playlist Clip {}", clip_index + 1),
+            );
             self.status = if explicit_queue {
                 format!(
-                    "Queued scene from Playlist Clip {} across {scene_clip_count} tracks using each track's settings",
-                    selected_clip_index + 1,
+                    "Queued {scene_source} across {scene_clip_count} tracks using each track's settings"
                 )
             } else {
                 format!(
-                    "Scheduled scene from Playlist Clip {} across {scene_clip_count} tracks using each track's settings",
-                    selected_clip_index + 1,
+                    "Scheduled {scene_source} across {scene_clip_count} tracks using each track's settings"
                 )
             };
         }
@@ -41684,7 +41770,7 @@ fn playlist_performance_zone_start_tick(markers: &[TimeMarker]) -> Option<u32> {
 fn playlist_performance_scene_clip_indices(
     arrangement: &Arrangement,
     supported_clip_indices: &BTreeSet<usize>,
-    selected_clip_index: usize,
+    scene_tick: u32,
     performance_zone_end_tick: u32,
     ppq: u16,
     initial_time_signature: Option<(u8, u8)>,
@@ -41712,11 +41798,10 @@ fn playlist_performance_scene_clip_indices(
                 .unwrap_or(0)
         }
     };
-    let selected_clip = arrangement.clips.get(selected_clip_index)?;
-    if !supported_clip_indices.contains(&selected_clip_index) {
+    if scene_tick >= performance_zone_end_tick {
         return None;
     }
-    let selected_group = group_start_tick(selected_clip.position_ticks);
+    let selected_group = group_start_tick(scene_tick);
     let mut clips_by_track = BTreeMap::<u32, Vec<(u32, usize)>>::new();
     for &clip_index in supported_clip_indices {
         let Some(clip) = arrangement.clips.get(clip_index) else {
