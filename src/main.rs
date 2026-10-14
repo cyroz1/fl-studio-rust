@@ -611,6 +611,17 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_bool(enabled, "Mixer insert flag")?,
             )
         }
+        [command, input, output, event_index, routing_flag_index, enabled]
+            if command == "set-mixer-routing-flag" =>
+        {
+            set_mixer_routing_flag(
+                Path::new(input),
+                Path::new(output),
+                parse_usize(event_index, "Mixer routing event index")?,
+                parse_usize(routing_flag_index, "Mixer routing flag byte index")?,
+                parse_bool(enabled, "Mixer routing flag")?,
+            )
+        }
         [command, input, output, channel_id, zipped] if command == "set-channel-zipped" => {
             set_channel_zipped(
                 Path::new(input),
@@ -2531,6 +2542,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild set-mixer-parameter-record-value <input.flp> <output.flp> <event-index> <record-index> <signed-value>\n",
             "  flp-rebuild rename-mixer-insert <input.flp> <output.flp> <insert-ordinal> <name>\n",
             "  flp-rebuild set-mixer-insert-flag <input.flp> <output.flp> <insert-ordinal> <enabled|soloed|polarity-reversed|swap-left-right|effects-enabled> <0|1>\n",
+            "  flp-rebuild set-mixer-routing-flag <input.flp> <output.flp> <event-index> <flag-byte-index> <0|1>\n",
             "  flp-rebuild automation <file.flp>\n",
             "  flp-rebuild time-markers <file.flp>\n",
             "  flp-rebuild sample-paths <file.flp>\n",
@@ -4127,6 +4139,9 @@ fn list_mixer(path: &Path) -> Result<(), String> {
     let parameters = document
         .mixer_parameter_records()
         .map_err(|error| format!("could not decode Mixer parameter records: {error}"))?;
+    let sends = document
+        .mixer_send_summaries()
+        .map_err(|error| format!("could not decode Mixer sends: {error}"))?;
     println!("recognized insert records: {}", inserts.len());
     for insert in inserts {
         println!(
@@ -4176,6 +4191,24 @@ fn list_mixer(path: &Path) -> Result<(), String> {
             record.slot_index(),
             record.target_scope_raw(),
             record.value()
+        );
+    }
+    println!("Mixer sends: {}", sends.len());
+    for send in sends {
+        let (parameter_event, parameter_record) = send.parameter_location();
+        let routing_flag = send
+            .routing_flag_location()
+            .map(|(event, byte)| format!("{event}:{byte}"))
+            .unwrap_or_else(|| "-".to_owned());
+        println!(
+            "source_insert={} route_id=0x{:02X} parameter_event={} parameter_record={} value={} enabled={:?} routing_flag_event_byte={}",
+            send.insert_ordinal(),
+            send.route_parameter_id(),
+            parameter_event,
+            parameter_record,
+            send.value(),
+            send.enabled(),
+            routing_flag
         );
     }
     Ok(())
@@ -4971,6 +5004,30 @@ fn set_mixer_insert_flag(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "set Mixer insert {insert_ordinal} flag {field} to {} in {}",
+        u8::from(enabled),
+        output.display()
+    );
+    Ok(())
+}
+
+fn set_mixer_routing_flag(
+    input: &Path,
+    output: &Path,
+    event_index: usize,
+    routing_flag_index: usize,
+    enabled: bool,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .set_mixer_routing_flag(event_index, routing_flag_index, enabled)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "set Mixer routing event {event_index} flag byte {routing_flag_index} to {} in {}",
         u8::from(enabled),
         output.display()
     );
