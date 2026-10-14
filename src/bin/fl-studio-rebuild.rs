@@ -59,9 +59,9 @@ use flp_rebuild::{
     PatternController, PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation,
     PayloadEncoding, PlaylistClip, PlaylistClipEdit, PlaylistClipSelectionClipboard,
     PlaylistClipTarget, PlaylistTrack, PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress,
-    PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit, RandomNoteGeneratorOptions,
-    RandomizerOptions, RiffMachineOptions, RiffMachineQuantizeMode, ScaleLevelsOptions, TimeMarker,
-    TimeMarkerEdit, VstPluginStateMetadata,
+    PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit, RandomNoteChordMap,
+    RandomNoteGeneratorOptions, RandomizerOptions, RiffMachineOptions, RiffMachineQuantizeMode,
+    ScaleLevelsOptions, TimeMarker, TimeMarkerEdit, VstPluginStateMetadata,
 };
 use md5::{Digest, Md5};
 
@@ -3411,6 +3411,8 @@ struct DawUi {
     random_note_generation_merge_repeated_notes: bool,
     random_note_generation_base_octave: u8,
     random_note_generation_range_octaves: u8,
+    random_note_generation_chord_map: Option<RandomNoteChordMap>,
+    random_note_generation_chord_root: u8,
     random_note_generation_minimum_key: u8,
     random_note_generation_maximum_key: u8,
     random_note_generation_snap_to_scale: bool,
@@ -4192,6 +4194,8 @@ impl DawUi {
             random_note_generation_merge_repeated_notes: false,
             random_note_generation_base_octave: 4,
             random_note_generation_range_octaves: 3,
+            random_note_generation_chord_map: None,
+            random_note_generation_chord_root: 0,
             random_note_generation_minimum_key: 0,
             random_note_generation_maximum_key: 127,
             random_note_generation_snap_to_scale: false,
@@ -25167,6 +25171,38 @@ impl DawUi {
                         "Generate pitches in current scale",
                     );
                 });
+                egui::ComboBox::from_id_salt("random-note-chord-map")
+                    .selected_text(self.random_note_generation_chord_map.map_or("Off", |map| {
+                        map.label()
+                    }))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.random_note_generation_chord_map,
+                            None,
+                            "Off",
+                        );
+                        for chord_map in RandomNoteChordMap::ALL {
+                            ui.selectable_value(
+                                &mut self.random_note_generation_chord_map,
+                                Some(chord_map),
+                                chord_map.label(),
+                            );
+                        }
+                    });
+                ui.add_enabled_ui(self.random_note_generation_chord_map.is_some(), |ui| {
+                    egui::ComboBox::from_id_salt("random-note-chord-root")
+                        .selected_text(PITCH_CLASSES
+                            [usize::from(self.random_note_generation_chord_root)])
+                        .show_ui(ui, |ui| {
+                            for (root, label) in PITCH_CLASSES.iter().enumerate() {
+                                ui.selectable_value(
+                                    &mut self.random_note_generation_chord_root,
+                                    root as u8,
+                                    *label,
+                                );
+                            }
+                        });
+                });
                 ui.small("Generated note length follows the snap grid; the time range end is exclusive.");
                 ui.add(
                     egui::Slider::new(&mut self.randomizer_velocity_amount, -100..=100)
@@ -25695,6 +25731,8 @@ impl DawUi {
                 let merge_repeated_notes = self.random_note_generation_merge_repeated_notes;
                 let base_octave = self.random_note_generation_base_octave;
                 let range_octaves = self.random_note_generation_range_octaves;
+                let chord_map = self.random_note_generation_chord_map;
+                let chord_root = self.random_note_generation_chord_root;
                 let minimum_key = u16::from(self.random_note_generation_minimum_key);
                 let maximum_key = u16::from(self.random_note_generation_maximum_key);
                 let scale_root = self.piano_roll_scale_root;
@@ -25713,6 +25751,8 @@ impl DawUi {
                     merge_repeated_notes,
                     base_octave: Some(base_octave),
                     range_octaves: Some(range_octaves),
+                    chord_map,
+                    chord_root,
                     minimum_key,
                     maximum_key,
                 };
@@ -25742,12 +25782,19 @@ impl DawUi {
                             self.dirty = true;
                         }
                         self.status = format!(
-                            "Generated {created} notes in pattern {pattern_id} from tick {start_tick} to {end_tick} using seed {seed}, octave {base_octave}, range {range_octaves}, and {length_variation_percent}% length variation{}",
+                            "Generated {created} notes in pattern {pattern_id} from tick {start_tick} to {end_tick} using seed {seed}, octave {base_octave}, range {range_octaves}, and {length_variation_percent}% length variation{}{}",
                             if snap_to_scale {
                                 " within the current scale"
                             } else {
                                 ""
-                            }
+                            },
+                            chord_map.map_or_else(String::new, |map| {
+                                format!(
+                                    " using {} rooted at {}",
+                                    map.label(),
+                                    PITCH_CLASSES[usize::from(chord_root)]
+                                )
+                            })
                         );
                     }
                     Err(error) => self.status = format!("Could not generate random notes: {error}"),

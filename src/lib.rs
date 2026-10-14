@@ -1389,6 +1389,171 @@ pub struct RandomizerOptions {
     pub reset_levels: bool,
 }
 
+/// Chord tones used to constrain seeded random note generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RandomNoteChordMap {
+    Major,
+    Minor,
+    Diminished,
+    Augmented,
+    Suspended2,
+    Suspended4,
+    Power,
+    Dominant7,
+    Major7,
+    Minor7,
+    Major6,
+    Minor6,
+    Add9,
+    MinorAdd9,
+    Diminished7,
+    HalfDiminished7,
+    MinorMajor7,
+    Dominant7Flat5,
+    Dominant7Sharp5,
+    Dominant7Flat9,
+    Dominant7Sharp9,
+    Dominant9,
+    Major9,
+    Minor9,
+    Dominant11,
+    Minor11,
+    Dominant13,
+    Major7Add13,
+}
+
+impl RandomNoteChordMap {
+    pub const ALL: [Self; 28] = [
+        Self::Major,
+        Self::Minor,
+        Self::Diminished,
+        Self::Augmented,
+        Self::Suspended2,
+        Self::Suspended4,
+        Self::Power,
+        Self::Dominant7,
+        Self::Major7,
+        Self::Minor7,
+        Self::Major6,
+        Self::Minor6,
+        Self::Add9,
+        Self::MinorAdd9,
+        Self::Diminished7,
+        Self::HalfDiminished7,
+        Self::MinorMajor7,
+        Self::Dominant7Flat5,
+        Self::Dominant7Sharp5,
+        Self::Dominant7Flat9,
+        Self::Dominant7Sharp9,
+        Self::Dominant9,
+        Self::Major9,
+        Self::Minor9,
+        Self::Dominant11,
+        Self::Minor11,
+        Self::Dominant13,
+        Self::Major7Add13,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Major => "Major",
+            Self::Minor => "Minor",
+            Self::Diminished => "Diminished",
+            Self::Augmented => "Augmented",
+            Self::Suspended2 => "Suspended 2",
+            Self::Suspended4 => "Suspended 4",
+            Self::Power => "Power fifth",
+            Self::Dominant7 => "Dominant 7",
+            Self::Major7 => "Major 7",
+            Self::Minor7 => "Minor 7",
+            Self::Major6 => "Major 6",
+            Self::Minor6 => "Minor 6",
+            Self::Add9 => "Add 9",
+            Self::MinorAdd9 => "Minor add 9",
+            Self::Diminished7 => "Diminished 7",
+            Self::HalfDiminished7 => "Half-diminished 7",
+            Self::MinorMajor7 => "Minor-major 7",
+            Self::Dominant7Flat5 => "Dominant 7 flat 5",
+            Self::Dominant7Sharp5 => "Dominant 7 sharp 5",
+            Self::Dominant7Flat9 => "Dominant 7 flat 9",
+            Self::Dominant7Sharp9 => "Dominant 7 sharp 9",
+            Self::Dominant9 => "Dominant 9",
+            Self::Major9 => "Major 9",
+            Self::Minor9 => "Minor 9",
+            Self::Dominant11 => "Dominant 11",
+            Self::Minor11 => "Minor 11",
+            Self::Dominant13 => "Dominant 13",
+            Self::Major7Add13 => "Major 7 add 13",
+        }
+    }
+
+    pub fn cli_name(self) -> &'static str {
+        match self {
+            Self::Major => "major",
+            Self::Minor => "minor",
+            Self::Diminished => "diminished",
+            Self::Augmented => "augmented",
+            Self::Suspended2 => "sus2",
+            Self::Suspended4 => "sus4",
+            Self::Power => "power",
+            Self::Dominant7 => "dominant7",
+            Self::Major7 => "major7",
+            Self::Minor7 => "minor7",
+            Self::Major6 => "major6",
+            Self::Minor6 => "minor6",
+            Self::Add9 => "add9",
+            Self::MinorAdd9 => "minor-add9",
+            Self::Diminished7 => "diminished7",
+            Self::HalfDiminished7 => "half-diminished7",
+            Self::MinorMajor7 => "minor-major7",
+            Self::Dominant7Flat5 => "dominant7-flat5",
+            Self::Dominant7Sharp5 => "dominant7-sharp5",
+            Self::Dominant7Flat9 => "dominant7-flat9",
+            Self::Dominant7Sharp9 => "dominant7-sharp9",
+            Self::Dominant9 => "dominant9",
+            Self::Major9 => "major9",
+            Self::Minor9 => "minor9",
+            Self::Dominant11 => "dominant11",
+            Self::Minor11 => "minor11",
+            Self::Dominant13 => "dominant13",
+            Self::Major7Add13 => "major7-add13",
+        }
+    }
+
+    pub fn intervals(self) -> &'static [u8] {
+        match self {
+            Self::Major => &[0, 4, 7],
+            Self::Minor => &[0, 3, 7],
+            Self::Diminished => &[0, 3, 6],
+            Self::Augmented => &[0, 4, 8],
+            Self::Suspended2 => &[0, 2, 7],
+            Self::Suspended4 => &[0, 5, 7],
+            Self::Power => &[0, 7, 12],
+            Self::Dominant7 => &[0, 4, 7, 10],
+            Self::Major7 => &[0, 4, 7, 11],
+            Self::Minor7 => &[0, 3, 7, 10],
+            Self::Major6 => &[0, 4, 7, 9],
+            Self::Minor6 => &[0, 3, 7, 9],
+            Self::Add9 => &[0, 4, 7, 14],
+            Self::MinorAdd9 => &[0, 3, 7, 14],
+            Self::Diminished7 => &[0, 3, 6, 9],
+            Self::HalfDiminished7 => &[0, 3, 6, 10],
+            Self::MinorMajor7 => &[0, 3, 7, 11],
+            Self::Dominant7Flat5 => &[0, 4, 6, 10],
+            Self::Dominant7Sharp5 => &[0, 4, 8, 10],
+            Self::Dominant7Flat9 => &[0, 4, 7, 10, 13],
+            Self::Dominant7Sharp9 => &[0, 4, 7, 10, 15],
+            Self::Dominant9 => &[0, 4, 7, 10, 14],
+            Self::Major9 => &[0, 4, 7, 11, 14],
+            Self::Minor9 => &[0, 3, 7, 10, 14],
+            Self::Dominant11 => &[0, 4, 7, 10, 14, 17],
+            Self::Minor11 => &[0, 3, 7, 10, 14, 17],
+            Self::Dominant13 => &[0, 4, 7, 10, 14, 17, 21],
+            Self::Major7Add13 => &[0, 4, 7, 11, 21],
+        }
+    }
+}
+
 /// Parameters for generating seeded notes on a bounded Piano roll grid range.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RandomNoteGeneratorOptions {
@@ -1409,6 +1574,10 @@ pub struct RandomNoteGeneratorOptions {
     pub base_octave: Option<u8>,
     /// Number of octaves above the base octave included in the pitch pool.
     pub range_octaves: Option<u8>,
+    /// Optional chord map. Its pitch classes are combined with any selected scale.
+    pub chord_map: Option<RandomNoteChordMap>,
+    /// Chord-map root pitch class, 0 = C through 11 = B.
+    pub chord_root: u8,
     pub minimum_key: u16,
     pub maximum_key: u16,
 }
@@ -11051,6 +11220,11 @@ impl FlpDocument {
                 "random note generation octave range does not overlap the selected key bounds",
             ));
         }
+        if options.chord_map.is_some() && options.chord_root > 11 {
+            return Err(FlpError::UnsupportedEdit(
+                "random note generation chord root must be between 0 and 11",
+            ));
+        }
         if let Some((scale_root, scale_intervals)) = scale
             && (scale_root > 11
                 || scale_intervals.is_empty()
@@ -11084,6 +11258,10 @@ impl FlpDocument {
             .filter(|key| {
                 scale.is_none_or(|(root, intervals)| {
                     note_pitch_in_scale(i32::from(*key), root, intervals)
+                }) && options.chord_map.is_none_or(|chord_map| {
+                    chord_map.intervals().iter().any(|interval| {
+                        (u16::from(options.chord_root) + u16::from(*interval)) % 12 == *key % 12
+                    })
                 })
             })
             .collect::<Vec<_>>();
