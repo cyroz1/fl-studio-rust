@@ -4500,30 +4500,35 @@ pub fn stream_sampler_midi_input_to_device(
     }
 }
 
-/// Stream live MIDI events through one prepared VST3 channel while transport is stopped.
+/// Stream live MIDI events through prepared VST3 channels while transport is stopped.
 ///
 /// Arrangement notes are removed from the prepared live stream before this function is called.
-/// The processor still supplies the channel's mixer routing, latency compensation, and pitch
-/// settings while note events arrive on the worker thread.
+/// The processor still supplies each channel's mixer routing, latency compensation, and pitch
+/// settings while note events arrive on the worker thread. Layer sources route notes through the
+/// same key-range and Random selection rules used by rendered patterns.
 pub fn stream_vst3_midi_input_to_device(
     mut processor: Vst3PlaylistStreamProcessor,
     document: FlpDocument,
-    channel_id: u16,
+    source_channel_id: u16,
+    target_channel_ids: BTreeSet<u16>,
     events: Receiver<Vst3LiveInputEvent>,
     writer: &StreamingAudioWriter,
     cancelled: &AtomicBool,
 ) -> Result<(), String> {
-    if !processor.performance_channel_ids().contains(&channel_id) {
+    let available_channel_ids = processor.performance_channel_ids();
+    if !target_channel_ids.is_subset(&available_channel_ids) {
         return Err(format!(
-            "VST3 channel {channel_id} is not available for live MIDI audition"
+            "one or more VST3 channels for source {source_channel_id} are not available for live MIDI audition"
         ));
     }
+    let channel_router = ChannelNoteRouter::new(document.channels());
     let master_output = MixerMasterOutput::from_document(&document);
     processor.start_processing()?;
 
     const LIVE_BLOCK_FRAMES: usize = 128;
     let mut block = vec![0.0f32; LIVE_BLOCK_FRAMES * 2];
-    let mut note_ids = HashMap::<(u8, u8), VecDeque<(i32, u8)>>::new();
+    let mut note_ids = HashMap::<(u8, u8), VecDeque<Vec<(u16, i32, u8)>>>::new();
+    let mut note_seed = 0u64;
     let stream_result = (|| {
         loop {
             if cancelled.load(Ordering::Acquire) || writer.is_cancelled() {
@@ -4538,13 +4543,25 @@ pub fn stream_vst3_midi_input_to_device(
                         velocity,
                     }) => {
                         let source_key = key.min(127);
-                        let (note_id, rendered_key) = processor.schedule_live_input_note_on(
-                            channel_id, channel, source_key, velocity,
-                        )?;
+                        let routed_targets = channel_router
+                            .targets_for_note(source_channel_id, note_seed, u16::from(source_key))
+                            .into_iter()
+                            .filter(|target_id| target_channel_ids.contains(target_id));
+                        note_seed = note_seed.wrapping_add(1);
+                        let mut active_targets = Vec::new();
+                        for target_channel_id in routed_targets {
+                            let (note_id, rendered_key) = processor.schedule_live_input_note_on(
+                                target_channel_id,
+                                channel,
+                                source_key,
+                                velocity,
+                            )?;
+                            active_targets.push((target_channel_id, note_id, rendered_key));
+                        }
                         note_ids
                             .entry((channel & 0x0F, source_key))
                             .or_default()
-                            .push_back((note_id, rendered_key));
+                            .push_back(active_targets);
                     }
                     Ok(Vst3LiveInputEvent::NoteOff { channel, key }) => {
                         let source_note = (channel & 0x0F, key.min(127));
@@ -4553,13 +4570,32 @@ pub fn stream_vst3_midi_input_to_device(
                         if note_ids.get(&source_note).is_some_and(VecDeque::is_empty) {
                             note_ids.remove(&source_note);
                         }
-                        if let Some((note_id, rendered_key)) = active_note {
-                            processor.schedule_live_input_note_off(
-                                channel_id,
-                                channel,
-                                rendered_key,
-                                note_id,
-                            )?;
+                        if let Some(active_targets) = active_note {
+                            for (target_channel_id, note_id, rendered_key) in active_targets {
+                                processor.schedule_live_input_note_off(
+                                    target_channel_id,
+                                    channel,
+                                    rendered_key,
+                                    note_id,
+                                )?;
+                            }
+                        }
+                    }
+                    Ok(
+                        live_event @ Vst3LiveInputEvent::PolyphonicPressure { channel, key, .. },
+                    ) => {
+                        let source_note = (channel & 0x0F, key.min(127));
+                        let affected_targets = note_ids
+                            .get(&source_note)
+                            .into_iter()
+                            .flatten()
+                            .flatten()
+                            .map(|(target_channel_id, _, _)| *target_channel_id)
+                            .collect::<BTreeSet<_>>();
+                        let midi_event = live_input_controller_event(live_event)?;
+                        for target_channel_id in affected_targets {
+                            processor
+                                .schedule_live_input_midi_event(target_channel_id, midi_event)?;
                         }
                     }
                     Ok(live_event) => {
@@ -4572,10 +4608,11 @@ pub fn stream_vst3_midi_input_to_device(
                             note_ids
                                 .retain(|(midi_channel, _), _| *midi_channel != (channel & 0x0F));
                         }
-                        processor.schedule_live_input_midi_event(
-                            channel_id,
-                            live_input_controller_event(live_event)?,
-                        )?;
+                        let midi_event = live_input_controller_event(live_event)?;
+                        for target_channel_id in &target_channel_ids {
+                            processor
+                                .schedule_live_input_midi_event(*target_channel_id, midi_event)?;
+                        }
                     }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {

@@ -3750,6 +3750,7 @@ struct LiveSamplerInputSession {
 struct LiveVst3InputSession {
     pattern_id: u16,
     channel_id: u16,
+    target_channel_ids: BTreeSet<u16>,
     sender: Sender<Vst3LiveInputEvent>,
     receiver: Receiver<Result<(), String>>,
     cancelled: Arc<AtomicBool>,
@@ -34527,6 +34528,42 @@ impl DawUi {
         }
     }
 
+    fn live_vst3_target_channels(&self, source_channel_id: u16) -> Option<BTreeSet<u16>> {
+        let channels = self.document.as_ref()?.channels();
+        let channels_by_id = channels
+            .iter()
+            .map(|channel| (channel.id(), channel))
+            .collect::<BTreeMap<_, _>>();
+        let source = channels_by_id.get(&source_channel_id)?;
+        if source.enabled() == Some(false) {
+            return None;
+        }
+        if self.channel_vst3_instances.contains_key(&source_channel_id) {
+            return Some(BTreeSet::from([source_channel_id]));
+        }
+        if source.channel_type() != Some(ChannelType::Layer) {
+            return None;
+        }
+        let mut seen = BTreeSet::new();
+        let mut target_channels = BTreeSet::new();
+        for child_id in source.layer_child_ids()? {
+            if !seen.insert(*child_id) {
+                continue;
+            }
+            let Some(child) = channels_by_id.get(child_id) else {
+                continue;
+            };
+            if child.enabled() == Some(false) || child.channel_type() == Some(ChannelType::Layer) {
+                continue;
+            }
+            if !self.channel_vst3_instances.contains_key(child_id) {
+                return None;
+            }
+            target_channels.insert(*child_id);
+        }
+        (!target_channels.is_empty()).then_some(target_channels)
+    }
+
     fn start_live_vst3_input(&mut self, pattern_id: u16, channel_id: u16) -> bool {
         let Some(document) = self.document.as_ref().cloned() else {
             return false;
@@ -34542,8 +34579,8 @@ impl DawUi {
             self.status = "Enable the selected VST3 channel for live MIDI audition".to_owned();
             return false;
         }
-        let Some(instance_id) = self.channel_vst3_instances.get(&channel_id).copied() else {
-            self.status = "Load the selected VST3 channel before live MIDI audition".to_owned();
+        let Some(target_channel_ids) = self.live_vst3_target_channels(channel_id) else {
+            self.status = "Live VST3 audition needs a loaded VST3 channel or a Layer whose enabled non-Layer children are loaded VST3s".to_owned();
             return false;
         };
         if self.audio_engine.is_none() {
@@ -34609,8 +34646,13 @@ impl DawUi {
             self.status = "Load the selected VST3 channel before live MIDI audition".to_owned();
             return false;
         };
-        let channel_instances = [(channel_id, instance_id)].into_iter().collect();
-        let live_channels = BTreeSet::from([channel_id]);
+        let channel_instances = self
+            .channel_vst3_instances
+            .iter()
+            .filter(|(target_id, _)| target_channel_ids.contains(target_id))
+            .map(|(&target_id, &instance_id)| (target_id, instance_id))
+            .collect::<BTreeMap<_, _>>();
+        let live_channels = target_channel_ids.clone();
         let mut processor = match host.prepare_playlist_performance_stream(
             &preparation_document,
             options,
@@ -34624,9 +34666,11 @@ impl DawUi {
                 return false;
             }
         };
-        if let Err(error) = processor.clear_live_input_events(channel_id) {
-            self.status = format!("Could not prepare VST3 input audition: {error}");
-            return false;
+        for target_channel_id in &target_channel_ids {
+            if let Err(error) = processor.clear_live_input_events(*target_channel_id) {
+                self.status = format!("Could not prepare VST3 input audition: {error}");
+                return false;
+            }
         }
         let writer = match engine.begin_live_streaming_playback() {
             Ok(writer) => writer,
@@ -34639,6 +34683,7 @@ impl DawUi {
         let (result_sender, result_receiver) = mpsc::sync_channel(1);
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
+        let worker_target_channel_ids = target_channel_ids.clone();
         let worker_document = document;
         let worker = thread::Builder::new()
             .name("vst3-midi-input".to_owned())
@@ -34647,6 +34692,7 @@ impl DawUi {
                     processor,
                     worker_document,
                     channel_id,
+                    worker_target_channel_ids,
                     event_receiver,
                     &writer,
                     &worker_cancelled,
@@ -34660,6 +34706,7 @@ impl DawUi {
                 self.live_vst3_input = Some(LiveVst3InputSession {
                     pattern_id,
                     channel_id,
+                    target_channel_ids,
                     sender: event_sender,
                     receiver: result_receiver,
                     cancelled,
@@ -35154,7 +35201,7 @@ impl DawUi {
         else {
             return;
         };
-        if !self.channel_vst3_instances.contains_key(&channel_id) {
+        if self.live_vst3_target_channels(channel_id).is_none() {
             return;
         }
         if self.live_sampler_input.is_some() {
@@ -35314,9 +35361,8 @@ impl DawUi {
                 || self.midi_input_connection.is_none()
                 || Some(session.pattern_id) != self.selected_pattern
                 || Some(session.channel_id) != self.selected_note_channel
-                || !self
-                    .channel_vst3_instances
-                    .contains_key(&session.channel_id)
+                || self.live_vst3_target_channels(session.channel_id).as_ref()
+                    != Some(&session.target_channel_ids)
         }) {
             self.stop_live_vst3_input();
             if let Some(engine) = &self.audio_engine {
