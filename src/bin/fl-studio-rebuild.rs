@@ -42752,7 +42752,7 @@ fn playlist_performance_scene_clip_indices(
         .time_markers
         .iter()
         .filter(|marker| {
-            !marker.is_signature() && marker.position_ticks() < performance_zone_end_tick
+            !marker.is_signature() && marker.position_ticks() < context.performance_zone_end_tick
         })
         .map(TimeMarker::position_ticks)
         .collect::<Vec<_>>();
