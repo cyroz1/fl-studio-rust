@@ -14666,7 +14666,7 @@ impl DawUi {
                         );
                         let scene_region_response = if can_trigger_performance_scene {
                             scene_region_response.on_hover_text(
-                                "Click a blank marker or bar region to launch its full scene; Shift-click queues it.",
+                                "Click a blank marker or bar region to launch its full scene, stopping tracks without a supported clip; Shift-click queues it.",
                             )
                         } else {
                             scene_region_response
@@ -15549,7 +15549,7 @@ impl DawUi {
                                             egui::Button::new("Launch scene"),
                                         )
                                         .on_hover_text(
-                                            "Schedules one supported clip from this scene column per Playlist track, limited to this clip's Track Group when applicable. Repeated scene launches cycle sub-clips; bars define the columns when no non-signature markers precede Start.",
+                                            "Schedules one supported clip from this scene column per Playlist track and stops tracks in scope without a supported clip. The scene is limited to this clip's Track Group when applicable. Repeated scene launches cycle sub-clips; bars define the columns when no non-signature markers precede Start.",
                                         )
                                         .clicked()
                                     {
@@ -15633,7 +15633,7 @@ impl DawUi {
                                             egui::Button::new("Launch scene"),
                                         )
                                         .on_hover_text(
-                                            "Schedules one supported clip from this scene column per Playlist track, limited to this clip's Track Group when applicable. Repeated scene launches cycle sub-clips; bars define the columns when no non-signature markers precede Start.",
+                                            "Schedules one supported clip from this scene column per Playlist track and stops tracks in scope without a supported clip. The scene is limited to this clip's Track Group when applicable. Repeated scene launches cycle sub-clips; bars define the columns when no non-signature markers precede Start.",
                                         )
                                         .clicked()
                                     {
@@ -16619,6 +16619,9 @@ impl DawUi {
         }
         let mut scene_commands_sent = 0usize;
         let mut scene_command_failed = false;
+        let mut scene_launched_track_ids = BTreeSet::new();
+        let mut scene_start_tick = None::<u32>;
+        let mut scene_contains_queued_clip = false;
         for (clip_index, explicit_queue, is_scene_clip) in performance_clip_launch_actions {
             let launch_request = self.performance_clip_launch_request(
                 PerformanceLaunchContext {
@@ -16642,6 +16645,18 @@ impl DawUi {
                     Ok(()) => {
                         if is_scene_clip {
                             scene_commands_sent += 1;
+                            if let Some(track_id) = arrangement
+                                .clips
+                                .get(clip_index)
+                                .and_then(PlaylistClip::playlist_track_id)
+                            {
+                                scene_launched_track_ids.insert(track_id);
+                            }
+                            scene_start_tick = Some(
+                                scene_start_tick
+                                    .map_or(start_tick, |current: u32| current.min(start_tick)),
+                            );
+                            scene_contains_queued_clip |= queue_launch;
                         }
                         self.status = if queue_launch {
                             format!(
@@ -16675,6 +16690,19 @@ impl DawUi {
             && scene_commands_sent == scene_clip_count
             && !scene_command_failed
         {
+            if !explicit_queue
+                && !scene_contains_queued_clip
+                && let Some(scene_start_tick) = scene_start_tick
+            {
+                for track in &tracks {
+                    if scene_track_group_range
+                        .is_none_or(|(first, last)| (first..=last).contains(&track.id))
+                        && !scene_launched_track_ids.contains(&track.id)
+                    {
+                        self.queue_performance_track_stop_at_tick(track.id, scene_start_tick);
+                    }
+                }
+            }
             let scene_source = source_clip_index.map_or_else(
                 || format!("scene at tick {scene_group_start_tick}"),
                 |clip_index| format!("scene from Playlist Clip {}", clip_index + 1),
