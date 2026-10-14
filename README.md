@@ -79,6 +79,7 @@ flp-rebuild quantize-notes-selected <input.flp> <output.flp> <pattern-id> <chann
 flp-rebuild legato-notes <input.flp> <output.flp> <pattern-id> <channel-id>
 flp-rebuild legato-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based>
 flp-rebuild chop-notes <input.flp> <output.flp> <pattern-id> <channel-id> <divisions-2..64>
+flp-rebuild chop-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <divisions-2..64>
 flp-rebuild glue-notes <input.flp> <output.flp> <pattern-id> <channel-id>
 flp-rebuild flip-notes <input.flp> <output.flp> <pattern-id> <channel-id>
 flp-rebuild strum-notes <input.flp> <output.flp> <pattern-id> <channel-id> <spread-ticks> <up|down>
@@ -171,7 +172,7 @@ In the Piano roll, **Quantize selected** targets the current selection. The **Ed
 
 The Piano roll's **Edit** target selector applies note-transform buttons to either the whole channel or only selected notes. **Legato channel/selected** extends targeted notes to the next distinct onset in the channel; notes in the final onset group keep their current lengths. `legato-notes-selected` applies this to comma-separated zero-based channel-local note indexes.
 
-**Chop channel/selected** and `chop-notes` divide eligible notes into equal segments. Each new segment retains the source note's properties; any leftover ticks stay in the final segment.
+**Chop channel/selected** and `chop-notes` divide eligible notes into equal segments. Each new segment retains the source note's properties; any leftover ticks stay in the final segment. `chop-notes-selected` accepts comma-separated zero-based channel-local note indexes.
 
 **Glue channel/selected** and `glue-notes` join touching or overlapping targeted notes when all stored properties besides position and length match.
 
