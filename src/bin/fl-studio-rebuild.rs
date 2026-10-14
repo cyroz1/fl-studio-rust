@@ -3161,7 +3161,7 @@ struct DawUi {
     history_snapshot_available_this_frame: bool,
     playing: bool,
     performance_mode_active: bool,
-    held_performance_clip: Option<(u16, u32, usize)>,
+    held_performance_clips: Vec<(u16, u32, usize)>,
     performance_scene_round_robin: BTreeMap<(u16, u32, u32), usize>,
     performance_launch_sender: Option<Sender<PlaylistPerformanceCommand>>,
     project_playback_loaded: bool,
@@ -3885,7 +3885,7 @@ impl DawUi {
             history_snapshot_available_this_frame: false,
             playing: false,
             performance_mode_active: false,
-            held_performance_clip: None,
+            held_performance_clips: Vec::new(),
             performance_scene_round_robin: BTreeMap::new(),
             performance_launch_sender: None,
             project_playback_loaded: false,
@@ -7911,7 +7911,7 @@ impl DawUi {
     }
 
     fn stop_project_playback(&mut self) {
-        self.held_performance_clip = None;
+        self.held_performance_clips.clear();
         self.performance_scene_round_robin.clear();
         self.performance_launch_sender = None;
         self.stop_midi_playlist_playback();
@@ -12513,7 +12513,8 @@ impl DawUi {
         let mut performance_clip_launch_requested = None;
         let mut performance_clip_queue_requested = None;
         let mut performance_scene_launch_requested = None;
-        let mut performance_hold_release_requested = None;
+        let mut performance_scene_hold_requested = None;
+        let mut performance_hold_release_requested = Vec::new();
         let mut seek_tick_requested = None;
         let mut dropped_playlist_audio = None;
         let mut playlist_clip_vertical_move = None;
@@ -14070,11 +14071,17 @@ impl DawUi {
                                 clip_press,
                                 Some(PlaylistTrackPress::HoldStop | PlaylistTrackPress::HoldMotion)
                             );
-                            let (primary_pressed, primary_released, shift_pressed) = ui.input(|input| {
+                            let (
+                                primary_pressed,
+                                primary_released,
+                                shift_pressed,
+                                control_pressed,
+                            ) = ui.input(|input| {
                                 (
                                     input.pointer.button_pressed(PointerButton::Primary),
                                     input.pointer.button_released(PointerButton::Primary),
                                     input.modifiers.shift,
+                                    input.modifiers.ctrl || input.modifiers.command,
                                 )
                             });
                             let performance_press_started = if hold_press && !shift_pressed {
@@ -14102,20 +14109,25 @@ impl DawUi {
                             {
                                 if shift_pressed {
                                     performance_clip_queue_requested = Some(clip_index);
+                                } else if control_pressed {
+                                    performance_scene_launch_requested =
+                                        Some((clip_index, false));
+                                    performance_scene_hold_requested =
+                                        Some((clip_index, primary_released));
                                 } else {
                                     performance_clip_launch_requested = Some(clip_index);
                                     if hold_press
                                         && let Some(track_id) = clip_track_id
                                     {
                                         if primary_released {
-                                            performance_hold_release_requested = Some((
+                                            performance_hold_release_requested.push((
                                                 arrangement.id,
                                                 track_id,
                                                 clip_index,
                                             ));
                                         } else {
-                                            self.held_performance_clip =
-                                                Some((arrangement.id, track_id, clip_index));
+                                            self.held_performance_clips
+                                                .push((arrangement.id, track_id, clip_index));
                                         }
                                     }
                                 }
@@ -14276,7 +14288,7 @@ impl DawUi {
                             let drag_hint = if self.playlist_mute_tool_active {
                                 "Mute tool selected: click to mute or unmute this clip. Press T or select Mute to return to move mode."
                             } else if can_trigger_performance_clip {
-                                "Performance Mode: supported clips trigger on click, or queue in request order with Shift-click. The track Queue setting also queues normal clicks."
+                                "Performance Mode: supported clips trigger on click, Shift-click queues a clip, and Ctrl/Cmd-click launches its scene. The track Queue setting also queues normal clicks."
                             } else if !can_resize_clip {
                                 "Drag to move. Resizing and source-window editing are unavailable for this FL Studio clip format."
                             } else if self.playlist_slip_tool_active && is_audio_clip {
@@ -15624,6 +15636,42 @@ impl DawUi {
                 self.status =
                     "Could not find supported clips in this Performance Mode scene".into();
             } else {
+                if let Some((_, release_requested)) = performance_scene_hold_requested {
+                    for &clip_index in &scene_clip_indices {
+                        let track_id = arrangement
+                            .clips
+                            .get(clip_index)
+                            .and_then(PlaylistClip::playlist_track_id);
+                        let is_hold_track = track_id
+                            .and_then(|track_id| tracks.iter().find(|track| track.id == track_id))
+                            .is_some_and(|track| {
+                                matches!(
+                                    track.press,
+                                    Some(
+                                        PlaylistTrackPress::HoldStop
+                                            | PlaylistTrackPress::HoldMotion
+                                    )
+                                )
+                            });
+                        if let Some(track_id) = track_id
+                            && is_hold_track
+                        {
+                            if release_requested {
+                                performance_hold_release_requested.push((
+                                    arrangement.id,
+                                    track_id,
+                                    clip_index,
+                                ));
+                            } else {
+                                self.held_performance_clips.push((
+                                    arrangement.id,
+                                    track_id,
+                                    clip_index,
+                                ));
+                            }
+                        }
+                    }
+                }
                 performance_scene_summary = Some((
                     selected_clip_index,
                     scene_clip_indices.len(),
@@ -15777,7 +15825,7 @@ impl DawUi {
             };
         }
 
-        if let Some((arrangement_id, track_id, clip_index)) = performance_hold_release_requested {
+        for (arrangement_id, track_id, clip_index) in performance_hold_release_requested {
             self.queue_performance_hold_release(arrangement_id, track_id, clip_index);
         }
 
@@ -35941,10 +35989,13 @@ impl eframe::App for DawUi {
         *ui.visuals_mut() = app_visuals();
         self.guard_window_close(ui.ctx());
         if ui.input(|input| input.pointer.button_released(PointerButton::Primary))
-            && let Some((arrangement_id, track_id, clip_index)) = self.held_performance_clip.take()
             && self.performance_launch_sender.is_some()
         {
-            self.queue_performance_hold_release(arrangement_id, track_id, clip_index);
+            for (arrangement_id, track_id, clip_index) in
+                std::mem::take(&mut self.held_performance_clips)
+            {
+                self.queue_performance_hold_release(arrangement_id, track_id, clip_index);
+            }
         }
         let history_navigation_requested = ui.input(|input| {
             input.modifiers.command
