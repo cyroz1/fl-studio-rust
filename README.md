@@ -91,6 +91,7 @@ flp-rebuild limit-notes-selected <input.flp> <output.flp> <pattern-id> <channel-
 flp-rebuild arp-notes <input.flp> <output.flp> <pattern-id> <channel-id> <step-ticks> <range-octaves-1..4> <gate-1..100> <up|down|up-down>
 flp-rebuild arp-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <step-ticks> <range-octaves-1..4> <gate-1..100> <up|down|up-down>
 flp-rebuild slice-notes <input.flp> <output.flp> <pattern-id> <channel-id> <position-ticks>
+flp-rebuild slice-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <position-ticks>
 flp-rebuild add-note <input.flp> <output.flp> <pattern-id> <channel-id> <position> <length> <key> <velocity>
 flp-rebuild delete-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index>
 flp-rebuild import-midi <input.flp> <input.mid> <output.flp> <track> <pattern-id> <channel-id>
@@ -144,7 +145,7 @@ The selected-note inspector can toggle a **Slide** note flag and shows a small m
 
 Use Ctrl/Cmd+B or **Selection → Duplicate to right** to copy the selected notes, or all notes in the current channel when nothing is selected. The copy preserves note properties and moves right by the notes' combined time span; a separate time-range repeat interval is not available yet.
 
-**Slice channel/selected** and `slice-notes` split targeted notes that cross the chosen tick into two notes. Both pieces retain the source note's properties.
+**Slice channel/selected** and `slice-notes` split targeted notes that cross the chosen tick into two notes. Both pieces retain the source note's properties. `slice-notes-selected` accepts comma-separated zero-based channel-local note indexes.
 
 The desktop executable also accepts an `.flp` path as its first argument to open that project at startup.
 
