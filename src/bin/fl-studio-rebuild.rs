@@ -48,7 +48,7 @@ use flp_rebuild::vst3::{
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, Arrangement, ArticulateOptions, AutomationChannel,
     AutomationPoint, AutomationPointEdit, ChannelGroupSummary, ChannelSortOrder, ChannelSummary,
-    ChannelType, ClawMachineOptions, FlpDocument, FlpError, FstPreset, FstPresetKind,
+    ChannelType, ClawMachineOptions, FlamOptions, FlpDocument, FlpError, FstPreset, FstPresetKind,
     LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerParameterKind,
     MixerParameterRecord, PATTERN_NOTE_DEFAULT_FLAGS, PATTERN_NOTE_DEFAULT_RELEASE, Pattern,
     PatternController, PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation,
@@ -24420,28 +24420,26 @@ impl DawUi {
             let result = stroke_ticks
                 .ok_or_else(|| "Flam time cannot be mapped to a positive project tick".to_owned())
                 .and_then(|stroke_ticks| {
+                    let options = FlamOptions {
+                        stroke_ticks,
+                        velocity,
+                        before,
+                        group_notes,
+                    };
                     self.document
                         .as_mut()
                         .ok_or_else(|| "no project is open".to_owned())
                         .and_then(|document| {
                             let result = if edit_selection_only {
-                                document.flam_pattern_note_selection_with_grouping(
+                                document.flam_pattern_note_selection_with_options(
                                     pattern_id,
                                     channel_id,
                                     &selected_quantize_indices,
-                                    stroke_ticks,
-                                    velocity,
-                                    before,
-                                    group_notes,
+                                    options,
                                 )
                             } else {
-                                document.flam_pattern_notes_with_grouping(
-                                    pattern_id,
-                                    channel_id,
-                                    stroke_ticks,
-                                    velocity,
-                                    before,
-                                    group_notes,
+                                document.flam_pattern_notes_with_options(
+                                    pattern_id, channel_id, options,
                                 )
                             };
                             result.map_err(|error| error.to_string())

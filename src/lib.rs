@@ -1347,6 +1347,26 @@ pub struct RandomizerOptions {
     pub reset_levels: bool,
 }
 
+/// Parameters for adding and optionally grouping Flam strokes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FlamOptions {
+    pub stroke_ticks: u32,
+    pub velocity: u8,
+    pub before: bool,
+    pub group_notes: bool,
+}
+
+impl Default for FlamOptions {
+    fn default() -> Self {
+        Self {
+            stroke_ticks: 12,
+            velocity: 80,
+            before: true,
+            group_notes: false,
+        }
+    }
+}
+
 /// Parameters for scaling note velocity with a pivot and logarithmic tension.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ScaleLevelsOptions {
@@ -10704,32 +10724,23 @@ impl FlpDocument {
             pattern_id,
             channel_id,
             None,
-            stroke_ticks,
-            velocity,
-            before,
-            false,
+            FlamOptions {
+                stroke_ticks,
+                velocity,
+                before,
+                group_notes: false,
+            },
         )
     }
 
-    /// Adds short strokes and groups them with the processed channel notes when requested.
-    pub fn flam_pattern_notes_with_grouping(
+    /// Adds short strokes using the supplied timing, velocity, placement, and grouping options.
+    pub fn flam_pattern_notes_with_options(
         &mut self,
         pattern_id: u16,
         channel_id: u16,
-        stroke_ticks: u32,
-        velocity: u8,
-        before: bool,
-        group_notes: bool,
+        options: FlamOptions,
     ) -> Result<usize, FlpError> {
-        self.flam_pattern_notes_in_scope(
-            pattern_id,
-            channel_id,
-            None,
-            stroke_ticks,
-            velocity,
-            before,
-            group_notes,
-        )
+        self.flam_pattern_notes_in_scope(pattern_id, channel_id, None, options)
     }
 
     /// Adds flam strokes only for the supplied selected channel-local note indices.
@@ -10746,33 +10757,24 @@ impl FlpDocument {
             pattern_id,
             channel_id,
             Some(note_indices),
-            stroke_ticks,
-            velocity,
-            before,
-            false,
+            FlamOptions {
+                stroke_ticks,
+                velocity,
+                before,
+                group_notes: false,
+            },
         )
     }
 
-    /// Adds strokes to selected notes and optionally groups the originals with their strokes.
-    pub fn flam_pattern_note_selection_with_grouping(
+    /// Adds strokes to selected notes using the supplied options.
+    pub fn flam_pattern_note_selection_with_options(
         &mut self,
         pattern_id: u16,
         channel_id: u16,
         note_indices: &[usize],
-        stroke_ticks: u32,
-        velocity: u8,
-        before: bool,
-        group_notes: bool,
+        options: FlamOptions,
     ) -> Result<usize, FlpError> {
-        self.flam_pattern_notes_in_scope(
-            pattern_id,
-            channel_id,
-            Some(note_indices),
-            stroke_ticks,
-            velocity,
-            before,
-            group_notes,
-        )
+        self.flam_pattern_notes_in_scope(pattern_id, channel_id, Some(note_indices), options)
     }
 
     fn flam_pattern_notes_in_scope(
@@ -10780,11 +10782,14 @@ impl FlpDocument {
         pattern_id: u16,
         channel_id: u16,
         note_indices: Option<&[usize]>,
-        stroke_ticks: u32,
-        velocity: u8,
-        before: bool,
-        group_notes: bool,
+        options: FlamOptions,
     ) -> Result<usize, FlpError> {
+        let FlamOptions {
+            stroke_ticks,
+            velocity,
+            before,
+            group_notes,
+        } = options;
         if stroke_ticks == 0 {
             return Err(FlpError::UnsupportedEdit(
                 "flam stroke time must be greater than zero ticks",
