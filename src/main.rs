@@ -731,6 +731,110 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 scale_intervals,
             )
         }
+        [command, input, output, pattern_id, channel_id, note_indices, seed, velocity_amount,
+            pan_amount, pitch_range, bipolar, reset_levels]
+            if command == "randomize-notes-selected" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            randomize_notes_selection(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                &note_indices,
+                RandomizerOptions {
+                    seed: parse_u64(seed, "randomizer seed")?,
+                    velocity_amount_percent: parse_i16(velocity_amount, "velocity amount")?,
+                    pan_amount_percent: parse_i16(pan_amount, "pan amount")?,
+                    release_amount_percent: 0,
+                    mod_x_amount_percent: 0,
+                    mod_y_amount_percent: 0,
+                    pitch_range_semitones: parse_u8(pitch_range, "pitch range")?,
+                    bipolar: parse_bool(bipolar, "bipolar")?,
+                    reset_levels: parse_bool(reset_levels, "reset levels")?,
+                },
+                None,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, note_indices, seed, velocity_amount,
+            pan_amount, pitch_range, bipolar, reset_levels, release_amount, mod_x_amount,
+            mod_y_amount]
+            if command == "randomize-notes-selected" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            randomize_notes_selection(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                &note_indices,
+                RandomizerOptions {
+                    seed: parse_u64(seed, "randomizer seed")?,
+                    velocity_amount_percent: parse_i16(velocity_amount, "velocity amount")?,
+                    pan_amount_percent: parse_i16(pan_amount, "pan amount")?,
+                    release_amount_percent: parse_i16(release_amount, "release amount")?,
+                    mod_x_amount_percent: parse_i16(mod_x_amount, "Mod X amount")?,
+                    mod_y_amount_percent: parse_i16(mod_y_amount, "Mod Y amount")?,
+                    pitch_range_semitones: parse_u8(pitch_range, "pitch range")?,
+                    bipolar: parse_bool(bipolar, "bipolar")?,
+                    reset_levels: parse_bool(reset_levels, "reset levels")?,
+                },
+                None,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, note_indices, seed, velocity_amount,
+            pan_amount, pitch_range, bipolar, reset_levels, scale_name, scale_root]
+            if command == "randomize-notes-selected-scale" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            let scale_intervals = parse_scale_name(scale_name)?;
+            randomize_notes_selection(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                &note_indices,
+                RandomizerOptions {
+                    seed: parse_u64(seed, "randomizer seed")?,
+                    velocity_amount_percent: parse_i16(velocity_amount, "velocity amount")?,
+                    pan_amount_percent: parse_i16(pan_amount, "pan amount")?,
+                    release_amount_percent: 0,
+                    mod_x_amount_percent: 0,
+                    mod_y_amount_percent: 0,
+                    pitch_range_semitones: parse_u8(pitch_range, "pitch range")?,
+                    bipolar: parse_bool(bipolar, "bipolar")?,
+                    reset_levels: parse_bool(reset_levels, "reset levels")?,
+                },
+                Some((parse_u8(scale_root, "scale root")?, scale_intervals)),
+            )
+        }
+        [command, input, output, pattern_id, channel_id, note_indices, seed, velocity_amount,
+            pan_amount, pitch_range, bipolar, reset_levels, scale_name, scale_root, release_amount,
+            mod_x_amount, mod_y_amount]
+            if command == "randomize-notes-selected-scale" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            let scale_intervals = parse_scale_name(scale_name)?;
+            randomize_notes_selection(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                &note_indices,
+                RandomizerOptions {
+                    seed: parse_u64(seed, "randomizer seed")?,
+                    velocity_amount_percent: parse_i16(velocity_amount, "velocity amount")?,
+                    pan_amount_percent: parse_i16(pan_amount, "pan amount")?,
+                    release_amount_percent: parse_i16(release_amount, "release amount")?,
+                    mod_x_amount_percent: parse_i16(mod_x_amount, "Mod X amount")?,
+                    mod_y_amount_percent: parse_i16(mod_y_amount, "Mod Y amount")?,
+                    pitch_range_semitones: parse_u8(pitch_range, "pitch range")?,
+                    bipolar: parse_bool(bipolar, "bipolar")?,
+                    reset_levels: parse_bool(reset_levels, "reset levels")?,
+                },
+                Some((parse_u8(scale_root, "scale root")?, scale_intervals)),
+            )
+        }
         [command, input, output, pattern_id, channel_id, seed, timing_range, velocity_variation]
             if command == "humanize-notes" =>
         {
@@ -1208,6 +1312,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild flam-notes <input.flp> <output.flp> <pattern-id> <channel-id> <stroke-ticks> <velocity-0..127> <before|after>\n",
             "  flp-rebuild randomize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <velocity:-100..100> <pan:-100..100> <pitch-range:0..24> <bipolar:0|1> <reset:0|1> [release:-100..100 mod-x:-100..100 mod-y:-100..100]\n",
             "  flp-rebuild randomize-notes-scale <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <velocity:-100..100> <pan:-100..100> <pitch-range:0..24> <bipolar:0|1> <reset:0|1> <scale-name> <scale-root:0..11> [release:-100..100 mod-x:-100..100 mod-y:-100..100]\n",
+            "  flp-rebuild randomize-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <seed> <velocity:-100..100> <pan:-100..100> <pitch-range:0..24> <bipolar:0|1> <reset:0|1> [release:-100..100 mod-x:-100..100 mod-y:-100..100]\n",
+            "  flp-rebuild randomize-notes-selected-scale <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <seed> <velocity:-100..100> <pan:-100..100> <pitch-range:0..24> <bipolar:0|1> <reset:0|1> <scale-name> <scale-root:0..11> [release:-100..100 mod-x:-100..100 mod-y:-100..100]\n",
             "  flp-rebuild humanize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <timing-range-ticks> <velocity-variation-0..100> [pan-variation-0..100 release-variation-0..100 mod-x-variation-0..100 mod-y-variation-0..100]\n",
             "  flp-rebuild limit-notes <input.flp> <output.flp> <pattern-id> <channel-id> <minimum-key-0..127> <maximum-key-0..127>\n",
             "  flp-rebuild arp-notes <input.flp> <output.flp> <pattern-id> <channel-id> <step-ticks> <range-octaves-1..4> <gate-1..100> <up|down|up-down>\n",
@@ -1258,6 +1364,23 @@ fn parse_clip_indices(value: &str) -> Result<Vec<usize>, String> {
     }
     if indices.len() < 2 {
         return Err("merge-pattern-clips requires at least two clip indexes".to_owned());
+    }
+    Ok(indices)
+}
+
+fn parse_note_indices(value: &str) -> Result<Vec<usize>, String> {
+    let indices = value
+        .split(',')
+        .map(|part| {
+            let part = part.trim();
+            if part.is_empty() {
+                return Err("note indexes must be comma-separated non-negative integers".to_owned());
+            }
+            parse_usize(part, "note index")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if indices.is_empty() {
+        return Err("at least one channel-local note index is required".to_owned());
     }
     Ok(indices)
 }
@@ -3370,7 +3493,7 @@ fn randomize_notes(
     channel_id: u16,
     options: RandomizerOptions,
 ) -> Result<(), String> {
-    randomize_notes_inner(input, output, pattern_id, channel_id, options, None)
+    randomize_notes_inner(input, output, pattern_id, channel_id, None, options, None)
 }
 
 fn randomize_notes_with_scale(
@@ -3387,8 +3510,29 @@ fn randomize_notes_with_scale(
         output,
         pattern_id,
         channel_id,
+        None,
         options,
         Some((scale_root, scale_intervals)),
+    )
+}
+
+fn randomize_notes_selection(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    note_indices: &[usize],
+    options: RandomizerOptions,
+    scale: Option<(u8, &[u8])>,
+) -> Result<(), String> {
+    randomize_notes_inner(
+        input,
+        output,
+        pattern_id,
+        channel_id,
+        Some(note_indices),
+        options,
+        scale,
     )
 }
 
@@ -3397,19 +3541,32 @@ fn randomize_notes_inner(
     output: &Path,
     pattern_id: u16,
     channel_id: u16,
+    note_indices: Option<&[usize]>,
     options: RandomizerOptions,
     scale: Option<(u8, &[u8])>,
 ) -> Result<(), String> {
     let (_, mut document) = load_document(input)?;
-    let changed = match scale {
-        Some((scale_root, scale_intervals)) => document.randomize_pattern_notes_with_scale(
+    let changed = match (note_indices, scale) {
+        (Some(note_indices), Some((scale_root, scale_intervals))) => document
+            .randomize_pattern_note_selection_with_scale(
+                pattern_id,
+                channel_id,
+                note_indices,
+                options,
+                scale_root,
+                scale_intervals,
+            ),
+        (Some(note_indices), None) => {
+            document.randomize_pattern_note_selection(pattern_id, channel_id, note_indices, options)
+        }
+        (None, Some((scale_root, scale_intervals))) => document.randomize_pattern_notes_with_scale(
             pattern_id,
             channel_id,
             options,
             scale_root,
             scale_intervals,
         ),
-        None => document.randomize_pattern_notes(pattern_id, channel_id, options),
+        (None, None) => document.randomize_pattern_notes(pattern_id, channel_id, options),
     }
     .map_err(|error| error.to_string())?;
     let bytes = document
