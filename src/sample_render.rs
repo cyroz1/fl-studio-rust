@@ -1075,6 +1075,47 @@ fn playlist_performance_vst3_note_source_supported(
     loaded_vst3_channels.contains(&source_channel_id) && source.plugin_identifier().is_some()
 }
 
+fn playlist_performance_note_source_route_kinds(
+    source_channel_id: u16,
+    channels: &HashMap<u16, ChannelSummary>,
+    loaded_vst3_channels: &BTreeSet<u16>,
+) -> Option<(bool, bool)> {
+    let source = channels.get(&source_channel_id)?;
+    if source.enabled() == Some(false) {
+        return None;
+    }
+    if let Some(child_ids) = source.layer_child_ids() {
+        if child_ids.is_empty() {
+            return None;
+        }
+        let (mut has_sampler, mut has_vst3) = (false, false);
+        for child_id in child_ids {
+            let child = channels.get(child_id)?;
+            if child.enabled() == Some(false) || child.kind() == Some(3) {
+                return None;
+            }
+            if child.kind() == Some(0) {
+                has_sampler = true;
+            } else if loaded_vst3_channels.contains(child_id) && child.plugin_identifier().is_some()
+            {
+                has_vst3 = true;
+            } else {
+                return None;
+            }
+        }
+        return Some((has_sampler, has_vst3));
+    }
+    if source.kind() == Some(0) {
+        Some((true, false))
+    } else if loaded_vst3_channels.contains(&source_channel_id)
+        && source.plugin_identifier().is_some()
+    {
+        Some((false, true))
+    } else {
+        None
+    }
+}
+
 fn playlist_performance_vst3_clip_candidates(
     document: &FlpDocument,
     arrangement_id: u16,
@@ -1143,6 +1184,85 @@ fn playlist_performance_vst3_clip_candidates(
         .collect())
 }
 
+fn playlist_performance_mixed_source_clip_candidates(
+    document: &FlpDocument,
+    arrangement_id: u16,
+    performance_zone_end_tick: u32,
+    loaded_vst3_channels: &BTreeSet<u16>,
+) -> Result<BTreeSet<usize>, String> {
+    if loaded_vst3_channels.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let arrangement = document
+        .arrangements()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|arrangement| arrangement.id == arrangement_id)
+        .ok_or_else(|| format!("arrangement {arrangement_id} was not found"))?;
+    let patterns = document
+        .patterns()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|pattern| (pattern.id, pattern))
+        .collect::<HashMap<_, _>>();
+    let channels = document
+        .channels()
+        .into_iter()
+        .map(|channel| (channel.id(), channel))
+        .collect::<HashMap<_, _>>();
+    let disabled_tracks = document
+        .playlist_tracks()
+        .into_iter()
+        .filter(|track| track.enabled == Some(false))
+        .map(|track| track.id)
+        .collect::<BTreeSet<_>>();
+    Ok(arrangement
+        .clips
+        .iter()
+        .enumerate()
+        .filter_map(|(index, clip)| {
+            let PlaylistClipTarget::Pattern { id } = clip.target() else {
+                return None;
+            };
+            let track_id = clip.playlist_track_id()?;
+            let pattern = patterns.get(&id)?;
+            let notes = pattern
+                .notes
+                .iter()
+                .filter(|note| !note.is_muted())
+                .collect::<Vec<_>>();
+            let (mut has_sampler, mut has_vst3) = (false, false);
+            let sources_supported = notes.iter().all(|note| {
+                let Some((note_has_sampler, note_has_vst3)) =
+                    playlist_performance_note_source_route_kinds(
+                        note.channel_id,
+                        &channels,
+                        loaded_vst3_channels,
+                    )
+                else {
+                    return false;
+                };
+                has_sampler |= note_has_sampler;
+                has_vst3 |= note_has_vst3;
+                true
+            });
+            (clip.position_ticks < performance_zone_end_tick
+                && clip.length_ticks > 0
+                && !clip.is_muted()
+                && !disabled_tracks.contains(&track_id)
+                && clip
+                    .scale
+                    .is_none_or(|scale| scale.is_finite() && (scale - 1.0).abs() <= 1e-9)
+                && pattern.controllers.is_empty()
+                && !notes.is_empty()
+                && sources_supported
+                && has_sampler
+                && has_vst3)
+                .then_some(index)
+        })
+        .collect())
+}
+
 /// Return supported Audio and Sampler clips before Start.
 pub fn playlist_performance_clip_indices(
     document: &FlpDocument,
@@ -1157,8 +1277,8 @@ pub fn playlist_performance_clip_indices(
     )
 }
 
-/// Return supported Performance Mode clips, including Layers whose direct children are all loaded
-/// VST3 channels.
+/// Return supported Performance Mode clips, including Pattern Clips that combine enabled Sampler
+/// and loaded VST3 destinations.
 pub fn playlist_performance_clip_indices_with_vst3(
     document: &FlpDocument,
     arrangement_id: u16,
@@ -1176,6 +1296,12 @@ pub fn playlist_performance_clip_indices_with_vst3(
         performance_zone_end_tick,
     )?);
     clip_indices.extend(playlist_performance_vst3_clip_candidates(
+        document,
+        arrangement_id,
+        performance_zone_end_tick,
+        loaded_vst3_channels,
+    )?);
+    clip_indices.extend(playlist_performance_mixed_source_clip_candidates(
         document,
         arrangement_id,
         performance_zone_end_tick,
@@ -1215,19 +1341,26 @@ pub fn playlist_performance_clip_indices_with_vst3(
     Ok(clip_indices)
 }
 
-/// Return only VST3 Pattern Clips on tracks whose Performance Zone media is fully supported.
+/// Return VST3 and mixed Sampler/VST3 Pattern Clips on tracks whose Performance Zone media is fully
+/// supported.
 pub fn playlist_performance_vst3_clip_indices(
     document: &FlpDocument,
     arrangement_id: u16,
     performance_zone_end_tick: u32,
     loaded_vst3_channels: &BTreeSet<u16>,
 ) -> Result<BTreeSet<usize>, String> {
-    let candidates = playlist_performance_vst3_clip_candidates(
+    let mut candidates = playlist_performance_vst3_clip_candidates(
         document,
         arrangement_id,
         performance_zone_end_tick,
         loaded_vst3_channels,
     )?;
+    candidates.extend(playlist_performance_mixed_source_clip_candidates(
+        document,
+        arrangement_id,
+        performance_zone_end_tick,
+        loaded_vst3_channels,
+    )?);
     let supported = playlist_performance_clip_indices_with_vst3(
         document,
         arrangement_id,
@@ -1752,6 +1885,12 @@ pub fn stream_playlist_performance_with_vst3_to_device(
         options.arrangement_id,
         performance.performance_zone_end_tick,
     )?;
+    performance_sampler_clip_indices.extend(playlist_performance_mixed_source_clip_candidates(
+        document,
+        options.arrangement_id,
+        performance.performance_zone_end_tick,
+        &loaded_vst3_channels,
+    )?);
     let mut performance_audio_clip_indices = playlist_performance_audio_clip_indices(
         document,
         options.arrangement_id,
@@ -6515,6 +6654,7 @@ impl PlaylistPerformanceRuntime {
     ) -> Result<(), String> {
         let is_sampler_clip = self.clips_by_index.contains_key(&launch.clip_index);
         let is_audio_clip = self.audio_clips_by_index.contains_key(&launch.clip_index);
+        let is_vst3_clip = self.vst3_clips_by_index.contains_key(&launch.clip_index);
         let (track_id, length_ticks) =
             if let Some(clip) = self.clips_by_index.get(&launch.clip_index) {
                 (clip.track_id, clip.length_ticks)
@@ -6551,7 +6691,8 @@ impl PlaylistPerformanceRuntime {
                     first_pass_scheduled: false,
                 },
             );
-        } else if is_audio_clip {
+        }
+        if is_audio_clip {
             self.active_audio_by_track.insert(
                 track_id,
                 ActivePerformanceAudioClip {
@@ -6563,7 +6704,8 @@ impl PlaylistPerformanceRuntime {
                     first_pass_scheduled: false,
                 },
             );
-        } else {
+        }
+        if is_vst3_clip {
             self.active_vst3_by_track.insert(
                 track_id,
                 ActivePerformanceVst3Clip {
