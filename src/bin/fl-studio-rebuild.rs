@@ -3741,6 +3741,7 @@ struct PendingSamplerStream {
 struct LiveSamplerInputSession {
     pattern_id: u16,
     channel_id: u16,
+    target_channel_ids: BTreeSet<u16>,
     sender: Sender<SamplerLiveNoteEvent>,
     receiver: Receiver<Result<(), String>>,
     cancelled: Arc<AtomicBool>,
@@ -34528,6 +34529,42 @@ impl DawUi {
         }
     }
 
+    fn live_sampler_target_channels(&self, source_channel_id: u16) -> Option<BTreeSet<u16>> {
+        let channels = self.document.as_ref()?.channels();
+        let channels_by_id = channels
+            .iter()
+            .map(|channel| (channel.id(), channel))
+            .collect::<BTreeMap<_, _>>();
+        let source = channels_by_id.get(&source_channel_id)?;
+        if source.enabled() == Some(false) {
+            return None;
+        }
+        if source.kind() == Some(0) {
+            return Some(BTreeSet::from([source_channel_id]));
+        }
+        if source.channel_type() != Some(ChannelType::Layer) {
+            return None;
+        }
+        let mut seen = BTreeSet::new();
+        let mut target_channels = BTreeSet::new();
+        for child_id in source.layer_child_ids()? {
+            if !seen.insert(*child_id) {
+                continue;
+            }
+            let Some(child) = channels_by_id.get(child_id) else {
+                continue;
+            };
+            if child.enabled() == Some(false) || child.channel_type() == Some(ChannelType::Layer) {
+                continue;
+            }
+            if child.kind() != Some(0) {
+                return None;
+            }
+            target_channels.insert(*child_id);
+        }
+        (!target_channels.is_empty()).then_some(target_channels)
+    }
+
     fn live_vst3_target_channels(&self, source_channel_id: u16) -> Option<BTreeSet<u16>> {
         let channels = self.document.as_ref()?.channels();
         let channels_by_id = channels
@@ -34768,20 +34805,19 @@ impl DawUi {
         else {
             return false;
         };
-        if channel.kind() != Some(0) {
-            self.status = "Select a Sampler channel for live MIDI audition".to_owned();
-            return false;
-        }
         if channel.enabled() == Some(false) {
             self.status = "Enable the selected Sampler channel for live MIDI audition".to_owned();
             return false;
         }
+        let Some(target_channel_ids) = self.live_sampler_target_channels(channel_id) else {
+            self.status = "Live Sampler audition needs a Sampler channel or a Layer whose enabled non-Layer children are Samplers".to_owned();
+            return false;
+        };
         let Some(project_path) = self.sample_project_path() else {
             self.status = "Save the project before auditioning its Sampler input".to_owned();
             return false;
         };
-        let mut preview_document = document;
-        let pattern = match preview_document.patterns() {
+        let pattern = match document.patterns() {
             Ok(patterns) => patterns
                 .into_iter()
                 .find(|pattern| pattern.id == pattern_id),
@@ -34790,38 +34826,11 @@ impl DawUi {
                 return false;
             }
         };
-        let Some(pattern) = pattern else {
+        let Some(_pattern) = pattern else {
             self.status = format!("Pattern {pattern_id} was not found");
             return false;
         };
-        if !pattern
-            .notes
-            .iter()
-            .any(|note| note.channel_id == channel_id && !note.is_muted())
-            && let Err(error) = preview_document.add_pattern_note(
-                pattern_id,
-                PatternNote {
-                    position: 0,
-                    flags: PATTERN_NOTE_DEFAULT_FLAGS,
-                    channel_id,
-                    length: 1,
-                    key: 60,
-                    group: 0,
-                    fine_pitch: 120,
-                    reserved: 0,
-                    release: PATTERN_NOTE_DEFAULT_RELEASE,
-                    midi_channel: 0,
-                    pan: 64,
-                    velocity: 1,
-                    mod_x: 128,
-                    mod_y: 128,
-                },
-            )
-        {
-            self.status = format!("Could not prepare Sampler input audition: {error}");
-            return false;
-        }
-        let project_bytes = match preview_document.encode_lossless() {
+        let project_bytes = match document.encode_lossless() {
             Ok(bytes) => bytes,
             Err(error) => {
                 self.status = format!("Could not encode Sampler input audition: {error}");
@@ -34866,6 +34875,7 @@ impl DawUi {
         let (result_sender, result_receiver) = mpsc::sync_channel(1);
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
+        let worker_target_channel_ids = target_channel_ids.clone();
         let read_sample_root_note = self.read_sample_root_note;
         let resampling_quality = self.live_resampling_quality;
         let initial_pitch_bend_cents = self
@@ -34896,6 +34906,7 @@ impl DawUi {
                                 ..SamplerPatternRenderOptions::default()
                             },
                             channel_id,
+                            worker_target_channel_ids,
                             event_receiver,
                             &writer,
                             &worker_cancelled,
@@ -34927,6 +34938,7 @@ impl DawUi {
                 self.live_sampler_input = Some(LiveSamplerInputSession {
                     pattern_id,
                     channel_id,
+                    target_channel_ids,
                     sender: event_sender,
                     receiver: result_receiver,
                     cancelled,
@@ -34979,13 +34991,7 @@ impl DawUi {
         else {
             return;
         };
-        let is_sampler_channel = self.document.as_ref().is_some_and(|document| {
-            document
-                .channels()
-                .iter()
-                .any(|channel| channel.id() == channel_id && channel.kind() == Some(0))
-        });
-        if !is_sampler_channel {
+        if self.live_sampler_target_channels(channel_id).is_none() {
             return;
         }
         if self.live_vst3_input.is_some() {
@@ -35149,6 +35155,10 @@ impl DawUi {
                 || self.midi_input_connection.is_none()
                 || Some(session.pattern_id) != self.selected_pattern
                 || Some(session.channel_id) != self.selected_note_channel
+                || self
+                    .live_sampler_target_channels(session.channel_id)
+                    .as_ref()
+                    != Some(&session.target_channel_ids)
         }) {
             self.stop_live_sampler_input();
             if let Some(engine) = &self.audio_engine {
