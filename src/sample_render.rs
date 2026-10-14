@@ -969,14 +969,36 @@ fn playlist_performance_sampler_clip_candidates(
                 && pattern.controllers.is_empty()
                 && pattern.notes.iter().all(|note| {
                     note.is_muted()
-                        || channels.get(&note.channel_id).is_some_and(|channel| {
-                            channel.kind() == Some(0) && channel.enabled() != Some(false)
-                        })
+                        || playlist_performance_sampler_note_source_supported(
+                            note.channel_id,
+                            &channels,
+                        )
                 }))
             .then_some(index)
         })
         .collect::<BTreeSet<_>>();
     Ok(candidates)
+}
+
+fn playlist_performance_sampler_note_source_supported(
+    source_channel_id: u16,
+    channels: &HashMap<u16, ChannelSummary>,
+) -> bool {
+    let Some(source) = channels.get(&source_channel_id) else {
+        return false;
+    };
+    if source.enabled() == Some(false) {
+        return false;
+    }
+    if let Some(child_ids) = source.layer_child_ids() {
+        return !child_ids.is_empty()
+            && child_ids.iter().all(|child_id| {
+                channels
+                    .get(child_id)
+                    .is_some_and(|child| child.kind() == Some(0) && child.enabled() != Some(false))
+            });
+    }
+    source.kind() == Some(0)
 }
 
 /// Return enabled Audio Clips before the Start marker that can be launched in Performance Mode.
@@ -1699,8 +1721,8 @@ pub fn stream_playlist_with_vst3_to_device_with_monitor(
 /// Stream arrangement audio while accepting quantized Audio and Sampler Clip launches.
 ///
 /// The arrangement must contain supported clips before the named Start marker. Launches replace
-/// content from the same Playlist track and repeat at the clip's tick length. Loaded direct VST3
-/// Pattern channels can receive live clip launches alongside Sampler and Audio Clips.
+/// content from the same Playlist track and repeat at the clip's tick length. Loaded VST3 Pattern
+/// Clips can receive live launches alongside Sampler and Audio Clips.
 pub fn stream_playlist_performance_with_vst3_to_device(
     document: &FlpDocument,
     project_path: impl AsRef<Path>,
