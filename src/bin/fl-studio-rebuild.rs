@@ -3398,6 +3398,9 @@ struct DawUi {
     randomizer_seed: u64,
     randomizer_velocity_amount: i16,
     randomizer_pan_amount: i16,
+    randomizer_release_amount: i16,
+    randomizer_mod_x_amount: i16,
+    randomizer_mod_y_amount: i16,
     randomizer_pitch_range: u8,
     randomizer_bipolar: bool,
     randomizer_reset_levels: bool,
@@ -4163,6 +4166,9 @@ impl DawUi {
             randomizer_seed: 1,
             randomizer_velocity_amount: 0,
             randomizer_pan_amount: 0,
+            randomizer_release_amount: 0,
+            randomizer_mod_x_amount: 0,
+            randomizer_mod_y_amount: 0,
             randomizer_pitch_range: 0,
             randomizer_bipolar: true,
             randomizer_reset_levels: false,
@@ -25073,6 +25079,18 @@ impl DawUi {
                         .text("Pan randomize (%)"),
                 );
                 ui.add(
+                    egui::Slider::new(&mut self.randomizer_release_amount, -100..=100)
+                        .text("Release randomize (%)"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.randomizer_mod_x_amount, -100..=100)
+                        .text("Mod X randomize (%)"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.randomizer_mod_y_amount, -100..=100)
+                        .text("Mod Y randomize (%)"),
+                );
+                ui.add(
                     egui::Slider::new(&mut self.randomizer_pitch_range, 0..=24)
                         .text("Pitch range (semitones)"),
                 );
@@ -25554,6 +25572,9 @@ impl DawUi {
             let seed = self.randomizer_seed;
             let velocity_amount = self.randomizer_velocity_amount;
             let pan_amount = self.randomizer_pan_amount;
+            let release_amount = self.randomizer_release_amount;
+            let mod_x_amount = self.randomizer_mod_x_amount;
+            let mod_y_amount = self.randomizer_mod_y_amount;
             let pitch_range = self.randomizer_pitch_range;
             let bipolar = self.randomizer_bipolar;
             let reset_levels = self.randomizer_reset_levels;
@@ -25570,6 +25591,9 @@ impl DawUi {
                             seed,
                             velocity_amount_percent: velocity_amount,
                             pan_amount_percent: pan_amount,
+                            release_amount_percent: release_amount,
+                            mod_x_amount_percent: mod_x_amount,
+                            mod_y_amount_percent: mod_y_amount,
                             pitch_range_semitones: pitch_range,
                             bipolar,
                             reset_levels,
@@ -25596,6 +25620,9 @@ impl DawUi {
                             seed,
                             velocity_amount_percent: velocity_amount,
                             pan_amount_percent: pan_amount,
+                            release_amount_percent: release_amount,
+                            mod_x_amount_percent: mod_x_amount,
+                            mod_y_amount_percent: mod_y_amount,
                             pitch_range_semitones: pitch_range,
                             bipolar,
                             reset_levels,

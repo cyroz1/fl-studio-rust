@@ -1375,12 +1375,15 @@ fn riff_machine_groove_note_timing(
     Ok((start, length.max(1)))
 }
 
-/// Parameters for seeded note velocity, pan, and pitch randomization.
+/// Parameters for seeded note-level and pitch randomization.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RandomizerOptions {
     pub seed: u64,
     pub velocity_amount_percent: i16,
     pub pan_amount_percent: i16,
+    pub release_amount_percent: i16,
+    pub mod_x_amount_percent: i16,
+    pub mod_y_amount_percent: i16,
     pub pitch_range_semitones: u8,
     pub bipolar: bool,
     pub reset_levels: bool,
@@ -10988,15 +10991,21 @@ impl FlpDocument {
             seed,
             velocity_amount_percent,
             pan_amount_percent,
+            release_amount_percent,
+            mod_x_amount_percent,
+            mod_y_amount_percent,
             pitch_range_semitones,
             bipolar,
             reset_levels,
         } = options;
         if !(-100..=100).contains(&velocity_amount_percent)
             || !(-100..=100).contains(&pan_amount_percent)
+            || !(-100..=100).contains(&release_amount_percent)
+            || !(-100..=100).contains(&mod_x_amount_percent)
+            || !(-100..=100).contains(&mod_y_amount_percent)
         {
             return Err(FlpError::UnsupportedEdit(
-                "randomizer velocity and pan amounts must be between -100 and 100",
+                "randomizer level amounts must be between -100 and 100",
             ));
         }
         if pitch_range_semitones > 24 {
@@ -11048,9 +11057,27 @@ impl FlpDocument {
             } else {
                 i32::from(note.pan)
             };
+            let release_base = if reset_levels {
+                64
+            } else {
+                i32::from(note.release)
+            };
+            let mod_x_base = if reset_levels {
+                128
+            } else {
+                i32::from(note.mod_x)
+            };
+            let mod_y_base = if reset_levels {
+                128
+            } else {
+                i32::from(note.mod_y)
+            };
             let velocity_range =
                 (127 * i32::from(velocity_amount_percent.unsigned_abs()) + 50) / 100;
             let pan_range = (127 * i32::from(pan_amount_percent.unsigned_abs()) + 50) / 100;
+            let release_range = (128 * i32::from(release_amount_percent.unsigned_abs()) + 50) / 100;
+            let mod_x_range = (255 * i32::from(mod_x_amount_percent.unsigned_abs()) + 50) / 100;
+            let mod_y_range = (255 * i32::from(mod_y_amount_percent.unsigned_abs()) + 50) / 100;
             let velocity_offset = randomizer_offset(
                 &mut state,
                 velocity_range,
@@ -11063,6 +11090,51 @@ impl FlpDocument {
                 pan_amount_percent.is_negative(),
                 bipolar,
             );
+            // Keep the established velocity, pan, and pitch random stream order stable.
+            let (key, pitch_changed) = match scale {
+                Some((scale_root, scale_intervals)) if pitch_range_semitones > 0 => (
+                    randomizer_pitch_in_scale(
+                        &mut state,
+                        note.key,
+                        pitch_range_semitones,
+                        bipolar,
+                        scale_root,
+                        scale_intervals,
+                    ),
+                    true,
+                ),
+                _ if pitch_range_semitones > 0 => {
+                    let pitch_offset = randomizer_offset(
+                        &mut state,
+                        i32::from(pitch_range_semitones),
+                        false,
+                        bipolar,
+                    );
+                    (
+                        (i32::from(note.key) + pitch_offset).clamp(0, i32::from(u16::MAX)) as u16,
+                        true,
+                    )
+                }
+                _ => (note.key, false),
+            };
+            let release_offset = randomizer_offset(
+                &mut state,
+                release_range,
+                release_amount_percent.is_negative(),
+                bipolar,
+            );
+            let mod_x_offset = randomizer_offset(
+                &mut state,
+                mod_x_range,
+                mod_x_amount_percent.is_negative(),
+                bipolar,
+            );
+            let mod_y_offset = randomizer_offset(
+                &mut state,
+                mod_y_range,
+                mod_y_amount_percent.is_negative(),
+                bipolar,
+            );
             let velocity = if !reset_levels && velocity_amount_percent == 0 {
                 note.velocity
             } else {
@@ -11073,30 +11145,17 @@ impl FlpDocument {
             } else {
                 (pan_base + pan_offset).clamp(0, 127) as u8
             };
-            let key = match scale {
-                Some((scale_root, scale_intervals)) if pitch_range_semitones > 0 => {
-                    randomizer_pitch_in_scale(
-                        &mut state,
-                        note.key,
-                        pitch_range_semitones,
-                        bipolar,
-                        scale_root,
-                        scale_intervals,
-                    )
-                }
-                _ if pitch_range_semitones > 0 => {
-                    let pitch_offset = randomizer_offset(
-                        &mut state,
-                        i32::from(pitch_range_semitones),
-                        false,
-                        bipolar,
-                    );
-                    (i32::from(note.key) + pitch_offset).clamp(0, i32::from(u16::MAX)) as u16
-                }
-                _ => note.key,
-            };
-            if velocity != note.velocity || pan != note.pan || key != note.key {
-                edits.push((note_index, velocity, pan, key));
+            let release = (release_base + release_offset).clamp(0, 128) as u8;
+            let mod_x = (mod_x_base + mod_x_offset).clamp(0, 255) as u8;
+            let mod_y = (mod_y_base + mod_y_offset).clamp(0, 255) as u8;
+            if velocity != note.velocity
+                || pan != note.pan
+                || (pitch_changed && key != note.key)
+                || release != note.release
+                || mod_x != note.mod_x
+                || mod_y != note.mod_y
+            {
+                edits.push((note_index, velocity, pan, key, release, mod_x, mod_y));
             }
         }
         if edits.is_empty() {
@@ -11104,7 +11163,7 @@ impl FlpDocument {
         }
 
         let mut updated = self.clone();
-        for (note_index, velocity, pan, key) in &edits {
+        for (note_index, velocity, pan, key, release, mod_x, mod_y) in &edits {
             updated.edit_pattern_note(
                 pattern_id,
                 channel_id,
@@ -11113,6 +11172,9 @@ impl FlpDocument {
                     velocity: Some(*velocity),
                     pan: Some(*pan),
                     key: Some(*key),
+                    release: Some(*release),
+                    mod_x: Some(*mod_x),
+                    mod_y: Some(*mod_y),
                     ..PatternNoteEdit::default()
                 },
             )?;
@@ -22688,6 +22750,9 @@ mod tests {
             seed: 41,
             velocity_amount_percent: 0,
             pan_amount_percent: 0,
+            release_amount_percent: 0,
+            mod_x_amount_percent: 0,
+            mod_y_amount_percent: 0,
             pitch_range_semitones: 5,
             bipolar: true,
             reset_levels: false,

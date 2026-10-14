@@ -649,6 +649,31 @@ fn run(args: Vec<String>) -> Result<(), String> {
                     seed: parse_u64(seed, "randomizer seed")?,
                     velocity_amount_percent: parse_i16(velocity_amount, "velocity amount")?,
                     pan_amount_percent: parse_i16(pan_amount, "pan amount")?,
+                    release_amount_percent: 0,
+                    mod_x_amount_percent: 0,
+                    mod_y_amount_percent: 0,
+                    pitch_range_semitones: parse_u8(pitch_range, "pitch range")?,
+                    bipolar: parse_bool(bipolar, "bipolar")?,
+                    reset_levels: parse_bool(reset_levels, "reset levels")?,
+                },
+            )
+        }
+        [command, input, output, pattern_id, channel_id, seed, velocity_amount, pan_amount,
+            pitch_range, bipolar, reset_levels, release_amount, mod_x_amount, mod_y_amount]
+            if command == "randomize-notes" =>
+        {
+            randomize_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                RandomizerOptions {
+                    seed: parse_u64(seed, "randomizer seed")?,
+                    velocity_amount_percent: parse_i16(velocity_amount, "velocity amount")?,
+                    pan_amount_percent: parse_i16(pan_amount, "pan amount")?,
+                    release_amount_percent: parse_i16(release_amount, "release amount")?,
+                    mod_x_amount_percent: parse_i16(mod_x_amount, "Mod X amount")?,
+                    mod_y_amount_percent: parse_i16(mod_y_amount, "Mod Y amount")?,
                     pitch_range_semitones: parse_u8(pitch_range, "pitch range")?,
                     bipolar: parse_bool(bipolar, "bipolar")?,
                     reset_levels: parse_bool(reset_levels, "reset levels")?,
@@ -669,6 +694,35 @@ fn run(args: Vec<String>) -> Result<(), String> {
                     seed: parse_u64(seed, "randomizer seed")?,
                     velocity_amount_percent: parse_i16(velocity_amount, "velocity amount")?,
                     pan_amount_percent: parse_i16(pan_amount, "pan amount")?,
+                    release_amount_percent: 0,
+                    mod_x_amount_percent: 0,
+                    mod_y_amount_percent: 0,
+                    pitch_range_semitones: parse_u8(pitch_range, "pitch range")?,
+                    bipolar: parse_bool(bipolar, "bipolar")?,
+                    reset_levels: parse_bool(reset_levels, "reset levels")?,
+                },
+                parse_u8(scale_root, "scale root")?,
+                scale_intervals,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, seed, velocity_amount, pan_amount,
+            pitch_range, bipolar, reset_levels, scale_name, scale_root, release_amount,
+            mod_x_amount, mod_y_amount]
+            if command == "randomize-notes-scale" =>
+        {
+            let scale_intervals = parse_scale_name(scale_name)?;
+            randomize_notes_with_scale(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                RandomizerOptions {
+                    seed: parse_u64(seed, "randomizer seed")?,
+                    velocity_amount_percent: parse_i16(velocity_amount, "velocity amount")?,
+                    pan_amount_percent: parse_i16(pan_amount, "pan amount")?,
+                    release_amount_percent: parse_i16(release_amount, "release amount")?,
+                    mod_x_amount_percent: parse_i16(mod_x_amount, "Mod X amount")?,
+                    mod_y_amount_percent: parse_i16(mod_y_amount, "Mod Y amount")?,
                     pitch_range_semitones: parse_u8(pitch_range, "pitch range")?,
                     bipolar: parse_bool(bipolar, "bipolar")?,
                     reset_levels: parse_bool(reset_levels, "reset levels")?,
@@ -1123,8 +1177,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild flip-notes <input.flp> <output.flp> <pattern-id> <channel-id>\n",
             "  flp-rebuild strum-notes <input.flp> <output.flp> <pattern-id> <channel-id> <spread-ticks> <up|down>\n",
             "  flp-rebuild flam-notes <input.flp> <output.flp> <pattern-id> <channel-id> <stroke-ticks> <velocity-0..127> <before|after>\n",
-            "  flp-rebuild randomize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <velocity-amount:-100..100> <pan-amount:-100..100> <pitch-range:0..24> <bipolar:0|1> <reset:0|1>\n",
-            "  flp-rebuild randomize-notes-scale <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <velocity-amount:-100..100> <pan-amount:-100..100> <pitch-range:0..24> <bipolar:0|1> <reset:0|1> <scale-name> <scale-root:0..11>\n",
+            "  flp-rebuild randomize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <velocity:-100..100> <pan:-100..100> <pitch-range:0..24> <bipolar:0|1> <reset:0|1> [release:-100..100 mod-x:-100..100 mod-y:-100..100]\n",
+            "  flp-rebuild randomize-notes-scale <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <velocity:-100..100> <pan:-100..100> <pitch-range:0..24> <bipolar:0|1> <reset:0|1> <scale-name> <scale-root:0..11> [release:-100..100 mod-x:-100..100 mod-y:-100..100]\n",
             "  flp-rebuild humanize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <timing-range-ticks> <velocity-variation-0..100>\n",
             "  flp-rebuild limit-notes <input.flp> <output.flp> <pattern-id> <channel-id> <minimum-key-0..127> <maximum-key-0..127>\n",
             "  flp-rebuild arp-notes <input.flp> <output.flp> <pattern-id> <channel-id> <step-ticks> <range-octaves-1..4> <gate-1..100> <up|down|up-down>\n",
