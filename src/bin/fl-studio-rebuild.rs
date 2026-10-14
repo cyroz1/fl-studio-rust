@@ -3263,6 +3263,7 @@ struct DawUi {
     flam_stroke_ms: f32,
     flam_velocity: u8,
     flam_before: bool,
+    flam_group_notes: bool,
     randomizer_seed: u64,
     randomizer_velocity_amount: i16,
     randomizer_pan_amount: i16,
@@ -3989,6 +3990,7 @@ impl DawUi {
             flam_stroke_ms: 50.0,
             flam_velocity: 80,
             flam_before: true,
+            flam_group_notes: false,
             randomizer_seed: 1,
             randomizer_velocity_amount: 0,
             randomizer_pan_amount: 0,
@@ -23970,6 +23972,9 @@ impl DawUi {
                 }
                 ui.add(egui::Slider::new(&mut self.flam_velocity, 0..=127).text("Flam velocity"));
                 ui.checkbox(&mut self.flam_before, "Flam before notes");
+                ui.checkbox(&mut self.flam_group_notes, "Group notes").on_hover_text(
+                    "Assign the processed notes and generated Flam strokes to one note group.",
+                );
                 ui.add(
                     egui::Slider::new(&mut self.randomizer_velocity_amount, -100..=100)
                         .text("Velocity randomize (%)"),
@@ -24411,6 +24416,7 @@ impl DawUi {
             };
             let velocity = self.flam_velocity;
             let before = self.flam_before;
+            let group_notes = self.flam_group_notes;
             let result = stroke_ticks
                 .ok_or_else(|| "Flam time cannot be mapped to a positive project tick".to_owned())
                 .and_then(|stroke_ticks| {
@@ -24419,21 +24425,23 @@ impl DawUi {
                         .ok_or_else(|| "no project is open".to_owned())
                         .and_then(|document| {
                             let result = if edit_selection_only {
-                                document.flam_pattern_note_selection(
+                                document.flam_pattern_note_selection_with_grouping(
                                     pattern_id,
                                     channel_id,
                                     &selected_quantize_indices,
                                     stroke_ticks,
                                     velocity,
                                     before,
+                                    group_notes,
                                 )
                             } else {
-                                document.flam_pattern_notes(
+                                document.flam_pattern_notes_with_grouping(
                                     pattern_id,
                                     channel_id,
                                     stroke_ticks,
                                     velocity,
                                     before,
+                                    group_notes,
                                 )
                             };
                             result.map_err(|error| error.to_string())

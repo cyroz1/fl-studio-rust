@@ -10707,6 +10707,28 @@ impl FlpDocument {
             stroke_ticks,
             velocity,
             before,
+            false,
+        )
+    }
+
+    /// Adds short strokes and groups them with the processed channel notes when requested.
+    pub fn flam_pattern_notes_with_grouping(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        stroke_ticks: u32,
+        velocity: u8,
+        before: bool,
+        group_notes: bool,
+    ) -> Result<usize, FlpError> {
+        self.flam_pattern_notes_in_scope(
+            pattern_id,
+            channel_id,
+            None,
+            stroke_ticks,
+            velocity,
+            before,
+            group_notes,
         )
     }
 
@@ -10727,6 +10749,29 @@ impl FlpDocument {
             stroke_ticks,
             velocity,
             before,
+            false,
+        )
+    }
+
+    /// Adds strokes to selected notes and optionally groups the originals with their strokes.
+    pub fn flam_pattern_note_selection_with_grouping(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: &[usize],
+        stroke_ticks: u32,
+        velocity: u8,
+        before: bool,
+        group_notes: bool,
+    ) -> Result<usize, FlpError> {
+        self.flam_pattern_notes_in_scope(
+            pattern_id,
+            channel_id,
+            Some(note_indices),
+            stroke_ticks,
+            velocity,
+            before,
+            group_notes,
         )
     }
 
@@ -10738,6 +10783,7 @@ impl FlpDocument {
         stroke_ticks: u32,
         velocity: u8,
         before: bool,
+        group_notes: bool,
     ) -> Result<usize, FlpError> {
         if stroke_ticks == 0 {
             return Err(FlpError::UnsupportedEdit(
@@ -10758,13 +10804,13 @@ impl FlpDocument {
             ))?;
         let selected_indices =
             note_indices.map(|indices| indices.iter().copied().collect::<HashSet<_>>());
-        let strokes = pattern
+        let mut strokes = pattern
             .notes
             .iter()
             .filter(|note| note.channel_id == channel_id)
             .enumerate()
             .filter(|(note_index, _)| note_index_in_scope(*note_index, selected_indices.as_ref()))
-            .map(|(_, note)| {
+            .map(|(note_index, note)| {
                 let mut stroke = note.clone();
                 stroke.position = if before {
                     note.position.saturating_sub(stroke_ticks)
@@ -10775,7 +10821,7 @@ impl FlpDocument {
                 };
                 stroke.length = stroke_ticks;
                 stroke.velocity = velocity;
-                Ok(stroke)
+                Ok((note_index, stroke))
             })
             .collect::<Result<Vec<_>, FlpError>>()?;
         if strokes.is_empty() {
@@ -10783,9 +10829,41 @@ impl FlpDocument {
         }
 
         let mut updated = self.clone();
-        updated.add_pattern_notes(pattern_id, &strokes)?;
+        if group_notes {
+            let used_groups = pattern
+                .notes
+                .iter()
+                .filter(|note| note.channel_id == channel_id && note.group != 0)
+                .map(|note| note.group)
+                .collect::<BTreeSet<_>>();
+            let group = (1..=u16::MAX)
+                .find(|group| !used_groups.contains(group))
+                .ok_or(FlpError::UnsupportedEdit(
+                    "no free note group ID remains for this channel",
+                ))?;
+            let source_edits = strokes
+                .iter_mut()
+                .map(|(note_index, stroke)| {
+                    stroke.group = group;
+                    (
+                        *note_index,
+                        PatternNoteEdit {
+                            group: Some(group),
+                            ..PatternNoteEdit::default()
+                        },
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            updated.edit_pattern_notes_batch(pattern_id, channel_id, &source_edits)?;
+        }
+        let stroke_count = strokes.len();
+        let stroke_notes = strokes
+            .into_iter()
+            .map(|(_, stroke)| stroke)
+            .collect::<Vec<_>>();
+        updated.add_pattern_notes(pattern_id, &stroke_notes)?;
         *self = updated;
-        Ok(strokes.len())
+        Ok(stroke_count)
     }
 
     /// Randomizes channel note velocity, pan, and pitch from a repeatable seed.
