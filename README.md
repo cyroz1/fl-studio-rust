@@ -81,6 +81,7 @@ flp-rebuild legato-notes-selected <input.flp> <output.flp> <pattern-id> <channel
 flp-rebuild chop-notes <input.flp> <output.flp> <pattern-id> <channel-id> <divisions-2..64>
 flp-rebuild chop-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <divisions-2..64>
 flp-rebuild glue-notes <input.flp> <output.flp> <pattern-id> <channel-id>
+flp-rebuild glue-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based>
 flp-rebuild flip-notes <input.flp> <output.flp> <pattern-id> <channel-id>
 flp-rebuild strum-notes <input.flp> <output.flp> <pattern-id> <channel-id> <spread-ticks> <up|down>
 flp-rebuild flam-notes <input.flp> <output.flp> <pattern-id> <channel-id> <stroke-ticks> <velocity-0..127> <before|after> [group-notes:0|1]
@@ -174,7 +175,7 @@ The Piano roll's **Edit** target selector applies note-transform buttons to eith
 
 **Chop channel/selected** and `chop-notes` divide eligible notes into equal segments. Each new segment retains the source note's properties; any leftover ticks stay in the final segment. `chop-notes-selected` accepts comma-separated zero-based channel-local note indexes.
 
-**Glue channel/selected** and `glue-notes` join touching or overlapping targeted notes when all stored properties besides position and length match.
+**Glue channel/selected** and `glue-notes` join touching or overlapping targeted notes when all stored properties besides position and length match. `glue-notes-selected` limits joining to comma-separated zero-based channel-local note indexes.
 
 **Flip channel/selected** and `flip-notes` mirror note positions around the end of the latest channel note or, for a selection, within the selected notes' time bounds. Note lengths and other properties are retained.
 

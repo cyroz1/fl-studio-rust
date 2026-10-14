@@ -679,6 +679,18 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u16(channel_id, "channel id")?,
             )
         }
+        [command, input, output, pattern_id, channel_id, note_indices]
+            if command == "glue-notes-selected" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            glue_notes_with_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Some(&note_indices),
+            )
+        }
         [command, input, output, pattern_id, channel_id] if command == "flip-notes" => {
             flip_notes(
                 Path::new(input),
@@ -2136,6 +2148,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild chop-notes <input.flp> <output.flp> <pattern-id> <channel-id> <divisions-2..64>\n",
             "  flp-rebuild chop-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <divisions-2..64>\n",
             "  flp-rebuild glue-notes <input.flp> <output.flp> <pattern-id> <channel-id>\n",
+            "  flp-rebuild glue-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based>\n",
             "  flp-rebuild flip-notes <input.flp> <output.flp> <pattern-id> <channel-id>\n",
             "  flp-rebuild strum-notes <input.flp> <output.flp> <pattern-id> <channel-id> <spread-ticks> <up|down> [velocity-amount:-127..127 velocity-tension:-100..100]\n",
             "  flp-rebuild flam-notes <input.flp> <output.flp> <pattern-id> <channel-id> <stroke-ticks> <velocity-0..127> <before|after> [group-notes:0|1]\n",
@@ -4390,17 +4403,36 @@ fn chop_notes_with_scope(
 }
 
 fn glue_notes(input: &Path, output: &Path, pattern_id: u16, channel_id: u16) -> Result<(), String> {
+    glue_notes_with_scope(input, output, pattern_id, channel_id, None)
+}
+
+fn glue_notes_with_scope(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    note_indices: Option<&[usize]>,
+) -> Result<(), String> {
     let (_, mut document) = load_document(input)?;
-    let removed = document
-        .glue_pattern_notes(pattern_id, channel_id)
-        .map_err(|error| error.to_string())?;
+    let removed = match note_indices {
+        Some(note_indices) => {
+            document.glue_pattern_note_selection(pattern_id, channel_id, note_indices)
+        }
+        None => document.glue_pattern_notes(pattern_id, channel_id),
+    }
+    .map_err(|error| error.to_string())?;
     let bytes = document
         .encode_lossless()
         .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
     fs::write(output, bytes)
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
-        "joined notes and removed {removed} records in pattern {pattern_id}, channel {channel_id} to {}",
+        "joined notes and removed {removed} records in pattern {pattern_id}, channel {channel_id} ({}) to {}",
+        if note_indices.is_some() {
+            "selected notes"
+        } else {
+            "all channel notes"
+        },
         output.display()
     );
     Ok(())
