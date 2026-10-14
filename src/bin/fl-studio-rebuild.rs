@@ -3134,6 +3134,14 @@ struct ActiveMidiPlaylistPlayback {
     next_message: usize,
 }
 
+struct PerformanceLaunchContext<'a> {
+    arrangement: &'a Arrangement,
+    tracks: &'a [PlaylistTrack],
+    ppq: u16,
+    initial_time_signature: Option<(u8, u8)>,
+    signature_changes: &'a [(u32, u8, u8)],
+}
+
 struct DawUi {
     document: Option<FlpDocument>,
     current_path: Option<PathBuf>,
@@ -3162,6 +3170,7 @@ struct DawUi {
     playing: bool,
     performance_mode_active: bool,
     held_performance_clips: Vec<(u16, u32, usize)>,
+    midi_held_performance_clips: BTreeMap<(u8, u8), (u16, u32, usize)>,
     performance_scene_round_robin: BTreeMap<(u16, u32, u32), usize>,
     performance_launch_sender: Option<Sender<PlaylistPerformanceCommand>>,
     project_playback_loaded: bool,
@@ -3889,6 +3898,7 @@ impl DawUi {
             playing: false,
             performance_mode_active: false,
             held_performance_clips: Vec::new(),
+            midi_held_performance_clips: BTreeMap::new(),
             performance_scene_round_robin: BTreeMap::new(),
             performance_launch_sender: None,
             project_playback_loaded: false,
@@ -7317,6 +7327,91 @@ impl DawUi {
         }
     }
 
+    fn performance_clip_launch_request(
+        &self,
+        context: PerformanceLaunchContext<'_>,
+        clip_index: usize,
+        explicit_queue: bool,
+    ) -> Option<(PlaylistPerformanceCommand, u32, bool, &'static str)> {
+        let PerformanceLaunchContext {
+            arrangement,
+            tracks,
+            ppq,
+            initial_time_signature,
+            signature_changes,
+        } = context;
+        let clip = arrangement.clips.get(clip_index)?;
+        let clip_track_id = clip.playlist_track_id()?;
+        let clip_track = tracks.iter().find(|track| track.id == clip_track_id);
+        let clip_trigger_sync = clip_track.and_then(|track| track.trigger_sync);
+        let clip_position_sync = clip_track.and_then(|track| track.position_sync);
+        let clip_position_sync_label = clip_position_sync
+            .map(playlist_track_sync_label)
+            .unwrap_or("Off");
+        let clip_tolerant = clip_track.and_then(|track| track.tolerant).unwrap_or(true);
+        let queue_launch =
+            explicit_queue || clip_track.is_some_and(|track| track.queued.unwrap_or(false));
+        let (engine, tempo_map) = self
+            .audio_engine
+            .as_ref()
+            .zip(self.playlist_tempo_map.as_ref())?;
+        let sample_rate = engine.sample_rate();
+        let current_device_frame = engine.project_playback_position_frames();
+        let safe_device_frame = current_device_frame.saturating_add(u64::from(sample_rate) / 8);
+        let current_tick = tempo_map.tick_at_frame(current_device_frame, sample_rate)?;
+        let safe_tick = tempo_map.tick_at_frame(safe_device_frame, sample_rate)?;
+        let target_tick = if queue_launch {
+            u32::try_from(safe_tick.ceil() as u64).ok()?
+        } else {
+            let mut target_tick = playlist_performance_trigger_tick(
+                safe_tick,
+                ppq,
+                initial_time_signature,
+                signature_changes,
+                clip_trigger_sync,
+                clip.length_ticks,
+            )?;
+            if clip_tolerant && clip_trigger_sync != Some(PlaylistTrackSync::Off) {
+                let boundary_from_current = playlist_performance_trigger_tick(
+                    current_tick,
+                    ppq,
+                    initial_time_signature,
+                    signature_changes,
+                    clip_trigger_sync,
+                    clip.length_ticks,
+                )?;
+                if f64::from(boundary_from_current) < safe_tick.ceil() {
+                    target_tick = u32::try_from(safe_tick.ceil() as u64).ok()?;
+                }
+            }
+            target_tick
+        };
+        let start_frame = tempo_map
+            .frame_at_tick(u64::from(target_tick), sample_rate)
+            .ok()?;
+        let position_offset_ticks = playlist_performance_position_offset_ticks(
+            target_tick,
+            clip.position_ticks,
+            clip.length_ticks,
+            ppq,
+            initial_time_signature,
+            signature_changes,
+            clip_position_sync,
+        );
+        let launch = PlaylistPerformanceLaunch {
+            clip_index,
+            start_tick: u64::from(target_tick),
+            start_frame,
+            position_offset_ticks,
+        };
+        let command = if queue_launch {
+            PlaylistPerformanceCommand::Enqueue(launch)
+        } else {
+            PlaylistPerformanceCommand::Launch(launch)
+        };
+        Some((command, target_tick, queue_launch, clip_position_sync_label))
+    }
+
     fn queue_performance_hold_release(
         &mut self,
         arrangement_id: u16,
@@ -7373,6 +7468,180 @@ impl DawUi {
             }
             _ => {
                 self.status = "Could not map Performance Mode motion timing".into();
+            }
+        }
+    }
+
+    fn release_all_midi_performance_clips(&mut self) {
+        let held = std::mem::take(&mut self.midi_held_performance_clips);
+        for (_, (arrangement_id, track_id, clip_index)) in held {
+            self.queue_performance_hold_release(arrangement_id, track_id, clip_index);
+        }
+    }
+
+    fn handle_midi_performance_note(&mut self, message: ReceivedMidiMessage) {
+        match message.event {
+            MidiInputEvent::NoteOn {
+                channel,
+                key,
+                velocity,
+            } if channel == 0 && velocity > 0 => {
+                self.trigger_performance_midi_clip(channel, key);
+            }
+            MidiInputEvent::NoteOff { channel, key, .. }
+            | MidiInputEvent::NoteOn {
+                channel,
+                key,
+                velocity: 0,
+            } if channel == 0 => {
+                if let Some((arrangement_id, track_id, clip_index)) =
+                    self.midi_held_performance_clips.remove(&(channel, key))
+                {
+                    self.queue_performance_hold_release(arrangement_id, track_id, clip_index);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn trigger_performance_midi_clip(&mut self, channel: u8, key: u8) {
+        if channel != 0
+            || !self.performance_mode_active
+            || !self.playing
+            || self.performance_launch_sender.is_none()
+            || key >= 120
+        {
+            return;
+        }
+        let Some(document) = self.document.as_ref() else {
+            return;
+        };
+        let Ok(arrangements) = document.arrangements() else {
+            return;
+        };
+        let Some(arrangement) = arrangements
+            .iter()
+            .find(|arrangement| Some(arrangement.id) == self.selected_arrangement)
+            .or_else(|| arrangements.first())
+            .cloned()
+        else {
+            return;
+        };
+        let Some(performance_zone_end_tick) =
+            playlist_performance_zone_start_tick(&arrangement.time_markers)
+        else {
+            return;
+        };
+        let Ok(supported_clip_indices) =
+            playlist_performance_clip_indices(document, arrangement.id, performance_zone_end_tick)
+        else {
+            return;
+        };
+        let mut tracks = document.playlist_tracks_in_arrangement(arrangement.id);
+        tracks.sort_by_key(|track| track.id);
+        let track_index = usize::from(key / 12);
+        if track_index >= 10 {
+            return;
+        }
+        let Some(track) = tracks.get(track_index) else {
+            return;
+        };
+        let project_time_signature = document.metadata().time_signature().unwrap_or((4, 4));
+        let signature_changes = arrangement
+            .time_markers
+            .iter()
+            .filter(|marker| marker.is_signature())
+            .filter_map(|marker| {
+                Some((
+                    marker.position_ticks(),
+                    marker.numerator()?.max(1),
+                    marker.denominator()?.max(1),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let ppq = document.header().ppq().max(1);
+        let Some(scene_tick) = playlist_performance_midi_scene_tick(
+            &arrangement,
+            key % 12,
+            performance_zone_end_tick,
+            ppq,
+            Some(project_time_signature),
+            &signature_changes,
+        ) else {
+            return;
+        };
+        let Some((scene_group_start_tick, scene_clip_groups)) =
+            playlist_performance_scene_clip_indices(
+                &arrangement,
+                &supported_clip_indices,
+                scene_tick,
+                performance_zone_end_tick,
+                ppq,
+                Some(project_time_signature),
+                &signature_changes,
+            )
+        else {
+            return;
+        };
+        let Some(scene_clips) = scene_clip_groups
+            .get(&track.id)
+            .filter(|clips| !clips.is_empty())
+        else {
+            return;
+        };
+        let round_robin_key = (arrangement.id, scene_group_start_tick, track.id);
+        let next_position = self
+            .performance_scene_round_robin
+            .get(&round_robin_key)
+            .copied()
+            .unwrap_or(0)
+            % scene_clips.len();
+        let clip_index = scene_clips[next_position];
+        self.performance_scene_round_robin
+            .insert(round_robin_key, (next_position + 1) % scene_clips.len());
+        let press = track.press;
+        let Some((command, start_tick, queued, position_sync_label)) = self
+            .performance_clip_launch_request(
+                PerformanceLaunchContext {
+                    arrangement: &arrangement,
+                    tracks: &tracks,
+                    ppq,
+                    initial_time_signature: Some(project_time_signature),
+                    signature_changes: &signature_changes,
+                },
+                clip_index,
+                false,
+            )
+        else {
+            self.status = "Could not map MIDI Performance Mode launch timing or position".into();
+            return;
+        };
+        let Some(sender) = self.performance_launch_sender.as_ref() else {
+            return;
+        };
+        match sender.send(command) {
+            Ok(()) => {
+                if matches!(
+                    press,
+                    Some(PlaylistTrackPress::HoldStop | PlaylistTrackPress::HoldMotion)
+                ) {
+                    self.midi_held_performance_clips
+                        .insert((channel, key), (arrangement.id, track.id, clip_index));
+                }
+                self.status = if queued {
+                    format!(
+                        "MIDI triggered Playlist Clip {} into its track queue",
+                        clip_index + 1
+                    )
+                } else {
+                    format!(
+                        "MIDI triggered Playlist Clip {} for tick {start_tick} with Position Sync {position_sync_label}",
+                        clip_index + 1
+                    )
+                };
+            }
+            Err(_) => {
+                self.status = "Performance Mode audio worker is no longer available".into();
             }
         }
     }
@@ -7918,6 +8187,7 @@ impl DawUi {
 
     fn stop_project_playback(&mut self) {
         self.held_performance_clips.clear();
+        self.midi_held_performance_clips.clear();
         self.performance_scene_round_robin.clear();
         self.performance_launch_sender = None;
         self.stop_midi_playlist_playback();
@@ -14315,7 +14585,7 @@ impl DawUi {
                             let drag_hint = if self.playlist_mute_tool_active {
                                 "Mute tool selected: click to mute or unmute this clip. Press T or select Mute to return to move mode."
                             } else if can_trigger_performance_clip {
-                                "Performance Mode: supported clips trigger on click, Shift-click queues a clip, Ctrl/Cmd-click launches its scene, and blank marker/bar cells launch or queue scenes. The track Queue setting also queues normal clicks."
+                                "Performance Mode: click supported clips or send MIDI channel 1 notes to trigger them; notes map 12 clip slots per Playlist track across the first 10 tracks. Shift-click queues a clip, Ctrl/Cmd-click launches its scene, and blank marker/bar cells launch or queue scenes. The track Queue setting also queues normal clicks."
                             } else if !can_resize_clip {
                                 "Drag to move. Resizing and source-window editing are unavailable for this FL Studio clip format."
                             } else if self.playlist_slip_tool_active && is_audio_clip {
@@ -15779,120 +16049,47 @@ impl DawUi {
         let mut scene_commands_sent = 0usize;
         let mut scene_command_failed = false;
         for (clip_index, explicit_queue, is_scene_clip) in performance_clip_launch_actions {
-            let clip_length_ticks = arrangement
-                .clips
-                .get(clip_index)
-                .map(|clip| clip.length_ticks)
-                .unwrap_or(0);
-            let clip_source_start_tick = arrangement
-                .clips
-                .get(clip_index)
-                .map(|clip| clip.position_ticks)
-                .unwrap_or(0);
-            let clip_track_id = arrangement
-                .clips
-                .get(clip_index)
-                .and_then(|clip| clip.playlist_track_id());
-            let clip_track =
-                clip_track_id.and_then(|track_id| tracks.iter().find(|track| track.id == track_id));
-            let clip_trigger_sync = clip_track.and_then(|track| track.trigger_sync);
-            let clip_position_sync = clip_track.and_then(|track| track.position_sync);
-            let clip_position_sync_label = clip_position_sync
-                .map(playlist_track_sync_label)
-                .unwrap_or("Off");
-            let clip_tolerant = clip_track.and_then(|track| track.tolerant).unwrap_or(true);
-            let queue_launch =
-                explicit_queue || clip_track.is_some_and(|track| track.queued.unwrap_or(false));
-            let launch_position = self
-                .audio_engine
-                .as_ref()
-                .zip(self.playlist_tempo_map.as_ref())
-                .and_then(|(engine, tempo_map)| {
-                    let sample_rate = engine.sample_rate();
-                    let current_device_frame = engine.project_playback_position_frames();
-                    let safe_device_frame =
-                        current_device_frame.saturating_add(u64::from(sample_rate) / 8);
-                    let current_tick =
-                        tempo_map.tick_at_frame(current_device_frame, sample_rate)?;
-                    let safe_tick = tempo_map.tick_at_frame(safe_device_frame, sample_rate)?;
-                    let target_tick = if queue_launch {
-                        u32::try_from(safe_tick.ceil() as u64).ok()?
-                    } else {
-                        let mut target_tick = playlist_performance_trigger_tick(
-                            safe_tick,
-                            ppq,
-                            project_time_signature,
-                            &signature_changes,
-                            clip_trigger_sync,
-                            clip_length_ticks,
-                        )?;
-                        if clip_tolerant && clip_trigger_sync != Some(PlaylistTrackSync::Off) {
-                            let boundary_from_current = playlist_performance_trigger_tick(
-                                current_tick,
-                                ppq,
-                                project_time_signature,
-                                &signature_changes,
-                                clip_trigger_sync,
-                                clip_length_ticks,
-                            )?;
-                            if f64::from(boundary_from_current) < safe_tick.ceil() {
-                                target_tick = u32::try_from(safe_tick.ceil() as u64).ok()?;
-                            }
+            let launch_request = self.performance_clip_launch_request(
+                PerformanceLaunchContext {
+                    arrangement: &arrangement,
+                    tracks: &tracks,
+                    ppq,
+                    initial_time_signature: project_time_signature,
+                    signature_changes: &signature_changes,
+                },
+                clip_index,
+                explicit_queue,
+            );
+            let Some((command, start_tick, queue_launch, clip_position_sync_label)) =
+                launch_request
+            else {
+                self.status = "Could not map Performance Mode launch timing or position".into();
+                continue;
+            };
+            match self.performance_launch_sender.as_ref() {
+                Some(sender) => match sender.send(command) {
+                    Ok(()) => {
+                        if is_scene_clip {
+                            scene_commands_sent += 1;
                         }
-                        target_tick
-                    };
-                    let target_frame = tempo_map
-                        .frame_at_tick(u64::from(target_tick), sample_rate)
-                        .ok()?;
-                    let position_offset_ticks = playlist_performance_position_offset_ticks(
-                        target_tick,
-                        clip_source_start_tick,
-                        clip_length_ticks,
-                        ppq,
-                        project_time_signature,
-                        &signature_changes,
-                        clip_position_sync,
-                    );
-                    Some((target_tick, target_frame, position_offset_ticks))
-                });
-            match (launch_position, self.performance_launch_sender.as_ref()) {
-                (Some((start_tick, start_frame, position_offset_ticks)), Some(sender)) => {
-                    let launch = PlaylistPerformanceLaunch {
-                        clip_index,
-                        start_tick: u64::from(start_tick),
-                        start_frame,
-                        position_offset_ticks,
-                    };
-                    let command = if queue_launch {
-                        PlaylistPerformanceCommand::Enqueue(launch)
-                    } else {
-                        PlaylistPerformanceCommand::Launch(launch)
-                    };
-                    match sender.send(command) {
-                        Ok(()) => {
-                            if is_scene_clip {
-                                scene_commands_sent += 1;
-                            }
-                            self.status = if queue_launch {
-                                format!(
-                                    "Added Playlist Clip {} to the track queue; Position Sync {clip_position_sync_label} is applied when it starts",
-                                    clip_index + 1,
-                                )
-                            } else {
-                                format!(
-                                    "Queued Playlist Clip {} for tick {start_tick} with Position Sync {clip_position_sync_label}",
-                                    clip_index + 1,
-                                )
-                            };
-                        }
-                        Err(_) => {
-                            scene_command_failed = true;
-                            self.status =
-                                "Performance Mode audio worker is no longer available".into();
-                        }
+                        self.status = if queue_launch {
+                            format!(
+                                "Added Playlist Clip {} to the track queue; Position Sync {clip_position_sync_label} is applied when it starts",
+                                clip_index + 1,
+                            )
+                        } else {
+                            format!(
+                                "Queued Playlist Clip {} for tick {start_tick} with Position Sync {clip_position_sync_label}",
+                                clip_index + 1,
+                            )
+                        };
                     }
-                }
-                _ => {
+                    Err(_) => {
+                        scene_command_failed = true;
+                        self.status = "Performance Mode audio worker is no longer available".into();
+                    }
+                },
+                None => {
                     self.status = "Could not map Performance Mode launch timing or position".into();
                 }
             }
@@ -31987,6 +32184,7 @@ impl DawUi {
         self.midi_output_gain_learning = false;
         self.midi_play_pause_learning = false;
         self.midi_play_pause_cc_active = false;
+        self.release_all_midi_performance_clips();
         self.stop_live_sampler_input_for_device_change();
         self.stop_midi_input_thru();
         let previous_connection = self.midi_input_connection.take();
@@ -32014,6 +32212,7 @@ impl DawUi {
     }
 
     fn disconnect_midi_input(&mut self) {
+        self.release_all_midi_performance_clips();
         self.stop_live_sampler_input_for_device_change();
         self.stop_midi_input_thru();
         self.midi_output_gain_learning = false;
@@ -33951,6 +34150,7 @@ impl DawUi {
                 _ => {}
             }
             self.handle_live_sampler_input(message.event);
+            self.handle_midi_performance_note(message);
             self.handle_midi_control_change(message, history_snapshot_available);
             if let MidiInputEvent::Transport(command) = message.event {
                 self.handle_midi_transport(command, message, history_snapshot_available);
@@ -41842,6 +42042,46 @@ fn playlist_performance_zone_start_tick(markers: &[TimeMarker]) -> Option<u32> {
         })
         .map(TimeMarker::position_ticks)
         .min()
+}
+
+fn playlist_performance_midi_scene_tick(
+    arrangement: &Arrangement,
+    scene_index: u8,
+    performance_zone_end_tick: u32,
+    ppq: u16,
+    initial_time_signature: Option<(u8, u8)>,
+    signature_changes: &[(u32, u8, u8)],
+) -> Option<u32> {
+    let mut marker_positions = arrangement
+        .time_markers
+        .iter()
+        .filter(|marker| {
+            !marker.is_signature() && marker.position_ticks() < performance_zone_end_tick
+        })
+        .map(TimeMarker::position_ticks)
+        .collect::<Vec<_>>();
+    marker_positions.sort_unstable();
+    marker_positions.dedup();
+    if !marker_positions.is_empty() {
+        if marker_positions[0] > 0 {
+            marker_positions.insert(0, 0);
+        }
+        return marker_positions
+            .get(usize::from(scene_index))
+            .copied()
+            .filter(|tick| *tick < performance_zone_end_tick);
+    }
+
+    let mut scene_tick = 0;
+    for _ in 0..scene_index {
+        scene_tick = playlist_next_bar_tick(
+            f64::from(scene_tick),
+            ppq,
+            initial_time_signature,
+            signature_changes,
+        )?;
+    }
+    (scene_tick < performance_zone_end_tick).then_some(scene_tick)
 }
 
 fn playlist_performance_scene_clip_indices(
