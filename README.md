@@ -75,6 +75,7 @@ flp-rebuild edit-automation-point <input.flp> <output.flp> <channel-id> <point-i
 flp-rebuild edit-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index> <position> <length> <key> <velocity>
 flp-rebuild edit-note-properties <input.flp> <output.flp> <pattern-id> <channel-id> <note-index> <flags-raw|-> <group-raw|-> <fine-pitch|-> <release|-> <midi-channel-raw|-> <pan|-> <mod-x|-> <mod-y|->
 flp-rebuild quantize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <grid-ticks> <strength-0..1> <swing-0..1>
+flp-rebuild quantize-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <grid-ticks> <strength-0..1> <swing-0..1> [sensitivity-0..1 duration-strength-0..1 leave-duration|leave-end|quantize-duration|quantize-end]
 flp-rebuild legato-notes <input.flp> <output.flp> <pattern-id> <channel-id>
 flp-rebuild chop-notes <input.flp> <output.flp> <pattern-id> <channel-id> <divisions-2..64>
 flp-rebuild glue-notes <input.flp> <output.flp> <pattern-id> <channel-id>
@@ -163,7 +164,7 @@ The **Project settings…** control edits the currently mapped Advanced options:
 
 `edit-note-properties` updates a note's raw flags/group, fine-pitch, release, raw MIDI-channel, pan, and modulation X/Y fields. Pass `-` for any property to leave it unchanged. The reserved byte remains untouched.
 
-`quantize-notes` moves note starts toward the nearest grid points for one pattern channel. Strength and swing are fractions from `0` to `1`; lengths and other note properties are retained.
+`quantize-notes` moves note starts toward the nearest grid points for one pattern channel. Strength and swing are fractions from `0` to `1`; lengths and other note properties are retained. Its advanced form also accepts sensitivity, duration strength, and a duration/end mode. `quantize-notes-selected` applies the same controls to comma-separated zero-based channel-local note indexes.
 
 In the Piano roll, **Quantize selected** targets the current selection. The **Edit** target selector routes other note-transform buttons to **Auto** (use the selection when present, otherwise the channel), **Channel**, or **Selected notes**.
 

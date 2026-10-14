@@ -575,6 +575,27 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 },
             )
         }
+        [command, input, output, pattern_id, channel_id, note_indices, grid_ticks, strength, swing,
+            sensitivity, duration_strength, mode]
+            if command == "quantize-notes-selected" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            quantize_notes_with_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Some(&note_indices),
+                QuantizeNoteOptions {
+                    grid_ticks: parse_u32(grid_ticks, "quantize grid ticks")?,
+                    start_strength: parse_f64(strength, "quantize start strength")?,
+                    swing: parse_f64(swing, "quantize swing")?,
+                    sensitivity: parse_f64(sensitivity, "quantize sensitivity")?,
+                    duration_strength: parse_f64(duration_strength, "quantize duration strength")?,
+                    mode: parse_quantize_note_mode(mode)?,
+                },
+            )
+        }
         [command, input, output, pattern_id, channel_id, grid_ticks, strength, swing]
             if command == "quantize-notes" =>
         {
@@ -586,6 +607,24 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u32(grid_ticks, "quantize grid ticks")?,
                 parse_f64(strength, "quantize strength")?,
                 parse_f64(swing, "quantize swing")?,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, note_indices, grid_ticks, strength, swing]
+            if command == "quantize-notes-selected" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            quantize_notes_with_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Some(&note_indices),
+                QuantizeNoteOptions {
+                    grid_ticks: parse_u32(grid_ticks, "quantize grid ticks")?,
+                    start_strength: parse_f64(strength, "quantize strength")?,
+                    swing: parse_f64(swing, "quantize swing")?,
+                    ..QuantizeNoteOptions::default()
+                },
             )
         }
         [command, input, output, pattern_id, channel_id] if command == "legato-notes" => {
@@ -2066,6 +2105,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild edit-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index> <position> <length> <key> <velocity>\n",
             "  flp-rebuild edit-note-properties <input.flp> <output.flp> <pattern-id> <channel-id> <note-index> <flags-raw|-> <group-raw|-> <fine-pitch|-> <release|-> <midi-channel-raw|-> <pan|-> <mod-x|-> <mod-y|->\n",
             "  flp-rebuild quantize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <grid-ticks> <start-strength-0..1> <swing-0..1> [sensitivity-0..1 duration-strength-0..1 leave-duration|leave-end|quantize-duration|quantize-end]\n",
+            "  flp-rebuild quantize-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <grid-ticks> <start-strength-0..1> <swing-0..1> [sensitivity-0..1 duration-strength-0..1 leave-duration|leave-end|quantize-duration|quantize-end]\n",
             "  flp-rebuild legato-notes <input.flp> <output.flp> <pattern-id> <channel-id>\n",
             "  flp-rebuild chop-notes <input.flp> <output.flp> <pattern-id> <channel-id> <divisions-2..64>\n",
             "  flp-rebuild glue-notes <input.flp> <output.flp> <pattern-id> <channel-id>\n",
@@ -4199,17 +4239,40 @@ fn quantize_notes_with_options(
     channel_id: u16,
     options: QuantizeNoteOptions,
 ) -> Result<(), String> {
+    quantize_notes_with_scope(input, output, pattern_id, channel_id, None, options)
+}
+
+fn quantize_notes_with_scope(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    note_indices: Option<&[usize]>,
+    options: QuantizeNoteOptions,
+) -> Result<(), String> {
     let (_, mut document) = load_document(input)?;
-    let changed = document
-        .quantize_pattern_notes_with_options(pattern_id, channel_id, options)
-        .map_err(|error| error.to_string())?;
+    let changed = match note_indices {
+        Some(note_indices) => document.quantize_pattern_note_selection_with_options(
+            pattern_id,
+            channel_id,
+            note_indices,
+            options,
+        ),
+        None => document.quantize_pattern_notes_with_options(pattern_id, channel_id, options),
+    }
+    .map_err(|error| error.to_string())?;
     let bytes = document
         .encode_lossless()
         .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
     fs::write(output, bytes)
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
-        "quantized {changed} notes in pattern {pattern_id}, channel {channel_id} to {}",
+        "quantized {changed} notes in pattern {pattern_id}, channel {channel_id} ({}) to {}",
+        if note_indices.is_some() {
+            "selected notes"
+        } else {
+            "all channel notes"
+        },
         output.display()
     );
     Ok(())
