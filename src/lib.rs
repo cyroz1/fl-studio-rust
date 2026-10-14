@@ -9544,11 +9544,11 @@ impl FlpDocument {
                 };
                 let next_start = next_start.min(u64::from(u32::MAX)) as u32;
                 let next_length = next_length.min(u64::from(u32::MAX)) as u32;
-                ((next_start != note.position || next_length != note.length).then_some((
+                (next_start != note.position || next_length != note.length).then_some((
                     note_index,
                     next_start,
                     next_length,
-                )))
+                ))
             })
             .collect::<Vec<_>>();
         if edits.is_empty() {
