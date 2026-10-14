@@ -15581,40 +15581,39 @@ impl DawUi {
             .map(|(clip_index, explicit_queue)| (clip_index, explicit_queue, false))
             .collect::<Vec<_>>();
         let mut performance_scene_summary = None;
-        if let Some((selected_clip_index, explicit_queue)) = performance_scene_launch_requested {
-            if let Some(zone_end_tick) = performance_zone_end_tick {
-                let supported_clip_indices = self.document.as_ref().and_then(|document| {
-                    playlist_performance_clip_indices(document, arrangement.id, zone_end_tick).ok()
-                });
-                if let Some(supported_clip_indices) = supported_clip_indices {
-                    let scene_clip_indices = playlist_performance_scene_clip_indices(
-                        &arrangement,
-                        &supported_clip_indices,
-                        selected_clip_index,
-                        zone_end_tick,
-                        ppq,
-                        project_time_signature,
-                        &signature_changes,
-                    );
-                    if scene_clip_indices.is_empty() {
-                        self.status =
-                            "Could not find supported clips in this Performance Mode scene".into();
-                    } else {
-                        performance_scene_summary = Some((
-                            selected_clip_index,
-                            scene_clip_indices.len(),
-                            explicit_queue,
-                        ));
-                        performance_clip_launch_actions.extend(
-                            scene_clip_indices
-                                .into_iter()
-                                .map(|clip_index| (clip_index, explicit_queue, true)),
-                        );
-                    }
-                } else {
-                    self.status = "Could not prepare clips for the Performance Mode scene".into();
-                }
+        let performance_scene_requested = performance_scene_launch_requested.is_some();
+        if let Some((selected_clip_index, explicit_queue)) = performance_scene_launch_requested
+            && let Some(zone_end_tick) = performance_zone_end_tick
+            && let Some(supported_clip_indices) = self.document.as_ref().and_then(|document| {
+                playlist_performance_clip_indices(document, arrangement.id, zone_end_tick).ok()
+            })
+        {
+            let scene_clip_indices = playlist_performance_scene_clip_indices(
+                &arrangement,
+                &supported_clip_indices,
+                selected_clip_index,
+                zone_end_tick,
+                ppq,
+                project_time_signature,
+                &signature_changes,
+            );
+            if scene_clip_indices.is_empty() {
+                self.status =
+                    "Could not find supported clips in this Performance Mode scene".into();
+            } else {
+                performance_scene_summary = Some((
+                    selected_clip_index,
+                    scene_clip_indices.len(),
+                    explicit_queue,
+                ));
+                performance_clip_launch_actions.extend(
+                    scene_clip_indices
+                        .into_iter()
+                        .map(|clip_index| (clip_index, explicit_queue, true)),
+                );
             }
+        } else if performance_scene_requested {
+            self.status = "Could not prepare clips for the Performance Mode scene".into();
         }
         let mut scene_commands_sent = 0usize;
         let mut scene_command_failed = false;
