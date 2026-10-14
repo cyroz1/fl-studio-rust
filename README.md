@@ -100,6 +100,7 @@ flp-rebuild arp-notes <input.flp> <output.flp> <pattern-id> <channel-id> <step-t
 flp-rebuild arp-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <step-ticks> <range-octaves-1..4> <gate-1..100> <up|down|up-down>
 flp-rebuild slice-notes <input.flp> <output.flp> <pattern-id> <channel-id> <position-ticks>
 flp-rebuild slice-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <position-ticks>
+flp-rebuild slice-notes-at-positions <input.flp> <output.flp> <pattern-id> <cuts:channel-id:note-index:tick,...>
 flp-rebuild scale-levels-notes <input.flp> <output.flp> <pattern-id> <channel-id> <center:-100..100> <tension:-100..100> <multiplier:0..200> <offset:-100..100>
 flp-rebuild scale-levels-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <center:-100..100> <tension:-100..100> <multiplier:0..200> <offset:-100..100>
 flp-rebuild articulate-notes <input.flp> <output.flp> <pattern-id> <channel-id> <multiplier:10..100> <variation:0..100> <seed> <use-original-lengths:0|1> <chop-chords:0|1>
@@ -163,7 +164,7 @@ The selected-note inspector can toggle a **Slide** note flag and shows a small m
 
 Use Ctrl/Cmd+B or **Selection → Duplicate to right** to copy the selected notes, or all notes in the current channel when nothing is selected. The copy preserves note properties and moves right by the notes' combined time span; a separate time-range repeat interval is not available yet.
 
-**Slice channel/selected** and `slice-notes` split targeted notes that cross the chosen tick into two notes. Both pieces retain the source note's properties. `slice-notes-selected` accepts comma-separated zero-based channel-local note indexes.
+**Slice channel/selected** and `slice-notes` split targeted notes that cross the chosen tick into two notes. Both pieces retain the source note's properties. `slice-notes-selected` accepts comma-separated zero-based channel-local note indexes. `slice-notes-at-positions` accepts per-note `channel-id:note-index:tick` triples, allowing one command to cut notes on multiple channels at different ticks.
 
 The desktop executable also accepts an `.flp` path as its first argument to open that project at startup.
 

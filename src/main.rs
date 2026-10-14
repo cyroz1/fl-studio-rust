@@ -1755,6 +1755,17 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u32(position_ticks, "slice position")?,
             )
         }
+        [command, input, output, pattern_id, note_cuts]
+            if command == "slice-notes-at-positions" =>
+        {
+            let note_cuts = parse_note_cuts(note_cuts)?;
+            slice_notes_at_positions(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                &note_cuts,
+            )
+        }
         [command, input, output, pattern_id, channel_id, center, tension, multiplier, offset]
             if command == "scale-levels-notes" =>
         {
@@ -2324,6 +2335,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild riff-machine-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> [--option=value ...]\n",
             "  flp-rebuild slice-notes <input.flp> <output.flp> <pattern-id> <channel-id> <position-ticks>\n",
             "  flp-rebuild slice-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <position-ticks>\n",
+            "  flp-rebuild slice-notes-at-positions <input.flp> <output.flp> <pattern-id> <cuts:channel-id:note-index:tick,...>\n",
             "  flp-rebuild scale-levels-notes <input.flp> <output.flp> <pattern-id> <channel-id> <center:-100..100> <tension:-100..100> <multiplier:0..200> <offset:-100..100>\n",
             "  flp-rebuild scale-levels-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <center:-100..100> <tension:-100..100> <multiplier:0..200> <offset:-100..100>\n",
             "  flp-rebuild articulate-notes <input.flp> <output.flp> <pattern-id> <channel-id> <multiplier:10..100> <variation:0..100> <seed> <use-original-lengths:0|1> <chop-chords:0|1>\n",
@@ -2397,6 +2409,36 @@ fn parse_note_indices(value: &str) -> Result<Vec<usize>, String> {
         return Err("at least one channel-local note index is required".to_owned());
     }
     Ok(indices)
+}
+
+fn parse_note_cuts(value: &str) -> Result<Vec<(u16, usize, u32)>, String> {
+    let mut cuts = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for cut in value.split(',') {
+        let mut fields = cut.split(':');
+        let channel_id = fields.next().unwrap_or_default();
+        let note_index = fields.next().unwrap_or_default();
+        let position_ticks = fields.next().unwrap_or_default();
+        if channel_id.is_empty()
+            || note_index.is_empty()
+            || position_ticks.is_empty()
+            || fields.next().is_some()
+        {
+            return Err(
+                "note cuts must be comma-separated channel-id:note-index:tick triples".to_owned(),
+            );
+        }
+        let channel_id = parse_u16(channel_id, "note cut channel id")?;
+        let note_index = parse_usize(note_index, "note cut channel-local index")?;
+        let position_ticks = parse_u32(position_ticks, "note cut position")?;
+        if !seen.insert((channel_id, note_index)) {
+            return Err(format!(
+                "note cut for channel {channel_id}, note {note_index} was supplied more than once"
+            ));
+        }
+        cuts.push((channel_id, note_index, position_ticks));
+    }
+    Ok(cuts)
 }
 
 fn parse_flam_placement(value: &str) -> Result<bool, String> {
@@ -5352,6 +5394,29 @@ fn slice_notes_with_scope(
         } else {
             "all channel notes"
         },
+        output.display()
+    );
+    Ok(())
+}
+
+fn slice_notes_at_positions(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    note_cuts: &[(u16, usize, u32)],
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let created = document
+        .slice_pattern_notes_at_positions(pattern_id, note_cuts)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "created {created} sliced notes in pattern {pattern_id} from {} note cuts in {}",
+        note_cuts.len(),
         output.display()
     );
     Ok(())
