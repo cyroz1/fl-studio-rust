@@ -467,6 +467,12 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 .map_err(|_| "channel id must be an integer from 0 through 65535".to_owned())?;
             rename_channel(Path::new(input), Path::new(output), channel_id, name)
         }
+        [command, input, output, sample_path, name] if command == "create-sampler-channel" => {
+            create_sample_channel(Path::new(input), Path::new(output), sample_path, name, false)
+        }
+        [command, input, output, sample_path, name] if command == "create-audio-channel" => {
+            create_sample_channel(Path::new(input), Path::new(output), sample_path, name, true)
+        }
         [command, input, output, name] if command == "create-channel-group" => {
             create_channel_group(Path::new(input), Path::new(output), name)
         }
@@ -2474,6 +2480,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild delete-pattern-time-signature <input.flp> <output.flp> <pattern-id> <position-ticks>\n",
             "  flp-rebuild set-global-swing <input.flp> <output.flp> <percent-0..100>\n",
             "  flp-rebuild rename-channel <input.flp> <output.flp> <channel-id> <name>\n",
+            "  flp-rebuild create-sampler-channel <input.flp> <output.flp> <sample-path> <name>\n",
+            "  flp-rebuild create-audio-channel <input.flp> <output.flp> <sample-path> <name>\n",
             "  flp-rebuild create-channel-group <input.flp> <output.flp> <name>\n",
             "  flp-rebuild group-channels <input.flp> <output.flp> <channel-ids:comma-separated> <name>\n",
             "  flp-rebuild rename-channel-group <input.flp> <output.flp> <group-index> <name>\n",
@@ -4594,6 +4602,33 @@ fn rename_channel(input: &Path, output: &Path, channel_id: u16, name: &str) -> R
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "renamed channel {channel_id} to {name:?} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn create_sample_channel(
+    input: &Path,
+    output: &Path,
+    sample_path: &str,
+    name: &str,
+    audio_clip: bool,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let channel_id = if audio_clip {
+        document.create_audio_channel(sample_path, name)
+    } else {
+        document.create_sampler_channel(sample_path, name)
+    }
+    .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    let channel_type = if audio_clip { "Audio Clip" } else { "Sampler" };
+    println!(
+        "created {channel_type} channel {channel_id} named {name:?} with sample {sample_path:?} in {}",
         output.display()
     );
     Ok(())
