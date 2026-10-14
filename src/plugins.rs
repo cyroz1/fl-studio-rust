@@ -368,19 +368,30 @@ mod tests {
     use std::collections::HashSet;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct TestDirectory(PathBuf);
 
     impl TestDirectory {
         fn new() -> Self {
-            let nonce = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("clock should be after epoch")
-                .as_nanos();
-            let path = std::env::temp_dir().join(format!("flp-plugin-scan-{nonce}"));
-            fs::create_dir_all(&path).expect("temporary directory should be created");
-            Self(path)
+            static NEXT_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
+            loop {
+                let timestamp = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("clock should be after epoch")
+                    .as_nanos();
+                let directory_id = NEXT_DIRECTORY_ID.fetch_add(1, Ordering::Relaxed);
+                let path = std::env::temp_dir().join(format!(
+                    "flp-plugin-scan-{timestamp}-{}-{directory_id}",
+                    std::process::id()
+                ));
+                match fs::create_dir(&path) {
+                    Ok(()) => return Self(path),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("temporary directory should be created: {error}"),
+                }
+            }
         }
     }
 
