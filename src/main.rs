@@ -15,9 +15,9 @@ use flp_rebuild::sample_render::{
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions};
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, AutomationPointEdit, ChannelLevelAdjustmentsEdit,
-    FlpDocument, FstPreset, PatternControllerEdit, PatternNote, PatternNoteEdit, PlaylistClipEdit,
-    PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit,
-    ProjectSettingsEdit, RandomizerOptions, TimeMarkerEdit,
+    FlpDocument, FstPreset, HumanizerOptions, PatternControllerEdit, PatternNote, PatternNoteEdit,
+    PlaylistClipEdit, PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress,
+    PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions, TimeMarkerEdit,
 };
 
 fn main() -> ExitCode {
@@ -740,8 +740,37 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u16(pattern_id, "pattern id")?,
                 parse_u16(channel_id, "channel id")?,
                 parse_u64(seed, "humanize seed")?,
-                parse_u32(timing_range, "timing range")?,
-                parse_u8(velocity_variation, "velocity variation")?,
+                HumanizerOptions {
+                    timing_range_ticks: parse_u32(timing_range, "timing range")?,
+                    velocity_variation_percent: parse_u8(
+                        velocity_variation,
+                        "velocity variation",
+                    )?,
+                    ..HumanizerOptions::default()
+                },
+            )
+        }
+        [command, input, output, pattern_id, channel_id, seed, timing_range, velocity_variation,
+            pan_variation, release_variation, mod_x_variation, mod_y_variation]
+            if command == "humanize-notes" =>
+        {
+            humanize_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                parse_u64(seed, "humanize seed")?,
+                HumanizerOptions {
+                    timing_range_ticks: parse_u32(timing_range, "timing range")?,
+                    velocity_variation_percent: parse_u8(
+                        velocity_variation,
+                        "velocity variation",
+                    )?,
+                    pan_variation_percent: parse_u8(pan_variation, "pan variation")?,
+                    release_variation_percent: parse_u8(release_variation, "release variation")?,
+                    mod_x_variation_percent: parse_u8(mod_x_variation, "Mod X variation")?,
+                    mod_y_variation_percent: parse_u8(mod_y_variation, "Mod Y variation")?,
+                },
             )
         }
         [command, input, output, pattern_id, channel_id, minimum_key, maximum_key]
@@ -1179,7 +1208,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild flam-notes <input.flp> <output.flp> <pattern-id> <channel-id> <stroke-ticks> <velocity-0..127> <before|after>\n",
             "  flp-rebuild randomize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <velocity:-100..100> <pan:-100..100> <pitch-range:0..24> <bipolar:0|1> <reset:0|1> [release:-100..100 mod-x:-100..100 mod-y:-100..100]\n",
             "  flp-rebuild randomize-notes-scale <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <velocity:-100..100> <pan:-100..100> <pitch-range:0..24> <bipolar:0|1> <reset:0|1> <scale-name> <scale-root:0..11> [release:-100..100 mod-x:-100..100 mod-y:-100..100]\n",
-            "  flp-rebuild humanize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <timing-range-ticks> <velocity-variation-0..100>\n",
+            "  flp-rebuild humanize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <timing-range-ticks> <velocity-variation-0..100> [pan-variation-0..100 release-variation-0..100 mod-x-variation-0..100 mod-y-variation-0..100]\n",
             "  flp-rebuild limit-notes <input.flp> <output.flp> <pattern-id> <channel-id> <minimum-key-0..127> <maximum-key-0..127>\n",
             "  flp-rebuild arp-notes <input.flp> <output.flp> <pattern-id> <channel-id> <step-ticks> <range-octaves-1..4> <gate-1..100> <up|down|up-down>\n",
             "  flp-rebuild slice-notes <input.flp> <output.flp> <pattern-id> <channel-id> <position-ticks>\n",
@@ -3402,18 +3431,11 @@ fn humanize_notes(
     pattern_id: u16,
     channel_id: u16,
     seed: u64,
-    timing_range_ticks: u32,
-    velocity_variation_percent: u8,
+    options: HumanizerOptions,
 ) -> Result<(), String> {
     let (_, mut document) = load_document(input)?;
     let changed = document
-        .humanize_pattern_notes(
-            pattern_id,
-            channel_id,
-            seed,
-            timing_range_ticks,
-            velocity_variation_percent,
-        )
+        .humanize_pattern_notes_with_options(pattern_id, channel_id, seed, options)
         .map_err(|error| error.to_string())?;
     let bytes = document
         .encode_lossless()

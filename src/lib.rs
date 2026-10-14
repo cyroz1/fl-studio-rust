@@ -1389,6 +1389,23 @@ pub struct RandomizerOptions {
     pub reset_levels: bool,
 }
 
+/// Timing and note-level variation for a seeded Humanize pass.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HumanizerOptions {
+    /// Maximum symmetric timing offset, in project ticks.
+    pub timing_range_ticks: u32,
+    /// Symmetric variation as a percentage of the full velocity range.
+    pub velocity_variation_percent: u8,
+    /// Symmetric variation as a percentage of the full pan range.
+    pub pan_variation_percent: u8,
+    /// Symmetric variation as a percentage of the full release range.
+    pub release_variation_percent: u8,
+    /// Symmetric variation as a percentage of the full Mod X range.
+    pub mod_x_variation_percent: u8,
+    /// Symmetric variation as a percentage of the full Mod Y range.
+    pub mod_y_variation_percent: u8,
+}
+
 /// Parameters for adding and optionally grouping Flam strokes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FlamOptions {
@@ -11322,14 +11339,27 @@ impl FlpDocument {
         timing_range_ticks: u32,
         velocity_variation_percent: u8,
     ) -> Result<usize, FlpError> {
-        self.humanize_pattern_notes_in_scope(
+        self.humanize_pattern_notes_with_options(
             pattern_id,
             channel_id,
-            None,
             seed,
-            timing_range_ticks,
-            velocity_variation_percent,
+            HumanizerOptions {
+                timing_range_ticks,
+                velocity_variation_percent,
+                ..HumanizerOptions::default()
+            },
         )
+    }
+
+    /// Adds seeded timing variation and note-level variation to channel notes.
+    pub fn humanize_pattern_notes_with_options(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        seed: u64,
+        options: HumanizerOptions,
+    ) -> Result<usize, FlpError> {
+        self.humanize_pattern_notes_in_scope(pattern_id, channel_id, None, seed, options)
     }
 
     /// Adds timing and velocity variation only to selected notes.
@@ -11342,13 +11372,34 @@ impl FlpDocument {
         timing_range_ticks: u32,
         velocity_variation_percent: u8,
     ) -> Result<usize, FlpError> {
+        self.humanize_pattern_note_selection_with_options(
+            pattern_id,
+            channel_id,
+            note_indices,
+            seed,
+            HumanizerOptions {
+                timing_range_ticks,
+                velocity_variation_percent,
+                ..HumanizerOptions::default()
+            },
+        )
+    }
+
+    /// Adds timing and note-level variation only to selected notes.
+    pub fn humanize_pattern_note_selection_with_options(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: &[usize],
+        seed: u64,
+        options: HumanizerOptions,
+    ) -> Result<usize, FlpError> {
         self.humanize_pattern_notes_in_scope(
             pattern_id,
             channel_id,
             Some(note_indices),
             seed,
-            timing_range_ticks,
-            velocity_variation_percent,
+            options,
         )
     }
 
@@ -11358,15 +11409,19 @@ impl FlpDocument {
         channel_id: u16,
         note_indices: Option<&[usize]>,
         seed: u64,
-        timing_range_ticks: u32,
-        velocity_variation_percent: u8,
+        options: HumanizerOptions,
     ) -> Result<usize, FlpError> {
-        if velocity_variation_percent > 100 {
+        if options.velocity_variation_percent > 100
+            || options.pan_variation_percent > 100
+            || options.release_variation_percent > 100
+            || options.mod_x_variation_percent > 100
+            || options.mod_y_variation_percent > 100
+        {
             return Err(FlpError::UnsupportedEdit(
-                "humanize velocity variation must be between 0 and 100 percent",
+                "humanize level variations must be between 0 and 100 percent",
             ));
         }
-        if timing_range_ticks > i32::MAX as u32 {
+        if options.timing_range_ticks > i32::MAX as u32 {
             return Err(FlpError::UnsupportedEdit(
                 "humanize timing range must fit a signed 32-bit tick offset",
             ));
@@ -11383,7 +11438,11 @@ impl FlpDocument {
         } else {
             seed
         };
-        let velocity_range = (127 * i32::from(velocity_variation_percent) + 50) / 100;
+        let velocity_range = (127 * i32::from(options.velocity_variation_percent) + 50) / 100;
+        let pan_range = (127 * i32::from(options.pan_variation_percent) + 50) / 100;
+        let release_range = (128 * i32::from(options.release_variation_percent) + 50) / 100;
+        let mod_x_range = (255 * i32::from(options.mod_x_variation_percent) + 50) / 100;
+        let mod_y_range = (255 * i32::from(options.mod_y_variation_percent) + 50) / 100;
         let selected_indices =
             note_indices.map(|indices| indices.iter().copied().collect::<HashSet<_>>());
         let mut edits = Vec::new();
@@ -11396,20 +11455,50 @@ impl FlpDocument {
         {
             let timing_offset = randomizer_offset(
                 &mut state,
-                i32::try_from(timing_range_ticks).map_err(|_| FlpError::LengthOverflow)?,
+                i32::try_from(options.timing_range_ticks).map_err(|_| FlpError::LengthOverflow)?,
                 false,
                 true,
             );
             let position = (i64::from(note.position) + i64::from(timing_offset))
                 .clamp(0, i64::from(u32::MAX)) as u32;
             let velocity_offset = randomizer_offset(&mut state, velocity_range, false, true);
-            let velocity = if velocity_variation_percent == 0 {
+            let velocity = if options.velocity_variation_percent == 0 {
                 note.velocity
             } else {
                 (i32::from(note.velocity) + velocity_offset).clamp(0, 127) as u8
             };
-            if position != note.position || velocity != note.velocity {
-                edits.push((note_index, position, velocity));
+            let pan_offset = randomizer_offset(&mut state, pan_range, false, true);
+            let pan = if options.pan_variation_percent == 0 {
+                note.pan
+            } else {
+                (i32::from(note.pan) + pan_offset).clamp(0, 127) as u8
+            };
+            let release_offset = randomizer_offset(&mut state, release_range, false, true);
+            let release = if options.release_variation_percent == 0 {
+                note.release
+            } else {
+                (i32::from(note.release) + release_offset).clamp(0, 128) as u8
+            };
+            let mod_x_offset = randomizer_offset(&mut state, mod_x_range, false, true);
+            let mod_x = if options.mod_x_variation_percent == 0 {
+                note.mod_x
+            } else {
+                (i32::from(note.mod_x) + mod_x_offset).clamp(0, 255) as u8
+            };
+            let mod_y_offset = randomizer_offset(&mut state, mod_y_range, false, true);
+            let mod_y = if options.mod_y_variation_percent == 0 {
+                note.mod_y
+            } else {
+                (i32::from(note.mod_y) + mod_y_offset).clamp(0, 255) as u8
+            };
+            if position != note.position
+                || velocity != note.velocity
+                || pan != note.pan
+                || release != note.release
+                || mod_x != note.mod_x
+                || mod_y != note.mod_y
+            {
+                edits.push((note_index, position, velocity, pan, release, mod_x, mod_y));
             }
         }
         if edits.is_empty() {
@@ -11417,7 +11506,7 @@ impl FlpDocument {
         }
 
         let mut updated = self.clone();
-        for (note_index, position, velocity) in &edits {
+        for (note_index, position, velocity, pan, release, mod_x, mod_y) in &edits {
             updated.edit_pattern_note(
                 pattern_id,
                 channel_id,
@@ -11425,6 +11514,10 @@ impl FlpDocument {
                 PatternNoteEdit {
                     position: Some(*position),
                     velocity: Some(*velocity),
+                    pan: Some(*pan),
+                    release: Some(*release),
+                    mod_x: Some(*mod_x),
+                    mod_y: Some(*mod_y),
                     ..PatternNoteEdit::default()
                 },
             )?;

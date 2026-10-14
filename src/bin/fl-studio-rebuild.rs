@@ -54,7 +54,7 @@ use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, Arrangement, ArticulateOptions, AutomationChannel,
     AutomationPoint, AutomationPointEdit, ChannelGroupSummary, ChannelSortOrder, ChannelSummary,
     ChannelType, ClawMachineOptions, FlamOptions, FlpDocument, FlpError, FstPreset, FstPresetKind,
-    LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerParameterKind,
+    HumanizerOptions, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerParameterKind,
     MixerParameterRecord, PATTERN_NOTE_DEFAULT_FLAGS, PATTERN_NOTE_DEFAULT_RELEASE, Pattern,
     PatternController, PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation,
     PayloadEncoding, PlaylistClip, PlaylistClipEdit, PlaylistClipSelectionClipboard,
@@ -3417,6 +3417,10 @@ struct DawUi {
     articulate_chop_chords: bool,
     humanize_timing_range_ticks: u32,
     humanize_velocity_variation_percent: u8,
+    humanize_pan_variation_percent: u8,
+    humanize_release_variation_percent: u8,
+    humanize_mod_x_variation_percent: u8,
+    humanize_mod_y_variation_percent: u8,
     note_limit_minimum_key: u8,
     note_limit_maximum_key: u8,
     note_limit_wrap_to_bottom: bool,
@@ -4185,6 +4189,10 @@ impl DawUi {
             articulate_chop_chords: false,
             humanize_timing_range_ticks: 12,
             humanize_velocity_variation_percent: 10,
+            humanize_pan_variation_percent: 0,
+            humanize_release_variation_percent: 0,
+            humanize_mod_x_variation_percent: 0,
+            humanize_mod_y_variation_percent: 0,
             note_limit_minimum_key: 36,
             note_limit_maximum_key: 83,
             note_limit_wrap_to_bottom: false,
@@ -25109,6 +25117,22 @@ impl DawUi {
                         .text("Humanize velocity (%)"),
                 );
                 ui.add(
+                    egui::Slider::new(&mut self.humanize_pan_variation_percent, 0..=100)
+                        .text("Humanize pan (%)"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.humanize_release_variation_percent, 0..=100)
+                        .text("Humanize release (%)"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.humanize_mod_x_variation_percent, 0..=100)
+                        .text("Humanize Mod X (%)"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.humanize_mod_y_variation_percent, 0..=100)
+                        .text("Humanize Mod Y (%)"),
+                );
+                ui.add(
                     egui::Slider::new(&mut self.note_limit_minimum_key, 0..=127)
                         .text("Limit lowest key"),
                 );
@@ -25667,27 +25691,34 @@ impl DawUi {
             let seed = self.randomizer_seed;
             let timing_range_ticks = self.humanize_timing_range_ticks;
             let velocity_variation_percent = self.humanize_velocity_variation_percent;
+            let pan_variation_percent = self.humanize_pan_variation_percent;
+            let release_variation_percent = self.humanize_release_variation_percent;
+            let mod_x_variation_percent = self.humanize_mod_x_variation_percent;
+            let mod_y_variation_percent = self.humanize_mod_y_variation_percent;
+            let options = HumanizerOptions {
+                timing_range_ticks,
+                velocity_variation_percent,
+                pan_variation_percent,
+                release_variation_percent,
+                mod_x_variation_percent,
+                mod_y_variation_percent,
+            };
             let result = self
                 .document
                 .as_mut()
                 .ok_or_else(|| "no project is open".to_owned())
                 .and_then(|document| {
                     let result = if edit_selection_only {
-                        document.humanize_pattern_note_selection(
+                        document.humanize_pattern_note_selection_with_options(
                             pattern_id,
                             channel_id,
                             &selected_quantize_indices,
                             seed,
-                            timing_range_ticks,
-                            velocity_variation_percent,
+                            options,
                         )
                     } else {
-                        document.humanize_pattern_notes(
-                            pattern_id,
-                            channel_id,
-                            seed,
-                            timing_range_ticks,
-                            velocity_variation_percent,
+                        document.humanize_pattern_notes_with_options(
+                            pattern_id, channel_id, seed, options,
                         )
                     };
                     result.map_err(|error| error.to_string())
