@@ -1909,6 +1909,27 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_usize(note_index, "channel note index")?,
             )
         }
+        [command, input, output, pattern_id, channel_id] if command == "delete-notes" => {
+            delete_notes_with_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                None,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, note_indices]
+            if command == "delete-notes-selected" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            delete_notes_with_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Some(&note_indices),
+            )
+        }
         [command, input, output, arrangement_id, clip_index, position, length]
             if command == "edit-clip" =>
         {
@@ -2311,6 +2332,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild claw-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <period-ticks:16+> <trash-every:2..16> <time-distortion:-100..100> <remove-short-notes:0|1> <stretch-to-compensate:0|1>\n",
             "  flp-rebuild add-note <input.flp> <output.flp> <pattern-id> <channel-id> <position> <length> <key> <velocity>\n",
             "  flp-rebuild delete-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index>\n",
+            "  flp-rebuild delete-notes <input.flp> <output.flp> <pattern-id> <channel-id>\n",
+            "  flp-rebuild delete-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based>\n",
             "  flp-rebuild import-midi <input.flp> <input.mid> <output.flp> <track> <pattern-id> <channel-id>\n",
             "  flp-rebuild edit-clip <input.flp> <output.flp> <arrangement-id> <clip-index> <position> <length>\n",
             "  flp-rebuild set-clip-muted <input.flp> <output.flp> <arrangement-id> <clip-index> <muted:0|1>\n",
@@ -5492,6 +5515,38 @@ fn delete_note(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "deleted note {note_index} from pattern {pattern_id}, channel {channel_id} to {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn delete_notes_with_scope(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    note_indices: Option<&[usize]>,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let deleted = match note_indices {
+        Some(note_indices) => {
+            document.delete_pattern_note_selection(pattern_id, channel_id, note_indices)
+        }
+        None => document.delete_pattern_notes(pattern_id, channel_id),
+    }
+    .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "deleted {deleted} notes in pattern {pattern_id}, channel {channel_id} ({}) to {}",
+        if note_indices.is_some() {
+            "selected notes"
+        } else {
+            "all channel notes"
+        },
         output.display()
     );
     Ok(())
