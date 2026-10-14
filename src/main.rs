@@ -576,6 +576,20 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 sample_path,
             )
         }
+        [command, input, output, event_index, record_index, value]
+            if command == "set-mixer-parameter-record-value" =>
+        {
+            let value = value
+                .parse::<i32>()
+                .map_err(|_| "Mixer parameter value must be a signed 32-bit integer".to_owned())?;
+            set_mixer_parameter_record_value(
+                Path::new(input),
+                Path::new(output),
+                parse_usize(event_index, "Mixer event index")?,
+                parse_usize(record_index, "Mixer record index")?,
+                value,
+            )
+        }
         [command, input, output, channel_id, zipped] if command == "set-channel-zipped" => {
             set_channel_zipped(
                 Path::new(input),
@@ -2493,6 +2507,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild channels <file.flp>\n",
             "  flp-rebuild channel-groups <file.flp>\n",
             "  flp-rebuild mixer <file.flp>\n",
+            "  flp-rebuild set-mixer-parameter-record-value <input.flp> <output.flp> <event-index> <record-index> <signed-value>\n",
             "  flp-rebuild automation <file.flp>\n",
             "  flp-rebuild time-markers <file.flp>\n",
             "  flp-rebuild sample-paths <file.flp>\n",
@@ -4127,6 +4142,19 @@ fn list_mixer(path: &Path) -> Result<(), String> {
         count_kind(flp_rebuild::MixerParameterKind::StereoSeparation),
         count_kind(flp_rebuild::MixerParameterKind::RouteVolume),
     );
+    for record in &parameters {
+        println!(
+            "0xE1 event={} record={} id=0x{:02X} kind={:?} target={} slot={} scope_raw={} value={}",
+            record.event_index(),
+            record.record_index(),
+            record.parameter_id(),
+            record.kind(),
+            record.target_index(),
+            record.slot_index(),
+            record.target_scope_raw(),
+            record.value()
+        );
+    }
     Ok(())
 }
 
@@ -4827,6 +4855,29 @@ fn edit_channel_order(
     fs::write(output, bytes)
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!("{description} in {}", output.display());
+    Ok(())
+}
+
+fn set_mixer_parameter_record_value(
+    input: &Path,
+    output: &Path,
+    event_index: usize,
+    record_index: usize,
+    value: i32,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .set_mixer_parameter_record_value(event_index, record_index, value)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "set Mixer 0xE1 event {event_index} record {record_index} value to {value} in {}",
+        output.display()
+    );
     Ok(())
 }
 

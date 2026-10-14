@@ -43,6 +43,7 @@ flp-rebuild channels <file.flp>
 flp-rebuild plugin-states <file.flp>
 flp-rebuild channel-events <file.flp> <channel-id>
 flp-rebuild mixer <file.flp>
+flp-rebuild set-mixer-parameter-record-value <input.flp> <output.flp> <event-index> <record-index> <signed-value>
 flp-rebuild automation <file.flp>
 flp-rebuild time-markers <file.flp>
 flp-rebuild patterns <file.flp>
@@ -279,7 +280,7 @@ Layer child relationships and raw flags are available in the project model. The 
 
 ## Mixer
 
-The `mixer <file.flp>` command reports recognized insert fields and counts known `0xE1` parameter IDs. The desktop Mixer presents recognized insert records as selectable vertical strips, with a Track Inspector for existing names and raw route, color, icon, and event-range fields. Names can be edited through their `0xCC` events while retaining the project's string encoding and unrelated bytes. A strip shows editable raw volume and pan controls only when the corpus-derived target convention finds one unique zero-scope record for each; a unique in-range stereo-separation record also gets an editable raw slider. The target-to-visible-track mapping remains unverified. The inspector shows ten disabled effect-slot placeholders while the slot data remains opaque. Its expandable `0xE1` record list edits raw signed values by exact event and record index, and shows target and slot bits as candidates. Offline metering, effect processing, and routing remain incomplete; live Master and recognized direct-route insert peak meters are available.
+The `mixer <file.flp>` command reports recognized insert fields and each `0xE1` parameter record's global event index, record index, raw ID, candidate target/slot bits, and signed value. `set-mixer-parameter-record-value <input.flp> <output.flp> <event-index> <record-index> <signed-value>` changes one record's signed value while retaining its prefix, ID, target word, and other records. The desktop Mixer presents recognized insert records as selectable vertical strips, with a Track Inspector for existing names and raw route, color, icon, and event-range fields. Names can be edited through their `0xCC` events while retaining the project's string encoding and unrelated bytes. A strip shows editable raw volume and pan controls only when the corpus-derived target convention finds one unique zero-scope record for each; a unique in-range stereo-separation record also gets an editable raw slider. The target-to-visible-track mapping remains unverified. The inspector shows ten disabled effect-slot placeholders while the slot data remains opaque. Its expandable `0xE1` record list edits raw signed values by exact event and record index, and shows target and slot bits as candidates. Offline metering, effect processing, and routing remain incomplete; live Master and recognized direct-route insert peak meters are available.
 
 ## Automation points
 
