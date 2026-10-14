@@ -93,6 +93,7 @@ const BLUE_SELECTION: Color32 = Color32::from_rgb(14, 23, 63);
 const RED_SELECTION: Color32 = Color32::from_rgb(62, 22, 20);
 const MIDI_PLAYLIST_MESSAGES_PER_UPDATE: usize = 256;
 const MIDI_THRU_NOTE_STACK_LIMIT: u8 = 16;
+const PLAYLIST_LABEL_WIDTH: f32 = 178.0;
 const PURPLE: Color32 = Color32::from_rgb(150, 93, 181);
 const ORANGE: Color32 = Color32::from_rgb(195, 129, 61);
 const RED: Color32 = Color32::from_rgb(252, 67, 46);
@@ -3180,6 +3181,7 @@ struct DawUi {
     performance_mode_active: bool,
     held_performance_clips: Vec<(u16, u32, usize)>,
     midi_held_performance_clips: MidiPerformanceHoldMap,
+    midi_performance_page_navigation: bool,
     midi_performance_scene_mode: bool,
     midi_performance_plus_scene_mode: bool,
     performance_scene_round_robin: BTreeMap<(u16, u32, u32), usize>,
@@ -3910,6 +3912,7 @@ impl DawUi {
             performance_mode_active: false,
             held_performance_clips: Vec::new(),
             midi_held_performance_clips: BTreeMap::new(),
+            midi_performance_page_navigation: false,
             midi_performance_scene_mode: false,
             midi_performance_plus_scene_mode: false,
             performance_scene_round_robin: BTreeMap::new(),
@@ -7516,6 +7519,7 @@ impl DawUi {
 
     fn release_all_midi_performance_clips(&mut self) {
         let held = std::mem::take(&mut self.midi_held_performance_clips);
+        self.midi_performance_page_navigation = false;
         self.midi_performance_scene_mode = false;
         self.midi_performance_plus_scene_mode = false;
         for (_, held_clips) in held {
@@ -7531,6 +7535,13 @@ impl DawUi {
 
     fn handle_midi_performance_note(&mut self, message: ReceivedMidiMessage) {
         match message.event {
+            MidiInputEvent::NoteOn {
+                channel: 0,
+                key: key @ 120..=124,
+                velocity,
+            } if velocity > 0 && self.performance_mode_active && self.playing => {
+                self.navigate_midi_performance_playlist(key);
+            }
             MidiInputEvent::NoteOn {
                 channel: 0,
                 key: 125,
@@ -7602,6 +7613,102 @@ impl DawUi {
             }
             _ => {}
         }
+    }
+
+    fn navigate_midi_performance_playlist(&mut self, key: u8) {
+        if key == 124 {
+            self.midi_performance_page_navigation = !self.midi_performance_page_navigation;
+            self.status = if self.midi_performance_page_navigation {
+                "MIDI Performance Mode navigation moves 12 cells per press".to_owned()
+            } else {
+                "MIDI Performance Mode navigation moves one cell per press".to_owned()
+            };
+            return;
+        }
+
+        let step_count = if self.midi_performance_page_navigation {
+            12
+        } else {
+            1
+        };
+        let current_offset = self
+            .playlist_pending_scroll_offset
+            .unwrap_or(self.playlist_grid_scroll_offset);
+        match key {
+            120 | 121 => {
+                let row_height = (27.0 * self.playlist_track_zoom).max(1.0);
+                let current_track = ((current_offset.y - 34.0).max(0.0) / row_height).floor();
+                let target_track = if key == 120 {
+                    (current_track as i64 - i64::from(step_count)).max(0)
+                } else {
+                    current_track as i64 + i64::from(step_count)
+                };
+                let target_y = if target_track == 0 {
+                    0.0
+                } else {
+                    34.0 + target_track as f32 * row_height
+                };
+                self.playlist_pending_scroll_offset = Some(Vec2::new(current_offset.x, target_y));
+            }
+            122 | 123 => {
+                let Some(document) = self.document.as_ref() else {
+                    return;
+                };
+                let arrangements = document.arrangements().unwrap_or_default();
+                let Some(arrangement) = arrangements
+                    .iter()
+                    .find(|arrangement| Some(arrangement.id) == self.selected_arrangement)
+                    .or_else(|| arrangements.first())
+                else {
+                    return;
+                };
+                let ppq = document.header().ppq().max(1);
+                let initial_time_signature = document.metadata().time_signature();
+                let signature_changes = arrangement
+                    .time_markers
+                    .iter()
+                    .filter(|marker| marker.is_signature())
+                    .filter_map(|marker| {
+                        Some((
+                            marker.position_ticks(),
+                            marker.numerator()?.max(1),
+                            marker.denominator()?.max(1),
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                let timeline_zoom = self.timeline_zoom.max(0.001);
+                let current_tick = ((current_offset.x - PLAYLIST_LABEL_WIDTH).max(0.0)
+                    / timeline_zoom)
+                    .floor()
+                    .clamp(0.0, u32::MAX as f32) as u32;
+                let target_tick = playlist_performance_navigation_target_tick(
+                    arrangement,
+                    current_tick,
+                    key == 123,
+                    step_count,
+                    ppq,
+                    initial_time_signature,
+                    &signature_changes,
+                );
+                let target_x = if target_tick == 0 {
+                    0.0
+                } else {
+                    PLAYLIST_LABEL_WIDTH + target_tick as f32 * timeline_zoom
+                };
+                self.playlist_pending_scroll_offset = Some(Vec2::new(target_x, current_offset.y));
+            }
+            _ => return,
+        }
+        self.status = format!(
+            "Scrolled the Performance Mode Playlist {}",
+            match key {
+                120 => "up",
+                121 => "down",
+                122 => "left",
+                123 => "right",
+                _ => unreachable!(),
+            }
+        );
     }
 
     fn trigger_performance_midi_scene(&mut self, channel: u8, key: u8, additive: bool) {
@@ -8471,6 +8578,7 @@ impl DawUi {
     fn stop_project_playback(&mut self) {
         self.held_performance_clips.clear();
         self.midi_held_performance_clips.clear();
+        self.midi_performance_page_navigation = false;
         self.midi_performance_scene_mode = false;
         self.midi_performance_plus_scene_mode = false;
         self.performance_scene_round_robin.clear();
@@ -13127,6 +13235,9 @@ impl DawUi {
                 });
             if performance_mode_button.clicked() {
                 self.performance_mode_active = !self.performance_mode_active;
+                if !self.performance_mode_active {
+                    self.midi_performance_page_navigation = false;
+                }
                 self.status = if self.performance_mode_active {
                     "Performance Mode enabled; playback will start at the Start marker".to_owned()
                 } else {
@@ -13428,7 +13539,7 @@ impl DawUi {
             .or_else(|| arrangement.clips.first())
             .and_then(|clip| clip.track_index)
             .unwrap_or(0);
-        let label_width = 178.0;
+        let label_width = PLAYLIST_LABEL_WIDTH;
         let touch_gesture = ui.input(|input| input.multi_touch());
         let any_touches = ui.input(|input| input.any_touches());
         let input_time = ui.input(|input| input.time);
@@ -14870,7 +14981,7 @@ impl DawUi {
                             let drag_hint = if self.playlist_mute_tool_active {
                                 "Mute tool selected: click to mute or unmute this clip. Press T or select Mute to return to move mode."
                             } else if can_trigger_performance_clip {
-                                "Performance Mode: click supported clips or send MIDI channel 1 notes to trigger them; notes map 12 clip slots per Playlist track across the first 10 tracks. Mapped controllers can hold F10/F#10 notes for Scene/+Scene. Shift-click queues a clip, Ctrl/Cmd-click launches its scene, and blank marker/bar cells launch or queue scenes. The track Queue setting also queues normal clicks."
+                                "Performance Mode: click supported clips or send MIDI channel 1 notes to trigger them; notes map 12 clip slots per Playlist track across the first 10 tracks. Mapped controllers can use C10–D#10 to scroll the Playlist, E10 to toggle 12-cell page steps, and hold F10/F#10 for Scene/+Scene. Shift-click queues a clip, Ctrl/Cmd-click launches its scene, and blank marker/bar cells launch or queue scenes. The track Queue setting also queues normal clicks."
                             } else if !can_resize_clip {
                                 "Drag to move. Resizing and source-window editing are unavailable for this FL Studio clip format."
                             } else if self.playlist_slip_tool_active && is_audio_clip {
@@ -42327,6 +42438,77 @@ fn playlist_performance_zone_start_tick(markers: &[TimeMarker]) -> Option<u32> {
         })
         .map(TimeMarker::position_ticks)
         .min()
+}
+
+fn playlist_performance_navigation_target_tick(
+    arrangement: &Arrangement,
+    current_tick: u32,
+    forward: bool,
+    steps: u8,
+    ppq: u16,
+    initial_time_signature: Option<(u8, u8)>,
+    signature_changes: &[(u32, u8, u8)],
+) -> u32 {
+    let mut marker_positions = arrangement
+        .time_markers
+        .iter()
+        .filter(|marker| !marker.is_signature())
+        .map(TimeMarker::position_ticks)
+        .collect::<Vec<_>>();
+    marker_positions.sort_unstable();
+    marker_positions.dedup();
+    if marker_positions
+        .first()
+        .is_some_and(|position| *position > 0)
+    {
+        marker_positions.insert(0, 0);
+    }
+
+    let mut target_tick = current_tick;
+    for _ in 0..steps {
+        let next_tick = if forward {
+            marker_positions
+                .iter()
+                .copied()
+                .find(|position| *position > target_tick)
+                .or_else(|| {
+                    playlist_next_bar_tick(
+                        f64::from(target_tick),
+                        ppq,
+                        initial_time_signature,
+                        signature_changes,
+                    )
+                })
+        } else {
+            marker_positions
+                .iter()
+                .copied()
+                .filter(|position| *position < target_tick)
+                .max()
+                .or_else(|| {
+                    (target_tick > 0).then(|| {
+                        playlist_measure_at_tick(
+                            ppq,
+                            initial_time_signature,
+                            signature_changes,
+                            target_tick.saturating_sub(1),
+                        )
+                        .0
+                    })
+                })
+        };
+        let Some(next_tick) = next_tick.filter(|position| {
+            if forward {
+                *position > target_tick
+            } else {
+                *position < target_tick
+            }
+        }) else {
+            break;
+        };
+        target_tick = next_tick;
+    }
+    target_tick
 }
 
 fn playlist_performance_midi_scene_tick(
