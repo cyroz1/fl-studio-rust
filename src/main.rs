@@ -16,9 +16,9 @@ use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions};
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, ArticulateOptions, AutomationPointEdit,
     ChannelLevelAdjustmentsEdit, ChannelSortOrder, ClawMachineOptions, FlamOptions, FlpDocument,
-    FstPreset, HumanizerOptions, LimitNoteOptions, LimitSnapDirection, PatternControllerEdit,
-    PatternNote, PatternNoteEdit, PatternNoteRotation, PlaylistClipEdit, PlaylistTrackEdit,
-    PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit,
+    FstPreset, HumanizerOptions, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit,
+    PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation, PlaylistClipEdit,
+    PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit,
     ProjectSettingsEdit, QuantizeNoteMode, QuantizeNoteOptions, RandomNoteChordMap,
     RandomNoteGeneratorOptions, RandomizerOptions, RiffMachineOptions, RiffMachineQuantizeMode,
     ScaleLevelsOptions, StrumOptions, TimeMarkerEdit,
@@ -598,6 +598,17 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 Path::new(output),
                 parse_usize(insert_ordinal, "Mixer insert ordinal")?,
                 name,
+            )
+        }
+        [command, input, output, insert_ordinal, field, enabled]
+            if command == "set-mixer-insert-flag" =>
+        {
+            set_mixer_insert_flag(
+                Path::new(input),
+                Path::new(output),
+                parse_usize(insert_ordinal, "Mixer insert ordinal")?,
+                field,
+                parse_bool(enabled, "Mixer insert flag")?,
             )
         }
         [command, input, output, channel_id, zipped] if command == "set-channel-zipped" => {
@@ -2519,6 +2530,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild mixer <file.flp>\n",
             "  flp-rebuild set-mixer-parameter-record-value <input.flp> <output.flp> <event-index> <record-index> <signed-value>\n",
             "  flp-rebuild rename-mixer-insert <input.flp> <output.flp> <insert-ordinal> <name>\n",
+            "  flp-rebuild set-mixer-insert-flag <input.flp> <output.flp> <insert-ordinal> <enabled|soloed|polarity-reversed|swap-left-right|effects-enabled> <0|1>\n",
             "  flp-rebuild automation <file.flp>\n",
             "  flp-rebuild time-markers <file.flp>\n",
             "  flp-rebuild sample-paths <file.flp>\n",
@@ -4909,6 +4921,57 @@ fn rename_mixer_insert(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "renamed Mixer insert {insert_ordinal} to {name:?} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn set_mixer_insert_flag(
+    input: &Path,
+    output: &Path,
+    insert_ordinal: usize,
+    field: &str,
+    enabled: bool,
+) -> Result<(), String> {
+    let edit = match field {
+        "enabled" => MixerInsertEdit {
+            enabled: Some(enabled),
+            ..MixerInsertEdit::default()
+        },
+        "soloed" => MixerInsertEdit {
+            soloed: Some(enabled),
+            ..MixerInsertEdit::default()
+        },
+        "polarity-reversed" => MixerInsertEdit {
+            polarity_reversed: Some(enabled),
+            ..MixerInsertEdit::default()
+        },
+        "swap-left-right" => MixerInsertEdit {
+            swap_left_right: Some(enabled),
+            ..MixerInsertEdit::default()
+        },
+        "effects-enabled" => MixerInsertEdit {
+            effects_enabled: Some(enabled),
+            ..MixerInsertEdit::default()
+        },
+        _ => {
+            return Err(format!(
+                "unknown Mixer insert flag {field:?}; expected enabled, soloed, polarity-reversed, swap-left-right, or effects-enabled"
+            ));
+        }
+    };
+    let (_, mut document) = load_document(input)?;
+    document
+        .edit_mixer_insert_flags(insert_ordinal, edit)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "set Mixer insert {insert_ordinal} flag {field} to {} in {}",
+        u8::from(enabled),
         output.display()
     );
     Ok(())
