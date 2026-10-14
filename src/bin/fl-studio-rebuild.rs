@@ -7918,11 +7918,13 @@ impl DawUi {
                 &arrangement,
                 &supported_clip_indices,
                 scene_tick,
-                performance_zone_end_tick,
-                ppq,
-                Some(project_time_signature),
-                &signature_changes,
-                None,
+                PlaylistPerformanceSceneContext {
+                    performance_zone_end_tick,
+                    ppq,
+                    initial_time_signature: Some(project_time_signature),
+                    signature_changes: &signature_changes,
+                    track_group_range: None,
+                },
             )
         else {
             return;
@@ -8103,11 +8105,13 @@ impl DawUi {
                 &arrangement,
                 &supported_clip_indices,
                 scene_tick,
-                performance_zone_end_tick,
-                ppq,
-                Some(project_time_signature),
-                &signature_changes,
-                None,
+                PlaylistPerformanceSceneContext {
+                    performance_zone_end_tick,
+                    ppq,
+                    initial_time_signature: Some(project_time_signature),
+                    signature_changes: &signature_changes,
+                    track_group_range: None,
+                },
             )
         else {
             return;
@@ -16529,11 +16533,13 @@ impl DawUi {
                     &arrangement,
                     &supported_clip_indices,
                     scene_tick,
-                    zone_end_tick,
-                    ppq,
-                    project_time_signature,
-                    &signature_changes,
-                    scene_track_group_range,
+                    PlaylistPerformanceSceneContext {
+                        performance_zone_end_tick: zone_end_tick,
+                        ppq,
+                        initial_time_signature: project_time_signature,
+                        signature_changes: &signature_changes,
+                        track_group_range: scene_track_group_range,
+                    },
                 )
         {
             let scene_clip_indices = scene_clip_groups
@@ -42728,15 +42734,19 @@ fn playlist_performance_midi_scene_tick(
     (scene_tick < performance_zone_end_tick).then_some(scene_tick)
 }
 
+struct PlaylistPerformanceSceneContext<'a> {
+    performance_zone_end_tick: u32,
+    ppq: u16,
+    initial_time_signature: Option<(u8, u8)>,
+    signature_changes: &'a [(u32, u8, u8)],
+    track_group_range: Option<(u32, u32)>,
+}
+
 fn playlist_performance_scene_clip_indices(
     arrangement: &Arrangement,
     supported_clip_indices: &BTreeSet<usize>,
     scene_tick: u32,
-    performance_zone_end_tick: u32,
-    ppq: u16,
-    initial_time_signature: Option<(u8, u8)>,
-    signature_changes: &[(u32, u8, u8)],
-    track_group_range: Option<(u32, u32)>,
+    context: PlaylistPerformanceSceneContext<'_>,
 ) -> Option<(u32, BTreeMap<u32, Vec<usize>>)> {
     let mut marker_positions = arrangement
         .time_markers
@@ -42750,7 +42760,13 @@ fn playlist_performance_scene_clip_indices(
     marker_positions.dedup();
     let group_start_tick = |tick: u32| {
         if marker_positions.is_empty() {
-            playlist_measure_at_tick(ppq, initial_time_signature, signature_changes, tick).0
+            playlist_measure_at_tick(
+                context.ppq,
+                context.initial_time_signature,
+                context.signature_changes,
+                tick,
+            )
+            .0
         } else {
             marker_positions
                 .iter()
@@ -42760,7 +42776,7 @@ fn playlist_performance_scene_clip_indices(
                 .unwrap_or(0)
         }
     };
-    if scene_tick >= performance_zone_end_tick {
+    if scene_tick >= context.performance_zone_end_tick {
         return None;
     }
     let selected_group = group_start_tick(scene_tick);
@@ -42775,7 +42791,10 @@ fn playlist_performance_scene_clip_indices(
         let Some(track_id) = clip.playlist_track_id() else {
             continue;
         };
-        if track_group_range.is_some_and(|(first, last)| !(first..=last).contains(&track_id)) {
+        if context
+            .track_group_range
+            .is_some_and(|(first, last)| !(first..=last).contains(&track_id))
+        {
             continue;
         }
         clips_by_track
