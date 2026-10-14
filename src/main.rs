@@ -43,6 +43,9 @@ fn run(args: Vec<String>) -> Result<(), String> {
         }
         [command, path] if command == "global-swing" => show_global_swing(Path::new(path)),
         [command, path] if command == "channels" => list_channels(Path::new(path)),
+        [command, path] if command == "channel-groups" => {
+            list_channel_groups(Path::new(path))
+        }
         [command, path] if command == "mixer" => list_mixer(Path::new(path)),
         [command, path] if command == "automation" => list_automation(Path::new(path)),
         [command, path] if command == "time-markers" => list_time_markers(Path::new(path)),
@@ -462,6 +465,32 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 .parse::<u16>()
                 .map_err(|_| "channel id must be an integer from 0 through 65535".to_owned())?;
             rename_channel(Path::new(input), Path::new(output), channel_id, name)
+        }
+        [command, input, output, name] if command == "create-channel-group" => {
+            create_channel_group(Path::new(input), Path::new(output), name)
+        }
+        [command, input, output, channel_ids, name] if command == "group-channels" => {
+            group_channels(
+                Path::new(input),
+                Path::new(output),
+                &parse_channel_id_list(channel_ids)?,
+                name,
+            )
+        }
+        [command, input, output, group_index, name] if command == "rename-channel-group" => {
+            rename_channel_group(
+                Path::new(input),
+                Path::new(output),
+                parse_channel_group_index(group_index)?,
+                name,
+            )
+        }
+        [command, input, output, group_index] if command == "delete-channel-group" => {
+            delete_channel_group(
+                Path::new(input),
+                Path::new(output),
+                parse_channel_group_index(group_index)?,
+            )
         }
         [command, input, output, channel_id, color] if command == "set-channel-color" => {
             set_channel_color(
@@ -2341,6 +2370,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild plugin-scan\n",
             "  flp-rebuild render-pattern-vst3 <project.flp> <pattern-id> <channel-id> <plugin.vst3> <output.{wav|flac|ogg|mp3}> [tail-seconds]\n",
             "  flp-rebuild channels <file.flp>\n",
+            "  flp-rebuild channel-groups <file.flp>\n",
             "  flp-rebuild mixer <file.flp>\n",
             "  flp-rebuild automation <file.flp>\n",
             "  flp-rebuild time-markers <file.flp>\n",
@@ -2375,6 +2405,10 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild delete-pattern-time-signature <input.flp> <output.flp> <pattern-id> <position-ticks>\n",
             "  flp-rebuild set-global-swing <input.flp> <output.flp> <percent-0..100>\n",
             "  flp-rebuild rename-channel <input.flp> <output.flp> <channel-id> <name>\n",
+            "  flp-rebuild create-channel-group <input.flp> <output.flp> <name>\n",
+            "  flp-rebuild group-channels <input.flp> <output.flp> <channel-ids:comma-separated> <name>\n",
+            "  flp-rebuild rename-channel-group <input.flp> <output.flp> <group-index> <name>\n",
+            "  flp-rebuild delete-channel-group <input.flp> <output.flp> <group-index>\n",
             "  flp-rebuild set-channel-color <input.flp> <output.flp> <channel-id> <RRGGBB>\n",
             "  flp-rebuild set-channel-levels <input.flp> <output.flp> <channel-id> <volume-0..12800> <pan-0..12800>\n",
             "  flp-rebuild set-channel-main-pitch <input.flp> <output.flp> <channel-id> <0|1>\n",
@@ -2901,11 +2935,17 @@ fn parse_channel_id_list(value: &str) -> Result<Vec<u16>, String> {
         .split(',')
         .map(|child_id| {
             if child_id.is_empty() {
-                return Err("child channel IDs must be comma-separated integers".to_owned());
+                return Err("channel IDs must be comma-separated integers".to_owned());
             }
-            parse_u16(child_id, "child channel id")
+            parse_u16(child_id, "channel id")
         })
         .collect()
+}
+
+fn parse_channel_group_index(value: &str) -> Result<i32, String> {
+    let index = parse_usize(value, "Channel Rack group index")?;
+    i32::try_from(index)
+        .map_err(|_| "Channel Rack group index must fit within a signed 32-bit integer".to_owned())
 }
 
 fn project_info_argument(value: &str) -> Option<String> {
@@ -3776,6 +3816,124 @@ fn list_channels(path: &Path) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+fn list_channel_groups(path: &Path) -> Result<(), String> {
+    let (_, document) = load_document(path)?;
+    let groups = document.channel_groups();
+    let channels = document.channels();
+    println!("channel groups: {}", groups.len());
+    for group in &groups {
+        let channel_ids = channels
+            .iter()
+            .filter(|channel| channel.group_number() == Some(group.index()))
+            .map(|channel| channel.id().to_string())
+            .collect::<Vec<_>>();
+        println!(
+            "index={} name={:?} channel_ids={}",
+            group.index(),
+            group.name().unwrap_or("(undecoded)"),
+            if channel_ids.is_empty() {
+                "-".to_owned()
+            } else {
+                channel_ids.join(",")
+            }
+        );
+    }
+    let unassigned = channels
+        .iter()
+        .filter(|channel| channel.group_number().is_none())
+        .map(|channel| channel.id().to_string())
+        .collect::<Vec<_>>();
+    println!(
+        "unassigned_channel_ids={}",
+        if unassigned.is_empty() {
+            "-".to_owned()
+        } else {
+            unassigned.join(",")
+        }
+    );
+    let unresolved = channels
+        .iter()
+        .filter_map(|channel| {
+            let index = channel.group_number()?;
+            (!groups.iter().any(|group| group.index() == index))
+                .then(|| format!("{}:{index}", channel.id()))
+        })
+        .collect::<Vec<_>>();
+    if !unresolved.is_empty() {
+        println!(
+            "unresolved_channel_group_assignments={}",
+            unresolved.join(",")
+        );
+    }
+    Ok(())
+}
+
+fn edit_channel_groups(
+    input: &Path,
+    output: &Path,
+    edit: impl FnOnce(&mut FlpDocument) -> Result<String, String>,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let description = edit(&mut document)?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!("{description} in {}", output.display());
+    Ok(())
+}
+
+fn create_channel_group(input: &Path, output: &Path, name: &str) -> Result<(), String> {
+    edit_channel_groups(input, output, |document| {
+        let index = document
+            .add_channel_group(name)
+            .map_err(|error| error.to_string())?;
+        Ok(format!("created Channel Rack group {index} named {name:?}"))
+    })
+}
+
+fn group_channels(
+    input: &Path,
+    output: &Path,
+    channel_ids: &[u16],
+    name: &str,
+) -> Result<(), String> {
+    edit_channel_groups(input, output, |document| {
+        let index = document
+            .group_channels(channel_ids, name)
+            .map_err(|error| error.to_string())?;
+        Ok(format!(
+            "assigned channel IDs {channel_ids:?} to Channel Rack group {index} named {name:?}"
+        ))
+    })
+}
+
+fn rename_channel_group(
+    input: &Path,
+    output: &Path,
+    group_index: i32,
+    name: &str,
+) -> Result<(), String> {
+    edit_channel_groups(input, output, |document| {
+        document
+            .rename_channel_group(group_index, name)
+            .map_err(|error| error.to_string())?;
+        Ok(format!(
+            "renamed Channel Rack group {group_index} to {name:?}"
+        ))
+    })
+}
+
+fn delete_channel_group(input: &Path, output: &Path, group_index: i32) -> Result<(), String> {
+    edit_channel_groups(input, output, |document| {
+        document
+            .delete_channel_group(group_index)
+            .map_err(|error| error.to_string())?;
+        Ok(format!("deleted Channel Rack group {group_index}"))
+    })
 }
 
 fn list_mixer(path: &Path) -> Result<(), String> {
