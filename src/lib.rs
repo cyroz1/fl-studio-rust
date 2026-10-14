@@ -1403,6 +1403,8 @@ pub struct RandomNoteGeneratorOptions {
     pub notes_per_step: u8,
     /// Maximum seeded note-length variation, from -100% (shorter) to +100% (longer).
     pub length_variation_percent: i16,
+    /// Merge touching or overlapping generated notes that have the same pitch.
+    pub merge_repeated_notes: bool,
     pub minimum_key: u16,
     pub maximum_key: u16,
 }
@@ -11120,6 +11122,29 @@ impl FlpDocument {
             }
             position = position.saturating_add(u64::from(options.step_ticks));
         }
+
+        let mut additions = if options.merge_repeated_notes {
+            additions.sort_by_key(|note| (note.key, note.position));
+            let mut merged: Vec<PatternNote> = Vec::with_capacity(additions.len());
+            for note in additions {
+                if let Some(previous) = merged.last_mut() {
+                    let previous_end = u64::from(previous.position) + u64::from(previous.length);
+                    if previous.key == note.key && u64::from(note.position) <= previous_end {
+                        let note_end = u64::from(note.position) + u64::from(note.length);
+                        previous.length = u32::try_from(
+                            previous_end.max(note_end) - u64::from(previous.position),
+                        )
+                        .map_err(|_| FlpError::LengthOverflow)?;
+                        continue;
+                    }
+                }
+                merged.push(note);
+            }
+            merged.sort_by_key(|note| (note.position, note.key));
+            merged
+        } else {
+            additions
+        };
 
         if additions.is_empty() {
             return Ok(0);

@@ -3408,6 +3408,7 @@ struct DawUi {
     random_note_generation_density_percent: u8,
     random_note_generation_stack: u8,
     random_note_generation_length_variation_percent: i16,
+    random_note_generation_merge_repeated_notes: bool,
     random_note_generation_minimum_key: u8,
     random_note_generation_maximum_key: u8,
     random_note_generation_snap_to_scale: bool,
@@ -4186,6 +4187,7 @@ impl DawUi {
             random_note_generation_density_percent: 100,
             random_note_generation_stack: 1,
             random_note_generation_length_variation_percent: 0,
+            random_note_generation_merge_repeated_notes: false,
             random_note_generation_minimum_key: 48,
             random_note_generation_maximum_key: 84,
             random_note_generation_snap_to_scale: false,
@@ -25132,6 +25134,11 @@ impl DawUi {
                     )
                     .text("Random note length variation (%)"),
                 );
+                ui.checkbox(
+                    &mut self.random_note_generation_merge_repeated_notes,
+                    "Merge same-pitch notes",
+                )
+                .on_hover_text("Join touching or overlapping generated notes with the same pitch.");
                 ui.add(
                     egui::Slider::new(&mut self.random_note_generation_minimum_key, 0..=127)
                         .text("Random note lowest key"),
@@ -25671,6 +25678,7 @@ impl DawUi {
                 let density_percent = self.random_note_generation_density_percent;
                 let notes_per_step = self.random_note_generation_stack;
                 let length_variation_percent = self.random_note_generation_length_variation_percent;
+                let merge_repeated_notes = self.random_note_generation_merge_repeated_notes;
                 let minimum_key = u16::from(self.random_note_generation_minimum_key);
                 let maximum_key = u16::from(self.random_note_generation_maximum_key);
                 let scale_root = self.piano_roll_scale_root;
@@ -25686,6 +25694,7 @@ impl DawUi {
                     density_percent,
                     notes_per_step,
                     length_variation_percent,
+                    merge_repeated_notes,
                     minimum_key,
                     maximum_key,
                 };
