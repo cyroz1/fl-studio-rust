@@ -3170,7 +3170,9 @@ struct DawUi {
     playing: bool,
     performance_mode_active: bool,
     held_performance_clips: Vec<(u16, u32, usize)>,
-    midi_held_performance_clips: BTreeMap<(u8, u8), (u16, u32, usize)>,
+    midi_held_performance_clips: BTreeMap<(u8, u8), Vec<(u16, u32, usize)>>,
+    midi_performance_scene_mode: bool,
+    midi_performance_plus_scene_mode: bool,
     performance_scene_round_robin: BTreeMap<(u16, u32, u32), usize>,
     performance_launch_sender: Option<Sender<PlaylistPerformanceCommand>>,
     project_playback_loaded: bool,
@@ -3899,6 +3901,8 @@ impl DawUi {
             performance_mode_active: false,
             held_performance_clips: Vec::new(),
             midi_held_performance_clips: BTreeMap::new(),
+            midi_performance_scene_mode: false,
+            midi_performance_plus_scene_mode: false,
             performance_scene_round_robin: BTreeMap::new(),
             performance_launch_sender: None,
             project_playback_loaded: false,
@@ -7327,6 +7331,35 @@ impl DawUi {
         }
     }
 
+    fn queue_performance_track_stop_at_tick(&mut self, track_id: u32, start_tick: u32) {
+        let start_frame = self
+            .audio_engine
+            .as_ref()
+            .zip(self.playlist_tempo_map.as_ref())
+            .and_then(|(engine, tempo_map)| {
+                tempo_map
+                    .frame_at_tick(u64::from(start_tick), engine.sample_rate())
+                    .ok()
+            });
+        match (start_frame, self.performance_launch_sender.as_ref()) {
+            (Some(start_frame), Some(sender)) => {
+                if sender
+                    .send(PlaylistPerformanceCommand::StopTrack {
+                        track_id,
+                        start_tick: u64::from(start_tick),
+                        start_frame,
+                    })
+                    .is_err()
+                {
+                    self.status = "Performance Mode audio worker is no longer available".into();
+                }
+            }
+            _ => {
+                self.status = "Could not map the Performance Mode scene stop position".into();
+            }
+        }
+    }
+
     fn performance_clip_launch_request(
         &self,
         context: PerformanceLaunchContext<'_>,
@@ -7474,19 +7507,69 @@ impl DawUi {
 
     fn release_all_midi_performance_clips(&mut self) {
         let held = std::mem::take(&mut self.midi_held_performance_clips);
-        for (_, (arrangement_id, track_id, clip_index)) in held {
-            self.queue_performance_hold_release(arrangement_id, track_id, clip_index);
+        self.midi_performance_scene_mode = false;
+        self.midi_performance_plus_scene_mode = false;
+        for (_, held_clips) in held {
+            for (arrangement_id, track_id, clip_index) in held_clips {
+                self.queue_performance_hold_release(arrangement_id, track_id, clip_index);
+            }
         }
     }
 
     fn handle_midi_performance_note(&mut self, message: ReceivedMidiMessage) {
         match message.event {
             MidiInputEvent::NoteOn {
+                channel: 0,
+                key: 125,
+                velocity,
+            } if velocity > 0 && self.performance_mode_active && self.playing => {
+                self.midi_performance_scene_mode = true;
+            }
+            MidiInputEvent::NoteOff {
+                channel: 0,
+                key: 125,
+                ..
+            }
+            | MidiInputEvent::NoteOn {
+                channel: 0,
+                key: 125,
+                velocity: 0,
+            } => {
+                self.midi_performance_scene_mode = false;
+            }
+            MidiInputEvent::NoteOn {
+                channel: 0,
+                key: 126,
+                velocity,
+            } if velocity > 0 && self.performance_mode_active && self.playing => {
+                self.midi_performance_plus_scene_mode = true;
+            }
+            MidiInputEvent::NoteOff {
+                channel: 0,
+                key: 126,
+                ..
+            }
+            | MidiInputEvent::NoteOn {
+                channel: 0,
+                key: 126,
+                velocity: 0,
+            } => {
+                self.midi_performance_plus_scene_mode = false;
+            }
+            MidiInputEvent::NoteOn {
                 channel,
                 key,
                 velocity,
             } if channel == 0 && velocity > 0 => {
-                self.trigger_performance_midi_clip(channel, key);
+                if self.midi_performance_scene_mode || self.midi_performance_plus_scene_mode {
+                    self.trigger_performance_midi_scene(
+                        channel,
+                        key,
+                        self.midi_performance_plus_scene_mode,
+                    );
+                } else {
+                    self.trigger_performance_midi_clip(channel, key);
+                }
             }
             MidiInputEvent::NoteOff { channel, key, .. }
             | MidiInputEvent::NoteOn {
@@ -7494,14 +7577,187 @@ impl DawUi {
                 key,
                 velocity: 0,
             } if channel == 0 => {
-                if let Some((arrangement_id, track_id, clip_index)) =
-                    self.midi_held_performance_clips.remove(&(channel, key))
-                {
-                    self.queue_performance_hold_release(arrangement_id, track_id, clip_index);
+                if let Some(held_clips) = self.midi_held_performance_clips.remove(&(channel, key)) {
+                    for (arrangement_id, track_id, clip_index) in held_clips {
+                        self.queue_performance_hold_release(arrangement_id, track_id, clip_index);
+                    }
                 }
             }
             _ => {}
         }
+    }
+
+    fn trigger_performance_midi_scene(&mut self, channel: u8, key: u8, additive: bool) {
+        if channel != 0
+            || !self.performance_mode_active
+            || !self.playing
+            || self.performance_launch_sender.is_none()
+            || key >= 120
+        {
+            return;
+        }
+        let Some(document) = self.document.as_ref() else {
+            return;
+        };
+        let Ok(arrangements) = document.arrangements() else {
+            return;
+        };
+        let Some(arrangement) = arrangements
+            .iter()
+            .find(|arrangement| Some(arrangement.id) == self.selected_arrangement)
+            .or_else(|| arrangements.first())
+            .cloned()
+        else {
+            return;
+        };
+        let Some(performance_zone_end_tick) =
+            playlist_performance_zone_start_tick(&arrangement.time_markers)
+        else {
+            return;
+        };
+        let Ok(supported_clip_indices) =
+            playlist_performance_clip_indices(document, arrangement.id, performance_zone_end_tick)
+        else {
+            return;
+        };
+        let mut tracks = document.playlist_tracks_in_arrangement(arrangement.id);
+        tracks.sort_by_key(|track| track.id);
+        let project_time_signature = document.metadata().time_signature().unwrap_or((4, 4));
+        let signature_changes = arrangement
+            .time_markers
+            .iter()
+            .filter(|marker| marker.is_signature())
+            .filter_map(|marker| {
+                Some((
+                    marker.position_ticks(),
+                    marker.numerator()?.max(1),
+                    marker.denominator()?.max(1),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let ppq = document.header().ppq().max(1);
+        let Some(scene_tick) = playlist_performance_midi_scene_tick(
+            &arrangement,
+            key % 12,
+            performance_zone_end_tick,
+            ppq,
+            Some(project_time_signature),
+            &signature_changes,
+        ) else {
+            return;
+        };
+        let Some((scene_group_start_tick, scene_clip_groups)) =
+            playlist_performance_scene_clip_indices(
+                &arrangement,
+                &supported_clip_indices,
+                scene_tick,
+                performance_zone_end_tick,
+                ppq,
+                Some(project_time_signature),
+                &signature_changes,
+            )
+        else {
+            return;
+        };
+        let mut launch_actions = Vec::new();
+        for (&track_id, clip_indices) in &scene_clip_groups {
+            if clip_indices.is_empty() {
+                continue;
+            }
+            let round_robin_key = (arrangement.id, scene_group_start_tick, track_id);
+            let next_position = self
+                .performance_scene_round_robin
+                .get(&round_robin_key)
+                .copied()
+                .unwrap_or(0)
+                % clip_indices.len();
+            let clip_index = clip_indices[next_position];
+            self.performance_scene_round_robin
+                .insert(round_robin_key, (next_position + 1) % clip_indices.len());
+            let Some(track) = tracks.iter().find(|track| track.id == track_id) else {
+                continue;
+            };
+            let Some((command, start_tick, queued, position_sync_label)) = self
+                .performance_clip_launch_request(
+                    PerformanceLaunchContext {
+                        arrangement: &arrangement,
+                        tracks: &tracks,
+                        ppq,
+                        initial_time_signature: Some(project_time_signature),
+                        signature_changes: &signature_changes,
+                    },
+                    clip_index,
+                    false,
+                )
+            else {
+                continue;
+            };
+            launch_actions.push((
+                track_id,
+                clip_index,
+                command,
+                start_tick,
+                queued,
+                position_sync_label,
+                track.press,
+            ));
+        }
+        if launch_actions.is_empty() {
+            self.status = "No supported clips in the MIDI-selected Performance Mode scene".into();
+            return;
+        }
+
+        let scene_start_tick = launch_actions
+            .iter()
+            .map(|(_, _, _, start_tick, _, _, _)| *start_tick)
+            .min()
+            .unwrap_or(scene_group_start_tick);
+        if !additive {
+            let launched_track_ids = launch_actions
+                .iter()
+                .map(|(track_id, ..)| *track_id)
+                .collect::<BTreeSet<_>>();
+            for track in &tracks {
+                if !launched_track_ids.contains(&track.id) {
+                    self.queue_performance_track_stop_at_tick(track.id, scene_start_tick);
+                }
+            }
+        }
+
+        let Some(sender) = self.performance_launch_sender.as_ref() else {
+            return;
+        };
+        let mut launched_tracks = 0usize;
+        for (track_id, clip_index, command, start_tick, queued, position_sync_label, press) in
+            launch_actions
+        {
+            if sender.send(command).is_err() {
+                self.status = "Performance Mode audio worker is no longer available".into();
+                return;
+            }
+            launched_tracks += 1;
+            if matches!(
+                press,
+                Some(PlaylistTrackPress::HoldStop | PlaylistTrackPress::HoldMotion)
+            ) {
+                self.midi_held_performance_clips
+                    .entry((channel, key))
+                    .or_default()
+                    .push((arrangement.id, track_id, clip_index));
+            }
+            if queued {
+                self.status = format!("MIDI queued Playlist Clip {} for its track", clip_index + 1);
+            } else {
+                self.status = format!(
+                    "MIDI scheduled Playlist Clip {} for tick {start_tick} with Position Sync {position_sync_label}",
+                    clip_index + 1
+                );
+            }
+        }
+        let scene_kind = if additive { "+Scene" } else { "Scene" };
+        self.status = format!(
+            "MIDI {scene_kind} triggered at tick {scene_group_start_tick} across {launched_tracks} Playlist tracks"
+        );
     }
 
     fn trigger_performance_midi_clip(&mut self, channel: u8, key: u8) {
@@ -7626,7 +7882,9 @@ impl DawUi {
                     Some(PlaylistTrackPress::HoldStop | PlaylistTrackPress::HoldMotion)
                 ) {
                     self.midi_held_performance_clips
-                        .insert((channel, key), (arrangement.id, track.id, clip_index));
+                        .entry((channel, key))
+                        .or_default()
+                        .push((arrangement.id, track.id, clip_index));
                 }
                 self.status = if queued {
                     format!(
@@ -8188,6 +8446,8 @@ impl DawUi {
     fn stop_project_playback(&mut self) {
         self.held_performance_clips.clear();
         self.midi_held_performance_clips.clear();
+        self.midi_performance_scene_mode = false;
+        self.midi_performance_plus_scene_mode = false;
         self.performance_scene_round_robin.clear();
         self.performance_launch_sender = None;
         self.stop_midi_playlist_playback();
@@ -14585,7 +14845,7 @@ impl DawUi {
                             let drag_hint = if self.playlist_mute_tool_active {
                                 "Mute tool selected: click to mute or unmute this clip. Press T or select Mute to return to move mode."
                             } else if can_trigger_performance_clip {
-                                "Performance Mode: click supported clips or send MIDI channel 1 notes to trigger them; notes map 12 clip slots per Playlist track across the first 10 tracks. Shift-click queues a clip, Ctrl/Cmd-click launches its scene, and blank marker/bar cells launch or queue scenes. The track Queue setting also queues normal clicks."
+                                "Performance Mode: click supported clips or send MIDI channel 1 notes to trigger them; notes map 12 clip slots per Playlist track across the first 10 tracks. Mapped controllers can hold F10/F#10 notes for Scene/+Scene. Shift-click queues a clip, Ctrl/Cmd-click launches its scene, and blank marker/bar cells launch or queue scenes. The track Queue setting also queues normal clicks."
                             } else if !can_resize_clip {
                                 "Drag to move. Resizing and source-window editing are unavailable for this FL Studio clip format."
                             } else if self.playlist_slip_tool_active && is_audio_clip {
