@@ -4,8 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -588,6 +587,13 @@ pub enum SamplerLiveNoteEvent {
         pan: u8,
         pitch_bend_cents: i16,
     },
+}
+
+/// Live MIDI notes sent to a selected VST3 channel while transport is stopped.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Vst3LiveNoteEvent {
+    NoteOn { channel: u8, key: u8, velocity: u8 },
+    NoteOff { channel: u8, key: u8 },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4462,6 +4468,90 @@ pub fn stream_sampler_midi_input_to_device(
         writer.write_stereo_samples(&block)?;
         block_start = block_start.saturating_add(LIVE_BLOCK_FRAMES as u64);
     }
+}
+
+/// Stream live MIDI note events through one prepared VST3 channel while transport is stopped.
+///
+/// Arrangement notes are removed from the prepared live stream before this function is called.
+/// The processor still supplies the channel's mixer routing, latency compensation, and pitch
+/// settings while note events arrive on the worker thread.
+pub fn stream_vst3_midi_input_to_device(
+    mut processor: Vst3PlaylistStreamProcessor,
+    document: FlpDocument,
+    channel_id: u16,
+    events: Receiver<Vst3LiveNoteEvent>,
+    writer: &StreamingAudioWriter,
+    cancelled: &AtomicBool,
+) -> Result<(), String> {
+    if !processor.performance_channel_ids().contains(&channel_id) {
+        return Err(format!(
+            "VST3 channel {channel_id} is not available for live MIDI audition"
+        ));
+    }
+    let master_output = MixerMasterOutput::from_document(&document);
+    processor.start_processing()?;
+
+    const LIVE_BLOCK_FRAMES: usize = 128;
+    let mut block = vec![0.0f32; LIVE_BLOCK_FRAMES * 2];
+    let mut note_ids = HashMap::<(u8, u8), VecDeque<(i32, u8)>>::new();
+    let stream_result = (|| {
+        loop {
+            if cancelled.load(Ordering::Acquire) || writer.is_cancelled() {
+                return Err("VST3 input audition was stopped".to_owned());
+            }
+            let mut disconnected = false;
+            loop {
+                match events.try_recv() {
+                    Ok(Vst3LiveNoteEvent::NoteOn {
+                        channel,
+                        key,
+                        velocity,
+                    }) => {
+                        let source_key = key.min(127);
+                        let (note_id, rendered_key) = processor.schedule_live_input_note_on(
+                            channel_id, channel, source_key, velocity,
+                        )?;
+                        note_ids
+                            .entry((channel & 0x0F, source_key))
+                            .or_default()
+                            .push_back((note_id, rendered_key));
+                    }
+                    Ok(Vst3LiveNoteEvent::NoteOff { channel, key }) => {
+                        let source_note = (channel & 0x0F, key.min(127));
+                        let active_note =
+                            note_ids.get_mut(&source_note).and_then(VecDeque::pop_front);
+                        if note_ids.get(&source_note).is_some_and(VecDeque::is_empty) {
+                            note_ids.remove(&source_note);
+                        }
+                        if let Some((note_id, rendered_key)) = active_note {
+                            processor.schedule_live_input_note_off(
+                                channel_id,
+                                channel,
+                                rendered_key,
+                                note_id,
+                            )?;
+                        }
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+            if disconnected {
+                break;
+            }
+            processor.mix_next_block(&mut block)?;
+            master_output.apply(&mut block);
+            writer.write_stereo_samples(&block)?;
+        }
+        Ok(())
+    })();
+
+    let cleanup_result = processor.stop_live_input_notes();
+    let stop_result = processor.stop_processing();
+    stream_result.and(cleanup_result).and(stop_result)
 }
 
 fn stream_prepared_sampler_pattern(
