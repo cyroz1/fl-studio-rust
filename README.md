@@ -85,6 +85,7 @@ flp-rebuild glue-notes-selected <input.flp> <output.flp> <pattern-id> <channel-i
 flp-rebuild flip-notes <input.flp> <output.flp> <pattern-id> <channel-id>
 flp-rebuild flip-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based>
 flp-rebuild strum-notes <input.flp> <output.flp> <pattern-id> <channel-id> <spread-ticks> <up|down>
+flp-rebuild strum-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <spread-ticks> <up|down> [velocity-amount:-127..127 velocity-tension:-100..100]
 flp-rebuild flam-notes <input.flp> <output.flp> <pattern-id> <channel-id> <stroke-ticks> <velocity-0..127> <before|after> [group-notes:0|1]
 flp-rebuild flam-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <stroke-ticks> <velocity-0..127> <before|after> [group-notes:0|1]
 flp-rebuild randomize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <velocity-amount:-100..100> <pan-amount:-100..100> <pitch-range:0..24> <bipolar:0|1> <reset:0|1>
@@ -180,7 +181,7 @@ The Piano roll's **Edit** target selector applies note-transform buttons to eith
 
 **Flip channel/selected** and `flip-notes` mirror note positions around the end of the latest channel note or, for a selection, within the selected notes' time bounds. Note lengths and other properties are retained. `flip-notes-selected` accepts comma-separated zero-based channel-local note indexes.
 
-**Strum channel/selected** and `strum-notes` stagger simultaneous targeted notes by pitch over the configured tick spread. Choose low-to-high (`up`) or high-to-low (`down`); note lengths and other properties are retained.
+**Strum channel/selected** and `strum-notes` stagger simultaneous targeted notes by pitch over the configured tick spread. Choose low-to-high (`up`) or high-to-low (`down`); note lengths and other properties are retained. `strum-notes-selected` accepts comma-separated zero-based channel-local note indexes and the optional velocity shaping controls.
 
 **Flam channel/selected** and `flam-notes` add a short same-pitch stroke for each targeted note. Set stroke time and velocity, and choose before or after placement. Before strokes earlier than tick zero are clamped to tick zero. The Piano roll also offers absolute millisecond or tempo-based tick timing, 1/64, 1/32, and 1/16 timing presets, and note grouping. The CLI uses ticks and can group originals with their new strokes; `flam-notes-selected` targets comma-separated zero-based channel-local note indexes. The legacy channel-wide command keeps grouping off unless `group-notes:1` is supplied. Exact native preset labels and values remain unverified.
 

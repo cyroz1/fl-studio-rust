@@ -753,6 +753,45 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 descending,
             )
         }
+        [command, input, output, pattern_id, channel_id, note_indices, spread_ticks, direction,
+            velocity_amount, velocity_tension]
+            if command == "strum-notes-selected" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            strum_notes_with_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Some(&note_indices),
+                StrumOptions {
+                    spread_ticks: parse_u32(spread_ticks, "strum spread")?,
+                    descending: parse_strum_direction(direction)?,
+                    velocity_amount: parse_i16(velocity_amount, "strum velocity amount")?,
+                    velocity_tension_percent: parse_i16(
+                        velocity_tension,
+                        "strum velocity tension",
+                    )?,
+                },
+            )
+        }
+        [command, input, output, pattern_id, channel_id, note_indices, spread_ticks, direction]
+            if command == "strum-notes-selected" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            strum_notes_with_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Some(&note_indices),
+                StrumOptions {
+                    spread_ticks: parse_u32(spread_ticks, "strum spread")?,
+                    descending: parse_strum_direction(direction)?,
+                    ..StrumOptions::default()
+                },
+            )
+        }
         [command, input, output, pattern_id, channel_id, stroke_ticks, velocity, placement]
             if command == "flam-notes" =>
         {
@@ -2164,6 +2203,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild flip-notes <input.flp> <output.flp> <pattern-id> <channel-id>\n",
             "  flp-rebuild flip-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based>\n",
             "  flp-rebuild strum-notes <input.flp> <output.flp> <pattern-id> <channel-id> <spread-ticks> <up|down> [velocity-amount:-127..127 velocity-tension:-100..100]\n",
+            "  flp-rebuild strum-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <spread-ticks> <up|down> [velocity-amount:-127..127 velocity-tension:-100..100]\n",
             "  flp-rebuild flam-notes <input.flp> <output.flp> <pattern-id> <channel-id> <stroke-ticks> <velocity-0..127> <before|after> [group-notes:0|1]\n",
             "  flp-rebuild flam-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <stroke-ticks> <velocity-0..127> <before|after> [group-notes:0|1]\n",
             "  flp-rebuild generate-random-notes <input.flp> <output.flp> <pattern-id> <channel-id> <start-ticks> <end-ticks-exclusive> <step-ticks> <note-length-ticks> <density-0..100> <minimum-key-0..127> <maximum-key-0..127> <seed> [stack-1..16 [length-variation:-100..100 [merge-same-notes:0|1 [base-octave-0..10 range-octaves-1..11 [chord-map-name chord-root-0..11]]]]]\n",
@@ -4515,17 +4555,40 @@ fn strum_notes_with_options(
     channel_id: u16,
     options: StrumOptions,
 ) -> Result<(), String> {
+    strum_notes_with_scope(input, output, pattern_id, channel_id, None, options)
+}
+
+fn strum_notes_with_scope(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    note_indices: Option<&[usize]>,
+    options: StrumOptions,
+) -> Result<(), String> {
     let (_, mut document) = load_document(input)?;
-    let changed = document
-        .strum_pattern_notes_with_options(pattern_id, channel_id, options)
-        .map_err(|error| error.to_string())?;
+    let changed = match note_indices {
+        Some(note_indices) => document.strum_pattern_note_selection_with_options(
+            pattern_id,
+            channel_id,
+            note_indices,
+            options,
+        ),
+        None => document.strum_pattern_notes_with_options(pattern_id, channel_id, options),
+    }
+    .map_err(|error| error.to_string())?;
     let bytes = document
         .encode_lossless()
         .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
     fs::write(output, bytes)
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
-        "strummed {changed} notes in pattern {pattern_id}, channel {channel_id} with {} ticks of spread, velocity amount {}, and velocity tension {}% ({}) to {}",
+        "strummed {changed} notes in pattern {pattern_id}, channel {channel_id} ({}) with {} ticks of spread, velocity amount {}, and velocity tension {}% ({}) to {}",
+        if note_indices.is_some() {
+            "selected notes"
+        } else {
+            "all channel notes"
+        },
         options.spread_ticks,
         options.velocity_amount,
         options.velocity_tension_percent,
@@ -4533,6 +4596,14 @@ fn strum_notes_with_options(
         output.display()
     );
     Ok(())
+}
+
+fn parse_strum_direction(value: &str) -> Result<bool, String> {
+    match value {
+        "up" => Ok(false),
+        "down" => Ok(true),
+        _ => Err("strum direction must be 'up' or 'down'".to_owned()),
+    }
 }
 
 fn flam_notes(
