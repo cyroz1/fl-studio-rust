@@ -15,12 +15,13 @@ use flp_rebuild::sample_render::{
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions};
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, ArticulateOptions, AutomationPointEdit,
-    ChannelLevelAdjustmentsEdit, ClawMachineOptions, FlamOptions, FlpDocument, FstPreset,
-    HumanizerOptions, LimitNoteOptions, LimitSnapDirection, PatternControllerEdit, PatternNote,
-    PatternNoteEdit, PatternNoteRotation, PlaylistClipEdit, PlaylistTrackEdit, PlaylistTrackMotion,
-    PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit, QuantizeNoteMode,
-    QuantizeNoteOptions, RandomNoteChordMap, RandomNoteGeneratorOptions, RandomizerOptions,
-    RiffMachineOptions, RiffMachineQuantizeMode, ScaleLevelsOptions, StrumOptions, TimeMarkerEdit,
+    ChannelLevelAdjustmentsEdit, ChannelSortOrder, ClawMachineOptions, FlamOptions, FlpDocument,
+    FstPreset, HumanizerOptions, LimitNoteOptions, LimitSnapDirection, PatternControllerEdit,
+    PatternNote, PatternNoteEdit, PatternNoteRotation, PlaylistClipEdit, PlaylistTrackEdit,
+    PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit,
+    ProjectSettingsEdit, QuantizeNoteMode, QuantizeNoteOptions, RandomNoteChordMap,
+    RandomNoteGeneratorOptions, RandomizerOptions, RiffMachineOptions, RiffMachineQuantizeMode,
+    ScaleLevelsOptions, StrumOptions, TimeMarkerEdit,
 };
 
 fn main() -> ExitCode {
@@ -498,6 +499,28 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 Path::new(output),
                 parse_u16(channel_id, "channel id")?,
                 parse_rgb_hex(color)?,
+            )
+        }
+        [command, input, output, channel_id, target_index] if command == "move-channel" => {
+            move_channel(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(channel_id, "channel id")?,
+                parse_usize(target_index, "target Channel Rack index")?,
+            )
+        }
+        [command, input, output, channel_ids] if command == "reorder-channels" => {
+            reorder_channels(
+                Path::new(input),
+                Path::new(output),
+                &parse_channel_id_list(channel_ids)?,
+            )
+        }
+        [command, input, output, order] if command == "sort-channels" => {
+            sort_channels(
+                Path::new(input),
+                Path::new(output),
+                parse_channel_sort_order(order)?,
             )
         }
         [command, input, output, channel_ids, color] if command == "set-channel-colors" => {
@@ -2445,6 +2468,9 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild rename-channel-group <input.flp> <output.flp> <group-index> <name>\n",
             "  flp-rebuild delete-channel-group <input.flp> <output.flp> <group-index>\n",
             "  flp-rebuild set-channel-color <input.flp> <output.flp> <channel-id> <RRGGBB>\n",
+            "  flp-rebuild move-channel <input.flp> <output.flp> <channel-id> <target-index:zero-based>\n",
+            "  flp-rebuild reorder-channels <input.flp> <output.flp> <complete-channel-id-order:comma-separated>\n",
+            "  flp-rebuild sort-channels <input.flp> <output.flp> <color|mixer-track|name|type>\n",
             "  flp-rebuild set-channel-colors <input.flp> <output.flp> <channel-ids:comma-separated> <RRGGBB>\n",
             "  flp-rebuild set-channel-color-gradient <input.flp> <output.flp> <channel-ids:comma-separated-in-order> <start-RRGGBB> <end-RRGGBB>\n",
             "  flp-rebuild set-channel-levels <input.flp> <output.flp> <channel-id> <volume-0..12800> <pan-0..12800>\n",
@@ -2985,6 +3011,16 @@ fn parse_channel_group_index(value: &str) -> Result<i32, String> {
     let index = parse_usize(value, "Channel Rack group index")?;
     i32::try_from(index)
         .map_err(|_| "Channel Rack group index must fit within a signed 32-bit integer".to_owned())
+}
+
+fn parse_channel_sort_order(value: &str) -> Result<ChannelSortOrder, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "color" => Ok(ChannelSortOrder::Color),
+        "mixer-track" => Ok(ChannelSortOrder::MixerTrack),
+        "name" => Ok(ChannelSortOrder::Name),
+        "type" => Ok(ChannelSortOrder::Type),
+        _ => Err("channel sort order must be color, mixer-track, name, or type".to_owned()),
+    }
 }
 
 fn project_info_argument(value: &str) -> Option<String> {
@@ -4620,6 +4656,67 @@ fn set_channel_color_gradient(
 }
 
 fn edit_channel_colors(
+    input: &Path,
+    output: &Path,
+    description: String,
+    edit: impl FnOnce(&mut FlpDocument) -> Result<(), String>,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    edit(&mut document)?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!("{description} in {}", output.display());
+    Ok(())
+}
+
+fn move_channel(
+    input: &Path,
+    output: &Path,
+    channel_id: u16,
+    target_index: usize,
+) -> Result<(), String> {
+    edit_channel_order(
+        input,
+        output,
+        format!("moved channel {channel_id} to Channel Rack index {target_index}"),
+        |document| {
+            document
+                .move_channel(channel_id, target_index)
+                .map_err(|error| error.to_string())
+        },
+    )
+}
+
+fn reorder_channels(input: &Path, output: &Path, channel_ids: &[u16]) -> Result<(), String> {
+    edit_channel_order(
+        input,
+        output,
+        format!("reordered Channel Rack channels as {channel_ids:?}"),
+        |document| {
+            document
+                .reorder_channels(channel_ids)
+                .map_err(|error| error.to_string())
+        },
+    )
+}
+
+fn sort_channels(input: &Path, output: &Path, order: ChannelSortOrder) -> Result<(), String> {
+    edit_channel_order(
+        input,
+        output,
+        format!("sorted Channel Rack channels by {order:?}"),
+        |document| {
+            document
+                .sort_channels(order)
+                .map_err(|error| error.to_string())
+        },
+    )
+}
+
+fn edit_channel_order(
     input: &Path,
     output: &Path,
     description: String,
