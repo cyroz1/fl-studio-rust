@@ -2165,6 +2165,16 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u32(length, "clip length")?,
             )
         }
+        [command, input, output, arrangement_id, clip_index]
+            if command == "delete-playlist-clip" =>
+        {
+            delete_playlist_clip(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(arrangement_id, "arrangement id")?,
+                parse_usize(clip_index, "clip index")?,
+            )
+        }
         [command, input, output, arrangement_id, clip_index, muted]
             if command == "set-clip-muted" =>
         {
@@ -2583,6 +2593,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild create-playlist-audio-clip <input.flp> <output.flp> <arrangement-id> <channel-id> <position-ticks> <length-ticks> <track-index:zero-based>\n",
             "  flp-rebuild import-midi <input.flp> <input.mid> <output.flp> <track> <pattern-id> <channel-id>\n",
             "  flp-rebuild edit-clip <input.flp> <output.flp> <arrangement-id> <clip-index> <position> <length>\n",
+            "  flp-rebuild delete-playlist-clip <input.flp> <output.flp> <arrangement-id> <clip-index>\n",
             "  flp-rebuild set-clip-muted <input.flp> <output.flp> <arrangement-id> <clip-index> <muted:0|1>\n",
             "  flp-rebuild edit-playlist-track <input.flp> <output.flp> <track-id> <enabled:0|1|-> <grouped:0|1|->\n",
             "  flp-rebuild set-playlist-track-press <input.flp> <output.flp> <arrangement-id> <track-id> <retrigger|hold-stop|hold-motion|latch>\n",
@@ -6489,6 +6500,28 @@ fn edit_clip(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "wrote arrangement {arrangement_id} clip {clip_index} with position {position} and length {length} to {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn delete_playlist_clip(
+    input: &Path,
+    output: &Path,
+    arrangement_id: u16,
+    clip_index: usize,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .delete_playlist_clip(arrangement_id, clip_index)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "deleted Playlist clip {clip_index} from arrangement {arrangement_id} in {}",
         output.display()
     );
     Ok(())
