@@ -34679,7 +34679,7 @@ impl DawUi {
     fn send_live_vst3_controller_state(&self, sender: &Sender<Vst3LiveInputEvent>) {
         for (channel_index, state) in self.midi_input_channel_state.iter().copied().enumerate() {
             let channel = channel_index as u8;
-            let mut send_control_change = |controller, value| {
+            let send_control_change = |controller, value| {
                 let _ = sender.send(Vst3LiveInputEvent::ControlChange {
                     channel,
                     controller,
