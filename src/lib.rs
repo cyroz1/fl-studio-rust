@@ -1199,6 +1199,28 @@ pub enum PatternNoteRotation {
     Right,
 }
 
+/// Timing and velocity settings for the Piano roll Strum operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StrumOptions {
+    pub spread_ticks: u32,
+    pub descending: bool,
+    /// Positive values lower successive note velocities; negative values raise them.
+    pub velocity_amount: i16,
+    /// Curves the velocity change from gradual to accelerated/decelerated.
+    pub velocity_tension_percent: i16,
+}
+
+impl Default for StrumOptions {
+    fn default() -> Self {
+        Self {
+            spread_ticks: 120,
+            descending: false,
+            velocity_amount: 0,
+            velocity_tension_percent: 0,
+        }
+    }
+}
+
 /// Pitch range, wrap mode, and optional scale settings for the Piano roll Limit operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LimitNoteOptions<'a> {
@@ -10349,7 +10371,26 @@ impl FlpDocument {
         spread_ticks: u32,
         descending: bool,
     ) -> Result<usize, FlpError> {
-        self.strum_pattern_notes_in_scope(pattern_id, channel_id, None, spread_ticks, descending)
+        self.strum_pattern_notes_in_scope(
+            pattern_id,
+            channel_id,
+            None,
+            StrumOptions {
+                spread_ticks,
+                descending,
+                ..StrumOptions::default()
+            },
+        )
+    }
+
+    /// Strums channel chords with configurable start-time and velocity shaping.
+    pub fn strum_pattern_notes_with_options(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        options: StrumOptions,
+    ) -> Result<usize, FlpError> {
+        self.strum_pattern_notes_in_scope(pattern_id, channel_id, None, options)
     }
 
     /// Staggers simultaneous notes only within the supplied channel-local selection.
@@ -10365,9 +10406,23 @@ impl FlpDocument {
             pattern_id,
             channel_id,
             Some(note_indices),
-            spread_ticks,
-            descending,
+            StrumOptions {
+                spread_ticks,
+                descending,
+                ..StrumOptions::default()
+            },
         )
+    }
+
+    /// Strums only the supplied channel-local notes with configurable velocity shaping.
+    pub fn strum_pattern_note_selection_with_options(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: &[usize],
+        options: StrumOptions,
+    ) -> Result<usize, FlpError> {
+        self.strum_pattern_notes_in_scope(pattern_id, channel_id, Some(note_indices), options)
     }
 
     fn strum_pattern_notes_in_scope(
@@ -10375,9 +10430,18 @@ impl FlpDocument {
         pattern_id: u16,
         channel_id: u16,
         note_indices: Option<&[usize]>,
-        spread_ticks: u32,
-        descending: bool,
+        options: StrumOptions,
     ) -> Result<usize, FlpError> {
+        if !(-127..=127).contains(&options.velocity_amount) {
+            return Err(FlpError::UnsupportedEdit(
+                "strum velocity amount must be between -127 and 127",
+            ));
+        }
+        if !(-100..=100).contains(&options.velocity_tension_percent) {
+            return Err(FlpError::UnsupportedEdit(
+                "strum velocity tension must be between -100 and 100 percent",
+            ));
+        }
         let patterns = self.patterns()?;
         let pattern = patterns
             .iter()
@@ -10385,7 +10449,7 @@ impl FlpDocument {
             .ok_or(FlpError::UnsupportedEdit(
                 "the requested pattern does not exist",
             ))?;
-        let mut onset_groups = std::collections::BTreeMap::<u32, Vec<(usize, u16)>>::new();
+        let mut onset_groups = std::collections::BTreeMap::<u32, Vec<(usize, u16, u8)>>::new();
         let selected_indices =
             note_indices.map(|indices| indices.iter().copied().collect::<HashSet<_>>());
         for (note_index, note) in pattern
@@ -10397,28 +10461,51 @@ impl FlpDocument {
             if !note_index_in_scope(note_index, selected_indices.as_ref()) {
                 continue;
             }
-            onset_groups
-                .entry(note.position)
-                .or_default()
-                .push((note_index, note.key));
+            onset_groups.entry(note.position).or_default().push((
+                note_index,
+                note.key,
+                note.velocity,
+            ));
         }
 
         let mut edits = Vec::new();
         for (onset, mut group) in onset_groups {
-            if group.len() < 2 || spread_ticks == 0 {
+            if group.len() < 2 || (options.spread_ticks == 0 && options.velocity_amount == 0) {
                 continue;
             }
-            group.sort_by_key(|(note_index, key)| {
-                (if descending { u16::MAX - *key } else { *key }, *note_index)
+            group.sort_by_key(|(note_index, key, _)| {
+                (
+                    if options.descending {
+                        u16::MAX - *key
+                    } else {
+                        *key
+                    },
+                    *note_index,
+                )
             });
             let steps = u64::try_from(group.len() - 1).map_err(|_| FlpError::LengthOverflow)?;
-            for (rank, (note_index, _)) in group.into_iter().enumerate() {
+            let tension = f64::from(options.velocity_tension_percent) / 100.0;
+            let exponent = if tension >= 0.0 {
+                1.0 + 3.0 * tension
+            } else {
+                1.0 / (1.0 + 3.0 * tension.abs())
+            };
+            for (rank, (note_index, _, original_velocity)) in group.into_iter().enumerate() {
                 let rank = u64::try_from(rank).map_err(|_| FlpError::LengthOverflow)?;
-                let offset = u64::from(spread_ticks) * rank / steps;
+                let offset = u64::from(options.spread_ticks) * rank / steps;
                 let position = u64::from(onset) + offset;
                 let position = u32::try_from(position).map_err(|_| FlpError::LengthOverflow)?;
-                if position != onset {
-                    edits.push((note_index, position));
+                let progress = (rank as f64 / steps as f64).powf(exponent);
+                let velocity_delta = -f64::from(options.velocity_amount) * progress;
+                let velocity = if velocity_delta == 0.0 {
+                    original_velocity
+                } else {
+                    (f64::from(original_velocity) + velocity_delta)
+                        .round()
+                        .clamp(0.0, 127.0) as u8
+                };
+                if position != onset || velocity != original_velocity {
+                    edits.push((note_index, position, velocity));
                 }
             }
         }
@@ -10427,13 +10514,14 @@ impl FlpDocument {
         }
 
         let mut updated = self.clone();
-        for (note_index, position) in &edits {
+        for (note_index, position, velocity) in &edits {
             updated.edit_pattern_note(
                 pattern_id,
                 channel_id,
                 *note_index,
                 PatternNoteEdit {
                     position: Some(*position),
+                    velocity: Some(*velocity),
                     ..PatternNoteEdit::default()
                 },
             )?;

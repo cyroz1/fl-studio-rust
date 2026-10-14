@@ -61,7 +61,7 @@ use flp_rebuild::{
     PlaylistClipTarget, PlaylistTrack, PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress,
     PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit, QuantizeNoteMode, QuantizeNoteOptions,
     RandomNoteChordMap, RandomNoteGeneratorOptions, RandomizerOptions, RiffMachineOptions,
-    RiffMachineQuantizeMode, ScaleLevelsOptions, TimeMarker, TimeMarkerEdit,
+    RiffMachineQuantizeMode, ScaleLevelsOptions, StrumOptions, TimeMarker, TimeMarkerEdit,
     VstPluginStateMetadata,
 };
 use md5::{Digest, Md5};
@@ -3393,6 +3393,8 @@ struct DawUi {
     chop_divisions: u8,
     strum_spread_ticks: u32,
     strum_descending: bool,
+    strum_velocity_amount: i16,
+    strum_velocity_tension_percent: i16,
     flam_stroke_ticks: u32,
     flam_time_absolute: bool,
     flam_stroke_ms: f32,
@@ -4179,6 +4181,8 @@ impl DawUi {
             chop_divisions: 4,
             strum_spread_ticks: 120,
             strum_descending: false,
+            strum_velocity_amount: 0,
+            strum_velocity_tension_percent: 0,
             flam_stroke_ticks: 12,
             flam_time_absolute: true,
             flam_stroke_ms: 50.0,
@@ -25108,6 +25112,14 @@ impl DawUi {
                     egui::Slider::new(&mut self.strum_spread_ticks, 0..=1536)
                         .text("Strum spread (ticks)"),
                 );
+                ui.add(
+                    egui::Slider::new(&mut self.strum_velocity_amount, -127..=127)
+                        .text("Strum velocity"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.strum_velocity_tension_percent, -100..=100)
+                        .text("Velocity tension (%)"),
+                );
                 egui::ComboBox::from_id_salt("piano-roll-strum-direction")
                     .selected_text(if self.strum_descending {
                         "Strum: Down"
@@ -25662,28 +25674,26 @@ impl DawUi {
             && let (Some(pattern_id), Some(channel_id)) =
                 (self.selected_pattern, self.selected_note_channel)
         {
-            let spread_ticks = self.strum_spread_ticks;
-            let descending = self.strum_descending;
+            let options = StrumOptions {
+                spread_ticks: self.strum_spread_ticks,
+                descending: self.strum_descending,
+                velocity_amount: self.strum_velocity_amount,
+                velocity_tension_percent: self.strum_velocity_tension_percent,
+            };
             let result = self
                 .document
                 .as_mut()
                 .ok_or_else(|| "no project is open".to_owned())
                 .and_then(|document| {
                     let result = if edit_selection_only {
-                        document.strum_pattern_note_selection(
+                        document.strum_pattern_note_selection_with_options(
                             pattern_id,
                             channel_id,
                             &selected_quantize_indices,
-                            spread_ticks,
-                            descending,
+                            options,
                         )
                     } else {
-                        document.strum_pattern_notes(
-                            pattern_id,
-                            channel_id,
-                            spread_ticks,
-                            descending,
-                        )
+                        document.strum_pattern_notes_with_options(pattern_id, channel_id, options)
                     };
                     result.map_err(|error| error.to_string())
                 });

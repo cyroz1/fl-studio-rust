@@ -18,7 +18,8 @@ use flp_rebuild::{
     FlpDocument, FstPreset, HumanizerOptions, PatternControllerEdit, PatternNote, PatternNoteEdit,
     PlaylistClipEdit, PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress,
     PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit, QuantizeNoteMode, QuantizeNoteOptions,
-    RandomNoteChordMap, RandomNoteGeneratorOptions, RandomizerOptions, TimeMarkerEdit,
+    RandomNoteChordMap, RandomNoteGeneratorOptions, RandomizerOptions, StrumOptions,
+    TimeMarkerEdit,
 };
 
 fn main() -> ExitCode {
@@ -619,6 +620,31 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 Path::new(output),
                 parse_u16(pattern_id, "pattern id")?,
                 parse_u16(channel_id, "channel id")?,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, spread_ticks, direction,
+            velocity_amount, velocity_tension]
+            if command == "strum-notes" =>
+        {
+            let descending = match direction.as_str() {
+                "up" => false,
+                "down" => true,
+                _ => return Err("strum direction must be 'up' or 'down'".to_owned()),
+            };
+            strum_notes_with_options(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                StrumOptions {
+                    spread_ticks: parse_u32(spread_ticks, "strum spread")?,
+                    descending,
+                    velocity_amount: parse_i16(velocity_amount, "strum velocity amount")?,
+                    velocity_tension_percent: parse_i16(
+                        velocity_tension,
+                        "strum velocity tension",
+                    )?,
+                },
             )
         }
         [command, input, output, pattern_id, channel_id, spread_ticks, direction]
@@ -1715,7 +1741,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild chop-notes <input.flp> <output.flp> <pattern-id> <channel-id> <divisions-2..64>\n",
             "  flp-rebuild glue-notes <input.flp> <output.flp> <pattern-id> <channel-id>\n",
             "  flp-rebuild flip-notes <input.flp> <output.flp> <pattern-id> <channel-id>\n",
-            "  flp-rebuild strum-notes <input.flp> <output.flp> <pattern-id> <channel-id> <spread-ticks> <up|down>\n",
+            "  flp-rebuild strum-notes <input.flp> <output.flp> <pattern-id> <channel-id> <spread-ticks> <up|down> [velocity-amount:-127..127 velocity-tension:-100..100]\n",
             "  flp-rebuild flam-notes <input.flp> <output.flp> <pattern-id> <channel-id> <stroke-ticks> <velocity-0..127> <before|after>\n",
             "  flp-rebuild generate-random-notes <input.flp> <output.flp> <pattern-id> <channel-id> <start-ticks> <end-ticks-exclusive> <step-ticks> <note-length-ticks> <density-0..100> <minimum-key-0..127> <maximum-key-0..127> <seed> [stack-1..16 [length-variation:-100..100 [merge-same-notes:0|1 [base-octave-0..10 range-octaves-1..11 [chord-map-name chord-root-0..11]]]]]\n",
             "  flp-rebuild generate-random-notes-scale <input.flp> <output.flp> <pattern-id> <channel-id> <start-ticks> <end-ticks-exclusive> <step-ticks> <note-length-ticks> <density-0..100> <minimum-key-0..127> <maximum-key-0..127> <seed> <scale-name> <scale-root-0..11> [stack-1..16 [length-variation:-100..100 [merge-same-notes:0|1 [base-octave-0..10 range-octaves-1..11 [chord-map-name chord-root-0..11]]]]]\n",
@@ -3889,9 +3915,29 @@ fn strum_notes(
     spread_ticks: u32,
     descending: bool,
 ) -> Result<(), String> {
+    strum_notes_with_options(
+        input,
+        output,
+        pattern_id,
+        channel_id,
+        StrumOptions {
+            spread_ticks,
+            descending,
+            ..StrumOptions::default()
+        },
+    )
+}
+
+fn strum_notes_with_options(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    options: StrumOptions,
+) -> Result<(), String> {
     let (_, mut document) = load_document(input)?;
     let changed = document
-        .strum_pattern_notes(pattern_id, channel_id, spread_ticks, descending)
+        .strum_pattern_notes_with_options(pattern_id, channel_id, options)
         .map_err(|error| error.to_string())?;
     let bytes = document
         .encode_lossless()
@@ -3899,8 +3945,11 @@ fn strum_notes(
     fs::write(output, bytes)
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
-        "strummed {changed} notes in pattern {pattern_id}, channel {channel_id} with {spread_ticks} ticks of spread ({}) to {}",
-        if descending { "down" } else { "up" },
+        "strummed {changed} notes in pattern {pattern_id}, channel {channel_id} with {} ticks of spread, velocity amount {}, and velocity tension {}% ({}) to {}",
+        options.spread_ticks,
+        options.velocity_amount,
+        options.velocity_tension_percent,
+        if options.descending { "down" } else { "up" },
         output.display()
     );
     Ok(())
