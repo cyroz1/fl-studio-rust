@@ -3162,6 +3162,7 @@ struct DawUi {
     playing: bool,
     performance_mode_active: bool,
     held_performance_clip: Option<(u16, u32, usize)>,
+    performance_scene_round_robin: BTreeMap<(u16, u32, u32), usize>,
     performance_launch_sender: Option<Sender<PlaylistPerformanceCommand>>,
     project_playback_loaded: bool,
     playlist_playback_loaded: bool,
@@ -3885,6 +3886,7 @@ impl DawUi {
             playing: false,
             performance_mode_active: false,
             held_performance_clip: None,
+            performance_scene_round_robin: BTreeMap::new(),
             performance_launch_sender: None,
             project_playback_loaded: false,
             playlist_playback_loaded: false,
@@ -7910,6 +7912,7 @@ impl DawUi {
 
     fn stop_project_playback(&mut self) {
         self.held_performance_clip = None;
+        self.performance_scene_round_robin.clear();
         self.performance_launch_sender = None;
         self.stop_midi_playlist_playback();
         self.stop_midi_clock();
@@ -14676,7 +14679,7 @@ impl DawUi {
                                             egui::Button::new("Launch scene"),
                                         )
                                         .on_hover_text(
-                                            "Schedules the first supported clip in this time-marker region on each Playlist track. When no time markers precede Start, bars define the scene columns.",
+                                            "Schedules one supported clip from this scene column per Playlist track. Repeated scene launches cycle sub-clips; bars define the columns when no non-signature markers precede Start.",
                                         )
                                         .clicked()
                                     {
@@ -14690,7 +14693,7 @@ impl DawUi {
                                             egui::Button::new("Queue scene"),
                                         )
                                         .on_hover_text(
-                                            "Adds the first supported clip in this scene column on each Playlist track to its track queue.",
+                                            "Adds one supported clip from this scene column per track to its queue. Repeated scene requests cycle sub-clips.",
                                         )
                                         .clicked()
                                     {
@@ -14760,7 +14763,7 @@ impl DawUi {
                                             egui::Button::new("Launch scene"),
                                         )
                                         .on_hover_text(
-                                            "Schedules the first supported clip in this time-marker region on each Playlist track. When no time markers precede Start, bars define the scene columns.",
+                                            "Schedules one supported clip from this scene column per Playlist track. Repeated scene launches cycle sub-clips; bars define the columns when no non-signature markers precede Start.",
                                         )
                                         .clicked()
                                     {
@@ -14774,7 +14777,7 @@ impl DawUi {
                                             egui::Button::new("Queue scene"),
                                         )
                                         .on_hover_text(
-                                            "Adds the first supported clip in this scene column on each Playlist track to its track queue.",
+                                            "Adds one supported clip from this scene column per track to its queue. Repeated scene requests cycle sub-clips.",
                                         )
                                         .clicked()
                                     {
@@ -15587,16 +15590,36 @@ impl DawUi {
             && let Some(supported_clip_indices) = self.document.as_ref().and_then(|document| {
                 playlist_performance_clip_indices(document, arrangement.id, zone_end_tick).ok()
             })
+            && let Some((scene_group_start_tick, scene_clip_groups)) =
+                playlist_performance_scene_clip_indices(
+                    &arrangement,
+                    &supported_clip_indices,
+                    selected_clip_index,
+                    zone_end_tick,
+                    ppq,
+                    project_time_signature,
+                    &signature_changes,
+                )
         {
-            let scene_clip_indices = playlist_performance_scene_clip_indices(
-                &arrangement,
-                &supported_clip_indices,
-                selected_clip_index,
-                zone_end_tick,
-                ppq,
-                project_time_signature,
-                &signature_changes,
-            );
+            let scene_clip_indices = scene_clip_groups
+                .into_iter()
+                .filter_map(|(track_id, clip_indices)| {
+                    if clip_indices.is_empty() {
+                        return None;
+                    }
+                    let cycle_key = (arrangement.id, scene_group_start_tick, track_id);
+                    let next_position = self
+                        .performance_scene_round_robin
+                        .get(&cycle_key)
+                        .copied()
+                        .unwrap_or(0)
+                        % clip_indices.len();
+                    let clip_index = clip_indices[next_position];
+                    self.performance_scene_round_robin
+                        .insert(cycle_key, (next_position + 1) % clip_indices.len());
+                    Some(clip_index)
+                })
+                .collect::<Vec<_>>();
             if scene_clip_indices.is_empty() {
                 self.status =
                     "Could not find supported clips in this Performance Mode scene".into();
@@ -15743,12 +15766,12 @@ impl DawUi {
         {
             self.status = if explicit_queue {
                 format!(
-                    "Queued marker scene from Playlist Clip {} across {scene_clip_count} tracks using each track's settings",
+                    "Queued scene from Playlist Clip {} across {scene_clip_count} tracks using each track's settings",
                     selected_clip_index + 1,
                 )
             } else {
                 format!(
-                    "Scheduled marker scene from Playlist Clip {} across {scene_clip_count} tracks using each track's settings",
+                    "Scheduled scene from Playlist Clip {} across {scene_clip_count} tracks using each track's settings",
                     selected_clip_index + 1,
                 )
             };
@@ -41615,7 +41638,7 @@ fn playlist_performance_scene_clip_indices(
     ppq: u16,
     initial_time_signature: Option<(u8, u8)>,
     signature_changes: &[(u32, u8, u8)],
-) -> Vec<usize> {
+) -> Option<(u32, BTreeMap<u32, Vec<usize>>)> {
     let mut marker_positions = arrangement
         .time_markers
         .iter()
@@ -41639,13 +41662,13 @@ fn playlist_performance_scene_clip_indices(
         }
     };
     let Some(selected_clip) = arrangement.clips.get(selected_clip_index) else {
-        return Vec::new();
+        return None;
     };
     if !supported_clip_indices.contains(&selected_clip_index) {
-        return Vec::new();
+        return None;
     }
     let selected_group = group_start_tick(selected_clip.position_ticks);
-    let mut first_clip_by_track = BTreeMap::<u32, (u32, usize)>::new();
+    let mut clips_by_track = BTreeMap::<u32, Vec<(u32, usize)>>::new();
     for &clip_index in supported_clip_indices {
         let Some(clip) = arrangement.clips.get(clip_index) else {
             continue;
@@ -41656,16 +41679,27 @@ fn playlist_performance_scene_clip_indices(
         let Some(track_id) = clip.playlist_track_id() else {
             continue;
         };
-        let candidate = (clip.position_ticks, clip_index);
-        first_clip_by_track
+        clips_by_track
             .entry(track_id)
-            .and_modify(|first| *first = (*first).min(candidate))
-            .or_insert(candidate);
+            .or_default()
+            .push((clip.position_ticks, clip_index));
     }
-    first_clip_by_track
-        .into_values()
-        .map(|(_, clip_index)| clip_index)
-        .collect()
+    Some((
+        selected_group,
+        clips_by_track
+            .into_iter()
+            .map(|(track_id, mut clips)| {
+                clips.sort_unstable();
+                (
+                    track_id,
+                    clips
+                        .into_iter()
+                        .map(|(_, clip_index)| clip_index)
+                        .collect(),
+                )
+            })
+            .collect(),
+    ))
 }
 
 fn playlist_performance_trigger_tick(
