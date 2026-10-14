@@ -173,6 +173,26 @@ impl MidiInputChannelState {
         self.pan
     }
 
+    pub fn raw_mod_x(self) -> u8 {
+        self.mod_x
+    }
+
+    pub fn raw_mod_y(self) -> u8 {
+        self.mod_y
+    }
+
+    pub fn raw_pitch_bend_value(self) -> u16 {
+        self.pitch_bend_value
+    }
+
+    pub fn raw_pitch_bend_sensitivity_semitones(self) -> u8 {
+        self.pitch_bend_sensitivity_semitones
+    }
+
+    pub fn raw_pitch_bend_sensitivity_cents(self) -> u8 {
+        self.pitch_bend_sensitivity_cents
+    }
+
     fn note_mod_x(self) -> u8 {
         midi_modulation_to_fl_note_value(self.mod_x)
     }

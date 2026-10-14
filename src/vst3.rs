@@ -349,6 +349,49 @@ impl Vst3PlaylistStreamProcessor {
         Ok(())
     }
 
+    pub(crate) fn schedule_live_input_midi_event(
+        &mut self,
+        channel_id: u16,
+        event: MidiEvent,
+    ) -> Result<(), String> {
+        let stream = self
+            .streams
+            .iter_mut()
+            .find(|stream| stream.channel_id == channel_id && stream.live_performance)
+            .ok_or_else(|| format!("VST3 channel {channel_id} is not available for live input"))?;
+        let event = match event {
+            MidiEvent::ControlChange { .. }
+            | MidiEvent::ProgramChange { .. }
+            | MidiEvent::PitchBend { .. }
+            | MidiEvent::ChannelAftertouch { .. } => event,
+            MidiEvent::PolyAftertouch {
+                channel,
+                note,
+                pressure,
+            } => MidiEvent::PolyAftertouch {
+                channel,
+                note: (i16::from(note) + stream.note_pitch_offset_semitones).clamp(0, 127) as u8,
+                pressure,
+            },
+            _ => return Err("only live VST3 controller messages can use this path".to_owned()),
+        };
+        let frame = stream.source_frame;
+        queue_live_vst3_input_event(
+            stream,
+            ScheduledMidiEvent {
+                frame,
+                priority: 1,
+                event,
+                fine_pitch_offset_cents: 0,
+                note_id: -1,
+                note_pan: 64,
+                note_release: 64,
+                performance_track_id: Some(LIVE_VST3_INPUT_TRACK_ID),
+            },
+        );
+        Ok(())
+    }
+
     pub(crate) fn stop_live_input_notes(&mut self) -> Result<(), String> {
         for stream in &mut self.streams {
             if !stream.live_performance {
@@ -2779,6 +2822,11 @@ fn send_scheduled_midi_event(
 ) -> Result<(), String> {
     let pitch_offset_cents =
         combined_pitch_offset_cents(project_pitch_offset_cents, fine_pitch_offset_cents);
+    if !matches!(event, MidiEvent::NoteOn { .. } | MidiEvent::NoteOff { .. }) {
+        return plugin
+            .send_midi_event_at(event, sample_offset)
+            .map_err(|error| error.to_string());
+    }
     if note.supports_pan {
         let mut plugin_event = plugin_event_with_pitch_offset_and_note_id(
             event,

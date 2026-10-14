@@ -21,6 +21,7 @@ use mp3lame_encoder::{
 #[cfg(test)]
 use vorbis_rs::VorbisDecoder;
 use vorbis_rs::{VorbisBitrateManagementStrategy, VorbisEncoder, VorbisEncoderBuilder};
+use vst3_host::midi::{MidiChannel, MidiEvent};
 
 use crate::audio::{
     AudioInputRecording, MIXER_TRACK_METER_COUNT, MixerTrackPeakMeters, StreamingAudioWriter,
@@ -589,11 +590,40 @@ pub enum SamplerLiveNoteEvent {
     },
 }
 
-/// Live MIDI notes sent to a selected VST3 channel while transport is stopped.
+/// Live MIDI messages sent to a selected VST3 channel while transport is stopped.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Vst3LiveNoteEvent {
-    NoteOn { channel: u8, key: u8, velocity: u8 },
-    NoteOff { channel: u8, key: u8 },
+pub enum Vst3LiveInputEvent {
+    NoteOn {
+        channel: u8,
+        key: u8,
+        velocity: u8,
+    },
+    NoteOff {
+        channel: u8,
+        key: u8,
+    },
+    ControlChange {
+        channel: u8,
+        controller: u8,
+        value: u8,
+    },
+    ProgramChange {
+        channel: u8,
+        program: u8,
+    },
+    PitchBend {
+        channel: u8,
+        value: u16,
+    },
+    ChannelPressure {
+        channel: u8,
+        pressure: u8,
+    },
+    PolyphonicPressure {
+        channel: u8,
+        key: u8,
+        pressure: u8,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4470,7 +4500,7 @@ pub fn stream_sampler_midi_input_to_device(
     }
 }
 
-/// Stream live MIDI note events through one prepared VST3 channel while transport is stopped.
+/// Stream live MIDI events through one prepared VST3 channel while transport is stopped.
 ///
 /// Arrangement notes are removed from the prepared live stream before this function is called.
 /// The processor still supplies the channel's mixer routing, latency compensation, and pitch
@@ -4479,7 +4509,7 @@ pub fn stream_vst3_midi_input_to_device(
     mut processor: Vst3PlaylistStreamProcessor,
     document: FlpDocument,
     channel_id: u16,
-    events: Receiver<Vst3LiveNoteEvent>,
+    events: Receiver<Vst3LiveInputEvent>,
     writer: &StreamingAudioWriter,
     cancelled: &AtomicBool,
 ) -> Result<(), String> {
@@ -4502,7 +4532,7 @@ pub fn stream_vst3_midi_input_to_device(
             let mut disconnected = false;
             loop {
                 match events.try_recv() {
-                    Ok(Vst3LiveNoteEvent::NoteOn {
+                    Ok(Vst3LiveInputEvent::NoteOn {
                         channel,
                         key,
                         velocity,
@@ -4516,7 +4546,7 @@ pub fn stream_vst3_midi_input_to_device(
                             .or_default()
                             .push_back((note_id, rendered_key));
                     }
-                    Ok(Vst3LiveNoteEvent::NoteOff { channel, key }) => {
+                    Ok(Vst3LiveInputEvent::NoteOff { channel, key }) => {
                         let source_note = (channel & 0x0F, key.min(127));
                         let active_note =
                             note_ids.get_mut(&source_note).and_then(VecDeque::pop_front);
@@ -4531,6 +4561,21 @@ pub fn stream_vst3_midi_input_to_device(
                                 note_id,
                             )?;
                         }
+                    }
+                    Ok(live_event) => {
+                        if let Vst3LiveInputEvent::ControlChange {
+                            channel,
+                            controller: 120 | 123..=127,
+                            ..
+                        } = live_event
+                        {
+                            note_ids
+                                .retain(|(midi_channel, _), _| *midi_channel != (channel & 0x0F));
+                        }
+                        processor.schedule_live_input_midi_event(
+                            channel_id,
+                            live_input_controller_event(live_event)?,
+                        )?;
                     }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
@@ -4552,6 +4597,51 @@ pub fn stream_vst3_midi_input_to_device(
     let cleanup_result = processor.stop_live_input_notes();
     let stop_result = processor.stop_processing();
     stream_result.and(cleanup_result).and(stop_result)
+}
+
+fn live_input_controller_event(event: Vst3LiveInputEvent) -> Result<MidiEvent, String> {
+    let channel = match event {
+        Vst3LiveInputEvent::ControlChange { channel, .. }
+        | Vst3LiveInputEvent::ProgramChange { channel, .. }
+        | Vst3LiveInputEvent::PitchBend { channel, .. }
+        | Vst3LiveInputEvent::ChannelPressure { channel, .. }
+        | Vst3LiveInputEvent::PolyphonicPressure { channel, .. } => {
+            MidiChannel::from_index(channel & 0x0F)
+                .ok_or_else(|| "MIDI channel is outside 0..15".to_owned())?
+        }
+        Vst3LiveInputEvent::NoteOn { .. } | Vst3LiveInputEvent::NoteOff { .. } => {
+            return Err("note events need VST3 note IDs".to_owned());
+        }
+    };
+    Ok(match event {
+        Vst3LiveInputEvent::ControlChange {
+            controller, value, ..
+        } => MidiEvent::ControlChange {
+            channel,
+            controller: controller.min(127),
+            value: value.min(127),
+        },
+        Vst3LiveInputEvent::ProgramChange { program, .. } => MidiEvent::ProgramChange {
+            channel,
+            program: program.min(127),
+        },
+        Vst3LiveInputEvent::PitchBend { value, .. } => MidiEvent::PitchBend {
+            channel,
+            value: value.min(16_383),
+        },
+        Vst3LiveInputEvent::ChannelPressure { pressure, .. } => MidiEvent::ChannelAftertouch {
+            channel,
+            pressure: pressure.min(127),
+        },
+        Vst3LiveInputEvent::PolyphonicPressure { key, pressure, .. } => MidiEvent::PolyAftertouch {
+            channel,
+            note: key.min(127),
+            pressure: pressure.min(127),
+        },
+        Vst3LiveInputEvent::NoteOn { .. } | Vst3LiveInputEvent::NoteOff { .. } => {
+            unreachable!("note variants were handled before conversion")
+        }
+    })
 }
 
 fn stream_prepared_sampler_pattern(

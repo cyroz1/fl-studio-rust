@@ -43,7 +43,7 @@ use flp_rebuild::sample_render::{
     stream_sampler_pattern_to_device, stream_vst3_midi_input_to_device,
     write_input_recording_to_wav,
 };
-use flp_rebuild::sample_render::{SamplerLiveNoteEvent, Vst3LiveNoteEvent};
+use flp_rebuild::sample_render::{SamplerLiveNoteEvent, Vst3LiveInputEvent};
 use flp_rebuild::vst3::{
     MAX_REPORTED_TAIL_SECONDS, Vst3HostRuntime, Vst3PatternRenderOptions, Vst3PatternStreamHandle,
 };
@@ -3750,7 +3750,7 @@ struct LiveSamplerInputSession {
 struct LiveVst3InputSession {
     pattern_id: u16,
     channel_id: u16,
-    sender: Sender<Vst3LiveNoteEvent>,
+    sender: Sender<Vst3LiveInputEvent>,
     receiver: Receiver<Result<(), String>>,
     cancelled: Arc<AtomicBool>,
     worker: thread::JoinHandle<()>,
@@ -34656,6 +34656,7 @@ impl DawUi {
             });
         match worker {
             Ok(worker) => {
+                self.send_live_vst3_controller_state(&event_sender);
                 self.live_vst3_input = Some(LiveVst3InputSession {
                     pattern_id,
                     channel_id,
@@ -34672,6 +34673,40 @@ impl DawUi {
                 self.status = format!("Could not start VST3 input worker: {error}");
                 false
             }
+        }
+    }
+
+    fn send_live_vst3_controller_state(&self, sender: &Sender<Vst3LiveInputEvent>) {
+        for (channel_index, state) in self.midi_input_channel_state.iter().copied().enumerate() {
+            let channel = channel_index as u8;
+            let mut send_control_change = |controller, value| {
+                let _ = sender.send(Vst3LiveInputEvent::ControlChange {
+                    channel,
+                    controller,
+                    value,
+                });
+            };
+            send_control_change(10, state.raw_pan());
+            send_control_change(74, state.raw_mod_x());
+            send_control_change(71, state.raw_mod_y());
+            send_control_change(101, 0);
+            send_control_change(100, 0);
+            send_control_change(6, state.raw_pitch_bend_sensitivity_semitones());
+            send_control_change(38, state.raw_pitch_bend_sensitivity_cents());
+            send_control_change(101, 127);
+            send_control_change(100, 127);
+            send_control_change(
+                64,
+                if self.midi_live_sampler_sustain_channels.contains(&channel) {
+                    127
+                } else {
+                    0
+                },
+            );
+            let _ = sender.send(Vst3LiveInputEvent::PitchBend {
+                channel,
+                value: state.raw_pitch_bend_value(),
+            });
         }
     }
 
@@ -35157,7 +35192,7 @@ impl DawUi {
                     key
                 };
                 (
-                    Vst3LiveNoteEvent::NoteOn {
+                    Vst3LiveInputEvent::NoteOn {
                         channel,
                         key: audition_key,
                         velocity,
@@ -35184,17 +35219,74 @@ impl DawUi {
                     self.midi_live_vst3_note_mapping.remove(&source_note);
                 }
                 (
-                    Vst3LiveNoteEvent::NoteOff {
+                    Vst3LiveInputEvent::NoteOff {
                         channel,
                         key: mapped_key,
                     },
                     None,
                 )
             }
+            MidiInputEvent::ControlChange {
+                channel,
+                controller,
+                value,
+            } => (
+                Vst3LiveInputEvent::ControlChange {
+                    channel,
+                    controller,
+                    value,
+                },
+                None,
+            ),
+            MidiInputEvent::ProgramChange { channel, program } => {
+                (Vst3LiveInputEvent::ProgramChange { channel, program }, None)
+            }
+            MidiInputEvent::PitchBend { channel, value } => (
+                Vst3LiveInputEvent::PitchBend {
+                    channel,
+                    value: (i32::from(value) + 8192).clamp(0, 16_383) as u16,
+                },
+                None,
+            ),
+            MidiInputEvent::ChannelPressure { channel, pressure } => (
+                Vst3LiveInputEvent::ChannelPressure { channel, pressure },
+                None,
+            ),
+            MidiInputEvent::PolyphonicPressure {
+                channel,
+                key,
+                pressure,
+            } => {
+                let source_note = (channel & 0x0F, key.min(127));
+                let audition_key = self
+                    .midi_live_vst3_note_mapping
+                    .get(&source_note)
+                    .and_then(VecDeque::back)
+                    .copied()
+                    .unwrap_or(key.min(127));
+                (
+                    Vst3LiveInputEvent::PolyphonicPressure {
+                        channel,
+                        key: audition_key,
+                        pressure,
+                    },
+                    None,
+                )
+            }
             _ => return,
         };
+        if let MidiInputEvent::ControlChange {
+            channel,
+            controller: 120 | 123..=127,
+            ..
+        } = event
+        {
+            let channel = channel & 0x0F;
+            self.midi_live_vst3_note_mapping
+                .retain(|(mapped_channel, _), _| *mapped_channel != channel);
+        }
         if self.live_vst3_input.is_none()
-            && matches!(live_event, Vst3LiveNoteEvent::NoteOn { .. })
+            && matches!(live_event, Vst3LiveInputEvent::NoteOn { .. })
             && !self.start_live_vst3_input(pattern_id, channel_id)
         {
             return;
