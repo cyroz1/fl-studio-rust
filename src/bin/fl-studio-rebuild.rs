@@ -41661,9 +41661,7 @@ fn playlist_performance_scene_clip_indices(
                 .unwrap_or(0)
         }
     };
-    let Some(selected_clip) = arrangement.clips.get(selected_clip_index) else {
-        return None;
-    };
+    let selected_clip = arrangement.clips.get(selected_clip_index)?;
     if !supported_clip_indices.contains(&selected_clip_index) {
         return None;
     }
