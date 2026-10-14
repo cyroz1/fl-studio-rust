@@ -12509,6 +12509,7 @@ impl DawUi {
         let mut merge_pattern_clips_requested = None;
         let mut performance_clip_launch_requested = None;
         let mut performance_clip_queue_requested = None;
+        let mut performance_scene_launch_requested = None;
         let mut performance_hold_release_requested = None;
         let mut seek_tick_requested = None;
         let mut dropped_playlist_audio = None;
@@ -14669,6 +14670,34 @@ impl DawUi {
                                         performance_clip_queue_requested = Some(clip_index);
                                         ui.close();
                                     }
+                                    if ui
+                                        .add_enabled(
+                                            can_launch_performance_clip,
+                                            egui::Button::new("Launch scene"),
+                                        )
+                                        .on_hover_text(
+                                            "Schedules the first supported clip in this time-marker region on each Playlist track. When no time markers precede Start, bars define the scene columns.",
+                                        )
+                                        .clicked()
+                                    {
+                                        performance_scene_launch_requested =
+                                            Some((clip_index, false));
+                                        ui.close();
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            can_launch_performance_clip,
+                                            egui::Button::new("Queue scene"),
+                                        )
+                                        .on_hover_text(
+                                            "Adds the first supported clip in this scene column on each Playlist track to its track queue.",
+                                        )
+                                        .clicked()
+                                    {
+                                        performance_scene_launch_requested =
+                                            Some((clip_index, true));
+                                        ui.close();
+                                    }
                                 } else if is_pattern_clip {
                                     let selected_pattern_context_indices = self
                                         .selected_playlist_pattern_clip_indices(arrangement.id)
@@ -14723,6 +14752,34 @@ impl DawUi {
                                         .clicked()
                                     {
                                         performance_clip_queue_requested = Some(clip_index);
+                                        ui.close();
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            can_launch_performance_clip,
+                                            egui::Button::new("Launch scene"),
+                                        )
+                                        .on_hover_text(
+                                            "Schedules the first supported clip in this time-marker region on each Playlist track. When no time markers precede Start, bars define the scene columns.",
+                                        )
+                                        .clicked()
+                                    {
+                                        performance_scene_launch_requested =
+                                            Some((clip_index, false));
+                                        ui.close();
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            can_launch_performance_clip,
+                                            egui::Button::new("Queue scene"),
+                                        )
+                                        .on_hover_text(
+                                            "Adds the first supported clip in this scene column on each Playlist track to its track queue.",
+                                        )
+                                        .clicked()
+                                    {
+                                        performance_scene_launch_requested =
+                                            Some((clip_index, true));
                                         ui.close();
                                     }
                                     let can_consolidate_pattern_clip = !clip.is_muted()
@@ -15519,7 +15576,49 @@ impl DawUi {
         let performance_clip_launch_action = performance_clip_queue_requested
             .map(|clip_index| (clip_index, true))
             .or_else(|| performance_clip_launch_requested.map(|clip_index| (clip_index, false)));
-        if let Some((clip_index, explicit_queue)) = performance_clip_launch_action {
+        let mut performance_clip_launch_actions = performance_clip_launch_action
+            .into_iter()
+            .map(|(clip_index, explicit_queue)| (clip_index, explicit_queue, false))
+            .collect::<Vec<_>>();
+        let mut performance_scene_summary = None;
+        if let Some((selected_clip_index, explicit_queue)) = performance_scene_launch_requested {
+            if let Some(zone_end_tick) = performance_zone_end_tick {
+                let supported_clip_indices = self.document.as_ref().and_then(|document| {
+                    playlist_performance_clip_indices(document, arrangement.id, zone_end_tick).ok()
+                });
+                if let Some(supported_clip_indices) = supported_clip_indices {
+                    let scene_clip_indices = playlist_performance_scene_clip_indices(
+                        &arrangement,
+                        &supported_clip_indices,
+                        selected_clip_index,
+                        zone_end_tick,
+                        ppq,
+                        project_time_signature,
+                        &signature_changes,
+                    );
+                    if scene_clip_indices.is_empty() {
+                        self.status =
+                            "Could not find supported clips in this Performance Mode scene".into();
+                    } else {
+                        performance_scene_summary = Some((
+                            selected_clip_index,
+                            scene_clip_indices.len(),
+                            explicit_queue,
+                        ));
+                        performance_clip_launch_actions.extend(
+                            scene_clip_indices
+                                .into_iter()
+                                .map(|clip_index| (clip_index, explicit_queue, true)),
+                        );
+                    }
+                } else {
+                    self.status = "Could not prepare clips for the Performance Mode scene".into();
+                }
+            }
+        }
+        let mut scene_commands_sent = 0usize;
+        let mut scene_command_failed = false;
+        for (clip_index, explicit_queue, is_scene_clip) in performance_clip_launch_actions {
             let clip_length_ticks = arrangement
                 .clips
                 .get(clip_index)
@@ -15611,6 +15710,9 @@ impl DawUi {
                     };
                     match sender.send(command) {
                         Ok(()) => {
+                            if is_scene_clip {
+                                scene_commands_sent += 1;
+                            }
                             self.status = if queue_launch {
                                 format!(
                                     "Added Playlist Clip {} to the track queue; Position Sync {clip_position_sync_label} is applied when it starts",
@@ -15624,6 +15726,7 @@ impl DawUi {
                             };
                         }
                         Err(_) => {
+                            scene_command_failed = true;
                             self.status =
                                 "Performance Mode audio worker is no longer available".into();
                         }
@@ -15633,6 +15736,23 @@ impl DawUi {
                     self.status = "Could not map Performance Mode launch timing or position".into();
                 }
             }
+        }
+        if let Some((selected_clip_index, scene_clip_count, explicit_queue)) =
+            performance_scene_summary
+            && scene_commands_sent == scene_clip_count
+            && !scene_command_failed
+        {
+            self.status = if explicit_queue {
+                format!(
+                    "Queued marker scene from Playlist Clip {} across {scene_clip_count} tracks using each track's settings",
+                    selected_clip_index + 1,
+                )
+            } else {
+                format!(
+                    "Scheduled marker scene from Playlist Clip {} across {scene_clip_count} tracks using each track's settings",
+                    selected_clip_index + 1,
+                )
+            };
         }
 
         if let Some((arrangement_id, track_id, clip_index)) = performance_hold_release_requested {
@@ -41486,6 +41606,67 @@ fn playlist_performance_zone_start_tick(markers: &[TimeMarker]) -> Option<u32> {
         })
         .map(TimeMarker::position_ticks)
         .min()
+}
+
+fn playlist_performance_scene_clip_indices(
+    arrangement: &Arrangement,
+    supported_clip_indices: &BTreeSet<usize>,
+    selected_clip_index: usize,
+    performance_zone_end_tick: u32,
+    ppq: u16,
+    initial_time_signature: Option<(u8, u8)>,
+    signature_changes: &[(u32, u8, u8)],
+) -> Vec<usize> {
+    let mut marker_positions = arrangement
+        .time_markers
+        .iter()
+        .filter(|marker| {
+            !marker.is_signature() && marker.position_ticks() < performance_zone_end_tick
+        })
+        .map(TimeMarker::position_ticks)
+        .collect::<Vec<_>>();
+    marker_positions.sort_unstable();
+    marker_positions.dedup();
+    let group_start_tick = |tick: u32| {
+        if marker_positions.is_empty() {
+            playlist_measure_at_tick(ppq, initial_time_signature, signature_changes, tick).0
+        } else {
+            marker_positions
+                .iter()
+                .copied()
+                .take_while(|position| *position <= tick)
+                .last()
+                .unwrap_or(0)
+        }
+    };
+    let Some(selected_clip) = arrangement.clips.get(selected_clip_index) else {
+        return Vec::new();
+    };
+    if !supported_clip_indices.contains(&selected_clip_index) {
+        return Vec::new();
+    }
+    let selected_group = group_start_tick(selected_clip.position_ticks);
+    let mut first_clip_by_track = BTreeMap::<u32, (u32, usize)>::new();
+    for &clip_index in supported_clip_indices {
+        let Some(clip) = arrangement.clips.get(clip_index) else {
+            continue;
+        };
+        if group_start_tick(clip.position_ticks) != selected_group {
+            continue;
+        }
+        let Some(track_id) = clip.playlist_track_id() else {
+            continue;
+        };
+        let candidate = (clip.position_ticks, clip_index);
+        first_clip_by_track
+            .entry(track_id)
+            .and_modify(|first| *first = (*first).min(candidate))
+            .or_insert(candidate);
+    }
+    first_clip_by_track
+        .into_values()
+        .map(|(_, clip_index)| clip_index)
+        .collect()
 }
 
 fn playlist_performance_trigger_tick(
