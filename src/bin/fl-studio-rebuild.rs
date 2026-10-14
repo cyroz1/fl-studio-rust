@@ -23955,6 +23955,29 @@ impl DawUi {
                         ui.selectable_value(&mut self.strum_descending, false, "Low to high");
                         ui.selectable_value(&mut self.strum_descending, true, "High to low");
                     });
+                let flam_ppq = self
+                    .document
+                    .as_ref()
+                    .map(|document| u32::from(document.header().ppq().max(1)))
+                    .unwrap_or(96);
+                let max_flam_stroke_ticks = flam_ppq.div_ceil(4).max(384);
+                ui.menu_button("Options", |ui| {
+                    ui.label("Tempo-based timing");
+                    for (label, subdivision) in [
+                        ("1/64 note", 16u32),
+                        ("1/32 note", 8),
+                        ("1/16 note", 4),
+                    ] {
+                        if ui.button(label).clicked() {
+                            self.flam_time_absolute = false;
+                            self.flam_stroke_ticks = flam_ppq.div_ceil(subdivision).max(1);
+                            ui.close();
+                        }
+                    }
+                })
+                .on_hover_text(
+                    "Choose a tempo-based Flam timing using the current project PPQ; other Flam settings stay as configured.",
+                );
                 ui.checkbox(&mut self.flam_time_absolute, "Absolute").on_hover_text(
                     "Treat Flam time as milliseconds and convert it to ticks using the current project tempo and PPQ. Later tempo changes can change the effective spacing.",
                 );
@@ -23966,7 +23989,7 @@ impl DawUi {
                     );
                 } else {
                     ui.add(
-                        egui::Slider::new(&mut self.flam_stroke_ticks, 1..=384)
+                        egui::Slider::new(&mut self.flam_stroke_ticks, 1..=max_flam_stroke_ticks)
                             .text("Flam time (ticks)"),
                     );
                 }
