@@ -3288,7 +3288,7 @@ struct DawUi {
     midi_performance_global_snap_mode: bool,
     midi_performance_scene_mode: bool,
     midi_performance_plus_scene_mode: bool,
-    performance_scene_round_robin: BTreeMap<(u16, u32, u32), usize>,
+    performance_scene_round_robin: BTreeMap<(u16, PlaylistPerformanceSceneKey, u32), usize>,
     performance_launch_sender: Option<Sender<PlaylistPerformanceCommand>>,
     project_playback_loaded: bool,
     playlist_playback_loaded: bool,
@@ -7913,20 +7913,19 @@ impl DawUi {
         ) else {
             return;
         };
-        let Some((scene_group_start_tick, scene_clip_groups)) =
-            playlist_performance_scene_clip_indices(
-                &arrangement,
-                &supported_clip_indices,
-                scene_tick,
-                PlaylistPerformanceSceneContext {
-                    performance_zone_end_tick,
-                    ppq,
-                    initial_time_signature: Some(project_time_signature),
-                    signature_changes: &signature_changes,
-                    track_group_range: None,
-                },
-            )
-        else {
+        let Some((scene_key, scene_clip_groups)) = playlist_performance_scene_clip_indices(
+            &arrangement,
+            &supported_clip_indices,
+            scene_tick,
+            PlaylistPerformanceSceneContext {
+                performance_zone_end_tick,
+                ppq,
+                initial_time_signature: Some(project_time_signature),
+                signature_changes: &signature_changes,
+                clip_group: None,
+                track_group_range: None,
+            },
+        ) else {
             return;
         };
         let mut launch_actions = Vec::new();
@@ -7934,7 +7933,7 @@ impl DawUi {
             if clip_indices.is_empty() {
                 continue;
             }
-            let round_robin_key = (arrangement.id, scene_group_start_tick, track_id);
+            let round_robin_key = (arrangement.id, scene_key, track_id);
             let next_position = self
                 .performance_scene_round_robin
                 .get(&round_robin_key)
@@ -7977,11 +7976,13 @@ impl DawUi {
             return;
         }
 
-        let scene_start_tick = launch_actions
+        let Some(scene_start_tick) = launch_actions
             .iter()
             .map(|(_, _, _, start_tick, _, _, _)| *start_tick)
             .min()
-            .unwrap_or(scene_group_start_tick);
+        else {
+            return;
+        };
         if !additive {
             let launched_track_ids = launch_actions
                 .iter()
@@ -8029,8 +8030,12 @@ impl DawUi {
             }
         }
         let scene_kind = if additive { "+Scene" } else { "Scene" };
+        let scene_label = match scene_key {
+            PlaylistPerformanceSceneKey::Marker(tick) => format!("at tick {tick}"),
+            PlaylistPerformanceSceneKey::ClipGroup(group) => format!("for Clip Group {group}"),
+        };
         self.status = format!(
-            "MIDI {scene_kind} triggered at tick {scene_group_start_tick} across {launched_tracks} Playlist tracks"
+            "MIDI {scene_kind} triggered {scene_label} across {launched_tracks} Playlist tracks"
         );
     }
 
@@ -8100,20 +8105,19 @@ impl DawUi {
         ) else {
             return;
         };
-        let Some((scene_group_start_tick, scene_clip_groups)) =
-            playlist_performance_scene_clip_indices(
-                &arrangement,
-                &supported_clip_indices,
-                scene_tick,
-                PlaylistPerformanceSceneContext {
-                    performance_zone_end_tick,
-                    ppq,
-                    initial_time_signature: Some(project_time_signature),
-                    signature_changes: &signature_changes,
-                    track_group_range: None,
-                },
-            )
-        else {
+        let Some((scene_key, scene_clip_groups)) = playlist_performance_scene_clip_indices(
+            &arrangement,
+            &supported_clip_indices,
+            scene_tick,
+            PlaylistPerformanceSceneContext {
+                performance_zone_end_tick,
+                ppq,
+                initial_time_signature: Some(project_time_signature),
+                signature_changes: &signature_changes,
+                clip_group: None,
+                track_group_range: None,
+            },
+        ) else {
             return;
         };
         let Some(scene_clips) = scene_clip_groups
@@ -8122,7 +8126,7 @@ impl DawUi {
         else {
             return;
         };
-        let round_robin_key = (arrangement.id, scene_group_start_tick, track.id);
+        let round_robin_key = (arrangement.id, scene_key, track.id);
         let next_position = self
             .performance_scene_round_robin
             .get(&round_robin_key)
@@ -15154,7 +15158,7 @@ impl DawUi {
                             let drag_hint = if self.playlist_mute_tool_active {
                                 "Mute tool selected: click to mute or unmute this clip. Press T or select Mute to return to move mode."
                             } else if can_trigger_performance_clip {
-                                "Performance Mode: click supported clips or send MIDI channel 1 notes to trigger them; notes map 12 clip slots per Playlist track across the first 10 tracks. Mapped controllers can use C10–D#10 to scroll the Playlist, E10 to toggle 12-cell page steps, hold F10/F#10 for Scene/+Scene, and hold G11 to use the selected MIDI Global Snap instead of track Trigger Sync. Shift-click queues a clip, Ctrl/Cmd-click launches its marker/bar scene within its Track Group when grouped, and blank marker/bar cells launch or queue full scenes. The track Queue setting also queues normal clicks."
+                                "Performance Mode: click supported clips or send MIDI channel 1 notes to trigger them; notes map 12 clip slots per Playlist track across the first 10 tracks. Mapped controllers can use C10–D#10 to scroll the Playlist, E10 to toggle 12-cell page steps, hold F10/F#10 for Scene/+Scene, and hold G11 to use the selected MIDI Global Snap instead of track Trigger Sync. Shift-click queues a clip. Ctrl/Cmd-click on a clip with a nonzero Group launches that Clip Group across tracks; same-track members cycle as sub-clips. Ungrouped clips launch their marker/bar scene, scoped to their Track Group when grouped. Blank marker/bar cells launch or queue full scenes. The track Queue setting also queues normal clicks."
                             } else if !can_resize_clip {
                                 "Drag to move. Resizing and source-window editing are unavailable for this FL Studio clip format."
                             } else if self.playlist_slip_tool_active && is_audio_clip {
@@ -15598,7 +15602,7 @@ impl DawUi {
                                             egui::Button::new("Launch scene"),
                                         )
                                         .on_hover_text(
-                                            "Schedules one supported clip from this scene column per Playlist track and stops tracks in scope without a supported clip. The scene is limited to this clip's Track Group when applicable. Repeated scene launches cycle sub-clips; bars define the columns when no non-signature markers precede Start.",
+                                            "Schedules supported members of this clip's nonzero Clip Group across tracks, cycling same-track members as sub-clips. Ungrouped clips use their marker/bar scene, limited to this clip's Track Group when applicable. Immediate launches stop unmatched tracks; bars define columns when no non-signature markers precede Start.",
                                         )
                                         .clicked()
                                     {
@@ -15612,7 +15616,7 @@ impl DawUi {
                                             egui::Button::new("Queue scene"),
                                         )
                                         .on_hover_text(
-                                            "Adds one supported clip from this scene column per track to its queue, limited to this clip's Track Group when applicable. Repeated scene requests cycle sub-clips.",
+                                            "Adds supported members of this clip's nonzero Clip Group across tracks, cycling same-track members as sub-clips. Ungrouped clips use their marker/bar scene, limited to this clip's Track Group when applicable.",
                                         )
                                         .clicked()
                                     {
@@ -15682,7 +15686,7 @@ impl DawUi {
                                             egui::Button::new("Launch scene"),
                                         )
                                         .on_hover_text(
-                                            "Schedules one supported clip from this scene column per Playlist track and stops tracks in scope without a supported clip. The scene is limited to this clip's Track Group when applicable. Repeated scene launches cycle sub-clips; bars define the columns when no non-signature markers precede Start.",
+                                            "Schedules supported members of this clip's nonzero Clip Group across tracks, cycling same-track members as sub-clips. Ungrouped clips use their marker/bar scene, limited to this clip's Track Group when applicable. Immediate launches stop unmatched tracks; bars define columns when no non-signature markers precede Start.",
                                         )
                                         .clicked()
                                     {
@@ -15696,7 +15700,7 @@ impl DawUi {
                                             egui::Button::new("Queue scene"),
                                         )
                                         .on_hover_text(
-                                            "Adds one supported clip from this scene column per track to its queue, limited to this clip's Track Group when applicable. Repeated scene requests cycle sub-clips.",
+                                            "Adds supported members of this clip's nonzero Clip Group across tracks, cycling same-track members as sub-clips. Ungrouped clips use their marker/bar scene, limited to this clip's Track Group when applicable.",
                                         )
                                         .clicked()
                                     {
@@ -16565,31 +16569,40 @@ impl DawUi {
             .collect::<Vec<_>>();
         let mut performance_scene_summary = None;
         let performance_scene_requested = performance_scene_launch_requested.is_some();
-        let scene_track_group_range = performance_scene_launch_requested
+        let scene_clip_group = performance_scene_launch_requested
             .and_then(|(_, _, source_clip_index)| source_clip_index)
             .and_then(|clip_index| arrangement.clips.get(clip_index))
-            .and_then(PlaylistClip::playlist_track_id)
-            .and_then(|track_id| playlist_track_group_range(track_id, &tracks))
-            .filter(|(first, last)| first < last);
+            .map(|clip| clip.group)
+            .filter(|group| *group != 0);
+        let scene_track_group_range = if scene_clip_group.is_none() {
+            performance_scene_launch_requested
+                .and_then(|(_, _, source_clip_index)| source_clip_index)
+                .and_then(|clip_index| arrangement.clips.get(clip_index))
+                .and_then(PlaylistClip::playlist_track_id)
+                .and_then(|track_id| playlist_track_group_range(track_id, &tracks))
+                .filter(|(first, last)| first < last)
+        } else {
+            None
+        };
         if let Some((scene_tick, explicit_queue, source_clip_index)) =
             performance_scene_launch_requested
             && let Some(zone_end_tick) = performance_zone_end_tick
             && let Some(supported_clip_indices) = self.document.as_ref().and_then(|document| {
                 playlist_performance_clip_indices(document, arrangement.id, zone_end_tick).ok()
             })
-            && let Some((scene_group_start_tick, scene_clip_groups)) =
-                playlist_performance_scene_clip_indices(
-                    &arrangement,
-                    &supported_clip_indices,
-                    scene_tick,
-                    PlaylistPerformanceSceneContext {
-                        performance_zone_end_tick: zone_end_tick,
-                        ppq,
-                        initial_time_signature: project_time_signature,
-                        signature_changes: &signature_changes,
-                        track_group_range: scene_track_group_range,
-                    },
-                )
+            && let Some((scene_key, scene_clip_groups)) = playlist_performance_scene_clip_indices(
+                &arrangement,
+                &supported_clip_indices,
+                scene_tick,
+                PlaylistPerformanceSceneContext {
+                    performance_zone_end_tick: zone_end_tick,
+                    ppq,
+                    initial_time_signature: project_time_signature,
+                    signature_changes: &signature_changes,
+                    clip_group: scene_clip_group,
+                    track_group_range: scene_track_group_range,
+                },
+            )
         {
             let scene_clip_indices = scene_clip_groups
                 .into_iter()
@@ -16597,7 +16610,7 @@ impl DawUi {
                     if clip_indices.is_empty() {
                         return None;
                     }
-                    let cycle_key = (arrangement.id, scene_group_start_tick, track_id);
+                    let cycle_key = (arrangement.id, scene_key, track_id);
                     let next_position = self
                         .performance_scene_round_robin
                         .get(&cycle_key)
@@ -16652,7 +16665,7 @@ impl DawUi {
                 }
                 performance_scene_summary = Some((
                     source_clip_index,
-                    scene_group_start_tick,
+                    scene_key,
                     scene_clip_indices.len(),
                     explicit_queue,
                     scene_track_group_range.map(|(parent, _)| parent),
@@ -16731,7 +16744,7 @@ impl DawUi {
         }
         if let Some((
             source_clip_index,
-            scene_group_start_tick,
+            scene_key,
             scene_clip_count,
             explicit_queue,
             track_group_parent,
@@ -16753,8 +16766,20 @@ impl DawUi {
                 }
             }
             let scene_source = source_clip_index.map_or_else(
-                || format!("scene at tick {scene_group_start_tick}"),
-                |clip_index| format!("scene from Playlist Clip {}", clip_index + 1),
+                || match scene_key {
+                    PlaylistPerformanceSceneKey::Marker(tick) => format!("scene at tick {tick}"),
+                    PlaylistPerformanceSceneKey::ClipGroup(group) => {
+                        format!("Clip Group {group}")
+                    }
+                },
+                |clip_index| match scene_key {
+                    PlaylistPerformanceSceneKey::Marker(_) => {
+                        format!("scene from Playlist Clip {}", clip_index + 1)
+                    }
+                    PlaylistPerformanceSceneKey::ClipGroup(group) => {
+                        format!("Clip Group {group} from Playlist Clip {}", clip_index + 1)
+                    }
+                },
             );
             let track_group_scope = track_group_parent
                 .map(|parent| format!(" in Playlist Track Group {parent}"))
@@ -42863,11 +42888,18 @@ fn playlist_performance_midi_scene_tick(
     (scene_tick < performance_zone_end_tick).then_some(scene_tick)
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum PlaylistPerformanceSceneKey {
+    Marker(u32),
+    ClipGroup(u16),
+}
+
 struct PlaylistPerformanceSceneContext<'a> {
     performance_zone_end_tick: u32,
     ppq: u16,
     initial_time_signature: Option<(u8, u8)>,
     signature_changes: &'a [(u32, u8, u8)],
+    clip_group: Option<u16>,
     track_group_range: Option<(u32, u32)>,
 }
 
@@ -42876,7 +42908,47 @@ fn playlist_performance_scene_clip_indices(
     supported_clip_indices: &BTreeSet<usize>,
     scene_tick: u32,
     context: PlaylistPerformanceSceneContext<'_>,
-) -> Option<(u32, BTreeMap<u32, Vec<usize>>)> {
+) -> Option<(PlaylistPerformanceSceneKey, BTreeMap<u32, Vec<usize>>)> {
+    if scene_tick >= context.performance_zone_end_tick {
+        return None;
+    }
+
+    if let Some(group_id) = context.clip_group {
+        let mut clips_by_track = BTreeMap::<u32, Vec<(u32, usize)>>::new();
+        for &clip_index in supported_clip_indices {
+            let Some(clip) = arrangement.clips.get(clip_index) else {
+                continue;
+            };
+            if clip.group != group_id {
+                continue;
+            }
+            let Some(track_id) = clip.playlist_track_id() else {
+                continue;
+            };
+            clips_by_track
+                .entry(track_id)
+                .or_default()
+                .push((clip.position_ticks, clip_index));
+        }
+        let clips_by_track = clips_by_track
+            .into_iter()
+            .map(|(track_id, mut clips)| {
+                clips.sort_unstable();
+                (
+                    track_id,
+                    clips
+                        .into_iter()
+                        .map(|(_, clip_index)| clip_index)
+                        .collect(),
+                )
+            })
+            .collect();
+        return Some((
+            PlaylistPerformanceSceneKey::ClipGroup(group_id),
+            clips_by_track,
+        ));
+    }
+
     let mut marker_positions = arrangement
         .time_markers
         .iter()
@@ -42905,9 +42977,6 @@ fn playlist_performance_scene_clip_indices(
                 .unwrap_or(0)
         }
     };
-    if scene_tick >= context.performance_zone_end_tick {
-        return None;
-    }
     let selected_group = group_start_tick(scene_tick);
     let mut clips_by_track = BTreeMap::<u32, Vec<(u32, usize)>>::new();
     for &clip_index in supported_clip_indices {
@@ -42932,7 +43001,7 @@ fn playlist_performance_scene_clip_indices(
             .push((clip.position_ticks, clip_index));
     }
     Some((
-        selected_group,
+        PlaylistPerformanceSceneKey::Marker(selected_group),
         clips_by_track
             .into_iter()
             .map(|(track_id, mut clips)| {
