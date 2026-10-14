@@ -4431,7 +4431,7 @@ pub fn stream_sampler_midi_input_to_device(
                     flags: crate::PATTERN_NOTE_DEFAULT_FLAGS,
                     channel_id: *target_channel_id,
                     length: 1,
-                    key: key as u8,
+                    key,
                     group: 0,
                     fine_pitch: 120,
                     reserved: 0,
