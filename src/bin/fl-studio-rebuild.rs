@@ -23974,6 +23974,17 @@ impl DawUi {
                             ui.close();
                         }
                     }
+                    ui.separator();
+                    if ui.button("Reset").clicked() {
+                        let defaults = FlamOptions::default();
+                        self.flam_time_absolute = true;
+                        self.flam_stroke_ticks = defaults.stroke_ticks;
+                        self.flam_stroke_ms = 50.0;
+                        self.flam_velocity = defaults.velocity;
+                        self.flam_before = defaults.before;
+                        self.flam_group_notes = defaults.group_notes;
+                        ui.close();
+                    }
                 })
                 .response
                 .on_hover_text(
