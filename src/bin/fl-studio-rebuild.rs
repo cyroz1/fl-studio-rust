@@ -962,6 +962,108 @@ enum PianoRollSnap {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PerformanceGlobalSnap {
+    None,
+    Line,
+    Cell,
+    StepSixth,
+    StepQuarter,
+    StepThird,
+    StepHalf,
+    StepTwoThirds,
+    StepThreeQuarters,
+    Step,
+    BeatSixth,
+    BeatQuarter,
+    BeatThird,
+    BeatHalf,
+    BeatTwoThirds,
+    BeatThreeQuarters,
+    Beat,
+    Bar,
+}
+
+impl PerformanceGlobalSnap {
+    const ALL: [Self; 18] = [
+        Self::Line,
+        Self::Cell,
+        Self::None,
+        Self::StepSixth,
+        Self::StepQuarter,
+        Self::StepThird,
+        Self::StepHalf,
+        Self::StepTwoThirds,
+        Self::StepThreeQuarters,
+        Self::Step,
+        Self::BeatSixth,
+        Self::BeatQuarter,
+        Self::BeatThird,
+        Self::BeatHalf,
+        Self::BeatTwoThirds,
+        Self::BeatThreeQuarters,
+        Self::Beat,
+        Self::Bar,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::Line => "Line",
+            Self::Cell => "Cell",
+            Self::StepSixth => "1/6 step",
+            Self::StepQuarter => "1/4 step",
+            Self::StepThird => "1/3 step",
+            Self::StepHalf => "1/2 step",
+            Self::StepTwoThirds => "2/3 step",
+            Self::StepThreeQuarters => "3/4 step",
+            Self::Step => "1 step",
+            Self::BeatSixth => "1/6 beat",
+            Self::BeatQuarter => "1/4 beat",
+            Self::BeatThird => "1/3 beat",
+            Self::BeatHalf => "1/2 beat",
+            Self::BeatTwoThirds => "2/3 beat",
+            Self::BeatThreeQuarters => "3/4 beat",
+            Self::Beat => "1 beat",
+            Self::Bar => "Bar",
+        }
+    }
+
+    fn interval_ticks(self, ppq: u16, signature: (u8, u8)) -> Option<u64> {
+        let ppq = ppq.max(1);
+        let ppq_ticks = u64::from(ppq);
+        let beat_ticks = playlist_bar_ticks(ppq, (1, signature.1.max(1)));
+        let (base_ticks, numerator, denominator) = match self {
+            Self::None | Self::Line | Self::Cell => return None,
+            Self::StepSixth => (ppq_ticks, 1, 24),
+            Self::StepQuarter => (ppq_ticks, 1, 16),
+            Self::StepThird => (ppq_ticks, 1, 12),
+            Self::StepHalf => (ppq_ticks, 1, 8),
+            Self::StepTwoThirds => (ppq_ticks, 1, 6),
+            Self::StepThreeQuarters => (ppq_ticks, 3, 16),
+            Self::Step => (ppq_ticks, 1, 4),
+            Self::BeatSixth => (beat_ticks, 1, 6),
+            Self::BeatQuarter => (beat_ticks, 1, 4),
+            Self::BeatThird => (beat_ticks, 1, 3),
+            Self::BeatHalf => (beat_ticks, 1, 2),
+            Self::BeatTwoThirds => (beat_ticks, 2, 3),
+            Self::BeatThreeQuarters => (beat_ticks, 3, 4),
+            Self::Beat => (beat_ticks, 1, 1),
+            Self::Bar => return Some(playlist_bar_ticks(ppq, signature).max(1)),
+        };
+        Some(
+            base_ticks
+                .saturating_mul(numerator)
+                .div_ceil(denominator)
+                .max(1),
+        )
+    }
+
+    const fn uses_timing_grid(self) -> bool {
+        !matches!(self, Self::None | Self::Line | Self::Cell)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PianoRollEventTarget {
     Velocity,
     Pan,
@@ -3182,6 +3284,8 @@ struct DawUi {
     held_performance_clips: Vec<(u16, u32, usize)>,
     midi_held_performance_clips: MidiPerformanceHoldMap,
     midi_performance_page_navigation: bool,
+    performance_global_snap: PerformanceGlobalSnap,
+    midi_performance_global_snap_mode: bool,
     midi_performance_scene_mode: bool,
     midi_performance_plus_scene_mode: bool,
     performance_scene_round_robin: BTreeMap<(u16, u32, u32), usize>,
@@ -3913,6 +4017,8 @@ impl DawUi {
             held_performance_clips: Vec::new(),
             midi_held_performance_clips: BTreeMap::new(),
             midi_performance_page_navigation: false,
+            performance_global_snap: PerformanceGlobalSnap::BeatQuarter,
+            midi_performance_global_snap_mode: false,
             midi_performance_scene_mode: false,
             midi_performance_plus_scene_mode: false,
             performance_scene_round_robin: BTreeMap::new(),
@@ -7405,26 +7511,39 @@ impl DawUi {
         let safe_device_frame = current_device_frame.saturating_add(u64::from(sample_rate) / 8);
         let current_tick = tempo_map.tick_at_frame(current_device_frame, sample_rate)?;
         let safe_tick = tempo_map.tick_at_frame(safe_device_frame, sample_rate)?;
-        let target_tick = if queue_launch {
-            u32::try_from(safe_tick.ceil() as u64).ok()?
-        } else {
-            let mut target_tick = playlist_performance_trigger_tick(
-                safe_tick,
-                ppq,
-                initial_time_signature,
-                signature_changes,
-                clip_trigger_sync,
-                clip.length_ticks,
-            )?;
-            if clip_tolerant && clip_trigger_sync != Some(PlaylistTrackSync::Off) {
-                let boundary_from_current = playlist_performance_trigger_tick(
-                    current_tick,
+        let global_snap_override = self
+            .midi_performance_global_snap_mode
+            .then_some(self.performance_global_snap);
+        let trigger_snap_active = global_snap_override.map_or(
+            clip_trigger_sync != Some(PlaylistTrackSync::Off),
+            PerformanceGlobalSnap::uses_timing_grid,
+        );
+        let trigger_tick = |tick| {
+            if let Some(global_snap) = global_snap_override {
+                playlist_performance_global_snap_tick(
+                    tick,
+                    ppq,
+                    initial_time_signature,
+                    signature_changes,
+                    global_snap,
+                )
+            } else {
+                playlist_performance_trigger_tick(
+                    tick,
                     ppq,
                     initial_time_signature,
                     signature_changes,
                     clip_trigger_sync,
                     clip.length_ticks,
-                )?;
+                )
+            }
+        };
+        let target_tick = if queue_launch {
+            u32::try_from(safe_tick.ceil() as u64).ok()?
+        } else {
+            let mut target_tick = trigger_tick(safe_tick)?;
+            if clip_tolerant && trigger_snap_active {
+                let boundary_from_current = trigger_tick(current_tick)?;
                 if f64::from(boundary_from_current) < safe_tick.ceil() {
                     target_tick = u32::try_from(safe_tick.ceil() as u64).ok()?;
                 }
@@ -7520,6 +7639,7 @@ impl DawUi {
     fn release_all_midi_performance_clips(&mut self) {
         let held = std::mem::take(&mut self.midi_held_performance_clips);
         self.midi_performance_page_navigation = false;
+        self.midi_performance_global_snap_mode = false;
         self.midi_performance_scene_mode = false;
         self.midi_performance_plus_scene_mode = false;
         for (_, held_clips) in held {
@@ -7541,6 +7661,29 @@ impl DawUi {
                 velocity,
             } if velocity > 0 && self.performance_mode_active && self.playing => {
                 self.navigate_midi_performance_playlist(key);
+            }
+            MidiInputEvent::NoteOn {
+                channel: 0,
+                key: 127,
+                velocity,
+            } if velocity > 0 && self.performance_mode_active && self.playing => {
+                self.midi_performance_global_snap_mode = true;
+                self.status = format!(
+                    "MIDI Global Snap held: {}",
+                    self.performance_global_snap.label()
+                );
+            }
+            MidiInputEvent::NoteOff {
+                channel: 0,
+                key: 127,
+                ..
+            }
+            | MidiInputEvent::NoteOn {
+                channel: 0,
+                key: 127,
+                velocity: 0,
+            } => {
+                self.midi_performance_global_snap_mode = false;
             }
             MidiInputEvent::NoteOn {
                 channel: 0,
@@ -8579,6 +8722,7 @@ impl DawUi {
         self.held_performance_clips.clear();
         self.midi_held_performance_clips.clear();
         self.midi_performance_page_navigation = false;
+        self.midi_performance_global_snap_mode = false;
         self.midi_performance_scene_mode = false;
         self.midi_performance_plus_scene_mode = false;
         self.performance_scene_round_robin.clear();
@@ -13223,6 +13367,20 @@ impl DawUi {
             ui.separator();
             ui.label(format!("{} PPQ", ppq));
             ui.separator();
+            ui.label("MIDI Global Snap")
+                .on_hover_text("Used instead of per-track Trigger Sync while MIDI note 127 is held");
+            egui::ComboBox::from_id_salt("playlist-performance-global-snap")
+                .selected_text(self.performance_global_snap.label())
+                .show_ui(ui, |ui| {
+                    for snap in PerformanceGlobalSnap::ALL {
+                        ui.selectable_value(
+                            &mut self.performance_global_snap,
+                            snap,
+                            snap.label(),
+                        );
+                    }
+                });
+            ui.separator();
             let performance_mode_button = ui
                 .add_enabled(
                     !self.project_playback_loaded,
@@ -13237,6 +13395,7 @@ impl DawUi {
                 self.performance_mode_active = !self.performance_mode_active;
                 if !self.performance_mode_active {
                     self.midi_performance_page_navigation = false;
+                    self.midi_performance_global_snap_mode = false;
                 }
                 self.status = if self.performance_mode_active {
                     "Performance Mode enabled; playback will start at the Start marker".to_owned()
@@ -14981,7 +15140,7 @@ impl DawUi {
                             let drag_hint = if self.playlist_mute_tool_active {
                                 "Mute tool selected: click to mute or unmute this clip. Press T or select Mute to return to move mode."
                             } else if can_trigger_performance_clip {
-                                "Performance Mode: click supported clips or send MIDI channel 1 notes to trigger them; notes map 12 clip slots per Playlist track across the first 10 tracks. Mapped controllers can use C10–D#10 to scroll the Playlist, E10 to toggle 12-cell page steps, and hold F10/F#10 for Scene/+Scene. Shift-click queues a clip, Ctrl/Cmd-click launches its scene, and blank marker/bar cells launch or queue scenes. The track Queue setting also queues normal clicks."
+                                "Performance Mode: click supported clips or send MIDI channel 1 notes to trigger them; notes map 12 clip slots per Playlist track across the first 10 tracks. Mapped controllers can use C10–D#10 to scroll the Playlist, E10 to toggle 12-cell page steps, hold F10/F#10 for Scene/+Scene, and hold G11 to use the selected MIDI Global Snap instead of track Trigger Sync. Shift-click queues a clip, Ctrl/Cmd-click launches its scene, and blank marker/bar cells launch or queue scenes. The track Queue setting also queues normal clicks."
                             } else if !can_resize_clip {
                                 "Drag to move. Resizing and source-window editing are unavailable for this FL Studio clip format."
                             } else if self.playlist_slip_tool_active && is_audio_clip {
@@ -42654,6 +42813,46 @@ fn playlist_performance_trigger_tick(
         PlaylistTrackSync::Auto => u64::from(clip_length_ticks).min(four_beats).max(1),
     }
     .max(1);
+    let phase_start = signature_changes
+        .iter()
+        .filter(|(position, _, _)| *position <= current_tick)
+        .map(|(position, _, _)| u64::from(*position))
+        .max()
+        .unwrap_or(0);
+    let elapsed = safe_tick.saturating_sub(phase_start);
+    let intervals = elapsed.div_ceil(interval_ticks);
+    let mut target_tick = phase_start.saturating_add(intervals.saturating_mul(interval_ticks));
+    if target_tick < safe_tick {
+        target_tick = target_tick.saturating_add(interval_ticks);
+    }
+    if let Some(next_signature_marker) = signature_changes
+        .iter()
+        .map(|(position, _, _)| u64::from(*position))
+        .filter(|position| *position > u64::from(current_tick) && *position < target_tick)
+        .min()
+    {
+        target_tick = next_signature_marker;
+    }
+    u32::try_from(target_tick).ok()
+}
+
+fn playlist_performance_global_snap_tick(
+    tick: f64,
+    ppq: u16,
+    initial_time_signature: Option<(u8, u8)>,
+    signature_changes: &[(u32, u8, u8)],
+    global_snap: PerformanceGlobalSnap,
+) -> Option<u32> {
+    if !tick.is_finite() || tick < 0.0 || tick > f64::from(u32::MAX) {
+        return None;
+    }
+    let current_tick = tick.floor() as u32;
+    let safe_tick = tick.ceil() as u64;
+    let signature =
+        playlist_signature_at_tick(initial_time_signature, signature_changes, current_tick);
+    let Some(interval_ticks) = global_snap.interval_ticks(ppq, signature) else {
+        return u32::try_from(safe_tick).ok();
+    };
     let phase_start = signature_changes
         .iter()
         .filter(|(position, _, _)| *position <= current_tick)
