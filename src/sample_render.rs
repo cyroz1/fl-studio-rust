@@ -1028,6 +1028,31 @@ pub fn playlist_performance_audio_clip_indices(
         .collect())
 }
 
+fn playlist_performance_vst3_note_source_supported(
+    source_channel_id: u16,
+    channels: &HashMap<u16, ChannelSummary>,
+    loaded_vst3_channels: &BTreeSet<u16>,
+) -> bool {
+    let Some(source) = channels.get(&source_channel_id) else {
+        return false;
+    };
+    if source.enabled() == Some(false) {
+        return false;
+    }
+    if let Some(child_ids) = source.layer_child_ids() {
+        return !child_ids.is_empty()
+            && child_ids.iter().all(|child_id| {
+                loaded_vst3_channels.contains(child_id)
+                    && channels.get(child_id).is_some_and(|child| {
+                        child.kind() != Some(3)
+                            && child.enabled() != Some(false)
+                            && child.plugin_identifier().is_some()
+                    })
+            });
+    }
+    loaded_vst3_channels.contains(&source_channel_id) && source.plugin_identifier().is_some()
+}
+
 fn playlist_performance_vst3_clip_candidates(
     document: &FlpDocument,
     arrangement_id: u16,
@@ -1085,11 +1110,11 @@ fn playlist_performance_vst3_clip_candidates(
                 && pattern.controllers.is_empty()
                 && !notes.is_empty()
                 && notes.iter().all(|note| {
-                    loaded_vst3_channels.contains(&note.channel_id)
-                        && channels.get(&note.channel_id).is_some_and(|channel| {
-                            channel.enabled() != Some(false)
-                                && channel.plugin_identifier().is_some()
-                        })
+                    playlist_performance_vst3_note_source_supported(
+                        note.channel_id,
+                        &channels,
+                        loaded_vst3_channels,
+                    )
                 }))
             .then_some(index)
         })
@@ -1110,8 +1135,8 @@ pub fn playlist_performance_clip_indices(
     )
 }
 
-/// Return supported Performance Mode clips, treating only loaded direct VST3 Pattern channels as
-/// launchable plugin sources.
+/// Return supported Performance Mode clips, including Layers whose direct children are all loaded
+/// VST3 channels.
 pub fn playlist_performance_clip_indices_with_vst3(
     document: &FlpDocument,
     arrangement_id: u16,
@@ -1190,7 +1215,8 @@ pub fn playlist_performance_vst3_clip_indices(
     Ok(candidates.intersection(&supported).copied().collect())
 }
 
-/// Return direct VST3 channels referenced by eligible Performance Mode Pattern Clips.
+/// Return VST3 channels referenced directly or through eligible Layer sources in Performance Mode
+/// Pattern Clips.
 pub fn playlist_performance_vst3_channel_ids(
     document: &FlpDocument,
     arrangement_id: u16,
@@ -1208,6 +1234,11 @@ pub fn playlist_performance_vst3_channel_ids(
         .into_iter()
         .map(|pattern| (pattern.id, pattern))
         .collect::<HashMap<_, _>>();
+    let channels = document
+        .channels()
+        .into_iter()
+        .map(|channel| (channel.id(), channel))
+        .collect::<HashMap<_, _>>();
     Ok(clip_indices
         .iter()
         .filter_map(|clip_index| arrangement.clips.get(*clip_index))
@@ -1220,7 +1251,23 @@ pub fn playlist_performance_vst3_channel_ids(
                 .notes
                 .iter()
                 .filter(|note| !note.is_muted())
-                .map(|note| note.channel_id)
+                .flat_map(|note| {
+                    channels
+                        .get(&note.channel_id)
+                        .map(|channel| {
+                            channel
+                                .layer_child_ids()
+                                .map_or_else(|| vec![channel.id()], <[u16]>::to_vec)
+                        })
+                        .unwrap_or_default()
+                })
+        })
+        .filter(|channel_id| {
+            channels.get(channel_id).is_some_and(|channel| {
+                channel.kind() != Some(3)
+                    && channel.enabled() != Some(false)
+                    && channel.plugin_identifier().is_some()
+            })
         })
         .collect())
 }
@@ -5522,6 +5569,7 @@ impl PlaylistPerformanceRuntime {
         if !sources.vst3_clip_indices.is_empty() {
             let patterns = document.patterns().map_err(|error| error.to_string())?;
             let channels = document.channels();
+            let channel_router = ChannelNoteRouter::new(channels.clone());
             let channels_by_id = channels
                 .iter()
                 .map(|channel| (channel.id(), channel))
@@ -5551,19 +5599,24 @@ impl PlaylistPerformanceRuntime {
                         .get(&channel_id)
                         .map_or(128, |channel| channel.swing_mix())
                 },
-                |channel_id, _, _| {
-                    if !sources.vst3_channel_ids.contains(&channel_id) {
-                        return Vec::new();
-                    }
-                    channels_by_id
-                        .get(&channel_id)
-                        .filter(|channel| {
-                            channel.enabled() != Some(false)
-                                && channel.plugin_identifier().is_some()
-                                && mixer_route_audibility.allows_channel(channel.mixer_track())
+                |channel_id, note_seed, key| {
+                    channel_router
+                        .targets_for_note(channel_id, note_seed, key)
+                        .into_iter()
+                        .filter(|target_channel_id| {
+                            sources.vst3_channel_ids.contains(target_channel_id)
                         })
-                        .map(|_| vec![channel_id])
-                        .unwrap_or_default()
+                        .filter(|target_channel_id| {
+                            channels_by_id
+                                .get(target_channel_id)
+                                .is_some_and(|channel| {
+                                    channel.enabled() != Some(false)
+                                        && channel.plugin_identifier().is_some()
+                                        && mixer_route_audibility
+                                            .allows_channel(channel.mixer_track())
+                                })
+                        })
+                        .collect()
                 },
             )?;
             let mut notes_by_clip = HashMap::<usize, Vec<PerformanceVst3Note>>::new();
