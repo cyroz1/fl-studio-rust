@@ -566,6 +566,16 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_bool(enabled, "channel enabled setting")?,
             )
         }
+        [command, input, output, channel_id, sample_path]
+            if command == "set-channel-sample-path" =>
+        {
+            set_channel_sample_path(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(channel_id, "channel id")?,
+                sample_path,
+            )
+        }
         [command, input, output, channel_id, zipped] if command == "set-channel-zipped" => {
             set_channel_zipped(
                 Path::new(input),
@@ -2530,6 +2540,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild set-channel-color-gradient <input.flp> <output.flp> <channel-ids:comma-separated-in-order> <start-RRGGBB> <end-RRGGBB>\n",
             "  flp-rebuild set-channel-levels <input.flp> <output.flp> <channel-id> <volume-0..12800> <pan-0..12800>\n",
             "  flp-rebuild set-channel-enabled <input.flp> <output.flp> <channel-id> <0|1>\n",
+            "  flp-rebuild set-channel-sample-path <input.flp> <output.flp> <channel-id> <sample-path>\n",
             "  flp-rebuild set-channel-zipped <input.flp> <output.flp> <channel-id> <0|1>\n",
             "  flp-rebuild set-channel-main-pitch <input.flp> <output.flp> <channel-id> <0|1>\n",
             "  flp-rebuild set-channel-add-to-key <input.flp> <output.flp> <channel-id> <0|1>\n",
@@ -4816,6 +4827,28 @@ fn edit_channel_order(
     fs::write(output, bytes)
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!("{description} in {}", output.display());
+    Ok(())
+}
+
+fn set_channel_sample_path(
+    input: &Path,
+    output: &Path,
+    channel_id: u16,
+    sample_path: &str,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .set_channel_sample_path(channel_id, sample_path)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "set channel {channel_id} sample path to {sample_path:?} in {}",
+        output.display()
+    );
     Ok(())
 }
 
