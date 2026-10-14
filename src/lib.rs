@@ -1405,6 +1405,10 @@ pub struct RandomNoteGeneratorOptions {
     pub length_variation_percent: i16,
     /// Merge touching or overlapping generated notes that have the same pitch.
     pub merge_repeated_notes: bool,
+    /// Base octave for an octave-bounded pitch pool. Set with `range_octaves`.
+    pub base_octave: Option<u8>,
+    /// Number of octaves above the base octave included in the pitch pool.
+    pub range_octaves: Option<u8>,
     pub minimum_key: u16,
     pub maximum_key: u16,
 }
@@ -11015,6 +11019,38 @@ impl FlpDocument {
                 "random note generation key range must be ordered and remain within keys 0 through 127",
             ));
         }
+        let (minimum_key, maximum_key) = match (options.base_octave, options.range_octaves) {
+            (None, None) => (options.minimum_key, options.maximum_key),
+            (Some(base_octave), Some(range_octaves)) => {
+                if base_octave > 10 {
+                    return Err(FlpError::UnsupportedEdit(
+                        "random note generation base octave must be between 0 and 10",
+                    ));
+                }
+                if !(1..=11).contains(&range_octaves) {
+                    return Err(FlpError::UnsupportedEdit(
+                        "random note generation octave range must be between 1 and 11",
+                    ));
+                }
+                let octave_start = u16::from(base_octave) * 12;
+                let octave_end =
+                    (u32::from(octave_start) + u32::from(range_octaves) * 12).min(127) as u16;
+                (
+                    options.minimum_key.max(octave_start),
+                    options.maximum_key.min(octave_end),
+                )
+            }
+            _ => {
+                return Err(FlpError::UnsupportedEdit(
+                    "random note generation base octave and octave range must be set together",
+                ));
+            }
+        };
+        if minimum_key > maximum_key {
+            return Err(FlpError::UnsupportedEdit(
+                "random note generation octave range does not overlap the selected key bounds",
+            ));
+        }
         if let Some((scale_root, scale_intervals)) = scale
             && (scale_root > 11
                 || scale_intervals.is_empty()
@@ -11044,7 +11080,7 @@ impl FlpDocument {
             ));
         }
 
-        let pitches = (options.minimum_key..=options.maximum_key)
+        let pitches = (minimum_key..=maximum_key)
             .filter(|key| {
                 scale.is_none_or(|(root, intervals)| {
                     note_pitch_in_scale(i32::from(*key), root, intervals)

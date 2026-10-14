@@ -3409,6 +3409,8 @@ struct DawUi {
     random_note_generation_stack: u8,
     random_note_generation_length_variation_percent: i16,
     random_note_generation_merge_repeated_notes: bool,
+    random_note_generation_base_octave: u8,
+    random_note_generation_range_octaves: u8,
     random_note_generation_minimum_key: u8,
     random_note_generation_maximum_key: u8,
     random_note_generation_snap_to_scale: bool,
@@ -4188,8 +4190,10 @@ impl DawUi {
             random_note_generation_stack: 1,
             random_note_generation_length_variation_percent: 0,
             random_note_generation_merge_repeated_notes: false,
-            random_note_generation_minimum_key: 48,
-            random_note_generation_maximum_key: 84,
+            random_note_generation_base_octave: 4,
+            random_note_generation_range_octaves: 3,
+            random_note_generation_minimum_key: 0,
+            random_note_generation_maximum_key: 127,
             random_note_generation_snap_to_scale: false,
             scale_levels_center_percent: 0,
             scale_levels_tension_percent: 0,
@@ -25140,13 +25144,23 @@ impl DawUi {
                 )
                 .on_hover_text("Join touching or overlapping generated notes with the same pitch.");
                 ui.add(
+                    egui::Slider::new(&mut self.random_note_generation_base_octave, 0..=10)
+                        .text("Random note base octave"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.random_note_generation_range_octaves, 1..=11)
+                        .text("Random note octave range"),
+                );
+                ui.add(
                     egui::Slider::new(&mut self.random_note_generation_minimum_key, 0..=127)
                         .text("Random note lowest key"),
-                );
+                )
+                .on_hover_text("Narrow the octave-selected pitch pool from below.");
                 ui.add(
                     egui::Slider::new(&mut self.random_note_generation_maximum_key, 0..=127)
                         .text("Random note highest key"),
-                );
+                )
+                .on_hover_text("Narrow the octave-selected pitch pool from above.");
                 ui.add_enabled_ui(self.piano_roll_scale != PianoRollScale::None, |ui| {
                     ui.checkbox(
                         &mut self.random_note_generation_snap_to_scale,
@@ -25679,6 +25693,8 @@ impl DawUi {
                 let notes_per_step = self.random_note_generation_stack;
                 let length_variation_percent = self.random_note_generation_length_variation_percent;
                 let merge_repeated_notes = self.random_note_generation_merge_repeated_notes;
+                let base_octave = self.random_note_generation_base_octave;
+                let range_octaves = self.random_note_generation_range_octaves;
                 let minimum_key = u16::from(self.random_note_generation_minimum_key);
                 let maximum_key = u16::from(self.random_note_generation_maximum_key);
                 let scale_root = self.piano_roll_scale_root;
@@ -25695,6 +25711,8 @@ impl DawUi {
                     notes_per_step,
                     length_variation_percent,
                     merge_repeated_notes,
+                    base_octave: Some(base_octave),
+                    range_octaves: Some(range_octaves),
                     minimum_key,
                     maximum_key,
                 };
@@ -25724,7 +25742,7 @@ impl DawUi {
                             self.dirty = true;
                         }
                         self.status = format!(
-                            "Generated {created} notes in pattern {pattern_id} from tick {start_tick} to {end_tick} using seed {seed} with {length_variation_percent}% length variation{}",
+                            "Generated {created} notes in pattern {pattern_id} from tick {start_tick} to {end_tick} using seed {seed}, octave {base_octave}, range {range_octaves}, and {length_variation_percent}% length variation{}",
                             if snap_to_scale {
                                 " within the current scale"
                             } else {
