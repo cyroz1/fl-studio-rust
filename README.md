@@ -96,6 +96,8 @@ flp-rebuild scale-levels-notes <input.flp> <output.flp> <pattern-id> <channel-id
 flp-rebuild scale-levels-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <center:-100..100> <tension:-100..100> <multiplier:0..200> <offset:-100..100>
 flp-rebuild articulate-notes <input.flp> <output.flp> <pattern-id> <channel-id> <multiplier:10..100> <variation:0..100> <seed> <use-original-lengths:0|1> <chop-chords:0|1>
 flp-rebuild articulate-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <multiplier:10..100> <variation:0..100> <seed> <use-original-lengths:0|1> <chop-chords:0|1> <only-with-selection:0|1>
+flp-rebuild claw-notes <input.flp> <output.flp> <pattern-id> <channel-id> <period-ticks:16+> <trash-every:2..16> <time-distortion:-100..100> <remove-short-notes:0|1> <stretch-to-compensate:0|1>
+flp-rebuild claw-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <period-ticks:16+> <trash-every:2..16> <time-distortion:-100..100> <remove-short-notes:0|1> <stretch-to-compensate:0|1>
 flp-rebuild add-note <input.flp> <output.flp> <pattern-id> <channel-id> <position> <length> <key> <velocity>
 flp-rebuild delete-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index>
 flp-rebuild import-midi <input.flp> <input.mid> <output.flp> <track> <pattern-id> <channel-id>
@@ -187,7 +189,7 @@ The Piano roll's **Edit** target selector applies note-transform buttons to eith
 
 **Riff machine channel/selected** uses the targeted notes as a progression, builds diatonic triads in the current Piano roll scale, arpeggiates them, and applies seeded velocity variation, note-length scaling, and key-range fitting. It does not yet provide native progression presets, mirror and groove stages, custom patterns, or staged preview ([FL Studio Riff Machine manual](https://www.image-line.com/fl-studio-learning/fl-studio-online-manual/html/pianoroll_riff.htm)).
 
-**Claw machine channel/selected** gates notes on a repeating period, slews their timing toward the period start or end, can remove notes shorter than one period slice, and can stretch notes across gaps left by removed notes. Its 16-slice gate and timing curve are local interpretations; native note-splitting and exact distortion behavior remain unverified ([FL Studio Claw Machine manual](https://www.image-line.com/fl-studio-learning/fl-studio-online-manual/html/pianoroll_claw.htm)).
+**Claw machine channel/selected** and `claw-notes` gate notes on a repeating period, slew their timing toward the period start or end, and can remove notes shorter than one period slice or stretch notes across gaps left by removed notes. `claw-notes-selected` accepts comma-separated zero-based channel-local note indexes. Its 16-slice gate and timing curve are local interpretations; native note-splitting and exact distortion behavior remain unverified ([FL Studio Claw Machine manual](https://www.image-line.com/fl-studio-learning/fl-studio-online-manual/html/pianoroll_claw.htm)).
 
 **Slice channel/selected** splits targeted notes that cross the configured tick, retaining their note properties. The drag-based directional Slice tool remains incomplete.
 
