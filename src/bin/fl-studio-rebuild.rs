@@ -13367,30 +13367,30 @@ impl DawUi {
             ui.separator();
             ui.label(format!("{} PPQ", ppq));
             ui.separator();
-            ui.label("MIDI Global Snap")
-                .on_hover_text("Used instead of per-track Trigger Sync while MIDI note 127 is held");
-            egui::ComboBox::from_id_salt("playlist-performance-global-snap")
-                .selected_text(self.performance_global_snap.label())
-                .show_ui(ui, |ui| {
-                    for snap in PerformanceGlobalSnap::ALL {
-                        ui.selectable_value(
-                            &mut self.performance_global_snap,
-                            snap,
-                            snap.label(),
-                        );
-                    }
-                });
-            ui.separator();
             let performance_mode_button = ui
                 .add_enabled(
                     !self.project_playback_loaded,
                     egui::Button::new("Performance Mode").selected(self.performance_mode_active),
                 )
                 .on_hover_text(if performance_zone_end_tick.is_some() {
-                    "Start playback from the non-signature marker named Start; launch supported Sampler Pattern Clips at the next bar."
+                    "Start playback from the non-signature marker named Start; launch supported Sampler Pattern Clips at the next bar. Right-click for the MIDI Global Snap setting."
                 } else {
-                    "Add a non-signature time marker named Start to define the Performance Zone."
+                    "Add a non-signature time marker named Start to define the Performance Zone. Right-click for the MIDI Global Snap setting."
                 });
+            performance_mode_button.context_menu(|ui| {
+                ui.label("MIDI Global Snap (while MIDI note 127 is held)");
+                egui::ComboBox::from_id_salt("playlist-performance-global-snap")
+                    .selected_text(self.performance_global_snap.label())
+                    .show_ui(ui, |ui| {
+                        for snap in PerformanceGlobalSnap::ALL {
+                            ui.selectable_value(
+                                &mut self.performance_global_snap,
+                                snap,
+                                snap.label(),
+                            );
+                        }
+                    });
+            });
             if performance_mode_button.clicked() {
                 self.performance_mode_active = !self.performance_mode_active;
                 if !self.performance_mode_active {
