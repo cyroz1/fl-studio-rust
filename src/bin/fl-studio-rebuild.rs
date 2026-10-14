@@ -13290,6 +13290,13 @@ impl DawUi {
             .collect::<Vec<_>>();
         let performance_zone_end_tick =
             playlist_performance_zone_start_tick(&arrangement.time_markers);
+        let existing_playlist_clip_groups = arrangement
+            .clips
+            .iter()
+            .filter_map(|clip| (clip.group != 0).then_some(clip.group))
+            .collect::<BTreeSet<_>>();
+        let next_playlist_clip_group =
+            (1..=u16::MAX).find(|group| !existing_playlist_clip_groups.contains(group));
 
         let waveform_paths = arrangement
             .clips
@@ -13312,6 +13319,7 @@ impl DawUi {
         let mut solo_playlist_track_requested = None;
         let mut delete_clip_requested = None;
         let mut muted_clip_requested = None;
+        let mut playlist_clip_group_requested = None;
         let mut copy_clip_requested = None;
         let mut cut_clip_requested = None;
         let mut paste_clip_after_requested = None;
@@ -15193,6 +15201,16 @@ impl DawUi {
                                         .map(|clip| (*index, clip.is_muted()))
                                 })
                                 .collect::<Vec<_>>();
+                            let can_group_clip_selection =
+                                mute_selection_indices.len() > 1 && next_playlist_clip_group.is_some();
+                            let can_ungroup_clip_selection = mute_selection_indices.iter().any(
+                                |index| {
+                                    arrangement
+                                        .clips
+                                        .get(*index)
+                                        .is_some_and(|clip| clip.group != 0)
+                                },
+                            );
                             let response = response.on_hover_text(drag_hint);
                             response.context_menu(|ui| {
                                 if similar_clip_indices.len() > 1 {
@@ -15210,6 +15228,37 @@ impl DawUi {
                                         );
                                         ui.close();
                                     }
+                                    ui.separator();
+                                }
+                                if ui
+                                    .add_enabled(
+                                        can_group_clip_selection,
+                                        egui::Button::new("Group selected clips"),
+                                    )
+                                    .on_disabled_hover_text(if next_playlist_clip_group.is_none() {
+                                        "All nonzero Playlist Clip Group IDs are in use"
+                                    } else {
+                                        "Select at least two Playlist clips"
+                                    })
+                                    .clicked()
+                                    && let Some(group) = next_playlist_clip_group
+                                {
+                                    playlist_clip_group_requested =
+                                        Some((mute_selection_indices.clone(), group));
+                                    ui.close();
+                                }
+                                if ui
+                                    .add_enabled(
+                                        can_ungroup_clip_selection,
+                                        egui::Button::new("Ungroup selected clips"),
+                                    )
+                                    .clicked()
+                                {
+                                    playlist_clip_group_requested =
+                                        Some((mute_selection_indices.clone(), 0));
+                                    ui.close();
+                                }
+                                if can_group_clip_selection || can_ungroup_clip_selection {
                                     ui.separator();
                                 }
                                 if mute_selection_states.len() > 1 {
@@ -17110,6 +17159,58 @@ impl DawUi {
                     self.status = format!("Could not change Playlist clip mute state: {error}");
                 }
                 None => self.status = "Open a project to mute Playlist clips".to_owned(),
+            }
+        }
+
+        if let Some((clip_indices, group)) = playlist_clip_group_requested {
+            let result = self.document.as_ref().map(|document| {
+                let mut updated = document.clone();
+                for clip_index in &clip_indices {
+                    updated
+                        .edit_playlist_clip(
+                            arrangement.id,
+                            *clip_index,
+                            PlaylistClipEdit {
+                                group: Some(group),
+                                ..PlaylistClipEdit::default()
+                            },
+                        )
+                        .map_err(|error| error.to_string())?;
+                }
+                Ok::<_, String>(updated)
+            });
+            match result {
+                Some(Ok(updated)) => {
+                    self.document = Some(updated);
+                    self.stop_project_playback();
+                    self.dirty = true;
+                    ui.ctx().request_repaint();
+                    self.status = if group == 0 {
+                        format!(
+                            "Ungrouped {} selected Playlist {}",
+                            clip_indices.len(),
+                            if clip_indices.len() == 1 {
+                                "clip"
+                            } else {
+                                "clips"
+                            }
+                        )
+                    } else {
+                        format!(
+                            "Grouped {} selected Playlist {} as Group {group}",
+                            clip_indices.len(),
+                            if clip_indices.len() == 1 {
+                                "clip"
+                            } else {
+                                "clips"
+                            }
+                        )
+                    };
+                }
+                Some(Err(error)) => {
+                    self.status = format!("Could not update Playlist Clip Groups: {error}");
+                }
+                None => self.status = "Open a project to edit Playlist Clip Groups".to_owned(),
             }
         }
 
