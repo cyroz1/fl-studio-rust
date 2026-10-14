@@ -3259,6 +3259,8 @@ struct DawUi {
     strum_spread_ticks: u32,
     strum_descending: bool,
     flam_stroke_ticks: u32,
+    flam_time_absolute: bool,
+    flam_stroke_ms: f32,
     flam_velocity: u8,
     flam_before: bool,
     randomizer_seed: u64,
@@ -3983,6 +3985,8 @@ impl DawUi {
             strum_spread_ticks: 120,
             strum_descending: false,
             flam_stroke_ticks: 12,
+            flam_time_absolute: false,
+            flam_stroke_ms: 50.0,
             flam_velocity: 80,
             flam_before: true,
             randomizer_seed: 1,
@@ -23949,10 +23953,21 @@ impl DawUi {
                         ui.selectable_value(&mut self.strum_descending, false, "Low to high");
                         ui.selectable_value(&mut self.strum_descending, true, "High to low");
                     });
-                ui.add(
-                    egui::Slider::new(&mut self.flam_stroke_ticks, 1..=384)
-                        .text("Flam time (ticks)"),
+                ui.checkbox(&mut self.flam_time_absolute, "Absolute").on_hover_text(
+                    "Treat Flam time as milliseconds and convert it to ticks using the current project tempo and PPQ. Later tempo changes can change the effective spacing.",
                 );
+                if self.flam_time_absolute {
+                    ui.add(
+                        egui::Slider::new(&mut self.flam_stroke_ms, 0.1..=500.0)
+                            .step_by(0.1)
+                            .text("Flam time (ms)"),
+                    );
+                } else {
+                    ui.add(
+                        egui::Slider::new(&mut self.flam_stroke_ticks, 1..=384)
+                            .text("Flam time (ticks)"),
+                    );
+                }
                 ui.add(egui::Slider::new(&mut self.flam_velocity, 0..=127).text("Flam velocity"));
                 ui.checkbox(&mut self.flam_before, "Flam before notes");
                 ui.add(
@@ -24375,33 +24390,54 @@ impl DawUi {
             && let (Some(pattern_id), Some(channel_id)) =
                 (self.selected_pattern, self.selected_note_channel)
         {
-            let stroke_ticks = self.flam_stroke_ticks;
+            let stroke_ticks = if self.flam_time_absolute {
+                self.document.as_ref().and_then(|document| {
+                    let tempo_bpm = document.metadata().tempo_bpm().unwrap_or(140.0);
+                    let ppq = document.header().ppq();
+                    let stroke_ticks =
+                        f64::from(self.flam_stroke_ms) * tempo_bpm * f64::from(ppq) / 60_000.0;
+                    (self.flam_stroke_ms.is_finite()
+                        && self.flam_stroke_ms > 0.0
+                        && tempo_bpm.is_finite()
+                        && tempo_bpm > 0.0
+                        && ppq > 0
+                        && stroke_ticks.is_finite()
+                        && stroke_ticks > 0.0
+                        && stroke_ticks <= f64::from(u32::MAX))
+                    .then_some(stroke_ticks.round().clamp(1.0, f64::from(u32::MAX)) as u32)
+                })
+            } else {
+                Some(self.flam_stroke_ticks)
+            };
             let velocity = self.flam_velocity;
             let before = self.flam_before;
-            let result = self
-                .document
-                .as_mut()
-                .ok_or_else(|| "no project is open".to_owned())
-                .and_then(|document| {
-                    let result = if edit_selection_only {
-                        document.flam_pattern_note_selection(
-                            pattern_id,
-                            channel_id,
-                            &selected_quantize_indices,
-                            stroke_ticks,
-                            velocity,
-                            before,
-                        )
-                    } else {
-                        document.flam_pattern_notes(
-                            pattern_id,
-                            channel_id,
-                            stroke_ticks,
-                            velocity,
-                            before,
-                        )
-                    };
-                    result.map_err(|error| error.to_string())
+            let result = stroke_ticks
+                .ok_or_else(|| "Flam time cannot be mapped to a positive project tick".to_owned())
+                .and_then(|stroke_ticks| {
+                    self.document
+                        .as_mut()
+                        .ok_or_else(|| "no project is open".to_owned())
+                        .and_then(|document| {
+                            let result = if edit_selection_only {
+                                document.flam_pattern_note_selection(
+                                    pattern_id,
+                                    channel_id,
+                                    &selected_quantize_indices,
+                                    stroke_ticks,
+                                    velocity,
+                                    before,
+                                )
+                            } else {
+                                document.flam_pattern_notes(
+                                    pattern_id,
+                                    channel_id,
+                                    stroke_ticks,
+                                    velocity,
+                                    before,
+                                )
+                            };
+                            result.map_err(|error| error.to_string())
+                        })
                 });
             match result {
                 Ok(created) => {
