@@ -348,15 +348,13 @@ impl Vst3PlaylistStreamProcessor {
                     })
                 })
                 .collect::<Vec<_>>();
-            stream.render.events[next_event..].retain(|event| {
+            let mut pending_events = stream.render.events.split_off(next_event);
+            pending_events.retain(|event| {
                 event.performance_track_id != Some(track_id) || event.frame < stop_source_frame
             });
-            if !note_offs.is_empty() {
-                let mut pending_events = stream.render.events.split_off(stream.next_event);
-                pending_events.extend(note_offs);
-                pending_events.sort_by_key(|event| (event.frame, event.priority));
-                stream.render.events.extend(pending_events);
-            }
+            pending_events.extend(note_offs);
+            pending_events.sort_by_key(|event| (event.frame, event.priority));
+            stream.render.events.extend(pending_events);
         }
         Ok(())
     }
