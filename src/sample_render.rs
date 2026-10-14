@@ -5132,6 +5132,7 @@ struct PlaylistPerformanceRuntime {
     queued_by_track: BTreeMap<u32, VecDeque<PlaylistPerformanceLaunch>>,
     motion_by_track: HashMap<u32, Option<PlaylistTrackMotion>>,
     motion_clip_order_by_track: HashMap<u32, Vec<usize>>,
+    motion_group_clip_by_index: HashMap<usize, usize>,
     press_by_track: HashMap<u32, Option<PlaylistTrackPress>>,
     position_sync_by_track: HashMap<u32, Option<PlaylistTrackSync>>,
     ppq: u16,
@@ -5280,37 +5281,8 @@ impl PlaylistPerformanceRuntime {
             .iter()
             .map(|track| (track.id, track.motion))
             .collect();
-        let mut motion_clip_order_by_track = BTreeMap::<u32, Vec<(u32, usize)>>::new();
-        for (&clip_index, clip) in &clips_by_index {
-            motion_clip_order_by_track
-                .entry(clip.track_id)
-                .or_default()
-                .push((clip.source_start_tick, clip_index));
-        }
-        for (&clip_index, clip) in &audio_clips_by_index {
-            motion_clip_order_by_track
-                .entry(clip.track_id)
-                .or_default()
-                .push((clip.source_start_tick, clip_index));
-        }
-        let motion_clip_order_by_track = motion_clip_order_by_track
-            .into_iter()
-            .map(|(track_id, mut clips)| {
-                clips.sort_unstable();
-                (
-                    track_id,
-                    clips
-                        .into_iter()
-                        .map(|(_, clip_index)| clip_index)
-                        .collect(),
-                )
-            })
-            .collect();
-        let press_by_track = tracks.iter().map(|track| (track.id, track.press)).collect();
-        let position_sync_by_track = tracks
-            .into_iter()
-            .map(|track| (track.id, track.position_sync))
-            .collect();
+        let ppq = document.header().ppq();
+        let initial_time_signature = document.metadata().time_signature();
         let signature_changes = arrangement
             .time_markers
             .iter()
@@ -5322,6 +5294,36 @@ impl PlaylistPerformanceRuntime {
                     marker.denominator()?.max(1),
                 ))
             })
+            .collect::<Vec<_>>();
+        let mut marker_group_positions = arrangement
+            .time_markers
+            .iter()
+            .filter(|marker| !marker.is_signature())
+            .map(|marker| marker.position_ticks())
+            .filter(|position| *position < performance_zone_end_tick)
+            .collect::<Vec<_>>();
+        marker_group_positions.sort_unstable();
+        marker_group_positions.dedup();
+        let motion_clips =
+            clips_by_index
+                .iter()
+                .map(|(&clip_index, clip)| (clip.track_id, clip.source_start_tick, clip_index))
+                .chain(audio_clips_by_index.iter().map(|(&clip_index, clip)| {
+                    (clip.track_id, clip.source_start_tick, clip_index)
+                }));
+        let (motion_clip_order_by_track, motion_group_clip_by_index) =
+            performance_motion_clip_groups(
+                motion_clips,
+                &marker_group_positions,
+                performance_zone_end_tick,
+                ppq,
+                initial_time_signature,
+                &signature_changes,
+            );
+        let press_by_track = tracks.iter().map(|track| (track.id, track.press)).collect();
+        let position_sync_by_track = tracks
+            .into_iter()
+            .map(|track| (track.id, track.position_sync))
             .collect();
         Ok(Self {
             performance_zone_end_tick,
@@ -5333,10 +5335,11 @@ impl PlaylistPerformanceRuntime {
             queued_by_track: BTreeMap::new(),
             motion_by_track,
             motion_clip_order_by_track,
+            motion_group_clip_by_index,
             press_by_track,
             position_sync_by_track,
-            ppq: document.header().ppq(),
-            initial_time_signature: document.metadata().time_signature(),
+            ppq,
+            initial_time_signature,
             signature_changes,
             clips_by_index,
             audio_clips_by_index,
@@ -5506,9 +5509,14 @@ impl PlaylistPerformanceRuntime {
                     {
                         continue;
                     }
+                    let motion_clip_index = self
+                        .motion_group_clip_by_index
+                        .get(&clip_index)
+                        .copied()
+                        .unwrap_or(clip_index);
                     let step = performance_motion_release_step_with_seed(
                         self.motion_by_track.get(&track_id).copied().flatten(),
-                        clip_index,
+                        motion_clip_index,
                         self.motion_clip_order_by_track
                             .get(&track_id)
                             .map(Vec::as_slice)
@@ -5561,16 +5569,21 @@ impl PlaylistPerformanceRuntime {
             .saturating_add(u64::from(self.sample_rate));
         self.apply_queued_transitions(horizon_frame, sampler_engine)?;
         self.apply_automatic_motion_transitions(block_start, horizon_frame, sampler_engine)?;
+        let motion_group_clip_by_index = &self.motion_group_clip_by_index;
         let mut queued_notes = Vec::new();
         for active in self.active_by_track.values_mut() {
             let clip = self
                 .clips_by_index
                 .get(&active.clip_index)
                 .ok_or_else(|| "active Performance Mode clip disappeared".to_owned())?;
+            let motion_clip_index = motion_group_clip_by_index
+                .get(&active.clip_index)
+                .copied()
+                .unwrap_or(active.clip_index);
             let pass_action = performance_motion_pass_action(
                 self.motion_by_track.get(&clip.track_id).copied().flatten(),
                 self.press_by_track.get(&clip.track_id).copied().flatten(),
-                active.clip_index,
+                motion_clip_index,
                 self.motion_clip_order_by_track
                     .get(&clip.track_id)
                     .map(Vec::as_slice)
@@ -5676,10 +5689,14 @@ impl PlaylistPerformanceRuntime {
                 .audio_clips_by_index
                 .get(&active.clip_index)
                 .ok_or_else(|| "active Performance Mode Audio Clip disappeared".to_owned())?;
+            let motion_clip_index = motion_group_clip_by_index
+                .get(&active.clip_index)
+                .copied()
+                .unwrap_or(active.clip_index);
             let pass_action = performance_motion_pass_action(
                 self.motion_by_track.get(&clip.track_id).copied().flatten(),
                 self.press_by_track.get(&clip.track_id).copied().flatten(),
-                active.clip_index,
+                motion_clip_index,
                 self.motion_clip_order_by_track
                     .get(&clip.track_id)
                     .map(Vec::as_slice)
@@ -5749,10 +5766,15 @@ impl PlaylistPerformanceRuntime {
         }
         let mut completed_stop_tracks = Vec::new();
         for (&track_id, active) in &self.active_by_track {
+            let motion_clip_index = self
+                .motion_group_clip_by_index
+                .get(&active.clip_index)
+                .copied()
+                .unwrap_or(active.clip_index);
             if performance_motion_pass_action(
                 self.motion_by_track.get(&track_id).copied().flatten(),
                 self.press_by_track.get(&track_id).copied().flatten(),
-                active.clip_index,
+                motion_clip_index,
                 self.motion_clip_order_by_track
                     .get(&track_id)
                     .map(Vec::as_slice)
@@ -5768,10 +5790,15 @@ impl PlaylistPerformanceRuntime {
             }
         }
         for (&track_id, active) in &self.active_audio_by_track {
+            let motion_clip_index = self
+                .motion_group_clip_by_index
+                .get(&active.clip_index)
+                .copied()
+                .unwrap_or(active.clip_index);
             if performance_motion_pass_action(
                 self.motion_by_track.get(&track_id).copied().flatten(),
                 self.press_by_track.get(&track_id).copied().flatten(),
-                active.clip_index,
+                motion_clip_index,
                 self.motion_clip_order_by_track
                     .get(&track_id)
                     .map(Vec::as_slice)
@@ -5963,7 +5990,10 @@ impl PlaylistPerformanceRuntime {
                     && performance_motion_pass_action(
                         self.motion_by_track.get(&track_id).copied().flatten(),
                         self.press_by_track.get(&track_id).copied().flatten(),
-                        clip_index,
+                        self.motion_group_clip_by_index
+                            .get(&clip_index)
+                            .copied()
+                            .unwrap_or(clip_index),
                         self.motion_clip_order_by_track
                             .get(&track_id)
                             .map(Vec::as_slice)
@@ -6049,11 +6079,20 @@ impl PlaylistPerformanceRuntime {
                 .get(&track_id)
                 .map(Vec::as_slice)
                 .unwrap_or_default();
+            let motion_clip_index = self
+                .motion_group_clip_by_index
+                .get(&clip_index)
+                .copied()
+                .unwrap_or(clip_index);
             let motion = self.motion_by_track.get(&track_id).copied().flatten();
             let press = self.press_by_track.get(&track_id).copied().flatten();
             if !first_pass_scheduled
-                || performance_motion_pass_action(motion, press, clip_index, ordered_clip_indices)
-                    != PerformanceMotionPassAction::Advance
+                || performance_motion_pass_action(
+                    motion,
+                    press,
+                    motion_clip_index,
+                    ordered_clip_indices,
+                ) != PerformanceMotionPassAction::Advance
             {
                 continue;
             }
@@ -6078,7 +6117,7 @@ impl PlaylistPerformanceRuntime {
             let start_frame = self.tempo_map.frame_at_tick(start_tick, self.sample_rate)?;
             let step = performance_motion_release_step_with_seed(
                 motion,
-                clip_index,
+                motion_clip_index,
                 ordered_clip_indices,
                 u64::from(track_id) ^ start_frame.rotate_left(17),
             );
@@ -6158,6 +6197,64 @@ fn performance_latch_should_stop(
     requested_clip_index: usize,
 ) -> bool {
     press == Some(PlaylistTrackPress::Latch) && active_clip_index == Some(requested_clip_index)
+}
+
+fn performance_motion_clip_groups(
+    clips: impl IntoIterator<Item = (u32, u32, usize)>,
+    marker_group_positions: &[u32],
+    performance_zone_end_tick: u32,
+    ppq: u16,
+    initial_time_signature: Option<(u8, u8)>,
+    signature_changes: &[(u32, u8, u8)],
+) -> (HashMap<u32, Vec<usize>>, HashMap<usize, usize>) {
+    let mut clips_by_track_and_group = BTreeMap::<u32, BTreeMap<u64, Vec<(u32, usize)>>>::new();
+    for (track_id, start_tick, clip_index) in clips {
+        if start_tick >= performance_zone_end_tick {
+            continue;
+        }
+        let group_start_tick = if marker_group_positions.is_empty() {
+            performance_signature_and_bar_start(
+                u64::from(start_tick),
+                initial_time_signature,
+                signature_changes,
+                ppq,
+            )
+            .0
+        } else {
+            marker_group_positions
+                .iter()
+                .copied()
+                .take_while(|position| *position <= start_tick)
+                .last()
+                .map(u64::from)
+                .unwrap_or(0)
+        };
+        clips_by_track_and_group
+            .entry(track_id)
+            .or_default()
+            .entry(group_start_tick)
+            .or_default()
+            .push((start_tick, clip_index));
+    }
+
+    let mut ordered_clips_by_track = HashMap::new();
+    let mut group_clip_by_index = HashMap::new();
+    for (track_id, groups) in clips_by_track_and_group {
+        let mut ordered_clips = Vec::with_capacity(groups.len());
+        for clips in groups.into_values() {
+            let mut clips = clips;
+            clips.sort_unstable();
+            let Some((_, group_clip_index)) = clips.first().copied() else {
+                continue;
+            };
+            ordered_clips.push(group_clip_index);
+            for (_, clip_index) in clips {
+                group_clip_by_index.insert(clip_index, group_clip_index);
+            }
+        }
+        ordered_clips_by_track.insert(track_id, ordered_clips);
+    }
+    (ordered_clips_by_track, group_clip_by_index)
 }
 
 fn performance_motion_is_one_shot(motion: Option<PlaylistTrackMotion>) -> bool {

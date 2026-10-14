@@ -13585,7 +13585,7 @@ impl DawUi {
                                 let mut requested_motion = None;
                                 ui.horizontal(|ui| {
                                     ui.label("Motion").on_hover_text(
-                                        "Saved per-track motion mode. One Shot plays the first pass and stops. March and Random modes advance after each pass for Retrigger, Hold & stop, and Latch; Hold & motion advances on release. Scene grouping is not implemented yet.",
+                                        "Saved per-track motion mode. One Shot plays the first pass and stops. March and Random modes advance after each pass for Retrigger, Hold & stop, and Latch; Hold & motion advances on release. Time-marker regions define Motion steps; when none are set before Start, bars define the steps. Additional clips in a region are sub-clips and are skipped. Saved Clip Groups and Track Groups are not applied.",
                                     );
                                     egui::ComboBox::from_id_salt((
                                         "playlist-track-motion",
