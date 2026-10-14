@@ -43,7 +43,9 @@ use flp_rebuild::sample_render::{
     stream_sampler_pattern_to_device, stream_vst3_midi_input_to_device,
     write_input_recording_to_wav,
 };
-use flp_rebuild::sample_render::{SamplerLiveNoteEvent, Vst3LiveInputEvent};
+use flp_rebuild::sample_render::{
+    SamplerLiveInputRouting, SamplerLiveNoteEvent, Vst3LiveInputEvent,
+};
 use flp_rebuild::vst3::{
     MAX_REPORTED_TAIL_SECONDS, Vst3HostRuntime, Vst3PatternRenderOptions, Vst3PatternStreamHandle,
 };
@@ -34905,8 +34907,10 @@ impl DawUi {
                                 read_sample_root_note,
                                 ..SamplerPatternRenderOptions::default()
                             },
-                            channel_id,
-                            worker_target_channel_ids,
+                            SamplerLiveInputRouting {
+                                source_channel_id: channel_id,
+                                target_channel_ids: worker_target_channel_ids,
+                            },
                             event_receiver,
                             &writer,
                             &worker_cancelled,

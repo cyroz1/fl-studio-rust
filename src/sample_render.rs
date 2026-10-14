@@ -590,6 +590,15 @@ pub enum SamplerLiveNoteEvent {
     },
 }
 
+/// Source channel and resolved Sampler destinations for live MIDI audition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SamplerLiveInputRouting {
+    /// Channel receiving the selected Pattern's live MIDI input.
+    pub source_channel_id: u16,
+    /// Enabled Sampler channels that may receive routed notes from the source.
+    pub target_channel_ids: BTreeSet<u16>,
+}
+
 /// Live MIDI messages sent to a selected VST3 channel while transport is stopped.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Vst3LiveInputEvent {
@@ -4341,12 +4350,15 @@ pub fn stream_sampler_midi_input_to_device(
     document: &FlpDocument,
     project_path: impl AsRef<Path>,
     options: SamplerPatternRenderOptions,
-    source_channel_id: u16,
-    target_channel_ids: BTreeSet<u16>,
+    routing: SamplerLiveInputRouting,
     events: Receiver<SamplerLiveNoteEvent>,
     writer: &StreamingAudioWriter,
     cancelled: &AtomicBool,
 ) -> Result<(), String> {
+    let SamplerLiveInputRouting {
+        source_channel_id,
+        target_channel_ids,
+    } = routing;
     let channels = document.channels();
     let channels_by_id = channels
         .iter()
