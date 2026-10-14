@@ -94,6 +94,8 @@ flp-rebuild slice-notes <input.flp> <output.flp> <pattern-id> <channel-id> <posi
 flp-rebuild slice-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <position-ticks>
 flp-rebuild scale-levels-notes <input.flp> <output.flp> <pattern-id> <channel-id> <center:-100..100> <tension:-100..100> <multiplier:0..200> <offset:-100..100>
 flp-rebuild scale-levels-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <center:-100..100> <tension:-100..100> <multiplier:0..200> <offset:-100..100>
+flp-rebuild articulate-notes <input.flp> <output.flp> <pattern-id> <channel-id> <multiplier:10..100> <variation:0..100> <seed> <use-original-lengths:0|1> <chop-chords:0|1>
+flp-rebuild articulate-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <multiplier:10..100> <variation:0..100> <seed> <use-original-lengths:0|1> <chop-chords:0|1> <only-with-selection:0|1>
 flp-rebuild add-note <input.flp> <output.flp> <pattern-id> <channel-id> <position> <length> <key> <velocity>
 flp-rebuild delete-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index>
 flp-rebuild import-midi <input.flp> <input.mid> <output.flp> <track> <pattern-id> <channel-id>
@@ -190,6 +192,8 @@ The Piano roll's **Edit** target selector applies note-transform buttons to eith
 **Slice channel/selected** splits targeted notes that cross the configured tick, retaining their note properties. The drag-based directional Slice tool remains incomplete.
 
 **Scale Levels channel/selected** and `scale-levels-notes` adjust note velocities with Center, logarithmic Tension, Multiply, and Offset. `scale-levels-notes-selected` accepts comma-separated zero-based channel-local note indexes. Center and Tension use local formulas pending comparison against native FL Studio.
+
+**Articulate channel/selected** scales original note lengths or uses the next onset as a legato boundary, with optional seeded Variation and chord chopping. `articulate-notes` exposes channel-wide processing; `articulate-notes-selected` accepts comma-separated zero-based channel-local note indexes and the Only with selection option. Quick preset values and the variation distribution remain unverified against native FL Studio.
 
 The Piano roll key and scale selectors highlight C through B in major, natural minor, harmonic minor, and major or minor pentatonic scales. Selecting **None** disables highlighting; the helper does not constrain note entry.
 

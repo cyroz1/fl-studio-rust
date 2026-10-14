@@ -14,13 +14,13 @@ use flp_rebuild::sample_render::{
 };
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions};
 use flp_rebuild::{
-    ArpeggioDirection, ArpeggioOptions, AutomationPointEdit, ChannelLevelAdjustmentsEdit,
-    FlamOptions, FlpDocument, FstPreset, HumanizerOptions, LimitNoteOptions, LimitSnapDirection,
-    PatternControllerEdit, PatternNote, PatternNoteEdit, PlaylistClipEdit, PlaylistTrackEdit,
-    PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit,
-    ProjectSettingsEdit, QuantizeNoteMode, QuantizeNoteOptions, RandomNoteChordMap,
-    RandomNoteGeneratorOptions, RandomizerOptions, ScaleLevelsOptions, StrumOptions,
-    TimeMarkerEdit,
+    ArpeggioDirection, ArpeggioOptions, ArticulateOptions, AutomationPointEdit,
+    ChannelLevelAdjustmentsEdit, FlamOptions, FlpDocument, FstPreset, HumanizerOptions,
+    LimitNoteOptions, LimitSnapDirection, PatternControllerEdit, PatternNote, PatternNoteEdit,
+    PlaylistClipEdit, PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress,
+    PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit, QuantizeNoteMode, QuantizeNoteOptions,
+    RandomNoteChordMap, RandomNoteGeneratorOptions, RandomizerOptions, ScaleLevelsOptions,
+    StrumOptions, TimeMarkerEdit,
 };
 
 fn main() -> ExitCode {
@@ -1587,6 +1587,47 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 },
             )
         }
+        [command, input, output, pattern_id, channel_id, multiplier, variation, seed,
+            use_original_lengths, chop_chords]
+            if command == "articulate-notes" =>
+        {
+            articulate_notes_with_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                None,
+                ArticulateOptions {
+                    multiplier_percent: parse_u8(multiplier, "Articulate multiplier")?,
+                    variation_percent: parse_u8(variation, "Articulate variation")?,
+                    seed: parse_u64(seed, "Articulate seed")?,
+                    use_original_lengths: parse_bool(use_original_lengths, "use original lengths")?,
+                    chop_chords: parse_bool(chop_chords, "chop chords")?,
+                },
+                false,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, note_indices, multiplier, variation,
+            seed, use_original_lengths, chop_chords, only_with_selection]
+            if command == "articulate-notes-selected" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            articulate_notes_with_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Some(&note_indices),
+                ArticulateOptions {
+                    multiplier_percent: parse_u8(multiplier, "Articulate multiplier")?,
+                    variation_percent: parse_u8(variation, "Articulate variation")?,
+                    seed: parse_u64(seed, "Articulate seed")?,
+                    use_original_lengths: parse_bool(use_original_lengths, "use original lengths")?,
+                    chop_chords: parse_bool(chop_chords, "chop chords")?,
+                },
+                parse_bool(only_with_selection, "only with selection")?,
+            )
+        }
         [command, input, output, pattern_id, channel_id, position, length, key, velocity]
             if command == "add-note" =>
         {
@@ -1997,6 +2038,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild slice-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <position-ticks>\n",
             "  flp-rebuild scale-levels-notes <input.flp> <output.flp> <pattern-id> <channel-id> <center:-100..100> <tension:-100..100> <multiplier:0..200> <offset:-100..100>\n",
             "  flp-rebuild scale-levels-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <center:-100..100> <tension:-100..100> <multiplier:0..200> <offset:-100..100>\n",
+            "  flp-rebuild articulate-notes <input.flp> <output.flp> <pattern-id> <channel-id> <multiplier:10..100> <variation:0..100> <seed> <use-original-lengths:0|1> <chop-chords:0|1>\n",
+            "  flp-rebuild articulate-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <multiplier:10..100> <variation:0..100> <seed> <use-original-lengths:0|1> <chop-chords:0|1> <only-with-selection:0|1>\n",
             "  flp-rebuild add-note <input.flp> <output.flp> <pattern-id> <channel-id> <position> <length> <key> <velocity>\n",
             "  flp-rebuild delete-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index>\n",
             "  flp-rebuild import-midi <input.flp> <input.mid> <output.flp> <track> <pattern-id> <channel-id>\n",
@@ -4676,6 +4719,44 @@ fn scale_levels_notes_with_scope(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "scaled velocity levels for {changed} notes in pattern {pattern_id}, channel {channel_id} ({}) to {}",
+        if note_indices.is_some() {
+            "selected notes"
+        } else {
+            "all channel notes"
+        },
+        output.display()
+    );
+    Ok(())
+}
+
+fn articulate_notes_with_scope(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    note_indices: Option<&[usize]>,
+    options: ArticulateOptions,
+    only_with_selection: bool,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let changed = match note_indices {
+        Some(note_indices) => document.articulate_pattern_note_selection(
+            pattern_id,
+            channel_id,
+            note_indices,
+            options,
+            only_with_selection,
+        ),
+        None => document.articulate_pattern_notes(pattern_id, channel_id, options),
+    }
+    .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "articulated lengths for {changed} notes in pattern {pattern_id}, channel {channel_id} ({}) to {}",
         if note_indices.is_some() {
             "selected notes"
         } else {
