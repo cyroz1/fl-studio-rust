@@ -590,6 +590,16 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 value,
             )
         }
+        [command, input, output, insert_ordinal, name]
+            if command == "rename-mixer-insert" =>
+        {
+            rename_mixer_insert(
+                Path::new(input),
+                Path::new(output),
+                parse_usize(insert_ordinal, "Mixer insert ordinal")?,
+                name,
+            )
+        }
         [command, input, output, channel_id, zipped] if command == "set-channel-zipped" => {
             set_channel_zipped(
                 Path::new(input),
@@ -2508,6 +2518,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild channel-groups <file.flp>\n",
             "  flp-rebuild mixer <file.flp>\n",
             "  flp-rebuild set-mixer-parameter-record-value <input.flp> <output.flp> <event-index> <record-index> <signed-value>\n",
+            "  flp-rebuild rename-mixer-insert <input.flp> <output.flp> <insert-ordinal> <name>\n",
             "  flp-rebuild automation <file.flp>\n",
             "  flp-rebuild time-markers <file.flp>\n",
             "  flp-rebuild sample-paths <file.flp>\n",
@@ -4876,6 +4887,28 @@ fn set_mixer_parameter_record_value(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "set Mixer 0xE1 event {event_index} record {record_index} value to {value} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn rename_mixer_insert(
+    input: &Path,
+    output: &Path,
+    insert_ordinal: usize,
+    name: &str,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .set_mixer_insert_name(insert_ordinal, name)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "renamed Mixer insert {insert_ordinal} to {name:?} in {}",
         output.display()
     );
     Ok(())
