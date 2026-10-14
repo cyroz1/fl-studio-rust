@@ -76,7 +76,7 @@ jobs:
             {
               echo "### Signed macOS installer skipped"
               echo
-              echo "The macOS tests have passed. CI will build and inspect an unsigned app bundle and disk image, then upload the disk image and a separate GUI preview artifact. The unsigned disk image is for CI and local testing; configure signing and notarization credentials to publish a Gatekeeper-verified installer. See [macOS CI packaging](docs/macos-ci-packaging.md)."
+              echo "The macOS tests have passed. CI will build and inspect an unsigned app bundle and disk image, then upload only the installer. The unsigned disk image is for CI and local packaging checks; configure signing and notarization credentials to publish a Gatekeeper-verified installer. See [macOS CI packaging](docs/macos-ci-packaging.md)."
             } >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
@@ -1109,15 +1109,6 @@ jobs:
           xvfb-run --auto-servernum --server-args="-screen 0 1600x900x24 +extension GLX" \
             bash "$RUNNER_TEMP/capture-ui.sh"
 
-      - name: Upload Linux GUI preview
-        if: always() && runner.os == 'Linux'
-        uses: actions/upload-artifact@v4
-        with:
-          name: linux-gui-preview
-          path: dist/gui-preview/*.png
-          if-no-files-found: error
-          retention-days: 14
-
       - name: Build signed and notarized macOS installer
         if: runner.os == 'macOS' && steps.macos-signing.outputs.configured == 'true'
         env:
@@ -1201,48 +1192,6 @@ jobs:
           print("Unsigned macOS app bundle and .flp association are valid")
           PY
 
-      - name: Prepare unsigned macOS GUI preview
-        if: runner.os == 'macOS' && steps.macos-signing.outputs.configured == 'false'
-        shell: bash
-        run: |
-          app_path="$(find dist -maxdepth 1 -type d -name '*.app' -print -quit)"
-          if [[ -z "$app_path" ]]; then
-            echo "::error::Cargo Packager did not produce a macOS app bundle."
-            exit 1
-          fi
-          preview_dir="dist/macos-unsigned-preview"
-          mkdir -p "$preview_dir"
-          app_name="$(basename "$app_path")"
-          app_executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app_path/Contents/Info.plist")"
-          app_binary_path="$app_name/Contents/MacOS/$app_executable"
-          app_archive="$preview_dir/$app_name.tar.gz"
-          tar -czpf "$app_archive" -C "$(dirname "$app_path")" "$app_name"
-          python3 - "$app_archive" "$app_binary_path" <<'PY'
-          import sys
-          import tarfile
-
-          archive_path, binary_path = sys.argv[1:]
-          with tarfile.open(archive_path, "r:gz") as archive:
-              binary = archive.getmember(binary_path)
-              if not binary.isfile() or binary.mode & 0o111 == 0:
-                  raise SystemExit("macOS preview archive did not preserve the app executable bit")
-          print("Unsigned macOS preview archive preserves the app executable bit")
-          PY
-          cat > "$preview_dir/README-FIRST.txt" <<'EOF'
-          This is an unsigned macOS CI preview. Extract this Actions artifact, then unpack
-          the app archive before opening it. Gatekeeper can label an unsigned, quarantined
-          app “damaged” because it has no Developer ID signature and notarization.
-
-          To open the app, open Terminal, change to this folder, then run:
-
-              tar -xzf "FL Studio Rebuild.app.tar.gz"
-              xattr -dr com.apple.quarantine "FL Studio Rebuild.app"
-              open "FL Studio Rebuild.app"
-
-          A signed and notarized disk image is produced only when the repository's Apple
-          Developer ID and notarization secrets are configured.
-          EOF
-
       - name: Verify macOS signature and notarization
         if: runner.os == 'macOS' && steps.macos-signing.outputs.configured == 'true'
         shell: bash
@@ -1256,7 +1205,7 @@ jobs:
           xcrun stapler validate "$app_path"
           spctl --assess --type execute --verbose=4 "$app_path"
 
-      - name: Launch and capture native macOS GUI
+      - name: Launch packaged macOS app
         if: runner.os == 'macOS'
         shell: bash
         run: |
@@ -1273,8 +1222,6 @@ jobs:
             exit 1
           fi
 
-          preview_dir="dist/macos-gui-preview"
-          mkdir -p "$preview_dir"
           app_pid=""
           cleanup() {
             if [[ -n "$app_pid" ]]; then
@@ -1295,19 +1242,26 @@ jobs:
             exit 1
           fi
           sleep 3
-          if screencapture -x "$preview_dir/startup.png" && [[ -s "$preview_dir/startup.png" ]]; then
-            echo "Captured the native macOS startup window."
-          else
-            echo "::warning::The macOS app launched, but the runner could not capture its screen."
-            rm -f "$preview_dir/startup.png"
-          fi
+          echo "Packaged macOS app remained running after launch."
 
-      - name: Upload Linux and Windows installers
-        if: runner.os != 'macOS'
+      - name: Upload Linux installers
+        if: runner.os == 'Linux'
         uses: actions/upload-artifact@v4
         with:
           name: installers-${{ matrix.os }}
-          path: dist/*
+          path: |
+            dist/*.AppImage
+            dist/*.deb
+            dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Windows installers
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: installers-${{ matrix.os }}
+          path: dist/*.exe
           if-no-files-found: error
           retention-days: 14
 
@@ -1320,31 +1274,13 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: Upload unsigned macOS GUI preview
+      - name: Upload unsigned macOS installer
         if: runner.os == 'macOS' && steps.macos-signing.outputs.configured == 'false'
         uses: actions/upload-artifact@v4
         with:
-          name: macos-unsigned-gui-preview
-          path: dist/macos-unsigned-preview
-          if-no-files-found: error
-          retention-days: 14
-
-      - name: Upload unsigned macOS disk image
-        if: runner.os == 'macOS' && steps.macos-signing.outputs.configured == 'false'
-        uses: actions/upload-artifact@v4
-        with:
-          name: macos-unsigned-dmg-preview
+          name: installers-${{ matrix.os }}
           path: dist/*.dmg
           if-no-files-found: error
-          retention-days: 14
-
-      - name: Upload native macOS screenshot
-        if: runner.os == 'macOS'
-        uses: actions/upload-artifact@v4
-        with:
-          name: macos-native-gui-preview
-          path: dist/macos-gui-preview/startup.png
-          if-no-files-found: warn
           retention-days: 14
 
       - name: Remove temporary macOS signing files
