@@ -173,6 +173,8 @@ The **Project settings…** control edits the currently mapped Advanced options:
 
 `quantize-notes` moves note starts toward the nearest grid points for one pattern channel. Strength and swing are fractions from `0` to `1`; lengths and other note properties are retained. Its advanced form also accepts sensitivity, duration strength, and a duration/end mode. `quantize-notes-selected` applies the same controls to comma-separated zero-based channel-local note indexes.
 
+`rotate-notes` moves channel note starts left or right by one snap step, wrapping each note inside its meter-aware measure. `rotate-notes-selected` applies the same operation to comma-separated zero-based channel-local note indexes; selecting a grouped note also rotates the other members of its group.
+
 In the Piano roll, **Quantize selected** targets the current selection. The **Edit** target selector routes other note-transform buttons to **Auto** (use the selection when present, otherwise the channel), **Channel**, or **Selected notes**.
 
 The Piano roll's **Edit** target selector applies note-transform buttons to either the whole channel or only selected notes. **Legato channel/selected** extends targeted notes to the next distinct onset in the channel; notes in the final onset group keep their current lengths. `legato-notes-selected` applies this to comma-separated zero-based channel-local note indexes.
