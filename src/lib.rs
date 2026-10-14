@@ -906,46 +906,85 @@ impl ChannelNoteRouter {
         note_seed: u64,
         key: u16,
     ) -> Vec<u16> {
-        let Some(source) = self.channels_by_id.get(&source_channel_id) else {
-            return Vec::new();
+        let mut targets = Vec::new();
+        let mut seen_targets = HashSet::new();
+        self.route_channel(
+            source_channel_id,
+            note_seed,
+            key,
+            &mut HashSet::new(),
+            &mut seen_targets,
+            &mut targets,
+        );
+        targets
+    }
+
+    fn route_channel(
+        &self,
+        channel_id: u16,
+        note_seed: u64,
+        key: u16,
+        active_layers: &mut HashSet<u16>,
+        seen_targets: &mut HashSet<u16>,
+        targets: &mut Vec<u16>,
+    ) {
+        let Some(channel) = self.channels_by_id.get(&channel_id) else {
+            return;
         };
-        if source.enabled == Some(false) {
-            return Vec::new();
+        if channel.enabled == Some(false) || !channel_accepts_key(channel, key) {
+            return;
         }
-        if !channel_accepts_key(source, key) {
-            return Vec::new();
+        if channel.channel_type() != Some(ChannelType::Layer) {
+            if seen_targets.insert(channel_id) {
+                targets.push(channel_id);
+            }
+            return;
         }
-        if source.channel_type() != Some(ChannelType::Layer) {
-            return vec![source_channel_id];
+        if !active_layers.insert(channel_id) {
+            return;
         }
 
-        let mut seen = HashSet::new();
-        let children = source
+        let mut seen_children = HashSet::new();
+        let children = channel
             .layer_children
             .iter()
             .copied()
-            .filter(|child_id| seen.insert(*child_id))
+            .filter(|child_id| seen_children.insert(*child_id))
             .filter(|child_id| {
                 self.channels_by_id.get(child_id).is_some_and(|child| {
                     child.enabled != Some(false)
-                        && child.channel_type() != Some(ChannelType::Layer)
+                        && (child.channel_type() != Some(ChannelType::Layer)
+                            || !active_layers.contains(child_id))
                         && channel_accepts_key(child, key)
                 })
             })
             .collect::<Vec<_>>();
-
-        if children.is_empty() {
-            return children;
+        if channel.layer_random_enabled() == Some(true) && !children.is_empty() {
+            let mut random = note_seed ^ (u64::from(channel_id) << 32) ^ 0x9E37_79B9_7F4A_7C15;
+            random = (random ^ (random >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            random = (random ^ (random >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            random ^= random >> 31;
+            self.route_channel(
+                children[(random as usize) % children.len()],
+                note_seed,
+                key,
+                active_layers,
+                seen_targets,
+                targets,
+            );
+        } else {
+            for child_id in children {
+                self.route_channel(
+                    child_id,
+                    note_seed,
+                    key,
+                    active_layers,
+                    seen_targets,
+                    targets,
+                );
+            }
         }
-        if source.layer_random_enabled() != Some(true) {
-            return children;
-        }
-
-        let mut random = note_seed ^ (u64::from(source_channel_id) << 32) ^ 0x9E37_79B9_7F4A_7C15;
-        random = (random ^ (random >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        random = (random ^ (random >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        random ^= random >> 31;
-        vec![children[(random as usize) % children.len()]]
+        active_layers.remove(&channel_id);
     }
 }
 

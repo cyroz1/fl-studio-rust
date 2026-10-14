@@ -43755,6 +43755,70 @@ fn playlist_freeze_pattern_sources_supported(
         .iter()
         .map(|channel| (channel.id(), channel))
         .collect::<BTreeMap<_, _>>();
+    fn validate_layer_children(
+        pattern_id: u16,
+        key: u16,
+        layer_id: u16,
+        channels_by_id: &BTreeMap<u16, &ChannelSummary>,
+        loaded_vst3_channels: &BTreeSet<u16>,
+        active_layers: &mut BTreeSet<u16>,
+    ) -> Result<(), String> {
+        if !active_layers.insert(layer_id) {
+            return Err(format!(
+                "Pattern {pattern_id} contains a cyclic Layer child reference"
+            ));
+        }
+        let Some(layer) = channels_by_id.get(&layer_id).copied() else {
+            return Err(format!(
+                "Pattern {pattern_id} uses a Layer with a missing child channel"
+            ));
+        };
+        let mut seen = BTreeSet::new();
+        for child_id in layer
+            .layer_child_ids()
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|child_id| seen.insert(*child_id))
+        {
+            let Some(child) = channels_by_id.get(&child_id).copied() else {
+                return Err(format!(
+                    "Pattern {pattern_id} uses a Layer with a missing child channel"
+                ));
+            };
+            let child_accepts_note = child.enabled() != Some(false)
+                && child
+                    .keyboard_key_region()
+                    .is_none_or(|(low, high)| (low..=high).contains(&key));
+            if !child_accepts_note {
+                continue;
+            }
+            match child.channel_type() {
+                Some(ChannelType::Layer) => validate_layer_children(
+                    pattern_id,
+                    key,
+                    child_id,
+                    channels_by_id,
+                    loaded_vst3_channels,
+                    active_layers,
+                )?,
+                Some(ChannelType::Sampler) => {}
+                Some(ChannelType::Instrument) if loaded_vst3_channels.contains(&child_id) => {}
+                Some(ChannelType::Instrument) => {
+                    return Err(format!(
+                        "Pattern {pattern_id} uses an unloaded instrument channel"
+                    ));
+                }
+                _ => {
+                    return Err(format!(
+                        "Pattern {pattern_id} has a Layer child that this renderer cannot process"
+                    ));
+                }
+            }
+        }
+        active_layers.remove(&layer_id);
+        Ok(())
+    }
     for note in pattern.notes.iter().filter(|note| !note.is_muted()) {
         let Some(source) = channels_by_id.get(&note.channel_id).copied() else {
             return Err(format!(
@@ -43779,45 +43843,14 @@ fn playlist_freeze_pattern_sources_supported(
                 ));
             }
             Some(ChannelType::Layer) => {
-                let mut child_ids = BTreeSet::new();
-                for child_id in source
-                    .layer_child_ids()
-                    .into_iter()
-                    .flatten()
-                    .copied()
-                    .filter(|child_id| child_ids.insert(*child_id))
-                {
-                    let Some(child) = channels_by_id.get(&child_id).copied() else {
-                        return Err(format!(
-                            "Pattern {} uses a Layer with a missing child channel",
-                            pattern.id
-                        ));
-                    };
-                    let child_accepts_note = child.enabled() != Some(false)
-                        && child
-                            .keyboard_key_region()
-                            .is_none_or(|(low, high)| (low..=high).contains(&note.key));
-                    if !child_accepts_note {
-                        continue;
-                    }
-                    if child.channel_type() == Some(ChannelType::Layer) {
-                        return Err(format!(
-                            "Pattern {} uses a nested Layer that this renderer cannot process",
-                            pattern.id
-                        ));
-                    }
-                    match child.channel_type() {
-                        Some(ChannelType::Sampler) => {}
-                        Some(ChannelType::Instrument)
-                            if loaded_vst3_channels.contains(&child.id()) => {}
-                        _ => {
-                            return Err(format!(
-                                "Pattern {} has a Layer child that this renderer cannot process",
-                                pattern.id
-                            ));
-                        }
-                    }
-                }
+                validate_layer_children(
+                    pattern.id,
+                    note.key,
+                    source.id(),
+                    &channels_by_id,
+                    loaded_vst3_channels,
+                    &mut BTreeSet::new(),
+                )?;
             }
             _ => {
                 return Err(format!(
