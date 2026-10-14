@@ -20,7 +20,7 @@ use flp_rebuild::{
     PatternNoteEdit, PatternNoteRotation, PlaylistClipEdit, PlaylistTrackEdit, PlaylistTrackMotion,
     PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit, QuantizeNoteMode,
     QuantizeNoteOptions, RandomNoteChordMap, RandomNoteGeneratorOptions, RandomizerOptions,
-    ScaleLevelsOptions, StrumOptions, TimeMarkerEdit,
+    RiffMachineOptions, RiffMachineQuantizeMode, ScaleLevelsOptions, StrumOptions, TimeMarkerEdit,
 };
 
 fn main() -> ExitCode {
@@ -1706,6 +1706,31 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 },
             )
         }
+        [command, input, output, pattern_id, channel_id, options @ ..]
+            if command == "riff-machine-notes" =>
+        {
+            riff_machine_notes_with_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                None,
+                parse_riff_machine_options(options)?,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, note_indices, options @ ..]
+            if command == "riff-machine-notes-selected" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            riff_machine_notes_with_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Some(&note_indices),
+                parse_riff_machine_options(options)?,
+            )
+        }
         [command, input, output, pattern_id, channel_id, position_ticks]
             if command == "slice-notes" =>
         {
@@ -2274,6 +2299,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild limit-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <minimum-key-0..127> <maximum-key-0..127> [wrap-to-bottom:0|1 scale-name|none scale-root:0..11|-> snap-direction:up|down|alternate]\n",
             "  flp-rebuild arp-notes <input.flp> <output.flp> <pattern-id> <channel-id> <step-ticks> <range-octaves-1..4> <gate-1..100> <up|down|up-down>\n",
             "  flp-rebuild arp-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <step-ticks> <range-octaves-1..4> <gate-1..100> <up|down|up-down>\n",
+            "  flp-rebuild riff-machine-notes <input.flp> <output.flp> <pattern-id> <channel-id> [--option=value ...]\n",
+            "  flp-rebuild riff-machine-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> [--option=value ...]\n",
             "  flp-rebuild slice-notes <input.flp> <output.flp> <pattern-id> <channel-id> <position-ticks>\n",
             "  flp-rebuild slice-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <position-ticks>\n",
             "  flp-rebuild scale-levels-notes <input.flp> <output.flp> <pattern-id> <channel-id> <center:-100..100> <tension:-100..100> <multiplier:0..200> <offset:-100..100>\n",
@@ -2525,6 +2552,124 @@ fn parse_arpeggio_direction(value: &str) -> Result<ArpeggioDirection, String> {
         "up-down" => Ok(ArpeggioDirection::UpDown),
         _ => Err("arpeggiator direction must be 'up', 'down', or 'up-down'".to_owned()),
     }
+}
+
+fn parse_riff_machine_quantize_mode(value: &str) -> Result<RiffMachineQuantizeMode, String> {
+    match value {
+        "leave-duration" => Ok(RiffMachineQuantizeMode::LeaveDuration),
+        "leave-end" => Ok(RiffMachineQuantizeMode::LeaveEnd),
+        "quantize-duration" => Ok(RiffMachineQuantizeMode::QuantizeDuration),
+        "quantize-end" => Ok(RiffMachineQuantizeMode::QuantizeEnd),
+        _ => Err("Riff Machine Groove mode must be leave-duration, leave-end, quantize-duration, or quantize-end".to_owned()),
+    }
+}
+
+fn parse_riff_machine_options(values: &[String]) -> Result<RiffMachineOptions<'static>, String> {
+    let mut options = RiffMachineOptions::default();
+    let mut seen = std::collections::HashSet::new();
+    for argument in values {
+        let option = argument.strip_prefix("--").ok_or_else(|| {
+            format!("Riff Machine options must use --name=value syntax: {argument}")
+        })?;
+        let (name, value) = option.split_once('=').ok_or_else(|| {
+            format!("Riff Machine option must use --name=value syntax: {argument}")
+        })?;
+        if name.is_empty() || value.is_empty() {
+            return Err(format!(
+                "Riff Machine option needs a name and value: {argument}"
+            ));
+        }
+        if !seen.insert(name) {
+            return Err(format!(
+                "Riff Machine option was supplied more than once: --{name}"
+            ));
+        }
+        match name {
+            "scale" => options.scale_intervals = parse_scale_name(value)?,
+            "root" => {
+                options.scale_root = parse_u8(value, "Riff Machine scale root")?;
+                if options.scale_root > 11 {
+                    return Err("Riff Machine scale root must be between 0 and 11".to_owned());
+                }
+            }
+            "min-key" => options.minimum_key = parse_u16(value, "Riff Machine minimum key")?,
+            "max-key" => options.maximum_key = parse_u16(value, "Riff Machine maximum key")?,
+            "wrap-to-bottom" => {
+                options.wrap_to_bottom = parse_bool(value, "Riff Machine wrap to bottom")?
+            }
+            "snap-direction" => {
+                options.snap_direction = match value {
+                    "up" => LimitSnapDirection::Up,
+                    "down" => LimitSnapDirection::Down,
+                    "alternate" => LimitSnapDirection::Alternate,
+                    _ => {
+                        return Err(
+                            "Riff Machine snap direction must be up, down, or alternate".to_owned()
+                        );
+                    }
+                }
+            }
+            "step-ticks" => options.step_ticks = parse_u32(value, "Riff Machine step")?,
+            "range-octaves" => {
+                options.range_octaves = parse_u8(value, "Riff Machine octave range")?
+            }
+            "gate-percent" => options.gate_percent = parse_u8(value, "Riff Machine gate")?,
+            "direction" => options.direction = parse_arpeggio_direction(value)?,
+            "mirror-horizontal" => {
+                options.mirror_horizontal = parse_bool(value, "horizontal mirror")?
+            }
+            "preserve-start-times" => {
+                options.preserve_start_times = parse_bool(value, "preserve start times")?
+            }
+            "mirror-vertical" => options.mirror_vertical = parse_bool(value, "vertical mirror")?,
+            "groove-snap-ticks" => {
+                options.groove_snap_ticks = if value == "none" {
+                    None
+                } else {
+                    Some(parse_u32(value, "Riff Machine Groove snap ticks")?)
+                }
+            }
+            "groove-start-percent" => {
+                options.groove_start_percent = parse_u8(value, "Groove start percentage")?
+            }
+            "groove-sensitivity-percent" => {
+                options.groove_sensitivity_percent =
+                    parse_u8(value, "Groove sensitivity percentage")?
+            }
+            "groove-duration-percent" => {
+                options.groove_duration_percent = parse_u8(value, "Groove duration percentage")?
+            }
+            "groove-mode" => {
+                options.groove_quantize_mode = parse_riff_machine_quantize_mode(value)?
+            }
+            "pan-variation-percent" => {
+                options.pan_variation_percent = parse_u8(value, "pan variation")?
+            }
+            "length-multiplier-percent" => {
+                options.length_multiplier_percent = parse_u8(value, "length multiplier")?
+            }
+            "velocity-variation-percent" => {
+                options.velocity_variation_percent = parse_u8(value, "velocity variation")?
+            }
+            "release-variation-percent" => {
+                options.release_variation_percent = parse_u8(value, "release variation")?
+            }
+            "mod-x-variation-percent" => {
+                options.mod_x_variation_percent = parse_u8(value, "Mod X variation")?
+            }
+            "mod-y-variation-percent" => {
+                options.mod_y_variation_percent = parse_u8(value, "Mod Y variation")?
+            }
+            "pitch-variation-semitones" => {
+                options.pitch_variation_semitones = parse_u8(value, "pitch variation")?
+            }
+            "reset-levels" => options.reset_levels = parse_bool(value, "reset levels")?,
+            "bipolar-levels" => options.bipolar_levels = parse_bool(value, "bipolar levels")?,
+            "seed" => options.seed = parse_u64(value, "Riff Machine seed")?,
+            _ => return Err(format!("unknown Riff Machine option: --{name}")),
+        }
+    }
+    Ok(options)
 }
 
 fn parse_note_rotation(value: &str) -> Result<PatternNoteRotation, String> {
@@ -5101,6 +5246,43 @@ fn arpeggiate_notes_with_scope(
         } else {
             "all channel notes"
         },
+        output.display()
+    );
+    Ok(())
+}
+
+fn riff_machine_notes_with_scope(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    note_indices: Option<&[usize]>,
+    options: RiffMachineOptions<'_>,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let created = match note_indices {
+        Some(note_indices) => document.riff_machine_pattern_note_selection(
+            pattern_id,
+            channel_id,
+            note_indices,
+            options,
+        ),
+        None => document.riff_machine_pattern_notes(pattern_id, channel_id, options),
+    }
+    .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "created {created} Riff Machine notes in pattern {pattern_id}, channel {channel_id} ({}) with seed {} in {}",
+        if note_indices.is_some() {
+            "selected notes"
+        } else {
+            "all channel notes"
+        },
+        options.seed,
         output.display()
     );
     Ok(())
