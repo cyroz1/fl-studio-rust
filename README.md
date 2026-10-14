@@ -89,6 +89,7 @@ flp-rebuild set-channel-swing <input.flp> <output.flp> <channel-id> <percent-0..
 flp-rebuild set-layer-children <input.flp> <output.flp> <layer-channel-id> <child-ids-comma-separated|->
 flp-rebuild set-layer-flags <input.flp> <output.flp> <layer-channel-id> <random:0|1|-> <crossfade:0|1|->
 flp-rebuild edit-automation-point <input.flp> <output.flp> <channel-id> <point-index> <position-beats> <value> <tension>
+flp-rebuild interpolate-automation-points <input.flp> <output.flp> <channel-id> <first-point-index> <last-point-index>
 flp-rebuild edit-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index> <position> <length> <key> <velocity>
 flp-rebuild edit-note-properties <input.flp> <output.flp> <pattern-id> <channel-id> <note-index> <flags-raw|-> <group-raw|-> <fine-pitch|-> <release|-> <midi-channel-raw|-> <pan|-> <mod-x|-> <mod-y|->
 flp-rebuild quantize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <grid-ticks> <strength-0..1> <swing-0..1>
@@ -276,7 +277,7 @@ The `mixer <file.flp>` command reports recognized insert fields and counts known
 
 ## Automation points
 
-`automation <file.flp>` lists point curves from type-5 automation channels. `edit-automation-point` changes an existing point's position in beats, normalized value, and tension. `insert-automation-point` inserts at a zero-based slot (including the slot after the last point), and `delete-automation-point` removes a point by zero-based index. These operations preserve existing point tails and the blob's header and era trailer; new points use a zeroed opaque tail. They require a channel with an existing `0xEA` point blob. The desktop Automation view draws a type-5 curve and supports point selection, drag and numeric editing, insertion, deletion, and linear interpolation of point values between two endpoints. Interpolation retains point positions and opaque data; the preview uses straight segments and does not render FL tension/interpolation modes. Parameter links, event automation, automation-clip creation, and FL Studio's window-level curve workflow remain incomplete.
+`automation <file.flp>` lists point curves from type-5 automation channels. `edit-automation-point` changes an existing point's position in beats, normalized value, and tension. `insert-automation-point` inserts at a zero-based slot (including the slot after the last point), and `delete-automation-point` removes a point by zero-based index. `interpolate-automation-points` linearly fills the values of points strictly between two existing endpoint indices, leaving the endpoints, positions, tensions, and opaque data unchanged; it reports how many points it changed. These operations preserve existing point tails and the blob's header and era trailer; new points use a zeroed opaque tail. They require a channel with an existing `0xEA` point blob. The desktop Automation view draws a type-5 curve and supports point selection, drag and numeric editing, insertion, deletion, and linear interpolation of point values between two endpoints. The preview uses straight segments and does not render FL tension/interpolation modes. Parameter links, event automation, automation-clip creation, and FL Studio's window-level curve workflow remain incomplete.
 
 ## Automated checks and installers
 

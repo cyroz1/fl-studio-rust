@@ -673,6 +673,17 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_usize(point_index, "automation point index")?,
             )
         }
+        [command, input, output, channel_id, first_point_index, last_point_index]
+            if command == "interpolate-automation-points" =>
+        {
+            interpolate_automation_points(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(channel_id, "channel id")?,
+                parse_usize(first_point_index, "first automation point index")?,
+                parse_usize(last_point_index, "last automation point index")?,
+            )
+        }
         [command, input, output, pattern_id, channel_id, note_index, position, length, key, velocity]
             if command == "edit-note" =>
         {
@@ -2485,6 +2496,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild edit-automation-point <input.flp> <output.flp> <channel-id> <point-index> <position-beats> <value> <tension>\n",
             "  flp-rebuild insert-automation-point <input.flp> <output.flp> <channel-id> <insertion-slot> <position-beats> <value> <tension>\n",
             "  flp-rebuild delete-automation-point <input.flp> <output.flp> <channel-id> <point-index>\n",
+            "  flp-rebuild interpolate-automation-points <input.flp> <output.flp> <channel-id> <first-point-index> <last-point-index>\n",
             "  flp-rebuild edit-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index> <position> <length> <key> <velocity>\n",
             "  flp-rebuild edit-note-properties <input.flp> <output.flp> <pattern-id> <channel-id> <note-index> <flags-raw|-> <group-raw|-> <fine-pitch|-> <release|-> <midi-channel-raw|-> <pan|-> <mod-x|-> <mod-y|->\n",
             "  flp-rebuild quantize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <grid-ticks> <start-strength-0..1> <swing-0..1> [sensitivity-0..1 duration-strength-0..1 leave-duration|leave-end|quantize-duration|quantize-end]\n",
@@ -5014,6 +5026,29 @@ fn delete_automation_point(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "deleted automation point {point_index} from channel {channel_id} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn interpolate_automation_points(
+    input: &Path,
+    output: &Path,
+    channel_id: u16,
+    first_point_index: usize,
+    last_point_index: usize,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let interpolated_count = document
+        .interpolate_automation_points(channel_id, first_point_index, last_point_index)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "interpolated {interpolated_count} automation points between indices {first_point_index} and {last_point_index} in channel {channel_id} in {}",
         output.display()
     );
     Ok(())
