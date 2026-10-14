@@ -86,7 +86,8 @@ flp-rebuild randomize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <
 flp-rebuild randomize-notes-scale <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <velocity-amount:-100..100> <pan-amount:-100..100> <pitch-range:0..24> <bipolar:0|1> <reset:0|1> <scale-name> <scale-root:0..11>
 flp-rebuild humanize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <timing-range-ticks> <velocity-variation-0..100>
 flp-rebuild humanize-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <seed> <timing-range-ticks> <velocity-variation-0..100>
-flp-rebuild limit-notes <input.flp> <output.flp> <pattern-id> <channel-id> <minimum-key-0..127> <maximum-key-0..127>
+flp-rebuild limit-notes <input.flp> <output.flp> <pattern-id> <channel-id> <minimum-key-0..127> <maximum-key-0..127> [wrap-to-bottom:0|1 scale-name|none scale-root:0..11|-> snap-direction:up|down|alternate]
+flp-rebuild limit-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <minimum-key-0..127> <maximum-key-0..127> [wrap-to-bottom:0|1 scale-name|none scale-root:0..11|-> snap-direction:up|down|alternate]
 flp-rebuild arp-notes <input.flp> <output.flp> <pattern-id> <channel-id> <step-ticks> <range-octaves-1..4> <gate-1..100> <up|down|up-down>
 flp-rebuild slice-notes <input.flp> <output.flp> <pattern-id> <channel-id> <position-ticks>
 flp-rebuild add-note <input.flp> <output.flp> <pattern-id> <channel-id> <position> <length> <key> <velocity>
@@ -174,7 +175,7 @@ The Piano roll's **Edit** target selector applies note-transform buttons to eith
 
 **Humanize channel/selected** and `humanize-notes` apply seeded onset shifts within a symmetric tick range and velocity variation within a symmetric percentage range. Note lengths and other properties are retained. The CLI also offers `humanize-notes-selected` for comma-separated zero-based channel-local note indexes, plus optional pan, release, Mod X, and Mod Y variations. Timing is expressed in project ticks; tempo-relative timing remains incomplete.
 
-**Limit channel/selected** and `limit-notes` fold targeted note pitches by octaves into the chosen key range, then clamp notes whose pitch classes cannot fit. The Piano roll can also wrap notes to the lowest octave in the range and snap out-of-scale pitches to the currently selected key and scale, upward, downward, or alternating. The CLI remains range-only; native alternate-snap edge behavior has not been compared.
+**Limit channel/selected** and `limit-notes` fold targeted note pitches by octaves into the chosen key range, then clamp notes whose pitch classes cannot fit. The Piano roll can also wrap notes to the lowest octave in the range and snap out-of-scale pitches to the currently selected key and scale, upward, downward, or alternating. The CLI exposes these options in its extended form, and `limit-notes-selected` applies them to comma-separated zero-based channel-local note indexes. Use `none -` when scale snapping is disabled; native alternate-snap edge behavior has not been compared.
 
 **Arpeggiate channel/selected** and `arp-notes` replace targeted simultaneous chord groups with repeated up, down, or up/down note runs across a configurable octave range. Step time and gate length are configurable. Custom `.fsc` arp patterns, alternate patterns, and native sync modes are not implemented.
 

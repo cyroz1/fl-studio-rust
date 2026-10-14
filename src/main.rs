@@ -15,11 +15,11 @@ use flp_rebuild::sample_render::{
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions};
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, AutomationPointEdit, ChannelLevelAdjustmentsEdit,
-    FlamOptions, FlpDocument, FstPreset, HumanizerOptions, PatternControllerEdit, PatternNote,
-    PatternNoteEdit, PlaylistClipEdit, PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress,
-    PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit, QuantizeNoteMode, QuantizeNoteOptions,
-    RandomNoteChordMap, RandomNoteGeneratorOptions, RandomizerOptions, StrumOptions,
-    TimeMarkerEdit,
+    FlamOptions, FlpDocument, FstPreset, HumanizerOptions, LimitNoteOptions, LimitSnapDirection,
+    PatternControllerEdit, PatternNote, PatternNoteEdit, PlaylistClipEdit, PlaylistTrackEdit,
+    PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit,
+    ProjectSettingsEdit, QuantizeNoteMode, QuantizeNoteOptions, RandomNoteChordMap,
+    RandomNoteGeneratorOptions, RandomizerOptions, StrumOptions, TimeMarkerEdit,
 };
 
 fn main() -> ExitCode {
@@ -1429,6 +1429,67 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u16(maximum_key, "maximum key")?,
             )
         }
+        [command, input, output, pattern_id, channel_id, minimum_key, maximum_key, wrap_to_bottom,
+            scale_name, scale_root, snap_direction]
+            if command == "limit-notes" =>
+        {
+            limit_notes_with_options(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                None,
+                parse_limit_note_options(
+                    minimum_key,
+                    maximum_key,
+                    wrap_to_bottom,
+                    scale_name,
+                    scale_root,
+                    snap_direction,
+                )?,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, note_indices, minimum_key, maximum_key]
+            if command == "limit-notes-selected" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            limit_notes_with_options(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Some(&note_indices),
+                LimitNoteOptions {
+                    minimum_key: parse_u16(minimum_key, "minimum key")?,
+                    maximum_key: parse_u16(maximum_key, "maximum key")?,
+                    wrap_to_bottom: false,
+                    scale_root: None,
+                    scale_intervals: None,
+                    snap_direction: LimitSnapDirection::Up,
+                },
+            )
+        }
+        [command, input, output, pattern_id, channel_id, note_indices, minimum_key, maximum_key,
+            wrap_to_bottom, scale_name, scale_root, snap_direction]
+            if command == "limit-notes-selected" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            limit_notes_with_options(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Some(&note_indices),
+                parse_limit_note_options(
+                    minimum_key,
+                    maximum_key,
+                    wrap_to_bottom,
+                    scale_name,
+                    scale_root,
+                    snap_direction,
+                )?,
+            )
+        }
         [command, input, output, pattern_id, channel_id, step_ticks, range_octaves, gate, direction]
             if command == "arp-notes" =>
         {
@@ -1859,7 +1920,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild randomize-notes-selected-scale <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <seed> <velocity:-100..100> <pan:-100..100> <pitch-range:0..24> <bipolar:0|1> <reset:0|1> <scale-name> <scale-root:0..11> [release:-100..100 mod-x:-100..100 mod-y:-100..100]\n",
             "  flp-rebuild humanize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <timing-range-ticks> <velocity-variation-0..100> [pan-variation-0..100 release-variation-0..100 mod-x-variation-0..100 mod-y-variation-0..100]\n",
             "  flp-rebuild humanize-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <seed> <timing-range-ticks> <velocity-variation-0..100> [pan-variation-0..100 release-variation-0..100 mod-x-variation-0..100 mod-y-variation-0..100]\n",
-            "  flp-rebuild limit-notes <input.flp> <output.flp> <pattern-id> <channel-id> <minimum-key-0..127> <maximum-key-0..127>\n",
+            "  flp-rebuild limit-notes <input.flp> <output.flp> <pattern-id> <channel-id> <minimum-key-0..127> <maximum-key-0..127> [wrap-to-bottom:0|1 scale-name|none scale-root:0..11|-> snap-direction:up|down|alternate]\n",
+            "  flp-rebuild limit-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <minimum-key-0..127> <maximum-key-0..127> [wrap-to-bottom:0|1 scale-name|none scale-root:0..11|-> snap-direction:up|down|alternate]\n",
             "  flp-rebuild arp-notes <input.flp> <output.flp> <pattern-id> <channel-id> <step-ticks> <range-octaves-1..4> <gate-1..100> <up|down|up-down>\n",
             "  flp-rebuild slice-notes <input.flp> <output.flp> <pattern-id> <channel-id> <position-ticks>\n",
             "  flp-rebuild add-note <input.flp> <output.flp> <pattern-id> <channel-id> <position> <length> <key> <velocity>\n",
@@ -1935,6 +1997,45 @@ fn parse_flam_placement(value: &str) -> Result<bool, String> {
         "after" => Ok(false),
         _ => Err("flam placement must be 'before' or 'after'".to_owned()),
     }
+}
+
+fn parse_limit_note_options(
+    minimum_key: &str,
+    maximum_key: &str,
+    wrap_to_bottom: &str,
+    scale_name: &str,
+    scale_root: &str,
+    snap_direction: &str,
+) -> Result<LimitNoteOptions<'static>, String> {
+    let (scale_root, scale_intervals) = if scale_name == "none" {
+        if scale_root != "-" {
+            return Err("scale root must be '-' when scale name is 'none'".to_owned());
+        }
+        (None, None)
+    } else {
+        if scale_root == "-" {
+            return Err("a scale root is required when a scale name is provided".to_owned());
+        }
+        let root = parse_u8(scale_root, "scale root")?;
+        if root > 11 {
+            return Err("scale root must be between 0 and 11".to_owned());
+        }
+        (Some(root), Some(parse_scale_name(scale_name)?))
+    };
+    let snap_direction = match snap_direction {
+        "up" => LimitSnapDirection::Up,
+        "down" => LimitSnapDirection::Down,
+        "alternate" => LimitSnapDirection::Alternate,
+        _ => return Err("limit snap direction must be 'up', 'down', or 'alternate'".to_owned()),
+    };
+    Ok(LimitNoteOptions {
+        minimum_key: parse_u16(minimum_key, "minimum key")?,
+        maximum_key: parse_u16(maximum_key, "maximum key")?,
+        wrap_to_bottom: parse_bool(wrap_to_bottom, "wrap to bottom")?,
+        scale_root,
+        scale_intervals,
+        snap_direction,
+    })
 }
 
 fn parse_midi_channel_mapping(value: &str) -> Result<MidiChannelMapping, String> {
@@ -4341,6 +4442,44 @@ fn limit_notes(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "limited {changed} note pitches in pattern {pattern_id}, channel {channel_id} to {minimum_key}..={maximum_key} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn limit_notes_with_options(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    note_indices: Option<&[usize]>,
+    options: LimitNoteOptions<'_>,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let changed = match note_indices {
+        Some(note_indices) => document.limit_pattern_note_selection_range_with_options(
+            pattern_id,
+            channel_id,
+            note_indices,
+            options,
+        ),
+        None => document.limit_pattern_note_range_with_options(pattern_id, channel_id, options),
+    }
+    .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "limited {changed} note pitches in pattern {pattern_id}, channel {channel_id} ({}) to {}..={} in {}",
+        if note_indices.is_some() {
+            "selected notes"
+        } else {
+            "all channel notes"
+        },
+        options.minimum_key,
+        options.maximum_key,
         output.display()
     );
     Ok(())
