@@ -8368,7 +8368,11 @@ impl DawUi {
             self.live_sampler_workers.push(session.worker);
         }
         self.midi_live_sampler_note_mapping.clear();
-        self.stop_live_layer_input();
+        self.midi_live_layer_note_mapping.clear();
+        if let Some(session) = self.live_layer_input.take() {
+            session.cancelled.store(true, Ordering::Release);
+            self.live_vst3_workers.push(session.worker);
+        }
         if let Some(session) = self.live_vst3_input.take() {
             session.cancelled.store(true, Ordering::Release);
             self.live_vst3_workers.push(session.worker);
@@ -8611,7 +8615,11 @@ impl DawUi {
             self.live_sampler_workers.push(session.worker);
         }
         self.midi_live_sampler_note_mapping.clear();
-        self.stop_live_layer_input();
+        self.midi_live_layer_note_mapping.clear();
+        if let Some(session) = self.live_layer_input.take() {
+            session.cancelled.store(true, Ordering::Release);
+            self.live_vst3_workers.push(session.worker);
+        }
         if let Some(session) = self.live_vst3_input.take() {
             session.cancelled.store(true, Ordering::Release);
             self.live_vst3_workers.push(session.worker);
