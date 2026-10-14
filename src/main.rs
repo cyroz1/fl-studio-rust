@@ -2140,6 +2140,19 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u16(track_index, "zero-based Playlist track index")?,
             )
         }
+        [command, input, output, arrangement_id, channel_id, position, length, track_index]
+            if command == "create-playlist-audio-clip" =>
+        {
+            create_playlist_audio_clip(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(arrangement_id, "arrangement id")?,
+                parse_u16(channel_id, "Audio Clip channel id")?,
+                parse_u32(position, "clip position")?,
+                parse_u32(length, "clip length")?,
+                parse_u16(track_index, "zero-based Playlist track index")?,
+            )
+        }
         [command, input, output, arrangement_id, clip_index, position, length]
             if command == "edit-clip" =>
         {
@@ -2567,6 +2580,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild delete-notes <input.flp> <output.flp> <pattern-id> <channel-id>\n",
             "  flp-rebuild delete-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based>\n",
             "  flp-rebuild create-playlist-pattern-clip <input.flp> <output.flp> <arrangement-id> <pattern-id> <position-ticks> <length-ticks> <track-index:zero-based>\n",
+            "  flp-rebuild create-playlist-audio-clip <input.flp> <output.flp> <arrangement-id> <channel-id> <position-ticks> <length-ticks> <track-index:zero-based>\n",
             "  flp-rebuild import-midi <input.flp> <input.mid> <output.flp> <track> <pattern-id> <channel-id>\n",
             "  flp-rebuild edit-clip <input.flp> <output.flp> <arrangement-id> <clip-index> <position> <length>\n",
             "  flp-rebuild set-clip-muted <input.flp> <output.flp> <arrangement-id> <clip-index> <muted:0|1>\n",
@@ -6412,6 +6426,37 @@ fn create_playlist_pattern_clip(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "created Playlist Pattern Clip {clip_index} for pattern {pattern_id} at tick {position_ticks}, length {length_ticks}, track {track_index} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn create_playlist_audio_clip(
+    input: &Path,
+    output: &Path,
+    arrangement_id: u16,
+    channel_id: u16,
+    position_ticks: u32,
+    length_ticks: u32,
+    track_index: u16,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let clip_index = document
+        .create_playlist_audio_clip(
+            arrangement_id,
+            channel_id,
+            position_ticks,
+            length_ticks,
+            track_index,
+        )
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "created Playlist Audio Clip {clip_index} for channel {channel_id} at tick {position_ticks}, length {length_ticks}, track {track_index} in {}",
         output.display()
     );
     Ok(())
