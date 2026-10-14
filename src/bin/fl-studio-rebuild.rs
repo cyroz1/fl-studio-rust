@@ -59,9 +59,10 @@ use flp_rebuild::{
     PatternController, PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation,
     PayloadEncoding, PlaylistClip, PlaylistClipEdit, PlaylistClipSelectionClipboard,
     PlaylistClipTarget, PlaylistTrack, PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress,
-    PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit, RandomNoteChordMap,
-    RandomNoteGeneratorOptions, RandomizerOptions, RiffMachineOptions, RiffMachineQuantizeMode,
-    ScaleLevelsOptions, TimeMarker, TimeMarkerEdit, VstPluginStateMetadata,
+    PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit, QuantizeNoteMode, QuantizeNoteOptions,
+    RandomNoteChordMap, RandomNoteGeneratorOptions, RandomizerOptions, RiffMachineOptions,
+    RiffMachineQuantizeMode, ScaleLevelsOptions, TimeMarker, TimeMarkerEdit,
+    VstPluginStateMetadata,
 };
 use md5::{Digest, Md5};
 
@@ -3386,6 +3387,9 @@ struct DawUi {
     last_painted_note: Option<(u16, u16, u16, u32)>,
     quantize_strength_percent: u8,
     quantize_swing_percent: u8,
+    quantize_sensitivity_percent: u8,
+    quantize_duration_strength_percent: u8,
+    quantize_mode: QuantizeNoteMode,
     chop_divisions: u8,
     strum_spread_ticks: u32,
     strum_descending: bool,
@@ -4169,6 +4173,9 @@ impl DawUi {
             last_painted_note: None,
             quantize_strength_percent: 100,
             quantize_swing_percent: 0,
+            quantize_sensitivity_percent: 100,
+            quantize_duration_strength_percent: 100,
+            quantize_mode: QuantizeNoteMode::LeaveDuration,
             chop_divisions: 4,
             strum_spread_ticks: 120,
             strum_descending: false,
@@ -25057,6 +25064,45 @@ impl DawUi {
                 ui.add(
                     egui::Slider::new(&mut self.quantize_swing_percent, 0..=100).text("Swing (%)"),
                 );
+                ui.add(
+                    egui::Slider::new(&mut self.quantize_sensitivity_percent, 0..=100)
+                        .text("Sensitivity (%)"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.quantize_duration_strength_percent, 0..=100)
+                        .text("Duration (%)"),
+                );
+                egui::ComboBox::from_id_salt("piano-roll-quantize-mode")
+                    .selected_text(match self.quantize_mode {
+                        QuantizeNoteMode::LeaveDuration => "Quantize: Leave duration",
+                        QuantizeNoteMode::LeaveEnd => "Quantize: Leave end",
+                        QuantizeNoteMode::QuantizeDuration => {
+                            "Quantize: Quantize duration"
+                        }
+                        QuantizeNoteMode::QuantizeEnd => "Quantize: Quantize end",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.quantize_mode,
+                            QuantizeNoteMode::LeaveDuration,
+                            "Leave duration",
+                        );
+                        ui.selectable_value(
+                            &mut self.quantize_mode,
+                            QuantizeNoteMode::LeaveEnd,
+                            "Leave end",
+                        );
+                        ui.selectable_value(
+                            &mut self.quantize_mode,
+                            QuantizeNoteMode::QuantizeDuration,
+                            "Quantize duration",
+                        );
+                        ui.selectable_value(
+                            &mut self.quantize_mode,
+                            QuantizeNoteMode::QuantizeEnd,
+                            "Quantize end time",
+                        );
+                    });
                 ui.add(egui::Slider::new(&mut self.chop_divisions, 2..=16).text("Chop divisions"));
                 ui.add(
                     egui::Slider::new(&mut self.strum_spread_ticks, 0..=1536)
@@ -25379,15 +25425,24 @@ impl DawUi {
                 (self.selected_pattern, self.selected_note_channel)
         {
             let grid_ticks = self.piano_roll_snap.ticks(ppq, time_signature);
-            let strength = if quick_quantize_start_requested {
-                1.0
+            let options = if quick_quantize_start_requested {
+                QuantizeNoteOptions {
+                    grid_ticks,
+                    start_strength: 1.0,
+                    sensitivity: 1.0,
+                    duration_strength: 0.0,
+                    swing: 0.0,
+                    mode: QuantizeNoteMode::LeaveDuration,
+                }
             } else {
-                f64::from(self.quantize_strength_percent) / 100.0
-            };
-            let swing = if quick_quantize_start_requested {
-                0.0
-            } else {
-                f64::from(self.quantize_swing_percent) / 100.0
+                QuantizeNoteOptions {
+                    grid_ticks,
+                    start_strength: f64::from(self.quantize_strength_percent) / 100.0,
+                    sensitivity: f64::from(self.quantize_sensitivity_percent) / 100.0,
+                    duration_strength: f64::from(self.quantize_duration_strength_percent) / 100.0,
+                    swing: f64::from(self.quantize_swing_percent) / 100.0,
+                    mode: self.quantize_mode,
+                }
             };
             let result = self
                 .document
@@ -25395,18 +25450,15 @@ impl DawUi {
                 .ok_or_else(|| "no project is open".to_owned())
                 .and_then(|document| {
                     let result = if quantize_selected_requested {
-                        document.quantize_pattern_note_selection(
+                        document.quantize_pattern_note_selection_with_options(
                             pattern_id,
                             channel_id,
                             &selected_quantize_indices,
-                            grid_ticks,
-                            strength,
-                            swing,
+                            options,
                         )
                     } else {
-                        document.quantize_pattern_notes(
-                            pattern_id, channel_id, grid_ticks, strength, swing,
-                        )
+                        document
+                            .quantize_pattern_notes_with_options(pattern_id, channel_id, options)
                     };
                     result.map_err(|error| error.to_string())
                 });
@@ -25417,10 +25469,10 @@ impl DawUi {
                         self.dirty = true;
                     }
                     self.status = if quantize_selected_requested {
-                        format!("Quantized {changed} selected note starts in pattern {pattern_id}")
+                        format!("Quantized {changed} selected notes in pattern {pattern_id}")
                     } else {
                         format!(
-                            "Quantized {changed} note starts in pattern {pattern_id}, channel {channel_id}"
+                            "Quantized {changed} notes in pattern {pattern_id}, channel {channel_id}"
                         )
                     };
                 }

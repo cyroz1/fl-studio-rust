@@ -17,8 +17,8 @@ use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, AutomationPointEdit, ChannelLevelAdjustmentsEdit,
     FlpDocument, FstPreset, HumanizerOptions, PatternControllerEdit, PatternNote, PatternNoteEdit,
     PlaylistClipEdit, PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress,
-    PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit, RandomNoteChordMap,
-    RandomNoteGeneratorOptions, RandomizerOptions, TimeMarkerEdit,
+    PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit, QuantizeNoteMode, QuantizeNoteOptions,
+    RandomNoteChordMap, RandomNoteGeneratorOptions, RandomizerOptions, TimeMarkerEdit,
 };
 
 fn main() -> ExitCode {
@@ -551,6 +551,25 @@ fn run(args: Vec<String>) -> Result<(), String> {
                     mod_x: parse_optional_u8(mod_x, "modulation X")?,
                     mod_y: parse_optional_u8(mod_y, "modulation Y")?,
                     ..PatternNoteEdit::default()
+                },
+            )
+        }
+        [command, input, output, pattern_id, channel_id, grid_ticks, strength, swing,
+            sensitivity, duration_strength, mode]
+            if command == "quantize-notes" =>
+        {
+            quantize_notes_with_options(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                QuantizeNoteOptions {
+                    grid_ticks: parse_u32(grid_ticks, "quantize grid ticks")?,
+                    start_strength: parse_f64(strength, "quantize start strength")?,
+                    swing: parse_f64(swing, "quantize swing")?,
+                    sensitivity: parse_f64(sensitivity, "quantize sensitivity")?,
+                    duration_strength: parse_f64(duration_strength, "quantize duration strength")?,
+                    mode: parse_quantize_note_mode(mode)?,
                 },
             )
         }
@@ -1691,7 +1710,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild delete-automation-point <input.flp> <output.flp> <channel-id> <point-index>\n",
             "  flp-rebuild edit-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index> <position> <length> <key> <velocity>\n",
             "  flp-rebuild edit-note-properties <input.flp> <output.flp> <pattern-id> <channel-id> <note-index> <flags-raw|-> <group-raw|-> <fine-pitch|-> <release|-> <midi-channel-raw|-> <pan|-> <mod-x|-> <mod-y|->\n",
-            "  flp-rebuild quantize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <grid-ticks> <strength-0..1> <swing-0..1>\n",
+            "  flp-rebuild quantize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <grid-ticks> <start-strength-0..1> <swing-0..1> [sensitivity-0..1 duration-strength-0..1 leave-duration|leave-end|quantize-duration|quantize-end]\n",
             "  flp-rebuild legato-notes <input.flp> <output.flp> <pattern-id> <channel-id>\n",
             "  flp-rebuild chop-notes <input.flp> <output.flp> <pattern-id> <channel-id> <divisions-2..64>\n",
             "  flp-rebuild glue-notes <input.flp> <output.flp> <pattern-id> <channel-id>\n",
@@ -1903,6 +1922,19 @@ fn parse_arpeggio_direction(value: &str) -> Result<ArpeggioDirection, String> {
         "down" => Ok(ArpeggioDirection::Down),
         "up-down" => Ok(ArpeggioDirection::UpDown),
         _ => Err("arpeggiator direction must be 'up', 'down', or 'up-down'".to_owned()),
+    }
+}
+
+fn parse_quantize_note_mode(value: &str) -> Result<QuantizeNoteMode, String> {
+    match value {
+        "leave-duration" => Ok(QuantizeNoteMode::LeaveDuration),
+        "leave-end" => Ok(QuantizeNoteMode::LeaveEnd),
+        "quantize-duration" => Ok(QuantizeNoteMode::QuantizeDuration),
+        "quantize-end" => Ok(QuantizeNoteMode::QuantizeEnd),
+        _ => Err(
+            "quantize mode must be leave-duration, leave-end, quantize-duration, or quantize-end"
+                .to_owned(),
+        ),
     }
 }
 
@@ -3733,9 +3765,30 @@ fn quantize_notes(
     strength: f64,
     swing: f64,
 ) -> Result<(), String> {
+    quantize_notes_with_options(
+        input,
+        output,
+        pattern_id,
+        channel_id,
+        QuantizeNoteOptions {
+            grid_ticks,
+            start_strength: strength,
+            swing,
+            ..QuantizeNoteOptions::default()
+        },
+    )
+}
+
+fn quantize_notes_with_options(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    options: QuantizeNoteOptions,
+) -> Result<(), String> {
     let (_, mut document) = load_document(input)?;
     let changed = document
-        .quantize_pattern_notes(pattern_id, channel_id, grid_ticks, strength, swing)
+        .quantize_pattern_notes_with_options(pattern_id, channel_id, options)
         .map_err(|error| error.to_string())?;
     let bytes = document
         .encode_lossless()

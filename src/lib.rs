@@ -1228,6 +1228,40 @@ pub enum RiffMachineQuantizeMode {
     QuantizeEnd,
 }
 
+/// Note-duration behavior for Piano roll quantization.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QuantizeNoteMode {
+    LeaveDuration,
+    LeaveEnd,
+    QuantizeDuration,
+    QuantizeEnd,
+}
+
+/// Settings for Piano roll quantization of note starts and durations.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct QuantizeNoteOptions {
+    pub grid_ticks: u32,
+    pub start_strength: f64,
+    /// Snap only features within this fraction of half a grid step.
+    pub sensitivity: f64,
+    pub duration_strength: f64,
+    pub swing: f64,
+    pub mode: QuantizeNoteMode,
+}
+
+impl Default for QuantizeNoteOptions {
+    fn default() -> Self {
+        Self {
+            grid_ticks: 24,
+            start_strength: 1.0,
+            sensitivity: 1.0,
+            duration_strength: 0.0,
+            swing: 0.0,
+            mode: QuantizeNoteMode::LeaveDuration,
+        }
+    }
+}
+
 /// Settings for a seeded, scale-based Riff Machine pass over an existing note progression.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RiffMachineOptions<'a> {
@@ -9350,8 +9384,26 @@ impl FlpDocument {
         swing: f64,
     ) -> Result<usize, FlpError> {
         self.quantize_pattern_notes_in_scope(
-            pattern_id, channel_id, None, grid_ticks, strength, swing,
+            pattern_id,
+            channel_id,
+            None,
+            QuantizeNoteOptions {
+                grid_ticks,
+                start_strength: strength,
+                swing,
+                ..QuantizeNoteOptions::default()
+            },
         )
+    }
+
+    /// Quantizes a channel's note starts and optional durations with the supplied settings.
+    pub fn quantize_pattern_notes_with_options(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        options: QuantizeNoteOptions,
+    ) -> Result<usize, FlpError> {
+        self.quantize_pattern_notes_in_scope(pattern_id, channel_id, None, options)
     }
 
     /// Moves only the supplied channel-note indices toward the closest grid points.
@@ -9369,10 +9421,24 @@ impl FlpDocument {
             pattern_id,
             channel_id,
             Some(note_indices),
-            grid_ticks,
-            strength,
-            swing,
+            QuantizeNoteOptions {
+                grid_ticks,
+                start_strength: strength,
+                swing,
+                ..QuantizeNoteOptions::default()
+            },
         )
+    }
+
+    /// Quantizes only the supplied channel notes with the supplied start and duration settings.
+    pub fn quantize_pattern_note_selection_with_options(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: &[usize],
+        options: QuantizeNoteOptions,
+    ) -> Result<usize, FlpError> {
+        self.quantize_pattern_notes_in_scope(pattern_id, channel_id, Some(note_indices), options)
     }
 
     fn quantize_pattern_notes_in_scope(
@@ -9380,21 +9446,31 @@ impl FlpDocument {
         pattern_id: u16,
         channel_id: u16,
         note_indices: Option<&[usize]>,
-        grid_ticks: u32,
-        strength: f64,
-        swing: f64,
+        options: QuantizeNoteOptions,
     ) -> Result<usize, FlpError> {
-        if grid_ticks == 0 {
+        if options.grid_ticks == 0 {
             return Err(FlpError::UnsupportedEdit(
                 "quantize grid must be greater than zero ticks",
             ));
         }
-        if !strength.is_finite() || !(0.0..=1.0).contains(&strength) {
+        if !options.start_strength.is_finite() || !(0.0..=1.0).contains(&options.start_strength) {
             return Err(FlpError::UnsupportedEdit(
-                "quantize strength must be between 0 and 1",
+                "quantize start strength must be between 0 and 1",
             ));
         }
-        if !swing.is_finite() || !(0.0..=1.0).contains(&swing) {
+        if !options.sensitivity.is_finite() || !(0.0..=1.0).contains(&options.sensitivity) {
+            return Err(FlpError::UnsupportedEdit(
+                "quantize sensitivity must be between 0 and 1",
+            ));
+        }
+        if !options.duration_strength.is_finite()
+            || !(0.0..=1.0).contains(&options.duration_strength)
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "quantize duration strength must be between 0 and 1",
+            ));
+        }
+        if !options.swing.is_finite() || !(0.0..=1.0).contains(&options.swing) {
             return Err(FlpError::UnsupportedEdit(
                 "quantize swing must be between 0 and 1",
             ));
@@ -9406,7 +9482,7 @@ impl FlpDocument {
             .ok_or(FlpError::UnsupportedEdit(
                 "the requested pattern does not exist",
             ))?;
-        let grid = u64::from(grid_ticks);
+        let grid = u64::from(options.grid_ticks);
         let selected_indices =
             note_indices.map(|indices| indices.iter().copied().collect::<HashSet<_>>());
         let edits = pattern
@@ -9420,21 +9496,59 @@ impl FlpDocument {
                     .is_none_or(|indices| indices.contains(note_index))
             })
             .filter_map(|(note_index, note)| {
-                let position = u64::from(note.position);
-                let grid_index = position.saturating_add(grid / 2) / grid;
-                let straight_target = grid_index.saturating_mul(grid);
-                let swing_offset = if grid_index % 2 == 1 {
-                    (grid as f64 * 0.5 * swing).round() as u64
-                } else {
-                    0
+                let original_start = u64::from(note.position);
+                let original_length = u64::from(note.length);
+                let original_end = original_start.saturating_add(original_length);
+                let target_for = |tick: u64| {
+                    let grid_index = tick.saturating_add(grid / 2) / grid;
+                    let straight_target = grid_index.saturating_mul(grid);
+                    let sensitivity_limit = grid as f64 * 0.5 * options.sensitivity;
+                    if tick.abs_diff(straight_target) as f64 > sensitivity_limit {
+                        return tick;
+                    }
+                    let swing_offset = if grid_index % 2 == 1 {
+                        (grid as f64 * 0.5 * options.swing).round() as u64
+                    } else {
+                        0
+                    };
+                    straight_target.saturating_add(swing_offset)
                 };
-                let target = straight_target
-                    .saturating_add(swing_offset)
-                    .min(u64::from(u32::MAX)) as f64;
-                let next_position = (position as f64 + (target - position as f64) * strength)
-                    .round()
-                    .clamp(0.0, f64::from(u32::MAX)) as u32;
-                (next_position != note.position).then_some((note_index, next_position))
+                let mix = |original: u64, target: u64, strength: f64| {
+                    (original as f64 + (target as f64 - original as f64) * strength)
+                        .round()
+                        .clamp(0.0, f64::from(u32::MAX)) as u64
+                };
+
+                let target_start = target_for(original_start);
+                let mut next_start = mix(original_start, target_start, options.start_strength);
+                let target_end = target_for(original_end);
+                let next_length = if original_length == 0 {
+                    original_length
+                } else {
+                    match options.mode {
+                        QuantizeNoteMode::LeaveDuration => original_length,
+                        QuantizeNoteMode::LeaveEnd => {
+                            next_start = next_start.min(original_end.saturating_sub(1));
+                            original_end.saturating_sub(next_start)
+                        }
+                        QuantizeNoteMode::QuantizeDuration => {
+                            let target_length = target_end.saturating_sub(target_start).max(1);
+                            mix(original_length, target_length, options.duration_strength).max(1)
+                        }
+                        QuantizeNoteMode::QuantizeEnd => {
+                            let next_end = mix(original_end, target_end, options.duration_strength);
+                            next_start = next_start.min(next_end.saturating_sub(1));
+                            next_end.saturating_sub(next_start).max(1)
+                        }
+                    }
+                };
+                let next_start = next_start.min(u64::from(u32::MAX)) as u32;
+                let next_length = next_length.min(u64::from(u32::MAX)) as u32;
+                ((next_start != note.position || next_length != note.length).then_some((
+                    note_index,
+                    next_start,
+                    next_length,
+                )))
             })
             .collect::<Vec<_>>();
         if edits.is_empty() {
@@ -9442,13 +9556,14 @@ impl FlpDocument {
         }
 
         let mut updated = self.clone();
-        for (note_index, position) in &edits {
+        for (note_index, position, length) in &edits {
             updated.edit_pattern_note(
                 pattern_id,
                 channel_id,
                 *note_index,
                 PatternNoteEdit {
                     position: Some(*position),
+                    length: Some(*length),
                     ..PatternNoteEdit::default()
                 },
             )?;
