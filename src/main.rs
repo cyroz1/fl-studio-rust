@@ -15,8 +15,8 @@ use flp_rebuild::sample_render::{
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions};
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, AutomationPointEdit, ChannelLevelAdjustmentsEdit,
-    FlpDocument, FstPreset, HumanizerOptions, PatternControllerEdit, PatternNote, PatternNoteEdit,
-    PlaylistClipEdit, PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress,
+    FlamOptions, FlpDocument, FstPreset, HumanizerOptions, PatternControllerEdit, PatternNote,
+    PatternNoteEdit, PlaylistClipEdit, PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress,
     PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit, QuantizeNoteMode, QuantizeNoteOptions,
     RandomNoteChordMap, RandomNoteGeneratorOptions, RandomizerOptions, StrumOptions,
     TimeMarkerEdit,
@@ -680,6 +680,65 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u32(stroke_ticks, "flam stroke time")?,
                 parse_u8(velocity, "flam velocity")?,
                 before,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, stroke_ticks, velocity, placement,
+            group_notes]
+            if command == "flam-notes" =>
+        {
+            let before = parse_flam_placement(placement)?;
+            flam_notes_with_options(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                None,
+                FlamOptions {
+                    stroke_ticks: parse_u32(stroke_ticks, "flam stroke time")?,
+                    velocity: parse_u8(velocity, "flam velocity")?,
+                    before,
+                    group_notes: parse_bool(group_notes, "group notes")?,
+                },
+            )
+        }
+        [command, input, output, pattern_id, channel_id, note_indices, stroke_ticks, velocity,
+            placement]
+            if command == "flam-notes-selected" =>
+        {
+            let before = parse_flam_placement(placement)?;
+            let note_indices = parse_note_indices(note_indices)?;
+            flam_notes_with_options(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Some(&note_indices),
+                FlamOptions {
+                    stroke_ticks: parse_u32(stroke_ticks, "flam stroke time")?,
+                    velocity: parse_u8(velocity, "flam velocity")?,
+                    before,
+                    group_notes: false,
+                },
+            )
+        }
+        [command, input, output, pattern_id, channel_id, note_indices, stroke_ticks, velocity,
+            placement, group_notes]
+            if command == "flam-notes-selected" =>
+        {
+            let before = parse_flam_placement(placement)?;
+            let note_indices = parse_note_indices(note_indices)?;
+            flam_notes_with_options(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Some(&note_indices),
+                FlamOptions {
+                    stroke_ticks: parse_u32(stroke_ticks, "flam stroke time")?,
+                    velocity: parse_u8(velocity, "flam velocity")?,
+                    before,
+                    group_notes: parse_bool(group_notes, "group notes")?,
+                },
             )
         }
         [command, input, output, pattern_id, channel_id, start_tick, end_tick, step_ticks,
@@ -1742,7 +1801,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild glue-notes <input.flp> <output.flp> <pattern-id> <channel-id>\n",
             "  flp-rebuild flip-notes <input.flp> <output.flp> <pattern-id> <channel-id>\n",
             "  flp-rebuild strum-notes <input.flp> <output.flp> <pattern-id> <channel-id> <spread-ticks> <up|down> [velocity-amount:-127..127 velocity-tension:-100..100]\n",
-            "  flp-rebuild flam-notes <input.flp> <output.flp> <pattern-id> <channel-id> <stroke-ticks> <velocity-0..127> <before|after>\n",
+            "  flp-rebuild flam-notes <input.flp> <output.flp> <pattern-id> <channel-id> <stroke-ticks> <velocity-0..127> <before|after> [group-notes:0|1]\n",
+            "  flp-rebuild flam-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <stroke-ticks> <velocity-0..127> <before|after> [group-notes:0|1]\n",
             "  flp-rebuild generate-random-notes <input.flp> <output.flp> <pattern-id> <channel-id> <start-ticks> <end-ticks-exclusive> <step-ticks> <note-length-ticks> <density-0..100> <minimum-key-0..127> <maximum-key-0..127> <seed> [stack-1..16 [length-variation:-100..100 [merge-same-notes:0|1 [base-octave-0..10 range-octaves-1..11 [chord-map-name chord-root-0..11]]]]]\n",
             "  flp-rebuild generate-random-notes-scale <input.flp> <output.flp> <pattern-id> <channel-id> <start-ticks> <end-ticks-exclusive> <step-ticks> <note-length-ticks> <density-0..100> <minimum-key-0..127> <maximum-key-0..127> <seed> <scale-name> <scale-root-0..11> [stack-1..16 [length-variation:-100..100 [merge-same-notes:0|1 [base-octave-0..10 range-octaves-1..11 [chord-map-name chord-root-0..11]]]]]\n",
             "  flp-rebuild randomize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <velocity:-100..100> <pan:-100..100> <pitch-range:0..24> <bipolar:0|1> <reset:0|1> [release:-100..100 mod-x:-100..100 mod-y:-100..100]\n",
@@ -1818,6 +1878,14 @@ fn parse_note_indices(value: &str) -> Result<Vec<usize>, String> {
         return Err("at least one channel-local note index is required".to_owned());
     }
     Ok(indices)
+}
+
+fn parse_flam_placement(value: &str) -> Result<bool, String> {
+    match value {
+        "before" => Ok(true),
+        "after" => Ok(false),
+        _ => Err("flam placement must be 'before' or 'after'".to_owned()),
+    }
 }
 
 fn parse_midi_channel_mapping(value: &str) -> Result<MidiChannelMapping, String> {
@@ -3964,21 +4032,61 @@ fn flam_notes(
     velocity: u8,
     before: bool,
 ) -> Result<(), String> {
+    flam_notes_with_options(
+        input,
+        output,
+        pattern_id,
+        channel_id,
+        None,
+        FlamOptions {
+            stroke_ticks,
+            velocity,
+            before,
+            group_notes: false,
+        },
+    )
+}
+
+fn flam_notes_with_options(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    note_indices: Option<&[usize]>,
+    options: FlamOptions,
+) -> Result<(), String> {
     let (_, mut document) = load_document(input)?;
-    let created = document
-        .flam_pattern_notes(pattern_id, channel_id, stroke_ticks, velocity, before)
-        .map_err(|error| error.to_string())?;
+    let created = match note_indices {
+        Some(note_indices) => document.flam_pattern_note_selection_with_options(
+            pattern_id,
+            channel_id,
+            note_indices,
+            options,
+        ),
+        None => document.flam_pattern_notes_with_options(pattern_id, channel_id, options),
+    }
+    .map_err(|error| error.to_string())?;
     let bytes = document
         .encode_lossless()
         .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
     fs::write(output, bytes)
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
-        "added {created} flam strokes in pattern {pattern_id}, channel {channel_id} ({}) to {}",
-        if before {
+        "added {created} flam strokes in pattern {pattern_id}, channel {channel_id}, {} ({}, {}) to {}",
+        if note_indices.is_some() {
+            "selected notes"
+        } else {
+            "all channel notes"
+        },
+        if options.before {
             "before notes"
         } else {
             "after notes"
+        },
+        if options.group_notes {
+            "grouped"
+        } else {
+            "not grouped"
         },
         output.display()
     );
