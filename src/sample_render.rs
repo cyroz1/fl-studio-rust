@@ -27,7 +27,7 @@ use crate::audio::{
     AudioInputRecording, MIXER_TRACK_METER_COUNT, MixerTrackPeakMeters, StreamingAudioWriter,
 };
 use crate::media::{DecodedAudio, SamplePathResolver, decode_audio_file, wav_sampler_metadata};
-use crate::vst3::Vst3PlaylistStreamProcessor;
+use crate::vst3::{PlaylistMidiNote, Vst3PlaylistStreamProcessor};
 use crate::{
     Arrangement, ChannelNoteRouter, ChannelSummary, FlpDocument, MixerInsertSignalTransform,
     MixerRouteAudibility, MixerSourceRoutePlan, MixerSourceRouteTransform, Pattern, PatternNote,
@@ -831,7 +831,7 @@ pub struct PlaylistRenderRange {
     pub minimum_content_frames: u64,
 }
 
-/// A Sampler Pattern Clip launch scheduled on the Playlist timeline.
+/// A Performance Mode Playlist Clip launch scheduled on the timeline.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PlaylistPerformanceLaunch {
     pub clip_index: usize,
@@ -878,6 +878,49 @@ pub struct PlaylistPerformanceStream {
 
 /// Return the supported Sampler Pattern Clips that can be launched before the Start marker.
 pub fn playlist_performance_sampler_clip_indices(
+    document: &FlpDocument,
+    arrangement_id: u16,
+    performance_zone_end_tick: u32,
+) -> Result<BTreeSet<usize>, String> {
+    let candidates = playlist_performance_sampler_clip_candidates(
+        document,
+        arrangement_id,
+        performance_zone_end_tick,
+    )?;
+    let arrangement = document
+        .arrangements()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|arrangement| arrangement.id == arrangement_id)
+        .ok_or_else(|| format!("arrangement {arrangement_id} was not found"))?;
+    let candidate_track_ids = candidates
+        .iter()
+        .filter_map(|index| arrangement.clips.get(*index)?.playlist_track_id())
+        .collect::<BTreeSet<_>>();
+    let eligible_track_ids = candidate_track_ids
+        .into_iter()
+        .filter(|track_id| {
+            arrangement.clips.iter().enumerate().all(|(index, clip)| {
+                clip.playlist_track_id() != Some(*track_id)
+                    || !matches!(clip.target(), PlaylistClipTarget::Pattern { .. })
+                    || clip.is_muted()
+                    || candidates.contains(&index)
+            })
+        })
+        .collect::<BTreeSet<_>>();
+    Ok(candidates
+        .into_iter()
+        .filter(|index| {
+            arrangement
+                .clips
+                .get(*index)
+                .and_then(PlaylistClip::playlist_track_id)
+                .is_some_and(|track_id| eligible_track_ids.contains(&track_id))
+        })
+        .collect())
+}
+
+fn playlist_performance_sampler_clip_candidates(
     document: &FlpDocument,
     arrangement_id: u16,
     performance_zone_end_tick: u32,
@@ -933,30 +976,7 @@ pub fn playlist_performance_sampler_clip_indices(
             .then_some(index)
         })
         .collect::<BTreeSet<_>>();
-    let eligible_track_ids = candidates
-        .iter()
-        .filter_map(|index| arrangement.clips.get(*index)?.playlist_track_id())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .filter(|track_id| {
-            arrangement.clips.iter().enumerate().all(|(index, clip)| {
-                clip.playlist_track_id() != Some(*track_id)
-                    || !matches!(clip.target(), PlaylistClipTarget::Pattern { .. })
-                    || clip.is_muted()
-                    || candidates.contains(&index)
-            })
-        })
-        .collect::<BTreeSet<_>>();
-    Ok(candidates
-        .into_iter()
-        .filter(|index| {
-            arrangement
-                .clips
-                .get(*index)
-                .and_then(PlaylistClip::playlist_track_id)
-                .is_some_and(|track_id| eligible_track_ids.contains(&track_id))
-        })
-        .collect())
+    Ok(candidates)
 }
 
 /// Return enabled Audio Clips before the Start marker that can be launched in Performance Mode.
@@ -1008,13 +1028,97 @@ pub fn playlist_performance_audio_clip_indices(
         .collect())
 }
 
-/// Return supported Audio and Sampler Pattern Clips that can launch before the Start marker.
+fn playlist_performance_vst3_clip_candidates(
+    document: &FlpDocument,
+    arrangement_id: u16,
+    performance_zone_end_tick: u32,
+    loaded_vst3_channels: &BTreeSet<u16>,
+) -> Result<BTreeSet<usize>, String> {
+    if loaded_vst3_channels.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let arrangement = document
+        .arrangements()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|arrangement| arrangement.id == arrangement_id)
+        .ok_or_else(|| format!("arrangement {arrangement_id} was not found"))?;
+    let patterns = document
+        .patterns()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|pattern| (pattern.id, pattern))
+        .collect::<HashMap<_, _>>();
+    let channels = document
+        .channels()
+        .into_iter()
+        .map(|channel| (channel.id(), channel))
+        .collect::<HashMap<_, _>>();
+    let disabled_tracks = document
+        .playlist_tracks()
+        .into_iter()
+        .filter(|track| track.enabled == Some(false))
+        .map(|track| track.id)
+        .collect::<BTreeSet<_>>();
+    Ok(arrangement
+        .clips
+        .iter()
+        .enumerate()
+        .filter_map(|(index, clip)| {
+            let PlaylistClipTarget::Pattern { id } = clip.target() else {
+                return None;
+            };
+            let track_id = clip.playlist_track_id()?;
+            let pattern = patterns.get(&id)?;
+            let notes = pattern
+                .notes
+                .iter()
+                .filter(|note| !note.is_muted())
+                .collect::<Vec<_>>();
+            (clip.position_ticks < performance_zone_end_tick
+                && clip.length_ticks > 0
+                && !clip.is_muted()
+                && !disabled_tracks.contains(&track_id)
+                && clip
+                    .scale
+                    .is_none_or(|scale| scale.is_finite() && (scale - 1.0).abs() <= 1e-9)
+                && pattern.controllers.is_empty()
+                && !notes.is_empty()
+                && notes.iter().all(|note| {
+                    loaded_vst3_channels.contains(&note.channel_id)
+                        && channels.get(&note.channel_id).is_some_and(|channel| {
+                            channel.enabled() != Some(false)
+                                && channel.plugin_identifier().is_some()
+                        })
+                }))
+            .then_some(index)
+        })
+        .collect())
+}
+
+/// Return supported Audio and Sampler clips before Start.
 pub fn playlist_performance_clip_indices(
     document: &FlpDocument,
     arrangement_id: u16,
     performance_zone_end_tick: u32,
 ) -> Result<BTreeSet<usize>, String> {
-    let mut clip_indices = playlist_performance_sampler_clip_indices(
+    playlist_performance_clip_indices_with_vst3(
+        document,
+        arrangement_id,
+        performance_zone_end_tick,
+        &BTreeSet::new(),
+    )
+}
+
+/// Return supported Performance Mode clips, treating only loaded direct VST3 Pattern channels as
+/// launchable plugin sources.
+pub fn playlist_performance_clip_indices_with_vst3(
+    document: &FlpDocument,
+    arrangement_id: u16,
+    performance_zone_end_tick: u32,
+    loaded_vst3_channels: &BTreeSet<u16>,
+) -> Result<BTreeSet<usize>, String> {
+    let mut clip_indices = playlist_performance_sampler_clip_candidates(
         document,
         arrangement_id,
         performance_zone_end_tick,
@@ -1023,6 +1127,12 @@ pub fn playlist_performance_clip_indices(
         document,
         arrangement_id,
         performance_zone_end_tick,
+    )?);
+    clip_indices.extend(playlist_performance_vst3_clip_candidates(
+        document,
+        arrangement_id,
+        performance_zone_end_tick,
+        loaded_vst3_channels,
     )?);
     let arrangement = document
         .arrangements()
@@ -1058,6 +1168,63 @@ pub fn playlist_performance_clip_indices(
     Ok(clip_indices)
 }
 
+/// Return only VST3 Pattern Clips on tracks whose Performance Zone media is fully supported.
+pub fn playlist_performance_vst3_clip_indices(
+    document: &FlpDocument,
+    arrangement_id: u16,
+    performance_zone_end_tick: u32,
+    loaded_vst3_channels: &BTreeSet<u16>,
+) -> Result<BTreeSet<usize>, String> {
+    let candidates = playlist_performance_vst3_clip_candidates(
+        document,
+        arrangement_id,
+        performance_zone_end_tick,
+        loaded_vst3_channels,
+    )?;
+    let supported = playlist_performance_clip_indices_with_vst3(
+        document,
+        arrangement_id,
+        performance_zone_end_tick,
+        loaded_vst3_channels,
+    )?;
+    Ok(candidates.intersection(&supported).copied().collect())
+}
+
+/// Return direct VST3 channels referenced by eligible Performance Mode Pattern Clips.
+pub fn playlist_performance_vst3_channel_ids(
+    document: &FlpDocument,
+    arrangement_id: u16,
+    clip_indices: &BTreeSet<usize>,
+) -> Result<BTreeSet<u16>, String> {
+    let arrangement = document
+        .arrangements()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|arrangement| arrangement.id == arrangement_id)
+        .ok_or_else(|| format!("arrangement {arrangement_id} was not found"))?;
+    let patterns = document
+        .patterns()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|pattern| (pattern.id, pattern))
+        .collect::<HashMap<_, _>>();
+    Ok(clip_indices
+        .iter()
+        .filter_map(|clip_index| arrangement.clips.get(*clip_index))
+        .filter_map(|clip| match clip.target() {
+            PlaylistClipTarget::Pattern { id } => patterns.get(&id),
+            PlaylistClipTarget::Channel { .. } => None,
+        })
+        .flat_map(|pattern| {
+            pattern
+                .notes
+                .iter()
+                .filter(|note| !note.is_muted())
+                .map(|note| note.channel_id)
+        })
+        .collect())
+}
+
 /// Return a copy of an arrangement with supported Performance Zone clips removed from static
 /// playback. Other clips and tempo automation remain on the normal song timeline.
 pub fn playlist_performance_static_document(
@@ -1067,6 +1234,29 @@ pub fn playlist_performance_static_document(
 ) -> Result<(FlpDocument, BTreeSet<usize>), String> {
     let performance_clip_indices =
         playlist_performance_clip_indices(document, arrangement_id, performance_zone_end_tick)?;
+    let mut static_document = document.clone();
+    for clip_index in performance_clip_indices.iter().rev().copied() {
+        static_document
+            .delete_playlist_clip(arrangement_id, clip_index)
+            .map_err(|error| format!("could not isolate Performance Zone tracks: {error}"))?;
+    }
+    Ok((static_document, performance_clip_indices))
+}
+
+/// Return an arrangement with supported Sampler, Audio, and loaded VST3 Performance clips
+/// removed from static playback.
+pub fn playlist_performance_static_document_with_vst3(
+    document: &FlpDocument,
+    arrangement_id: u16,
+    performance_zone_end_tick: u32,
+    loaded_vst3_channels: &BTreeSet<u16>,
+) -> Result<(FlpDocument, BTreeSet<usize>), String> {
+    let performance_clip_indices = playlist_performance_clip_indices_with_vst3(
+        document,
+        arrangement_id,
+        performance_zone_end_tick,
+        loaded_vst3_channels,
+    )?;
     let mut static_document = document.clone();
     for clip_index in performance_clip_indices.iter().rev().copied() {
         static_document
@@ -1462,8 +1652,8 @@ pub fn stream_playlist_with_vst3_to_device_with_monitor(
 /// Stream arrangement audio while accepting quantized Audio and Sampler Clip launches.
 ///
 /// The arrangement must contain supported clips before the named Start marker. Launches replace
-/// content from the same Playlist track and repeat at the clip's tick length. VST3 Pattern Clip
-/// launching, scenes, and controller-driven launch remain unsupported.
+/// content from the same Playlist track and repeat at the clip's tick length. Loaded direct VST3
+/// Pattern channels can receive live clip launches alongside Sampler and Audio Clips.
 pub fn stream_playlist_performance_with_vst3_to_device(
     document: &FlpDocument,
     project_path: impl AsRef<Path>,
@@ -1474,15 +1664,21 @@ pub fn stream_playlist_performance_with_vst3_to_device(
     performance: PlaylistPerformanceStream,
 ) -> Result<PlaylistRenderSummary, String> {
     let project_path = project_path.as_ref();
-    let (static_document, performance_clip_indices) = playlist_performance_static_document(
-        document,
-        options.arrangement_id,
-        performance.performance_zone_end_tick,
-    )?;
+    let loaded_vst3_channels = vst3_processor
+        .as_ref()
+        .map(Vst3PlaylistStreamProcessor::performance_channel_ids)
+        .unwrap_or_default();
+    let (static_document, performance_clip_indices) =
+        playlist_performance_static_document_with_vst3(
+            document,
+            options.arrangement_id,
+            performance.performance_zone_end_tick,
+            &loaded_vst3_channels,
+        )?;
     if performance_clip_indices.is_empty() {
         return Err("arrangement has no supported clips before the Start marker".into());
     }
-    let mut performance_sampler_clip_indices = playlist_performance_sampler_clip_indices(
+    let mut performance_sampler_clip_indices = playlist_performance_sampler_clip_candidates(
         document,
         options.arrangement_id,
         performance.performance_zone_end_tick,
@@ -1494,6 +1690,13 @@ pub fn stream_playlist_performance_with_vst3_to_device(
     )?;
     performance_sampler_clip_indices.retain(|index| performance_clip_indices.contains(index));
     performance_audio_clip_indices.retain(|index| performance_clip_indices.contains(index));
+    let mut performance_vst3_clip_indices = playlist_performance_vst3_clip_indices(
+        document,
+        options.arrangement_id,
+        performance.performance_zone_end_tick,
+        &loaded_vst3_channels,
+    )?;
+    performance_vst3_clip_indices.retain(|index| performance_clip_indices.contains(index));
     let mut audio = prepare_audio_clip_render(
         document,
         project_path,
@@ -1521,6 +1724,8 @@ pub fn stream_playlist_performance_with_vst3_to_device(
         PlaylistPerformanceSources {
             sampler_clip_indices: &performance_sampler_clip_indices,
             audio_clip_indices: &performance_audio_clip_indices,
+            vst3_clip_indices: &performance_vst3_clip_indices,
+            vst3_channel_ids: &loaded_vst3_channels,
             sampler: &sampler,
             audio: &audio,
         },
@@ -1558,7 +1763,7 @@ pub fn stream_playlist_performance_with_vst3_to_device(
         .collect::<BTreeSet<_>>();
     source_paths.extend(sampler.source_paths.iter().cloned());
     let vst3_summary = vst3_processor.as_ref().map(|processor| processor.summary());
-    let summary = PlaylistRenderSummary {
+    let mut summary = PlaylistRenderSummary {
         frames: static_frames.max(vst3_summary.as_ref().map_or(0, |summary| summary.frames)),
         sample_rate: options.sample_rate,
         audio_clips_rendered: audio.summary.clips_rendered,
@@ -1600,6 +1805,9 @@ pub fn stream_playlist_performance_with_vst3_to_device(
             writer.write_stereo_samples(skip_render_block_prefix(block, &mut frames_to_skip))
         },
     )?;
+    if let Some(processor) = vst3_processor.as_ref() {
+        summary.vst3_notes_rendered = processor.summary().notes_scheduled;
+    }
     Ok(summary)
 }
 
@@ -3701,6 +3909,7 @@ fn stream_prepared_playlist_render_with_performance(
                         &audio_mix_context,
                         block,
                         meter_buses.as_deref_mut(),
+                        render.vst3_processor.as_deref_mut(),
                     )?;
                 }
                 let sampler_samples = &mut sampler_block[..sample_count];
@@ -5093,7 +5302,37 @@ struct PerformanceAudioClip {
     template: PreparedClip,
 }
 
+#[derive(Clone)]
+struct PerformanceVst3Clip {
+    track_id: u32,
+    source_start_tick: u32,
+    length_ticks: u64,
+    notes: Vec<PerformanceVst3Note>,
+}
+
+#[derive(Clone, Copy)]
+struct PerformanceVst3Note {
+    relative_start_tick: u64,
+    relative_stop_tick: u64,
+    channel_id: u16,
+    key: u16,
+    velocity: u8,
+    midi_channel: u8,
+    fine_pitch_offset_cents: i16,
+    pan: u8,
+    release: u8,
+}
+
 struct ActivePerformanceAudioClip {
+    clip_index: usize,
+    next_loop_tick: u64,
+    initial_offset_ticks: u64,
+    first_loop_end_tick: u64,
+    loop_period_ticks: u64,
+    first_pass_scheduled: bool,
+}
+
+struct ActivePerformanceVst3Clip {
     clip_index: usize,
     next_loop_tick: u64,
     initial_offset_ticks: u64,
@@ -5118,6 +5357,8 @@ enum PerformanceMotionPassAction {
 struct PlaylistPerformanceSources<'a> {
     sampler_clip_indices: &'a BTreeSet<usize>,
     audio_clip_indices: &'a BTreeSet<usize>,
+    vst3_clip_indices: &'a BTreeSet<usize>,
+    vst3_channel_ids: &'a BTreeSet<u16>,
     sampler: &'a PreparedSamplerArrangement,
     audio: &'a PreparedAudioClipRender,
 }
@@ -5140,8 +5381,10 @@ struct PlaylistPerformanceRuntime {
     signature_changes: Vec<(u32, u8, u8)>,
     clips_by_index: HashMap<usize, PerformanceSamplerClip>,
     audio_clips_by_index: HashMap<usize, PerformanceAudioClip>,
+    vst3_clips_by_index: HashMap<usize, PerformanceVst3Clip>,
     active_by_track: BTreeMap<u32, ActivePerformanceSamplerClip>,
     active_audio_by_track: BTreeMap<u32, ActivePerformanceAudioClip>,
+    active_vst3_by_track: BTreeMap<u32, ActivePerformanceVst3Clip>,
     active_audio_playbacks: Vec<PreparedClip>,
 }
 
@@ -5276,6 +5519,111 @@ impl PlaylistPerformanceRuntime {
                 },
             );
         }
+        let mut vst3_clips_by_index = HashMap::new();
+        if !sources.vst3_clip_indices.is_empty() {
+            let patterns = document.patterns().map_err(|error| error.to_string())?;
+            let channels = document.channels();
+            let channels_by_id = channels
+                .iter()
+                .map(|channel| (channel.id(), channel))
+                .collect::<HashMap<_, _>>();
+            let disabled_track_ids = document
+                .playlist_tracks()
+                .into_iter()
+                .filter(|track| track.enabled == Some(false))
+                .map(|track| track.id)
+                .collect::<BTreeSet<_>>();
+            let track_filter =
+                PlaylistTrackFilter::new(&disabled_track_ids, options.soloed_playlist_track_range);
+            let mixer_route_audibility = MixerRouteAudibility::from_document(document);
+            let schedule = schedule_playlist_pattern_notes(
+                &patterns,
+                &arrangement,
+                track_filter,
+                PlaylistPatternScheduleOptions {
+                    ppq: document.header().ppq(),
+                    global_swing_mix_raw: document.metadata().global_swing_mix(),
+                    play_truncated_notes_in_clips: document
+                        .project_settings()
+                        .is_none_or(|settings| settings.play_truncated_notes_in_clips),
+                },
+                |channel_id| {
+                    channels_by_id
+                        .get(&channel_id)
+                        .map_or(128, |channel| channel.swing_mix())
+                },
+                |channel_id, _, _| {
+                    if !sources.vst3_channel_ids.contains(&channel_id) {
+                        return Vec::new();
+                    }
+                    channels_by_id
+                        .get(&channel_id)
+                        .filter(|channel| {
+                            channel.enabled() != Some(false)
+                                && channel.plugin_identifier().is_some()
+                                && mixer_route_audibility.allows_channel(channel.mixer_track())
+                        })
+                        .map(|_| vec![channel_id])
+                        .unwrap_or_default()
+                },
+            )?;
+            let mut notes_by_clip = HashMap::<usize, Vec<PerformanceVst3Note>>::new();
+            for placed in schedule
+                .notes
+                .iter()
+                .filter(|placed| sources.vst3_clip_indices.contains(&placed.clip_index))
+            {
+                let Some(clip) = arrangement.clips.get(placed.clip_index) else {
+                    continue;
+                };
+                let source_start_tick = u64::from(clip.position_ticks);
+                let relative_start_tick = placed.start_tick.saturating_sub(source_start_tick);
+                let stop_tick = placed
+                    .stop_tick
+                    .unwrap_or_else(|| placed.start_tick.saturating_add(1));
+                let relative_stop_tick = stop_tick
+                    .saturating_sub(source_start_tick)
+                    .max(relative_start_tick.saturating_add(1));
+                notes_by_clip
+                    .entry(placed.clip_index)
+                    .or_default()
+                    .push(PerformanceVst3Note {
+                        relative_start_tick,
+                        relative_stop_tick,
+                        channel_id: placed.target_channel_id,
+                        key: placed.note.key,
+                        velocity: placed.note.velocity,
+                        midi_channel: placed.note.midi_channel,
+                        fine_pitch_offset_cents: placed.note.fine_pitch_offset_cents(),
+                        pan: placed.note.pan,
+                        release: placed.note.release,
+                    });
+            }
+            for &clip_index in sources.vst3_clip_indices {
+                let clip = arrangement.clips.get(clip_index).ok_or_else(|| {
+                    format!(
+                        "Performance VST3 Pattern Clip {} disappeared",
+                        clip_index + 1
+                    )
+                })?;
+                let track_id = clip.playlist_track_id().ok_or_else(|| {
+                    format!(
+                        "Performance VST3 Pattern Clip {} has no Playlist track",
+                        clip_index + 1
+                    )
+                })?;
+                let notes = notes_by_clip.remove(&clip_index).unwrap_or_default();
+                vst3_clips_by_index.insert(
+                    clip_index,
+                    PerformanceVst3Clip {
+                        track_id,
+                        source_start_tick: clip.position_ticks,
+                        length_ticks: u64::from(clip.length_ticks),
+                        notes,
+                    },
+                );
+            }
+        }
         let tracks = document.playlist_tracks_in_arrangement(options.arrangement_id);
         let motion_by_track = tracks
             .iter()
@@ -5327,6 +5675,19 @@ impl PlaylistPerformanceRuntime {
                             clip_index,
                         ))
                     }),
+            )
+            .chain(
+                vst3_clips_by_index
+                    .iter()
+                    .filter_map(|(&clip_index, clip)| {
+                        let playlist_clip = arrangement.clips.get(clip_index)?;
+                        Some((
+                            clip.track_id,
+                            clip.source_start_tick,
+                            playlist_clip.group,
+                            clip_index,
+                        ))
+                    }),
             );
         let (motion_clip_order_by_track, motion_group_clip_by_index) =
             performance_motion_clip_groups(
@@ -5360,8 +5721,10 @@ impl PlaylistPerformanceRuntime {
             signature_changes,
             clips_by_index,
             audio_clips_by_index,
+            vst3_clips_by_index,
             active_by_track: BTreeMap::new(),
             active_audio_by_track: BTreeMap::new(),
+            active_vst3_by_track: BTreeMap::new(),
             active_audio_playbacks: Vec::new(),
         })
     }
@@ -5375,6 +5738,11 @@ impl PlaylistPerformanceRuntime {
                     .get(&track_id)
                     .map(|active| active.clip_index)
             })
+            .or_else(|| {
+                self.active_vst3_by_track
+                    .get(&track_id)
+                    .map(|active| active.clip_index)
+            })
     }
 
     fn cancel_pending_track_launches_from(&mut self, track_id: u32, start_frame: u64) {
@@ -5384,6 +5752,11 @@ impl PlaylistPerformanceRuntime {
             .map(|(clip_index, clip)| (*clip_index, clip.track_id))
             .chain(
                 self.audio_clips_by_index
+                    .iter()
+                    .map(|(clip_index, clip)| (*clip_index, clip.track_id)),
+            )
+            .chain(
+                self.vst3_clips_by_index
                     .iter()
                     .map(|(clip_index, clip)| (*clip_index, clip.track_id)),
             )
@@ -5418,6 +5791,7 @@ impl PlaylistPerformanceRuntime {
         audio_context: &PreparedAudioClipMixContext<'_>,
         audio_output: &mut [f32],
         meter_buses: Option<&mut [f32]>,
+        mut vst3_processor: Option<&mut Vst3PlaylistStreamProcessor>,
     ) -> Result<(), String> {
         while let Ok(launch) = self.launches.try_recv() {
             self.pending_commands.push(launch);
@@ -5457,9 +5831,18 @@ impl PlaylistPerformanceRuntime {
                         self.active_clip_index_on_track(track_id),
                         launch.clip_index,
                     ) {
-                        self.stop_track_at(track_id, launch.start_frame, sampler_engine);
+                        self.stop_track_at(
+                            track_id,
+                            launch.start_frame,
+                            sampler_engine,
+                            vst3_processor.as_deref_mut(),
+                        )?;
                     } else {
-                        self.activate_launch(launch, sampler_engine)?;
+                        self.activate_launch(
+                            launch,
+                            sampler_engine,
+                            vst3_processor.as_deref_mut(),
+                        )?;
                     }
                 }
                 PlaylistPerformanceCommand::Enqueue(launch) => {
@@ -5485,7 +5868,12 @@ impl PlaylistPerformanceRuntime {
                         launch.clip_index,
                     ) {
                         self.queued_by_track.remove(&track_id);
-                        self.stop_track_at(track_id, launch.start_frame, sampler_engine);
+                        self.stop_track_at(
+                            track_id,
+                            launch.start_frame,
+                            sampler_engine,
+                            vst3_processor.as_deref_mut(),
+                        )?;
                     } else if active_clip_index.is_some() {
                         self.queued_by_track
                             .entry(track_id)
@@ -5493,7 +5881,11 @@ impl PlaylistPerformanceRuntime {
                             .push_back(launch);
                     } else {
                         let launch = self.launch_with_position_at(launch, launch.start_tick)?;
-                        self.activate_launch(launch, sampler_engine)?;
+                        self.activate_launch(
+                            launch,
+                            sampler_engine,
+                            vst3_processor.as_deref_mut(),
+                        )?;
                     }
                 }
                 PlaylistPerformanceCommand::AdvanceMotion {
@@ -5547,7 +5939,12 @@ impl PlaylistPerformanceRuntime {
                     self.queued_by_track.remove(&track_id);
                     stopped_tracks_in_block.insert(track_id, start_frame);
                     let PerformanceMotionReleaseStep::Launch(next_clip_index) = step else {
-                        self.stop_track_at(track_id, start_frame, sampler_engine);
+                        self.stop_track_at(
+                            track_id,
+                            start_frame,
+                            sampler_engine,
+                            vst3_processor.as_deref_mut(),
+                        )?;
                         continue;
                     };
                     let launch = self.launch_with_position_at(
@@ -5559,7 +5956,7 @@ impl PlaylistPerformanceRuntime {
                         },
                         start_tick,
                     )?;
-                    self.activate_launch(launch, sampler_engine)?;
+                    self.activate_launch(launch, sampler_engine, vst3_processor.as_deref_mut())?;
                 }
                 PlaylistPerformanceCommand::StopTrack {
                     track_id,
@@ -5575,7 +5972,12 @@ impl PlaylistPerformanceRuntime {
                     }
                     self.queued_by_track.remove(&track_id);
                     self.cancel_pending_track_launches_from(track_id, start_frame);
-                    self.stop_track_at(track_id, start_frame, sampler_engine);
+                    self.stop_track_at(
+                        track_id,
+                        start_frame,
+                        sampler_engine,
+                        vst3_processor.as_deref_mut(),
+                    )?;
                     stopped_tracks_in_block.insert(track_id, start_frame);
                 }
             }
@@ -5584,8 +5986,17 @@ impl PlaylistPerformanceRuntime {
         let horizon_frame = block_start
             .saturating_add(frame_count as u64)
             .saturating_add(u64::from(self.sample_rate));
-        self.apply_queued_transitions(horizon_frame, sampler_engine)?;
-        self.apply_automatic_motion_transitions(block_start, horizon_frame, sampler_engine)?;
+        self.apply_queued_transitions(
+            horizon_frame,
+            sampler_engine,
+            vst3_processor.as_deref_mut(),
+        )?;
+        self.apply_automatic_motion_transitions(
+            block_start,
+            horizon_frame,
+            sampler_engine,
+            vst3_processor.as_deref_mut(),
+        )?;
         let motion_group_clip_by_index = &self.motion_group_clip_by_index;
         let mut queued_notes = Vec::new();
         for active in self.active_by_track.values_mut() {
@@ -5781,6 +6192,116 @@ impl PlaylistPerformanceRuntime {
                 }
             }
         }
+        let mut vst3_notes_by_track_and_channel =
+            BTreeMap::<(u32, u16), Vec<PlaylistMidiNote>>::new();
+        for (&track_id, active) in &mut self.active_vst3_by_track {
+            let clip = self
+                .vst3_clips_by_index
+                .get(&active.clip_index)
+                .ok_or_else(|| "active Performance Mode VST3 clip disappeared".to_owned())?;
+            let motion_clip_index = self
+                .motion_group_clip_by_index
+                .get(&active.clip_index)
+                .copied()
+                .unwrap_or(active.clip_index);
+            let pass_action = performance_motion_pass_action(
+                self.motion_by_track.get(&track_id).copied().flatten(),
+                self.press_by_track.get(&track_id).copied().flatten(),
+                motion_clip_index,
+                self.motion_clip_order_by_track
+                    .get(&track_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default(),
+            );
+            let single_pass = pass_action != PerformanceMotionPassAction::Loop;
+            if single_pass && active.first_pass_scheduled {
+                continue;
+            }
+            loop {
+                let loop_offset_ticks = active.initial_offset_ticks.min(clip.length_ticks);
+                let loop_length_ticks = clip.length_ticks.saturating_sub(loop_offset_ticks);
+                if loop_length_ticks == 0 {
+                    active.initial_offset_ticks = 0;
+                    continue;
+                }
+                let loop_end_tick = active
+                    .next_loop_tick
+                    .checked_add(loop_length_ticks)
+                    .ok_or_else(|| "Performance Mode VST3 loop tick overflow".to_owned())?;
+                let loop_start_frame = self
+                    .tempo_map
+                    .frame_at_tick(active.next_loop_tick, self.sample_rate)?;
+                if loop_start_frame > horizon_frame {
+                    break;
+                }
+                let loop_end_frame = self
+                    .tempo_map
+                    .frame_at_tick(loop_end_tick, self.sample_rate)?;
+                for template in &clip.notes {
+                    let (relative_start_tick, relative_stop_tick) = if loop_offset_ticks == 0 {
+                        (template.relative_start_tick, template.relative_stop_tick)
+                    } else if template.relative_start_tick >= loop_offset_ticks {
+                        (
+                            template.relative_start_tick - loop_offset_ticks,
+                            template
+                                .relative_stop_tick
+                                .saturating_sub(loop_offset_ticks),
+                        )
+                    } else if template.relative_stop_tick > loop_offset_ticks {
+                        (0, template.relative_stop_tick - loop_offset_ticks)
+                    } else {
+                        continue;
+                    };
+                    if single_pass && relative_start_tick >= loop_length_ticks {
+                        continue;
+                    }
+                    let start_tick = active
+                        .next_loop_tick
+                        .checked_add(relative_start_tick)
+                        .ok_or_else(|| "Performance Mode VST3 note start overflow".to_owned())?;
+                    let mut stop_tick = active
+                        .next_loop_tick
+                        .checked_add(relative_stop_tick)
+                        .ok_or_else(|| "Performance Mode VST3 note end overflow".to_owned())?;
+                    let start_frame = self.tempo_map.frame_at_tick(start_tick, self.sample_rate)?;
+                    if single_pass {
+                        if start_frame >= loop_end_frame {
+                            continue;
+                        }
+                        stop_tick = stop_tick
+                            .min(loop_end_tick)
+                            .max(start_tick.saturating_add(1));
+                    }
+                    vst3_notes_by_track_and_channel
+                        .entry((track_id, template.channel_id))
+                        .or_default()
+                        .push(PlaylistMidiNote {
+                            start_tick,
+                            stop_tick: stop_tick.max(start_tick.saturating_add(1)),
+                            key: template.key,
+                            velocity: template.velocity,
+                            midi_channel: template.midi_channel,
+                            fine_pitch_offset_cents: template.fine_pitch_offset_cents,
+                            pan: template.pan,
+                            release: template.release,
+                        });
+                }
+                active.next_loop_tick = loop_end_tick;
+                active.initial_offset_ticks = 0;
+                if single_pass {
+                    active.first_pass_scheduled = true;
+                    break;
+                }
+            }
+        }
+        if !vst3_notes_by_track_and_channel.is_empty() {
+            let processor = vst3_processor
+                .as_deref_mut()
+                .ok_or_else(|| "VST3 Performance Mode processor is unavailable".to_owned())?;
+            for ((track_id, channel_id), notes) in vst3_notes_by_track_and_channel {
+                processor.schedule_performance_notes(track_id, channel_id, &notes)?;
+            }
+        }
         let mut completed_stop_tracks = Vec::new();
         for (&track_id, active) in &self.active_by_track {
             let motion_clip_index = self
@@ -5830,9 +6351,34 @@ impl PlaylistPerformanceRuntime {
                 completed_stop_tracks.push(track_id);
             }
         }
+        for (&track_id, active) in &self.active_vst3_by_track {
+            let motion_clip_index = self
+                .motion_group_clip_by_index
+                .get(&active.clip_index)
+                .copied()
+                .unwrap_or(active.clip_index);
+            if performance_motion_pass_action(
+                self.motion_by_track.get(&track_id).copied().flatten(),
+                self.press_by_track.get(&track_id).copied().flatten(),
+                motion_clip_index,
+                self.motion_clip_order_by_track
+                    .get(&track_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default(),
+            ) == PerformanceMotionPassAction::Stop
+                && active.first_pass_scheduled
+                && self
+                    .tempo_map
+                    .frame_at_tick(active.first_loop_end_tick, self.sample_rate)?
+                    <= block_end
+            {
+                completed_stop_tracks.push(track_id);
+            }
+        }
         for track_id in completed_stop_tracks {
             self.active_by_track.remove(&track_id);
             self.active_audio_by_track.remove(&track_id);
+            self.active_vst3_by_track.remove(&track_id);
         }
         self.active_audio_playbacks
             .retain(|clip| clip.start_frame.saturating_add(clip.duration_frames) > block_start);
@@ -5873,6 +6419,11 @@ impl PlaylistPerformanceRuntime {
                     .get(&clip_index)
                     .map(|clip| clip.track_id)
             })
+            .or_else(|| {
+                self.vst3_clips_by_index
+                    .get(&clip_index)
+                    .map(|clip| clip.track_id)
+            })
             .ok_or_else(|| {
                 format!(
                     "Playlist Clip {} is not supported in Performance Mode",
@@ -5885,12 +6436,16 @@ impl PlaylistPerformanceRuntime {
         &mut self,
         launch: PlaylistPerformanceLaunch,
         sampler_engine: &mut SamplerVoiceEngine<'_>,
+        vst3_processor: Option<&mut Vst3PlaylistStreamProcessor>,
     ) -> Result<(), String> {
         let is_sampler_clip = self.clips_by_index.contains_key(&launch.clip_index);
+        let is_audio_clip = self.audio_clips_by_index.contains_key(&launch.clip_index);
         let (track_id, length_ticks) =
             if let Some(clip) = self.clips_by_index.get(&launch.clip_index) {
                 (clip.track_id, clip.length_ticks)
             } else if let Some(clip) = self.audio_clips_by_index.get(&launch.clip_index) {
+                (clip.track_id, clip.length_ticks)
+            } else if let Some(clip) = self.vst3_clips_by_index.get(&launch.clip_index) {
                 (clip.track_id, clip.length_ticks)
             } else {
                 return Err(format!(
@@ -5908,7 +6463,7 @@ impl PlaylistPerformanceRuntime {
             .start_tick
             .checked_add(first_loop_length)
             .ok_or_else(|| "Performance Mode loop tick overflow".to_owned())?;
-        self.stop_track_at(track_id, launch.start_frame, sampler_engine);
+        self.stop_track_at(track_id, launch.start_frame, sampler_engine, vst3_processor)?;
         if is_sampler_clip {
             self.active_by_track.insert(
                 track_id,
@@ -5921,10 +6476,22 @@ impl PlaylistPerformanceRuntime {
                     first_pass_scheduled: false,
                 },
             );
-        } else {
+        } else if is_audio_clip {
             self.active_audio_by_track.insert(
                 track_id,
                 ActivePerformanceAudioClip {
+                    clip_index: launch.clip_index,
+                    next_loop_tick: launch.start_tick,
+                    initial_offset_ticks: launch.position_offset_ticks,
+                    first_loop_end_tick,
+                    loop_period_ticks: length_ticks,
+                    first_pass_scheduled: false,
+                },
+            );
+        } else {
+            self.active_vst3_by_track.insert(
+                track_id,
+                ActivePerformanceVst3Clip {
                     clip_index: launch.clip_index,
                     next_loop_tick: launch.start_tick,
                     initial_offset_ticks: launch.position_offset_ticks,
@@ -5946,6 +6513,8 @@ impl PlaylistPerformanceRuntime {
             if let Some(clip) = self.clips_by_index.get(&launch.clip_index) {
                 (clip.track_id, clip.source_start_tick, clip.length_ticks)
             } else if let Some(clip) = self.audio_clips_by_index.get(&launch.clip_index) {
+                (clip.track_id, clip.source_start_tick, clip.length_ticks)
+            } else if let Some(clip) = self.vst3_clips_by_index.get(&launch.clip_index) {
                 (clip.track_id, clip.source_start_tick, clip.length_ticks)
             } else {
                 return Err(format!(
@@ -5974,6 +6543,7 @@ impl PlaylistPerformanceRuntime {
         &mut self,
         horizon_frame: u64,
         sampler_engine: &mut SamplerVoiceEngine<'_>,
+        mut vst3_processor: Option<&mut Vst3PlaylistStreamProcessor>,
     ) -> Result<(), String> {
         let track_ids = self.queued_by_track.keys().copied().collect::<Vec<_>>();
         for track_id in track_ids {
@@ -5995,6 +6565,15 @@ impl PlaylistPerformanceRuntime {
                     })
                     .or_else(|| {
                         self.active_audio_by_track.get(&track_id).map(|active| {
+                            (
+                                active.clip_index,
+                                active.first_loop_end_tick,
+                                active.loop_period_ticks,
+                            )
+                        })
+                    })
+                    .or_else(|| {
+                        self.active_vst3_by_track.get(&track_id).map(|active| {
                             (
                                 active.clip_index,
                                 active.first_loop_end_tick,
@@ -6043,7 +6622,7 @@ impl PlaylistPerformanceRuntime {
                 queued_launch.start_tick = boundary_tick;
                 queued_launch.start_frame = start_frame;
                 queued_launch = self.launch_with_position_at(queued_launch, boundary_tick)?;
-                self.activate_launch(queued_launch, sampler_engine)?;
+                self.activate_launch(queued_launch, sampler_engine, vst3_processor.as_deref_mut())?;
             }
             if self
                 .queued_by_track
@@ -6061,11 +6640,13 @@ impl PlaylistPerformanceRuntime {
         block_start: u64,
         horizon_frame: u64,
         sampler_engine: &mut SamplerVoiceEngine<'_>,
+        mut vst3_processor: Option<&mut Vst3PlaylistStreamProcessor>,
     ) -> Result<(), String> {
         let track_ids = self
             .active_by_track
             .keys()
             .chain(self.active_audio_by_track.keys())
+            .chain(self.active_vst3_by_track.keys())
             .copied()
             .collect::<BTreeSet<_>>();
         for track_id in track_ids {
@@ -6081,6 +6662,15 @@ impl PlaylistPerformanceRuntime {
                 })
                 .or_else(|| {
                     self.active_audio_by_track.get(&track_id).map(|active| {
+                        (
+                            active.clip_index,
+                            active.first_loop_end_tick,
+                            active.first_pass_scheduled,
+                        )
+                    })
+                })
+                .or_else(|| {
+                    self.active_vst3_by_track.get(&track_id).map(|active| {
                         (
                             active.clip_index,
                             active.first_loop_end_tick,
@@ -6149,10 +6739,15 @@ impl PlaylistPerformanceRuntime {
                         },
                         start_tick,
                     )?;
-                    self.activate_launch(launch, sampler_engine)?;
+                    self.activate_launch(launch, sampler_engine, vst3_processor.as_deref_mut())?;
                 }
                 Some(PerformanceMotionReleaseStep::Stop) => {
-                    self.stop_track_at(track_id, start_frame, sampler_engine);
+                    self.stop_track_at(
+                        track_id,
+                        start_frame,
+                        sampler_engine,
+                        vst3_processor.as_deref_mut(),
+                    )?;
                 }
                 None => {}
             }
@@ -6180,12 +6775,18 @@ impl PlaylistPerformanceRuntime {
         track_id: u32,
         stop_frame: u64,
         sampler_engine: &mut SamplerVoiceEngine<'_>,
-    ) {
+        vst3_processor: Option<&mut Vst3PlaylistStreamProcessor>,
+    ) -> Result<(), String> {
         sampler_engine.remove_queued_track_notes_from(track_id, stop_frame);
         sampler_engine.release_track_at(track_id, stop_frame);
         self.active_by_track.remove(&track_id);
         self.active_audio_by_track.remove(&track_id);
+        self.active_vst3_by_track.remove(&track_id);
         self.stop_audio_track_at(track_id, stop_frame);
+        if let Some(processor) = vst3_processor {
+            processor.stop_performance_track(track_id, stop_frame)?;
+        }
+        Ok(())
     }
 }
 

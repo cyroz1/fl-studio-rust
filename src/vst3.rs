@@ -4,7 +4,7 @@
 //! while preserving their complete raw bytes. This runtime does not translate
 //! Image-Line's FLP state envelope into the state stream expected by every VST3.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -57,6 +57,7 @@ struct ScheduledMidiEvent {
     note_id: i32,
     note_pan: u8,
     note_release: u8,
+    performance_track_id: Option<u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -201,15 +202,15 @@ pub struct Vst3PlaylistRenderSummary {
 }
 
 #[derive(Clone, Copy)]
-struct PlaylistMidiNote {
-    start_tick: u64,
-    stop_tick: u64,
-    key: u16,
-    velocity: u8,
-    midi_channel: u8,
-    fine_pitch_offset_cents: i16,
-    pan: u8,
-    release: u8,
+pub(crate) struct PlaylistMidiNote {
+    pub(crate) start_tick: u64,
+    pub(crate) stop_tick: u64,
+    pub(crate) key: u16,
+    pub(crate) velocity: u8,
+    pub(crate) midi_channel: u8,
+    pub(crate) fine_pitch_offset_cents: i16,
+    pub(crate) pan: u8,
+    pub(crate) release: u8,
 }
 
 struct PlaylistPluginStream {
@@ -228,12 +229,16 @@ struct PlaylistPluginStream {
     right_pan_gain: f32,
     mixer_transform: MixerSourceRouteTransform,
     mixer_meter_transforms: Vec<(usize, MixerSourceRouteTransform)>,
+    live_performance: bool,
+    active_performance_notes: HashMap<i32, ScheduledMidiEvent>,
+    note_pitch_offset_semitones: i16,
 }
 
 /// Prepared VST3 instrument channels for blockwise Playlist Song transport.
 /// The instances are the same objects used by the open editors.
 pub struct Vst3PlaylistStreamProcessor {
     streams: Vec<PlaylistPluginStream>,
+    tempo_map: PlaylistTempoMap,
     output_sample_rate: u32,
     content_frames: u64,
     output_frames: u64,
@@ -244,6 +249,118 @@ pub struct Vst3PlaylistStreamProcessor {
 }
 
 impl Vst3PlaylistStreamProcessor {
+    pub(crate) fn performance_channel_ids(&self) -> BTreeSet<u16> {
+        self.streams
+            .iter()
+            .filter(|stream| stream.live_performance)
+            .map(|stream| stream.channel_id)
+            .collect()
+    }
+
+    pub(crate) fn schedule_performance_notes(
+        &mut self,
+        track_id: u32,
+        channel_id: u16,
+        notes: &[PlaylistMidiNote],
+    ) -> Result<usize, String> {
+        if notes.is_empty() {
+            return Ok(0);
+        }
+        let stream = self
+            .streams
+            .iter_mut()
+            .find(|stream| stream.channel_id == channel_id && stream.live_performance)
+            .ok_or_else(|| {
+                format!("VST3 channel {channel_id} is not available for Performance Mode launches")
+            })?;
+        let (mut events, note_count) = scheduled_playlist_midi_events_with_tempo_map(
+            notes,
+            &self.tempo_map,
+            stream.render.sample_rate,
+        )?;
+        transpose_scheduled_note_events(&mut events, stream.note_pitch_offset_semitones);
+        for event in &mut events {
+            event.performance_track_id = Some(track_id);
+        }
+        let mut pending_events = stream.render.events.split_off(stream.next_event);
+        pending_events.extend(events);
+        pending_events.sort_by_key(|event| (event.frame, event.priority));
+        stream.render.events.extend(pending_events);
+        self.notes_scheduled = self.notes_scheduled.saturating_add(note_count);
+        Ok(note_count)
+    }
+
+    pub(crate) fn stop_performance_track(
+        &mut self,
+        track_id: u32,
+        stop_frame: u64,
+    ) -> Result<(), String> {
+        for stream in &mut self.streams {
+            if !stream.live_performance {
+                continue;
+            }
+            let stop_source_frame = (stop_frame as f64 * f64::from(stream.render.sample_rate)
+                / f64::from(self.output_sample_rate))
+            .round();
+            if !stop_source_frame.is_finite() || stop_source_frame > u64::MAX as f64 {
+                return Err("VST3 Performance Mode stop is outside the renderable range".into());
+            }
+            let stop_source_frame = stop_source_frame as u64;
+            let next_event = stream.next_event;
+            let pending_events = &stream.render.events[next_event..];
+            let mut notes_to_stop = stream
+                .active_performance_notes
+                .iter()
+                .filter(|(_, event)| event.performance_track_id == Some(track_id))
+                .map(|(&note_id, &event)| (note_id, event))
+                .collect::<HashMap<_, _>>();
+            for event in pending_events.iter().filter(|event| {
+                event.performance_track_id == Some(track_id)
+                    && event.frame < stop_source_frame
+                    && matches!(event.event, MidiEvent::NoteOn { .. })
+            }) {
+                notes_to_stop.entry(event.note_id).or_insert(*event);
+            }
+            let note_offs = notes_to_stop
+                .into_iter()
+                .filter(|(note_id, _)| {
+                    !pending_events.iter().any(|event| {
+                        event.performance_track_id == Some(track_id)
+                            && event.note_id == *note_id
+                            && event.frame < stop_source_frame
+                            && matches!(event.event, MidiEvent::NoteOff { .. })
+                    })
+                })
+                .filter_map(|(_, event)| {
+                    let MidiEvent::NoteOn { channel, note, .. } = event.event else {
+                        return None;
+                    };
+                    Some(ScheduledMidiEvent {
+                        frame: stop_source_frame,
+                        priority: 0,
+                        event: MidiEvent::NoteOff {
+                            channel,
+                            note,
+                            velocity: 0,
+                        },
+                        performance_track_id: Some(track_id),
+                        ..event
+                    })
+                })
+                .collect::<Vec<_>>();
+            stream.render.events[next_event..].retain(|event| {
+                event.performance_track_id != Some(track_id) || event.frame < stop_source_frame
+            });
+            if !note_offs.is_empty() {
+                let mut pending_events = stream.render.events.split_off(stream.next_event);
+                pending_events.extend(note_offs);
+                pending_events.sort_by_key(|event| (event.frame, event.priority));
+                stream.render.events.extend(pending_events);
+            }
+        }
+        Ok(())
+    }
+
     pub fn summary(&self) -> Vst3PlaylistRenderSummary {
         Vst3PlaylistRenderSummary {
             plugin_channels_rendered: self.streams.len(),
@@ -476,9 +593,13 @@ impl PlaylistPluginStream {
             .try_reserve(output_samples)
             .map_err(|error| format!("could not allocate VST3 Playlist output: {error}"))?;
         while self.pending_output.len() < frame_count && !self.resampler_finished {
-            if self.source_frame < self.render.total_frames {
-                let source_count = (self.render.total_frames - self.source_frame)
-                    .min(self.render.block_size as u64) as usize;
+            if self.live_performance || self.source_frame < self.render.total_frames {
+                let source_count = if self.live_performance {
+                    self.render.block_size
+                } else {
+                    (self.render.total_frames - self.source_frame)
+                        .min(self.render.block_size as u64) as usize
+                };
                 let block_end = self.source_frame + source_count as u64;
                 let mut buffers = AudioBuffers::new(
                     0,
@@ -500,6 +621,7 @@ impl PlaylistPluginStream {
                     while let Some(event) = self.render.events.get(self.next_event)
                         && event.frame < block_end
                     {
+                        let event = *event;
                         let offset = event.frame.saturating_sub(self.source_frame) as i32;
                         send_scheduled_midi_event(
                             &mut plugin,
@@ -514,7 +636,22 @@ impl PlaylistPluginStream {
                                 supports_pan: self.render.supports_note_pan,
                             },
                         )?;
+                        if event.performance_track_id.is_some() {
+                            match event.event {
+                                MidiEvent::NoteOn { .. } => {
+                                    self.active_performance_notes.insert(event.note_id, event);
+                                }
+                                MidiEvent::NoteOff { .. } => {
+                                    self.active_performance_notes.remove(&event.note_id);
+                                }
+                                _ => {}
+                            }
+                        }
                         self.next_event += 1;
+                    }
+                    if self.next_event > 4096 {
+                        self.render.events.drain(..self.next_event);
+                        self.next_event = 0;
                     }
                     crate::audio::enable_denormal_protection();
                     plugin
@@ -1321,6 +1458,42 @@ impl Vst3HostRuntime {
         channel_instances: &BTreeMap<u16, u64>,
         include_plugin_reported_tails: bool,
     ) -> Result<Vst3PlaylistStreamProcessor, String> {
+        self.prepare_playlist_stream_inner(
+            document,
+            options,
+            channel_instances,
+            include_plugin_reported_tails,
+            &BTreeSet::new(),
+        )
+    }
+
+    /// Prepare loaded VST3 channels for both static Playlist notes and live Performance Mode
+    /// Pattern Clip launches.
+    pub fn prepare_playlist_performance_stream(
+        &self,
+        document: &FlpDocument,
+        options: PlaylistRenderOptions,
+        channel_instances: &BTreeMap<u16, u64>,
+        live_performance_channels: &BTreeSet<u16>,
+        include_plugin_reported_tails: bool,
+    ) -> Result<Vst3PlaylistStreamProcessor, String> {
+        self.prepare_playlist_stream_inner(
+            document,
+            options,
+            channel_instances,
+            include_plugin_reported_tails,
+            live_performance_channels,
+        )
+    }
+
+    fn prepare_playlist_stream_inner(
+        &self,
+        document: &FlpDocument,
+        options: PlaylistRenderOptions,
+        channel_instances: &BTreeMap<u16, u64>,
+        include_plugin_reported_tails: bool,
+        live_performance_channels: &BTreeSet<u16>,
+    ) -> Result<Vst3PlaylistStreamProcessor, String> {
         let arrangement_id = options.arrangement_id;
         let output_sample_rate = options.sample_rate;
         let tail_seconds = f64::from(options.tail_seconds);
@@ -1428,6 +1601,12 @@ impl Vst3HostRuntime {
                     release: note.release,
                 });
         }
+        for &channel_id in live_performance_channels {
+            if channel_instances.contains_key(&channel_id) && plugin_channels.contains(&channel_id)
+            {
+                notes_by_channel.entry(channel_id).or_default();
+            }
+        }
 
         let clip_end_tick = arrangement.clips.iter().fold(0u64, |end, clip| {
             end.max(u64::from(clip.position_ticks) + u64::from(clip.length_ticks))
@@ -1514,6 +1693,7 @@ impl Vst3HostRuntime {
                     source_frames as u64,
                     pitch_offset_cents,
                     note_pitch_offset_semitones,
+                    live_performance_channels.contains(&channel_id),
                 )?;
                 (render, latency_frames)
             };
@@ -1537,6 +1717,9 @@ impl Vst3HostRuntime {
                 right_pan_gain,
                 mixer_transform,
                 mixer_meter_transforms,
+                live_performance: live_performance_channels.contains(&channel_id),
+                active_performance_notes: HashMap::new(),
+                note_pitch_offset_semitones,
             });
         }
         if streams.is_empty() {
@@ -1557,6 +1740,7 @@ impl Vst3HostRuntime {
         let (maximum_latency_frames, _) = plan_pdc_delays(&stream_latencies);
         let mut processor = Vst3PlaylistStreamProcessor {
             streams,
+            tempo_map,
             output_sample_rate,
             content_frames: output_frames,
             output_frames,
@@ -1620,8 +1804,9 @@ fn prepare_playlist_pattern_render(
     total_frames: u64,
     pitch_offset_cents: i16,
     note_pitch_offset_semitones: i16,
+    allow_empty_notes: bool,
 ) -> Result<PreparedPatternRender, String> {
-    if notes.is_empty() {
+    if notes.is_empty() && !allow_empty_notes {
         return Err("VST3 Playlist channel has no notes to render".to_owned());
     }
     let sample_rate = plugin.sample_rate();
@@ -1646,11 +1831,7 @@ fn prepare_playlist_pattern_render(
         scheduled_playlist_midi_events_with_tempo_map(notes, tempo_map, sample_rate)?;
     transpose_scheduled_note_events(&mut events, note_pitch_offset_semitones);
     let supports_note_pan = plugin_supports_note_pan(plugin);
-    let last_event_frame = events
-        .iter()
-        .map(|event| event.frame)
-        .max()
-        .ok_or_else(|| "VST3 Playlist channel has no renderable notes".to_owned())?;
+    let last_event_frame = events.iter().map(|event| event.frame).max().unwrap_or(0);
     Ok(PreparedPatternRender {
         events,
         parameter_automation: Vec::new(),
@@ -1740,6 +1921,7 @@ fn scheduled_playlist_midi_events_with_tempo_map(
             note_id,
             note_pan: note.pan,
             note_release: note.release,
+            performance_track_id: None,
         });
         events.push(ScheduledMidiEvent {
             frame: end_frame,
@@ -1753,6 +1935,7 @@ fn scheduled_playlist_midi_events_with_tempo_map(
             note_id,
             note_pan: note.pan,
             note_release: note.release,
+            performance_track_id: None,
         });
         note_count += 1;
     }
@@ -2615,6 +2798,7 @@ fn scheduled_pattern_events(
             note_id,
             note_pan: note.pan,
             note_release: note.release,
+            performance_track_id: None,
         });
         events.push(ScheduledMidiEvent {
             frame: end_frame as u64,
@@ -2628,6 +2812,7 @@ fn scheduled_pattern_events(
             note_id,
             note_pan: note.pan,
             note_release: note.release,
+            performance_track_id: None,
         });
         note_count += 1;
     }

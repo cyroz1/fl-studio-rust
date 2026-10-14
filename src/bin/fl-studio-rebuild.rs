@@ -32,8 +32,9 @@ use flp_rebuild::sample_render::{
     PlaylistPerformanceCommand, PlaylistPerformanceLaunch, PlaylistPerformanceStream,
     PlaylistRenderOptions, PlaylistRenderRange, PlaylistRenderSummary, PlaylistStreamMonitor,
     PlaylistTempoMap, ResamplingQuality, SamplerPatternRenderOptions, SamplerPatternRenderSummary,
-    WavChannelMode, WavDitherMode, WavSampleFormat, playlist_performance_clip_indices,
-    playlist_performance_static_document, render_audio_clips_to_file,
+    WavChannelMode, WavDitherMode, WavSampleFormat, playlist_performance_clip_indices_with_vst3,
+    playlist_performance_static_document_with_vst3, playlist_performance_vst3_channel_ids,
+    playlist_performance_vst3_clip_indices, render_audio_clips_to_file,
     render_playlist_mixer_stems_with_vst3_cancellable,
     render_playlist_with_vst3_to_file_from_frame_cancellable,
     render_playlist_with_vst3_to_flac_cancellable, render_playlist_with_vst3_to_mp3_cancellable,
@@ -7576,6 +7577,25 @@ impl DawUi {
         Some((command, target_tick, queue_launch, clip_position_sync_label))
     }
 
+    fn performance_supported_clip_indices(
+        &self,
+        document: &FlpDocument,
+        arrangement_id: u16,
+        performance_zone_end_tick: u32,
+    ) -> Result<BTreeSet<usize>, String> {
+        let loaded_vst3_channels = self
+            .channel_vst3_instances
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        playlist_performance_clip_indices_with_vst3(
+            document,
+            arrangement_id,
+            performance_zone_end_tick,
+            &loaded_vst3_channels,
+        )
+    }
+
     fn queue_performance_hold_release(
         &mut self,
         arrangement_id: u16,
@@ -7882,9 +7902,11 @@ impl DawUi {
         else {
             return;
         };
-        let Ok(supported_clip_indices) =
-            playlist_performance_clip_indices(document, arrangement.id, performance_zone_end_tick)
-        else {
+        let Ok(supported_clip_indices) = self.performance_supported_clip_indices(
+            document,
+            arrangement.id,
+            performance_zone_end_tick,
+        ) else {
             return;
         };
         let mut tracks = document.playlist_tracks_in_arrangement(arrangement.id);
@@ -8067,9 +8089,11 @@ impl DawUi {
         else {
             return;
         };
-        let Ok(supported_clip_indices) =
-            playlist_performance_clip_indices(document, arrangement.id, performance_zone_end_tick)
-        else {
+        let Ok(supported_clip_indices) = self.performance_supported_clip_indices(
+            document,
+            arrangement.id,
+            performance_zone_end_tick,
+        ) else {
             return;
         };
         let mut tracks = document.playlist_tracks_in_arrangement(arrangement.id);
@@ -8401,8 +8425,13 @@ impl DawUi {
             self.status = "Performance Mode needs a non-signature time marker named Start".into();
             return;
         };
+        let loaded_vst3_channels = self
+            .channel_vst3_instances
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
         let performance_clip_indices =
-            match playlist_performance_clip_indices(document, arrangement_id, start_tick) {
+            match self.performance_supported_clip_indices(document, arrangement_id, start_tick) {
                 Ok(clip_indices) => clip_indices,
                 Err(error) => {
                     self.status = format!("Could not prepare Performance Mode clips: {error}");
@@ -8410,9 +8439,37 @@ impl DawUi {
                 }
             };
         if performance_clip_indices.is_empty() {
-            self.status = "Add a supported Audio Clip or Sampler Pattern Clip before Start".into();
+            self.status =
+                "Add a supported Audio Clip, Sampler Pattern Clip, or loaded VST3 Pattern Clip before Start"
+                    .into();
             return;
         }
+        let performance_vst3_clip_indices = match playlist_performance_vst3_clip_indices(
+            document,
+            arrangement_id,
+            start_tick,
+            &loaded_vst3_channels,
+        ) {
+            Ok(indices) => indices
+                .intersection(&performance_clip_indices)
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            Err(error) => {
+                self.status = format!("Could not prepare Performance Mode VST3 clips: {error}");
+                return;
+            }
+        };
+        let performance_vst3_channel_ids = match playlist_performance_vst3_channel_ids(
+            document,
+            arrangement_id,
+            &performance_vst3_clip_indices,
+        ) {
+            Ok(channels) => channels,
+            Err(error) => {
+                self.status = format!("Could not prepare Performance Mode VST3 channels: {error}");
+                return;
+            }
+        };
         if self.audio_engine.is_none() {
             match AudioEngine::start(&self.audio_settings) {
                 Ok(engine) => self.audio_engine = Some(engine),
@@ -8470,23 +8527,27 @@ impl DawUi {
                 return;
             }
         };
-        let static_document =
-            match playlist_performance_static_document(document, arrangement_id, start_tick) {
-                Ok((static_document, _)) => static_document,
-                Err(error) => {
-                    self.status =
-                        format!("Could not prepare Performance Mode arrangement: {error}");
-                    return;
-                }
-            };
+        let static_document = match playlist_performance_static_document_with_vst3(
+            document,
+            arrangement_id,
+            start_tick,
+            &loaded_vst3_channels,
+        ) {
+            Ok((static_document, _)) => static_document,
+            Err(error) => {
+                self.status = format!("Could not prepare Performance Mode arrangement: {error}");
+                return;
+            }
+        };
         let vst3_processor = self
             .vst3_host
             .as_ref()
             .map(|host| {
-                host.prepare_playlist_stream(
+                host.prepare_playlist_performance_stream(
                     &static_document,
                     options,
                     &self.channel_vst3_instances,
+                    &performance_vst3_channel_ids,
                     true,
                 )
             })
@@ -8556,7 +8617,7 @@ impl DawUi {
                 });
                 self.stop_midi_pattern_preview();
                 self.status = format!(
-                    "Preparing Performance Mode from Start at tick {start_tick}; launch Audio or Sampler clips at the next bar"
+                    "Preparing Performance Mode from Start at tick {start_tick}; launch Audio, Sampler, or loaded VST3 clips at the next bar"
                 );
                 self.start_midi_clock(false);
             }
@@ -13391,7 +13452,7 @@ impl DawUi {
                     egui::Button::new("Performance Mode").selected(self.performance_mode_active),
                 )
                 .on_hover_text(if performance_zone_end_tick.is_some() {
-                    "Start playback from the non-signature marker named Start; launch supported Sampler Pattern Clips at the next bar. Right-click for the MIDI Global Snap setting."
+                    "Start playback from the non-signature marker named Start; launch supported Sampler Pattern Clips, loaded VST3 Pattern Clips, or Audio Clips at the next bar. Right-click for the MIDI Global Snap setting."
                 } else {
                     "Add a non-signature time marker named Start to define the Performance Zone. Right-click for the MIDI Global Snap setting."
                 });
@@ -14968,7 +15029,7 @@ impl DawUi {
                                     self.document
                                         .as_ref()
                                         .and_then(|document| {
-                                            playlist_performance_clip_indices(
+                                            self.performance_supported_clip_indices(
                                                 document,
                                                 arrangement.id,
                                                 zone_end_tick,
@@ -15551,7 +15612,7 @@ impl DawUi {
                                             self.document
                                                 .as_ref()
                                                 .and_then(|document| {
-                                                    playlist_performance_clip_indices(
+                                                    self.performance_supported_clip_indices(
                                                         document,
                                                         arrangement.id,
                                                         zone_end_tick,
@@ -15633,7 +15694,7 @@ impl DawUi {
                                             self.document
                                                 .as_ref()
                                                 .and_then(|document| {
-                                                    playlist_performance_clip_indices(
+                                                    self.performance_supported_clip_indices(
                                                         document,
                                                         arrangement.id,
                                                         zone_end_tick,
@@ -16588,7 +16649,8 @@ impl DawUi {
             performance_scene_launch_requested
             && let Some(zone_end_tick) = performance_zone_end_tick
             && let Some(supported_clip_indices) = self.document.as_ref().and_then(|document| {
-                playlist_performance_clip_indices(document, arrangement.id, zone_end_tick).ok()
+                self.performance_supported_clip_indices(document, arrangement.id, zone_end_tick)
+                    .ok()
             })
             && let Some((scene_key, scene_clip_groups)) = playlist_performance_scene_clip_indices(
                 &arrangement,
