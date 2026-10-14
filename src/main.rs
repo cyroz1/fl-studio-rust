@@ -671,6 +671,31 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u8(divisions, "note chop divisions")?,
             )
         }
+        [command, input, output, pattern_id, channel_id, snap_ticks]
+            if command == "quick-chop-notes" =>
+        {
+            quick_chop_notes_with_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                None,
+                parse_u32(snap_ticks, "quick chop snap ticks")?,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, note_indices, snap_ticks]
+            if command == "quick-chop-notes-selected" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            quick_chop_notes_with_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Some(&note_indices),
+                parse_u32(snap_ticks, "quick chop snap ticks")?,
+            )
+        }
         [command, input, output, pattern_id, channel_id] if command == "glue-notes" => {
             glue_notes(
                 Path::new(input),
@@ -2198,6 +2223,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild legato-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based>\n",
             "  flp-rebuild chop-notes <input.flp> <output.flp> <pattern-id> <channel-id> <divisions-2..64>\n",
             "  flp-rebuild chop-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <divisions-2..64>\n",
+            "  flp-rebuild quick-chop-notes <input.flp> <output.flp> <pattern-id> <channel-id> <snap-ticks>\n",
+            "  flp-rebuild quick-chop-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <snap-ticks>\n",
             "  flp-rebuild glue-notes <input.flp> <output.flp> <pattern-id> <channel-id>\n",
             "  flp-rebuild glue-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based>\n",
             "  flp-rebuild flip-notes <input.flp> <output.flp> <pattern-id> <channel-id>\n",
@@ -4445,6 +4472,42 @@ fn chop_notes_with_scope(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "created {created} chopped notes in pattern {pattern_id}, channel {channel_id} ({}) using {divisions} divisions in {}",
+        if note_indices.is_some() {
+            "selected notes"
+        } else {
+            "all channel notes"
+        },
+        output.display()
+    );
+    Ok(())
+}
+
+fn quick_chop_notes_with_scope(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    note_indices: Option<&[usize]>,
+    snap_ticks: u32,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let created = match note_indices {
+        Some(note_indices) => document.quick_chop_pattern_note_selection(
+            pattern_id,
+            channel_id,
+            note_indices,
+            snap_ticks,
+        ),
+        None => document.quick_chop_pattern_notes(pattern_id, channel_id, snap_ticks),
+    }
+    .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "created {created} Quick Chop notes in pattern {pattern_id}, channel {channel_id} ({}) at {snap_ticks} ticks in {}",
         if note_indices.is_some() {
             "selected notes"
         } else {
