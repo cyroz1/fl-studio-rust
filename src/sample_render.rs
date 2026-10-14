@@ -5304,13 +5304,30 @@ impl PlaylistPerformanceRuntime {
             .collect::<Vec<_>>();
         marker_group_positions.sort_unstable();
         marker_group_positions.dedup();
-        let motion_clips =
-            clips_by_index
-                .iter()
-                .map(|(&clip_index, clip)| (clip.track_id, clip.source_start_tick, clip_index))
-                .chain(audio_clips_by_index.iter().map(|(&clip_index, clip)| {
-                    (clip.track_id, clip.source_start_tick, clip_index)
-                }));
+        let motion_clips = clips_by_index
+            .iter()
+            .filter_map(|(&clip_index, clip)| {
+                let playlist_clip = arrangement.clips.get(clip_index)?;
+                Some((
+                    clip.track_id,
+                    clip.source_start_tick,
+                    playlist_clip.group,
+                    clip_index,
+                ))
+            })
+            .chain(
+                audio_clips_by_index
+                    .iter()
+                    .filter_map(|(&clip_index, clip)| {
+                        let playlist_clip = arrangement.clips.get(clip_index)?;
+                        Some((
+                            clip.track_id,
+                            clip.source_start_tick,
+                            playlist_clip.group,
+                            clip_index,
+                        ))
+                    }),
+            );
         let (motion_clip_order_by_track, motion_group_clip_by_index) =
             performance_motion_clip_groups(
                 motion_clips,
@@ -6199,40 +6216,52 @@ fn performance_latch_should_stop(
     press == Some(PlaylistTrackPress::Latch) && active_clip_index == Some(requested_clip_index)
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum PerformanceMotionGroupKey {
+    Marker(u64),
+    Clip(u16),
+}
+
 fn performance_motion_clip_groups(
-    clips: impl IntoIterator<Item = (u32, u32, usize)>,
+    clips: impl IntoIterator<Item = (u32, u32, u16, usize)>,
     marker_group_positions: &[u32],
     performance_zone_end_tick: u32,
     ppq: u16,
     initial_time_signature: Option<(u8, u8)>,
     signature_changes: &[(u32, u8, u8)],
 ) -> (HashMap<u32, Vec<usize>>, HashMap<usize, usize>) {
-    let mut clips_by_track_and_group = BTreeMap::<u32, BTreeMap<u64, Vec<(u32, usize)>>>::new();
-    for (track_id, start_tick, clip_index) in clips {
+    let mut clips_by_track_and_group =
+        BTreeMap::<u32, BTreeMap<PerformanceMotionGroupKey, Vec<(u32, usize)>>>::new();
+    for (track_id, start_tick, clip_group, clip_index) in clips {
         if start_tick >= performance_zone_end_tick {
             continue;
         }
-        let group_start_tick = if marker_group_positions.is_empty() {
-            performance_signature_and_bar_start(
-                u64::from(start_tick),
-                initial_time_signature,
-                signature_changes,
-                ppq,
-            )
-            .0
+        let group_key = if clip_group != 0 {
+            PerformanceMotionGroupKey::Clip(clip_group)
         } else {
-            marker_group_positions
-                .iter()
-                .copied()
-                .take_while(|position| *position <= start_tick)
-                .last()
-                .map(u64::from)
-                .unwrap_or(0)
+            let group_start_tick = if marker_group_positions.is_empty() {
+                performance_signature_and_bar_start(
+                    u64::from(start_tick),
+                    initial_time_signature,
+                    signature_changes,
+                    ppq,
+                )
+                .0
+            } else {
+                marker_group_positions
+                    .iter()
+                    .copied()
+                    .take_while(|position| *position <= start_tick)
+                    .last()
+                    .map(u64::from)
+                    .unwrap_or(0)
+            };
+            PerformanceMotionGroupKey::Marker(group_start_tick)
         };
         clips_by_track_and_group
             .entry(track_id)
             .or_default()
-            .entry(group_start_tick)
+            .entry(group_key)
             .or_default()
             .push((start_tick, clip_index));
     }
@@ -6240,18 +6269,23 @@ fn performance_motion_clip_groups(
     let mut ordered_clips_by_track = HashMap::new();
     let mut group_clip_by_index = HashMap::new();
     for (track_id, groups) in clips_by_track_and_group {
-        let mut ordered_clips = Vec::with_capacity(groups.len());
+        let mut ordered_group_clips = Vec::with_capacity(groups.len());
         for clips in groups.into_values() {
             let mut clips = clips;
             clips.sort_unstable();
-            let Some((_, group_clip_index)) = clips.first().copied() else {
+            let Some((group_start_tick, group_clip_index)) = clips.first().copied() else {
                 continue;
             };
-            ordered_clips.push(group_clip_index);
+            ordered_group_clips.push((group_start_tick, group_clip_index));
             for (_, clip_index) in clips {
                 group_clip_by_index.insert(clip_index, group_clip_index);
             }
         }
+        ordered_group_clips.sort_unstable();
+        let ordered_clips = ordered_group_clips
+            .into_iter()
+            .map(|(_, clip_index)| clip_index)
+            .collect();
         ordered_clips_by_track.insert(track_id, ordered_clips);
     }
     (ordered_clips_by_track, group_clip_by_index)
