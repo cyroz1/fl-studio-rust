@@ -11123,7 +11123,7 @@ impl FlpDocument {
             position = position.saturating_add(u64::from(options.step_ticks));
         }
 
-        let mut additions = if options.merge_repeated_notes {
+        let additions = if options.merge_repeated_notes {
             additions.sort_by_key(|note| (note.key, note.position));
             let mut merged: Vec<PatternNote> = Vec::with_capacity(additions.len());
             for note in additions {
