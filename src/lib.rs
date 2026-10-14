@@ -9996,8 +9996,29 @@ impl FlpDocument {
         signature_changes.sort_by_key(|(position, _, _)| *position);
         let initial_signature = self.metadata.time_signature();
         let ppq = self.header.ppq.max(1);
-        let selected_indices =
-            note_indices.map(|indices| indices.iter().copied().collect::<HashSet<_>>());
+        let selected_indices = note_indices.map(|indices| {
+            let mut selected = indices.iter().copied().collect::<HashSet<_>>();
+            let selected_groups = pattern
+                .notes
+                .iter()
+                .filter(|note| note.channel_id == channel_id)
+                .enumerate()
+                .filter(|(note_index, note)| selected.contains(note_index) && note.group != 0)
+                .map(|(_, note)| note.group)
+                .collect::<HashSet<_>>();
+            if !selected_groups.is_empty() {
+                selected.extend(
+                    pattern
+                        .notes
+                        .iter()
+                        .filter(|note| note.channel_id == channel_id)
+                        .enumerate()
+                        .filter(|(_, note)| selected_groups.contains(&note.group))
+                        .map(|(note_index, _)| note_index),
+                );
+            }
+            selected
+        });
         let mut edits = Vec::new();
         for (note_index, note) in pattern
             .notes
