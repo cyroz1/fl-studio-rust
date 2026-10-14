@@ -8338,8 +8338,16 @@ impl DawUi {
                 return;
             }
         };
-        self.stop_live_sampler_input();
-        self.stop_live_vst3_input();
+        if let Some(session) = self.live_sampler_input.take() {
+            session.cancelled.store(true, Ordering::Release);
+            self.live_sampler_workers.push(session.worker);
+        }
+        self.midi_live_sampler_note_mapping.clear();
+        if let Some(session) = self.live_vst3_input.take() {
+            session.cancelled.store(true, Ordering::Release);
+            self.live_vst3_workers.push(session.worker);
+        }
+        self.midi_live_vst3_note_mapping.clear();
         let writer = match engine.begin_streaming_playback_from_frame(start_frame) {
             Ok(writer) => writer,
             Err(error) => {
@@ -8572,8 +8580,16 @@ impl DawUi {
                 return;
             }
         };
-        self.stop_live_sampler_input();
-        self.stop_live_vst3_input();
+        if let Some(session) = self.live_sampler_input.take() {
+            session.cancelled.store(true, Ordering::Release);
+            self.live_sampler_workers.push(session.worker);
+        }
+        self.midi_live_sampler_note_mapping.clear();
+        if let Some(session) = self.live_vst3_input.take() {
+            session.cancelled.store(true, Ordering::Release);
+            self.live_vst3_workers.push(session.worker);
+        }
+        self.midi_live_vst3_note_mapping.clear();
         let writer = match engine.begin_live_streaming_playback_from_frame(start_frame) {
             Ok(writer) => writer,
             Err(error) => {
