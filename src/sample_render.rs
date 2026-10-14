@@ -3903,8 +3903,7 @@ fn stream_prepared_playlist_render_with_performance(
                 )?;
                 if let Some(performance) = performance.as_mut() {
                     performance.update(
-                        block_start,
-                        frame_count,
+                        block_start..block_start.saturating_add(frame_count as u64),
                         &mut sampler_engine,
                         &audio_mix_context,
                         block,
@@ -5785,20 +5784,22 @@ impl PlaylistPerformanceRuntime {
 
     fn update(
         &mut self,
-        block_start: u64,
-        frame_count: usize,
+        block: std::ops::Range<u64>,
         sampler_engine: &mut SamplerVoiceEngine<'_>,
         audio_context: &PreparedAudioClipMixContext<'_>,
         audio_output: &mut [f32],
         meter_buses: Option<&mut [f32]>,
         mut vst3_processor: Option<&mut Vst3PlaylistStreamProcessor>,
     ) -> Result<(), String> {
+        let block_start = block.start;
+        let frame_count = usize::try_from(block.end.saturating_sub(block_start))
+            .map_err(|_| "Performance Mode audio block is too large".to_owned())?;
+        let block_end = block.end;
         while let Ok(launch) = self.launches.try_recv() {
             self.pending_commands.push(launch);
         }
         self.pending_commands
             .sort_by_key(|command| command.start_frame());
-        let block_end = block_start.saturating_add(frame_count as u64);
         let due_command_count = self
             .pending_commands
             .partition_point(|command| command.start_frame() <= block_end);
@@ -6296,7 +6297,6 @@ impl PlaylistPerformanceRuntime {
         }
         if !vst3_notes_by_track_and_channel.is_empty() {
             let processor = vst3_processor
-                .as_deref_mut()
                 .ok_or_else(|| "VST3 Performance Mode processor is unavailable".to_owned())?;
             for ((track_id, channel_id), notes) in vst3_notes_by_track_and_channel {
                 processor.schedule_performance_notes(track_id, channel_id, &notes)?;

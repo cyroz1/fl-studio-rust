@@ -299,7 +299,7 @@ impl Vst3PlaylistStreamProcessor {
             if !stream.live_performance {
                 continue;
             }
-            let stop_source_frame = (stop_frame as f64 * f64::from(stream.render.sample_rate)
+            let stop_source_frame = (stop_frame as f64 * stream.render.sample_rate
                 / f64::from(self.output_sample_rate))
             .round();
             if !stop_source_frame.is_finite() || stop_source_frame > u64::MAX as f64 {
