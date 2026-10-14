@@ -500,6 +500,25 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_rgb_hex(color)?,
             )
         }
+        [command, input, output, channel_ids, color] if command == "set-channel-colors" => {
+            set_channel_colors(
+                Path::new(input),
+                Path::new(output),
+                &parse_channel_id_list(channel_ids)?,
+                parse_rgb_hex(color)?,
+            )
+        }
+        [command, input, output, channel_ids, start_color, end_color]
+            if command == "set-channel-color-gradient" =>
+        {
+            set_channel_color_gradient(
+                Path::new(input),
+                Path::new(output),
+                &parse_channel_id_list(channel_ids)?,
+                parse_rgb_hex(start_color)?,
+                parse_rgb_hex(end_color)?,
+            )
+        }
         [command, input, output, channel_id, enabled]
             if command == "set-channel-main-pitch" =>
         {
@@ -2426,6 +2445,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild rename-channel-group <input.flp> <output.flp> <group-index> <name>\n",
             "  flp-rebuild delete-channel-group <input.flp> <output.flp> <group-index>\n",
             "  flp-rebuild set-channel-color <input.flp> <output.flp> <channel-id> <RRGGBB>\n",
+            "  flp-rebuild set-channel-colors <input.flp> <output.flp> <channel-ids:comma-separated> <RRGGBB>\n",
+            "  flp-rebuild set-channel-color-gradient <input.flp> <output.flp> <channel-ids:comma-separated-in-order> <start-RRGGBB> <end-RRGGBB>\n",
             "  flp-rebuild set-channel-levels <input.flp> <output.flp> <channel-id> <volume-0..12800> <pan-0..12800>\n",
             "  flp-rebuild set-channel-enabled <input.flp> <output.flp> <channel-id> <0|1>\n",
             "  flp-rebuild set-channel-zipped <input.flp> <output.flp> <channel-id> <0|1>\n",
@@ -4552,6 +4573,66 @@ fn set_channel_color(
         rgb[2],
         output.display()
     );
+    Ok(())
+}
+
+fn set_channel_colors(
+    input: &Path,
+    output: &Path,
+    channel_ids: &[u16],
+    rgb: [u8; 3],
+) -> Result<(), String> {
+    edit_channel_colors(
+        input,
+        output,
+        format!(
+            "set color #{:02X}{:02X}{:02X} on channels {channel_ids:?}",
+            rgb[0], rgb[1], rgb[2]
+        ),
+        |document| {
+            document
+                .set_channel_colors(channel_ids, rgb)
+                .map_err(|error| error.to_string())
+        },
+    )
+}
+
+fn set_channel_color_gradient(
+    input: &Path,
+    output: &Path,
+    channel_ids: &[u16],
+    start_rgb: [u8; 3],
+    end_rgb: [u8; 3],
+) -> Result<(), String> {
+    edit_channel_colors(
+        input,
+        output,
+        format!(
+            "applied color gradient #{:02X}{:02X}{:02X}..#{:02X}{:02X}{:02X} to channels {channel_ids:?}",
+            start_rgb[0], start_rgb[1], start_rgb[2], end_rgb[0], end_rgb[1], end_rgb[2]
+        ),
+        |document| {
+            document
+                .set_channel_color_gradient(channel_ids, start_rgb, end_rgb)
+                .map_err(|error| error.to_string())
+        },
+    )
+}
+
+fn edit_channel_colors(
+    input: &Path,
+    output: &Path,
+    description: String,
+    edit: impl FnOnce(&mut FlpDocument) -> Result<(), String>,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    edit(&mut document)?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!("{description} in {}", output.display());
     Ok(())
 }
 
