@@ -11067,11 +11067,13 @@ impl FlpDocument {
                     (next_randomizer_value(&mut state) % pitches.len() as u64) as usize;
                 let remaining_ticks = end_tick - position;
                 let length = u64::from(options.note_length_ticks).min(remaining_ticks);
-                let mut note = PatternNote::default();
-                note.position = u32::try_from(position).map_err(|_| FlpError::LengthOverflow)?;
-                note.length = u32::try_from(length).map_err(|_| FlpError::LengthOverflow)?;
-                note.key = pitches[pitch_index];
-                note.channel_id = channel_id;
+                let note = PatternNote {
+                    position: u32::try_from(position).map_err(|_| FlpError::LengthOverflow)?,
+                    length: u32::try_from(length).map_err(|_| FlpError::LengthOverflow)?,
+                    key: pitches[pitch_index],
+                    channel_id,
+                    ..PatternNote::default()
+                };
                 additions.push(note);
             }
             position = position.saturating_add(u64::from(options.step_ticks));
