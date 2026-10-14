@@ -77,6 +77,7 @@ flp-rebuild edit-note-properties <input.flp> <output.flp> <pattern-id> <channel-
 flp-rebuild quantize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <grid-ticks> <strength-0..1> <swing-0..1>
 flp-rebuild quantize-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <grid-ticks> <strength-0..1> <swing-0..1> [sensitivity-0..1 duration-strength-0..1 leave-duration|leave-end|quantize-duration|quantize-end]
 flp-rebuild legato-notes <input.flp> <output.flp> <pattern-id> <channel-id>
+flp-rebuild legato-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based>
 flp-rebuild chop-notes <input.flp> <output.flp> <pattern-id> <channel-id> <divisions-2..64>
 flp-rebuild glue-notes <input.flp> <output.flp> <pattern-id> <channel-id>
 flp-rebuild flip-notes <input.flp> <output.flp> <pattern-id> <channel-id>
@@ -168,7 +169,7 @@ The **Project settings…** control edits the currently mapped Advanced options:
 
 In the Piano roll, **Quantize selected** targets the current selection. The **Edit** target selector routes other note-transform buttons to **Auto** (use the selection when present, otherwise the channel), **Channel**, or **Selected notes**.
 
-The Piano roll's **Edit** target selector applies note-transform buttons to either the whole channel or only selected notes. **Legato channel/selected** extends targeted notes to the next distinct onset in the channel; notes in the final onset group keep their current lengths.
+The Piano roll's **Edit** target selector applies note-transform buttons to either the whole channel or only selected notes. **Legato channel/selected** extends targeted notes to the next distinct onset in the channel; notes in the final onset group keep their current lengths. `legato-notes-selected` applies this to comma-separated zero-based channel-local note indexes.
 
 **Chop channel/selected** and `chop-notes` divide eligible notes into equal segments. Each new segment retains the source note's properties; any leftover ticks stay in the final segment.
 
