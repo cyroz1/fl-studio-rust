@@ -1911,6 +1911,18 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 },
             )
         }
+        [command, input, output, pattern_id, channel_id, note_specs]
+            if command == "add-notes" =>
+        {
+            let channel_id = parse_u16(channel_id, "channel id")?;
+            let notes = parse_note_specs(channel_id, note_specs)?;
+            add_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                &notes,
+            )
+        }
         [command, input, output, pattern_id, channel_id, note_index] if command == "delete-note" => {
             delete_note(
                 Path::new(input),
@@ -2343,6 +2355,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild claw-notes <input.flp> <output.flp> <pattern-id> <channel-id> <period-ticks:16+> <trash-every:2..16> <time-distortion:-100..100> <remove-short-notes:0|1> <stretch-to-compensate:0|1>\n",
             "  flp-rebuild claw-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <period-ticks:16+> <trash-every:2..16> <time-distortion:-100..100> <remove-short-notes:0|1> <stretch-to-compensate:0|1>\n",
             "  flp-rebuild add-note <input.flp> <output.flp> <pattern-id> <channel-id> <position> <length> <key> <velocity>\n",
+            "  flp-rebuild add-notes <input.flp> <output.flp> <pattern-id> <channel-id> <notes:position:length:key:velocity,...>\n",
             "  flp-rebuild delete-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index>\n",
             "  flp-rebuild delete-notes <input.flp> <output.flp> <pattern-id> <channel-id>\n",
             "  flp-rebuild delete-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based>\n",
@@ -2409,6 +2422,36 @@ fn parse_note_indices(value: &str) -> Result<Vec<usize>, String> {
         return Err("at least one channel-local note index is required".to_owned());
     }
     Ok(indices)
+}
+
+fn parse_note_specs(channel_id: u16, value: &str) -> Result<Vec<PatternNote>, String> {
+    let mut notes = Vec::new();
+    for note in value.split(',') {
+        let mut fields = note.split(':');
+        let position = fields.next().unwrap_or_default();
+        let length = fields.next().unwrap_or_default();
+        let key = fields.next().unwrap_or_default();
+        let velocity = fields.next().unwrap_or_default();
+        if position.is_empty()
+            || length.is_empty()
+            || key.is_empty()
+            || velocity.is_empty()
+            || fields.next().is_some()
+        {
+            return Err(
+                "notes must be comma-separated position:length:key:velocity tuples".to_owned(),
+            );
+        }
+        notes.push(PatternNote {
+            channel_id,
+            position: parse_u32(position, "note position")?,
+            length: parse_u32(length, "note length")?,
+            key: parse_u16(key, "note key")?,
+            velocity: parse_u8(velocity, "note velocity")?,
+            ..PatternNote::default()
+        });
+    }
+    Ok(notes)
 }
 
 fn parse_note_cuts(value: &str) -> Result<Vec<(u16, usize, u32)>, String> {
@@ -5543,6 +5586,34 @@ fn add_note(input: &Path, output: &Path, pattern_id: u16, note: PatternNote) -> 
         "added note to pattern {pattern_id}, channel {} at {} ticks to {}",
         note.channel_id,
         note.position,
+        output.display()
+    );
+    Ok(())
+}
+
+fn add_notes(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    notes: &[PatternNote],
+) -> Result<(), String> {
+    let channel_id = notes
+        .first()
+        .ok_or_else(|| "at least one note must be supplied".to_owned())?
+        .channel_id;
+    let (_, mut document) = load_document(input)?;
+    document
+        .add_pattern_notes(pattern_id, notes)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "added {} notes to pattern {pattern_id}, channel {} in {}",
+        notes.len(),
+        channel_id,
         output.display()
     );
     Ok(())
