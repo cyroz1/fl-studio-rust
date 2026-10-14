@@ -1389,6 +1389,20 @@ pub struct RandomizerOptions {
     pub reset_levels: bool,
 }
 
+/// Parameters for generating seeded notes on a bounded Piano roll grid range.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RandomNoteGeneratorOptions {
+    pub seed: u64,
+    pub start_tick: u32,
+    /// Exclusive end of the generated range.
+    pub end_tick: u32,
+    pub step_ticks: u32,
+    pub note_length_ticks: u32,
+    pub density_percent: u8,
+    pub minimum_key: u16,
+    pub maximum_key: u16,
+}
+
 /// Timing and note-level variation for a seeded Humanize pass.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct HumanizerOptions {
@@ -10928,6 +10942,149 @@ impl FlpDocument {
         updated.add_pattern_notes(pattern_id, &stroke_notes)?;
         *self = updated;
         Ok(stroke_count)
+    }
+
+    /// Generates seeded notes on a grid inside the requested tick range.
+    /// The end tick is exclusive; new notes use FL Studio's observed neutral defaults.
+    pub fn generate_random_pattern_notes(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        options: RandomNoteGeneratorOptions,
+    ) -> Result<usize, FlpError> {
+        self.generate_random_pattern_notes_in_scale(pattern_id, channel_id, options, None)
+    }
+
+    /// Generates seeded notes on a grid while limiting pitches to the supplied scale.
+    pub fn generate_random_pattern_notes_with_scale(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        options: RandomNoteGeneratorOptions,
+        scale_root: u8,
+        scale_intervals: &[u8],
+    ) -> Result<usize, FlpError> {
+        self.generate_random_pattern_notes_in_scale(
+            pattern_id,
+            channel_id,
+            options,
+            Some((scale_root, scale_intervals)),
+        )
+    }
+
+    fn generate_random_pattern_notes_in_scale(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        options: RandomNoteGeneratorOptions,
+        scale: Option<(u8, &[u8])>,
+    ) -> Result<usize, FlpError> {
+        if options.start_tick >= options.end_tick {
+            return Err(FlpError::UnsupportedEdit(
+                "random note generation requires a non-empty tick range",
+            ));
+        }
+        if options.step_ticks == 0 || options.note_length_ticks == 0 {
+            return Err(FlpError::UnsupportedEdit(
+                "random note generation step and note length must be greater than zero ticks",
+            ));
+        }
+        if options.density_percent > 100 {
+            return Err(FlpError::UnsupportedEdit(
+                "random note generation density must be between 0 and 100 percent",
+            ));
+        }
+        if options.minimum_key > options.maximum_key || options.maximum_key > 127 {
+            return Err(FlpError::UnsupportedEdit(
+                "random note generation key range must be ordered and remain within keys 0 through 127",
+            ));
+        }
+        if let Some((scale_root, scale_intervals)) = scale
+            && (scale_root > 11
+                || scale_intervals.is_empty()
+                || scale_intervals.first() != Some(&0)
+                || scale_intervals.iter().any(|interval| *interval > 11)
+                || scale_intervals.windows(2).any(|pair| pair[0] >= pair[1]))
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "random note generation scale intervals must be unique, ordered pitch classes starting at zero",
+            ));
+        }
+
+        self.require_unique_channel(channel_id)?;
+        let pattern = self
+            .patterns()?
+            .into_iter()
+            .find(|pattern| pattern.id == pattern_id)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested pattern does not exist",
+            ))?;
+        let grid_positions = u64::from(options.end_tick - options.start_tick)
+            .div_ceil(u64::from(options.step_ticks));
+        if grid_positions > MAX_MERGED_PATTERN_NOTES as u64 {
+            return Err(FlpError::UnsupportedEdit(
+                "random note generation is limited to two million grid positions",
+            ));
+        }
+
+        let pitches = (options.minimum_key..=options.maximum_key)
+            .filter(|key| {
+                scale.is_none_or(|(root, intervals)| {
+                    note_pitch_in_scale(i32::from(*key), root, intervals)
+                })
+            })
+            .collect::<Vec<_>>();
+        if pitches.is_empty() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested key range contains no notes from the selected scale",
+            ));
+        }
+
+        let mut state = if options.seed == 0 {
+            0x9e37_79b9_7f4a_7c15
+        } else {
+            options.seed
+        };
+        let available_notes = MAX_MERGED_PATTERN_NOTES.saturating_sub(pattern.notes.len());
+        let initial_capacity = usize::try_from(grid_positions.min(available_notes as u64))
+            .map_err(|_| FlpError::LengthOverflow)?
+            .min(65_536);
+        let mut additions = Vec::with_capacity(initial_capacity);
+        let mut position = u64::from(options.start_tick);
+        let end_tick = u64::from(options.end_tick);
+        while position < end_tick {
+            let selected = options.density_percent == 100
+                || (options.density_percent > 0
+                    && next_randomizer_value(&mut state) % 100
+                        < u64::from(options.density_percent));
+            if selected {
+                if additions.len() >= available_notes {
+                    return Err(FlpError::UnsupportedEdit(
+                        "random note generation would exceed two million notes in this pattern",
+                    ));
+                }
+                let pitch_index =
+                    (next_randomizer_value(&mut state) % pitches.len() as u64) as usize;
+                let remaining_ticks = end_tick - position;
+                let length = u64::from(options.note_length_ticks).min(remaining_ticks);
+                let mut note = PatternNote::default();
+                note.position = u32::try_from(position).map_err(|_| FlpError::LengthOverflow)?;
+                note.length = u32::try_from(length).map_err(|_| FlpError::LengthOverflow)?;
+                note.key = pitches[pitch_index];
+                note.channel_id = channel_id;
+                additions.push(note);
+            }
+            position = position.saturating_add(u64::from(options.step_ticks));
+        }
+
+        if additions.is_empty() {
+            return Ok(0);
+        }
+        let created = additions.len();
+        let mut updated = self.clone();
+        updated.add_pattern_notes(pattern_id, &additions)?;
+        *self = updated;
+        Ok(created)
     }
 
     /// Randomizes channel note velocity, pan, and pitch from a repeatable seed.

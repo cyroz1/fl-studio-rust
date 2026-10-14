@@ -17,7 +17,8 @@ use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, AutomationPointEdit, ChannelLevelAdjustmentsEdit,
     FlpDocument, FstPreset, HumanizerOptions, PatternControllerEdit, PatternNote, PatternNoteEdit,
     PlaylistClipEdit, PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress,
-    PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions, TimeMarkerEdit,
+    PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit, RandomNoteGeneratorOptions,
+    RandomizerOptions, TimeMarkerEdit,
 };
 
 fn main() -> ExitCode {
@@ -634,6 +635,51 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u32(stroke_ticks, "flam stroke time")?,
                 parse_u8(velocity, "flam velocity")?,
                 before,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, start_tick, end_tick, step_ticks,
+            note_length_ticks, density, minimum_key, maximum_key, seed]
+            if command == "generate-random-notes" =>
+        {
+            generate_random_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                RandomNoteGeneratorOptions {
+                    seed: parse_u64(seed, "random note generator seed")?,
+                    start_tick: parse_u32(start_tick, "generation start tick")?,
+                    end_tick: parse_u32(end_tick, "generation end tick")?,
+                    step_ticks: parse_u32(step_ticks, "generation step")?,
+                    note_length_ticks: parse_u32(note_length_ticks, "generated note length")?,
+                    density_percent: parse_u8(density, "generation density")?,
+                    minimum_key: u16::from(parse_u8(minimum_key, "minimum key")?),
+                    maximum_key: u16::from(parse_u8(maximum_key, "maximum key")?),
+                },
+                None,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, start_tick, end_tick, step_ticks,
+            note_length_ticks, density, minimum_key, maximum_key, seed, scale_name, scale_root]
+            if command == "generate-random-notes-scale" =>
+        {
+            let scale_intervals = parse_scale_name(scale_name)?;
+            generate_random_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                RandomNoteGeneratorOptions {
+                    seed: parse_u64(seed, "random note generator seed")?,
+                    start_tick: parse_u32(start_tick, "generation start tick")?,
+                    end_tick: parse_u32(end_tick, "generation end tick")?,
+                    step_ticks: parse_u32(step_ticks, "generation step")?,
+                    note_length_ticks: parse_u32(note_length_ticks, "generated note length")?,
+                    density_percent: parse_u8(density, "generation density")?,
+                    minimum_key: u16::from(parse_u8(minimum_key, "minimum key")?),
+                    maximum_key: u16::from(parse_u8(maximum_key, "maximum key")?),
+                },
+                Some((parse_u8(scale_root, "scale root")?, scale_intervals)),
             )
         }
         [command, input, output, pattern_id, channel_id, seed, velocity_amount, pan_amount,
@@ -1310,6 +1356,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild flip-notes <input.flp> <output.flp> <pattern-id> <channel-id>\n",
             "  flp-rebuild strum-notes <input.flp> <output.flp> <pattern-id> <channel-id> <spread-ticks> <up|down>\n",
             "  flp-rebuild flam-notes <input.flp> <output.flp> <pattern-id> <channel-id> <stroke-ticks> <velocity-0..127> <before|after>\n",
+            "  flp-rebuild generate-random-notes <input.flp> <output.flp> <pattern-id> <channel-id> <start-ticks> <end-ticks-exclusive> <step-ticks> <note-length-ticks> <density-0..100> <minimum-key-0..127> <maximum-key-0..127> <seed>\n",
+            "  flp-rebuild generate-random-notes-scale <input.flp> <output.flp> <pattern-id> <channel-id> <start-ticks> <end-ticks-exclusive> <step-ticks> <note-length-ticks> <density-0..100> <minimum-key-0..127> <maximum-key-0..127> <seed> <scale-name> <scale-root-0..11>\n",
             "  flp-rebuild randomize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <velocity:-100..100> <pan:-100..100> <pitch-range:0..24> <bipolar:0|1> <reset:0|1> [release:-100..100 mod-x:-100..100 mod-y:-100..100]\n",
             "  flp-rebuild randomize-notes-scale <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <velocity:-100..100> <pan:-100..100> <pitch-range:0..24> <bipolar:0|1> <reset:0|1> <scale-name> <scale-root:0..11> [release:-100..100 mod-x:-100..100 mod-y:-100..100]\n",
             "  flp-rebuild randomize-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <seed> <velocity:-100..100> <pan:-100..100> <pitch-range:0..24> <bipolar:0|1> <reset:0|1> [release:-100..100 mod-x:-100..100 mod-y:-100..100]\n",
@@ -3481,6 +3529,41 @@ fn flam_notes(
         } else {
             "after notes"
         },
+        output.display()
+    );
+    Ok(())
+}
+
+fn generate_random_notes(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    options: RandomNoteGeneratorOptions,
+    scale: Option<(u8, &[u8])>,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let created = match scale {
+        Some((scale_root, scale_intervals)) => document.generate_random_pattern_notes_with_scale(
+            pattern_id,
+            channel_id,
+            options,
+            scale_root,
+            scale_intervals,
+        ),
+        None => document.generate_random_pattern_notes(pattern_id, channel_id, options),
+    }
+    .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "generated {created} seeded notes in pattern {pattern_id}, channel {channel_id} from tick {} to {} using seed {} to {}",
+        options.start_tick,
+        options.end_tick,
+        options.seed,
         output.display()
     );
     Ok(())

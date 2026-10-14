@@ -59,9 +59,9 @@ use flp_rebuild::{
     PatternController, PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation,
     PayloadEncoding, PlaylistClip, PlaylistClipEdit, PlaylistClipSelectionClipboard,
     PlaylistClipTarget, PlaylistTrack, PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress,
-    PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions, RiffMachineOptions,
-    RiffMachineQuantizeMode, ScaleLevelsOptions, TimeMarker, TimeMarkerEdit,
-    VstPluginStateMetadata,
+    PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit, RandomNoteGeneratorOptions,
+    RandomizerOptions, RiffMachineOptions, RiffMachineQuantizeMode, ScaleLevelsOptions, TimeMarker,
+    TimeMarkerEdit, VstPluginStateMetadata,
 };
 use md5::{Digest, Md5};
 
@@ -3405,6 +3405,10 @@ struct DawUi {
     randomizer_bipolar: bool,
     randomizer_reset_levels: bool,
     randomizer_snap_to_scale: bool,
+    random_note_generation_density_percent: u8,
+    random_note_generation_minimum_key: u8,
+    random_note_generation_maximum_key: u8,
+    random_note_generation_snap_to_scale: bool,
     scale_levels_center_percent: i16,
     scale_levels_tension_percent: i16,
     scale_levels_multiplier_percent: u16,
@@ -4177,6 +4181,10 @@ impl DawUi {
             randomizer_bipolar: true,
             randomizer_reset_levels: false,
             randomizer_snap_to_scale: false,
+            random_note_generation_density_percent: 100,
+            random_note_generation_minimum_key: 48,
+            random_note_generation_maximum_key: 84,
+            random_note_generation_snap_to_scale: false,
             scale_levels_center_percent: 0,
             scale_levels_tension_percent: 0,
             scale_levels_multiplier_percent: 100,
@@ -22913,6 +22921,7 @@ impl DawUi {
         let mut flip_requested = false;
         let mut strum_requested = false;
         let mut flam_requested = false;
+        let mut generate_random_notes_requested = false;
         let mut randomize_requested = false;
         let mut scale_levels_requested = false;
         let mut articulate_requested = false;
@@ -23727,6 +23736,14 @@ impl DawUi {
             && self.selected_note_channel.is_some()
             && (self.piano_roll_edit_scope != PianoRollEditScope::Selection
                 || !selected_quantize_indices.is_empty());
+        let generate_random_notes_available = self.piano_roll_snap != PianoRollSnap::None
+            && self.selected_pattern.is_some_and(|pattern_id| {
+                self.piano_roll_time_selection
+                    .is_some_and(|(selection_pattern_id, start, end)| {
+                        selection_pattern_id == pattern_id && start < end
+                    })
+            })
+            && self.selected_note_channel.is_some();
         let has_loaded_instrument = self
             .selected_note_channel
             .is_some_and(|channel_id| self.channel_vst3_instances.contains_key(&channel_id));
@@ -23814,6 +23831,23 @@ impl DawUi {
                     }
                 });
                 ui.menu_button("Transform", |ui| {
+                    if ui
+                        .add_enabled(
+                            generate_random_notes_available,
+                            egui::Button::new("Generate random notes in time selection"),
+                        )
+                        .on_hover_text(
+                            "Create seeded notes on the current snap grid using the generation settings below",
+                        )
+                        .clicked()
+                    {
+                        generate_random_notes_requested = true;
+                        ui.close();
+                    }
+                    if !generate_random_notes_available {
+                        ui.small("Select a time range and choose a snap value to generate notes.");
+                    }
+                    ui.separator();
                     if ui
                         .add_enabled(
                             edit_scope_available,
@@ -24677,6 +24711,7 @@ impl DawUi {
             flip_requested = false;
             strum_requested = false;
             flam_requested = false;
+            generate_random_notes_requested = false;
             randomize_requested = false;
             scale_levels_requested = false;
             articulate_requested = false;
@@ -25078,6 +25113,25 @@ impl DawUi {
                 ui.checkbox(&mut self.flam_group_notes, "Group notes").on_hover_text(
                     "Assign the processed notes and generated Flam strokes to one note group.",
                 );
+                ui.add(
+                    egui::Slider::new(&mut self.random_note_generation_density_percent, 0..=100)
+                        .text("Random note density (%)"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.random_note_generation_minimum_key, 0..=127)
+                        .text("Random note lowest key"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.random_note_generation_maximum_key, 0..=127)
+                        .text("Random note highest key"),
+                );
+                ui.add_enabled_ui(self.piano_roll_scale != PianoRollScale::None, |ui| {
+                    ui.checkbox(
+                        &mut self.random_note_generation_snap_to_scale,
+                        "Generate pitches in current scale",
+                    );
+                });
+                ui.small("Generated note length follows the snap grid; the time range end is exclusive.");
                 ui.add(
                     egui::Slider::new(&mut self.randomizer_velocity_amount, -100..=100)
                         .text("Velocity randomize (%)"),
@@ -25587,6 +25641,74 @@ impl DawUi {
                     );
                 }
                 Err(error) => self.status = format!("Could not add flam strokes: {error}"),
+            }
+        }
+        if generate_random_notes_requested {
+            if let (Some(pattern_id), Some(channel_id), Some((range_pattern, start_tick, end_tick))) = (
+                self.selected_pattern,
+                self.selected_note_channel,
+                self.piano_roll_time_selection,
+            ) && range_pattern == pattern_id
+                && start_tick < end_tick
+            {
+                let seed = self.randomizer_seed;
+                let step_ticks = self.piano_roll_snap.ticks(ppq, time_signature);
+                let density_percent = self.random_note_generation_density_percent;
+                let minimum_key = u16::from(self.random_note_generation_minimum_key);
+                let maximum_key = u16::from(self.random_note_generation_maximum_key);
+                let scale_root = self.piano_roll_scale_root;
+                let scale_intervals = self.piano_roll_scale.intervals();
+                let snap_to_scale =
+                    self.random_note_generation_snap_to_scale && !scale_intervals.is_empty();
+                let options = RandomNoteGeneratorOptions {
+                    seed,
+                    start_tick,
+                    end_tick,
+                    step_ticks,
+                    note_length_ticks: step_ticks,
+                    density_percent,
+                    minimum_key,
+                    maximum_key,
+                };
+                let result = self
+                    .document
+                    .as_mut()
+                    .ok_or_else(|| "no project is open".to_owned())
+                    .and_then(|document| {
+                        let result = if snap_to_scale {
+                            document.generate_random_pattern_notes_with_scale(
+                                pattern_id,
+                                channel_id,
+                                options,
+                                scale_root,
+                                scale_intervals,
+                            )
+                        } else {
+                            document.generate_random_pattern_notes(pattern_id, channel_id, options)
+                        };
+                        result.map_err(|error| error.to_string())
+                    });
+                match result {
+                    Ok(created) => {
+                        self.randomizer_seed = seed.saturating_add(1);
+                        if created > 0 {
+                            self.stop_project_playback();
+                            self.dirty = true;
+                        }
+                        self.status = format!(
+                            "Generated {created} notes in pattern {pattern_id} from tick {start_tick} to {end_tick} using seed {seed}{}",
+                            if snap_to_scale {
+                                " within the current scale"
+                            } else {
+                                ""
+                            }
+                        );
+                    }
+                    Err(error) => self.status = format!("Could not generate random notes: {error}"),
+                }
+            } else {
+                self.status =
+                    "Select a time range in the active pattern before generating notes".to_owned();
             }
         }
         if randomize_requested
