@@ -34578,24 +34578,13 @@ impl DawUi {
         if source.channel_type() != Some(ChannelType::Layer) {
             return None;
         }
-        let mut seen = BTreeSet::new();
-        let mut target_channels = BTreeSet::new();
-        for child_id in source.layer_child_ids()? {
-            if !seen.insert(*child_id) {
-                continue;
-            }
-            let Some(child) = channels_by_id.get(child_id) else {
-                continue;
-            };
-            if child.enabled() == Some(false) || child.channel_type() == Some(ChannelType::Layer) {
-                continue;
-            }
-            if child.kind() != Some(0) {
-                return None;
-            }
-            target_channels.insert(*child_id);
-        }
-        (!target_channels.is_empty()).then_some(target_channels)
+        let targets = self.collect_live_layer_destinations(
+            source_channel_id,
+            &channels_by_id,
+            &mut BTreeSet::new(),
+        )?;
+        (targets.vst3_channel_ids.is_empty() && !targets.sampler_channel_ids.is_empty())
+            .then_some(targets.sampler_channel_ids)
     }
 
     fn live_vst3_target_channels(&self, source_channel_id: u16) -> Option<BTreeSet<u16>> {
@@ -34614,24 +34603,13 @@ impl DawUi {
         if source.channel_type() != Some(ChannelType::Layer) {
             return None;
         }
-        let mut seen = BTreeSet::new();
-        let mut target_channels = BTreeSet::new();
-        for child_id in source.layer_child_ids()? {
-            if !seen.insert(*child_id) {
-                continue;
-            }
-            let Some(child) = channels_by_id.get(child_id) else {
-                continue;
-            };
-            if child.enabled() == Some(false) || child.channel_type() == Some(ChannelType::Layer) {
-                continue;
-            }
-            if !self.channel_vst3_instances.contains_key(child_id) {
-                return None;
-            }
-            target_channels.insert(*child_id);
-        }
-        (!target_channels.is_empty()).then_some(target_channels)
+        let targets = self.collect_live_layer_destinations(
+            source_channel_id,
+            &channels_by_id,
+            &mut BTreeSet::new(),
+        )?;
+        (targets.sampler_channel_ids.is_empty() && !targets.vst3_channel_ids.is_empty())
+            .then_some(targets.vst3_channel_ids)
     }
 
     fn live_layer_input_targets(&self, source_channel_id: u16) -> Option<LiveLayerInputTargets> {
@@ -34644,31 +34622,66 @@ impl DawUi {
         if source.enabled() == Some(false) || source.channel_type() != Some(ChannelType::Layer) {
             return None;
         }
-        let mut seen = BTreeSet::new();
-        let mut targets = LiveLayerInputTargets {
-            sampler_channel_ids: BTreeSet::new(),
-            vst3_channel_ids: BTreeSet::new(),
-        };
-        for child_id in source.layer_child_ids()? {
-            if !seen.insert(*child_id) {
-                continue;
-            }
-            let Some(child) = channels_by_id.get(child_id) else {
-                continue;
-            };
-            if child.enabled() == Some(false) || child.channel_type() == Some(ChannelType::Layer) {
-                continue;
-            }
-            if child.kind() == Some(0) {
-                targets.sampler_channel_ids.insert(*child_id);
-            } else if self.channel_vst3_instances.contains_key(child_id) {
-                targets.vst3_channel_ids.insert(*child_id);
-            } else {
-                return None;
-            }
-        }
+        let targets = self.collect_live_layer_destinations(
+            source_channel_id,
+            &channels_by_id,
+            &mut BTreeSet::new(),
+        )?;
         (!targets.sampler_channel_ids.is_empty() && !targets.vst3_channel_ids.is_empty())
             .then_some(targets)
+    }
+
+    fn collect_live_layer_destinations(
+        &self,
+        layer_channel_id: u16,
+        channels_by_id: &BTreeMap<u16, &ChannelSummary>,
+        active_layers: &mut BTreeSet<u16>,
+    ) -> Option<LiveLayerInputTargets> {
+        let layer = channels_by_id.get(&layer_channel_id)?;
+        if layer.enabled() == Some(false) || !active_layers.insert(layer_channel_id) {
+            return Some(LiveLayerInputTargets {
+                sampler_channel_ids: BTreeSet::new(),
+                vst3_channel_ids: BTreeSet::new(),
+            });
+        }
+        let result = (|| {
+            let mut targets = LiveLayerInputTargets {
+                sampler_channel_ids: BTreeSet::new(),
+                vst3_channel_ids: BTreeSet::new(),
+            };
+            let mut seen = BTreeSet::new();
+            for child_id in layer.layer_child_ids()? {
+                if !seen.insert(*child_id) {
+                    continue;
+                }
+                let Some(child) = channels_by_id.get(child_id) else {
+                    continue;
+                };
+                if child.enabled() == Some(false) {
+                    continue;
+                }
+                if child.channel_type() == Some(ChannelType::Layer) {
+                    let nested = self.collect_live_layer_destinations(
+                        *child_id,
+                        channels_by_id,
+                        active_layers,
+                    )?;
+                    targets
+                        .sampler_channel_ids
+                        .extend(nested.sampler_channel_ids);
+                    targets.vst3_channel_ids.extend(nested.vst3_channel_ids);
+                } else if child.kind() == Some(0) {
+                    targets.sampler_channel_ids.insert(*child_id);
+                } else if self.channel_vst3_instances.contains_key(child_id) {
+                    targets.vst3_channel_ids.insert(*child_id);
+                } else {
+                    return None;
+                }
+            }
+            Some(targets)
+        })();
+        active_layers.remove(&layer_channel_id);
+        result
     }
 
     fn start_live_vst3_input(&mut self, pattern_id: u16, channel_id: u16) -> bool {
@@ -34687,7 +34700,7 @@ impl DawUi {
             return false;
         }
         let Some(target_channel_ids) = self.live_vst3_target_channels(channel_id) else {
-            self.status = "Live VST3 audition needs a loaded VST3 channel or a Layer whose enabled non-Layer children are loaded VST3s".to_owned();
+            self.status = "Live VST3 audition needs a loaded VST3 channel or a Layer whose enabled descendants are loaded VST3s".to_owned();
             return false;
         };
         if self.audio_engine.is_none() {
@@ -35085,7 +35098,7 @@ impl DawUi {
             return false;
         }
         let Some(target_channel_ids) = self.live_sampler_target_channels(channel_id) else {
-            self.status = "Live Sampler audition needs a Sampler channel or a Layer whose enabled non-Layer children are Samplers".to_owned();
+            self.status = "Live Sampler audition needs a Sampler channel or a Layer whose enabled descendants are Samplers".to_owned();
             return false;
         };
         let Some(project_path) = self.sample_project_path() else {
