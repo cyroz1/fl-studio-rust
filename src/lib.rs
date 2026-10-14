@@ -1399,6 +1399,8 @@ pub struct RandomNoteGeneratorOptions {
     pub step_ticks: u32,
     pub note_length_ticks: u32,
     pub density_percent: u8,
+    /// Number of distinct pitches to generate at each occupied grid position.
+    pub notes_per_step: u8,
     pub minimum_key: u16,
     pub maximum_key: u16,
 }
@@ -10994,6 +10996,11 @@ impl FlpDocument {
                 "random note generation density must be between 0 and 100 percent",
             ));
         }
+        if !(1..=16).contains(&options.notes_per_step) {
+            return Err(FlpError::UnsupportedEdit(
+                "random note generation stack must be between 1 and 16 notes per step",
+            ));
+        }
         if options.minimum_key > options.maximum_key || options.maximum_key > 127 {
             return Err(FlpError::UnsupportedEdit(
                 "random note generation key range must be ordered and remain within keys 0 through 127",
@@ -11021,9 +11028,10 @@ impl FlpDocument {
             ))?;
         let grid_positions = u64::from(options.end_tick - options.start_tick)
             .div_ceil(u64::from(options.step_ticks));
-        if grid_positions > MAX_MERGED_PATTERN_NOTES as u64 {
+        let note_opportunities = grid_positions * u64::from(options.notes_per_step);
+        if note_opportunities > MAX_MERGED_PATTERN_NOTES as u64 {
             return Err(FlpError::UnsupportedEdit(
-                "random note generation is limited to two million grid positions",
+                "random note generation is limited to two million grid-note positions",
             ));
         }
 
@@ -11039,6 +11047,11 @@ impl FlpDocument {
                 "the requested key range contains no notes from the selected scale",
             ));
         }
+        if pitches.len() < usize::from(options.notes_per_step) {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested key range does not contain enough distinct pitches for the selected stack",
+            ));
+        }
 
         let mut state = if options.seed == 0 {
             0x9e37_79b9_7f4a_7c15
@@ -11046,7 +11059,7 @@ impl FlpDocument {
             options.seed
         };
         let available_notes = MAX_MERGED_PATTERN_NOTES.saturating_sub(pattern.notes.len());
-        let initial_capacity = usize::try_from(grid_positions.min(available_notes as u64))
+        let initial_capacity = usize::try_from(note_opportunities.min(available_notes as u64))
             .map_err(|_| FlpError::LengthOverflow)?
             .min(65_536);
         let mut additions = Vec::with_capacity(initial_capacity);
@@ -11058,23 +11071,31 @@ impl FlpDocument {
                     && next_randomizer_value(&mut state) % 100
                         < u64::from(options.density_percent));
             if selected {
-                if additions.len() >= available_notes {
-                    return Err(FlpError::UnsupportedEdit(
-                        "random note generation would exceed two million notes in this pattern",
-                    ));
-                }
-                let pitch_index =
-                    (next_randomizer_value(&mut state) % pitches.len() as u64) as usize;
                 let remaining_ticks = end_tick - position;
                 let length = u64::from(options.note_length_ticks).min(remaining_ticks);
-                let note = PatternNote {
-                    position: u32::try_from(position).map_err(|_| FlpError::LengthOverflow)?,
-                    length: u32::try_from(length).map_err(|_| FlpError::LengthOverflow)?,
-                    key: pitches[pitch_index],
-                    channel_id,
-                    ..PatternNote::default()
-                };
-                additions.push(note);
+                let mut selected_pitches = Vec::with_capacity(usize::from(options.notes_per_step));
+                while selected_pitches.len() < usize::from(options.notes_per_step) {
+                    let pitch_index =
+                        (next_randomizer_value(&mut state) % pitches.len() as u64) as usize;
+                    let pitch = pitches[pitch_index];
+                    if !selected_pitches.contains(&pitch) {
+                        selected_pitches.push(pitch);
+                    }
+                }
+                for key in selected_pitches {
+                    if additions.len() >= available_notes {
+                        return Err(FlpError::UnsupportedEdit(
+                            "random note generation would exceed two million notes in this pattern",
+                        ));
+                    }
+                    additions.push(PatternNote {
+                        position: u32::try_from(position).map_err(|_| FlpError::LengthOverflow)?,
+                        length: u32::try_from(length).map_err(|_| FlpError::LengthOverflow)?,
+                        key,
+                        channel_id,
+                        ..PatternNote::default()
+                    });
+                }
             }
             position = position.saturating_add(u64::from(options.step_ticks));
         }
