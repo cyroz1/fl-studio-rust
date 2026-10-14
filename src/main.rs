@@ -19,7 +19,8 @@ use flp_rebuild::{
     PatternControllerEdit, PatternNote, PatternNoteEdit, PlaylistClipEdit, PlaylistTrackEdit,
     PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit,
     ProjectSettingsEdit, QuantizeNoteMode, QuantizeNoteOptions, RandomNoteChordMap,
-    RandomNoteGeneratorOptions, RandomizerOptions, StrumOptions, TimeMarkerEdit,
+    RandomNoteGeneratorOptions, RandomizerOptions, ScaleLevelsOptions, StrumOptions,
+    TimeMarkerEdit,
 };
 
 fn main() -> ExitCode {
@@ -1550,6 +1551,42 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u32(position_ticks, "slice position")?,
             )
         }
+        [command, input, output, pattern_id, channel_id, center, tension, multiplier, offset]
+            if command == "scale-levels-notes" =>
+        {
+            scale_levels_notes_with_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                None,
+                ScaleLevelsOptions {
+                    center_percent: parse_i16(center, "Scale Levels center")?,
+                    tension_percent: parse_i16(tension, "Scale Levels tension")?,
+                    multiplier_percent: parse_u16(multiplier, "Scale Levels multiplier")?,
+                    offset_percent: parse_i16(offset, "Scale Levels offset")?,
+                },
+            )
+        }
+        [command, input, output, pattern_id, channel_id, note_indices, center, tension,
+            multiplier, offset]
+            if command == "scale-levels-notes-selected" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            scale_levels_notes_with_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Some(&note_indices),
+                ScaleLevelsOptions {
+                    center_percent: parse_i16(center, "Scale Levels center")?,
+                    tension_percent: parse_i16(tension, "Scale Levels tension")?,
+                    multiplier_percent: parse_u16(multiplier, "Scale Levels multiplier")?,
+                    offset_percent: parse_i16(offset, "Scale Levels offset")?,
+                },
+            )
+        }
         [command, input, output, pattern_id, channel_id, position, length, key, velocity]
             if command == "add-note" =>
         {
@@ -1958,6 +1995,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild arp-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <step-ticks> <range-octaves-1..4> <gate-1..100> <up|down|up-down>\n",
             "  flp-rebuild slice-notes <input.flp> <output.flp> <pattern-id> <channel-id> <position-ticks>\n",
             "  flp-rebuild slice-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <position-ticks>\n",
+            "  flp-rebuild scale-levels-notes <input.flp> <output.flp> <pattern-id> <channel-id> <center:-100..100> <tension:-100..100> <multiplier:0..200> <offset:-100..100>\n",
+            "  flp-rebuild scale-levels-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <center:-100..100> <tension:-100..100> <multiplier:0..200> <offset:-100..100>\n",
             "  flp-rebuild add-note <input.flp> <output.flp> <pattern-id> <channel-id> <position> <length> <key> <velocity>\n",
             "  flp-rebuild delete-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index>\n",
             "  flp-rebuild import-midi <input.flp> <input.mid> <output.flp> <track> <pattern-id> <channel-id>\n",
@@ -4601,6 +4640,42 @@ fn slice_notes_with_scope(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "sliced {created} notes at tick {position_ticks} in pattern {pattern_id}, channel {channel_id} ({}) to {}",
+        if note_indices.is_some() {
+            "selected notes"
+        } else {
+            "all channel notes"
+        },
+        output.display()
+    );
+    Ok(())
+}
+
+fn scale_levels_notes_with_scope(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    note_indices: Option<&[usize]>,
+    options: ScaleLevelsOptions,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let changed = match note_indices {
+        Some(note_indices) => document.scale_pattern_note_selection_levels_with_options(
+            pattern_id,
+            channel_id,
+            note_indices,
+            options,
+        ),
+        None => document.scale_pattern_note_levels_with_options(pattern_id, channel_id, options),
+    }
+    .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "scaled velocity levels for {changed} notes in pattern {pattern_id}, channel {channel_id} ({}) to {}",
         if note_indices.is_some() {
             "selected notes"
         } else {

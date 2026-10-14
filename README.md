@@ -92,6 +92,8 @@ flp-rebuild arp-notes <input.flp> <output.flp> <pattern-id> <channel-id> <step-t
 flp-rebuild arp-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <step-ticks> <range-octaves-1..4> <gate-1..100> <up|down|up-down>
 flp-rebuild slice-notes <input.flp> <output.flp> <pattern-id> <channel-id> <position-ticks>
 flp-rebuild slice-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <position-ticks>
+flp-rebuild scale-levels-notes <input.flp> <output.flp> <pattern-id> <channel-id> <center:-100..100> <tension:-100..100> <multiplier:0..200> <offset:-100..100>
+flp-rebuild scale-levels-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <center:-100..100> <tension:-100..100> <multiplier:0..200> <offset:-100..100>
 flp-rebuild add-note <input.flp> <output.flp> <pattern-id> <channel-id> <position> <length> <key> <velocity>
 flp-rebuild delete-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index>
 flp-rebuild import-midi <input.flp> <input.mid> <output.flp> <track> <pattern-id> <channel-id>
@@ -186,6 +188,8 @@ The Piano roll's **Edit** target selector applies note-transform buttons to eith
 **Claw machine channel/selected** gates notes on a repeating period, slews their timing toward the period start or end, can remove notes shorter than one period slice, and can stretch notes across gaps left by removed notes. Its 16-slice gate and timing curve are local interpretations; native note-splitting and exact distortion behavior remain unverified ([FL Studio Claw Machine manual](https://www.image-line.com/fl-studio-learning/fl-studio-online-manual/html/pianoroll_claw.htm)).
 
 **Slice channel/selected** splits targeted notes that cross the configured tick, retaining their note properties. The drag-based directional Slice tool remains incomplete.
+
+**Scale Levels channel/selected** and `scale-levels-notes` adjust note velocities with Center, logarithmic Tension, Multiply, and Offset. `scale-levels-notes-selected` accepts comma-separated zero-based channel-local note indexes. Center and Tension use local formulas pending comparison against native FL Studio.
 
 The Piano roll key and scale selectors highlight C through B in major, natural minor, harmonic minor, and major or minor pentatonic scales. Selecting **None** disables highlighting; the helper does not constrain note entry.
 
