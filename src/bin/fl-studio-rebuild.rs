@@ -3142,6 +3142,15 @@ struct PerformanceLaunchContext<'a> {
     signature_changes: &'a [(u32, u8, u8)],
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MidiHeldPerformanceClip {
+    arrangement_id: u16,
+    track_id: u32,
+    clip_index: usize,
+}
+
+type MidiPerformanceHoldMap = BTreeMap<(u8, u8), Vec<MidiHeldPerformanceClip>>;
+
 struct DawUi {
     document: Option<FlpDocument>,
     current_path: Option<PathBuf>,
@@ -3170,7 +3179,7 @@ struct DawUi {
     playing: bool,
     performance_mode_active: bool,
     held_performance_clips: Vec<(u16, u32, usize)>,
-    midi_held_performance_clips: BTreeMap<(u8, u8), Vec<(u16, u32, usize)>>,
+    midi_held_performance_clips: MidiPerformanceHoldMap,
     midi_performance_scene_mode: bool,
     midi_performance_plus_scene_mode: bool,
     performance_scene_round_robin: BTreeMap<(u16, u32, u32), usize>,
@@ -7510,8 +7519,12 @@ impl DawUi {
         self.midi_performance_scene_mode = false;
         self.midi_performance_plus_scene_mode = false;
         for (_, held_clips) in held {
-            for (arrangement_id, track_id, clip_index) in held_clips {
-                self.queue_performance_hold_release(arrangement_id, track_id, clip_index);
+            for clip in held_clips {
+                self.queue_performance_hold_release(
+                    clip.arrangement_id,
+                    clip.track_id,
+                    clip.clip_index,
+                );
             }
         }
     }
@@ -7578,8 +7591,12 @@ impl DawUi {
                 velocity: 0,
             } if channel == 0 => {
                 if let Some(held_clips) = self.midi_held_performance_clips.remove(&(channel, key)) {
-                    for (arrangement_id, track_id, clip_index) in held_clips {
-                        self.queue_performance_hold_release(arrangement_id, track_id, clip_index);
+                    for clip in held_clips {
+                        self.queue_performance_hold_release(
+                            clip.arrangement_id,
+                            clip.track_id,
+                            clip.clip_index,
+                        );
                     }
                 }
             }
@@ -7743,7 +7760,11 @@ impl DawUi {
                 self.midi_held_performance_clips
                     .entry((channel, key))
                     .or_default()
-                    .push((arrangement.id, track_id, clip_index));
+                    .push(MidiHeldPerformanceClip {
+                        arrangement_id: arrangement.id,
+                        track_id,
+                        clip_index,
+                    });
             }
             if queued {
                 self.status = format!("MIDI queued Playlist Clip {} for its track", clip_index + 1);
@@ -7884,7 +7905,11 @@ impl DawUi {
                     self.midi_held_performance_clips
                         .entry((channel, key))
                         .or_default()
-                        .push((arrangement.id, track.id, clip_index));
+                        .push(MidiHeldPerformanceClip {
+                            arrangement_id: arrangement.id,
+                            track_id: track.id,
+                            clip_index,
+                        });
                 }
                 self.status = if queued {
                     format!(
