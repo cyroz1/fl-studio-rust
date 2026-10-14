@@ -1361,8 +1361,8 @@ impl Default for FlamOptions {
         Self {
             stroke_ticks: 12,
             velocity: 80,
-            before: true,
-            group_notes: false,
+            before: false,
+            group_notes: true,
         }
     }
 }
