@@ -11080,7 +11080,6 @@ impl FlpDocument {
                         < u64::from(options.density_percent));
             if selected {
                 let remaining_ticks = end_tick - position;
-                let length = u64::from(options.note_length_ticks).min(remaining_ticks);
                 let mut selected_pitches = Vec::with_capacity(usize::from(options.notes_per_step));
                 while selected_pitches.len() < usize::from(options.notes_per_step) {
                     let pitch_index =
