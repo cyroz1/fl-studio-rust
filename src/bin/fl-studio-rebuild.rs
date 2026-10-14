@@ -3407,6 +3407,7 @@ struct DawUi {
     randomizer_snap_to_scale: bool,
     random_note_generation_density_percent: u8,
     random_note_generation_stack: u8,
+    random_note_generation_length_variation_percent: i16,
     random_note_generation_minimum_key: u8,
     random_note_generation_maximum_key: u8,
     random_note_generation_snap_to_scale: bool,
@@ -4184,6 +4185,7 @@ impl DawUi {
             randomizer_snap_to_scale: false,
             random_note_generation_density_percent: 100,
             random_note_generation_stack: 1,
+            random_note_generation_length_variation_percent: 0,
             random_note_generation_minimum_key: 48,
             random_note_generation_maximum_key: 84,
             random_note_generation_snap_to_scale: false,
@@ -25124,6 +25126,13 @@ impl DawUi {
                         .text("Random note stack"),
                 );
                 ui.add(
+                    egui::Slider::new(
+                        &mut self.random_note_generation_length_variation_percent,
+                        -100..=100,
+                    )
+                    .text("Random note length variation (%)"),
+                );
+                ui.add(
                     egui::Slider::new(&mut self.random_note_generation_minimum_key, 0..=127)
                         .text("Random note lowest key"),
                 );
@@ -25661,6 +25670,7 @@ impl DawUi {
                 let step_ticks = self.piano_roll_snap.ticks(ppq, time_signature);
                 let density_percent = self.random_note_generation_density_percent;
                 let notes_per_step = self.random_note_generation_stack;
+                let length_variation_percent = self.random_note_generation_length_variation_percent;
                 let minimum_key = u16::from(self.random_note_generation_minimum_key);
                 let maximum_key = u16::from(self.random_note_generation_maximum_key);
                 let scale_root = self.piano_roll_scale_root;
@@ -25675,6 +25685,7 @@ impl DawUi {
                     note_length_ticks: step_ticks,
                     density_percent,
                     notes_per_step,
+                    length_variation_percent,
                     minimum_key,
                     maximum_key,
                 };
@@ -25704,7 +25715,7 @@ impl DawUi {
                             self.dirty = true;
                         }
                         self.status = format!(
-                            "Generated {created} notes in pattern {pattern_id} from tick {start_tick} to {end_tick} using seed {seed}{}",
+                            "Generated {created} notes in pattern {pattern_id} from tick {start_tick} to {end_tick} using seed {seed} with {length_variation_percent}% length variation{}",
                             if snap_to_scale {
                                 " within the current scale"
                             } else {

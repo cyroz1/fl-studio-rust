@@ -638,6 +638,62 @@ fn run(args: Vec<String>) -> Result<(), String> {
             )
         }
         [command, input, output, pattern_id, channel_id, start_tick, end_tick, step_ticks,
+            note_length_ticks, density, minimum_key, maximum_key, seed, stack, length_variation]
+            if command == "generate-random-notes" =>
+        {
+            generate_random_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                RandomNoteGeneratorOptions {
+                    seed: parse_u64(seed, "random note generator seed")?,
+                    start_tick: parse_u32(start_tick, "generation start tick")?,
+                    end_tick: parse_u32(end_tick, "generation end tick")?,
+                    step_ticks: parse_u32(step_ticks, "generation step")?,
+                    note_length_ticks: parse_u32(note_length_ticks, "generated note length")?,
+                    density_percent: parse_u8(density, "generation density")?,
+                    notes_per_step: parse_u8(stack, "note stack")?,
+                    length_variation_percent: parse_i16(
+                        length_variation,
+                        "note length variation",
+                    )?,
+                    minimum_key: u16::from(parse_u8(minimum_key, "minimum key")?),
+                    maximum_key: u16::from(parse_u8(maximum_key, "maximum key")?),
+                },
+                None,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, start_tick, end_tick, step_ticks,
+            note_length_ticks, density, minimum_key, maximum_key, seed, scale_name, scale_root,
+            stack, length_variation]
+            if command == "generate-random-notes-scale" =>
+        {
+            let scale_intervals = parse_scale_name(scale_name)?;
+            generate_random_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                RandomNoteGeneratorOptions {
+                    seed: parse_u64(seed, "random note generator seed")?,
+                    start_tick: parse_u32(start_tick, "generation start tick")?,
+                    end_tick: parse_u32(end_tick, "generation end tick")?,
+                    step_ticks: parse_u32(step_ticks, "generation step")?,
+                    note_length_ticks: parse_u32(note_length_ticks, "generated note length")?,
+                    density_percent: parse_u8(density, "generation density")?,
+                    notes_per_step: parse_u8(stack, "note stack")?,
+                    length_variation_percent: parse_i16(
+                        length_variation,
+                        "note length variation",
+                    )?,
+                    minimum_key: u16::from(parse_u8(minimum_key, "minimum key")?),
+                    maximum_key: u16::from(parse_u8(maximum_key, "maximum key")?),
+                },
+                Some((parse_u8(scale_root, "scale root")?, scale_intervals)),
+            )
+        }
+        [command, input, output, pattern_id, channel_id, start_tick, end_tick, step_ticks,
             note_length_ticks, density, minimum_key, maximum_key, seed, stack]
             if command == "generate-random-notes" =>
         {
@@ -654,6 +710,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                     note_length_ticks: parse_u32(note_length_ticks, "generated note length")?,
                     density_percent: parse_u8(density, "generation density")?,
                     notes_per_step: parse_u8(stack, "note stack")?,
+                    length_variation_percent: 0,
                     minimum_key: u16::from(parse_u8(minimum_key, "minimum key")?),
                     maximum_key: u16::from(parse_u8(maximum_key, "maximum key")?),
                 },
@@ -679,6 +736,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                     note_length_ticks: parse_u32(note_length_ticks, "generated note length")?,
                     density_percent: parse_u8(density, "generation density")?,
                     notes_per_step: parse_u8(stack, "note stack")?,
+                    length_variation_percent: 0,
                     minimum_key: u16::from(parse_u8(minimum_key, "minimum key")?),
                     maximum_key: u16::from(parse_u8(maximum_key, "maximum key")?),
                 },
@@ -702,6 +760,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                     note_length_ticks: parse_u32(note_length_ticks, "generated note length")?,
                     density_percent: parse_u8(density, "generation density")?,
                     notes_per_step: 1,
+                    length_variation_percent: 0,
                     minimum_key: u16::from(parse_u8(minimum_key, "minimum key")?),
                     maximum_key: u16::from(parse_u8(maximum_key, "maximum key")?),
                 },
@@ -726,6 +785,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                     note_length_ticks: parse_u32(note_length_ticks, "generated note length")?,
                     density_percent: parse_u8(density, "generation density")?,
                     notes_per_step: 1,
+                    length_variation_percent: 0,
                     minimum_key: u16::from(parse_u8(minimum_key, "minimum key")?),
                     maximum_key: u16::from(parse_u8(maximum_key, "maximum key")?),
                 },
@@ -1406,8 +1466,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild flip-notes <input.flp> <output.flp> <pattern-id> <channel-id>\n",
             "  flp-rebuild strum-notes <input.flp> <output.flp> <pattern-id> <channel-id> <spread-ticks> <up|down>\n",
             "  flp-rebuild flam-notes <input.flp> <output.flp> <pattern-id> <channel-id> <stroke-ticks> <velocity-0..127> <before|after>\n",
-            "  flp-rebuild generate-random-notes <input.flp> <output.flp> <pattern-id> <channel-id> <start-ticks> <end-ticks-exclusive> <step-ticks> <note-length-ticks> <density-0..100> <minimum-key-0..127> <maximum-key-0..127> <seed> [stack-1..16]\n",
-            "  flp-rebuild generate-random-notes-scale <input.flp> <output.flp> <pattern-id> <channel-id> <start-ticks> <end-ticks-exclusive> <step-ticks> <note-length-ticks> <density-0..100> <minimum-key-0..127> <maximum-key-0..127> <seed> <scale-name> <scale-root-0..11> [stack-1..16]\n",
+            "  flp-rebuild generate-random-notes <input.flp> <output.flp> <pattern-id> <channel-id> <start-ticks> <end-ticks-exclusive> <step-ticks> <note-length-ticks> <density-0..100> <minimum-key-0..127> <maximum-key-0..127> <seed> [stack-1..16 [length-variation:-100..100]]\n",
+            "  flp-rebuild generate-random-notes-scale <input.flp> <output.flp> <pattern-id> <channel-id> <start-ticks> <end-ticks-exclusive> <step-ticks> <note-length-ticks> <density-0..100> <minimum-key-0..127> <maximum-key-0..127> <seed> <scale-name> <scale-root-0..11> [stack-1..16 [length-variation:-100..100]]\n",
             "  flp-rebuild randomize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <velocity:-100..100> <pan:-100..100> <pitch-range:0..24> <bipolar:0|1> <reset:0|1> [release:-100..100 mod-x:-100..100 mod-y:-100..100]\n",
             "  flp-rebuild randomize-notes-scale <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <velocity:-100..100> <pan:-100..100> <pitch-range:0..24> <bipolar:0|1> <reset:0|1> <scale-name> <scale-root:0..11> [release:-100..100 mod-x:-100..100 mod-y:-100..100]\n",
             "  flp-rebuild randomize-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <seed> <velocity:-100..100> <pan:-100..100> <pitch-range:0..24> <bipolar:0|1> <reset:0|1> [release:-100..100 mod-x:-100..100 mod-y:-100..100]\n",

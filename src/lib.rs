@@ -1401,6 +1401,8 @@ pub struct RandomNoteGeneratorOptions {
     pub density_percent: u8,
     /// Number of distinct pitches to generate at each occupied grid position.
     pub notes_per_step: u8,
+    /// Maximum seeded note-length variation, from -100% (shorter) to +100% (longer).
+    pub length_variation_percent: i16,
     pub minimum_key: u16,
     pub maximum_key: u16,
 }
@@ -11001,6 +11003,11 @@ impl FlpDocument {
                 "random note generation stack must be between 1 and 16 notes per step",
             ));
         }
+        if !(-100..=100).contains(&options.length_variation_percent) {
+            return Err(FlpError::UnsupportedEdit(
+                "random note length variation must be between -100 and 100 percent",
+            ));
+        }
         if options.minimum_key > options.maximum_key || options.maximum_key > 127 {
             return Err(FlpError::UnsupportedEdit(
                 "random note generation key range must be ordered and remain within keys 0 through 127",
@@ -11058,6 +11065,7 @@ impl FlpDocument {
         } else {
             options.seed
         };
+        let mut length_state = state ^ 0xd1b5_4a32_d192_ed03;
         let available_notes = MAX_MERGED_PATTERN_NOTES.saturating_sub(pattern.notes.len());
         let initial_capacity = usize::try_from(note_opportunities.min(available_notes as u64))
             .map_err(|_| FlpError::LengthOverflow)?
@@ -11082,6 +11090,20 @@ impl FlpDocument {
                         selected_pitches.push(pitch);
                     }
                 }
+                let base_length = u64::from(options.note_length_ticks);
+                let variation_percent = u64::from(options.length_variation_percent.unsigned_abs());
+                let maximum_variation = base_length.saturating_mul(variation_percent).div_ceil(100);
+                let variation = if maximum_variation == 0 {
+                    0
+                } else {
+                    next_randomizer_value(&mut length_state) % (maximum_variation + 1)
+                };
+                let varied_length = if options.length_variation_percent < 0 {
+                    base_length.saturating_sub(variation).max(1)
+                } else {
+                    base_length.saturating_add(variation)
+                };
+                let length = varied_length.min(remaining_ticks);
                 for key in selected_pitches {
                     if additions.len() >= available_notes {
                         return Err(FlpError::UnsupportedEdit(
