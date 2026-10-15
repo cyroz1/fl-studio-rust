@@ -1234,8 +1234,6 @@ jobs:
           path: |
             dist/*.deb
             dist/*.AppImage
-            dist/*.tar.gz
-            dist/PKGBUILD
           if-no-files-found: error
           retention-days: 14
 

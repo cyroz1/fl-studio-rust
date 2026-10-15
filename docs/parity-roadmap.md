@@ -398,7 +398,7 @@ are applied where the Mixer rows below describe. Full export surface:
 |---|---|---|
 | Windows installer (NSIS/WiX) | `[partial]` | CI uploads the Windows NSIS setup executable; signing and runtime verification remain |
 | macOS app bundle, notarization | `[partial]` | CI launches the packaged app for a smoke check and uploads only its `.dmg` installer. Without signing secrets the disk image is unsigned; configured builds are checked with Apple's signature, stapler, and Gatekeeper tools. AU hosting + CoreAudio remain pending. |
-| Linux builds (AppImage/deb) | `[partial]` | CI uploads Debian, AppImage, and Pacman package outputs; XCB headers handled |
+| Linux builds (AppImage/deb) | `[partial]` | CI artifacts contain only the Debian and AppImage installers; the generic tarball and Arch package recipe are excluded. XCB headers handled |
 | Windows: ASIO support | `[partial]` | CPAL's ASIO backend is enabled on Windows; device enumeration includes available hosts, saved ASIO device IDs reopen through ASIO, and the UI limits ASIO devices to shared access. A Windows build and physical-driver input/output check remain. |
 | macOS: native menu bar, file associations | `[partial]` | The packaged app registers `.flp` project files and the application opens a project path passed on launch. Functional command menus remain in the app window; a native macOS menu bar and macOS file-open event handling while the app is already running remain. |
 | Cross-platform CI | `[done]` | |
