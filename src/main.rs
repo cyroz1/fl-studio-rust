@@ -1138,8 +1138,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 Path::new(output),
                 parse_u16(pattern_id, "pattern id")?,
                 parse_u16(channel_id, "channel id")?,
-                ArpeggioOptions {
-                    step_ticks: parse_u32(step_ticks, "arpeggiator step")?,
+                ArpeggiatorCliOptions {
+                    step: step_ticks,
                     range_octaves: parse_u8(range_octaves, "arpeggiator range")?,
                     gate_percent: parse_u8(gate, "arpeggiator gate")?,
                     direction,
@@ -1155,8 +1155,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 Path::new(output),
                 parse_u16(pattern_id, "pattern id")?,
                 parse_u16(channel_id, "channel id")?,
-                ArpeggioOptions {
-                    step_ticks: parse_u32(step_ticks, "arpeggiator step")?,
+                ArpeggiatorCliOptions {
+                    step: step_ticks,
                     range_octaves: parse_u8(range_octaves, "arpeggiator range")?,
                     gate_percent: parse_u8(gate, "arpeggiator gate")?,
                     direction: parse_arpeggio_direction(direction)?,
@@ -1688,8 +1688,9 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild limit-selected-notes <input.flp> <output.flp> <pattern-id> <channel-id> <minimum-key-0..127> <maximum-key-0..127> [key=value ...] <note-index,note-index,...>\n",
             "    Limit keys: wrap_to_bottom, scale_name, scale_root, snap_direction; scale_name uses names accepted by the scale-aware randomize commands\n",
             "    Limit values: booleans are 0|1|true|false; snap_direction=up|down|alternate; scale_name and scale_root must be supplied together\n",
-            "  flp-rebuild arp-notes <input.flp> <output.flp> <pattern-id> <channel-id> <step-ticks> <range-octaves-1..4> <gate-1..100> <up|down|up-down>\n",
-            "  flp-rebuild arp-selected-notes <input.flp> <output.flp> <pattern-id> <channel-id> <step-ticks> <range-octaves-1..4> <gate-1..100> <up|down|up-down> <note-index,note-index,...>\n",
+            "  flp-rebuild arp-notes <input.flp> <output.flp> <pattern-id> <channel-id> <step-ticks|1/n> <range-octaves-1..4> <gate-1..100> <up|down|up-down>\n",
+            "  flp-rebuild arp-selected-notes <input.flp> <output.flp> <pattern-id> <channel-id> <step-ticks|1/n> <range-octaves-1..4> <gate-1..100> <up|down|up-down> <note-index,note-index,...>\n",
+            "    Arpeggiator step accepts ticks or 1/1, 1/2, 1/4, 1/8, 1/16, 1/32, 1/64, or 1/128, rounded to project ticks using PPQ.\n",
             "  flp-rebuild riff-notes <input.flp> <output.flp> <pattern-id> <channel-id> <scale-name> <scale-root-0..11> <minimum-key-0..127> <maximum-key-0..127> <step-ticks> <range-octaves-1..4> <gate-1..100> <up|down|up-down> <seed> [key=value ...]\n",
             "  flp-rebuild riff-selected-notes <input.flp> <output.flp> <pattern-id> <channel-id> <scale-name> <scale-root-0..11> <minimum-key-0..127> <maximum-key-0..127> <step-ticks> <range-octaves-1..4> <gate-1..100> <up|down|up-down> <seed> [key=value ...] <note-index,note-index,...>\n",
             "    Riff keys: wrap_to_bottom, snap_direction, mirror_horizontal, preserve_start_times, mirror_vertical, groove_snap_ticks, groove_start_percent, groove_sensitivity_percent, groove_duration_percent, groove_quantize_mode, pan_variation_percent, length_multiplier_percent, velocity_variation_percent, release_variation_percent, mod_x_variation_percent, mod_y_variation_percent, pitch_variation_semitones, reset_levels, bipolar_levels\n",
@@ -4501,30 +4502,35 @@ fn parse_flam_stroke_duration(value: &str, document: &FlpDocument) -> Result<u32
     Ok(stroke_ticks as u32)
 }
 
-fn parse_humanize_timing_range(value: &str, document: &FlpDocument) -> Result<u32, String> {
+fn parse_tempo_relative_ticks(
+    value: &str,
+    document: &FlpDocument,
+    tick_description: &str,
+) -> Result<u32, String> {
     let Some((numerator, denominator)) = value.split_once('/') else {
-        return parse_u32(value, "humanize timing range ticks");
+        return parse_u32(value, tick_description);
     };
     if numerator != "1" {
-        return Err("humanize note division must be written as 1/<denominator>".to_owned());
+        return Err("note division must be written as 1/<denominator>".to_owned());
     }
-    let denominator = parse_u16(denominator, "humanize note division denominator")?;
+    let denominator = parse_u16(denominator, "note division denominator")?;
     if !matches!(denominator, 1 | 2 | 4 | 8 | 16 | 32 | 64 | 128) {
-        return Err("humanize note division must be between 1/1 and 1/128".to_owned());
+        return Err(
+            "note division must be 1/1, 1/2, 1/4, 1/8, 1/16, 1/32, 1/64, or 1/128".to_owned(),
+        );
     }
 
     let ppq = document.header().ppq();
     if ppq == 0 {
-        return Err("humanize note division cannot be mapped with a zero project PPQ".to_owned());
+        return Err("note division cannot be mapped with a zero project PPQ".to_owned());
     }
     let quarter_note_ticks = u64::from(ppq) * 4;
     let denominator = u64::from(denominator);
     let ticks = (quarter_note_ticks + denominator / 2) / denominator;
     if ticks == 0 {
-        return Err("humanize note division rounds to less than one project tick".to_owned());
+        return Err("note division rounds to less than one project tick".to_owned());
     }
-    u32::try_from(ticks)
-        .map_err(|_| "humanize note division exceeds the supported tick range".to_owned())
+    u32::try_from(ticks).map_err(|_| "note division exceeds the supported tick range".to_owned())
 }
 
 fn randomize_notes(
@@ -4637,7 +4643,8 @@ fn humanize_notes(
     velocity_variation_percent: u8,
 ) -> Result<(), String> {
     let (_, mut document) = load_document(input)?;
-    let timing_range_ticks = parse_humanize_timing_range(timing_range, &document)?;
+    let timing_range_ticks =
+        parse_tempo_relative_ticks(timing_range, &document, "humanize timing range ticks")?;
     let changed = document
         .humanize_pattern_notes(
             pattern_id,
@@ -4675,7 +4682,11 @@ fn humanize_selected_notes(
     note_indices: &[usize],
 ) -> Result<(), String> {
     let (_, mut document) = load_document(input)?;
-    let timing_range_ticks = parse_humanize_timing_range(options.timing_range, &document)?;
+    let timing_range_ticks = parse_tempo_relative_ticks(
+        options.timing_range,
+        &document,
+        "humanize timing range ticks",
+    )?;
     let changed = document
         .humanize_pattern_note_selection(
             pattern_id,
@@ -4798,14 +4809,28 @@ fn riff_machine_notes(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct ArpeggiatorCliOptions<'a> {
+    step: &'a str,
+    range_octaves: u8,
+    gate_percent: u8,
+    direction: ArpeggioDirection,
+}
+
 fn arpeggiate_notes(
     input: &Path,
     output: &Path,
     pattern_id: u16,
     channel_id: u16,
-    options: ArpeggioOptions,
+    options: ArpeggiatorCliOptions<'_>,
 ) -> Result<(), String> {
     let (_, mut document) = load_document(input)?;
+    let options = ArpeggioOptions {
+        step_ticks: parse_tempo_relative_ticks(options.step, &document, "arpeggiator step ticks")?,
+        range_octaves: options.range_octaves,
+        gate_percent: options.gate_percent,
+        direction: options.direction,
+    };
     let created = document
         .arpeggiate_pattern_notes(pattern_id, channel_id, options)
         .map_err(|error| error.to_string())?;
@@ -4826,10 +4851,16 @@ fn arpeggiate_selected_notes(
     output: &Path,
     pattern_id: u16,
     channel_id: u16,
-    options: ArpeggioOptions,
+    options: ArpeggiatorCliOptions<'_>,
     note_indices: &[usize],
 ) -> Result<(), String> {
     let (_, mut document) = load_document(input)?;
+    let options = ArpeggioOptions {
+        step_ticks: parse_tempo_relative_ticks(options.step, &document, "arpeggiator step ticks")?,
+        range_octaves: options.range_octaves,
+        gate_percent: options.gate_percent,
+        direction: options.direction,
+    };
     let created = document
         .arpeggiate_pattern_note_selection(pattern_id, channel_id, note_indices, options)
         .map_err(|error| error.to_string())?;

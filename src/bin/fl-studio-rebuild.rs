@@ -99,7 +99,7 @@ const PURPLE: Color32 = Color32::from_rgb(150, 93, 181);
 const ORANGE: Color32 = Color32::from_rgb(195, 129, 61);
 const RED: Color32 = Color32::from_rgb(252, 67, 46);
 
-fn humanize_note_division_ticks(ppq: u16, denominator: u16) -> Option<u32> {
+fn tempo_relative_note_division_ticks(ppq: u16, denominator: u16) -> Option<u32> {
     if ppq == 0 || !matches!(denominator, 1 | 2 | 4 | 8 | 16 | 32 | 64 | 128) {
         return None;
     }
@@ -3430,6 +3430,7 @@ struct DawUi {
     note_limit_snap_to_scale: bool,
     note_limit_snap_direction: LimitSnapDirection,
     arpeggiator_step_ticks: u32,
+    arpeggiator_step_note_division: Option<u16>,
     arpeggiator_range_octaves: u8,
     arpeggiator_gate_percent: u8,
     arpeggiator_direction: ArpeggioDirection,
@@ -4164,6 +4165,7 @@ impl DawUi {
             note_limit_snap_to_scale: false,
             note_limit_snap_direction: LimitSnapDirection::Up,
             arpeggiator_step_ticks: 24,
+            arpeggiator_step_note_division: None,
             arpeggiator_range_octaves: 1,
             arpeggiator_gate_percent: 80,
             arpeggiator_direction: ArpeggioDirection::Up,
@@ -25121,10 +25123,38 @@ impl DawUi {
                             });
                     },
                 );
-                ui.add(
-                    egui::Slider::new(&mut self.arpeggiator_step_ticks, 1..=384)
-                        .text("Arpeggiator step (ticks)"),
+                let step_unit = self.arpeggiator_step_note_division.map_or_else(
+                    || "Ticks".to_owned(),
+                    |denominator| format!("1/{denominator} note"),
                 );
+                egui::ComboBox::from_id_salt("piano-roll-arpeggiator-step-unit")
+                    .selected_text(step_unit)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.arpeggiator_step_note_division,
+                            None,
+                            "Ticks",
+                        );
+                        for denominator in [1, 2, 4, 8, 16, 32, 64, 128] {
+                            ui.selectable_value(
+                                &mut self.arpeggiator_step_note_division,
+                                Some(denominator),
+                                format!("1/{denominator} note"),
+                            );
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "Note divisions are converted using project PPQ, so their playback duration follows tempo changes.",
+                    );
+                if let Some(denominator) = self.arpeggiator_step_note_division {
+                    ui.label(format!("Step: 1/{denominator} note"));
+                } else {
+                    ui.add(
+                        egui::Slider::new(&mut self.arpeggiator_step_ticks, 1..=384)
+                            .text("Arpeggiator step (ticks)"),
+                    );
+                }
                 ui.add(
                     egui::Slider::new(&mut self.arpeggiator_range_octaves, 1..=4)
                         .text("Arpeggiator octaves"),
@@ -25632,7 +25662,7 @@ impl DawUi {
                 .and_then(|document| {
                     let timing_range_ticks = match timing_note_division {
                         Some(denominator) => {
-                            humanize_note_division_ticks(document.header().ppq(), denominator)
+                            tempo_relative_note_division_ticks(document.header().ppq(), denominator)
                                 .ok_or_else(|| {
                                     "humanize note division cannot be mapped using the project PPQ"
                                         .to_owned()
@@ -25730,6 +25760,7 @@ impl DawUi {
                 (self.selected_pattern, self.selected_note_channel)
         {
             let step_ticks = self.arpeggiator_step_ticks;
+            let step_note_division = self.arpeggiator_step_note_division;
             let range_octaves = self.arpeggiator_range_octaves;
             let gate_percent = self.arpeggiator_gate_percent;
             let direction = self.arpeggiator_direction;
@@ -25738,6 +25769,17 @@ impl DawUi {
                 .as_mut()
                 .ok_or_else(|| "no project is open".to_owned())
                 .and_then(|document| {
+                    let step_ticks = match step_note_division {
+                        Some(denominator) => tempo_relative_note_division_ticks(
+                            document.header().ppq(),
+                            denominator,
+                        )
+                        .ok_or_else(|| {
+                            "arpeggiator note division cannot be mapped using the project PPQ"
+                                .to_owned()
+                        })?,
+                        None => step_ticks,
+                    };
                     let result = if edit_selection_only {
                         document.arpeggiate_pattern_note_selection(
                             pattern_id,
