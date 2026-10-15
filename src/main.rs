@@ -14,9 +14,9 @@ use flp_rebuild::sample_render::{
 };
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions};
 use flp_rebuild::{
-    ArpeggioDirection, ArpeggioOptions, AutomationPointEdit, ChannelLevelAdjustmentsEdit,
-    FlpDocument, FstPreset, PatternControllerEdit, PatternNote, PatternNoteEdit,
-    PatternNoteRotation, PlaylistClipEdit, PlaylistTrackEdit, PlaylistTrackMotion,
+    ArpeggioDirection, ArpeggioOptions, ArticulateOptions, AutomationPointEdit,
+    ChannelLevelAdjustmentsEdit, FlpDocument, FstPreset, PatternControllerEdit, PatternNote,
+    PatternNoteEdit, PatternNoteRotation, PlaylistClipEdit, PlaylistTrackEdit, PlaylistTrackMotion,
     PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions,
     ScaleLevelsOptions, TimeMarkerEdit,
 };
@@ -695,6 +695,46 @@ fn run(args: Vec<String>) -> Result<(), String> {
                     tension_percent: parse_i16(tension, "Scale Levels tension")?,
                     multiplier_percent: parse_u16(multiplier, "Scale Levels multiplier")?,
                     offset_percent: parse_i16(offset, "Scale Levels offset")?,
+                },
+                Some(&parse_note_indices(note_indices)?),
+            )
+        }
+        [command, input, output, pattern_id, channel_id, multiplier, variation, seed, lengths,
+            chop_chords]
+            if command == "articulate-notes" =>
+        {
+            articulate_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                ArticulateCliOptions {
+                    multiplier_percent: parse_u8(multiplier, "articulate multiplier")?,
+                    variation_percent: parse_u8(variation, "articulate variation")?,
+                    seed: parse_u64(seed, "articulate seed")?,
+                    use_original_lengths: parse_articulate_lengths(lengths)?,
+                    chop_chords: parse_bool(chop_chords, "chop chords")?,
+                    only_with_selection: false,
+                },
+                None,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, multiplier, variation, seed, lengths,
+            chop_chords, only_with_selection, note_indices]
+            if command == "articulate-selected-notes" =>
+        {
+            articulate_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                ArticulateCliOptions {
+                    multiplier_percent: parse_u8(multiplier, "articulate multiplier")?,
+                    variation_percent: parse_u8(variation, "articulate variation")?,
+                    seed: parse_u64(seed, "articulate seed")?,
+                    use_original_lengths: parse_articulate_lengths(lengths)?,
+                    chop_chords: parse_bool(chop_chords, "chop chords")?,
+                    only_with_selection: parse_bool(only_with_selection, "only with selection")?,
                 },
                 Some(&parse_note_indices(note_indices)?),
             )
@@ -1470,6 +1510,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild rotate-selected-notes <input.flp> <output.flp> <pattern-id> <channel-id> <snap-ticks> <left|right> <note-index,note-index,...>\n",
             "  flp-rebuild scale-note-levels <input.flp> <output.flp> <pattern-id> <channel-id> <center:-100..100> <tension:-100..100> <multiplier:0..200> <offset:-100..100>\n",
             "  flp-rebuild scale-selected-note-levels <input.flp> <output.flp> <pattern-id> <channel-id> <center:-100..100> <tension:-100..100> <multiplier:0..200> <offset:-100..100> <note-index,note-index,...>\n",
+            "  flp-rebuild articulate-notes <input.flp> <output.flp> <pattern-id> <channel-id> <multiplier-10..100> <variation-0..100> <seed> <original|legato> <chop-chords:0|1>\n",
+            "  flp-rebuild articulate-selected-notes <input.flp> <output.flp> <pattern-id> <channel-id> <multiplier-10..100> <variation-0..100> <seed> <original|legato> <chop-chords:0|1> <only-with-selection:0|1> <note-index,note-index,...>\n",
             "  flp-rebuild legato-notes <input.flp> <output.flp> <pattern-id> <channel-id>\n",
             "  flp-rebuild legato-selected-notes <input.flp> <output.flp> <pattern-id> <channel-id> <note-index,note-index,...>\n",
             "  flp-rebuild chop-notes <input.flp> <output.flp> <pattern-id> <channel-id> <divisions-2..64>\n",
@@ -1629,6 +1671,14 @@ fn parse_bool(value: &str, description: &str) -> Result<bool, String> {
         "0" | "false" => Ok(false),
         "1" | "true" => Ok(true),
         _ => Err(format!("{description} must be 0 or 1")),
+    }
+}
+
+fn parse_articulate_lengths(value: &str) -> Result<bool, String> {
+    match value {
+        "original" => Ok(true),
+        "legato" => Ok(false),
+        _ => Err("articulate length mode must be 'original' or 'legato'".to_owned()),
     }
 }
 
@@ -3657,6 +3707,68 @@ fn scale_note_levels(
             "selected notes"
         } else {
             "notes"
+        },
+        output.display()
+    );
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct ArticulateCliOptions {
+    multiplier_percent: u8,
+    variation_percent: u8,
+    seed: u64,
+    use_original_lengths: bool,
+    chop_chords: bool,
+    only_with_selection: bool,
+}
+
+fn articulate_notes(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    cli_options: ArticulateCliOptions,
+    note_indices: Option<&[usize]>,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let options = ArticulateOptions {
+        multiplier_percent: cli_options.multiplier_percent,
+        variation_percent: cli_options.variation_percent,
+        seed: cli_options.seed,
+        use_original_lengths: cli_options.use_original_lengths,
+        chop_chords: cli_options.chop_chords,
+    };
+    let changed = match note_indices {
+        Some(note_indices) => document.articulate_pattern_note_selection(
+            pattern_id,
+            channel_id,
+            note_indices,
+            options,
+            cli_options.only_with_selection,
+        ),
+        None => document.articulate_pattern_notes(pattern_id, channel_id, options),
+    }
+    .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "articulated {changed} {} in pattern {pattern_id}, channel {channel_id} with {}% length, {}% variation (seed {}){} to {}",
+        if note_indices.is_some() {
+            "selected notes"
+        } else {
+            "notes"
+        },
+        cli_options.multiplier_percent,
+        cli_options.variation_percent,
+        cli_options.seed,
+        if cli_options.chop_chords {
+            ", chopping chords"
+        } else {
+            ""
         },
         output.display()
     );
