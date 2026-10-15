@@ -755,6 +755,30 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 Some(&parse_note_indices(note_indices)?),
             )
         }
+        [command, input, output, pattern_id, channel_id, preset]
+            if command == "articulate-preset" =>
+        {
+            articulate_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                parse_articulate_preset(preset)?,
+                None,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, preset, note_indices]
+            if command == "articulate-selected-preset" =>
+        {
+            articulate_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                parse_articulate_preset(preset)?,
+                Some(&parse_note_indices(note_indices)?),
+            )
+        }
         [command, input, output, pattern_id, channel_id, period_ticks, trash_every,
             time_distortion, remove_short_notes, stretch_to_compensate]
             if command == "claw-notes" =>
@@ -1662,6 +1686,9 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild scale-selected-note-levels <input.flp> <output.flp> <pattern-id> <channel-id> <center:-100..100> <tension:-100..100> <multiplier:0..200> <offset:-100..100> <note-index,note-index,...>\n",
             "  flp-rebuild articulate-notes <input.flp> <output.flp> <pattern-id> <channel-id> <multiplier-10..100> <variation-0..100> <seed> <original|legato> <chop-chords:0|1>\n",
             "  flp-rebuild articulate-selected-notes <input.flp> <output.flp> <pattern-id> <channel-id> <multiplier-10..100> <variation-0..100> <seed> <original|legato> <chop-chords:0|1> <only-with-selection:0|1> <note-index,note-index,...>\n",
+            "  flp-rebuild articulate-preset <input.flp> <output.flp> <pattern-id> <channel-id> <legato|portato|staccato|small-gap|chop-chords>\n",
+            "  flp-rebuild articulate-selected-preset <input.flp> <output.flp> <pattern-id> <channel-id> <legato|portato|staccato|small-gap|chop-chords> <note-index,note-index,...>\n",
+            "    Articulate presets use the Piano roll's quick preset settings with variation disabled.\n",
             "  flp-rebuild claw-notes <input.flp> <output.flp> <pattern-id> <channel-id> <period-ticks-16+> <trash-every-2..16> <time-distortion--100..100> <remove-short:0|1> <stretch-to-compensate:0|1>\n",
             "  flp-rebuild claw-selected-notes <input.flp> <output.flp> <pattern-id> <channel-id> <period-ticks-16+> <trash-every-2..16> <time-distortion--100..100> <remove-short:0|1> <stretch-to-compensate:0|1> <note-index,note-index,...>\n",
             "  flp-rebuild legato-notes <input.flp> <output.flp> <pattern-id> <channel-id>\n",
@@ -1841,6 +1868,30 @@ fn parse_articulate_lengths(value: &str) -> Result<bool, String> {
         "legato" => Ok(false),
         _ => Err("articulate length mode must be 'original' or 'legato'".to_owned()),
     }
+}
+
+fn parse_articulate_preset(value: &str) -> Result<ArticulateCliOptions, String> {
+    let (multiplier_percent, use_original_lengths, chop_chords) = match value {
+        "legato" => (100, false, false),
+        "portato" => (90, false, false),
+        "staccato" => (50, true, false),
+        "small-gap" => (98, false, false),
+        "chop-chords" => (100, true, true),
+        _ => {
+            return Err(
+                "articulate preset must be legato, portato, staccato, small-gap, or chop-chords"
+                    .to_owned(),
+            );
+        }
+    };
+    Ok(ArticulateCliOptions {
+        multiplier_percent,
+        variation_percent: 0,
+        seed: 1,
+        use_original_lengths,
+        chop_chords,
+        only_with_selection: false,
+    })
 }
 
 fn parse_scale_name(value: &str) -> Result<&'static [u8], String> {
