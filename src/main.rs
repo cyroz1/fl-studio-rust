@@ -701,6 +701,18 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u8(divisions, "note chop divisions")?,
             )
         }
+        [command, input, output, pattern_id, channel_id, divisions, note_indices]
+            if command == "chop-selected-notes" =>
+        {
+            chop_selected_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                parse_u8(divisions, "note chop divisions")?,
+                &parse_note_indices(note_indices)?,
+            )
+        }
         [command, input, output, pattern_id, channel_id] if command == "glue-notes" => {
             glue_notes(
                 Path::new(input),
@@ -1344,6 +1356,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild legato-notes <input.flp> <output.flp> <pattern-id> <channel-id>\n",
             "  flp-rebuild legato-selected-notes <input.flp> <output.flp> <pattern-id> <channel-id> <note-index,note-index,...>\n",
             "  flp-rebuild chop-notes <input.flp> <output.flp> <pattern-id> <channel-id> <divisions-2..64>\n",
+            "  flp-rebuild chop-selected-notes <input.flp> <output.flp> <pattern-id> <channel-id> <divisions-2..64> <note-index,note-index,...>\n",
             "  flp-rebuild glue-notes <input.flp> <output.flp> <pattern-id> <channel-id>\n",
             "  flp-rebuild flip-notes <input.flp> <output.flp> <pattern-id> <channel-id>\n",
             "  flp-rebuild strum-notes <input.flp> <output.flp> <pattern-id> <channel-id> <spread-ticks> <up|down>\n",
@@ -3549,6 +3562,30 @@ fn chop_notes(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "created {created} chopped notes in pattern {pattern_id}, channel {channel_id} using {divisions} divisions in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn chop_selected_notes(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    divisions: u8,
+    note_indices: &[usize],
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let created = document
+        .chop_pattern_note_selection(pattern_id, channel_id, note_indices, divisions)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "created {created} chopped notes from the selection in pattern {pattern_id}, channel {channel_id} using {divisions} divisions in {}",
         output.display()
     );
     Ok(())
