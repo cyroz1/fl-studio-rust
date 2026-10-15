@@ -15,11 +15,11 @@ use flp_rebuild::sample_render::{
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions};
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, ArticulateOptions, AutomationPointEdit,
-    ChannelLevelAdjustmentsEdit, ClawMachineOptions, FlpDocument, FstPreset, LimitNoteOptions,
-    LimitSnapDirection, PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation,
-    PlaylistClipEdit, PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress,
-    PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions, RiffMachineOptions,
-    RiffMachineQuantizeMode, ScaleLevelsOptions, TimeMarkerEdit,
+    ChannelLevelAdjustmentsEdit, ClawMachineOptions, FlamOptions, FlpDocument, FstPreset,
+    LimitNoteOptions, LimitSnapDirection, PatternControllerEdit, PatternNote, PatternNoteEdit,
+    PatternNoteRotation, PlaylistClipEdit, PlaylistTrackEdit, PlaylistTrackMotion,
+    PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions,
+    RiffMachineOptions, RiffMachineQuantizeMode, ScaleLevelsOptions, TimeMarkerEdit,
 };
 
 fn main() -> ExitCode {
@@ -926,7 +926,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 &parse_note_indices(note_indices)?,
             )
         }
-        [command, input, output, pattern_id, channel_id, stroke_ticks, velocity, placement]
+        [command, input, output, pattern_id, channel_id, stroke_duration, velocity, placement, option_args @ ..]
             if command == "flam-notes" =>
         {
             let before = match placement.as_str() {
@@ -939,15 +939,21 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 Path::new(output),
                 parse_u16(pattern_id, "pattern id")?,
                 parse_u16(channel_id, "channel id")?,
-                parse_u32(stroke_ticks, "flam stroke time")?,
-                parse_u8(velocity, "flam velocity")?,
-                before,
+                FlamCliOptions {
+                    stroke_duration,
+                    velocity: parse_u8(velocity, "flam velocity")?,
+                    before,
+                    group_notes: parse_flam_group_notes(option_args)?,
+                },
             )
         }
-        [command, input, output, pattern_id, channel_id, stroke_ticks, velocity, placement,
-            note_indices]
+        [command, input, output, pattern_id, channel_id, stroke_duration, velocity, placement,
+            extra_args @ ..]
             if command == "flam-selected-notes" =>
         {
+            let (note_indices, option_args) = extra_args.split_last().ok_or_else(|| {
+                "flam-selected-notes requires a comma-separated note index list".to_owned()
+            })?;
             let before = match placement.as_str() {
                 "before" => true,
                 "after" => false,
@@ -958,10 +964,11 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 Path::new(output),
                 parse_u16(pattern_id, "pattern id")?,
                 parse_u16(channel_id, "channel id")?,
-                SelectedFlamOptions {
-                    stroke_ticks: parse_u32(stroke_ticks, "flam stroke time")?,
+                FlamCliOptions {
+                    stroke_duration,
                     velocity: parse_u8(velocity, "flam velocity")?,
                     before,
+                    group_notes: parse_flam_group_notes(option_args)?,
                 },
                 &parse_note_indices(note_indices)?,
             )
@@ -1667,8 +1674,9 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild flip-selected-notes <input.flp> <output.flp> <pattern-id> <channel-id> <note-index,note-index,...>\n",
             "  flp-rebuild strum-notes <input.flp> <output.flp> <pattern-id> <channel-id> <spread-ticks> <up|down>\n",
             "  flp-rebuild strum-selected-notes <input.flp> <output.flp> <pattern-id> <channel-id> <spread-ticks> <up|down> <note-index,note-index,...>\n",
-            "  flp-rebuild flam-notes <input.flp> <output.flp> <pattern-id> <channel-id> <stroke-ticks> <velocity-0..127> <before|after>\n",
-            "  flp-rebuild flam-selected-notes <input.flp> <output.flp> <pattern-id> <channel-id> <stroke-ticks> <velocity-0..127> <before|after> <note-index,note-index,...>\n",
+            "  flp-rebuild flam-notes <input.flp> <output.flp> <pattern-id> <channel-id> <stroke-time> <velocity-0..127> <before|after> [group_notes=0|1|true|false]\n",
+            "  flp-rebuild flam-selected-notes <input.flp> <output.flp> <pattern-id> <channel-id> <stroke-time> <velocity-0..127> <before|after> [group_notes=0|1|true|false] <note-index,note-index,...>\n",
+            "    Flam stroke-time: an integer is ticks; suffix milliseconds with ms (for example 12ms). Grouping is off by default for CLI compatibility.\n",
             "  flp-rebuild randomize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <velocity-amount:-100..100> <pan-amount:-100..100> <pitch-range:0..24> <bipolar:0|1> <reset:0|1>\n",
             "  flp-rebuild randomize-notes-scale <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <velocity-amount:-100..100> <pan-amount:-100..100> <pitch-range:0..24> <bipolar:0|1> <reset:0|1> <scale-name> <scale-root:0..11>\n",
             "  flp-rebuild randomize-selected-notes <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <velocity-amount:-100..100> <pan-amount:-100..100> <pitch-range:0..24> <bipolar:0|1> <reset:0|1> <note-index,note-index,...>\n",
@@ -4360,18 +4368,30 @@ fn strum_selected_notes(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct FlamCliOptions<'a> {
+    stroke_duration: &'a str,
+    velocity: u8,
+    before: bool,
+    group_notes: bool,
+}
+
 fn flam_notes(
     input: &Path,
     output: &Path,
     pattern_id: u16,
     channel_id: u16,
-    stroke_ticks: u32,
-    velocity: u8,
-    before: bool,
+    flam_options: FlamCliOptions<'_>,
 ) -> Result<(), String> {
     let (_, mut document) = load_document(input)?;
+    let options = FlamOptions {
+        stroke_ticks: parse_flam_stroke_duration(flam_options.stroke_duration, &document)?,
+        velocity: flam_options.velocity,
+        before: flam_options.before,
+        group_notes: flam_options.group_notes,
+    };
     let created = document
-        .flam_pattern_notes(pattern_id, channel_id, stroke_ticks, velocity, before)
+        .flam_pattern_notes_with_options(pattern_id, channel_id, options)
         .map_err(|error| error.to_string())?;
     let bytes = document
         .encode_lossless()
@@ -4379,22 +4399,21 @@ fn flam_notes(
     fs::write(output, bytes)
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
-        "added {created} flam strokes in pattern {pattern_id}, channel {channel_id} ({}) to {}",
-        if before {
+        "added {created} flam strokes in pattern {pattern_id}, channel {channel_id} ({}, {} ticks, {}) to {}",
+        if flam_options.before {
             "before notes"
         } else {
             "after notes"
         },
+        options.stroke_ticks,
+        if flam_options.group_notes {
+            "grouped"
+        } else {
+            "ungrouped"
+        },
         output.display()
     );
     Ok(())
-}
-
-#[derive(Clone, Copy)]
-struct SelectedFlamOptions {
-    stroke_ticks: u32,
-    velocity: u8,
-    before: bool,
 }
 
 fn flam_selected_notes(
@@ -4402,19 +4421,18 @@ fn flam_selected_notes(
     output: &Path,
     pattern_id: u16,
     channel_id: u16,
-    options: SelectedFlamOptions,
+    flam_options: FlamCliOptions<'_>,
     note_indices: &[usize],
 ) -> Result<(), String> {
     let (_, mut document) = load_document(input)?;
+    let options = FlamOptions {
+        stroke_ticks: parse_flam_stroke_duration(flam_options.stroke_duration, &document)?,
+        velocity: flam_options.velocity,
+        before: flam_options.before,
+        group_notes: flam_options.group_notes,
+    };
     let created = document
-        .flam_pattern_note_selection(
-            pattern_id,
-            channel_id,
-            note_indices,
-            options.stroke_ticks,
-            options.velocity,
-            options.before,
-        )
+        .flam_pattern_note_selection_with_options(pattern_id, channel_id, note_indices, options)
         .map_err(|error| error.to_string())?;
     let bytes = document
         .encode_lossless()
@@ -4422,15 +4440,64 @@ fn flam_selected_notes(
     fs::write(output, bytes)
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
-        "added {created} selected-note flam strokes in pattern {pattern_id}, channel {channel_id} ({}) to {}",
-        if options.before {
+        "added {created} selected-note flam strokes in pattern {pattern_id}, channel {channel_id} ({}, {} ticks, {}) to {}",
+        if flam_options.before {
             "before notes"
         } else {
             "after notes"
         },
+        options.stroke_ticks,
+        if flam_options.group_notes {
+            "grouped"
+        } else {
+            "ungrouped"
+        },
         output.display()
     );
     Ok(())
+}
+
+fn parse_flam_group_notes(option_args: &[String]) -> Result<bool, String> {
+    let mut group_notes = false;
+    let mut seen = false;
+    for option in option_args {
+        let (key, value) = option
+            .split_once('=')
+            .ok_or_else(|| format!("Flam option must use key=value syntax: {option:?}"))?;
+        if key != "group_notes" {
+            return Err(format!("unknown Flam option {key:?}"));
+        }
+        if value.is_empty() {
+            return Err("Flam option group_notes needs a value".to_owned());
+        }
+        if seen {
+            return Err("Flam option group_notes was provided more than once".to_owned());
+        }
+        group_notes = parse_bool(value, "Flam group_notes")?;
+        seen = true;
+    }
+    Ok(group_notes)
+}
+
+fn parse_flam_stroke_duration(value: &str, document: &FlpDocument) -> Result<u32, String> {
+    let Some(milliseconds) = value.strip_suffix("ms") else {
+        return parse_u32(value, "flam stroke time ticks");
+    };
+    let duration_ms = parse_f64(milliseconds, "absolute Flam stroke time")?;
+    if duration_ms <= 0.0 {
+        return Err("absolute Flam stroke time must be greater than zero milliseconds".to_owned());
+    }
+
+    let ppq = document.header().ppq();
+    let tempo_bpm = document.metadata().tempo_bpm().unwrap_or(140.0);
+    if ppq == 0 || !tempo_bpm.is_finite() || tempo_bpm <= 0.0 {
+        return Err("absolute Flam stroke time cannot be mapped to project ticks".to_owned());
+    }
+    let stroke_ticks = (duration_ms * f64::from(ppq) * tempo_bpm / 60_000.0).round();
+    if !stroke_ticks.is_finite() || stroke_ticks < 1.0 || stroke_ticks > f64::from(u32::MAX) {
+        return Err("absolute Flam stroke time is outside the supported tick range".to_owned());
+    }
+    Ok(stroke_ticks as u32)
 }
 
 fn randomize_notes(
