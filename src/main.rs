@@ -276,6 +276,16 @@ fn run(args: Vec<String>) -> Result<(), String> {
         [command, input, output] if command == "create-pattern" => {
             create_pattern(Path::new(input), Path::new(output))
         }
+        [command, input, output, sample_path, channel_name]
+            if command == "create-sampler-channel" =>
+        {
+            create_sampler_channel(
+                Path::new(input),
+                Path::new(output),
+                sample_path,
+                channel_name,
+            )
+        }
         [command, input, output, pattern_id] if command == "duplicate-pattern" => {
             duplicate_pattern(
                 Path::new(input),
@@ -1118,6 +1128,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild roundtrip <input.flp> <output.flp>\n",
             "  flp-rebuild set-tempo <input.flp> <output.flp> <bpm>\n",
             "  flp-rebuild create-pattern <input.flp> <output.flp>\n",
+            "  flp-rebuild create-sampler-channel <input.flp> <output.flp> <sample-path> <channel-name>\n",
             "  flp-rebuild duplicate-pattern <input.flp> <output.flp> <pattern-id>\n",
             "  flp-rebuild set-project-info <input.flp> <output.flp> <title|-> <author|-> <genre|-> <comments|-> <web-link|->\n",
             "  flp-rebuild set-project-settings <input.flp> <output.flp> <play-truncated:0|1|-> <fast-declick:0|1|-> [pan-law-raw|-]\n",
@@ -3525,6 +3536,28 @@ fn create_pattern(input: &Path, output: &Path) -> Result<(), String> {
     fs::write(output, bytes)
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!("created empty pattern {pattern_id} in {}", output.display());
+    Ok(())
+}
+
+fn create_sampler_channel(
+    input: &Path,
+    output: &Path,
+    sample_path: &str,
+    channel_name: &str,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let channel_id = document
+        .create_sampler_channel(sample_path, channel_name)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "created Sampler channel {channel_id} ({channel_name}) in {}",
+        output.display()
+    );
     Ok(())
 }
 
