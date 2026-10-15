@@ -818,9 +818,11 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 Path::new(output),
                 parse_u16(pattern_id, "pattern id")?,
                 parse_u16(channel_id, "channel id")?,
-                parse_u32(stroke_ticks, "flam stroke time")?,
-                parse_u8(velocity, "flam velocity")?,
-                before,
+                SelectedFlamOptions {
+                    stroke_ticks: parse_u32(stroke_ticks, "flam stroke time")?,
+                    velocity: parse_u8(velocity, "flam velocity")?,
+                    before,
+                },
                 &parse_note_indices(note_indices)?,
             )
         }
@@ -3822,14 +3824,19 @@ fn flam_notes(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct SelectedFlamOptions {
+    stroke_ticks: u32,
+    velocity: u8,
+    before: bool,
+}
+
 fn flam_selected_notes(
     input: &Path,
     output: &Path,
     pattern_id: u16,
     channel_id: u16,
-    stroke_ticks: u32,
-    velocity: u8,
-    before: bool,
+    options: SelectedFlamOptions,
     note_indices: &[usize],
 ) -> Result<(), String> {
     let (_, mut document) = load_document(input)?;
@@ -3838,9 +3845,9 @@ fn flam_selected_notes(
             pattern_id,
             channel_id,
             note_indices,
-            stroke_ticks,
-            velocity,
-            before,
+            options.stroke_ticks,
+            options.velocity,
+            options.before,
         )
         .map_err(|error| error.to_string())?;
     let bytes = document
@@ -3850,7 +3857,7 @@ fn flam_selected_notes(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "added {created} selected-note flam strokes in pattern {pattern_id}, channel {channel_id} ({}) to {}",
-        if before {
+        if options.before {
             "before notes"
         } else {
             "after notes"
