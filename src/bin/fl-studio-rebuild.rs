@@ -25953,14 +25953,21 @@ impl DawUi {
                             ui.selectable_value(&mut pending.selected_track, index, label);
                         }
                     });
+                let selected_track_channel = pending
+                    .track_channel_ids
+                    .get(pending.selected_track)
+                    .copied()
+                    .flatten()
+                    .filter(|id| import_channels.iter().any(|channel| channel.id() == *id))
+                    .or(default_import_channel);
                 if ui
                     .add_enabled(
                         (pending.create_new_pattern || self.selected_pattern.is_some())
-                            && self.selected_note_channel.is_some(),
+                            && selected_track_channel.is_some(),
                         egui::Button::new("Import track"),
                     )
                     .clicked()
-                    && let Some(channel_id) = self.selected_note_channel
+                    && let Some(channel_id) = selected_track_channel
                     && (pending.create_new_pattern || self.selected_pattern.is_some())
                 {
                     import_midi_request = Some((
