@@ -46,6 +46,15 @@ pub struct MidiNote {
     release_velocity: Option<u8>,
 }
 
+/// Controls how note events from a MIDI file are placed into an FL Studio Pattern.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MidiImportOptions {
+    /// Remove leading silence so the first imported note starts at Pattern tick zero.
+    pub realign_events: bool,
+    /// Treat a Note On with zero velocity as a note instead of the usual Note Off.
+    pub zero_velocity_is_note_on: bool,
+}
+
 #[derive(Clone, Copy)]
 struct MidiChannelNoteState {
     pan: u8,
@@ -1222,6 +1231,14 @@ impl MidiTrack {
     /// each note starts. Missing CC values use MIDI center 64; a track without
     /// RPN 0 pitch sensitivity assumes a two-semitone range.
     pub fn notes(&self) -> Vec<MidiNote> {
+        self.notes_with_zero_velocity_note_on(false)
+    }
+
+    /// Pairs note messages, optionally treating zero-velocity Note On messages as notes.
+    pub fn notes_with_zero_velocity_note_on(
+        &self,
+        zero_velocity_is_note_on: bool,
+    ) -> Vec<MidiNote> {
         let mut notes = Vec::new();
         let mut active: BTreeMap<(u8, u8), VecDeque<usize>> = BTreeMap::new();
         let mut channel_state = BTreeMap::<u8, MidiChannelNoteState>::new();
@@ -1258,7 +1275,7 @@ impl MidiTrack {
                     let state = channel_state.entry(channel).or_default();
                     state.pitch_bend_value = u16::from(data[0]) | (u16::from(data[1]) << 7);
                 }
-                0x90 if data[1] != 0 => {
+                0x90 if data[1] != 0 || zero_velocity_is_note_on => {
                     let state = channel_state.get(&channel).copied().unwrap_or_default();
                     let note_index = notes.len();
                     notes.push(MidiNote {
@@ -2091,6 +2108,25 @@ mod tests {
         assert_eq!(notes[0].end_tick(), Some(240));
         assert_eq!(notes[0].duration_ticks(), Some(240));
         assert_eq!(midi.encode_lossless(), input);
+    }
+
+    #[test]
+    fn zero_velocity_note_on_can_be_imported_as_a_note() {
+        let midi = MidiFile::parse(&midi_fixture(&[
+            0x00, 0x90, 0x3C, 0x00, // Zero-velocity Note On at tick 0.
+            0x81, 0x70, 0x80, 0x3C, 0x7F, // Note Off at tick 240.
+            0x00, 0xFF, 0x2F, 0x00,
+        ]))
+        .expect("fixture should parse");
+        let track = &midi.tracks()[0];
+
+        assert!(track.notes().is_empty());
+        let notes = track.notes_with_zero_velocity_note_on(true);
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].velocity(), 0);
+        assert_eq!(notes[0].start_tick(), 0);
+        assert_eq!(notes[0].end_tick(), Some(240));
+        assert_eq!(notes[0].release_velocity(), Some(127));
     }
 
     #[test]

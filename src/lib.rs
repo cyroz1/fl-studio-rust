@@ -11955,6 +11955,24 @@ impl FlpDocument {
         pattern_id: u16,
         channel_id: u16,
     ) -> Result<usize, FlpError> {
+        self.import_midi_track_with_options(
+            midi,
+            track_index,
+            pattern_id,
+            channel_id,
+            midi::MidiImportOptions::default(),
+        )
+    }
+
+    /// Imports notes from one MIDI track with FL Studio-style placement options.
+    pub fn import_midi_track_with_options(
+        &mut self,
+        midi: &midi::MidiFile,
+        track_index: usize,
+        pattern_id: u16,
+        channel_id: u16,
+        options: midi::MidiImportOptions,
+    ) -> Result<usize, FlpError> {
         self.require_unique_channel(channel_id)?;
         if !self
             .patterns()?
@@ -11990,7 +12008,7 @@ impl FlpDocument {
                     "MIDI import requires a supported time division and valid tempo map",
                 )
             })?;
-        let midi_notes = track.notes();
+        let midi_notes = track.notes_with_zero_velocity_note_on(options.zero_velocity_is_note_on);
 
         let mut imported = Vec::with_capacity(midi_notes.len());
         for midi_note in &midi_notes {
@@ -12062,6 +12080,13 @@ impl FlpDocument {
                 ),
                 ..PatternNote::default()
             });
+        }
+
+        if options.realign_events {
+            let first_note_position = imported.iter().map(|note| note.position).min().unwrap_or(0);
+            for note in &mut imported {
+                note.position -= first_note_position;
+            }
         }
 
         let signature_tracks: Vec<usize> = if midi.format() == 1 {
@@ -15600,8 +15625,8 @@ mod tests {
         PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions,
         RiffMachineOptions, RiffMachineQuantizeMode, ScaleLevelsOptions, TimeMarkerEdit,
         apply_mixer_pan, apply_mixer_stereo_separation, midi::MidiChannelMapping,
-        midi::MidiEventKind, midi::MidiFile, note_pitch_in_scale, parse_vst_plugin_state_metadata,
-        riff_machine_groove_note_timing,
+        midi::MidiEventKind, midi::MidiFile, midi::MidiImportOptions, note_pitch_in_scale,
+        parse_vst_plugin_state_metadata, riff_machine_groove_note_timing,
     };
 
     fn articulate_options(
@@ -23858,6 +23883,51 @@ mod tests {
 
         let reparsed = FlpDocument::parse(&document.encode_lossless().unwrap()).unwrap();
         assert_eq!(reparsed.patterns().unwrap()[0].notes.len(), 3);
+    }
+
+    #[test]
+    fn midi_import_options_realign_notes_and_accept_zero_velocity_note_ons() {
+        let project_bytes = pattern_fixture(&[], &[]);
+        let midi_bytes = midi_fixture(
+            &[
+                0x83, 0x60, 0x90, 0x3C, 0x64, // C4 begins after one quarter note.
+                0x81, 0x70, 0x80, 0x3C, 0x40, // C4 ends after an eighth note.
+                0x00, 0x90, 0x3E, 0x00, // Zero-velocity Note On for D4.
+                0x81, 0x70, 0x80, 0x3E, 0x7F, // D4 ends one eighth note later.
+                0x00, 0xFF, 0x2F, 0x00,
+            ],
+            480,
+        );
+        let midi = MidiFile::parse(&midi_bytes).expect("MIDI fixture should parse");
+        let mut document =
+            FlpDocument::parse(&project_bytes).expect("project fixture should parse");
+
+        let imported = document
+            .import_midi_track_with_options(
+                &midi,
+                0,
+                7,
+                0,
+                MidiImportOptions {
+                    realign_events: true,
+                    zero_velocity_is_note_on: true,
+                },
+            )
+            .expect("selected import options should be supported");
+
+        assert_eq!(imported, 2);
+        let notes = &document.patterns().unwrap()[0].notes;
+        assert_eq!(
+            (notes[0].position, notes[0].length, notes[0].key),
+            (0, 48, 60)
+        );
+        assert_eq!(notes[0].velocity, 100);
+        assert_eq!(
+            (notes[1].position, notes[1].length, notes[1].key),
+            (48, 48, 62)
+        );
+        assert_eq!(notes[1].velocity, 0);
+        assert_eq!(notes[1].release, 128);
     }
 
     #[test]

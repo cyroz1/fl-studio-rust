@@ -5,7 +5,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use flp_rebuild::media::{SamplePathResolver, decode_audio_file};
-use flp_rebuild::midi::{MidiChannelMapping, MidiFile};
+use flp_rebuild::midi::{MidiChannelMapping, MidiFile, MidiImportOptions};
 use flp_rebuild::plugins::scan_installed_plugins;
 use flp_rebuild::project_package::copy_unique_sample_file;
 use flp_rebuild::sample_render::{
@@ -1047,7 +1047,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_usize(marker_index, "time marker index")?,
             )
         }
-        [command, input, midi_path, output, track, pattern_id, channel_id]
+        [command, input, midi_path, output, track, pattern_id, channel_id, options @ ..]
             if command == "import-midi" =>
         {
             import_midi_track(
@@ -1057,6 +1057,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_usize(track, "MIDI track number")?,
                 parse_u16(pattern_id, "pattern id")?,
                 parse_u16(channel_id, "channel id")?,
+                parse_midi_import_options(options)?,
             )
         }
         _ => Err(concat!(
@@ -1131,7 +1132,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild slice-notes <input.flp> <output.flp> <pattern-id> <channel-id> <position-ticks>\n",
             "  flp-rebuild add-note <input.flp> <output.flp> <pattern-id> <channel-id> <position> <length> <key> <velocity>\n",
             "  flp-rebuild delete-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index>\n",
-            "  flp-rebuild import-midi <input.flp> <input.mid> <output.flp> <track> <pattern-id> <channel-id>\n",
+            "  flp-rebuild import-midi <input.flp> <input.mid> <output.flp> <track> <pattern-id> <channel-id> [--realign-events] [--zero-velocity-notes]\n",
             "  flp-rebuild edit-clip <input.flp> <output.flp> <arrangement-id> <clip-index> <position> <length>\n",
             "  flp-rebuild set-clip-muted <input.flp> <output.flp> <arrangement-id> <clip-index> <muted:0|1>\n",
             "  flp-rebuild edit-playlist-track <input.flp> <output.flp> <track-id> <enabled:0|1|-> <grouped:0|1|->\n",
@@ -1185,6 +1186,18 @@ fn parse_midi_channel_mapping(value: &str) -> Result<MidiChannelMapping, String>
         "channels" => Ok(MidiChannelMapping::AssignProjectChannels),
         _ => Err("MIDI channel mapping must be 'stored' or 'channels'".to_owned()),
     }
+}
+
+fn parse_midi_import_options(flags: &[String]) -> Result<MidiImportOptions, String> {
+    let mut options = MidiImportOptions::default();
+    for flag in flags {
+        match flag.as_str() {
+            "--realign-events" => options.realign_events = true,
+            "--zero-velocity-notes" => options.zero_velocity_is_note_on = true,
+            _ => return Err(format!("unknown MIDI import option: {flag}")),
+        }
+    }
+    Ok(options)
 }
 
 fn parse_u8(value: &str, description: &str) -> Result<u8, String> {
@@ -3506,6 +3519,7 @@ fn import_midi_track(
     track_index: usize,
     pattern_id: u16,
     channel_id: u16,
+    options: MidiImportOptions,
 ) -> Result<(), String> {
     let (_, mut document) = load_document(input)?;
     let midi_bytes = fs::read(midi_path)
@@ -3513,7 +3527,7 @@ fn import_midi_track(
     let midi = MidiFile::parse(&midi_bytes)
         .map_err(|error| format!("could not parse {}: {error}", midi_path.display()))?;
     let imported = document
-        .import_midi_track(&midi, track_index, pattern_id, channel_id)
+        .import_midi_track_with_options(&midi, track_index, pattern_id, channel_id, options)
         .map_err(|error| error.to_string())?;
     let bytes = document
         .encode_lossless()
@@ -4301,7 +4315,8 @@ fn delete_time_marker(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_clip_indices, parse_rgb_hex, parse_scale_name};
+    use super::{parse_clip_indices, parse_midi_import_options, parse_rgb_hex, parse_scale_name};
+    use flp_rebuild::midi::MidiImportOptions;
 
     #[test]
     fn parses_channel_rgb_in_hex_form_with_optional_prefix() {
@@ -4317,6 +4332,25 @@ mod tests {
         assert!(parse_clip_indices("1").is_err());
         assert!(parse_clip_indices("1,,2").is_err());
         assert!(parse_clip_indices("one,2").is_err());
+    }
+
+    #[test]
+    fn parses_midi_import_options_and_rejects_unknown_flags() {
+        assert_eq!(
+            parse_midi_import_options(&[]),
+            Ok(MidiImportOptions::default())
+        );
+        assert_eq!(
+            parse_midi_import_options(&[
+                "--zero-velocity-notes".to_owned(),
+                "--realign-events".to_owned(),
+            ]),
+            Ok(MidiImportOptions {
+                realign_events: true,
+                zero_velocity_is_note_on: true,
+            })
+        );
+        assert!(parse_midi_import_options(&["--not-an-option".to_owned()]).is_err());
     }
 
     #[test]

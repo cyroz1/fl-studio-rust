@@ -22,7 +22,7 @@ use flp_rebuild::media::{
     decode_audio_preview, decode_audio_preview_from_position, decode_audio_waveform,
     summarize_audio_waveform, write_audio_range_to_wav_with_processing,
 };
-use flp_rebuild::midi::{MidiChannelMapping, MidiFile};
+use flp_rebuild::midi::{MidiChannelMapping, MidiFile, MidiImportOptions};
 use flp_rebuild::plugins::{PluginCandidate, PluginFormat, scan_installed_plugins};
 use flp_rebuild::project_package::{ProjectPackageWorkspace, copy_unique_sample_file};
 use flp_rebuild::sample_render::SamplerLiveNoteEvent;
@@ -2809,6 +2809,7 @@ struct PendingMidiImport {
     path: PathBuf,
     midi: MidiFile,
     selected_track: usize,
+    options: MidiImportOptions,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -10394,6 +10395,7 @@ impl DawUi {
                             path: path.clone(),
                             midi,
                             selected_track: 0,
+                            options: MidiImportOptions::default(),
                         });
                         self.view = MainView::PianoRoll;
                         self.status = format!("Loaded MIDI file {}", path.display());
@@ -25886,6 +25888,7 @@ impl DawUi {
                             path: path.clone(),
                             midi,
                             selected_track: 0,
+                            options: MidiImportOptions::default(),
                         });
                         self.status = format!("Loaded MIDI file {}", path.display());
                     }
@@ -25940,15 +25943,25 @@ impl DawUi {
                         pending.selected_track,
                         pattern_id,
                         channel_id,
+                        pending.options,
                     ));
                 }
                 clear_midi_import = ui.button("Clear").clicked();
             });
+            egui::CollapsingHeader::new("Import options")
+                .id_salt("midi-import-options")
+                .show(ui, |ui| {
+                    ui.checkbox(&mut pending.options.realign_events, "Realign events");
+                    ui.checkbox(
+                        &mut pending.options.zero_velocity_is_note_on,
+                        "Import zero velocity notes",
+                    );
+                });
         }
         if clear_midi_import {
             self.pending_midi_import = None;
         }
-        if let Some((midi, track_index, pattern_id, channel_id)) = import_midi_request {
+        if let Some((midi, track_index, pattern_id, channel_id, options)) = import_midi_request {
             let first_note_index = patterns
                 .iter()
                 .find(|pattern| pattern.id == pattern_id)
@@ -25961,7 +25974,13 @@ impl DawUi {
                 })
                 .unwrap_or(0);
             if let Some(document) = &mut self.document {
-                match document.import_midi_track(&midi, track_index, pattern_id, channel_id) {
+                match document.import_midi_track_with_options(
+                    &midi,
+                    track_index,
+                    pattern_id,
+                    channel_id,
+                    options,
+                ) {
                     Ok(imported) => {
                         if imported > 0 {
                             self.selected_note = Some((pattern_id, channel_id, first_note_index));
