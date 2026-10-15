@@ -679,6 +679,17 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u16(channel_id, "channel id")?,
             )
         }
+        [command, input, output, pattern_id, channel_id, note_indices]
+            if command == "legato-selected-notes" =>
+        {
+            legato_selected_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                &parse_note_indices(note_indices)?,
+            )
+        }
         [command, input, output, pattern_id, channel_id, divisions]
             if command == "chop-notes" =>
         {
@@ -1331,6 +1342,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild scale-note-levels <input.flp> <output.flp> <pattern-id> <channel-id> <center:-100..100> <tension:-100..100> <multiplier:0..200> <offset:-100..100>\n",
             "  flp-rebuild scale-selected-note-levels <input.flp> <output.flp> <pattern-id> <channel-id> <center:-100..100> <tension:-100..100> <multiplier:0..200> <offset:-100..100> <note-index,note-index,...>\n",
             "  flp-rebuild legato-notes <input.flp> <output.flp> <pattern-id> <channel-id>\n",
+            "  flp-rebuild legato-selected-notes <input.flp> <output.flp> <pattern-id> <channel-id> <note-index,note-index,...>\n",
             "  flp-rebuild chop-notes <input.flp> <output.flp> <pattern-id> <channel-id> <divisions-2..64>\n",
             "  flp-rebuild glue-notes <input.flp> <output.flp> <pattern-id> <channel-id>\n",
             "  flp-rebuild flip-notes <input.flp> <output.flp> <pattern-id> <channel-id>\n",
@@ -3491,6 +3503,29 @@ fn legato_notes(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "extended {changed} notes in pattern {pattern_id}, channel {channel_id} to {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn legato_selected_notes(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    note_indices: &[usize],
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let changed = document
+        .legato_pattern_note_selection(pattern_id, channel_id, note_indices)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "extended {changed} selected notes in pattern {pattern_id}, channel {channel_id} to {}",
         output.display()
     );
     Ok(())
