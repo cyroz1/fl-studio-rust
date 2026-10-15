@@ -15,9 +15,10 @@ use flp_rebuild::sample_render::{
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions};
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, AutomationPointEdit, ChannelLevelAdjustmentsEdit,
-    FlpDocument, FstPreset, PatternControllerEdit, PatternNote, PatternNoteEdit, PlaylistClipEdit,
-    PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit,
-    ProjectSettingsEdit, RandomizerOptions, ScaleLevelsOptions, TimeMarkerEdit,
+    FlpDocument, FstPreset, PatternControllerEdit, PatternNote, PatternNoteEdit,
+    PatternNoteRotation, PlaylistClipEdit, PlaylistTrackEdit, PlaylistTrackMotion,
+    PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions,
+    ScaleLevelsOptions, TimeMarkerEdit,
 };
 
 fn main() -> ExitCode {
@@ -634,6 +635,33 @@ fn run(args: Vec<String>) -> Result<(), String> {
                     swing: parse_f64(swing, "quantize swing")?,
                 },
                 &parse_note_indices(note_indices)?,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, snap_ticks, direction]
+            if command == "rotate-notes" =>
+        {
+            rotate_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                parse_u32(snap_ticks, "note rotation snap")?,
+                parse_note_rotation(direction)?,
+                None,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, snap_ticks, direction, note_indices]
+            if command == "rotate-selected-notes" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            rotate_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                parse_u32(snap_ticks, "note rotation snap")?,
+                parse_note_rotation(direction)?,
+                Some(&note_indices),
             )
         }
         [command, input, output, pattern_id, channel_id, center, tension, multiplier, offset]
@@ -1438,6 +1466,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild edit-note-properties <input.flp> <output.flp> <pattern-id> <channel-id> <note-index> <flags-raw|-> <group-raw|-> <fine-pitch|-> <release|-> <midi-channel-raw|-> <pan|-> <mod-x|-> <mod-y|->\n",
             "  flp-rebuild quantize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <grid-ticks> <strength-0..1> <swing-0..1>\n",
             "  flp-rebuild quantize-selected-notes <input.flp> <output.flp> <pattern-id> <channel-id> <grid-ticks> <strength-0..1> <swing-0..1> <note-index,note-index,...>\n",
+            "  flp-rebuild rotate-notes <input.flp> <output.flp> <pattern-id> <channel-id> <snap-ticks> <left|right>\n",
+            "  flp-rebuild rotate-selected-notes <input.flp> <output.flp> <pattern-id> <channel-id> <snap-ticks> <left|right> <note-index,note-index,...>\n",
             "  flp-rebuild scale-note-levels <input.flp> <output.flp> <pattern-id> <channel-id> <center:-100..100> <tension:-100..100> <multiplier:0..200> <offset:-100..100>\n",
             "  flp-rebuild scale-selected-note-levels <input.flp> <output.flp> <pattern-id> <channel-id> <center:-100..100> <tension:-100..100> <multiplier:0..200> <offset:-100..100> <note-index,note-index,...>\n",
             "  flp-rebuild legato-notes <input.flp> <output.flp> <pattern-id> <channel-id>\n",
@@ -1525,6 +1555,14 @@ fn parse_note_indices(value: &str) -> Result<Vec<usize>, String> {
         indices.push(parse_usize(part, "note index")?);
     }
     Ok(indices)
+}
+
+fn parse_note_rotation(value: &str) -> Result<PatternNoteRotation, String> {
+    match value {
+        "left" => Ok(PatternNoteRotation::Left),
+        "right" => Ok(PatternNoteRotation::Right),
+        _ => Err("note rotation direction must be 'left' or 'right'".to_owned()),
+    }
 }
 
 fn parse_midi_channel_mapping(value: &str) -> Result<MidiChannelMapping, String> {
@@ -3554,6 +3592,39 @@ fn quantize_selected_notes(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "quantized {changed} selected notes in pattern {pattern_id}, channel {channel_id} to {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn rotate_notes(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    snap_ticks: u32,
+    direction: PatternNoteRotation,
+    note_indices: Option<&[usize]>,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let changed = match note_indices {
+        Some(indices) => document
+            .rotate_pattern_note_selection(pattern_id, channel_id, indices, snap_ticks, direction),
+        None => document.rotate_pattern_notes(pattern_id, channel_id, snap_ticks, direction),
+    }
+    .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "rotated {changed} {} in pattern {pattern_id}, channel {channel_id} by {snap_ticks} ticks to {}",
+        if note_indices.is_some() {
+            "selected notes"
+        } else {
+            "notes"
+        },
         output.display()
     );
     Ok(())

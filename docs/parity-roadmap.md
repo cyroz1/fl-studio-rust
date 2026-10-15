@@ -206,7 +206,7 @@ FL Studio's piano roll is famously deep — the full toolset:
 
 **Edit operations:**
 - `[partial]` Quantize note starts on a selected snap grid with strength and swing, either channel-wide or on the selected notes; `quantize-selected-notes` exposes selected channel-local note indices in the CLI, while native swing semantics remain
-- `[partial]` Rotate selected notes or a channel by one snap step, wrapping note starts inside meter-aware measures; native time-selection and group edge behavior remain
+- `[partial]` Rotate selected notes or a channel by one snap step, wrapping note starts inside meter-aware measures; `rotate-notes` and `rotate-selected-notes` expose both scopes in the CLI; native time-selection and group edge behavior remain
 - `[partial]` Legato extends notes to the next distinct onset, and `legato-selected-notes` exposes selected channel-local note indices in the CLI; Quick Chop splits notes longer than the current snap into snap-sized segments, and `chop-selected-notes` exposes equal-division Chop for selected channel-local indices in the CLI; Glue joins touching/overlapping notes with matching properties, and `glue-selected-notes` exposes selected channel-local note indices in the CLI; native tool options remain
 - `[partial]` Score flipper mirrors a channel around its latest note end or selected notes within their time bounds; `flip-selected-notes` exposes selected channel-local note indices in the CLI; native tool options remain
 - `[partial]` Strum staggers simultaneous notes by pitch across a configurable tick spread within the channel or selection; `strum-selected-notes` exposes selected channel-local note indices, spread, and direction in the CLI; native velocity and chord-overlap options remain
