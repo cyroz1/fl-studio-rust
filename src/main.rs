@@ -752,9 +752,14 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 Path::new(output),
                 parse_u16(pattern_id, "pattern id")?,
                 parse_u16(channel_id, "channel id")?,
-                parse_u64(seed, "humanize seed")?,
-                parse_u32(timing_range, "timing range")?,
-                parse_u8(velocity_variation, "velocity variation")?,
+                HumanizeOptions {
+                    seed: parse_u64(seed, "humanize seed")?,
+                    timing_range_ticks: parse_u32(timing_range, "timing range")?,
+                    velocity_variation_percent: parse_u8(
+                        velocity_variation,
+                        "velocity variation",
+                    )?,
+                },
                 &parse_note_indices(note_indices)?,
             )
         }
@@ -3503,14 +3508,19 @@ fn humanize_notes(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct HumanizeOptions {
+    seed: u64,
+    timing_range_ticks: u32,
+    velocity_variation_percent: u8,
+}
+
 fn humanize_selected_notes(
     input: &Path,
     output: &Path,
     pattern_id: u16,
     channel_id: u16,
-    seed: u64,
-    timing_range_ticks: u32,
-    velocity_variation_percent: u8,
+    options: HumanizeOptions,
     note_indices: &[usize],
 ) -> Result<(), String> {
     let (_, mut document) = load_document(input)?;
@@ -3519,9 +3529,9 @@ fn humanize_selected_notes(
             pattern_id,
             channel_id,
             note_indices,
-            seed,
-            timing_range_ticks,
-            velocity_variation_percent,
+            options.seed,
+            options.timing_range_ticks,
+            options.velocity_variation_percent,
         )
         .map_err(|error| error.to_string())?;
     let bytes = document
@@ -3530,7 +3540,8 @@ fn humanize_selected_notes(
     fs::write(output, bytes)
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
-        "humanized {changed} selected notes in pattern {pattern_id}, channel {channel_id} with seed {seed} to {}",
+        "humanized {changed} selected notes in pattern {pattern_id}, channel {channel_id} with seed {} to {}",
+        options.seed,
         output.display()
     );
     Ok(())
