@@ -396,9 +396,9 @@ are applied where the Mixer rows below describe. Full export surface:
 
 | Item | Status | Notes |
 |---|---|---|
-| Windows installer (NSIS/WiX) | `[partial]` | CI builds installers; verify signed + working |
-| macOS app bundle, notarization | `[partial]` | CI runs macOS checks, launches the packaged app for a smoke check, and uploads a native startup screenshot. Without signing secrets it also builds an unsigned app bundle, verifies its executable and `.flp` registration, then archives and uploads it as a 14-day `macos-unsigned-gui-preview` artifact for local UI review. Installer publication waits for Developer ID signing and Apple notarization secrets; signed builds are checked with Apple's signature, stapler, and Gatekeeper tools. AU hosting + CoreAudio remain pending. |
-| Linux builds (AppImage/deb) | `[partial]` | CI builds; XCB headers handled |
+| Windows installer (NSIS/WiX) | `[partial]` | CI uploads the Windows NSIS setup executable; signing and runtime verification remain |
+| macOS app bundle, notarization | `[partial]` | CI launches the packaged app for a smoke check and uploads only its `.dmg` installer. Without signing secrets the disk image is unsigned; configured builds are checked with Apple's signature, stapler, and Gatekeeper tools. AU hosting + CoreAudio remain pending. |
+| Linux builds (AppImage/deb) | `[partial]` | CI uploads Debian, AppImage, and Pacman package outputs; XCB headers handled |
 | Windows: ASIO support | `[partial]` | CPAL's ASIO backend is enabled on Windows; device enumeration includes available hosts, saved ASIO device IDs reopen through ASIO, and the UI limits ASIO devices to shared access. A Windows build and physical-driver input/output check remain. |
 | macOS: native menu bar, file associations | `[partial]` | The packaged app registers `.flp` project files and the application opens a project path passed on launch. Functional command menus remain in the app window; a native macOS menu bar and macOS file-open event handling while the app is already running remain. |
 | Cross-platform CI | `[done]` | |
