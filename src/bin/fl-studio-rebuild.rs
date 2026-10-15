@@ -26164,13 +26164,11 @@ impl DawUi {
             }
         }
         if let Some((midi, options, channel_ids)) = import_midi_all_request {
-            let import_result = self.document.as_mut().and_then(|document| {
-                Some(
-                    document.import_midi_tracks_to_new_patterns_with_channel_map(
-                        &midi,
-                        &channel_ids,
-                        options,
-                    ),
+            let import_result = self.document.as_mut().map(|document| {
+                document.import_midi_tracks_to_new_patterns_with_channel_map(
+                    &midi,
+                    &channel_ids,
+                    options,
                 )
             });
             match import_result {
