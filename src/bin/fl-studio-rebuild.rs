@@ -621,27 +621,69 @@ fn detect_chord_name(notes: &[PatternNote], channel_id: u16, position: u32) -> S
         ("minor", &[0, 3, 7]),
         ("5", &[0, 7]),
     ];
-    let roots = std::iter::once(bass_pitch_class).chain(
-        pitch_classes
+    let roots = std::iter::once(bass_pitch_class)
+        .chain(
+            pitch_classes
+                .iter()
+                .copied()
+                .filter(|root| *root != bass_pitch_class),
+        )
+        .collect::<Vec<_>>();
+    for root in &roots {
+        let mut intervals = pitch_classes
             .iter()
-            .copied()
-            .filter(|root| *root != bass_pitch_class),
-    );
+            .map(|pitch| (*pitch + 12 - *root) % 12)
+            .collect::<Vec<_>>();
+        intervals.sort_unstable();
+        for (quality, expected) in QUALITIES {
+            if intervals == *expected {
+                let inversion = if bass_pitch_class == *root {
+                    String::new()
+                } else {
+                    format!("/{}", PITCH_CLASSES[usize::from(bass_pitch_class)])
+                };
+                return format!("{} {quality}{inversion}", PITCH_CLASSES[usize::from(*root)]);
+            }
+        }
+    }
     for root in roots {
         let mut intervals = pitch_classes
             .iter()
             .map(|pitch| (*pitch + 12 - root) % 12)
             .collect::<Vec<_>>();
         intervals.sort_unstable();
+        if intervals.len() < 3 || !intervals.contains(&0) {
+            continue;
+        }
         for (quality, expected) in QUALITIES {
-            if intervals == *expected {
-                let inversion = if bass_pitch_class == root {
-                    String::new()
-                } else {
-                    format!("/{}", PITCH_CLASSES[usize::from(bass_pitch_class)])
-                };
-                return format!("{} {quality}{inversion}", PITCH_CLASSES[usize::from(root)]);
+            if expected.len() < 4
+                || !expected.contains(&7)
+                || !(expected.contains(&3) || expected.contains(&4))
+                || !expected.contains(&0)
+                || intervals.len() + 1 != expected.len()
+                || intervals
+                    .iter()
+                    .any(|interval| !expected.contains(interval))
+            {
+                continue;
             }
+            let missing = expected
+                .iter()
+                .filter(|interval| !intervals.contains(interval))
+                .copied()
+                .collect::<Vec<_>>();
+            if missing.as_slice() != [7] {
+                continue;
+            }
+            let inversion = if bass_pitch_class == root {
+                String::new()
+            } else {
+                format!("/{}", PITCH_CLASSES[usize::from(bass_pitch_class)])
+            };
+            return format!(
+                "{} {quality}(no5){inversion}",
+                PITCH_CLASSES[usize::from(root)]
+            );
         }
     }
     format!("{} notes", pitch_classes.len())
