@@ -619,6 +619,23 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_f64(swing, "quantize swing")?,
             )
         }
+        [command, input, output, pattern_id, channel_id, grid_ticks, strength, swing,
+            note_indices]
+            if command == "quantize-selected-notes" =>
+        {
+            quantize_selected_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                QuantizeOptions {
+                    grid_ticks: parse_u32(grid_ticks, "quantize grid ticks")?,
+                    strength: parse_f64(strength, "quantize strength")?,
+                    swing: parse_f64(swing, "quantize swing")?,
+                },
+                &parse_note_indices(note_indices)?,
+            )
+        }
         [command, input, output, pattern_id, channel_id] if command == "legato-notes" => {
             legato_notes(
                 Path::new(input),
@@ -1275,6 +1292,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild edit-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index> <position> <length> <key> <velocity>\n",
             "  flp-rebuild edit-note-properties <input.flp> <output.flp> <pattern-id> <channel-id> <note-index> <flags-raw|-> <group-raw|-> <fine-pitch|-> <release|-> <midi-channel-raw|-> <pan|-> <mod-x|-> <mod-y|->\n",
             "  flp-rebuild quantize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <grid-ticks> <strength-0..1> <swing-0..1>\n",
+            "  flp-rebuild quantize-selected-notes <input.flp> <output.flp> <pattern-id> <channel-id> <grid-ticks> <strength-0..1> <swing-0..1> <note-index,note-index,...>\n",
             "  flp-rebuild legato-notes <input.flp> <output.flp> <pattern-id> <channel-id>\n",
             "  flp-rebuild chop-notes <input.flp> <output.flp> <pattern-id> <channel-id> <divisions-2..64>\n",
             "  flp-rebuild glue-notes <input.flp> <output.flp> <pattern-id> <channel-id>\n",
@@ -3343,6 +3361,44 @@ fn quantize_notes(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "quantized {changed} notes in pattern {pattern_id}, channel {channel_id} to {}",
+        output.display()
+    );
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct QuantizeOptions {
+    grid_ticks: u32,
+    strength: f64,
+    swing: f64,
+}
+
+fn quantize_selected_notes(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    options: QuantizeOptions,
+    note_indices: &[usize],
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let changed = document
+        .quantize_pattern_note_selection(
+            pattern_id,
+            channel_id,
+            note_indices,
+            options.grid_ticks,
+            options.strength,
+            options.swing,
+        )
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "quantized {changed} selected notes in pattern {pattern_id}, channel {channel_id} to {}",
         output.display()
     );
     Ok(())
