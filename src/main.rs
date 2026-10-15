@@ -585,6 +585,21 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 },
             )
         }
+        [command, input, output, pattern_id, channel_id, note_index, slide]
+            if command == "set-note-slide" =>
+        {
+            edit_note(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                parse_usize(note_index, "channel note index")?,
+                PatternNoteEdit {
+                    slide: Some(parse_bool(slide, "note slide flag")?),
+                    ..PatternNoteEdit::default()
+                },
+            )
+        }
         [command, input, output, pattern_id, channel_id, note_index, flags, group, fine_pitch, release, midi_channel, pan, mod_x, mod_y]
             if command == "edit-note-properties" =>
         {
@@ -1559,6 +1574,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild insert-automation-point <input.flp> <output.flp> <channel-id> <insertion-slot> <position-beats> <value> <tension>\n",
             "  flp-rebuild delete-automation-point <input.flp> <output.flp> <channel-id> <point-index>\n",
             "  flp-rebuild edit-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index> <position> <length> <key> <velocity>\n",
+            "  flp-rebuild set-note-slide <input.flp> <output.flp> <pattern-id> <channel-id> <note-index> <slide:0|1>\n",
             "  flp-rebuild edit-note-properties <input.flp> <output.flp> <pattern-id> <channel-id> <note-index> <flags-raw|-> <group-raw|-> <fine-pitch|-> <release|-> <midi-channel-raw|-> <pan|-> <mod-x|-> <mod-y|->\n",
             "  flp-rebuild quantize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <grid-ticks> <strength-0..1> <swing-0..1>\n",
             "  flp-rebuild quantize-selected-notes <input.flp> <output.flp> <pattern-id> <channel-id> <grid-ticks> <strength-0..1> <swing-0..1> <note-index,note-index,...>\n",
