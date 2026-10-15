@@ -18,7 +18,7 @@ use flp_rebuild::{
     ChannelLevelAdjustmentsEdit, ClawMachineOptions, FlpDocument, FstPreset, PatternControllerEdit,
     PatternNote, PatternNoteEdit, PatternNoteRotation, PlaylistClipEdit, PlaylistTrackEdit,
     PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit,
-    ProjectSettingsEdit, RandomizerOptions, ScaleLevelsOptions, TimeMarkerEdit,
+    ProjectSettingsEdit, RandomizerOptions, RiffMachineOptions, ScaleLevelsOptions, TimeMarkerEdit,
 };
 
 fn main() -> ExitCode {
@@ -1145,6 +1145,54 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 &parse_note_indices(note_indices)?,
             )
         }
+        [command, input, output, pattern_id, channel_id, scale_name, scale_root, minimum_key,
+            maximum_key, step_ticks, range_octaves, gate, direction, seed]
+            if command == "riff-notes" =>
+        {
+            riff_machine_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                RiffMachineOptions {
+                    scale_intervals: parse_scale_name(scale_name)?,
+                    scale_root: parse_u8(scale_root, "Riff Machine scale root")?,
+                    minimum_key: parse_u16(minimum_key, "Riff Machine minimum key")?,
+                    maximum_key: parse_u16(maximum_key, "Riff Machine maximum key")?,
+                    step_ticks: parse_u32(step_ticks, "Riff Machine step")?,
+                    range_octaves: parse_u8(range_octaves, "Riff Machine octave range")?,
+                    gate_percent: parse_u8(gate, "Riff Machine gate")?,
+                    direction: parse_arpeggio_direction(direction)?,
+                    seed: parse_u64(seed, "Riff Machine seed")?,
+                    ..RiffMachineOptions::default()
+                },
+                None,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, scale_name, scale_root, minimum_key,
+            maximum_key, step_ticks, range_octaves, gate, direction, seed, note_indices]
+            if command == "riff-selected-notes" =>
+        {
+            riff_machine_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                RiffMachineOptions {
+                    scale_intervals: parse_scale_name(scale_name)?,
+                    scale_root: parse_u8(scale_root, "Riff Machine scale root")?,
+                    minimum_key: parse_u16(minimum_key, "Riff Machine minimum key")?,
+                    maximum_key: parse_u16(maximum_key, "Riff Machine maximum key")?,
+                    step_ticks: parse_u32(step_ticks, "Riff Machine step")?,
+                    range_octaves: parse_u8(range_octaves, "Riff Machine octave range")?,
+                    gate_percent: parse_u8(gate, "Riff Machine gate")?,
+                    direction: parse_arpeggio_direction(direction)?,
+                    seed: parse_u64(seed, "Riff Machine seed")?,
+                    ..RiffMachineOptions::default()
+                },
+                Some(&parse_note_indices(note_indices)?),
+            )
+        }
         [command, input, output, pattern_id, channel_id, position_ticks]
             if command == "slice-notes" =>
         {
@@ -1608,6 +1656,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild limit-selected-notes <input.flp> <output.flp> <pattern-id> <channel-id> <minimum-key-0..127> <maximum-key-0..127> <note-index,note-index,...>\n",
             "  flp-rebuild arp-notes <input.flp> <output.flp> <pattern-id> <channel-id> <step-ticks> <range-octaves-1..4> <gate-1..100> <up|down|up-down>\n",
             "  flp-rebuild arp-selected-notes <input.flp> <output.flp> <pattern-id> <channel-id> <step-ticks> <range-octaves-1..4> <gate-1..100> <up|down|up-down> <note-index,note-index,...>\n",
+            "  flp-rebuild riff-notes <input.flp> <output.flp> <pattern-id> <channel-id> <scale-name> <scale-root-0..11> <minimum-key-0..127> <maximum-key-0..127> <step-ticks> <range-octaves-1..4> <gate-1..100> <up|down|up-down> <seed>\n",
+            "  flp-rebuild riff-selected-notes <input.flp> <output.flp> <pattern-id> <channel-id> <scale-name> <scale-root-0..11> <minimum-key-0..127> <maximum-key-0..127> <step-ticks> <range-octaves-1..4> <gate-1..100> <up|down|up-down> <seed> <note-index,note-index,...>\n",
             "  flp-rebuild slice-notes <input.flp> <output.flp> <pattern-id> <channel-id> <position-ticks>\n",
             "  flp-rebuild slice-selected-notes <input.flp> <output.flp> <pattern-id> <channel-id> <position-ticks> <note-index,note-index,...>\n",
             "  flp-rebuild add-note <input.flp> <output.flp> <pattern-id> <channel-id> <position> <length> <key> <velocity>\n",
@@ -4409,6 +4459,49 @@ fn limit_selected_notes(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "limited {changed} selected note pitches in pattern {pattern_id}, channel {channel_id} to {minimum_key}..={maximum_key} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn riff_machine_notes(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    options: RiffMachineOptions<'_>,
+    note_indices: Option<&[usize]>,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let changed = match note_indices {
+        Some(note_indices) => document.riff_machine_pattern_note_selection(
+            pattern_id,
+            channel_id,
+            note_indices,
+            options,
+        ),
+        None => document.riff_machine_pattern_notes(pattern_id, channel_id, options),
+    }
+    .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "generated {changed} {} through the Riff Machine in pattern {pattern_id}, channel {channel_id} with root {}, keys {}–{}, step {} ticks, range {} octave(s), gate {}%, seed {} to {}",
+        if note_indices.is_some() {
+            "selected notes"
+        } else {
+            "notes"
+        },
+        options.scale_root,
+        options.minimum_key,
+        options.maximum_key,
+        options.step_ticks,
+        options.range_octaves,
+        options.gate_percent,
+        options.seed,
         output.display()
     );
     Ok(())
