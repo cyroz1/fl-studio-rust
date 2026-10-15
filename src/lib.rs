@@ -12038,15 +12038,44 @@ impl FlpDocument {
         channel_id: u16,
         options: midi::MidiImportOptions,
     ) -> Result<Vec<(u16, usize)>, FlpError> {
-        self.require_unique_channel(channel_id)?;
+        let channel_ids = vec![channel_id; midi.tracks().len()];
+        self.import_midi_tracks_to_new_patterns_with_channel_map(midi, &channel_ids, options)
+    }
+
+    /// Imports every MIDI track into its own named Pattern on a mapped FL Studio channel.
+    ///
+    /// The channel map must contain one existing, uniquely identified channel for each MIDI
+    /// track. The new Patterns and their imported events are committed together. Track names
+    /// that cannot be represented by the project's string encoding are omitted. If any track
+    /// fails to import, the document remains unchanged. Results follow MIDI track order and
+    /// contain `(pattern_id, imported_note_count)` for each track.
+    pub fn import_midi_tracks_to_new_patterns_with_channel_map(
+        &mut self,
+        midi: &midi::MidiFile,
+        channel_ids: &[u16],
+        options: midi::MidiImportOptions,
+    ) -> Result<Vec<(u16, usize)>, FlpError> {
         if midi.tracks().is_empty() {
             return Err(FlpError::UnsupportedEdit(
                 "MIDI import requires at least one track",
             ));
         }
+        if channel_ids.len() != midi.tracks().len() {
+            return Err(FlpError::UnsupportedEdit(
+                "MIDI import requires one channel mapping per track",
+            ));
+        }
+        for channel_id in channel_ids {
+            self.require_unique_channel(*channel_id)?;
+        }
         let mut candidate = self.clone();
         let mut imported_tracks = Vec::with_capacity(midi.tracks().len());
-        for (track_index, track) in midi.tracks().iter().enumerate() {
+        for (track_index, (track, channel_id)) in midi
+            .tracks()
+            .iter()
+            .zip(channel_ids.iter().copied())
+            .enumerate()
+        {
             let pattern_id = candidate.create_pattern()?;
             if let Some(track_name) = track
                 .name()
@@ -24186,6 +24215,71 @@ mod tests {
         assert!(
             invalid
                 .import_midi_tracks_to_new_patterns(&midi, u16::MAX)
+                .is_err()
+        );
+        assert_eq!(invalid.encode_lossless().unwrap(), before);
+    }
+
+    #[test]
+    fn midi_import_routes_each_new_pattern_to_its_mapped_channel_atomically() {
+        let project_bytes = flp_fixture(
+            &[0x40, 0, 0, 0x40, 1, 0, 0x41, 7, 0, 0xD0, 0],
+            &[0xA1],
+            &[0xB2],
+        );
+        let first_track = [
+            0x00, 0x90, 0x3C, 0x64, 0x83, 0x60, 0x80, 0x3C, 0x40, 0x00, 0xFF, 0x2F, 0x00,
+        ];
+        let second_track = [
+            0x00, 0x91, 0x43, 0x50, 0x83, 0x60, 0x81, 0x43, 0x30, 0x00, 0xFF, 0x2F, 0x00,
+        ];
+        let midi_bytes =
+            midi_fixture_named_tracks(&[("Piano", &first_track), ("Bass", &second_track)], 480);
+        let midi = MidiFile::parse(&midi_bytes).expect("MIDI fixture should parse");
+        let mut document = FlpDocument::parse(&project_bytes).expect("project should parse");
+        assert_eq!(
+            document
+                .channels()
+                .iter()
+                .map(ChannelSummary::id)
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
+
+        let imported_tracks = document
+            .import_midi_tracks_to_new_patterns_with_channel_map(
+                &midi,
+                &[0, 1],
+                MidiImportOptions::default(),
+            )
+            .expect("each MIDI track should use its mapped FL channel");
+
+        assert_eq!(imported_tracks, [(8, 1), (9, 1)]);
+        let patterns = document.patterns().expect("patterns should decode");
+        assert_eq!(patterns[1].name.as_deref(), Some("Piano"));
+        assert_eq!(patterns[1].notes[0].channel_id, 0);
+        assert_eq!(patterns[2].name.as_deref(), Some("Bass"));
+        assert_eq!(patterns[2].notes[0].channel_id, 1);
+
+        let mut invalid = FlpDocument::parse(&project_bytes).unwrap();
+        let before = invalid.encode_lossless().unwrap();
+        assert!(
+            invalid
+                .import_midi_tracks_to_new_patterns_with_channel_map(
+                    &midi,
+                    &[0],
+                    MidiImportOptions::default(),
+                )
+                .is_err()
+        );
+        assert_eq!(invalid.encode_lossless().unwrap(), before);
+        assert!(
+            invalid
+                .import_midi_tracks_to_new_patterns_with_channel_map(
+                    &midi,
+                    &[0, u16::MAX],
+                    MidiImportOptions::default(),
+                )
                 .is_err()
         );
         assert_eq!(invalid.encode_lossless().unwrap(), before);

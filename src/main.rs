@@ -1071,7 +1071,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 Path::new(input),
                 Path::new(midi_path),
                 Path::new(output),
-                parse_u16(channel_id, "channel id")?,
+                parse_midi_import_channel_ids(channel_id)?,
                 parse_midi_import_options(options)?,
             )
         }
@@ -1148,7 +1148,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild add-note <input.flp> <output.flp> <pattern-id> <channel-id> <position> <length> <key> <velocity>\n",
             "  flp-rebuild delete-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index>\n",
             "  flp-rebuild import-midi <input.flp> <input.mid> <output.flp> <track> <pattern-id|new> <channel-id> [--realign-events] [--zero-velocity-notes]\n",
-            "  flp-rebuild import-midi-all <input.flp> <input.mid> <output.flp> <channel-id> [--realign-events] [--zero-velocity-notes]\n",
+            "  flp-rebuild import-midi-all <input.flp> <input.mid> <output.flp> <channel-id[,channel-id,...]> [--realign-events] [--zero-velocity-notes]\n",
             "  flp-rebuild edit-clip <input.flp> <output.flp> <arrangement-id> <clip-index> <position> <length>\n",
             "  flp-rebuild set-clip-muted <input.flp> <output.flp> <arrangement-id> <clip-index> <muted:0|1>\n",
             "  flp-rebuild edit-playlist-track <input.flp> <output.flp> <track-id> <enabled:0|1|-> <grouped:0|1|->\n",
@@ -1202,6 +1202,21 @@ fn parse_midi_channel_mapping(value: &str) -> Result<MidiChannelMapping, String>
         "channels" => Ok(MidiChannelMapping::AssignProjectChannels),
         _ => Err("MIDI channel mapping must be 'stored' or 'channels'".to_owned()),
     }
+}
+
+fn parse_midi_import_channel_ids(value: &str) -> Result<Vec<u16>, String> {
+    value
+        .split(',')
+        .map(|part| {
+            let part = part.trim();
+            if part.is_empty() {
+                return Err(
+                    "MIDI channel IDs must be one ID or a comma-separated list of IDs".to_owned(),
+                );
+            }
+            parse_u16(part, "channel id")
+        })
+        .collect()
 }
 
 fn parse_midi_import_options(flags: &[String]) -> Result<MidiImportOptions, String> {
@@ -3568,7 +3583,7 @@ fn import_midi_tracks(
     input: &Path,
     midi_path: &Path,
     output: &Path,
-    channel_id: u16,
+    channel_ids: Vec<u16>,
     options: MidiImportOptions,
 ) -> Result<(), String> {
     let (_, mut document) = load_document(input)?;
@@ -3576,8 +3591,13 @@ fn import_midi_tracks(
         .map_err(|error| format!("could not read {}: {error}", midi_path.display()))?;
     let midi = MidiFile::parse(&midi_bytes)
         .map_err(|error| format!("could not parse {}: {error}", midi_path.display()))?;
+    let channel_ids = if channel_ids.len() == 1 {
+        vec![channel_ids[0]; midi.tracks().len()]
+    } else {
+        channel_ids
+    };
     let imported_tracks = document
-        .import_midi_tracks_to_new_patterns_with_options(&midi, channel_id, options)
+        .import_midi_tracks_to_new_patterns_with_channel_map(&midi, &channel_ids, options)
         .map_err(|error| error.to_string())?;
     let imported_notes = imported_tracks
         .iter()
@@ -3588,13 +3608,18 @@ fn import_midi_tracks(
         .map(|(pattern_id, _)| pattern_id.to_string())
         .collect::<Vec<_>>()
         .join(", ");
+    let channel_ids = channel_ids
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
     let bytes = document
         .encode_lossless()
         .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
     fs::write(output, bytes)
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
-        "imported {} MIDI tracks ({imported_notes} notes) into patterns [{pattern_ids}] on channel {channel_id} in {}",
+        "imported {} MIDI tracks ({imported_notes} notes) into patterns [{pattern_ids}] on channels [{channel_ids}] in {}",
         imported_tracks.len(),
         output.display()
     );

@@ -2811,6 +2811,7 @@ struct PendingMidiImport {
     selected_track: usize,
     options: MidiImportOptions,
     create_new_pattern: bool,
+    track_channel_ids: Vec<Option<u16>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -10394,6 +10395,7 @@ impl DawUi {
                     Ok(midi) if !midi.tracks().is_empty() => {
                         self.pending_midi_import = Some(PendingMidiImport {
                             path: path.clone(),
+                            track_channel_ids: vec![None; midi.tracks().len()],
                             midi,
                             selected_track: 0,
                             options: MidiImportOptions::default(),
@@ -25888,6 +25890,7 @@ impl DawUi {
                     Ok(midi) if !midi.tracks().is_empty() => {
                         self.pending_midi_import = Some(PendingMidiImport {
                             path: path.clone(),
+                            track_channel_ids: vec![None; midi.tracks().len()],
                             midi,
                             selected_track: 0,
                             options: MidiImportOptions::default(),
@@ -25906,6 +25909,23 @@ impl DawUi {
         let mut import_midi_all_request = None;
         let mut clear_midi_import = false;
         if let Some(pending) = &mut self.pending_midi_import {
+            pending
+                .track_channel_ids
+                .resize(pending.midi.tracks().len(), None);
+            let import_channels: Vec<_> = channels
+                .iter()
+                .filter(|channel| {
+                    channels
+                        .iter()
+                        .filter(|candidate| candidate.id() == channel.id())
+                        .count()
+                        == 1
+                })
+                .collect();
+            let default_import_channel = self
+                .selected_note_channel
+                .filter(|id| import_channels.iter().any(|channel| channel.id() == *id))
+                .or_else(|| import_channels.first().map(|channel| channel.id()));
             ui.horizontal(|ui| {
                 ui.small(pending.path.file_name().map_or_else(
                     || "MIDI".to_owned(),
@@ -25963,17 +25983,99 @@ impl DawUi {
                         &mut pending.options.zero_velocity_is_note_on,
                         "Import zero velocity notes",
                     );
+                    egui::CollapsingHeader::new("Track routing")
+                        .id_salt("midi-import-track-routing")
+                        .show(ui, |ui| {
+                            for (index, track) in pending.midi.tracks().iter().enumerate() {
+                                let track_label = track
+                                    .name()
+                                    .filter(|name| !name.trim().is_empty())
+                                    .unwrap_or_else(|| format!("Track {}", index + 1));
+                                let selected_channel = pending.track_channel_ids[index]
+                                    .filter(|id| {
+                                        import_channels
+                                            .iter()
+                                            .any(|channel| channel.id() == *id)
+                                    })
+                                    .or(default_import_channel);
+                                ui.horizontal(|ui| {
+                                    ui.label(track_label);
+                                    egui::ComboBox::from_id_salt((
+                                        "midi-import-track-channel",
+                                        index,
+                                    ))
+                                    .selected_text(
+                                        selected_channel
+                                            .and_then(|id| {
+                                                import_channels
+                                                    .iter()
+                                                    .find(|channel| channel.id() == id)
+                                                    .map(|channel| {
+                                                        channel
+                                                            .display_name()
+                                                            .or(channel.plugin_identifier())
+                                                            .map(str::to_owned)
+                                                            .unwrap_or_else(|| {
+                                                                format!("Channel {}", channel.id())
+                                                            })
+                                                    })
+                                            })
+                                            .unwrap_or_else(|| "No channel".to_owned()),
+                                    )
+                                    .show_ui(ui, |ui| {
+                                        for channel in &import_channels {
+                                            let label = channel
+                                                .display_name()
+                                                .or(channel.plugin_identifier())
+                                                .map(str::to_owned)
+                                                .unwrap_or_else(|| {
+                                                    format!("Channel {}", channel.id())
+                                                });
+                                            ui.selectable_value(
+                                                &mut pending.track_channel_ids[index],
+                                                Some(channel.id()),
+                                                label,
+                                            );
+                                        }
+                                    });
+                                });
+                            }
+                            if import_channels.is_empty() {
+                                ui.weak("No uniquely identified FL channels are available.");
+                            }
+                        });
                     if ui
                         .add_enabled(
-                            self.selected_note_channel.is_some(),
+                            default_import_channel.is_some(),
                             egui::Button::new("Import all tracks as patterns"),
                         )
                         .on_hover_text(
-                            "Create one named pattern per MIDI track on the selected FL channel",
+                            "Create one named pattern per MIDI track and route each track to its selected FL channel",
                         )
                         .clicked()
                     {
-                        import_midi_all_request = Some((pending.midi.clone(), pending.options));
+                        let channel_ids = pending
+                            .midi
+                            .tracks()
+                            .iter()
+                            .enumerate()
+                            .map(|(index, _)| {
+                                pending.track_channel_ids[index]
+                                    .filter(|id| {
+                                        import_channels
+                                            .iter()
+                                            .any(|channel| channel.id() == *id)
+                                    })
+                                    .or(default_import_channel)
+                            })
+                            .collect::<Option<Vec<_>>>();
+                        if let Some(channel_ids) = channel_ids {
+                            import_midi_all_request = Some((
+                                pending.midi.clone(),
+                                pending.options,
+                                channel_ids,
+                            ));
+                        }
                     }
                 });
         }
@@ -26061,12 +26163,15 @@ impl DawUi {
                 None => self.status = "No project or target pattern is available".to_owned(),
             }
         }
-        if let Some((midi, options)) = import_midi_all_request {
+        if let Some((midi, options, channel_ids)) = import_midi_all_request {
             let import_result = self.document.as_mut().and_then(|document| {
-                self.selected_note_channel.map(|channel_id| {
-                    document
-                        .import_midi_tracks_to_new_patterns_with_options(&midi, channel_id, options)
-                })
+                Some(
+                    document.import_midi_tracks_to_new_patterns_with_channel_map(
+                        &midi,
+                        &channel_ids,
+                        options,
+                    ),
+                )
             });
             match import_result {
                 Some(Ok(imported_tracks)) => {
@@ -26075,15 +26180,11 @@ impl DawUi {
                         .map(|(_, imported)| *imported)
                         .sum::<usize>();
                     if let Some((pattern_id, imported)) = imported_tracks.first().copied() {
+                        let channel_id = channel_ids[0];
                         self.selected_pattern = Some(pattern_id);
-                        self.selected_note = self
-                            .selected_note_channel
-                            .filter(|_| imported > 0)
-                            .map(|channel_id| (pattern_id, channel_id, 0));
+                        self.selected_note = (imported > 0).then_some((pattern_id, channel_id, 0));
                         self.selected_piano_notes.clear();
-                        if imported > 0
-                            && let Some(channel_id) = self.selected_note_channel
-                        {
+                        if imported > 0 {
                             self.selected_piano_notes
                                 .insert((pattern_id, channel_id, 0));
                         }
