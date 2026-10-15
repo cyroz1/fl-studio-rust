@@ -230,7 +230,7 @@ The `mixer <file.flp>` command reports recognized insert fields and counts known
 
 ## Automated checks and installers
 
-GitHub Actions runs formatting checks, Clippy, and the Rust test suite on Ubuntu, macOS, and Windows for pushes, pull requests, and manual runs. Each platform job also builds a native desktop package with Cargo Packager. CI uploads a Windows NSIS installer and Linux Debian, AppImage, and pacman packages; macOS uploads a signed and notarized DMG when Apple signing secrets are configured, or an unsigned GUI preview otherwise. Gatekeeper may block the preview until its quarantine attribute is removed; see [macOS CI packaging](docs/macos-ci-packaging.md). The package definitions are in [`Packager.toml`](Packager.toml).
+GitHub Actions runs formatting checks, Clippy, and the Rust test suite on Ubuntu, macOS, and Windows for pushes, pull requests, and manual runs. Each platform job also builds a native desktop package with Cargo Packager. CI uploads platform installers only: the Windows NSIS installer, Linux Debian, AppImage, and pacman packages, and a macOS disk image. The macOS disk image is signed and notarized when Apple signing secrets are configured; otherwise it is unsigned and Gatekeeper may block it. See [macOS CI packaging](docs/macos-ci-packaging.md). The package definitions are in [`Packager.toml`](Packager.toml).
 
 ## Compatibility plan
 
