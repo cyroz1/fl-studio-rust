@@ -730,6 +730,52 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 scale_intervals,
             )
         }
+        [command, input, output, pattern_id, channel_id, seed, velocity_amount, pan_amount,
+            pitch_range, bipolar, reset_levels, note_indices]
+            if command == "randomize-selected-notes" =>
+        {
+            randomize_selected_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                RandomizerOptions {
+                    seed: parse_u64(seed, "randomizer seed")?,
+                    velocity_amount_percent: parse_i16(velocity_amount, "velocity amount")?,
+                    pan_amount_percent: parse_i16(pan_amount, "pan amount")?,
+                    pitch_range_semitones: parse_u8(pitch_range, "pitch range")?,
+                    bipolar: parse_bool(bipolar, "bipolar")?,
+                    reset_levels: parse_bool(reset_levels, "reset levels")?,
+                },
+                &parse_note_indices(note_indices)?,
+                None,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, seed, velocity_amount, pan_amount,
+            pitch_range, bipolar, reset_levels, scale_name, scale_root, note_indices]
+            if command == "randomize-selected-notes-scale" =>
+        {
+            let scale_intervals = parse_scale_name(scale_name)?;
+            randomize_selected_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                RandomizerOptions {
+                    seed: parse_u64(seed, "randomizer seed")?,
+                    velocity_amount_percent: parse_i16(velocity_amount, "velocity amount")?,
+                    pan_amount_percent: parse_i16(pan_amount, "pan amount")?,
+                    pitch_range_semitones: parse_u8(pitch_range, "pitch range")?,
+                    bipolar: parse_bool(bipolar, "bipolar")?,
+                    reset_levels: parse_bool(reset_levels, "reset levels")?,
+                },
+                &parse_note_indices(note_indices)?,
+                Some((
+                    parse_u8(scale_root, "scale root")?,
+                    scale_intervals,
+                )),
+            )
+        }
         [command, input, output, pattern_id, channel_id, seed, timing_range, velocity_variation]
             if command == "humanize-notes" =>
         {
@@ -1219,6 +1265,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild flam-notes <input.flp> <output.flp> <pattern-id> <channel-id> <stroke-ticks> <velocity-0..127> <before|after>\n",
             "  flp-rebuild randomize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <velocity-amount:-100..100> <pan-amount:-100..100> <pitch-range:0..24> <bipolar:0|1> <reset:0|1>\n",
             "  flp-rebuild randomize-notes-scale <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <velocity-amount:-100..100> <pan-amount:-100..100> <pitch-range:0..24> <bipolar:0|1> <reset:0|1> <scale-name> <scale-root:0..11>\n",
+            "  flp-rebuild randomize-selected-notes <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <velocity-amount:-100..100> <pan-amount:-100..100> <pitch-range:0..24> <bipolar:0|1> <reset:0|1> <note-index,note-index,...>\n",
+            "  flp-rebuild randomize-selected-notes-scale <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <velocity-amount:-100..100> <pan-amount:-100..100> <pitch-range:0..24> <bipolar:0|1> <reset:0|1> <scale-name> <scale-root:0..11> <note-index,note-index,...>\n",
             "  flp-rebuild humanize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <timing-range-ticks> <velocity-variation-0..100>\n",
             "  flp-rebuild humanize-selected-notes <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <timing-range-ticks> <velocity-variation-0..100> <note-index,note-index,...>\n",
             "  flp-rebuild limit-notes <input.flp> <output.flp> <pattern-id> <channel-id> <minimum-key-0..127> <maximum-key-0..127>\n",
@@ -3471,6 +3519,44 @@ fn randomize_notes_inner(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "randomized {changed} notes in pattern {pattern_id}, channel {channel_id} with seed {} to {}",
+        options.seed,
+        output.display()
+    );
+    Ok(())
+}
+
+fn randomize_selected_notes(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    options: RandomizerOptions,
+    note_indices: &[usize],
+    scale: Option<(u8, &[u8])>,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let changed = match scale {
+        Some((scale_root, scale_intervals)) => document
+            .randomize_pattern_note_selection_with_scale(
+                pattern_id,
+                channel_id,
+                note_indices,
+                options,
+                scale_root,
+                scale_intervals,
+            ),
+        None => {
+            document.randomize_pattern_note_selection(pattern_id, channel_id, note_indices, options)
+        }
+    }
+    .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "randomized {changed} selected notes in pattern {pattern_id}, channel {channel_id} with seed {} to {}",
         options.seed,
         output.display()
     );
