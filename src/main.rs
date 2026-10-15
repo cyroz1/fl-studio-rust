@@ -838,6 +838,24 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 },
             )
         }
+        [command, input, output, pattern_id, channel_id, step_ticks, range_octaves, gate,
+            direction, note_indices]
+            if command == "arp-selected-notes" =>
+        {
+            arpeggiate_selected_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                ArpeggioOptions {
+                    step_ticks: parse_u32(step_ticks, "arpeggiator step")?,
+                    range_octaves: parse_u8(range_octaves, "arpeggiator range")?,
+                    gate_percent: parse_u8(gate, "arpeggiator gate")?,
+                    direction: parse_arpeggio_direction(direction)?,
+                },
+                &parse_note_indices(note_indices)?,
+            )
+        }
         [command, input, output, pattern_id, channel_id, position_ticks]
             if command == "slice-notes" =>
         {
@@ -1271,6 +1289,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild humanize-selected-notes <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <timing-range-ticks> <velocity-variation-0..100> <note-index,note-index,...>\n",
             "  flp-rebuild limit-notes <input.flp> <output.flp> <pattern-id> <channel-id> <minimum-key-0..127> <maximum-key-0..127>\n",
             "  flp-rebuild arp-notes <input.flp> <output.flp> <pattern-id> <channel-id> <step-ticks> <range-octaves-1..4> <gate-1..100> <up|down|up-down>\n",
+            "  flp-rebuild arp-selected-notes <input.flp> <output.flp> <pattern-id> <channel-id> <step-ticks> <range-octaves-1..4> <gate-1..100> <up|down|up-down> <note-index,note-index,...>\n",
             "  flp-rebuild slice-notes <input.flp> <output.flp> <pattern-id> <channel-id> <position-ticks>\n",
             "  flp-rebuild add-note <input.flp> <output.flp> <pattern-id> <channel-id> <position> <length> <key> <velocity>\n",
             "  flp-rebuild delete-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index>\n",
@@ -3675,6 +3694,30 @@ fn arpeggiate_notes(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "generated {created} arpeggiated notes in pattern {pattern_id}, channel {channel_id} to {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn arpeggiate_selected_notes(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    options: ArpeggioOptions,
+    note_indices: &[usize],
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let created = document
+        .arpeggiate_pattern_note_selection(pattern_id, channel_id, note_indices, options)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "generated {created} arpeggiated notes from the selection in pattern {pattern_id}, channel {channel_id} to {}",
         output.display()
     );
     Ok(())
