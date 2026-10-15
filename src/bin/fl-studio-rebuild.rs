@@ -25903,6 +25903,7 @@ impl DawUi {
         }
 
         let mut import_midi_request = None;
+        let mut import_midi_all_request = None;
         let mut clear_midi_import = false;
         if let Some(pending) = &mut self.pending_midi_import {
             ui.horizontal(|ui| {
@@ -25962,6 +25963,18 @@ impl DawUi {
                         &mut pending.options.zero_velocity_is_note_on,
                         "Import zero velocity notes",
                     );
+                    if ui
+                        .add_enabled(
+                            self.selected_note_channel.is_some(),
+                            egui::Button::new("Import all tracks as patterns"),
+                        )
+                        .on_hover_text(
+                            "Create one named pattern per MIDI track on the selected FL channel",
+                        )
+                        .clicked()
+                    {
+                        import_midi_all_request = Some((pending.midi.clone(), pending.options));
+                    }
                 });
         }
         if clear_midi_import {
@@ -26046,6 +26059,48 @@ impl DawUi {
                 }
                 Some(Err(error)) => self.status = error.to_string(),
                 None => self.status = "No project or target pattern is available".to_owned(),
+            }
+        }
+        if let Some((midi, options)) = import_midi_all_request {
+            let import_result = self.document.as_mut().and_then(|document| {
+                self.selected_note_channel.map(|channel_id| {
+                    document
+                        .import_midi_tracks_to_new_patterns_with_options(&midi, channel_id, options)
+                })
+            });
+            match import_result {
+                Some(Ok(imported_tracks)) => {
+                    let imported_notes = imported_tracks
+                        .iter()
+                        .map(|(_, imported)| *imported)
+                        .sum::<usize>();
+                    if let Some((pattern_id, imported)) = imported_tracks.first().copied() {
+                        self.selected_pattern = Some(pattern_id);
+                        self.selected_note = self
+                            .selected_note_channel
+                            .filter(|_| imported > 0)
+                            .map(|channel_id| (pattern_id, channel_id, 0));
+                        self.selected_piano_notes.clear();
+                        if imported > 0
+                            && let Some(channel_id) = self.selected_note_channel
+                        {
+                            self.selected_piano_notes
+                                .insert((pattern_id, channel_id, 0));
+                        }
+                    }
+                    if !imported_tracks.is_empty() {
+                        self.dirty = true;
+                    }
+                    if let Some(document) = self.document.as_ref() {
+                        patterns = document.patterns().unwrap_or_default();
+                    }
+                    self.status = format!(
+                        "Imported {} MIDI tracks and {imported_notes} notes into named patterns",
+                        imported_tracks.len()
+                    );
+                }
+                Some(Err(error)) => self.status = error.to_string(),
+                None => self.status = "No project or target channel is available".to_owned(),
             }
         }
 
