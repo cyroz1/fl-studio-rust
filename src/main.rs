@@ -804,6 +804,26 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 before,
             )
         }
+        [command, input, output, pattern_id, channel_id, stroke_ticks, velocity, placement,
+            note_indices]
+            if command == "flam-selected-notes" =>
+        {
+            let before = match placement.as_str() {
+                "before" => true,
+                "after" => false,
+                _ => return Err("flam placement must be 'before' or 'after'".to_owned()),
+            };
+            flam_selected_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                parse_u32(stroke_ticks, "flam stroke time")?,
+                parse_u8(velocity, "flam velocity")?,
+                before,
+                &parse_note_indices(note_indices)?,
+            )
+        }
         [command, input, output, pattern_id, channel_id, seed, velocity_amount, pan_amount,
             pitch_range, bipolar, reset_levels]
             if command == "randomize-notes" =>
@@ -1404,6 +1424,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild strum-notes <input.flp> <output.flp> <pattern-id> <channel-id> <spread-ticks> <up|down>\n",
             "  flp-rebuild strum-selected-notes <input.flp> <output.flp> <pattern-id> <channel-id> <spread-ticks> <up|down> <note-index,note-index,...>\n",
             "  flp-rebuild flam-notes <input.flp> <output.flp> <pattern-id> <channel-id> <stroke-ticks> <velocity-0..127> <before|after>\n",
+            "  flp-rebuild flam-selected-notes <input.flp> <output.flp> <pattern-id> <channel-id> <stroke-ticks> <velocity-0..127> <before|after> <note-index,note-index,...>\n",
             "  flp-rebuild randomize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <velocity-amount:-100..100> <pan-amount:-100..100> <pitch-range:0..24> <bipolar:0|1> <reset:0|1>\n",
             "  flp-rebuild randomize-notes-scale <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <velocity-amount:-100..100> <pan-amount:-100..100> <pitch-range:0..24> <bipolar:0|1> <reset:0|1> <scale-name> <scale-root:0..11>\n",
             "  flp-rebuild randomize-selected-notes <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <velocity-amount:-100..100> <pan-amount:-100..100> <pitch-range:0..24> <bipolar:0|1> <reset:0|1> <note-index,note-index,...>\n",
@@ -3791,6 +3812,44 @@ fn flam_notes(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "added {created} flam strokes in pattern {pattern_id}, channel {channel_id} ({}) to {}",
+        if before {
+            "before notes"
+        } else {
+            "after notes"
+        },
+        output.display()
+    );
+    Ok(())
+}
+
+fn flam_selected_notes(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    stroke_ticks: u32,
+    velocity: u8,
+    before: bool,
+    note_indices: &[usize],
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let created = document
+        .flam_pattern_note_selection(
+            pattern_id,
+            channel_id,
+            note_indices,
+            stroke_ticks,
+            velocity,
+            before,
+        )
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "added {created} selected-note flam strokes in pattern {pattern_id}, channel {channel_id} ({}) to {}",
         if before {
             "before notes"
         } else {
