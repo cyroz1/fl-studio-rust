@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -15,10 +15,11 @@ use flp_rebuild::sample_render::{
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions};
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, ArticulateOptions, AutomationPointEdit,
-    ChannelLevelAdjustmentsEdit, ClawMachineOptions, FlpDocument, FstPreset, PatternControllerEdit,
-    PatternNote, PatternNoteEdit, PatternNoteRotation, PlaylistClipEdit, PlaylistTrackEdit,
-    PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit,
-    ProjectSettingsEdit, RandomizerOptions, RiffMachineOptions, ScaleLevelsOptions, TimeMarkerEdit,
+    ChannelLevelAdjustmentsEdit, ClawMachineOptions, FlpDocument, FstPreset, LimitSnapDirection,
+    PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation, PlaylistClipEdit,
+    PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit,
+    ProjectSettingsEdit, RandomizerOptions, RiffMachineOptions, RiffMachineQuantizeMode,
+    ScaleLevelsOptions, TimeMarkerEdit,
 };
 
 fn main() -> ExitCode {
@@ -1146,14 +1147,10 @@ fn run(args: Vec<String>) -> Result<(), String> {
             )
         }
         [command, input, output, pattern_id, channel_id, scale_name, scale_root, minimum_key,
-            maximum_key, step_ticks, range_octaves, gate, direction, seed]
+            maximum_key, step_ticks, range_octaves, gate, direction, seed, option_args @ ..]
             if command == "riff-notes" =>
         {
-            riff_machine_notes(
-                Path::new(input),
-                Path::new(output),
-                parse_u16(pattern_id, "pattern id")?,
-                parse_u16(channel_id, "channel id")?,
+            let options = parse_riff_machine_options(
                 RiffMachineOptions {
                     scale_intervals: parse_scale_name(scale_name)?,
                     scale_root: parse_u8(scale_root, "Riff Machine scale root")?,
@@ -1166,18 +1163,25 @@ fn run(args: Vec<String>) -> Result<(), String> {
                     seed: parse_u64(seed, "Riff Machine seed")?,
                     ..RiffMachineOptions::default()
                 },
+                option_args,
+            )?;
+            riff_machine_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                options,
                 None,
             )
         }
         [command, input, output, pattern_id, channel_id, scale_name, scale_root, minimum_key,
-            maximum_key, step_ticks, range_octaves, gate, direction, seed, note_indices]
+            maximum_key, step_ticks, range_octaves, gate, direction, seed, extra_args @ ..]
             if command == "riff-selected-notes" =>
         {
-            riff_machine_notes(
-                Path::new(input),
-                Path::new(output),
-                parse_u16(pattern_id, "pattern id")?,
-                parse_u16(channel_id, "channel id")?,
+            let (note_indices, option_args) = extra_args.split_last().ok_or_else(|| {
+                "riff-selected-notes requires a comma-separated note index list".to_owned()
+            })?;
+            let options = parse_riff_machine_options(
                 RiffMachineOptions {
                     scale_intervals: parse_scale_name(scale_name)?,
                     scale_root: parse_u8(scale_root, "Riff Machine scale root")?,
@@ -1190,6 +1194,14 @@ fn run(args: Vec<String>) -> Result<(), String> {
                     seed: parse_u64(seed, "Riff Machine seed")?,
                     ..RiffMachineOptions::default()
                 },
+                option_args,
+            )?;
+            riff_machine_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                options,
                 Some(&parse_note_indices(note_indices)?),
             )
         }
@@ -1656,8 +1668,10 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild limit-selected-notes <input.flp> <output.flp> <pattern-id> <channel-id> <minimum-key-0..127> <maximum-key-0..127> <note-index,note-index,...>\n",
             "  flp-rebuild arp-notes <input.flp> <output.flp> <pattern-id> <channel-id> <step-ticks> <range-octaves-1..4> <gate-1..100> <up|down|up-down>\n",
             "  flp-rebuild arp-selected-notes <input.flp> <output.flp> <pattern-id> <channel-id> <step-ticks> <range-octaves-1..4> <gate-1..100> <up|down|up-down> <note-index,note-index,...>\n",
-            "  flp-rebuild riff-notes <input.flp> <output.flp> <pattern-id> <channel-id> <scale-name> <scale-root-0..11> <minimum-key-0..127> <maximum-key-0..127> <step-ticks> <range-octaves-1..4> <gate-1..100> <up|down|up-down> <seed>\n",
-            "  flp-rebuild riff-selected-notes <input.flp> <output.flp> <pattern-id> <channel-id> <scale-name> <scale-root-0..11> <minimum-key-0..127> <maximum-key-0..127> <step-ticks> <range-octaves-1..4> <gate-1..100> <up|down|up-down> <seed> <note-index,note-index,...>\n",
+            "  flp-rebuild riff-notes <input.flp> <output.flp> <pattern-id> <channel-id> <scale-name> <scale-root-0..11> <minimum-key-0..127> <maximum-key-0..127> <step-ticks> <range-octaves-1..4> <gate-1..100> <up|down|up-down> <seed> [key=value ...]\n",
+            "  flp-rebuild riff-selected-notes <input.flp> <output.flp> <pattern-id> <channel-id> <scale-name> <scale-root-0..11> <minimum-key-0..127> <maximum-key-0..127> <step-ticks> <range-octaves-1..4> <gate-1..100> <up|down|up-down> <seed> [key=value ...] <note-index,note-index,...>\n",
+            "    Riff keys: wrap_to_bottom, snap_direction, mirror_horizontal, preserve_start_times, mirror_vertical, groove_snap_ticks, groove_start_percent, groove_sensitivity_percent, groove_duration_percent, groove_quantize_mode, pan_variation_percent, length_multiplier_percent, velocity_variation_percent, release_variation_percent, mod_x_variation_percent, mod_y_variation_percent, pitch_variation_semitones, reset_levels, bipolar_levels\n",
+            "    Riff values: booleans are 0|1|true|false; snap_direction=up|down|alternate; groove_snap_ticks=off|ticks; groove_quantize_mode=leave-duration|leave-end|quantize-duration|quantize-end\n",
             "  flp-rebuild slice-notes <input.flp> <output.flp> <pattern-id> <channel-id> <position-ticks>\n",
             "  flp-rebuild slice-selected-notes <input.flp> <output.flp> <pattern-id> <channel-id> <position-ticks> <note-index,note-index,...>\n",
             "  flp-rebuild add-note <input.flp> <output.flp> <pattern-id> <channel-id> <position> <length> <key> <velocity>\n",
@@ -1887,6 +1901,115 @@ fn parse_arpeggio_direction(value: &str) -> Result<ArpeggioDirection, String> {
         "down" => Ok(ArpeggioDirection::Down),
         "up-down" => Ok(ArpeggioDirection::UpDown),
         _ => Err("arpeggiator direction must be 'up', 'down', or 'up-down'".to_owned()),
+    }
+}
+
+fn parse_riff_machine_options<'a>(
+    mut options: RiffMachineOptions<'a>,
+    option_args: &[String],
+) -> Result<RiffMachineOptions<'a>, String> {
+    let mut seen = HashSet::new();
+    for option in option_args {
+        let (key, value) = option
+            .split_once('=')
+            .ok_or_else(|| format!("Riff Machine option must use key=value syntax: {option:?}"))?;
+        if value.is_empty() {
+            return Err(format!("Riff Machine option {key:?} needs a value"));
+        }
+        if !seen.insert(key) {
+            return Err(format!(
+                "Riff Machine option {key:?} was provided more than once"
+            ));
+        }
+
+        match key {
+            "wrap_to_bottom" => {
+                options.wrap_to_bottom = parse_bool(value, "Riff Machine wrap_to_bottom")?;
+            }
+            "snap_direction" => options.snap_direction = parse_limit_snap_direction(value)?,
+            "mirror_horizontal" => {
+                options.mirror_horizontal = parse_bool(value, "Riff Machine mirror_horizontal")?;
+            }
+            "preserve_start_times" => {
+                options.preserve_start_times =
+                    parse_bool(value, "Riff Machine preserve_start_times")?;
+            }
+            "mirror_vertical" => {
+                options.mirror_vertical = parse_bool(value, "Riff Machine mirror_vertical")?;
+            }
+            "groove_snap_ticks" => {
+                options.groove_snap_ticks = if value == "off" {
+                    None
+                } else {
+                    Some(parse_u32(value, "Riff Machine groove snap ticks")?)
+                };
+            }
+            "groove_start_percent" => {
+                options.groove_start_percent = parse_u8(value, "Riff Machine groove start")?;
+            }
+            "groove_sensitivity_percent" => {
+                options.groove_sensitivity_percent =
+                    parse_u8(value, "Riff Machine groove sensitivity")?;
+            }
+            "groove_duration_percent" => {
+                options.groove_duration_percent = parse_u8(value, "Riff Machine groove duration")?;
+            }
+            "groove_quantize_mode" => {
+                options.groove_quantize_mode = parse_riff_machine_quantize_mode(value)?;
+            }
+            "pan_variation_percent" => {
+                options.pan_variation_percent = parse_u8(value, "Riff Machine pan variation")?;
+            }
+            "length_multiplier_percent" => {
+                options.length_multiplier_percent =
+                    parse_u8(value, "Riff Machine length multiplier")?;
+            }
+            "velocity_variation_percent" => {
+                options.velocity_variation_percent =
+                    parse_u8(value, "Riff Machine velocity variation")?;
+            }
+            "release_variation_percent" => {
+                options.release_variation_percent =
+                    parse_u8(value, "Riff Machine release variation")?;
+            }
+            "mod_x_variation_percent" => {
+                options.mod_x_variation_percent = parse_u8(value, "Riff Machine Mod X variation")?;
+            }
+            "mod_y_variation_percent" => {
+                options.mod_y_variation_percent = parse_u8(value, "Riff Machine Mod Y variation")?;
+            }
+            "pitch_variation_semitones" => {
+                options.pitch_variation_semitones =
+                    parse_u8(value, "Riff Machine pitch variation")?;
+            }
+            "reset_levels" => {
+                options.reset_levels = parse_bool(value, "Riff Machine reset_levels")?;
+            }
+            "bipolar_levels" => {
+                options.bipolar_levels = parse_bool(value, "Riff Machine bipolar_levels")?;
+            }
+            _ => return Err(format!("unknown Riff Machine option {key:?}")),
+        }
+    }
+    Ok(options)
+}
+
+fn parse_limit_snap_direction(value: &str) -> Result<LimitSnapDirection, String> {
+    match value {
+        "up" => Ok(LimitSnapDirection::Up),
+        "down" => Ok(LimitSnapDirection::Down),
+        "alternate" => Ok(LimitSnapDirection::Alternate),
+        _ => Err("Riff Machine snap_direction must be 'up', 'down', or 'alternate'".to_owned()),
+    }
+}
+
+fn parse_riff_machine_quantize_mode(value: &str) -> Result<RiffMachineQuantizeMode, String> {
+    match value {
+        "leave-duration" => Ok(RiffMachineQuantizeMode::LeaveDuration),
+        "leave-end" => Ok(RiffMachineQuantizeMode::LeaveEnd),
+        "quantize-duration" => Ok(RiffMachineQuantizeMode::QuantizeDuration),
+        "quantize-end" => Ok(RiffMachineQuantizeMode::QuantizeEnd),
+        _ => Err("Riff Machine groove_quantize_mode must be 'leave-duration', 'leave-end', 'quantize-duration', or 'quantize-end'".to_owned()),
     }
 }
 
