@@ -11964,6 +11964,45 @@ impl FlpDocument {
         )
     }
 
+    /// Imports one MIDI track into a newly created pattern using default placement options.
+    pub fn import_midi_track_to_new_pattern(
+        &mut self,
+        midi: &midi::MidiFile,
+        track_index: usize,
+        channel_id: u16,
+    ) -> Result<(u16, usize), FlpError> {
+        self.import_midi_track_to_new_pattern_with_options(
+            midi,
+            track_index,
+            channel_id,
+            midi::MidiImportOptions::default(),
+        )
+    }
+
+    /// Imports one MIDI track into a newly created pattern with placement options.
+    ///
+    /// The new pattern and imported events are committed together. If either pattern
+    /// creation or MIDI import fails, the document remains unchanged.
+    pub fn import_midi_track_to_new_pattern_with_options(
+        &mut self,
+        midi: &midi::MidiFile,
+        track_index: usize,
+        channel_id: u16,
+        options: midi::MidiImportOptions,
+    ) -> Result<(u16, usize), FlpError> {
+        let mut candidate = self.clone();
+        let pattern_id = candidate.create_pattern()?;
+        let imported = candidate.import_midi_track_with_options(
+            midi,
+            track_index,
+            pattern_id,
+            channel_id,
+            options,
+        )?;
+        *self = candidate;
+        Ok((pattern_id, imported))
+    }
+
     /// Imports notes from one MIDI track with FL Studio-style placement options.
     pub fn import_midi_track_with_options(
         &mut self,
@@ -23928,6 +23967,61 @@ mod tests {
         );
         assert_eq!(notes[1].velocity, 0);
         assert_eq!(notes[1].release, 128);
+    }
+
+    #[test]
+    fn midi_import_can_create_a_new_pattern_atomically() {
+        let unknown_event = [0xFF, 0x02, 0xAA, 0xBB];
+        let project_bytes = pattern_fixture(&[], &unknown_event);
+        let midi_bytes = midi_fixture(
+            &[
+                0x00, 0x90, 0x3C, 0x64, // C4 begins at tick 0.
+                0x83, 0x60, 0x80, 0x3C, 0x40, // C4 ends at tick 480.
+                0x00, 0xFF, 0x2F, 0x00,
+            ],
+            480,
+        );
+        let midi = MidiFile::parse(&midi_bytes).expect("MIDI fixture should parse");
+        let mut document =
+            FlpDocument::parse(&project_bytes).expect("project fixture should parse");
+
+        let (pattern_id, imported) = document
+            .import_midi_track_to_new_pattern(&midi, 0, 0)
+            .expect("the track should import into a new pattern");
+
+        assert_eq!(pattern_id, 8);
+        assert_eq!(imported, 1);
+        let patterns = document.patterns().expect("patterns should decode");
+        assert_eq!(patterns.len(), 2);
+        assert!(patterns[0].notes.is_empty());
+        assert_eq!(patterns[1].id, pattern_id);
+        assert_eq!(patterns[1].notes.len(), 1);
+        assert_eq!(
+            (
+                patterns[1].notes[0].position,
+                patterns[1].notes[0].length,
+                patterns[1].notes[0].key,
+                patterns[1].notes[0].channel_id,
+            ),
+            (0, 96, 60, 0)
+        );
+        assert!(
+            document
+                .events()
+                .iter()
+                .any(|event| event.wire_bytes() == unknown_event)
+        );
+        let reparsed = FlpDocument::parse(&document.encode_lossless().unwrap()).unwrap();
+        assert_eq!(reparsed.patterns().unwrap()[1].notes.len(), 1);
+
+        let mut invalid = FlpDocument::parse(&project_bytes).unwrap();
+        let before = invalid.encode_lossless().unwrap();
+        assert!(
+            invalid
+                .import_midi_track_to_new_pattern(&midi, 1, 0)
+                .is_err()
+        );
+        assert_eq!(invalid.encode_lossless().unwrap(), before);
     }
 
     #[test]

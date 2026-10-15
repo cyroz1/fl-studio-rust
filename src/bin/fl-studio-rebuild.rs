@@ -2810,6 +2810,7 @@ struct PendingMidiImport {
     midi: MidiFile,
     selected_track: usize,
     options: MidiImportOptions,
+    create_new_pattern: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -10396,6 +10397,7 @@ impl DawUi {
                             midi,
                             selected_track: 0,
                             options: MidiImportOptions::default(),
+                            create_new_pattern: false,
                         });
                         self.view = MainView::PianoRoll;
                         self.status = format!("Loaded MIDI file {}", path.display());
@@ -25889,6 +25891,7 @@ impl DawUi {
                             midi,
                             selected_track: 0,
                             options: MidiImportOptions::default(),
+                            create_new_pattern: false,
                         });
                         self.status = format!("Loaded MIDI file {}", path.display());
                     }
@@ -25931,19 +25934,21 @@ impl DawUi {
                     });
                 if ui
                     .add_enabled(
-                        self.selected_pattern.is_some() && self.selected_note_channel.is_some(),
+                        (pending.create_new_pattern || self.selected_pattern.is_some())
+                            && self.selected_note_channel.is_some(),
                         egui::Button::new("Import track"),
                     )
                     .clicked()
-                    && let (Some(pattern_id), Some(channel_id)) =
-                        (self.selected_pattern, self.selected_note_channel)
+                    && let Some(channel_id) = self.selected_note_channel
+                    && (pending.create_new_pattern || self.selected_pattern.is_some())
                 {
                     import_midi_request = Some((
                         pending.midi.clone(),
                         pending.selected_track,
-                        pattern_id,
+                        self.selected_pattern,
                         channel_id,
                         pending.options,
+                        pending.create_new_pattern,
                     ));
                 }
                 clear_midi_import = ui.button("Clear").clicked();
@@ -25951,6 +25956,7 @@ impl DawUi {
             egui::CollapsingHeader::new("Import options")
                 .id_salt("midi-import-options")
                 .show(ui, |ui| {
+                    ui.checkbox(&mut pending.create_new_pattern, "Create a new pattern");
                     ui.checkbox(&mut pending.options.realign_events, "Realign events");
                     ui.checkbox(
                         &mut pending.options.zero_velocity_is_note_on,
@@ -25961,42 +25967,85 @@ impl DawUi {
         if clear_midi_import {
             self.pending_midi_import = None;
         }
-        if let Some((midi, track_index, pattern_id, channel_id, options)) = import_midi_request {
-            let first_note_index = patterns
-                .iter()
-                .find(|pattern| pattern.id == pattern_id)
-                .map(|pattern| {
-                    pattern
-                        .notes
-                        .iter()
-                        .filter(|note| note.channel_id == channel_id)
-                        .count()
-                })
-                .unwrap_or(0);
-            if let Some(document) = &mut self.document {
-                match document.import_midi_track_with_options(
-                    &midi,
-                    track_index,
-                    pattern_id,
-                    channel_id,
-                    options,
-                ) {
-                    Ok(imported) => {
-                        if imported > 0 {
-                            self.selected_note = Some((pattern_id, channel_id, first_note_index));
-                            self.selected_piano_notes.clear();
-                            self.selected_piano_notes.insert((
+        if let Some((
+            midi,
+            track_index,
+            target_pattern_id,
+            channel_id,
+            options,
+            create_new_pattern,
+        )) = import_midi_request
+        {
+            let first_note_index = if create_new_pattern {
+                0
+            } else {
+                target_pattern_id
+                    .and_then(|pattern_id| {
+                        patterns
+                            .iter()
+                            .find(|pattern| pattern.id == pattern_id)
+                            .map(|pattern| {
+                                pattern
+                                    .notes
+                                    .iter()
+                                    .filter(|note| note.channel_id == channel_id)
+                                    .count()
+                            })
+                    })
+                    .unwrap_or(0)
+            };
+            let import_result = self.document.as_mut().and_then(|document| {
+                if create_new_pattern {
+                    Some(document.import_midi_track_to_new_pattern_with_options(
+                        &midi,
+                        track_index,
+                        channel_id,
+                        options,
+                    ))
+                } else {
+                    target_pattern_id.map(|pattern_id| {
+                        document
+                            .import_midi_track_with_options(
+                                &midi,
+                                track_index,
                                 pattern_id,
                                 channel_id,
-                                first_note_index,
-                            ));
-                            self.dirty = true;
-                        }
-                        self.status =
-                            format!("Imported {imported} MIDI notes into pattern {pattern_id}");
-                    }
-                    Err(error) => self.status = error.to_string(),
+                                options,
+                            )
+                            .map(|imported| (pattern_id, imported))
+                    })
                 }
+            });
+            match import_result {
+                Some(Ok((pattern_id, imported))) => {
+                    self.selected_pattern = Some(pattern_id);
+                    if create_new_pattern {
+                        self.selected_note = None;
+                        self.selected_piano_notes.clear();
+                    }
+                    if imported > 0 {
+                        self.selected_note = Some((pattern_id, channel_id, first_note_index));
+                        self.selected_piano_notes.clear();
+                        self.selected_piano_notes.insert((
+                            pattern_id,
+                            channel_id,
+                            first_note_index,
+                        ));
+                    }
+                    if create_new_pattern || imported > 0 {
+                        self.dirty = true;
+                    }
+                    if let Some(document) = self.document.as_ref() {
+                        patterns = document.patterns().unwrap_or_default();
+                    }
+                    self.status = if create_new_pattern {
+                        format!("Imported {imported} MIDI notes into new pattern {pattern_id}")
+                    } else {
+                        format!("Imported {imported} MIDI notes into pattern {pattern_id}")
+                    };
+                }
+                Some(Err(error)) => self.status = error.to_string(),
+                None => self.status = "No project or target pattern is available".to_owned(),
             }
         }
 
