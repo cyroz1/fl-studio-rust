@@ -1069,7 +1069,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u16(pattern_id, "pattern id")?,
                 parse_u16(channel_id, "channel id")?,
                 parse_u64(seed, "humanize seed")?,
-                parse_u32(timing_range, "timing range")?,
+                timing_range,
                 parse_u8(velocity_variation, "velocity variation")?,
             )
         }
@@ -1084,7 +1084,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u16(channel_id, "channel id")?,
                 HumanizeOptions {
                     seed: parse_u64(seed, "humanize seed")?,
-                    timing_range_ticks: parse_u32(timing_range, "timing range")?,
+                    timing_range,
                     velocity_variation_percent: parse_u8(
                         velocity_variation,
                         "velocity variation",
@@ -1681,8 +1681,9 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild randomize-notes-scale <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <velocity-amount:-100..100> <pan-amount:-100..100> <pitch-range:0..24> <bipolar:0|1> <reset:0|1> <scale-name> <scale-root:0..11>\n",
             "  flp-rebuild randomize-selected-notes <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <velocity-amount:-100..100> <pan-amount:-100..100> <pitch-range:0..24> <bipolar:0|1> <reset:0|1> <note-index,note-index,...>\n",
             "  flp-rebuild randomize-selected-notes-scale <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <velocity-amount:-100..100> <pan-amount:-100..100> <pitch-range:0..24> <bipolar:0|1> <reset:0|1> <scale-name> <scale-root:0..11> <note-index,note-index,...>\n",
-            "  flp-rebuild humanize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <timing-range-ticks> <velocity-variation-0..100>\n",
-            "  flp-rebuild humanize-selected-notes <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <timing-range-ticks> <velocity-variation-0..100> <note-index,note-index,...>\n",
+            "  flp-rebuild humanize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <timing-range-ticks|1/n> <velocity-variation-0..100>\n",
+            "  flp-rebuild humanize-selected-notes <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <timing-range-ticks|1/n> <velocity-variation-0..100> <note-index,note-index,...>\n",
+            "    Humanize timing accepts ticks or 1/1, 1/2, 1/4, 1/8, 1/16, 1/32, 1/64, or 1/128, rounded to project ticks using PPQ.\n",
             "  flp-rebuild limit-notes <input.flp> <output.flp> <pattern-id> <channel-id> <minimum-key-0..127> <maximum-key-0..127> [key=value ...]\n",
             "  flp-rebuild limit-selected-notes <input.flp> <output.flp> <pattern-id> <channel-id> <minimum-key-0..127> <maximum-key-0..127> [key=value ...] <note-index,note-index,...>\n",
             "    Limit keys: wrap_to_bottom, scale_name, scale_root, snap_direction; scale_name uses names accepted by the scale-aware randomize commands\n",
@@ -4500,6 +4501,32 @@ fn parse_flam_stroke_duration(value: &str, document: &FlpDocument) -> Result<u32
     Ok(stroke_ticks as u32)
 }
 
+fn parse_humanize_timing_range(value: &str, document: &FlpDocument) -> Result<u32, String> {
+    let Some((numerator, denominator)) = value.split_once('/') else {
+        return parse_u32(value, "humanize timing range ticks");
+    };
+    if numerator != "1" {
+        return Err("humanize note division must be written as 1/<denominator>".to_owned());
+    }
+    let denominator = parse_u16(denominator, "humanize note division denominator")?;
+    if !matches!(denominator, 1 | 2 | 4 | 8 | 16 | 32 | 64 | 128) {
+        return Err("humanize note division must be between 1/1 and 1/128".to_owned());
+    }
+
+    let ppq = document.header().ppq();
+    if ppq == 0 {
+        return Err("humanize note division cannot be mapped with a zero project PPQ".to_owned());
+    }
+    let quarter_note_ticks = u64::from(ppq) * 4;
+    let denominator = u64::from(denominator);
+    let ticks = (quarter_note_ticks + denominator / 2) / denominator;
+    if ticks == 0 {
+        return Err("humanize note division rounds to less than one project tick".to_owned());
+    }
+    u32::try_from(ticks)
+        .map_err(|_| "humanize note division exceeds the supported tick range".to_owned())
+}
+
 fn randomize_notes(
     input: &Path,
     output: &Path,
@@ -4606,10 +4633,11 @@ fn humanize_notes(
     pattern_id: u16,
     channel_id: u16,
     seed: u64,
-    timing_range_ticks: u32,
+    timing_range: &str,
     velocity_variation_percent: u8,
 ) -> Result<(), String> {
     let (_, mut document) = load_document(input)?;
+    let timing_range_ticks = parse_humanize_timing_range(timing_range, &document)?;
     let changed = document
         .humanize_pattern_notes(
             pattern_id,
@@ -4632,9 +4660,9 @@ fn humanize_notes(
 }
 
 #[derive(Clone, Copy)]
-struct HumanizeOptions {
+struct HumanizeOptions<'a> {
     seed: u64,
-    timing_range_ticks: u32,
+    timing_range: &'a str,
     velocity_variation_percent: u8,
 }
 
@@ -4643,17 +4671,18 @@ fn humanize_selected_notes(
     output: &Path,
     pattern_id: u16,
     channel_id: u16,
-    options: HumanizeOptions,
+    options: HumanizeOptions<'_>,
     note_indices: &[usize],
 ) -> Result<(), String> {
     let (_, mut document) = load_document(input)?;
+    let timing_range_ticks = parse_humanize_timing_range(options.timing_range, &document)?;
     let changed = document
         .humanize_pattern_note_selection(
             pattern_id,
             channel_id,
             note_indices,
             options.seed,
-            options.timing_range_ticks,
+            timing_range_ticks,
             options.velocity_variation_percent,
         )
         .map_err(|error| error.to_string())?;

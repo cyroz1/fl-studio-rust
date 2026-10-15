@@ -99,6 +99,16 @@ const PURPLE: Color32 = Color32::from_rgb(150, 93, 181);
 const ORANGE: Color32 = Color32::from_rgb(195, 129, 61);
 const RED: Color32 = Color32::from_rgb(252, 67, 46);
 
+fn humanize_note_division_ticks(ppq: u16, denominator: u16) -> Option<u32> {
+    if ppq == 0 || !matches!(denominator, 1 | 2 | 4 | 8 | 16 | 32 | 64 | 128) {
+        return None;
+    }
+    let quarter_note_ticks = u64::from(ppq) * 4;
+    let denominator = u64::from(denominator);
+    let ticks = (quarter_note_ticks + denominator / 2) / denominator;
+    u32::try_from(ticks).ok().filter(|ticks| *ticks > 0)
+}
+
 fn state_preset_file_stem(name: &str, fallback: &str) -> String {
     let safe_name = name
         .chars()
@@ -3412,6 +3422,7 @@ struct DawUi {
     articulate_only_with_selection: bool,
     articulate_chop_chords: bool,
     humanize_timing_range_ticks: u32,
+    humanize_timing_note_division: Option<u16>,
     humanize_velocity_variation_percent: u8,
     note_limit_minimum_key: u8,
     note_limit_maximum_key: u8,
@@ -4145,6 +4156,7 @@ impl DawUi {
             articulate_only_with_selection: false,
             articulate_chop_chords: false,
             humanize_timing_range_ticks: 12,
+            humanize_timing_note_division: None,
             humanize_velocity_variation_percent: 10,
             note_limit_minimum_key: 36,
             note_limit_maximum_key: 83,
@@ -25026,10 +25038,38 @@ impl DawUi {
                 ui.add_enabled_ui(self.piano_roll_scale != PianoRollScale::None, |ui| {
                     ui.checkbox(&mut self.randomizer_snap_to_scale, "Keep pitches in scale");
                 });
-                ui.add(
-                    egui::Slider::new(&mut self.humanize_timing_range_ticks, 0..=96)
-                        .text("Humanize timing (± ticks)"),
+                let timing_unit = self.humanize_timing_note_division.map_or_else(
+                    || "Ticks".to_owned(),
+                    |denominator| format!("1/{denominator} note"),
                 );
+                egui::ComboBox::from_id_salt("humanize-timing-unit")
+                    .selected_text(timing_unit)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.humanize_timing_note_division,
+                            None,
+                            "Ticks",
+                        );
+                        for denominator in [1, 2, 4, 8, 16, 32, 64, 128] {
+                            ui.selectable_value(
+                                &mut self.humanize_timing_note_division,
+                                Some(denominator),
+                                format!("1/{denominator} note"),
+                            );
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "Note divisions are converted using project PPQ, so their playback duration follows tempo changes.",
+                    );
+                if let Some(denominator) = self.humanize_timing_note_division {
+                    ui.label(format!("Humanize timing: ±1/{denominator} note"));
+                } else {
+                    ui.add(
+                        egui::Slider::new(&mut self.humanize_timing_range_ticks, 0..=96)
+                            .text("Humanize timing (± ticks)"),
+                    );
+                }
                 ui.add(
                     egui::Slider::new(&mut self.humanize_velocity_variation_percent, 0..=100)
                         .text("Humanize velocity (%)"),
@@ -25583,12 +25623,23 @@ impl DawUi {
         {
             let seed = self.randomizer_seed;
             let timing_range_ticks = self.humanize_timing_range_ticks;
+            let timing_note_division = self.humanize_timing_note_division;
             let velocity_variation_percent = self.humanize_velocity_variation_percent;
             let result = self
                 .document
                 .as_mut()
                 .ok_or_else(|| "no project is open".to_owned())
                 .and_then(|document| {
+                    let timing_range_ticks = match timing_note_division {
+                        Some(denominator) => {
+                            humanize_note_division_ticks(document.header().ppq(), denominator)
+                                .ok_or_else(|| {
+                                    "humanize note division cannot be mapped using the project PPQ"
+                                        .to_owned()
+                                })?
+                        }
+                        None => timing_range_ticks,
+                    };
                     let result = if edit_selection_only {
                         document.humanize_pattern_note_selection(
                             pattern_id,
