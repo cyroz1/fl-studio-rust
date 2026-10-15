@@ -1017,6 +1017,18 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u32(position_ticks, "slice position")?,
             )
         }
+        [command, input, output, pattern_id, channel_id, position_ticks, note_indices]
+            if command == "slice-selected-notes" =>
+        {
+            slice_selected_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                parse_u32(position_ticks, "slice position")?,
+                &parse_note_indices(note_indices)?,
+            )
+        }
         [command, input, output, pattern_id, channel_id, position, length, key, velocity]
             if command == "add-note" =>
         {
@@ -1451,6 +1463,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild arp-notes <input.flp> <output.flp> <pattern-id> <channel-id> <step-ticks> <range-octaves-1..4> <gate-1..100> <up|down|up-down>\n",
             "  flp-rebuild arp-selected-notes <input.flp> <output.flp> <pattern-id> <channel-id> <step-ticks> <range-octaves-1..4> <gate-1..100> <up|down|up-down> <note-index,note-index,...>\n",
             "  flp-rebuild slice-notes <input.flp> <output.flp> <pattern-id> <channel-id> <position-ticks>\n",
+            "  flp-rebuild slice-selected-notes <input.flp> <output.flp> <pattern-id> <channel-id> <position-ticks> <note-index,note-index,...>\n",
             "  flp-rebuild add-note <input.flp> <output.flp> <pattern-id> <channel-id> <position> <length> <key> <velocity>\n",
             "  flp-rebuild delete-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index>\n",
             "  flp-rebuild import-midi <input.flp> <input.mid> <output.flp> <track> <pattern-id|new> <channel-id> [--realign-events] [--zero-velocity-notes]\n",
@@ -4171,6 +4184,30 @@ fn slice_notes(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "sliced {created} notes at tick {position_ticks} in pattern {pattern_id}, channel {channel_id} to {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn slice_selected_notes(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    position_ticks: u32,
+    note_indices: &[usize],
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let created = document
+        .slice_pattern_note_selection(pattern_id, channel_id, note_indices, position_ticks)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "sliced {created} selected notes at tick {position_ticks} in pattern {pattern_id}, channel {channel_id} to {}",
         output.display()
     );
     Ok(())
