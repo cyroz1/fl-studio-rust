@@ -71,6 +71,7 @@ use md5::{Digest, Md5};
 mod clap_probe;
 mod midi_input;
 mod midi_output;
+#[path = "fl-studio-rebuild/midi_thru.rs"]
 mod midi_thru;
 
 use midi_input::{
