@@ -32,8 +32,8 @@ use flp_rebuild::sample_render::{
     PlaylistPerformanceLaunch, PlaylistPerformanceStream, PlaylistRenderOptions,
     PlaylistRenderRange, PlaylistRenderSummary, PlaylistStreamMonitor, PlaylistTempoMap,
     ResamplingQuality, SamplerLiveInputRouting, SamplerLiveNoteEvent, SamplerPatternRenderOptions,
-    SamplerPatternRenderSummary, Vst3LiveInputEvent, WavChannelMode, WavDitherMode,
-    WavSampleFormat, nearest_playlist_audio_clip_zero_crossing_tick,
+    SamplerPatternRenderSummary, Vst3LiveInputEvent, Vst3PatternLoopPlayback, WavChannelMode,
+    WavDitherMode, WavSampleFormat, nearest_playlist_audio_clip_zero_crossing_tick,
     playlist_performance_clip_indices_with_vst3, playlist_performance_static_document_with_vst3,
     playlist_performance_vst3_channel_ids, playlist_performance_vst3_clip_indices,
     render_audio_clips_to_file, render_playlist_mixer_stems_with_vst3_cancellable,
@@ -41,6 +41,7 @@ use flp_rebuild::sample_render::{
     render_playlist_with_vst3_to_flac_cancellable, render_playlist_with_vst3_to_mp3_cancellable,
     render_playlist_with_vst3_to_ogg_cancellable, render_playlist_with_vst3_to_wav_cancellable,
     render_sampler_pattern_to_file, stream_mixed_layer_midi_input_to_device,
+    stream_pattern_loop_with_vst3_from_tick_to_device,
     stream_playlist_performance_with_vst3_to_device,
     stream_playlist_with_vst3_to_device_with_monitor, stream_sampler_midi_input_to_device,
     stream_sampler_pattern_loop_from_tick_to_device, stream_sampler_pattern_loop_to_device,
@@ -48,7 +49,8 @@ use flp_rebuild::sample_render::{
     write_input_recording_to_wav,
 };
 use flp_rebuild::vst3::{
-    MAX_REPORTED_TAIL_SECONDS, Vst3HostRuntime, Vst3PatternRenderOptions, Vst3PatternStreamHandle,
+    MAX_REPORTED_TAIL_SECONDS, Vst3HostRuntime, Vst3LiveInputStreamHandle,
+    Vst3PatternRenderOptions, Vst3PatternStreamHandle, Vst3PlaylistStreamProcessor,
 };
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, Arrangement, ArticulateOptions, AutomationChannel,
