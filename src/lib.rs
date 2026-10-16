@@ -3703,9 +3703,10 @@ impl FlpDocument {
                 .position(|event| event.opcode == 0x40)
                 .unwrap_or(self.events.len());
             self.events.iter().enumerate().find_map(|(index, event)| {
-                let is_project_string =
-                    matches!(event.opcode, 0xC2 | 0xC3 | 0xC4 | 0xC5 | 0xCB | 0xCE | 0xCF)
-                        || (event.opcode == 0xE7 && index < first_channel);
+                let is_project_string = matches!(
+                    event.opcode,
+                    0xC1 | 0xC2 | 0xC3 | 0xC4 | 0xC5 | 0xCB | 0xCE | 0xCF
+                ) || (event.opcode == 0xE7 && index < first_channel);
                 (is_project_string && matches!(event.encoding, PayloadEncoding::Data { .. }))
                     .then(|| project_string_is_utf16(&event.payload, None))
             })
@@ -4892,6 +4893,92 @@ impl FlpDocument {
         let mut candidate = self.clone();
         for event_index in source_event_indices.into_iter().rev() {
             candidate.events.remove(event_index);
+        }
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    fn set_pattern_name(&mut self, pattern_id: u16, name: &str) -> Result<(), FlpError> {
+        if name.contains('\0') {
+            return Err(FlpError::UnsupportedEdit(
+                "pattern names cannot contain an embedded NUL character",
+            ));
+        }
+        if !self
+            .patterns()?
+            .iter()
+            .any(|pattern| pattern.id == pattern_id)
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested pattern does not exist",
+            ));
+        }
+
+        let mut markers = self.events.iter().enumerate().filter(|(_, event)| {
+            event.opcode == 0x41
+                && event.encoding == PayloadEncoding::Word
+                && event.payload.as_slice() == pattern_id.to_le_bytes()
+        });
+        let Some((marker_index, _)) = markers.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested pattern marker does not exist",
+            ));
+        };
+        if markers.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested pattern id is ambiguous",
+            ));
+        }
+        let region_end = self.events[marker_index + 1..]
+            .iter()
+            .position(|event| {
+                (event.opcode == 0x41 && event.encoding == PayloadEncoding::Word)
+                    || matches!(event.opcode, 0x40 | 0x62 | 0x63)
+            })
+            .map_or(self.events.len(), |offset| marker_index + 1 + offset);
+        let name_events = (marker_index + 1..region_end)
+            .filter(|index| self.events[*index].opcode == 0xC1)
+            .collect::<Vec<_>>();
+        if name_events.len() > 1 {
+            return Err(FlpError::UnsupportedEdit(
+                "the pattern has multiple name events",
+            ));
+        }
+        let uses_utf16 = self
+            .project_string_encoding()
+            .ok_or(FlpError::UnsupportedEdit(
+                "the project's string encoding cannot be inferred for a pattern name",
+            ))?;
+
+        let mut candidate = self.clone();
+        if let Some(name_event_index) = name_events.first().copied() {
+            if !matches!(
+                candidate.events[name_event_index].encoding,
+                PayloadEncoding::Data { .. }
+            ) {
+                return Err(FlpError::UnsupportedEdit(
+                    "the pattern name is not a length-prefixed string",
+                ));
+            }
+            let replacement = replace_project_string_payload(
+                &candidate.events[name_event_index].payload,
+                name,
+                uses_utf16,
+            )?;
+            candidate.events[name_event_index].replace_data_payload(replacement)?;
+        } else {
+            let payload = encode_project_string(name, uses_utf16)?;
+            let insert_index = marker_index
+                + 1
+                + usize::from(
+                    self.events
+                        .get(marker_index + 1)
+                        .is_some_and(Self::is_pattern_note_event),
+                );
+            candidate
+                .events
+                .insert(insert_index, FlpEvent::new_data(0xC1, payload)?);
         }
         candidate.refresh_event_offsets()?;
         *self = candidate;
@@ -12943,11 +13030,11 @@ impl FlpDocument {
         let mut destinations = Vec::with_capacity(midi.tracks().len());
         let mut total_imported = 0usize;
         for (track_index, track) in midi.tracks().iter().enumerate() {
+            let track_name = Self::midi_track_display_name(track, track_index);
             let pattern_id = candidate.create_pattern()?;
-            let channel_id = candidate.duplicate_sampler_channel(
-                template_channel_id,
-                &Self::midi_track_display_name(track, track_index),
-            )?;
+            candidate.set_pattern_name(pattern_id, &track_name)?;
+            let channel_id =
+                candidate.duplicate_sampler_channel(template_channel_id, &track_name)?;
             let imported =
                 candidate.import_midi_track(midi, track_index, pattern_id, channel_id)?;
             total_imported = total_imported
@@ -25288,6 +25375,8 @@ mod tests {
             .iter()
             .find(|pattern| pattern.id == destinations[1].0)
             .expect("second sequence Pattern should exist");
+        assert_eq!(first_pattern.name.as_deref(), Some("Piano"));
+        assert_eq!(second_pattern.name.as_deref(), Some("Bass"));
         assert_eq!(first_pattern.notes.len(), 1);
         assert_eq!(
             (
