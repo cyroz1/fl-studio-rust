@@ -68,6 +68,7 @@ use vst3_host::midi::{MidiChannel as Vst3MidiChannel, MidiEvent as Vst3MidiEvent
 mod clap_probe;
 mod midi_input;
 mod midi_output;
+#[path = "fl-studio-rebuild/midi_thru.rs"]
 mod midi_thru;
 
 use midi_input::{
