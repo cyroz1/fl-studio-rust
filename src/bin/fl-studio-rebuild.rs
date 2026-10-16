@@ -26874,9 +26874,15 @@ impl DawUi {
         let mut import_midi_request = None;
         let mut import_all_midi_request = None;
         let mut create_sampler_midi_request = None;
+        let mut create_format2_midi_request = None;
         let mut clear_midi_import = false;
         if let Some(pending) = &mut self.pending_midi_import {
             ui.horizontal(|ui| {
+                let selected_sampler_template = self.selected_note_channel.filter(|channel_id| {
+                    available_midi_channels.iter().any(|channel| {
+                        channel.id() == *channel_id && channel.kind() == Some(0)
+                    })
+                });
                 ui.small(pending.path.file_name().map_or_else(
                     || "MIDI".to_owned(),
                     |name| name.to_string_lossy().into_owned(),
@@ -26945,11 +26951,6 @@ impl DawUi {
                             pattern_id,
                         ));
                     }
-                    let selected_sampler_template = self.selected_note_channel.filter(|channel_id| {
-                        available_midi_channels
-                            .iter()
-                            .any(|channel| channel.id() == *channel_id && channel.kind() == Some(0))
-                    });
                     if ui
                         .add_enabled(
                             self.selected_pattern.is_some()
@@ -26971,6 +26972,22 @@ impl DawUi {
                         ));
                     }
                 }
+                if pending.midi.format() == 2
+                    && ui
+                        .add_enabled(
+                            self.selected_pattern.is_some()
+                                && selected_sampler_template.is_some(),
+                            egui::Button::new("Create separate patterns + Samplers"),
+                        )
+                        .on_hover_text(
+                            "Create one new Pattern and named Sampler channel for each independent Format-2 sequence.",
+                        )
+                        .clicked()
+                    && let Some(template_channel_id) = selected_sampler_template
+                {
+                    create_format2_midi_request =
+                        Some((pending.midi.clone(), template_channel_id));
+                }
                 clear_midi_import = ui.button("Clear").clicked();
             });
             if pending.import_all_tracks {
@@ -26978,7 +26995,7 @@ impl DawUi {
                     ui.small("Choose a destination Channel Rack channel for each MIDI track.");
                     if pending.midi.format() == 2 {
                         ui.weak(
-                            "Format-2 tracks are independent sequences; import them one at a time.",
+                            "Format-2 tracks are independent sequences; create a separate Pattern for each or import one track at a time.",
                         );
                     }
                     for (track_index, track) in pending.midi.tracks().iter().enumerate() {
@@ -27133,6 +27150,41 @@ impl DawUi {
                         self.status = format!(
                             "Created {} Sampler channels and imported {imported} MIDI notes into pattern {pattern_id}",
                             channel_ids.len()
+                        );
+                    }
+                    Err(error) => self.status = error.to_string(),
+                }
+            }
+        }
+        if let Some((midi, template_channel_id)) = create_format2_midi_request {
+            let selected_track_index = midi
+                .tracks()
+                .iter()
+                .position(|track| !track.notes().is_empty())
+                .unwrap_or(0);
+            if let Some(document) = &mut self.document {
+                match document
+                    .import_midi_format2_tracks_to_sampler_patterns(&midi, template_channel_id)
+                {
+                    Ok((imported, destinations)) => {
+                        self.stop_project_playback();
+                        if let Some((pattern_id, channel_id)) =
+                            destinations.get(selected_track_index).copied()
+                        {
+                            self.selected_pattern = Some(pattern_id);
+                            self.selected_note_channel = Some(channel_id);
+                            self.selected_note = None;
+                            self.selected_piano_notes.clear();
+                            if imported > 0 {
+                                self.selected_note = Some((pattern_id, channel_id, 0));
+                                self.selected_piano_notes
+                                    .insert((pattern_id, channel_id, 0));
+                            }
+                        }
+                        self.dirty = true;
+                        self.status = format!(
+                            "Imported {imported} Format-2 MIDI notes into {} separate Patterns with Sampler channels",
+                            destinations.len()
                         );
                     }
                     Err(error) => self.status = error.to_string(),

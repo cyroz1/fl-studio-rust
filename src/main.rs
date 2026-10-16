@@ -1085,6 +1085,16 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u16(template_channel_id, "template channel id")?,
             )
         }
+        [command, input, midi_path, output, template_channel_id]
+            if command == "import-midi-format2" =>
+        {
+            import_midi_format2(
+                Path::new(input),
+                Path::new(midi_path),
+                Path::new(output),
+                parse_u16(template_channel_id, "template channel id")?,
+            )
+        }
         _ => Err(concat!(
             "usage:\n",
             "  flp-rebuild info <file.flp>\n",
@@ -1160,6 +1170,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild import-midi <input.flp> <input.mid> <output.flp> <track> <pattern-id> <channel-id>\n",
             "  flp-rebuild import-midi-all <input.flp> <input.mid> <output.flp> <pattern-id> <channel-ids-comma-separated>\n",
             "  flp-rebuild import-midi-sampler-tracks <input.flp> <input.mid> <output.flp> <pattern-id> <template-channel-id>\n",
+            "  flp-rebuild import-midi-format2 <input.flp> <input.mid> <output.flp> <template-channel-id>\n",
             "  flp-rebuild edit-clip <input.flp> <output.flp> <arrangement-id> <clip-index> <position> <length>\n",
             "  flp-rebuild set-clip-muted <input.flp> <output.flp> <arrangement-id> <clip-index> <muted:0|1>\n",
             "  flp-rebuild edit-playlist-track <input.flp> <output.flp> <track-id> <enabled:0|1|-> <grouped:0|1|->\n",
@@ -3610,6 +3621,37 @@ fn import_midi_sampler_tracks(
         .join(",");
     println!(
         "created Sampler channels {channel_ids} and imported {imported} MIDI notes into pattern {pattern_id} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn import_midi_format2(
+    input: &Path,
+    midi_path: &Path,
+    output: &Path,
+    template_channel_id: u16,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let midi_bytes = fs::read(midi_path)
+        .map_err(|error| format!("could not read {}: {error}", midi_path.display()))?;
+    let midi = MidiFile::parse(&midi_bytes)
+        .map_err(|error| format!("could not parse {}: {error}", midi_path.display()))?;
+    let (imported, destinations) = document
+        .import_midi_format2_tracks_to_sampler_patterns(&midi, template_channel_id)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    let destinations = destinations
+        .iter()
+        .map(|(pattern_id, channel_id)| format!("{pattern_id}:{channel_id}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    println!(
+        "imported {imported} Format-2 MIDI notes into Pattern:channel pairs {destinations} in {}",
         output.display()
     );
     Ok(())
