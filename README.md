@@ -66,6 +66,7 @@ flp-rebuild roundtrip <input.flp> <output.flp>
 flp-rebuild set-tempo <input.flp> <output.flp> <bpm>
 flp-rebuild create-pattern <input.flp> <output.flp>
 flp-rebuild duplicate-pattern <input.flp> <output.flp> <pattern-id>
+flp-rebuild rename-pattern <input.flp> <output.flp> <pattern-id> <name>
 flp-rebuild set-project-info <input.flp> <output.flp> <title|-> <author|-> <genre|-> <comments|-> <web-link|->
 flp-rebuild set-project-settings <input.flp> <output.flp> <play-truncated:0|1|-> <fast-declick:0|1|-> [pan-law-raw|-]
 flp-rebuild set-project-master-pitch <input.flp> <output.flp> <cents:-1200..1200>
