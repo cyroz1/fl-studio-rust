@@ -3808,6 +3808,7 @@ struct DawUi {
     midi_held_performance_clips: MidiPerformanceHoldMap,
     midi_performance_page_navigation: bool,
     performance_global_snap: PerformanceGlobalSnap,
+    performance_midi_channel: u8,
     midi_performance_global_snap_mode: bool,
     midi_performance_scene_mode: bool,
     midi_performance_plus_scene_mode: bool,
@@ -4352,7 +4353,11 @@ fn live_layer_sampler_children(document: &FlpDocument, source_channel_id: u16) -
         .collect()
 }
 
-fn is_performance_clip_trigger_channel_event(event: MidiInputEvent) -> bool {
+fn is_performance_clip_trigger_channel_event(
+    event: MidiInputEvent,
+    performance_channel: u8,
+) -> bool {
+    let performance_channel = performance_channel & 0x0F;
     match event {
         MidiInputEvent::NoteOn { channel, .. }
         | MidiInputEvent::NoteOff { channel, .. }
@@ -4360,7 +4365,7 @@ fn is_performance_clip_trigger_channel_event(event: MidiInputEvent) -> bool {
         | MidiInputEvent::ControlChange { channel, .. }
         | MidiInputEvent::ProgramChange { channel, .. }
         | MidiInputEvent::ChannelPressure { channel, .. }
-        | MidiInputEvent::PitchBend { channel, .. } => channel & 0x0F == 0,
+        | MidiInputEvent::PitchBend { channel, .. } => channel & 0x0F == performance_channel,
         MidiInputEvent::TimingClock
         | MidiInputEvent::SongPosition { .. }
         | MidiInputEvent::Transport(_) => false,
@@ -4672,6 +4677,7 @@ impl DawUi {
             send_playlist_notes: midi_output_send_playlist_notes,
             send_pattern_notes: midi_output_send_pattern_notes,
             fixed_velocity: midi_record_fixed_velocity,
+            performance_channel: performance_midi_channel,
             record_audio: record_audio_enabled,
             record_notes: record_notes_enabled,
         } = load_midi_device_selections();
@@ -4735,6 +4741,7 @@ impl DawUi {
             midi_held_performance_clips: BTreeMap::new(),
             midi_performance_page_navigation: false,
             performance_global_snap: PerformanceGlobalSnap::BeatQuarter,
+            performance_midi_channel,
             midi_performance_global_snap_mode: false,
             midi_performance_scene_mode: false,
             midi_performance_plus_scene_mode: false,
@@ -8585,19 +8592,28 @@ impl DawUi {
     }
 
     fn handle_midi_performance_note(&mut self, message: ReceivedMidiMessage) {
+        let performance_channel = self.performance_midi_channel & 0x0F;
         match message.event {
             MidiInputEvent::NoteOn {
-                channel: 0,
+                channel,
                 key: key @ 120..=124,
                 velocity,
-            } if velocity > 0 && self.performance_mode_active && self.playing => {
+            } if channel == performance_channel
+                && velocity > 0
+                && self.performance_mode_active
+                && self.playing =>
+            {
                 self.navigate_midi_performance_playlist(key);
             }
             MidiInputEvent::NoteOn {
-                channel: 0,
+                channel,
                 key: 127,
                 velocity,
-            } if velocity > 0 && self.performance_mode_active && self.playing => {
+            } if channel == performance_channel
+                && velocity > 0
+                && self.performance_mode_active
+                && self.playing =>
+            {
                 self.midi_performance_global_snap_mode = true;
                 self.status = format!(
                     "MIDI Global Snap held: {}",
@@ -8605,60 +8621,62 @@ impl DawUi {
                 );
             }
             MidiInputEvent::NoteOff {
-                channel: 0,
-                key: 127,
-                ..
+                channel, key: 127, ..
             }
             | MidiInputEvent::NoteOn {
-                channel: 0,
+                channel,
                 key: 127,
                 velocity: 0,
-            } => {
+            } if channel == performance_channel => {
                 self.midi_performance_global_snap_mode = false;
             }
             MidiInputEvent::NoteOn {
-                channel: 0,
+                channel,
                 key: 125,
                 velocity,
-            } if velocity > 0 && self.performance_mode_active && self.playing => {
+            } if channel == performance_channel
+                && velocity > 0
+                && self.performance_mode_active
+                && self.playing =>
+            {
                 self.midi_performance_scene_mode = true;
             }
             MidiInputEvent::NoteOff {
-                channel: 0,
-                key: 125,
-                ..
+                channel, key: 125, ..
             }
             | MidiInputEvent::NoteOn {
-                channel: 0,
+                channel,
                 key: 125,
                 velocity: 0,
-            } => {
+            } if channel == performance_channel => {
                 self.midi_performance_scene_mode = false;
             }
             MidiInputEvent::NoteOn {
-                channel: 0,
+                channel,
                 key: 126,
                 velocity,
-            } if velocity > 0 && self.performance_mode_active && self.playing => {
+            } if channel == performance_channel
+                && velocity > 0
+                && self.performance_mode_active
+                && self.playing =>
+            {
                 self.midi_performance_plus_scene_mode = true;
             }
             MidiInputEvent::NoteOff {
-                channel: 0,
-                key: 126,
-                ..
+                channel, key: 126, ..
             }
             | MidiInputEvent::NoteOn {
-                channel: 0,
+                channel,
                 key: 126,
                 velocity: 0,
-            } => {
+            } if channel == performance_channel => {
                 self.midi_performance_plus_scene_mode = false;
             }
             MidiInputEvent::NoteOn {
                 channel,
                 key,
                 velocity,
-            } if channel == 0 && velocity > 0 => {
+            } if channel == performance_channel && velocity > 0 => {
                 if self.midi_performance_scene_mode || self.midi_performance_plus_scene_mode {
                     self.trigger_performance_midi_scene(
                         channel,
@@ -8674,7 +8692,7 @@ impl DawUi {
                 channel,
                 key,
                 velocity: 0,
-            } if channel == 0 => {
+            } if channel == performance_channel => {
                 if let Some(held_clips) = self.midi_held_performance_clips.remove(&(channel, key)) {
                     for clip in held_clips {
                         self.queue_performance_hold_release(
@@ -8786,7 +8804,7 @@ impl DawUi {
     }
 
     fn trigger_performance_midi_scene(&mut self, channel: u8, key: u8, additive: bool) {
-        if channel != 0
+        if (channel & 0x0F) != (self.performance_midi_channel & 0x0F)
             || !self.performance_mode_active
             || !self.playing
             || self.performance_launch_sender.is_none()
@@ -8973,7 +8991,7 @@ impl DawUi {
     }
 
     fn trigger_performance_midi_clip(&mut self, channel: u8, key: u8) {
-        if channel != 0
+        if (channel & 0x0F) != (self.performance_midi_channel & 0x0F)
             || !self.performance_mode_active
             || !self.playing
             || self.performance_launch_sender.is_none()
@@ -14654,6 +14672,29 @@ impl DawUi {
                     "Add a non-signature time marker named Start to define the Performance Zone. Right-click for the MIDI Global Snap setting."
                 });
             performance_mode_button.context_menu(|ui| {
+                ui.label("MIDI Channel (for Performance Mode clip controls)");
+                let mut performance_midi_channel = self.performance_midi_channel + 1;
+                egui::ComboBox::from_id_salt("playlist-performance-midi-channel")
+                    .selected_text(format!("Channel {performance_midi_channel}"))
+                    .show_ui(ui, |ui| {
+                        for channel in 1..=16 {
+                            ui.selectable_value(
+                                &mut performance_midi_channel,
+                                channel,
+                                format!("Channel {channel}"),
+                            );
+                        }
+                    });
+                if performance_midi_channel != self.performance_midi_channel + 1 {
+                    self.performance_midi_channel = performance_midi_channel - 1;
+                    self.release_all_midi_performance_clips();
+                    self.stop_live_vst3_input();
+                    self.stop_live_sampler_input();
+                    self.status = format!(
+                        "Performance Mode MIDI controls use channel {performance_midi_channel}"
+                    );
+                    self.persist_midi_device_selections();
+                }
                 ui.label("MIDI Global Snap (while MIDI note 127 is held)");
                 egui::ComboBox::from_id_salt("playlist-performance-global-snap")
                     .selected_text(self.performance_global_snap.label())
@@ -35343,6 +35384,7 @@ impl DawUi {
             send_playlist_notes: self.midi_output_send_playlist_notes,
             send_pattern_notes: self.midi_output_send_pattern_notes,
             fixed_velocity: self.midi_record_fixed_velocity,
+            performance_channel: self.performance_midi_channel,
             record_audio: self.record_audio_enabled,
             record_notes: self.record_notes_enabled,
         };
@@ -37287,7 +37329,7 @@ impl DawUi {
     fn handle_live_vst3_input(&mut self, event: MidiInputEvent) -> bool {
         if !self.can_audition_live_midi_input()
             || (self.performance_launch_sender.is_some()
-                && is_performance_clip_trigger_channel_event(event))
+                && is_performance_clip_trigger_channel_event(event, self.performance_midi_channel))
         {
             return false;
         }
@@ -37668,7 +37710,7 @@ impl DawUi {
     fn handle_live_sampler_input(&mut self, event: MidiInputEvent) {
         if !self.can_audition_live_midi_input()
             || (self.performance_launch_sender.is_some()
-                && is_performance_clip_trigger_channel_event(event))
+                && is_performance_clip_trigger_channel_event(event, self.performance_midi_channel))
         {
             return;
         }
@@ -42871,6 +42913,7 @@ struct MidiDeviceSelections {
     send_playlist_notes: bool,
     send_pattern_notes: bool,
     fixed_velocity: bool,
+    performance_channel: u8,
     record_audio: bool,
     record_notes: bool,
 }
@@ -42884,6 +42927,7 @@ impl Default for MidiDeviceSelections {
             send_playlist_notes: false,
             send_pattern_notes: false,
             fixed_velocity: false,
+            performance_channel: 0,
             record_audio: true,
             record_notes: true,
         }
@@ -42963,13 +43007,14 @@ fn parse_midi_thru_preferences(contents: &str) -> (bool, Option<u8>) {
 
 fn encode_midi_device_selections(selections: &MidiDeviceSelections) -> String {
     format!(
-        "input={}\noutput={}\nclock={}\nplaylist_notes={}\npattern_notes={}\nfixed_velocity={}\nrecord_audio={}\nrecord_notes={}\n",
+        "input={}\noutput={}\nclock={}\nplaylist_notes={}\npattern_notes={}\nfixed_velocity={}\nperformance_channel={}\nrecord_audio={}\nrecord_notes={}\n",
         encode_midi_device_id(selections.input_id.as_deref().unwrap_or_default()),
         encode_midi_device_id(selections.output_id.as_deref().unwrap_or_default()),
         u8::from(selections.send_clock),
         u8::from(selections.send_playlist_notes),
         u8::from(selections.send_pattern_notes),
         u8::from(selections.fixed_velocity),
+        selections.performance_channel.min(15),
         u8::from(selections.record_audio),
         u8::from(selections.record_notes)
     )
@@ -42990,6 +43035,12 @@ fn parse_midi_device_selections(contents: &str) -> MidiDeviceSelections {
             selections.send_pattern_notes = enabled == "1";
         } else if let Some(enabled) = line.strip_prefix("fixed_velocity=") {
             selections.fixed_velocity = enabled == "1";
+        } else if let Some(channel) = line.strip_prefix("performance_channel=") {
+            if let Ok(channel) = channel.parse::<u8>()
+                && channel <= 15
+            {
+                selections.performance_channel = channel;
+            }
         } else if let Some(enabled) = line.strip_prefix("record_audio=") {
             selections.record_audio = enabled == "1";
         } else if let Some(enabled) = line.strip_prefix("record_notes=") {
@@ -48702,6 +48753,7 @@ mod tests {
             send_playlist_notes: true,
             send_pattern_notes: true,
             fixed_velocity: true,
+            performance_channel: 6,
             record_audio: false,
             record_notes: true,
         };
@@ -48713,7 +48765,9 @@ mod tests {
     #[test]
     fn midi_device_selections_skip_malformed_or_unknown_entries() {
         assert_eq!(
-            parse_midi_device_selections("input=0\noutput=xyz\nclock=invalid\nother=01\n"),
+            parse_midi_device_selections(
+                "input=0\noutput=xyz\nclock=invalid\nperformance_channel=16\nother=01\n"
+            ),
             MidiDeviceSelections::default()
         );
         assert_eq!(
@@ -48955,37 +49009,58 @@ mod tests {
     }
 
     #[test]
-    fn performance_mode_reserves_its_clip_trigger_channel_from_live_audition() {
+    fn performance_mode_reserves_its_configured_clip_trigger_channel_from_live_audition() {
         assert!(is_performance_clip_trigger_channel_event(
             MidiInputEvent::NoteOn {
                 channel: 0,
                 key: 60,
                 velocity: 100,
-            }
+            },
+            0,
         ));
         assert!(is_performance_clip_trigger_channel_event(
             MidiInputEvent::NoteOff {
                 channel: 0,
                 key: 60,
                 velocity: 64,
-            }
+            },
+            0,
         ));
         assert!(is_performance_clip_trigger_channel_event(
             MidiInputEvent::ControlChange {
                 channel: 0,
                 controller: 64,
                 value: 127,
-            }
+            },
+            0,
         ));
         assert!(!is_performance_clip_trigger_channel_event(
             MidiInputEvent::NoteOn {
                 channel: 1,
                 key: 60,
                 velocity: 100,
-            }
+            },
+            0,
+        ));
+        assert!(is_performance_clip_trigger_channel_event(
+            MidiInputEvent::NoteOn {
+                channel: 2,
+                key: 60,
+                velocity: 100,
+            },
+            2,
         ));
         assert!(!is_performance_clip_trigger_channel_event(
-            MidiInputEvent::TimingClock
+            MidiInputEvent::NoteOn {
+                channel: 2,
+                key: 60,
+                velocity: 100,
+            },
+            0,
+        ));
+        assert!(!is_performance_clip_trigger_channel_event(
+            MidiInputEvent::TimingClock,
+            0
         ));
     }
 
