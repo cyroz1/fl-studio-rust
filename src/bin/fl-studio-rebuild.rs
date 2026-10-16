@@ -4352,6 +4352,21 @@ fn live_layer_sampler_children(document: &FlpDocument, source_channel_id: u16) -
         .collect()
 }
 
+fn is_performance_clip_trigger_channel_event(event: MidiInputEvent) -> bool {
+    match event {
+        MidiInputEvent::NoteOn { channel, .. }
+        | MidiInputEvent::NoteOff { channel, .. }
+        | MidiInputEvent::PolyphonicPressure { channel, .. }
+        | MidiInputEvent::ControlChange { channel, .. }
+        | MidiInputEvent::ProgramChange { channel, .. }
+        | MidiInputEvent::ChannelPressure { channel, .. }
+        | MidiInputEvent::PitchBend { channel, .. } => channel & 0x0F == 0,
+        MidiInputEvent::TimingClock
+        | MidiInputEvent::SongPosition { .. }
+        | MidiInputEvent::Transport(_) => false,
+    }
+}
+
 fn resolve_live_vst3_input_targets(
     document: &FlpDocument,
     source_channel_id: u16,
@@ -9586,6 +9601,10 @@ impl DawUi {
                 return;
             }
         };
+        let live_midi_senders = vst3_processor
+            .as_ref()
+            .map(Vst3PlaylistStreamProcessor::live_midi_input_senders)
+            .unwrap_or_default();
         if let Some(session) = self.live_sampler_input.take() {
             session.cancelled.store(true, Ordering::Release);
             self.live_sampler_workers.push(session.worker);
@@ -9641,7 +9660,7 @@ impl DawUi {
                     receiver,
                     cancelled,
                     worker,
-                    live_midi_senders: BTreeMap::new(),
+                    live_midi_senders,
                 });
                 self.stop_midi_pattern_preview();
                 self.status = format!(
@@ -36747,6 +36766,9 @@ impl DawUi {
         if !self.playing {
             return true;
         }
+        if self.performance_launch_sender.is_some() {
+            return self.performance_mode_active && self.pending_audio_render.is_some();
+        }
         if self.performance_mode_active {
             return false;
         }
@@ -37263,7 +37285,10 @@ impl DawUi {
     }
 
     fn handle_live_vst3_input(&mut self, event: MidiInputEvent) -> bool {
-        if !self.can_audition_live_midi_input() {
+        if !self.can_audition_live_midi_input()
+            || (self.performance_launch_sender.is_some()
+                && is_performance_clip_trigger_channel_event(event))
+        {
             return false;
         }
         let (Some(pattern_id), Some(channel_id)) =
@@ -37641,7 +37666,10 @@ impl DawUi {
     }
 
     fn handle_live_sampler_input(&mut self, event: MidiInputEvent) {
-        if !self.can_audition_live_midi_input() {
+        if !self.can_audition_live_midi_input()
+            || (self.performance_launch_sender.is_some()
+                && is_performance_clip_trigger_channel_event(event))
+        {
             return;
         }
         let (Some(pattern_id), Some(channel_id)) =
@@ -47606,7 +47634,7 @@ mod tests {
         ActivePlaylistClipDrag, Arrangement, ChannelDisplayFilter, ChannelNoteRouter,
         DetachedWindowKind, DetachedWindowPlacement, DetachedWindowPlacements,
         DetectedPianoRollScale, FlpDocument, MainView, MidiControlChangeMapping,
-        MidiControllerCcBinding, MidiControllerTemplate, MidiDeviceSelections,
+        MidiControllerCcBinding, MidiControllerTemplate, MidiDeviceSelections, MidiInputEvent,
         PIANO_ROLL_RULER_HEIGHT, Pattern, PatternController, PatternNote, PianoRollChordStamp,
         PianoRollGrid, PianoRollScale, PianoRollSnap, PlaylistClip, PlaylistClipDragKind,
         PlaylistTempoMap, PlaylistTrack, PluginCandidate, PluginFormat, TimeSelectionShift,
@@ -47615,7 +47643,8 @@ mod tests {
         built_in_midi_controller_templates, candidate_matches_vst_identity,
         candidate_mixer_controls, candidate_mixer_stereo_separation, detect_chord_name,
         detect_piano_roll_channel_scale, detect_piano_roll_scale, encode_midi_device_id,
-        encode_midi_device_selections, first_available_playlist_track, live_layer_sampler_children,
+        encode_midi_device_selections, first_available_playlist_track,
+        is_performance_clip_trigger_channel_event, live_layer_sampler_children,
         live_vst3_note_keys_for_route, midi_button_press_edge, midi_controller_binding_for_device,
         next_piano_roll_note_group, note_from_grid_position, parse_midi_control_change_mapping,
         parse_midi_controller_templates, parse_midi_device_selections, parse_window_layout_presets,
@@ -48923,6 +48952,41 @@ mod tests {
         assert!(target.accepts_key(72));
         assert!(!target.accepts_key(73));
         assert!(!target.accepts_key(85));
+    }
+
+    #[test]
+    fn performance_mode_reserves_its_clip_trigger_channel_from_live_audition() {
+        assert!(is_performance_clip_trigger_channel_event(
+            MidiInputEvent::NoteOn {
+                channel: 0,
+                key: 60,
+                velocity: 100,
+            }
+        ));
+        assert!(is_performance_clip_trigger_channel_event(
+            MidiInputEvent::NoteOff {
+                channel: 0,
+                key: 60,
+                velocity: 64,
+            }
+        ));
+        assert!(is_performance_clip_trigger_channel_event(
+            MidiInputEvent::ControlChange {
+                channel: 0,
+                controller: 64,
+                value: 127,
+            }
+        ));
+        assert!(!is_performance_clip_trigger_channel_event(
+            MidiInputEvent::NoteOn {
+                channel: 1,
+                key: 60,
+                velocity: 100,
+            }
+        ));
+        assert!(!is_performance_clip_trigger_channel_event(
+            MidiInputEvent::TimingClock
+        ));
     }
 
     #[test]
