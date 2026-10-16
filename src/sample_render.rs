@@ -6,7 +6,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1299,6 +1299,7 @@ pub struct PlaylistStreamMonitor<'a> {
     start_frame: u64,
     meters: Option<&'a MixerTrackPeakMeters>,
     live_master_fader_gain: Option<Arc<AtomicU32>>,
+    live_master_pan_raw: Option<Arc<AtomicI32>>,
 }
 
 impl<'a> PlaylistStreamMonitor<'a> {
@@ -1308,6 +1309,7 @@ impl<'a> PlaylistStreamMonitor<'a> {
             start_frame,
             meters: None,
             live_master_fader_gain: None,
+            live_master_pan_raw: None,
         }
     }
 
@@ -1317,6 +1319,7 @@ impl<'a> PlaylistStreamMonitor<'a> {
             start_frame,
             meters: Some(meters),
             live_master_fader_gain: Some(meters.live_master_fader_gain()),
+            live_master_pan_raw: Some(meters.live_master_pan_raw()),
         }
     }
 }
@@ -1827,10 +1830,14 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
     let start_frame = monitor.start_frame;
     let meters = monitor.meters;
     let live_master_fader_gain = monitor.live_master_fader_gain;
+    let live_master_pan_raw = monitor.live_master_pan_raw;
     let project_path = project_path.as_ref();
     let mut master_output = MixerMasterOutput::from_document(document);
     if let Some(gain_target) = live_master_fader_gain {
         master_output = master_output.with_live_fader_gain_target(gain_target, options.sample_rate);
+    }
+    if let Some(pan_target) = live_master_pan_raw {
+        master_output = master_output.with_live_pan_raw_target(pan_target, options.sample_rate);
     }
     let audio = prepare_audio_clip_render(
         document,
@@ -3760,6 +3767,9 @@ struct MixerMasterOutput {
     live_fader_gain_target: Option<Arc<AtomicU32>>,
     live_fader_gain_current: Cell<Option<f32>>,
     live_fader_smoothing_alpha: f32,
+    live_pan_raw_target: Option<Arc<AtomicI32>>,
+    live_pan_raw_current: Cell<Option<f32>>,
+    live_pan_smoothing_alpha: f32,
 }
 
 impl MixerMasterOutput {
@@ -3791,6 +3801,13 @@ impl MixerMasterOutput {
         self
     }
 
+    fn with_live_pan_raw_target(mut self, pan_target: Arc<AtomicI32>, sample_rate: u32) -> Self {
+        self.live_pan_raw_target = Some(pan_target);
+        self.live_pan_smoothing_alpha =
+            crate::audio::output_gain_smoothing_alpha(sample_rate as f32);
+        self
+    }
+
     fn apply(&self, stereo_samples: &mut [f32]) {
         if self.enabled == Some(false) {
             stereo_samples.fill(0.0);
@@ -3799,7 +3816,11 @@ impl MixerMasterOutput {
         let (frames, _) = stereo_samples.as_chunks_mut::<2>();
         let master_transform = MixerInsertSignalTransform::default()
             .with_stereo_separation_raw(self.stereo_separation_raw)
-            .with_mixer_pan_raw(self.mixer_pan_raw)
+            .with_mixer_pan_raw(if self.live_pan_raw_target.is_some() {
+                None
+            } else {
+                self.mixer_pan_raw
+            })
             .with_mixer_pan_law_raw(self.mixer_pan_law_raw)
             .with_fader_volume_raw(if self.live_fader_gain_target.is_some() {
                 None
@@ -3815,6 +3836,25 @@ impl MixerMasterOutput {
                 frame[1] = -frame[1];
             }
             master_transform.apply_frame(frame);
+            if let Some(target) = &self.live_pan_raw_target {
+                let target_pan_raw = target.load(Ordering::Acquire);
+                if (-6_400..=6_400).contains(&target_pan_raw) {
+                    let current_pan_raw = self
+                        .live_pan_raw_current
+                        .get()
+                        .unwrap_or_else(|| self.mixer_pan_raw.unwrap_or(0) as f32);
+                    let next_pan_raw = crate::audio::smooth_output_gain(
+                        current_pan_raw,
+                        target_pan_raw as f32,
+                        self.live_pan_smoothing_alpha,
+                    );
+                    self.live_pan_raw_current.set(Some(next_pan_raw));
+                    MixerInsertSignalTransform::default()
+                        .with_mixer_pan_raw(Some(next_pan_raw.round() as i32))
+                        .with_mixer_pan_law_raw(self.mixer_pan_law_raw)
+                        .apply_frame(frame);
+                }
+            }
             if let Some(target) = &self.live_fader_gain_target {
                 let current_gain = self.live_fader_gain_current.get().unwrap_or_else(|| {
                     self.fader_volume_raw.map_or(1.0, |volume_raw| {
