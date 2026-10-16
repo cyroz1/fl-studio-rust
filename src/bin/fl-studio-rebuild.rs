@@ -41,7 +41,7 @@ use flp_rebuild::sample_render::{
     render_playlist_with_vst3_to_ogg_cancellable, render_playlist_with_vst3_to_wav_cancellable,
     render_sampler_pattern_to_file, stream_playlist_performance_with_vst3_to_device,
     stream_playlist_with_vst3_to_device_with_monitor, stream_sampler_midi_input_to_device,
-    stream_sampler_pattern_loop_to_device, stream_sampler_pattern_to_device,
+    stream_sampler_pattern_loop_from_tick_to_device, stream_sampler_pattern_to_device,
     write_input_recording_to_wav,
 };
 use flp_rebuild::vst3::{
@@ -3783,6 +3783,7 @@ struct DawUi {
     playing: bool,
     pattern_playback_mode: bool,
     pattern_mode_playback_source: Option<(u16, u64)>,
+    pattern_seek_tick: u64,
     performance_mode_active: bool,
     held_performance_clips: Vec<(u16, u32, usize)>,
     midi_held_performance_clips: MidiPerformanceHoldMap,
@@ -4541,6 +4542,7 @@ impl DawUi {
             playing: false,
             pattern_playback_mode: false,
             pattern_mode_playback_source: None,
+            pattern_seek_tick: 0,
             performance_mode_active: false,
             held_performance_clips: Vec::new(),
             midi_held_performance_clips: BTreeMap::new(),
@@ -9156,11 +9158,44 @@ impl DawUi {
                 return;
             }
         };
-        self.stream_selected_sampler_pattern(Some(loop_length_ticks));
+        let loop_start_tick = self.pattern_seek_tick % loop_length_ticks;
+        self.stream_selected_sampler_pattern_from_tick(Some(loop_length_ticks), loop_start_tick);
+        self.pattern_seek_tick = loop_start_tick;
         if self.playing {
             self.pattern_mode_playback_source = Some((pattern_id, loop_length_ticks));
             self.start_midi_clock(false);
             self.start_midi_pattern_transport(pattern_id, loop_length_ticks);
+        }
+    }
+
+    fn seek_pattern_mode_to_tick(&mut self, pattern_id: u16, requested_tick: u32) {
+        if !self.pattern_playback_mode || self.selected_pattern != Some(pattern_id) {
+            return;
+        }
+        let loop_length_ticks = match self.selected_pattern_loop_length_ticks(pattern_id) {
+            Ok(length_ticks) if length_ticks > 0 => length_ticks,
+            Ok(_) => {
+                self.status = "Could not seek a Pattern with an empty loop".to_owned();
+                return;
+            }
+            Err(error) => {
+                self.status = format!("Could not seek Pattern playback: {error}");
+                return;
+            }
+        };
+        let seek_tick = u64::from(requested_tick) % loop_length_ticks;
+        let restart_playback = self.playing;
+        let playback_loaded = self.project_playback_loaded
+            || self.pending_audio_render.is_some()
+            || self.pending_vst3_stream.is_some()
+            || self.pending_sampler_stream.is_some();
+        if restart_playback || playback_loaded {
+            self.stop_project_playback();
+        }
+        self.pattern_seek_tick = seek_tick;
+        self.status = format!("Pattern {pattern_id} position set to tick {seek_tick}");
+        if restart_playback {
+            self.start_pattern_mode_playback();
         }
     }
 
@@ -9672,6 +9707,7 @@ impl DawUi {
         self.project_playback_loaded = false;
         self.playlist_playback_loaded = false;
         self.playlist_seek_tick = 0;
+        self.pattern_seek_tick = 0;
         self.playlist_tempo_map = None;
     }
 
@@ -10773,7 +10809,13 @@ impl DawUi {
     }
 
     fn song_position_label(&self) -> String {
-        let pattern_position = self.current_pattern_mode_playhead_tick();
+        let pattern_position = self.current_pattern_mode_playhead_tick().or_else(|| {
+            if !self.pattern_playback_mode {
+                return None;
+            }
+            self.selected_pattern
+                .map(|pattern_id| (pattern_id, self.pattern_seek_tick as f64))
+        });
         let Some(document) = self.document.as_ref() else {
             return "1:01:000".to_owned();
         };
@@ -28539,6 +28581,14 @@ impl DawUi {
     }
 
     fn stream_selected_sampler_pattern(&mut self, loop_length_ticks: Option<u64>) {
+        self.stream_selected_sampler_pattern_from_tick(loop_length_ticks, 0);
+    }
+
+    fn stream_selected_sampler_pattern_from_tick(
+        &mut self,
+        loop_length_ticks: Option<u64>,
+        loop_start_tick: u64,
+    ) {
         let Some(pattern_id) = self.selected_pattern else {
             self.status = "Select a pattern before previewing Sampler channels".to_owned();
             return;
@@ -28576,6 +28626,21 @@ impl DawUi {
             return;
         }
         let device_rate = engine.sample_rate();
+        let start_frame = if let Some(loop_length_ticks) = loop_length_ticks {
+            let Some(start_frame) = pattern_loop_frame_at_tick(
+                loop_start_tick,
+                device_rate,
+                document.header().ppq(),
+                document.metadata().tempo_bpm().unwrap_or(140.0),
+                loop_length_ticks,
+            ) else {
+                self.status = "Could not map the Pattern seek position to audio frames".to_owned();
+                return;
+            };
+            start_frame
+        } else {
+            0
+        };
 
         self.stop_project_playback();
         if let Some(engine) = &self.audio_engine {
@@ -28591,7 +28656,7 @@ impl DawUi {
             .audio_engine
             .as_ref()
             .ok_or_else(|| "Audio output is not available".to_owned())
-            .and_then(AudioEngine::begin_streaming_playback)
+            .and_then(|engine| engine.begin_streaming_playback_from_frame(start_frame))
         {
             Ok(writer) => writer,
             Err(error) => {
@@ -28622,11 +28687,12 @@ impl DawUi {
                             ..SamplerPatternRenderOptions::default()
                         };
                         if let Some(loop_length_ticks) = loop_length_ticks {
-                            stream_sampler_pattern_loop_to_device(
+                            stream_sampler_pattern_loop_from_tick_to_device(
                                 &document,
                                 &project_path,
                                 options,
                                 loop_length_ticks,
+                                loop_start_tick,
                                 &writer,
                                 &worker_cancelled,
                             )
@@ -31109,6 +31175,7 @@ impl DawUi {
         }
         let mut mouse_wheel_target_hovered = false;
         let mut mouse_wheel_consumed = false;
+        let mut pattern_seek_tick_requested = None;
         let scroll_output = scroll_area.show(ui, |ui| {
             let scroll_modifiers = ui.input(|input| input.modifiers);
             let size = Vec2::new(
@@ -31154,8 +31221,28 @@ impl DawUi {
                     },
                 )
                 .on_hover_text(
-                    "Ctrl/Cmd-drag to select notes by time range · Shift adds to selection",
+                    "Click to seek Pattern playback in PAT mode · Ctrl/Cmd-drag selects notes by time range · Shift adds to selection",
                 );
+            if self.pattern_playback_mode
+                && self.selected_pattern == Some(pattern.id)
+                && self
+                    .pattern_mode_playback_source
+                    .is_none_or(|(active_pattern_id, _)| active_pattern_id == pattern.id)
+                && ruler_response.clicked_by(PointerButton::Primary)
+                && !scroll_modifiers.command
+                && !self.piano_roll_zoom_mode
+                && let Some(pointer) = ruler_response.interact_pointer_pos()
+            {
+                pattern_seek_tick_requested = Some((
+                    pattern.id,
+                    piano_roll_time_tick_at_x(
+                        pointer.x,
+                        rect.left() + keyboard_width,
+                        tick_scale,
+                        snap_ticks,
+                    ),
+                ));
+            }
             let keyboard_area_rect = egui::Rect::from_min_max(
                 egui::pos2(rect.left(), grid_rect.top()),
                 egui::pos2(rect.left() + keyboard_width, grid_rect.bottom()),
@@ -32700,6 +32787,9 @@ impl DawUi {
                 notes_to_add.push(note);
             }
         });
+        if let Some((pattern_id, tick)) = pattern_seek_tick_requested {
+            self.seek_pattern_mode_to_tick(pattern_id, tick);
+        }
         if !mouse_wheel_target_hovered {
             self.piano_roll_mouse_wheel_remainder = 0.0;
             self.piano_roll_mouse_wheel_action = None;
@@ -45951,6 +46041,27 @@ fn pattern_loop_tick_at_frame(
     tempo_map.tick_at_frame(frame % loop_length_frames, sample_rate)
 }
 
+fn pattern_loop_frame_at_tick(
+    tick: u64,
+    sample_rate: u32,
+    ppq: u16,
+    tempo_bpm: f64,
+    loop_length_ticks: u64,
+) -> Option<u64> {
+    if loop_length_ticks == 0 {
+        return None;
+    }
+    let tempo_map = PlaylistTempoMap::constant(ppq, tempo_bpm).ok()?;
+    let loop_length_frames = tempo_map
+        .frame_at_tick(loop_length_ticks, sample_rate)
+        .ok()?
+        .max(1);
+    let tick_frame = tempo_map
+        .frame_at_tick(tick % loop_length_ticks, sample_rate)
+        .ok()?;
+    Some(tick_frame % loop_length_frames)
+}
+
 fn playlist_signature_at_tick(
     initial_time_signature: Option<(u8, u8)>,
     signature_changes: &[(u32, u8, u8)],
@@ -46960,12 +47071,13 @@ mod tests {
         encode_midi_device_selections, first_available_playlist_track, midi_button_press_edge,
         midi_controller_binding_for_device, next_piano_roll_note_group, note_from_grid_position,
         parse_midi_control_change_mapping, parse_midi_controller_templates,
-        parse_midi_device_selections, parse_window_layout_presets, pattern_loop_tick_at_frame,
-        piano_roll_color_group_note_ids, piano_roll_controller_stroke_points,
-        piano_roll_controller_value_at, piano_roll_controller_value_range,
-        piano_roll_cross_pattern_ghost_notes, piano_roll_discard_length_edit,
-        piano_roll_duplicate_offset, piano_roll_ghost_note_is_visible, piano_roll_key_at_y,
-        piano_roll_note_group_members, piano_roll_note_nudge_edit, piano_roll_odd_note_selection,
+        parse_midi_device_selections, parse_window_layout_presets, pattern_loop_frame_at_tick,
+        pattern_loop_tick_at_frame, piano_roll_color_group_note_ids,
+        piano_roll_controller_stroke_points, piano_roll_controller_value_at,
+        piano_roll_controller_value_range, piano_roll_cross_pattern_ghost_notes,
+        piano_roll_discard_length_edit, piano_roll_duplicate_offset,
+        piano_roll_ghost_note_is_visible, piano_roll_key_at_y, piano_roll_note_group_members,
+        piano_roll_note_nudge_edit, piano_roll_odd_note_selection,
         piano_roll_overlap_note_selection, piano_roll_pitch_range_note_selection,
         piano_roll_random_note_selection, piano_roll_selection_time_range,
         piano_roll_shift_time_range, piano_roll_time_range_from_drag,
@@ -48800,6 +48912,28 @@ mod tests {
         );
         assert_eq!(pattern_loop_tick_at_frame(0, 48_000, 96, 120.0, 0), None);
         assert_eq!(pattern_loop_tick_at_frame(0, 0, 96, 120.0, 384), None);
+    }
+
+    #[test]
+    fn pattern_loop_seek_tick_maps_to_its_audio_phase() {
+        assert_eq!(
+            pattern_loop_frame_at_tick(0, 48_000, 96, 120.0, 384),
+            Some(0)
+        );
+        assert_eq!(
+            pattern_loop_frame_at_tick(96, 48_000, 96, 120.0, 384),
+            Some(24_000)
+        );
+        assert_eq!(
+            pattern_loop_frame_at_tick(480, 48_000, 96, 120.0, 384),
+            Some(24_000)
+        );
+        assert_eq!(
+            pattern_loop_frame_at_tick(384, 48_000, 96, 120.0, 384),
+            Some(0)
+        );
+        assert_eq!(pattern_loop_frame_at_tick(0, 48_000, 96, 120.0, 0), None);
+        assert_eq!(pattern_loop_frame_at_tick(0, 0, 96, 120.0, 384), None);
     }
 
     #[test]
