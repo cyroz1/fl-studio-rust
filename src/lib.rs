@@ -884,12 +884,12 @@ impl ChannelSummary {
 /// Layer Random uses a stable per-note pseudo-random choice in this runtime so
 /// Sampler and VST3 render paths agree on the selected child. FL Studio's native
 /// random sequence is not known, so rendered choices may differ from FL Studio.
-pub(crate) struct ChannelNoteRouter {
+pub struct ChannelNoteRouter {
     channels_by_id: HashMap<u16, ChannelSummary>,
 }
 
 impl ChannelNoteRouter {
-    pub(crate) fn new(channels: impl IntoIterator<Item = ChannelSummary>) -> Self {
+    pub fn new(channels: impl IntoIterator<Item = ChannelSummary>) -> Self {
         Self {
             channels_by_id: channels
                 .into_iter()
@@ -900,12 +900,7 @@ impl ChannelNoteRouter {
 
     /// Returns targets for a note after applying the source and child key regions.
     /// Layer Random chooses from the children that accept this note.
-    pub(crate) fn targets_for_note(
-        &self,
-        source_channel_id: u16,
-        note_seed: u64,
-        key: u16,
-    ) -> Vec<u16> {
+    pub fn targets_for_note(&self, source_channel_id: u16, note_seed: u64, key: u16) -> Vec<u16> {
         let Some(source) = self.channels_by_id.get(&source_channel_id) else {
             return Vec::new();
         };

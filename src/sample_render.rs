@@ -4575,7 +4575,7 @@ fn stream_sampler_pattern_loop_from_tick_with_vst3_to_device(
     }
 }
 
-/// Stream live MIDI note events through one Sampler channel while transport is stopped.
+/// Stream live MIDI note events through the Sampler channels in a selected channel or Layer.
 ///
 /// The pattern is used to prepare the selected channel's sample and routing state. Its saved
 /// notes are not played; note events arrive through `events` and are rendered on the worker.
@@ -4611,12 +4611,17 @@ pub fn stream_sampler_midi_input_to_device(
                 if child.enabled() == Some(false) {
                     continue;
                 }
-                if child.channel_type() != Some(ChannelType::Sampler) {
-                    return Err(format!(
-                        "Layer channel {channel_id} live audition currently supports Sampler children only; child {child_id} is not a Sampler"
-                    ));
+                match child.channel_type() {
+                    Some(ChannelType::Sampler) => {
+                        sampler_channel_ids.insert(*child_id);
+                    }
+                    Some(ChannelType::Instrument) => continue,
+                    _ => {
+                        return Err(format!(
+                            "Layer channel {channel_id} live audition supports Sampler and instrument children only; child {child_id} has an unsupported type"
+                        ));
+                    }
                 }
-                sampler_channel_ids.insert(*child_id);
             }
             if sampler_channel_ids.is_empty() {
                 return Err(format!(
