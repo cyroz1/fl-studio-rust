@@ -80,11 +80,9 @@ use midi_input::{
     ReceivedMidiMessage, connect_input_device, describe_event, enumerate_input_devices,
 };
 use midi_output::{
-    ConnectedMidiOutput, MIDI_CLOCK_TICK, MIDI_CONTINUE, MIDI_START, MIDI_STOP, MIDI_TEST_NOTE_OFF,
-    MIDI_TEST_NOTE_ON, MidiOutputDevice, ScheduledMidiMessage, ScheduledMidiTickMessage,
-    connect_output_device, enumerate_output_devices, midi_clock_pulse_count_at_tick,
-    midi_sixteenth_notes_from_tick, midi_song_position_pointer_message, pattern_preview_messages,
-    playlist_playback_messages,
+    ConnectedMidiOutput, MIDI_TEST_NOTE_OFF, MIDI_TEST_NOTE_ON, MidiClockScheduler,
+    MidiOutputDevice, ScheduledMidiMessage, ScheduledMidiTickMessage, connect_output_device,
+    enumerate_output_devices, pattern_preview_messages, playlist_playback_messages,
 };
 use midi_thru::{MidiThruSettings, MidiThruWorker};
 
@@ -3714,10 +3712,6 @@ struct ActiveMidiPatternPlayback {
     next_message: usize,
 }
 
-struct ActiveMidiClock {
-    next_pulse_index: u64,
-}
-
 struct ScheduledMidiFrameMessage {
     frame: u64,
     bytes: Vec<u8>,
@@ -4069,7 +4063,7 @@ struct DawUi {
     midi_output_connection: Option<ConnectedMidiOutput>,
     midi_output_send_clock: bool,
     midi_output_send_playlist_notes: bool,
-    midi_output_clock: Option<ActiveMidiClock>,
+    midi_output_clock: Option<MidiClockScheduler>,
     midi_playlist_playback: Option<ActiveMidiPlaylistPlayback>,
     midi_pattern_playback: Option<ActiveMidiPatternPlayback>,
     midi_pattern_play_requested: bool,
@@ -35255,155 +35249,76 @@ impl DawUi {
         }
     }
 
-    fn current_midi_sixteenth_position(&self) -> u16 {
-        let Some(tick) = self.current_playhead_tick() else {
-            return 0;
-        };
-        let ppq = self
-            .document
-            .as_ref()
-            .map(|document| document.header().ppq().max(1))
-            .unwrap_or(1);
-        midi_sixteenth_notes_from_tick(tick, ppq)
-    }
-
     fn start_midi_clock(&mut self, resume: bool) {
         if !self.midi_output_send_clock {
             return;
+        }
+        if self.midi_output_clock.is_some() {
+            self.stop_midi_clock();
         }
         let Some(current_tick) = self.current_playhead_tick() else {
             self.midi_output_error =
                 Some("Playlist position is unavailable for MIDI clock".to_owned());
             return;
         };
+        let Some(output) = self.midi_output_connection.as_ref().cloned() else {
+            return;
+        };
+        let Some(tempo_map) = self.playlist_tempo_map.clone() else {
+            self.midi_output_error =
+                Some("Playlist tempo map is unavailable for MIDI clock".to_owned());
+            return;
+        };
+        let Some((sample_rate, playback_clock)) = self
+            .audio_engine
+            .as_ref()
+            .map(|engine| (engine.sample_rate(), engine.project_playback_clock()))
+            .filter(|(sample_rate, _)| *sample_rate > 0)
+        else {
+            self.midi_output_error = Some("Audio timing is unavailable for MIDI clock".to_owned());
+            return;
+        };
         let ppq = self
             .document
             .as_ref()
             .map(|document| document.header().ppq().max(1))
             .unwrap_or(1);
-        let next_pulse_index = midi_clock_pulse_count_at_tick(current_tick, ppq).saturating_add(1);
-        let song_position = self.current_midi_sixteenth_position();
-        let Some(connection) = self.midi_output_connection.as_mut() else {
-            return;
-        };
-        let result = if resume || current_tick > 0.0 {
-            connection
-                .send(&midi_song_position_pointer_message(song_position))
-                .and_then(|()| connection.send(&MIDI_CONTINUE))
-        } else {
-            connection.send(&MIDI_START)
-        };
-        if let Err(error) = result {
-            self.midi_output_error = Some(error);
-            return;
+        match MidiClockScheduler::start(
+            output,
+            resume,
+            current_tick,
+            sample_rate,
+            ppq,
+            tempo_map,
+            playback_clock,
+        ) {
+            Ok(clock) => self.midi_output_clock = Some(clock),
+            Err(error) => {
+                self.midi_output_error = Some(error.clone());
+                self.status = format!("Could not start MIDI clock: {error}");
+            }
         }
-        self.midi_output_clock = Some(ActiveMidiClock { next_pulse_index });
     }
 
     fn stop_midi_clock(&mut self) {
-        if self.midi_output_clock.take().is_none() {
+        let Some(clock) = self.midi_output_clock.take() else {
             return;
-        }
-        if let Some(connection) = self.midi_output_connection.as_mut()
-            && let Err(error) = connection.send(&MIDI_STOP)
-        {
-            self.midi_output_error = Some(error);
+        };
+        if let Err(error) = clock.stop() {
+            self.midi_output_error = Some(error.clone());
+            self.status = format!("Could not stop MIDI clock cleanly: {error}");
         }
     }
 
     fn service_midi_clock(&mut self) {
-        if self.midi_output_clock.is_none() {
-            return;
-        }
-        let Some((sample_rate, current_frame)) = self.audio_engine.as_ref().map(|engine| {
-            (
-                engine.sample_rate(),
-                engine.project_playback_position_frames(),
-            )
-        }) else {
-            self.stop_midi_clock();
-            self.midi_output_error =
-                Some("Audio position was lost while sending MIDI clock".to_owned());
-            return;
-        };
-        if sample_rate == 0 {
-            self.stop_midi_clock();
-            self.midi_output_error =
-                Some("Audio sample rate was lost while sending MIDI clock".to_owned());
-            return;
-        }
-        let ppq = self
-            .document
+        let error = self
+            .midi_output_clock
             .as_ref()
-            .map(|document| document.header().ppq().max(1))
-            .unwrap_or(1);
-        let Some(current_tick) = self
-            .playlist_tempo_map
-            .as_ref()
-            .and_then(|tempo_map| tempo_map.tick_at_frame(current_frame, sample_rate))
-        else {
-            self.stop_midi_clock();
-            self.midi_output_error =
-                Some("Could not map Playlist position for MIDI clock".to_owned());
-            return;
-        };
-        let Some(tempo_map) = self.playlist_tempo_map.as_ref() else {
-            self.stop_midi_clock();
-            self.midi_output_error =
-                Some("Playlist tempo map was lost while sending MIDI clock".to_owned());
-            return;
-        };
-        let mut send_error = None;
-        let mut clock_lost = false;
-        {
-            if let Some(clock) = self.midi_output_clock.as_mut() {
-                if let Some(connection) = self.midi_output_connection.as_mut() {
-                    let mut sent = 0;
-                    while sent < 4 {
-                        let pulse_tick = clock.next_pulse_index as f64 * f64::from(ppq) / 24.0;
-                        let pulse_frame =
-                            match tempo_map.frame_at_fractional_tick(pulse_tick, sample_rate) {
-                                Ok(frame) => frame,
-                                Err(error) => {
-                                    send_error = Some(error);
-                                    break;
-                                }
-                            };
-                        if pulse_frame > current_frame {
-                            break;
-                        }
-                        if let Err(error) = connection.send(&MIDI_CLOCK_TICK) {
-                            send_error = Some(error);
-                            break;
-                        }
-                        let Some(next_pulse_index) = clock.next_pulse_index.checked_add(1) else {
-                            send_error = Some("MIDI clock pulse index overflowed".to_owned());
-                            break;
-                        };
-                        clock.next_pulse_index = next_pulse_index;
-                        sent += 1;
-                    }
-                    if sent == 4 {
-                        clock.next_pulse_index = clock.next_pulse_index.max(
-                            midi_clock_pulse_count_at_tick(current_tick, ppq).saturating_add(1),
-                        );
-                    }
-                } else {
-                    clock_lost = true;
-                }
-            }
-        }
-        if let Some(error) = send_error {
-            if let Some(connection) = self.midi_output_connection.as_mut() {
-                let _ = connection.send(&MIDI_STOP);
-            }
+            .and_then(MidiClockScheduler::take_error);
+        if let Some(error) = error {
             self.midi_output_clock = None;
             self.midi_output_error = Some(error.clone());
             self.status = format!("MIDI clock stopped: {error}");
-        } else if clock_lost {
-            self.midi_output_clock = None;
-            self.midi_output_error =
-                Some("MIDI output disconnected while sending clock".to_owned());
         }
     }
 
@@ -35561,28 +35476,6 @@ impl DawUi {
                 );
             }
         }
-    }
-
-    fn midi_clock_repaint_delay(&self) -> Option<Duration> {
-        let clock = self.midi_output_clock.as_ref()?;
-        let tempo_map = self.playlist_tempo_map.as_ref()?;
-        let engine = self.audio_engine.as_ref()?;
-        let ppq = self
-            .document
-            .as_ref()
-            .map(|document| document.header().ppq().max(1))?;
-        let sample_rate = engine.sample_rate();
-        if sample_rate == 0 {
-            return None;
-        }
-        let pulse_tick = clock.next_pulse_index as f64 * f64::from(ppq) / 24.0;
-        let target_frame = tempo_map
-            .frame_at_fractional_tick(pulse_tick, sample_rate)
-            .ok()?;
-        let remaining_frames =
-            target_frame.saturating_sub(engine.project_playback_position_frames());
-        let seconds = (remaining_frames as f64 / f64::from(sample_rate)).clamp(0.001, 0.033);
-        Some(Duration::from_secs_f64(seconds))
     }
 
     fn start_midi_pattern_preview(&mut self) {
@@ -40442,8 +40335,6 @@ impl eframe::App for DawUi {
             let repaint_delay =
                 if self.midi_pattern_playback.is_some() || self.midi_playlist_playback.is_some() {
                     Duration::from_millis(5)
-                } else if let Some(delay) = self.midi_clock_repaint_delay() {
-                    delay
                 } else {
                     Duration::from_millis(33)
                 };
