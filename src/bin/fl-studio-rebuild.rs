@@ -27258,6 +27258,7 @@ impl DawUi {
             .unwrap_or_default();
         let mut import_midi_request = None;
         let mut import_all_midi_request = None;
+        let mut create_sampler_midi_request = None;
         let mut clear_midi_import = false;
         if let Some(pending) = &mut self.pending_midi_import {
             ui.horizontal(|ui| {
@@ -27327,6 +27328,31 @@ impl DawUi {
                             pending.midi.clone(),
                             pending.track_channel_ids.clone(),
                             pattern_id,
+                        ));
+                    }
+                    let selected_sampler_template = self.selected_note_channel.filter(|channel_id| {
+                        available_midi_channels
+                            .iter()
+                            .any(|channel| channel.id() == *channel_id && channel.kind() == Some(0))
+                    });
+                    if ui
+                        .add_enabled(
+                            self.selected_pattern.is_some()
+                                && selected_sampler_template.is_some()
+                                && pending.midi.format() != 2,
+                            egui::Button::new("Create Sampler channels"),
+                        )
+                        .on_hover_text(
+                            "Copy the selected Sampler's sample and settings once per MIDI track, then import each track into its new channel.",
+                        )
+                        .clicked()
+                        && let (Some(pattern_id), Some(template_channel_id)) =
+                            (self.selected_pattern, selected_sampler_template)
+                    {
+                        create_sampler_midi_request = Some((
+                            pending.midi.clone(),
+                            pattern_id,
+                            template_channel_id,
                         ));
                     }
                 }
@@ -27453,6 +27479,45 @@ impl DawUi {
                         self.status = format!(
                             "Imported {imported} MIDI notes from {} tracks into pattern {pattern_id}",
                             midi.tracks().len()
+                        );
+                    }
+                    Err(error) => self.status = error.to_string(),
+                }
+            }
+        }
+        if let Some((midi, pattern_id, template_channel_id)) = create_sampler_midi_request {
+            let selected_track_index = midi
+                .tracks()
+                .iter()
+                .position(|track| !track.notes().is_empty())
+                .unwrap_or(0);
+            let first_note_index = 0;
+            if let Some(document) = &mut self.document {
+                match document.import_midi_tracks_to_sampler_channels(
+                    &midi,
+                    pattern_id,
+                    template_channel_id,
+                ) {
+                    Ok((imported, channel_ids)) => {
+                        self.stop_project_playback();
+                        if let Some(channel_id) = channel_ids.get(selected_track_index).copied() {
+                            self.selected_note_channel = Some(channel_id);
+                            self.selected_note = None;
+                            self.selected_piano_notes.clear();
+                            if imported > 0 {
+                                self.selected_note =
+                                    Some((pattern_id, channel_id, first_note_index));
+                                self.selected_piano_notes.insert((
+                                    pattern_id,
+                                    channel_id,
+                                    first_note_index,
+                                ));
+                            }
+                        }
+                        self.dirty = true;
+                        self.status = format!(
+                            "Created {} Sampler channels and imported {imported} MIDI notes into pattern {pattern_id}",
+                            channel_ids.len()
                         );
                     }
                     Err(error) => self.status = error.to_string(),
