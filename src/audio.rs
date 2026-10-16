@@ -46,6 +46,7 @@ pub struct MixerTrackPeakMeters {
     live_master_pan_raw: Arc<AtomicI32>,
     live_master_stereo_separation_raw: Arc<AtomicI32>,
     live_master_enabled: Arc<AtomicI32>,
+    live_master_signal_flags: Arc<AtomicI32>,
 }
 
 impl Default for MixerTrackPeakMeters {
@@ -56,6 +57,7 @@ impl Default for MixerTrackPeakMeters {
             live_master_pan_raw: Arc::new(AtomicI32::new(i32::MIN)),
             live_master_stereo_separation_raw: Arc::new(AtomicI32::new(i32::MIN)),
             live_master_enabled: Arc::new(AtomicI32::new(i32::MIN)),
+            live_master_signal_flags: Arc::new(AtomicI32::new(i32::MIN)),
         }
     }
 }
@@ -134,6 +136,22 @@ impl MixerTrackPeakMeters {
 
     pub(crate) fn live_master_enabled(&self) -> Arc<AtomicI32> {
         Arc::clone(&self.live_master_enabled)
+    }
+
+    /// Set the live Playlist stream's Master polarity and stereo-swap state.
+    ///
+    /// The render worker reads this packed flag value without taking a lock and smooths changes
+    /// over 20 ms. `None` preserves the saved document state when the flag record is unavailable.
+    pub fn set_live_master_signal_flags(&self, flags: Option<(bool, bool)>) {
+        let encoded = flags.map_or(i32::MIN, |(polarity_reversed, swap_left_right)| {
+            i32::from(polarity_reversed) | (i32::from(swap_left_right) << 1)
+        });
+        self.live_master_signal_flags
+            .store(encoded, Ordering::Release);
+    }
+
+    pub(crate) fn live_master_signal_flags(&self) -> Arc<AtomicI32> {
+        Arc::clone(&self.live_master_signal_flags)
     }
 
     pub(crate) fn publish_peak(&self, track: usize, peak: f32) {
