@@ -7,8 +7,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -111,6 +111,46 @@ pub struct Vst3PatternStream {
 pub struct Vst3PatternStreamHandle {
     receiver: Receiver<Result<Vst3RenderSummary, String>>,
     worker: thread::JoinHandle<()>,
+}
+
+/// A running VST3 instrument stream that accepts live MIDI events.
+pub struct Vst3LiveInputStreamHandle {
+    sender: SyncSender<MidiEvent>,
+    receiver: Receiver<Result<(), String>>,
+    cancelled: Arc<AtomicBool>,
+    worker: thread::JoinHandle<()>,
+}
+
+impl Vst3LiveInputStreamHandle {
+    /// Queue one live MIDI event for the next plug-in processing block.
+    pub fn try_send(&self, event: MidiEvent) -> Result<(), String> {
+        self.sender.try_send(event).map_err(|error| match error {
+            mpsc::TrySendError::Full(_) => "VST3 live MIDI queue is full".to_owned(),
+            mpsc::TrySendError::Disconnected(_) => {
+                "VST3 live MIDI worker is no longer available".to_owned()
+            }
+        })
+    }
+
+    /// Poll the live stream worker for a processing error without waiting.
+    pub fn try_recv(&self) -> Result<Result<(), String>, TryRecvError> {
+        self.receiver.try_recv()
+    }
+
+    /// Cancel live processing and send Note Off for any held notes before stopping the plug-in.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    /// Whether the plug-in processing worker has exited and can be joined without waiting.
+    pub fn is_finished(&self) -> bool {
+        self.worker.is_finished()
+    }
+
+    /// Join the worker after playback has been cancelled or ended.
+    pub fn join(self) -> thread::Result<()> {
+        self.worker.join()
+    }
 }
 
 impl Vst3PatternStreamHandle {
@@ -1405,6 +1445,75 @@ impl Vst3HostRuntime {
         ))
     }
 
+    /// Start a low-latency stream for live MIDI audition through an already loaded instrument.
+    pub fn start_live_midi_input_stream(
+        &self,
+        id: u64,
+        writer: StreamingAudioWriter,
+        output_sample_rate: u32,
+        pitch_offset_cents: i16,
+        note_pitch_offset_semitones: i16,
+    ) -> Result<Vst3LiveInputStreamHandle, String> {
+        if output_sample_rate == 0 {
+            return Err("audio output sample rate must be positive".to_owned());
+        }
+        if !(-1200..=1200).contains(&pitch_offset_cents) {
+            return Err("VST3 pitch offset must be between -1200 and 1200 cents".to_owned());
+        }
+        if !(-12..=12).contains(&note_pitch_offset_semitones) {
+            return Err("VST3 note pitch offset must be between -12 and 12 semitones".to_owned());
+        }
+        let plugin = self.plugin(id)?.clone();
+        let (sample_rate, block_size, output_channels) = {
+            let plugin = plugin
+                .lock()
+                .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
+            (
+                plugin.sample_rate(),
+                plugin.block_size(),
+                plugin.output_channel_count(),
+            )
+        };
+        if !sample_rate.is_finite() || !(8_000.0..=384_000.0).contains(&sample_rate) {
+            return Err("VST3 host sample rate is invalid".to_owned());
+        }
+        if block_size == 0 || block_size > 65_536 {
+            return Err("VST3 host block size is not renderable".to_owned());
+        }
+        if !(1..=2).contains(&output_channels) {
+            return Err(format!(
+                "VST3 live audition supports mono or stereo output buses; this instrument has {output_channels} channels"
+            ));
+        }
+
+        let (sender, receiver) = mpsc::sync_channel(256);
+        let (result_sender, result_receiver) = mpsc::sync_channel(1);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let worker = thread::Builder::new()
+            .name("vst3-live-midi-input".to_owned())
+            .spawn(move || {
+                let result = stream_live_midi_input(
+                    plugin,
+                    receiver,
+                    &writer,
+                    output_sample_rate,
+                    pitch_offset_cents,
+                    note_pitch_offset_semitones,
+                    worker_cancelled,
+                );
+                writer.finish();
+                let _ = result_sender.send(result);
+            })
+            .map_err(|error| format!("could not start VST3 live input worker: {error}"))?;
+        Ok(Vst3LiveInputStreamHandle {
+            sender,
+            receiver: result_receiver,
+            cancelled,
+            worker,
+        })
+    }
+
     /// Prepare a single pattern channel for blockwise streaming through its loaded VST3.
     pub fn prepare_pattern_channel_stream(
         &self,
@@ -2348,6 +2457,197 @@ fn process_pattern_render(
     let stop_result = plugin.stop_processing().map_err(|error| error.to_string());
     render_result?;
     stop_result
+}
+
+fn stream_live_midi_input(
+    plugin: Arc<Mutex<Plugin>>,
+    receiver: Receiver<MidiEvent>,
+    writer: &StreamingAudioWriter,
+    output_sample_rate: u32,
+    pitch_offset_cents: i16,
+    note_pitch_offset_semitones: i16,
+    cancelled: Arc<AtomicBool>,
+) -> Result<(), String> {
+    crate::audio::enable_denormal_protection();
+    let (sample_rate, block_size, output_channels) = {
+        let plugin = plugin
+            .lock()
+            .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
+        (
+            plugin.sample_rate(),
+            plugin.block_size(),
+            plugin.output_channel_count(),
+        )
+    };
+    if !sample_rate.is_finite() || !(8_000.0..=384_000.0).contains(&sample_rate) {
+        return Err("VST3 host sample rate is invalid".to_owned());
+    }
+    let sample_rate_u32 = sample_rate.round() as u32;
+    if block_size == 0 || block_size > 65_536 {
+        return Err("VST3 host block size is not renderable".to_owned());
+    }
+    if !(1..=2).contains(&output_channels) {
+        return Err("VST3 live audition supports mono or stereo output buses".to_owned());
+    }
+    let mut resampler = StereoStreamResampler::new(sample_rate_u32, output_sample_rate)?;
+    {
+        let mut plugin = plugin
+            .lock()
+            .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
+        plugin
+            .start_processing()
+            .map_err(|error| error.to_string())?;
+    }
+
+    let mut active_notes = BTreeMap::<(u8, u8), usize>::new();
+    let render_result = (|| {
+        loop {
+            if cancelled.load(Ordering::Acquire) || writer.is_cancelled() {
+                break Ok(());
+            }
+            let mut events = Vec::new();
+            let mut disconnected = false;
+            loop {
+                match receiver.try_recv() {
+                    Ok(event) => events.push(event),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+            let output = {
+                let mut plugin = plugin
+                    .lock()
+                    .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
+                for mut event in events {
+                    if let MidiEvent::NoteOn {
+                        channel,
+                        note,
+                        velocity: 0,
+                    } = event
+                    {
+                        event = MidiEvent::NoteOff {
+                            channel,
+                            note,
+                            velocity: 0,
+                        };
+                    }
+                    if note_pitch_offset_semitones != 0 {
+                        match &mut event {
+                            MidiEvent::NoteOn { note, .. } | MidiEvent::NoteOff { note, .. } => {
+                                *note = (i16::from(*note) + note_pitch_offset_semitones)
+                                    .clamp(0, 127) as u8;
+                            }
+                            _ => {}
+                        }
+                    }
+                    let release = match event {
+                        MidiEvent::NoteOff { velocity, .. } => velocity,
+                        _ => 0,
+                    };
+                    send_scheduled_midi_event(
+                        &mut plugin,
+                        event,
+                        0,
+                        pitch_offset_cents,
+                        0,
+                        ScheduledVst3Note {
+                            note_id: 0,
+                            note_pan: 64,
+                            note_release: release,
+                            supports_pan: false,
+                        },
+                    )?;
+                    match event {
+                        MidiEvent::NoteOn {
+                            channel,
+                            note,
+                            velocity,
+                        } if velocity > 0 => {
+                            let count = active_notes.entry((channel.as_index(), note)).or_default();
+                            *count = count.saturating_add(1);
+                        }
+                        MidiEvent::NoteOff { channel, note, .. } => {
+                            let key = (channel.as_index(), note);
+                            if let Some(count) = active_notes.get_mut(&key) {
+                                if *count <= 1 {
+                                    active_notes.remove(&key);
+                                } else {
+                                    *count -= 1;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let mut buffers = AudioBuffers::new(0, output_channels, block_size, sample_rate);
+                plugin
+                    .process_audio(&mut buffers)
+                    .map_err(|error| error.to_string())?;
+                if buffers.outputs.len() != output_channels
+                    || buffers
+                        .outputs
+                        .iter()
+                        .any(|channel| channel.len() < block_size)
+                {
+                    return Err("VST3 returned audio buffers with an unexpected shape".to_owned());
+                }
+                resampler.push_outputs(&buffers.outputs, block_size, output_channels)?
+            };
+            if let Err(error) = writer.write_stereo_samples(&output) {
+                if cancelled.load(Ordering::Acquire) || writer.is_cancelled() {
+                    break Ok(());
+                }
+                break Err(error);
+            }
+            if disconnected {
+                break Ok(());
+            }
+        }
+    })();
+
+    let cleanup_result = (|| {
+        let mut plugin = plugin
+            .lock()
+            .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
+        for ((channel, note), count) in active_notes {
+            let Some(channel) = MidiChannel::from_index(channel) else {
+                continue;
+            };
+            for _ in 0..count {
+                send_scheduled_midi_event(
+                    &mut plugin,
+                    MidiEvent::NoteOff {
+                        channel,
+                        note,
+                        velocity: 0,
+                    },
+                    0,
+                    pitch_offset_cents,
+                    0,
+                    ScheduledVst3Note {
+                        note_id: 0,
+                        note_pan: 64,
+                        note_release: 0,
+                        supports_pan: false,
+                    },
+                )?;
+            }
+        }
+        let mut buffers = AudioBuffers::new(0, output_channels, block_size, sample_rate);
+        plugin
+            .process_audio(&mut buffers)
+            .map_err(|error| error.to_string())
+    })();
+    let stop_result = plugin
+        .lock()
+        .map_err(|_| "plug-in state lock was poisoned".to_owned())?
+        .stop_processing()
+        .map_err(|error| error.to_string());
+
+    render_result.and(cleanup_result).and(stop_result)
 }
 
 fn stream_pattern_render(
