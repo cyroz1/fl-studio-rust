@@ -256,6 +256,10 @@ pub(crate) struct PlaylistMidiNote {
 struct PlaylistPluginStream {
     channel_id: u16,
     plugin: Arc<Mutex<Plugin>>,
+    live_midi_receiver: Receiver<PlaylistLiveMidiEvent>,
+    live_midi_stopped_generation: Arc<AtomicU64>,
+    live_midi_active_notes: BTreeMap<(u64, u8, u8), usize>,
+    live_midi_sustain_channels: BTreeMap<u64, BTreeSet<u8>>,
     render: PreparedPatternRender,
     resampler: StereoStreamResampler,
     pending_output: VecDeque<[f32; 2]>,
@@ -275,6 +279,69 @@ struct PlaylistPluginStream {
     pattern_loop: Option<PatternLoopEventQueue>,
 }
 
+#[derive(Clone, Copy)]
+struct PlaylistLiveMidiEvent {
+    generation: u64,
+    event: MidiEvent,
+}
+
+/// Routes live MIDI into a VST3 instrument already processing Playlist audio.
+#[derive(Clone)]
+pub struct Vst3PlaylistLiveInputSender {
+    sender: SyncSender<PlaylistLiveMidiEvent>,
+    next_generation: Arc<AtomicU64>,
+    stopped_generation: Arc<AtomicU64>,
+}
+
+/// One live MIDI audition session routed through a Playlist VST3 processor.
+pub struct Vst3PlaylistLiveInputSession {
+    sender: Vst3PlaylistLiveInputSender,
+    generation: u64,
+}
+
+impl Vst3PlaylistLiveInputSender {
+    pub fn begin_session(&self) -> Vst3PlaylistLiveInputSession {
+        let generation = self
+            .next_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        Vst3PlaylistLiveInputSession {
+            sender: self.clone(),
+            generation,
+        }
+    }
+}
+
+impl Vst3PlaylistLiveInputSession {
+    /// Queue one live MIDI event for the next Playlist plug-in processing block.
+    pub fn try_send(&self, event: MidiEvent) -> Result<(), String> {
+        self.sender
+            .sender
+            .try_send(PlaylistLiveMidiEvent {
+                generation: self.generation,
+                event,
+            })
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => "VST3 live MIDI queue is full".to_owned(),
+                mpsc::TrySendError::Disconnected(_) => {
+                    "Playlist VST3 processor is no longer available".to_owned()
+                }
+            })
+    }
+
+    pub fn stop(&self) {
+        self.sender
+            .stopped_generation
+            .fetch_max(self.generation, Ordering::AcqRel);
+    }
+}
+
+impl Drop for Vst3PlaylistLiveInputSession {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 struct PatternLoopEventQueue {
     loop_frames: u64,
     template_events: Vec<ScheduledMidiEvent>,
@@ -285,6 +352,7 @@ struct PatternLoopEventQueue {
 /// The instances are the same objects used by the open editors.
 pub struct Vst3PlaylistStreamProcessor {
     streams: Vec<PlaylistPluginStream>,
+    live_input_senders: BTreeMap<u16, Vst3PlaylistLiveInputSender>,
     tempo_map: PlaylistTempoMap,
     output_sample_rate: u32,
     content_frames: u64,
@@ -296,6 +364,14 @@ pub struct Vst3PlaylistStreamProcessor {
 }
 
 impl Vst3PlaylistStreamProcessor {
+    pub fn live_midi_input_sender(&self, channel_id: u16) -> Option<Vst3PlaylistLiveInputSender> {
+        self.live_input_senders.get(&channel_id).cloned()
+    }
+
+    pub fn live_midi_input_senders(&self) -> BTreeMap<u16, Vst3PlaylistLiveInputSender> {
+        self.live_input_senders.clone()
+    }
+
     pub(crate) fn performance_channel_ids(&self) -> BTreeSet<u16> {
         self.streams
             .iter()
@@ -563,12 +639,16 @@ impl Vst3PlaylistStreamProcessor {
         let mut first_error = None;
         while self.started_count > 0 {
             self.started_count -= 1;
-            let stream = &self.streams[self.started_count];
-            let result = stream
-                .plugin
+            let stream = &mut self.streams[self.started_count];
+            let plugin_cell = Arc::clone(&stream.plugin);
+            let result = plugin_cell
                 .lock()
                 .map_err(|_| "plug-in state lock was poisoned".to_owned())
-                .and_then(|mut plugin| plugin.stop_processing().map_err(|error| error.to_string()));
+                .and_then(|mut plugin| {
+                    let cleanup_result = stream.finish_live_midi(&mut plugin);
+                    let stop_result = plugin.stop_processing().map_err(|error| error.to_string());
+                    cleanup_result.and(stop_result)
+                });
             if let Err(error) = result
                 && first_error.is_none()
             {
@@ -654,8 +734,8 @@ impl PlaylistPluginStream {
                     self.render.sample_rate,
                 );
                 let output_block = {
-                    let mut plugin = self
-                        .plugin
+                    let plugin_cell = Arc::clone(&self.plugin);
+                    let mut plugin = plugin_cell
                         .lock()
                         .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
                     set_parameter_automation_for_block(
@@ -695,6 +775,7 @@ impl PlaylistPluginStream {
                         }
                         self.next_event += 1;
                     }
+                    self.process_live_midi_events(&mut plugin)?;
                     if self.next_event > 4096 {
                         self.render.events.drain(..self.next_event);
                         self.next_event = 0;
@@ -733,6 +814,199 @@ impl PlaylistPluginStream {
             output.extend_from_slice(&frame);
         }
         Ok(())
+    }
+
+    fn process_live_midi_events(&mut self, plugin: &mut Plugin) -> Result<(), String> {
+        let stopped_generation = self.live_midi_stopped_generation.load(Ordering::Acquire);
+        self.release_stopped_live_midi(plugin, stopped_generation)?;
+        while let Ok(queued) = self.live_midi_receiver.try_recv() {
+            if queued.generation <= stopped_generation {
+                continue;
+            }
+            let mut event = queued.event;
+            if let MidiEvent::NoteOn {
+                channel,
+                note,
+                velocity: 0,
+            } = event
+            {
+                event = MidiEvent::NoteOff {
+                    channel,
+                    note,
+                    velocity: 0,
+                };
+            }
+            if self.note_pitch_offset_semitones != 0 {
+                match &mut event {
+                    MidiEvent::NoteOn { note, .. }
+                    | MidiEvent::NoteOff { note, .. }
+                    | MidiEvent::PolyAftertouch { note, .. } => {
+                        *note = (i16::from(*note) + self.note_pitch_offset_semitones).clamp(0, 127)
+                            as u8;
+                    }
+                    _ => {}
+                }
+            }
+            let release = match event {
+                MidiEvent::NoteOff { velocity, .. } => velocity,
+                _ => 0,
+            };
+            match event {
+                MidiEvent::NoteOn { .. } | MidiEvent::NoteOff { .. } => {
+                    send_scheduled_midi_event(
+                        plugin,
+                        event,
+                        0,
+                        self.render.pitch_offset_cents,
+                        0,
+                        ScheduledVst3Note {
+                            note_id: 0,
+                            note_pan: 64,
+                            note_release: release,
+                            supports_pan: false,
+                        },
+                    )?;
+                }
+                _ => plugin
+                    .send_midi_event_at(event, 0)
+                    .map_err(|error| error.to_string())?,
+            }
+            match event {
+                MidiEvent::NoteOn {
+                    channel,
+                    note,
+                    velocity,
+                } if velocity > 0 => {
+                    let count = self
+                        .live_midi_active_notes
+                        .entry((queued.generation, channel.as_index(), note))
+                        .or_default();
+                    *count = count.saturating_add(1);
+                }
+                MidiEvent::NoteOff { channel, note, .. } => {
+                    let key = (queued.generation, channel.as_index(), note);
+                    if let Some(count) = self.live_midi_active_notes.get_mut(&key) {
+                        if *count <= 1 {
+                            self.live_midi_active_notes.remove(&key);
+                        } else {
+                            *count -= 1;
+                        }
+                    }
+                }
+                MidiEvent::ControlChange {
+                    channel,
+                    controller: 64,
+                    value,
+                } if value >= 64 => {
+                    self.live_midi_sustain_channels
+                        .entry(queued.generation)
+                        .or_default()
+                        .insert(channel.as_index());
+                }
+                MidiEvent::ControlChange {
+                    channel,
+                    controller: 64 | 121,
+                    ..
+                } => {
+                    if let Some(channels) =
+                        self.live_midi_sustain_channels.get_mut(&queued.generation)
+                    {
+                        channels.remove(&channel.as_index());
+                    }
+                }
+                MidiEvent::ControlChange {
+                    channel,
+                    controller,
+                    ..
+                } if controller == 120 || (123..=127).contains(&controller) => {
+                    self.live_midi_active_notes
+                        .retain(|(generation, active_channel, _), _| {
+                            *generation != queued.generation
+                                || *active_channel != channel.as_index()
+                        });
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn release_stopped_live_midi(
+        &mut self,
+        plugin: &mut Plugin,
+        stopped_generation: u64,
+    ) -> Result<(), String> {
+        let sustain_channels = self
+            .live_midi_sustain_channels
+            .iter()
+            .filter(|(generation, _)| **generation <= stopped_generation)
+            .flat_map(|(generation, channels)| {
+                channels.iter().map(|channel| (*generation, *channel))
+            })
+            .collect::<Vec<_>>();
+        for (generation, channel) in sustain_channels {
+            if let Some(channel) = MidiChannel::from_index(channel) {
+                plugin
+                    .send_midi_event_at(
+                        MidiEvent::ControlChange {
+                            channel,
+                            controller: 64,
+                            value: 0,
+                        },
+                        0,
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+            if let Some(channels) = self.live_midi_sustain_channels.get_mut(&generation) {
+                channels.remove(&channel);
+                if channels.is_empty() {
+                    self.live_midi_sustain_channels.remove(&generation);
+                }
+            }
+        }
+        let notes = self
+            .live_midi_active_notes
+            .iter()
+            .filter(|((generation, _, _), _)| *generation <= stopped_generation)
+            .map(|(&(generation, channel, note), &count)| (generation, channel, note, count))
+            .collect::<Vec<_>>();
+        for (generation, channel, note, count) in notes {
+            if let Some(channel) = MidiChannel::from_index(channel) {
+                for _ in 0..count {
+                    send_scheduled_midi_event(
+                        plugin,
+                        MidiEvent::NoteOff {
+                            channel,
+                            note,
+                            velocity: 0,
+                        },
+                        0,
+                        self.render.pitch_offset_cents,
+                        0,
+                        ScheduledVst3Note {
+                            note_id: 0,
+                            note_pan: 64,
+                            note_release: 0,
+                            supports_pan: false,
+                        },
+                    )?;
+                }
+            }
+            self.live_midi_active_notes
+                .remove(&(generation, channel, note));
+        }
+        self.live_midi_sustain_channels
+            .retain(|generation, _| *generation > stopped_generation);
+        self.live_midi_active_notes
+            .retain(|(generation, _, _), _| *generation > stopped_generation);
+        Ok(())
+    }
+
+    fn finish_live_midi(&mut self, plugin: &mut Plugin) -> Result<(), String> {
+        self.live_midi_stopped_generation
+            .store(u64::MAX, Ordering::Release);
+        while self.live_midi_receiver.try_recv().is_ok() {}
+        self.release_stopped_live_midi(plugin, u64::MAX)
     }
 
     fn queue_pattern_loop_events_before(&mut self, block_end: u64) -> Result<(), String> {
@@ -1762,6 +2036,7 @@ impl Vst3HostRuntime {
         let pan_law = project_pan_law(document);
         let project_master_pitch_cents = document.metadata().master_pitch_cents();
         let mut streams = Vec::new();
+        let mut live_input_senders = BTreeMap::new();
         let mut unloaded_plugin_channels = BTreeSet::new();
         let mut notes_scheduled = 0usize;
         for (channel_id, notes) in notes_by_channel {
@@ -1827,9 +2102,23 @@ impl Vst3HostRuntime {
             let resampler = StereoStreamResampler::new(render.sample_rate_u32, output_sample_rate)?;
             notes_scheduled = notes_scheduled.saturating_add(render.note_count);
             let template_events = render.events.clone();
+            let (live_midi_sender, live_midi_receiver) = mpsc::sync_channel(256);
+            let live_midi_stopped_generation = Arc::new(AtomicU64::new(0));
+            live_input_senders.insert(
+                channel_id,
+                Vst3PlaylistLiveInputSender {
+                    sender: live_midi_sender,
+                    next_generation: Arc::new(AtomicU64::new(0)),
+                    stopped_generation: Arc::clone(&live_midi_stopped_generation),
+                },
+            );
             streams.push(PlaylistPluginStream {
                 channel_id,
                 plugin,
+                live_midi_receiver,
+                live_midi_stopped_generation,
+                live_midi_active_notes: BTreeMap::new(),
+                live_midi_sustain_channels: BTreeMap::new(),
                 render,
                 resampler,
                 pending_output: VecDeque::new(),
@@ -1861,6 +2150,7 @@ impl Vst3HostRuntime {
         let (maximum_latency_frames, _) = plan_pdc_delays(&stream_latencies);
         let mut processor = Vst3PlaylistStreamProcessor {
             streams,
+            live_input_senders,
             tempo_map,
             output_sample_rate,
             content_frames: loop_output_frames,
@@ -2019,6 +2309,7 @@ impl Vst3HostRuntime {
         };
 
         let mut streams = Vec::new();
+        let mut live_input_senders = BTreeMap::new();
         let mut unloaded_plugin_channels = BTreeSet::new();
         let mut notes_scheduled = 0usize;
         let mut longest_plugin_tail_seconds = 0.0f64;
@@ -2089,9 +2380,23 @@ impl Vst3HostRuntime {
                 channel_pan_gains(pan, render.output_channels == 1, pan_law);
             let resampler = StereoStreamResampler::new(render.sample_rate_u32, output_sample_rate)?;
             notes_scheduled += render.note_count;
+            let (live_midi_sender, live_midi_receiver) = mpsc::sync_channel(256);
+            let live_midi_stopped_generation = Arc::new(AtomicU64::new(0));
+            live_input_senders.insert(
+                channel_id,
+                Vst3PlaylistLiveInputSender {
+                    sender: live_midi_sender,
+                    next_generation: Arc::new(AtomicU64::new(0)),
+                    stopped_generation: Arc::clone(&live_midi_stopped_generation),
+                },
+            );
             streams.push(PlaylistPluginStream {
                 channel_id,
                 plugin,
+                live_midi_receiver,
+                live_midi_stopped_generation,
+                live_midi_active_notes: BTreeMap::new(),
+                live_midi_sustain_channels: BTreeMap::new(),
                 render,
                 resampler,
                 pending_output: VecDeque::new(),
@@ -2129,6 +2434,7 @@ impl Vst3HostRuntime {
         let (maximum_latency_frames, _) = plan_pdc_delays(&stream_latencies);
         let mut processor = Vst3PlaylistStreamProcessor {
             streams,
+            live_input_senders,
             tempo_map,
             output_sample_rate,
             content_frames: output_frames,
@@ -3575,6 +3881,44 @@ fn reported_tail_seconds(tail_samples: u32, sample_rate_hz: f64) -> Option<f64> 
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn playlist_live_midi_sessions_retire_only_their_own_queued_events() {
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let stopped_generation = Arc::new(AtomicU64::new(0));
+        let playlist_sender = Vst3PlaylistLiveInputSender {
+            sender,
+            next_generation: Arc::new(AtomicU64::new(0)),
+            stopped_generation: Arc::clone(&stopped_generation),
+        };
+        let channel = MidiChannel::from_index(0).expect("channel 1 is supported");
+
+        let first_session = playlist_sender.begin_session();
+        first_session
+            .try_send(MidiEvent::NoteOn {
+                channel,
+                note: 60,
+                velocity: 100,
+            })
+            .unwrap();
+        first_session.stop();
+
+        let second_session = playlist_sender.begin_session();
+        second_session
+            .try_send(MidiEvent::NoteOn {
+                channel,
+                note: 64,
+                velocity: 100,
+            })
+            .unwrap();
+
+        let stopped = stopped_generation.load(Ordering::Acquire);
+        let first_event = receiver.try_recv().unwrap();
+        let second_event = receiver.try_recv().unwrap();
+        assert!(first_event.generation <= stopped);
+        assert!(second_event.generation > stopped);
+        assert_eq!(second_session.generation, first_session.generation + 1);
+    }
 
     #[test]
     fn pattern_loop_event_repeats_get_shifted_frames_and_distinct_note_ids() {
