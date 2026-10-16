@@ -2299,10 +2299,16 @@ enum PianoRollChordStamp {
     BottomUpTriad,
     BottomUpSeventh,
     SlideUp,
+    QuarterPulse,
+    EighthPulse,
+    SixteenthPulse,
+    Backbeat,
+    OffbeatEighths,
+    ShuffleEighths,
 }
 
 impl PianoRollChordStamp {
-    const ALL: [Self; 37] = [
+    const ALL: [Self; 43] = [
         Self::Major,
         Self::Minor,
         Self::Diminished,
@@ -2340,6 +2346,12 @@ impl PianoRollChordStamp {
         Self::BottomUpTriad,
         Self::BottomUpSeventh,
         Self::SlideUp,
+        Self::QuarterPulse,
+        Self::EighthPulse,
+        Self::SixteenthPulse,
+        Self::Backbeat,
+        Self::OffbeatEighths,
+        Self::ShuffleEighths,
     ];
 
     fn label(self) -> &'static str {
@@ -2381,11 +2393,17 @@ impl PianoRollChordStamp {
             Self::BottomUpTriad => "Bottom-up triad",
             Self::BottomUpSeventh => "Bottom-up seventh",
             Self::SlideUp => "Slide up",
+            Self::QuarterPulse => "Quarter pulse",
+            Self::EighthPulse => "Eighth pulse",
+            Self::SixteenthPulse => "Sixteenth pulse",
+            Self::Backbeat => "Backbeat",
+            Self::OffbeatEighths => "Offbeat eighths",
+            Self::ShuffleEighths => "Shuffle eighths",
         }
     }
 
     fn pitches(self, root_key: u16, scale: PianoRollScale, scale_root: u8) -> Vec<u16> {
-        if self.is_slide_up() {
+        if self.is_slide_up() || self.is_percussion() {
             return vec![root_key];
         }
         if let Some(note_count) = self.top_down_note_count() {
@@ -2427,6 +2445,14 @@ impl PianoRollChordStamp {
             | Self::BottomUpTriad
             | Self::BottomUpSeventh => &[],
             Self::SlideUp => unreachable!("slide stamps return before chord interval selection"),
+            Self::QuarterPulse
+            | Self::EighthPulse
+            | Self::SixteenthPulse
+            | Self::Backbeat
+            | Self::OffbeatEighths
+            | Self::ShuffleEighths => {
+                unreachable!("percussion stamps return before chord interval selection")
+            }
             Self::TopDownTriad | Self::TopDownSeventh => unreachable!(),
         };
         if !intervals.is_empty() {
@@ -2447,6 +2473,14 @@ impl PianoRollChordStamp {
                 Self::BottomUpTriad => &[0, 4, 7],
                 Self::BottomUpSeventh => &[0, 4, 7, 11],
                 Self::SlideUp => unreachable!("slide stamps return before scale selection"),
+                Self::QuarterPulse
+                | Self::EighthPulse
+                | Self::SixteenthPulse
+                | Self::Backbeat
+                | Self::OffbeatEighths
+                | Self::ShuffleEighths => {
+                    unreachable!("percussion stamps return before scale selection")
+                }
                 _ => unreachable!("manual chord stamps return before scale-degree selection"),
             };
             return intervals
@@ -2476,6 +2510,14 @@ impl PianoRollChordStamp {
             Self::BottomUpTriad => &[0, 2, 4],
             Self::BottomUpSeventh => &[0, 2, 4, 6],
             Self::SlideUp => unreachable!("slide stamps return before scale-degree selection"),
+            Self::QuarterPulse
+            | Self::EighthPulse
+            | Self::SixteenthPulse
+            | Self::Backbeat
+            | Self::OffbeatEighths
+            | Self::ShuffleEighths => {
+                unreachable!("percussion stamps return before scale-degree selection")
+            }
             _ => unreachable!("manual chord stamps return before scale-degree selection"),
         };
         let scale_anchor = i32::from(snapped_root) - i32::from(scale_intervals[scale_degree]);
@@ -2515,6 +2557,120 @@ impl PianoRollChordStamp {
     fn is_slide_up(self) -> bool {
         self == Self::SlideUp
     }
+
+    fn is_percussion(self) -> bool {
+        matches!(
+            self,
+            Self::QuarterPulse
+                | Self::EighthPulse
+                | Self::SixteenthPulse
+                | Self::Backbeat
+                | Self::OffbeatEighths
+                | Self::ShuffleEighths
+        )
+    }
+
+    fn percussion_hits(
+        self,
+        ppq: u16,
+        time_signature: Option<(u8, u8)>,
+    ) -> Option<(u32, Vec<(u32, u8)>)> {
+        if !self.is_percussion() {
+            return None;
+        }
+
+        let ppq_ticks = u32::from(ppq.max(1));
+        let bar_ticks = PianoRollSnap::Bar.ticks(ppq.max(1), time_signature);
+        let eighth_ticks = (ppq_ticks / 2).max(1);
+        let sixteenth_ticks = (ppq_ticks / 4).max(1);
+        let quarter_positions = (0..bar_ticks).step_by(ppq_ticks as usize);
+        let mut hits = Vec::new();
+
+        match self {
+            Self::QuarterPulse => {
+                hits.extend(quarter_positions.map(|position| (position, 104)));
+            }
+            Self::EighthPulse => {
+                hits.extend(
+                    (0..bar_ticks)
+                        .step_by(eighth_ticks as usize)
+                        .map(|position| {
+                            (position, if position % ppq_ticks == 0 { 110 } else { 78 })
+                        }),
+                );
+            }
+            Self::SixteenthPulse => {
+                hits.extend(
+                    (0..bar_ticks)
+                        .step_by(sixteenth_ticks as usize)
+                        .map(|position| {
+                            let velocity = if position % ppq_ticks == 0 {
+                                112
+                            } else if position % eighth_ticks == 0 {
+                                82
+                            } else {
+                                64
+                            };
+                            (position, velocity)
+                        }),
+                );
+            }
+            Self::Backbeat => {
+                hits.extend(
+                    quarter_positions
+                        .enumerate()
+                        .filter(|(beat, _)| beat % 2 == 1)
+                        .map(|(_, position)| (position, 112)),
+                );
+            }
+            Self::OffbeatEighths => {
+                hits.extend(quarter_positions.filter_map(|position| {
+                    let offbeat = position.saturating_add(eighth_ticks);
+                    (offbeat < bar_ticks).then_some((offbeat, 82))
+                }));
+            }
+            Self::ShuffleEighths => {
+                hits.extend(quarter_positions.flat_map(|position| {
+                    let shuffle = position.saturating_add(ppq_ticks.saturating_mul(2) / 3);
+                    [(position, 104), (shuffle, 76)]
+                        .into_iter()
+                        .filter(move |(hit_position, _)| *hit_position < bar_ticks)
+                }));
+            }
+            _ => unreachable!("non-percussion stamp has no rhythm hits"),
+        }
+
+        hits.sort_unstable_by_key(|(position, _)| *position);
+        hits.dedup_by_key(|(position, _)| *position);
+        Some((bar_ticks, hits))
+    }
+}
+
+fn piano_roll_percussion_stamp_notes(
+    stamp: PianoRollChordStamp,
+    root_note: &PatternNote,
+    ppq: u16,
+    time_signature: Option<(u8, u8)>,
+    snap_ticks: u32,
+) -> Option<Vec<PatternNote>> {
+    let (bar_ticks, hits) = stamp.percussion_hits(ppq, time_signature)?;
+    let mut notes = Vec::with_capacity(hits.len());
+    for (index, (offset_ticks, velocity)) in hits.iter().copied().enumerate() {
+        let Some(position) = root_note.position.checked_add(offset_ticks) else {
+            continue;
+        };
+        let next_hit = hits
+            .get(index + 1)
+            .map(|(next_offset, _)| *next_offset)
+            .unwrap_or(bar_ticks);
+        let spacing = next_hit.saturating_sub(offset_ticks).max(1);
+        let mut note = root_note.clone();
+        note.position = position;
+        note.length = snap_ticks.max(1).min(spacing);
+        note.velocity = velocity;
+        notes.push(note);
+    }
+    Some(notes)
 }
 
 fn apply_piano_roll_chord_inversion(pitches: &mut Vec<u16>, inversion: u8) -> bool {
@@ -24619,7 +24775,7 @@ impl DawUi {
             if self.piano_roll_stamp_mode {
                 let stamp_before_selection = self.piano_roll_chord_stamp;
                 egui::ComboBox::from_id_salt("piano-roll-chord-stamp")
-                    .selected_text(format!("Chord: {}", self.piano_roll_chord_stamp.label()))
+                    .selected_text(format!("Stamp: {}", self.piano_roll_chord_stamp.label()))
                     .show_ui(ui, |ui| {
                         let all_stamps = PianoRollChordStamp::ALL;
                         for (heading, stamps) in [
@@ -24628,7 +24784,8 @@ impl DawUi {
                             ("Scale-derived", &all_stamps[27..32]),
                             ("Top-down", &all_stamps[32..34]),
                             ("Bottom-up", &all_stamps[34..36]),
-                            ("Special", &all_stamps[36..]),
+                            ("Special", &all_stamps[36..37]),
+                            ("Percussions", &all_stamps[37..]),
                         ] {
                             ui.weak(heading);
                             for &stamp in stamps {
@@ -24653,6 +24810,9 @@ impl DawUi {
                 } else if self.piano_roll_chord_stamp.is_slide_up() {
                     self.piano_roll_chord_inversion = 0;
                     ui.label("Place above an overlapping note to slide it up");
+                } else if self.piano_roll_chord_stamp.is_percussion() {
+                    self.piano_roll_chord_inversion = 0;
+                    ui.label("One-bar rhythm on the clicked pitch");
                 } else {
                     let max_inversion = self
                         .piano_roll_chord_stamp
@@ -24699,10 +24859,14 @@ impl DawUi {
                             && !self.piano_roll_chord_stamp.is_slide_up(),
                         egui::Button::new("Preview C5"),
                     )
-                    .on_hover_text(if self.piano_roll_chord_stamp.is_slide_up() {
-                        "Slide notes do not produce sound on their own"
-                    } else {
-                        "Audition this chord stamp and voicing at C5"
+                    .on_hover_text(match self.piano_roll_chord_stamp {
+                        stamp if stamp.is_slide_up() => {
+                            "Slide notes do not produce sound on their own"
+                        }
+                        stamp if stamp.is_percussion() => {
+                            "Audition this one-bar rhythm stamp at C5"
+                        }
+                        _ => "Audition this chord stamp and voicing at C5",
                     })
                     .clicked()
                 {
@@ -24725,6 +24889,7 @@ impl DawUi {
         if chord_preview_requested {
             self.preview_piano_roll_chord_stamp(
                 self.piano_roll_snap.ticks(ppq, time_signature).max(1),
+                time_signature,
             );
         }
         if selection_pattern_before_toolbar != self.selected_pattern
@@ -26328,7 +26493,11 @@ impl DawUi {
         }
     }
 
-    fn preview_piano_roll_chord_stamp(&mut self, note_length: u32) {
+    fn preview_piano_roll_chord_stamp(
+        &mut self,
+        note_length: u32,
+        time_signature: Option<(u8, u8)>,
+    ) {
         if self.piano_roll_chord_stamp.is_slide_up() {
             self.status = "Slide notes do not produce sound on their own".to_owned();
             return;
@@ -26357,68 +26526,95 @@ impl DawUi {
             self.status = format!("Pattern {pattern_id} was not found");
             return;
         };
-        let bottom_up_note_count = self.piano_roll_chord_stamp.bottom_up_note_count();
-        let mut pitches = if let Some(note_count) = bottom_up_note_count {
-            piano_roll_bottom_up_chord_pitches(
-                60,
-                self.piano_roll_scale,
-                self.piano_roll_scale_root,
-                PianoRollChordContext {
-                    pattern_notes: &pattern.notes,
-                    channel_id,
-                    position_ticks: 0,
-                    window_ticks: note_length.saturating_mul(16).max(1),
-                },
-                note_count,
-            )
-        } else {
-            self.piano_roll_chord_stamp.pitches(
-                60,
-                self.piano_roll_scale,
-                self.piano_roll_scale_root,
-            )
-        };
-        if self
-            .piano_roll_chord_stamp
-            .top_down_note_count()
-            .is_some_and(|expected| pitches.len() < expected)
-        {
-            self.status = "Top-down chord needs more MIDI pitch range below C5".to_owned();
-            return;
-        }
-        if bottom_up_note_count.is_some_and(|expected| pitches.len() < expected) {
-            self.status = "Bottom-up chord does not fit the MIDI pitch range around C5".to_owned();
-            return;
-        }
-        if bottom_up_note_count.is_none()
-            && !apply_piano_roll_chord_inversion(&mut pitches, self.piano_roll_chord_inversion)
-        {
-            self.status = "Chord inversion exceeds the MIDI pitch range".to_owned();
-            return;
-        }
-        if pitches.is_empty() {
-            self.status = "The selected chord stamp has no playable notes".to_owned();
-            return;
-        }
-        let notes = pitches
-            .into_iter()
-            .map(|key| PatternNote {
+        let ppq = document.header().ppq();
+        let notes = if self.piano_roll_chord_stamp.is_percussion() {
+            let root_note = PatternNote {
                 position: 0,
-                flags: PATTERN_NOTE_DEFAULT_FLAGS,
                 channel_id,
                 length: note_length.max(1),
-                key,
-                group: 0,
-                fine_pitch: 120,
-                reserved: 0,
-                release: PATTERN_NOTE_DEFAULT_RELEASE,
-                midi_channel: 0,
-                pan: 64,
-                velocity: 100,
-                mod_x: 128,
-                mod_y: 128,
-            })
-            .collect::<Vec<_>>();
+                key: 60,
+                ..PatternNote::default()
+            };
+            let Some(notes) = piano_roll_percussion_stamp_notes(
+                self.piano_roll_chord_stamp,
+                &root_note,
+                ppq,
+                time_signature,
+                note_length,
+            ) else {
+                self.status = "Could not create the percussion stamp preview".to_owned();
+                return;
+            };
+            if notes.is_empty() {
+                self.status = "The percussion stamp has no playable notes".to_owned();
+                return;
+            }
+            notes
+        } else {
+            let bottom_up_note_count = self.piano_roll_chord_stamp.bottom_up_note_count();
+            let mut pitches = if let Some(note_count) = bottom_up_note_count {
+                piano_roll_bottom_up_chord_pitches(
+                    60,
+                    self.piano_roll_scale,
+                    self.piano_roll_scale_root,
+                    PianoRollChordContext {
+                        pattern_notes: &pattern.notes,
+                        channel_id,
+                        position_ticks: 0,
+                        window_ticks: note_length.saturating_mul(16).max(1),
+                    },
+                    note_count,
+                )
+            } else {
+                self.piano_roll_chord_stamp.pitches(
+                    60,
+                    self.piano_roll_scale,
+                    self.piano_roll_scale_root,
+                )
+            };
+            if self
+                .piano_roll_chord_stamp
+                .top_down_note_count()
+                .is_some_and(|expected| pitches.len() < expected)
+            {
+                self.status = "Top-down chord needs more MIDI pitch range below C5".to_owned();
+                return;
+            }
+            if bottom_up_note_count.is_some_and(|expected| pitches.len() < expected) {
+                self.status =
+                    "Bottom-up chord does not fit the MIDI pitch range around C5".to_owned();
+                return;
+            }
+            if bottom_up_note_count.is_none()
+                && !apply_piano_roll_chord_inversion(&mut pitches, self.piano_roll_chord_inversion)
+            {
+                self.status = "Chord inversion exceeds the MIDI pitch range".to_owned();
+                return;
+            }
+            if pitches.is_empty() {
+                self.status = "The selected chord stamp has no playable notes".to_owned();
+                return;
+            }
+            pitches
+                .into_iter()
+                .map(|key| PatternNote {
+                    position: 0,
+                    flags: PATTERN_NOTE_DEFAULT_FLAGS,
+                    channel_id,
+                    length: note_length.max(1),
+                    key,
+                    group: 0,
+                    fine_pitch: 120,
+                    reserved: 0,
+                    release: PATTERN_NOTE_DEFAULT_RELEASE,
+                    midi_channel: 0,
+                    pan: 64,
+                    velocity: 100,
+                    mod_x: 128,
+                    mod_y: 128,
+                })
+                .collect::<Vec<_>>()
+        };
         let channel = document
             .channels()
             .into_iter()
@@ -26478,7 +26674,6 @@ impl DawUi {
         } else {
             None
         };
-        let ppq = document.header().ppq();
         let tempo_bpm = document.metadata().tempo_bpm().unwrap_or(self.tempo_bpm);
         let pitch_offset_cents = project_channel_master_pitch_offset_cents(document, channel_id);
         let note_pitch_offset_semitones =
@@ -30851,58 +31046,86 @@ impl DawUi {
                     note_from_grid_position(pointer, grid_geometry, channel_id)
             {
                 root_note.length = snap_ticks.max(1);
-                let slide_up = self.piano_roll_chord_stamp.is_slide_up();
-                let bottom_up_note_count =
-                    self.piano_roll_chord_stamp.bottom_up_note_count();
-                let mut chord_pitches = if let Some(note_count) = bottom_up_note_count {
-                    piano_roll_bottom_up_chord_pitches(
-                        root_note.key,
-                        self.piano_roll_scale,
-                        self.piano_roll_scale_root,
-                        PianoRollChordContext {
-                            pattern_notes: &pattern.notes,
-                            channel_id,
-                            position_ticks: root_note.position,
-                            window_ticks: snap_ticks.saturating_mul(16).max(1),
-                        },
-                        note_count,
-                    )
+                let stamp_time_signature = pattern
+                    .time_markers
+                    .iter()
+                    .filter(|marker| {
+                        marker.is_signature() && marker.position_ticks() <= root_note.position
+                    })
+                    .filter_map(|marker| {
+                        Some((
+                            marker.position_ticks(),
+                            marker.numerator()?.max(1),
+                            marker.denominator()?.max(1),
+                        ))
+                    })
+                    .max_by_key(|(position, _, _)| *position)
+                    .map(|(_, numerator, denominator)| (numerator, denominator))
+                    .or(project_time_signature);
+                if let Some(percussion_notes) = piano_roll_percussion_stamp_notes(
+                    self.piano_roll_chord_stamp,
+                    &root_note,
+                    ppq,
+                    stamp_time_signature,
+                    snap_ticks,
+                ) {
+                    notes_to_add.extend(percussion_notes);
                 } else {
-                    self.piano_roll_chord_stamp.pitches(
-                        root_note.key,
-                        self.piano_roll_scale,
-                        self.piano_roll_scale_root,
-                    )
-                };
-                if self.piano_roll_chord_stamp.top_down_note_count().is_some_and(|expected| {
-                    chord_pitches.len() < expected
-                }) {
-                    self.status =
-                        "Top-down chord needs more MIDI pitch range below the clicked note"
-                            .to_owned();
-                } else if bottom_up_note_count
-                    .is_some_and(|expected| chord_pitches.len() < expected)
-                {
-                    self.status =
-                        "Bottom-up chord does not fit the MIDI pitch range at the clicked pitch"
-                            .to_owned();
-                } else if bottom_up_note_count.is_none()
-                    && !slide_up
-                    && !apply_piano_roll_chord_inversion(
-                        &mut chord_pitches,
-                        self.piano_roll_chord_inversion,
-                    )
-                {
-                    self.status = "Chord inversion exceeds the MIDI pitch range".to_owned();
-                } else {
-                    notes_to_add.extend(chord_pitches.into_iter().map(|key| {
-                        let mut note = root_note.clone();
-                        note.key = key;
-                        if slide_up {
-                            note.flags |= PATTERN_NOTE_SLIDE_FLAG;
-                        }
-                        note
-                    }));
+                    let slide_up = self.piano_roll_chord_stamp.is_slide_up();
+                    let bottom_up_note_count =
+                        self.piano_roll_chord_stamp.bottom_up_note_count();
+                    let mut chord_pitches = if let Some(note_count) = bottom_up_note_count {
+                        piano_roll_bottom_up_chord_pitches(
+                            root_note.key,
+                            self.piano_roll_scale,
+                            self.piano_roll_scale_root,
+                            PianoRollChordContext {
+                                pattern_notes: &pattern.notes,
+                                channel_id,
+                                position_ticks: root_note.position,
+                                window_ticks: snap_ticks.saturating_mul(16).max(1),
+                            },
+                            note_count,
+                        )
+                    } else {
+                        self.piano_roll_chord_stamp.pitches(
+                            root_note.key,
+                            self.piano_roll_scale,
+                            self.piano_roll_scale_root,
+                        )
+                    };
+                    if self
+                        .piano_roll_chord_stamp
+                        .top_down_note_count()
+                        .is_some_and(|expected| chord_pitches.len() < expected)
+                    {
+                        self.status =
+                            "Top-down chord needs more MIDI pitch range below the clicked note"
+                                .to_owned();
+                    } else if bottom_up_note_count
+                        .is_some_and(|expected| chord_pitches.len() < expected)
+                    {
+                        self.status =
+                            "Bottom-up chord does not fit the MIDI pitch range at the clicked pitch"
+                                .to_owned();
+                    } else if bottom_up_note_count.is_none()
+                        && !slide_up
+                        && !apply_piano_roll_chord_inversion(
+                            &mut chord_pitches,
+                            self.piano_roll_chord_inversion,
+                        )
+                    {
+                        self.status = "Chord inversion exceeds the MIDI pitch range".to_owned();
+                    } else {
+                        notes_to_add.extend(chord_pitches.into_iter().map(|key| {
+                            let mut note = root_note.clone();
+                            note.key = key;
+                            if slide_up {
+                                note.flags |= PATTERN_NOTE_SLIDE_FLAG;
+                            }
+                            note
+                        }));
+                    }
                 }
             }
             if self.piano_roll_paint_mode
