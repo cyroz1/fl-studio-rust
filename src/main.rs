@@ -139,6 +139,19 @@ fn run(args: Vec<String>) -> Result<(), String> {
         [command, path, pattern_id] if command == "pattern-controllers" => {
             list_pattern_controllers(Path::new(path), parse_u16(pattern_id, "pattern id")?)
         }
+        [command, input, output, pattern_id, channel, flags, position, value]
+            if command == "create-pattern-controller-stream" =>
+        {
+            create_pattern_controller_stream(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_raw_byte(channel, "raw controller channel")?,
+                parse_raw_byte(flags, "raw controller flags")?,
+                parse_u32(position, "controller position")?,
+                parse_f32(value, "controller value")?,
+            )
+        }
         [command, input, output, pattern_id, controller_index, position, value]
             if command == "edit-pattern-controller" =>
         {
@@ -1143,6 +1156,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild channel-events <file.flp> <channel-id>\n",
             "  flp-rebuild patterns <file.flp>\n",
             "  flp-rebuild pattern-controllers <file.flp> <pattern-id>\n",
+            "  flp-rebuild create-pattern-controller-stream <input.flp> <output.flp> <pattern-id> <channel-raw> <flags-raw-decimal|0xHEX> <position-ticks> <value>\n",
             "  flp-rebuild edit-pattern-controller <input.flp> <output.flp> <pattern-id> <controller-index> <position-ticks|-> <value|->\n",
             "  flp-rebuild duplicate-pattern-controller <input.flp> <output.flp> <pattern-id> <template-index> <position-ticks> <value>\n",
             "  flp-rebuild delete-pattern-controller <input.flp> <output.flp> <pattern-id> <controller-index>\n",
@@ -1255,6 +1269,19 @@ fn parse_u8(value: &str, description: &str) -> Result<u8, String> {
     value
         .parse::<u8>()
         .map_err(|_| format!("{description} must be an integer from 0 through 255"))
+}
+
+fn parse_raw_byte(value: &str, description: &str) -> Result<u8, String> {
+    if let Some(hex_value) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        u8::from_str_radix(hex_value, 16).map_err(|_| {
+            format!("{description} must be an integer from 0 through 255, optionally in hex")
+        })
+    } else {
+        parse_u8(value, description)
+    }
 }
 
 fn parse_u16(value: &str, description: &str) -> Result<u16, String> {
@@ -2595,6 +2622,31 @@ fn list_pattern_controllers(path: &Path, pattern_id: u16) -> Result<(), String> 
             controller.value_bits,
         );
     }
+    Ok(())
+}
+
+fn create_pattern_controller_stream(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel: u8,
+    flags: u8,
+    position: u32,
+    value: f32,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let controller_index = document
+        .create_pattern_controller_stream(pattern_id, channel, flags, position, value)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "created raw controller point {controller_index} in pattern {pattern_id}, channel {channel}, flags 0x{flags:02X} at {position} ticks in {}",
+        output.display()
+    );
     Ok(())
 }
 
@@ -4507,7 +4559,7 @@ fn delete_time_marker(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_clip_indices, parse_rgb_hex, parse_scale_name};
+    use super::{parse_clip_indices, parse_raw_byte, parse_rgb_hex, parse_scale_name};
 
     #[test]
     fn parses_channel_rgb_in_hex_form_with_optional_prefix() {
@@ -4515,6 +4567,15 @@ mod tests {
         assert_eq!(parse_rgb_hex("#102030"), Ok([0x10, 0x20, 0x30]));
         assert!(parse_rgb_hex("#12345").is_err());
         assert!(parse_rgb_hex("xyzxyz").is_err());
+    }
+
+    #[test]
+    fn parses_raw_pattern_controller_bytes_as_decimal_or_hex() {
+        assert_eq!(parse_raw_byte("145", "flags"), Ok(145));
+        assert_eq!(parse_raw_byte("0x91", "flags"), Ok(145));
+        assert_eq!(parse_raw_byte("0XFF", "channel"), Ok(255));
+        assert!(parse_raw_byte("256", "channel").is_err());
+        assert!(parse_raw_byte("0xGG", "flags").is_err());
     }
 
     #[test]
