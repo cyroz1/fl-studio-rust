@@ -32,8 +32,8 @@ use flp_rebuild::sample_render::{
     PlaylistPerformanceLaunch, PlaylistPerformanceStream, PlaylistRenderOptions,
     PlaylistRenderRange, PlaylistRenderSummary, PlaylistStreamMonitor, PlaylistTempoMap,
     ResamplingQuality, SamplerLiveInputRouting, SamplerLiveNoteEvent, SamplerPatternRenderOptions,
-    SamplerPatternRenderSummary, Vst3LiveInputEvent, WavChannelMode, WavDitherMode,
-    WavSampleFormat, nearest_playlist_audio_clip_zero_crossing_tick,
+    SamplerPatternRenderSummary, Vst3LiveInputEvent, Vst3PatternLoopPlayback, WavChannelMode,
+    WavDitherMode, WavSampleFormat, nearest_playlist_audio_clip_zero_crossing_tick,
     playlist_performance_clip_indices_with_vst3, playlist_performance_static_document_with_vst3,
     playlist_performance_vst3_channel_ids, playlist_performance_vst3_clip_indices,
     render_audio_clips_to_file, render_playlist_mixer_stems_with_vst3_cancellable,
@@ -41,6 +41,7 @@ use flp_rebuild::sample_render::{
     render_playlist_with_vst3_to_flac_cancellable, render_playlist_with_vst3_to_mp3_cancellable,
     render_playlist_with_vst3_to_ogg_cancellable, render_playlist_with_vst3_to_wav_cancellable,
     render_sampler_pattern_to_file, stream_mixed_layer_midi_input_to_device,
+    stream_pattern_loop_with_vst3_from_tick_to_device,
     stream_playlist_performance_with_vst3_to_device,
     stream_playlist_with_vst3_to_device_with_monitor, stream_sampler_midi_input_to_device,
     stream_sampler_pattern_loop_from_tick_to_device, stream_sampler_pattern_to_device,
@@ -4293,6 +4294,7 @@ struct PendingSamplerStream {
     receiver: Receiver<Result<SamplerPatternRenderSummary, String>>,
     cancelled: Arc<AtomicBool>,
     worker: thread::JoinHandle<()>,
+    live_midi_senders: BTreeMap<u16, Vst3PlaylistLiveInputSender>,
 }
 
 struct LiveSamplerInputSession {
@@ -4334,6 +4336,7 @@ struct LiveVst3InputSession {
 struct LivePlaylistVst3InputSession {
     pattern_id: u16,
     channel_id: u16,
+    pattern_mode: bool,
     target_channel_ids: BTreeSet<u16>,
     sessions: BTreeMap<u16, Vst3PlaylistLiveInputSession>,
 }
@@ -28611,6 +28614,7 @@ impl DawUi {
                     receiver,
                     cancelled,
                     worker,
+                    live_midi_senders: BTreeMap::new(),
                 });
                 self.playing = true;
                 self.project_playback_loaded = true;
@@ -28892,6 +28896,7 @@ impl DawUi {
                     receiver,
                     cancelled,
                     worker,
+                    live_midi_senders: BTreeMap::new(),
                 });
                 self.playing = true;
                 self.project_playback_loaded = true;
@@ -29109,6 +29114,36 @@ impl DawUi {
         } else {
             0
         };
+        let vst3_processor = if let Some(loop_length_ticks) = loop_length_ticks {
+            self.vst3_host
+                .as_ref()
+                .map(|host| {
+                    host.prepare_pattern_loop_stream(
+                        document,
+                        pattern_id,
+                        loop_length_ticks,
+                        device_rate,
+                        &self.channel_vst3_instances,
+                    )
+                })
+                .transpose()
+        } else {
+            Ok(None)
+        };
+        let vst3_processor = match vst3_processor {
+            Ok(processor) => processor,
+            Err(error) => {
+                self.status = format!("Could not prepare Pattern VST3 instruments: {error}");
+                return;
+            }
+        };
+        let live_midi_senders = vst3_processor
+            .as_ref()
+            .map(Vst3PlaylistStreamProcessor::live_midi_input_senders)
+            .unwrap_or_default();
+        let vst3_summary = vst3_processor
+            .as_ref()
+            .map(Vst3PlaylistStreamProcessor::summary);
 
         self.stop_project_playback();
         if let Some(engine) = &self.audio_engine {
@@ -29155,15 +29190,30 @@ impl DawUi {
                             ..SamplerPatternRenderOptions::default()
                         };
                         if let Some(loop_length_ticks) = loop_length_ticks {
-                            stream_sampler_pattern_loop_from_tick_to_device(
-                                &document,
-                                &project_path,
-                                options,
-                                loop_length_ticks,
-                                loop_start_tick,
-                                &writer,
-                                &worker_cancelled,
-                            )
+                            if let Some(vst3_processor) = vst3_processor {
+                                stream_pattern_loop_with_vst3_from_tick_to_device(
+                                    &document,
+                                    &project_path,
+                                    options,
+                                    Vst3PatternLoopPlayback {
+                                        loop_length_ticks,
+                                        start_tick: loop_start_tick,
+                                        processor: vst3_processor,
+                                    },
+                                    &writer,
+                                    &worker_cancelled,
+                                )
+                            } else {
+                                stream_sampler_pattern_loop_from_tick_to_device(
+                                    &document,
+                                    &project_path,
+                                    options,
+                                    loop_length_ticks,
+                                    loop_start_tick,
+                                    &writer,
+                                    &worker_cancelled,
+                                )
+                            }
                         } else {
                             stream_sampler_pattern_to_device(
                                 &document,
@@ -29183,12 +29233,27 @@ impl DawUi {
                     receiver,
                     cancelled,
                     worker,
+                    live_midi_senders,
                 });
                 self.playing = true;
                 self.project_playback_loaded = true;
                 self.status = if loop_length_ticks.is_some() {
+                    let vst3_status = vst3_summary.map_or_else(String::new, |summary| {
+                        let unloaded = if summary.unloaded_plugin_channels.is_empty() {
+                            String::new()
+                        } else {
+                            format!(
+                                "; {} VST3 channel(s) are not loaded",
+                                summary.unloaded_plugin_channels.len()
+                            )
+                        };
+                        format!(
+                            "; {} loaded VST3 channel(s), {} notes{}",
+                            summary.plugin_channels_rendered, summary.notes_scheduled, unloaded
+                        )
+                    });
                     format!(
-                        "Looping Pattern {pattern_id} through enabled Sampler channels; VST3 instruments, Audio Clips, and Mixer effects are not included"
+                        "Looping Pattern {pattern_id} through enabled Sampler channels{vst3_status}; Audio Clips and Mixer effects are not included"
                     )
                 } else {
                     format!(
@@ -37086,7 +37151,18 @@ impl DawUi {
     }
 
     fn can_audition_live_midi_input(&self) -> bool {
-        !self.playing || (!self.pattern_playback_mode && !self.performance_mode_active)
+        if !self.playing {
+            return true;
+        }
+        if self.performance_mode_active {
+            return false;
+        }
+        if !self.pattern_playback_mode {
+            return true;
+        }
+        self.pattern_mode_playback_source
+            .is_some_and(|(pattern_id, _)| Some(pattern_id) == self.selected_pattern)
+            && self.pending_sampler_stream.is_some()
     }
 
     fn stop_live_audition_playback_if_stopped(&self) {
@@ -37098,9 +37174,10 @@ impl DawUi {
     }
 
     fn start_live_playlist_vst3_input(&mut self, pattern_id: u16, channel_id: u16) -> bool {
-        if !self.playing || self.pattern_playback_mode || self.performance_mode_active {
+        if !self.playing || self.performance_mode_active {
             return false;
         }
+        let pattern_mode = self.pattern_playback_mode;
         let Some(target_channel_ids) = self.live_vst3_target_channels(channel_id) else {
             return false;
         };
@@ -37110,16 +37187,20 @@ impl DawUi {
                     .to_owned();
             return false;
         }
-        let Some(senders) = self
-            .pending_audio_render
-            .as_ref()
-            .map(|pending| &pending.live_midi_senders)
-        else {
+        let Some(senders) = (if pattern_mode {
+            self.pending_sampler_stream
+                .as_ref()
+                .map(|pending| &pending.live_midi_senders)
+        } else {
+            self.pending_audio_render
+                .as_ref()
+                .map(|pending| &pending.live_midi_senders)
+        }) else {
             return false;
         };
         let Some(sender) = senders.get(&channel_id) else {
             self.status =
-                "The selected VST3 channel is not part of the active Playlist stream".to_owned();
+                "The selected VST3 channel is not part of the active playback stream".to_owned();
             return false;
         };
         let session = sender.begin_session();
@@ -37163,11 +37244,15 @@ impl DawUi {
         self.live_playlist_vst3_input = Some(LivePlaylistVst3InputSession {
             pattern_id,
             channel_id,
+            pattern_mode,
             target_channel_ids,
             sessions: BTreeMap::from([(channel_id, session)]),
         });
-        self.status =
-            format!("Sending live MIDI to VST3 channel {channel_id} during Playlist playback");
+        self.status = if pattern_mode {
+            format!("Sending live MIDI to VST3 channel {channel_id} during Pattern playback")
+        } else {
+            format!("Sending live MIDI to VST3 channel {channel_id} during Playlist playback")
+        };
         true
     }
 
@@ -38473,18 +38558,25 @@ impl DawUi {
             .as_ref()
             .is_some_and(|session| {
                 !self.playing
-                    || self.pattern_playback_mode
+                    || session.pattern_mode != self.pattern_playback_mode
                     || self.performance_mode_active
                     || self.midi_input_connection.is_none()
                     || Some(session.pattern_id) != self.selected_pattern
                     || Some(session.channel_id) != self.selected_note_channel
                     || self.live_vst3_target_channels(session.channel_id).as_ref()
                         != Some(&session.target_channel_ids)
-                    || self.pending_audio_render.as_ref().is_none_or(|pending| {
-                        session
-                            .target_channel_ids
-                            .iter()
-                            .any(|channel_id| !pending.live_midi_senders.contains_key(channel_id))
+                    || (if session.pattern_mode {
+                        self.pending_sampler_stream.as_ref().is_none_or(|pending| {
+                            session.target_channel_ids.iter().any(|channel_id| {
+                                !pending.live_midi_senders.contains_key(channel_id)
+                            })
+                        })
+                    } else {
+                        self.pending_audio_render.as_ref().is_none_or(|pending| {
+                            session.target_channel_ids.iter().any(|channel_id| {
+                                !pending.live_midi_senders.contains_key(channel_id)
+                            })
+                        })
                     })
             })
         {
