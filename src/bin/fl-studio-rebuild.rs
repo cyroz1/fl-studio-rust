@@ -41,7 +41,8 @@ use flp_rebuild::sample_render::{
     render_playlist_with_vst3_to_ogg_cancellable, render_playlist_with_vst3_to_wav_cancellable,
     render_sampler_pattern_to_file, stream_playlist_performance_with_vst3_to_device,
     stream_playlist_with_vst3_to_device_with_monitor, stream_sampler_midi_input_to_device,
-    stream_sampler_pattern_to_device, write_input_recording_to_wav,
+    stream_sampler_pattern_loop_to_device, stream_sampler_pattern_to_device,
+    write_input_recording_to_wav,
 };
 use flp_rebuild::vst3::{
     MAX_REPORTED_TAIL_SECONDS, Vst3HostRuntime, Vst3PatternRenderOptions, Vst3PatternStreamHandle,
@@ -3796,6 +3797,7 @@ struct DawUi {
     history_navigation_during_frame: bool,
     history_snapshot_available_this_frame: bool,
     playing: bool,
+    pattern_playback_mode: bool,
     performance_mode_active: bool,
     held_performance_clips: Vec<(u16, u32, usize)>,
     midi_held_performance_clips: MidiPerformanceHoldMap,
@@ -4533,6 +4535,7 @@ impl DawUi {
             history_navigation_during_frame: false,
             history_snapshot_available_this_frame: false,
             playing: false,
+            pattern_playback_mode: false,
             performance_mode_active: false,
             held_performance_clips: Vec::new(),
             midi_held_performance_clips: BTreeMap::new(),
@@ -5199,6 +5202,11 @@ impl DawUi {
             && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Space));
         if child_play_pause_requested {
             self.toggle_project_playback();
+        }
+        let child_pattern_mode_toggle_requested = !context.egui_wants_keyboard_input()
+            && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::L));
+        if child_pattern_mode_toggle_requested {
+            self.set_pattern_playback_mode(!self.pattern_playback_mode);
         }
 
         *pointer_down |= ui.input(|input| {
@@ -8735,10 +8743,6 @@ impl DawUi {
     }
 
     fn start_project_playback(&mut self) {
-        if self.performance_mode_active {
-            self.start_performance_mode_playback();
-            return;
-        }
         if self.pending_song_render.is_some() {
             self.status = "Stop the Playlist render before starting playback".to_owned();
             return;
@@ -8749,6 +8753,14 @@ impl DawUi {
         }
         if self.document.is_none() {
             self.status = "Open an FL Studio project before playing".to_owned();
+            return;
+        }
+        if self.pattern_playback_mode {
+            self.start_pattern_mode_playback();
+            return;
+        }
+        if self.performance_mode_active {
+            self.start_performance_mode_playback();
             return;
         }
         let Some(project_path) = self.sample_project_path() else {
@@ -8906,6 +8918,56 @@ impl DawUi {
                 self.status = format!("Could not start audio streaming: {error}");
             }
         }
+    }
+
+    fn start_pattern_mode_playback(&mut self) {
+        let Some(pattern_id) = self.selected_pattern else {
+            self.status = "Select a Pattern before starting Pattern mode".to_owned();
+            return;
+        };
+        let loop_length_ticks = match self.selected_pattern_loop_length_ticks(pattern_id) {
+            Ok(length_ticks) => length_ticks,
+            Err(error) => {
+                self.status = format!("Could not determine the Pattern loop length: {error}");
+                return;
+            }
+        };
+        self.stream_selected_sampler_pattern(Some(loop_length_ticks));
+    }
+
+    fn selected_pattern_loop_length_ticks(&self, pattern_id: u16) -> Result<u64, String> {
+        let document = self
+            .document
+            .as_ref()
+            .ok_or_else(|| "open a project first".to_owned())?;
+        let pattern = document
+            .patterns()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|pattern| pattern.id == pattern_id)
+            .ok_or_else(|| format!("Pattern {pattern_id} was not found"))?;
+        let signature = pattern
+            .time_markers
+            .iter()
+            .filter(|marker| marker.is_signature() && marker.position_ticks() == 0)
+            .find_map(|marker| Some((marker.numerator()?, marker.denominator()?)))
+            .or_else(|| document.metadata().time_signature())
+            .unwrap_or((4, 4));
+        let ppq = u64::from(document.header().ppq().max(1));
+        let bar_ticks =
+            (ppq * u64::from(signature.0.max(1)) * 4 / u64::from(signature.1.max(1))).max(1);
+        let last_note_end = pattern
+            .notes
+            .iter()
+            .map(|note| u64::from(note.position).saturating_add(u64::from(note.length.max(1))))
+            .max()
+            .unwrap_or(0);
+        let explicit_length = pattern.length_ticks.map(u64::from).unwrap_or(0);
+        Ok(if explicit_length == 0 {
+            last_note_end.max(bar_ticks)
+        } else {
+            explicit_length.max(last_note_end)
+        })
     }
 
     fn start_performance_mode_playback(&mut self) {
@@ -9298,8 +9360,10 @@ impl DawUi {
                 Ok(()) => {
                     self.playing = true;
                     self.status = "Project playback resumed".to_owned();
-                    self.start_midi_clock(true);
-                    self.start_midi_playlist_playback_from_current_position();
+                    if !self.pattern_playback_mode {
+                        self.start_midi_clock(true);
+                        self.start_midi_playlist_playback_from_current_position();
+                    }
                 }
                 Err(error) => self.status = format!("Could not resume project playback: {error}"),
             }
@@ -9308,6 +9372,30 @@ impl DawUi {
         } else {
             self.start_project_playback();
         }
+    }
+
+    fn set_pattern_playback_mode(&mut self, pattern_mode: bool) {
+        if self.pattern_playback_mode == pattern_mode {
+            return;
+        }
+        if self.pending_song_render.is_some() {
+            self.status = "Stop the Playlist render before changing transport mode".to_owned();
+            return;
+        }
+        if self.playing
+            || self.project_playback_loaded
+            || self.pending_audio_render.is_some()
+            || self.pending_vst3_stream.is_some()
+            || self.pending_sampler_stream.is_some()
+        {
+            self.stop_project_playback();
+        }
+        self.pattern_playback_mode = pattern_mode;
+        self.status = if pattern_mode {
+            "Pattern mode selected".to_owned()
+        } else {
+            "Song mode selected".to_owned()
+        };
     }
 
     fn stop_project_playback(&mut self) {
@@ -10374,6 +10462,7 @@ impl DawUi {
                     ("Piano roll Shift+Q", "Quick quantize note starts"),
                     ("Alt/Opt+F8", "Browser"),
                     ("Space", "Play / pause"),
+                    ("L", "Toggle Pattern / Song mode"),
                     ("Ctrl/Cmd+S", "Save project"),
                     ("Ctrl/Cmd+C", "Copy selected Playlist clip"),
                     ("Ctrl/Cmd+X", "Cut selected Playlist clip"),
@@ -10562,6 +10651,22 @@ impl DawUi {
                 } else {
                     "Project playback stopped".to_owned()
                 };
+            }
+            if ui
+                .selectable_label(self.pattern_playback_mode, "PAT")
+                .on_hover_text(
+                    "L: play the selected Pattern through enabled Sampler channels; VST3 instruments, Audio Clips, and Mixer effects are not included yet.",
+                )
+                .clicked()
+            {
+                self.set_pattern_playback_mode(true);
+            }
+            if ui
+                .selectable_label(!self.pattern_playback_mode, "SONG")
+                .on_hover_text("L: play the Playlist arrangement")
+                .clicked()
+            {
+                self.set_pattern_playback_mode(false);
             }
             let play_label = if self.pending_audio_render.is_some() {
                 "…"
@@ -27678,6 +27783,10 @@ impl DawUi {
     }
 
     fn play_selected_sampler_pattern(&mut self) {
+        self.stream_selected_sampler_pattern(None);
+    }
+
+    fn stream_selected_sampler_pattern(&mut self, loop_length_ticks: Option<u64>) {
         let Some(pattern_id) = self.selected_pattern else {
             self.status = "Select a pattern before previewing Sampler channels".to_owned();
             return;
@@ -27744,24 +27853,40 @@ impl DawUi {
         let resampling_quality = self.live_resampling_quality;
         let (sender, receiver) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
-            .name("sampler-pattern-stream".to_owned())
+            .name(if loop_length_ticks.is_some() {
+                "sampler-pattern-transport".to_owned()
+            } else {
+                "sampler-pattern-stream".to_owned()
+            })
             .spawn(move || {
                 let result = FlpDocument::parse(&project_bytes)
                     .map_err(|error| error.to_string())
                     .and_then(|document| {
-                        stream_sampler_pattern_to_device(
-                            &document,
-                            &project_path,
-                            SamplerPatternRenderOptions {
-                                pattern_id,
-                                sample_rate: device_rate,
-                                resampling_quality,
-                                read_sample_root_note,
-                                ..SamplerPatternRenderOptions::default()
-                            },
-                            &writer,
-                            &worker_cancelled,
-                        )
+                        let options = SamplerPatternRenderOptions {
+                            pattern_id,
+                            sample_rate: device_rate,
+                            resampling_quality,
+                            read_sample_root_note,
+                            ..SamplerPatternRenderOptions::default()
+                        };
+                        if let Some(loop_length_ticks) = loop_length_ticks {
+                            stream_sampler_pattern_loop_to_device(
+                                &document,
+                                &project_path,
+                                options,
+                                loop_length_ticks,
+                                &writer,
+                                &worker_cancelled,
+                            )
+                        } else {
+                            stream_sampler_pattern_to_device(
+                                &document,
+                                &project_path,
+                                options,
+                                &writer,
+                                &worker_cancelled,
+                            )
+                        }
                     });
                 writer.finish();
                 let _ = sender.send(result);
@@ -27775,9 +27900,15 @@ impl DawUi {
                 });
                 self.playing = true;
                 self.project_playback_loaded = true;
-                self.status = format!(
-                    "Preparing Sampler voices for pattern {pattern_id} at {device_rate} Hz…"
-                );
+                self.status = if loop_length_ticks.is_some() {
+                    format!(
+                        "Looping Pattern {pattern_id} through enabled Sampler channels; VST3 instruments, Audio Clips, and Mixer effects are not included"
+                    )
+                } else {
+                    format!(
+                        "Preparing Sampler voices for pattern {pattern_id} at {device_rate} Hz…"
+                    )
+                };
             }
             Err(error) => {
                 self.stop_project_playback();
@@ -38182,6 +38313,11 @@ impl eframe::App for DawUi {
         if play_pause_requested {
             self.toggle_project_playback();
         }
+        let toggle_pattern_mode_requested = !ui.ctx().egui_wants_keyboard_input()
+            && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::L));
+        if toggle_pattern_mode_requested {
+            self.set_pattern_playback_mode(!self.pattern_playback_mode);
+        }
         let toggle_browser_requested = !ui.ctx().egui_wants_keyboard_input()
             && ui.input_mut(|input| input.consume_key(egui::Modifiers::ALT, egui::Key::F8));
         if toggle_browser_requested {
@@ -38830,6 +38966,13 @@ impl eframe::App for DawUi {
                 if child_play_pause_requested {
                     self.toggle_project_playback();
                 }
+                let child_pattern_mode_toggle_requested = !viewport_context
+                    .egui_wants_keyboard_input()
+                    && viewport_ui
+                        .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::L));
+                if child_pattern_mode_toggle_requested {
+                    self.set_pattern_playback_mode(!self.pattern_playback_mode);
+                }
                 let child_toggle_editable_ghosts = !viewport_context.egui_wants_keyboard_input()
                     && viewport_ui.input_mut(|input| {
                         input.consume_key(
@@ -38970,6 +39113,13 @@ impl eframe::App for DawUi {
                 if child_play_pause_requested {
                     self.toggle_project_playback();
                 }
+                let child_pattern_mode_toggle_requested = !viewport_context
+                    .egui_wants_keyboard_input()
+                    && viewport_ui
+                        .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::L));
+                if child_pattern_mode_toggle_requested {
+                    self.set_pattern_playback_mode(!self.pattern_playback_mode);
+                }
 
                 let child_pointer_down = viewport_ui.input(|input| {
                     input.pointer.primary_down()
@@ -39094,6 +39244,13 @@ impl eframe::App for DawUi {
                 if child_play_pause_requested {
                     self.toggle_project_playback();
                 }
+                let child_pattern_mode_toggle_requested = !viewport_context
+                    .egui_wants_keyboard_input()
+                    && viewport_ui
+                        .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::L));
+                if child_pattern_mode_toggle_requested {
+                    self.set_pattern_playback_mode(!self.pattern_playback_mode);
+                }
 
                 let child_pointer_down = viewport_ui.input(|input| {
                     input.pointer.primary_down()
@@ -39217,6 +39374,13 @@ impl eframe::App for DawUi {
                     });
                 if child_play_pause_requested {
                     self.toggle_project_playback();
+                }
+                let child_pattern_mode_toggle_requested = !viewport_context
+                    .egui_wants_keyboard_input()
+                    && viewport_ui
+                        .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::L));
+                if child_pattern_mode_toggle_requested {
+                    self.set_pattern_playback_mode(!self.pattern_playback_mode);
                 }
 
                 let child_pointer_down = viewport_ui.input(|input| {

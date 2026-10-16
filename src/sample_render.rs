@@ -4089,6 +4089,84 @@ pub fn stream_sampler_pattern_to_device(
     )
 }
 
+/// Stream one Sampler Pattern repeatedly until the worker or audio writer is cancelled.
+pub fn stream_sampler_pattern_loop_to_device(
+    document: &FlpDocument,
+    project_path: impl AsRef<Path>,
+    options: SamplerPatternRenderOptions,
+    loop_length_ticks: u64,
+    writer: &StreamingAudioWriter,
+    cancelled: &AtomicBool,
+) -> Result<SamplerPatternRenderSummary, String> {
+    if loop_length_ticks == 0 {
+        return Err("pattern loop length must be greater than zero".to_owned());
+    }
+    let ppq = document.header().ppq();
+    let tempo_bpm = document.metadata().tempo_bpm().unwrap_or(140.0);
+    let loop_frames = ticks_to_frames(loop_length_ticks, ppq, tempo_bpm, options.sample_rate)?;
+    if loop_frames == 0 {
+        return Err("pattern loop length rounds to zero audio frames".to_owned());
+    }
+    let render =
+        prepare_sampler_pattern(document, project_path.as_ref(), options, Some(cancelled))?;
+    crate::audio::enable_denormal_protection();
+    let release_frames = (f64::from(render.summary.sample_rate) * SAMPLER_RELEASE_SECONDS)
+        .round()
+        .max(1.0) as usize;
+    let mut engine = SamplerVoiceEngine::with_resampling_quality_and_pan_law(
+        &render.sources_by_channel,
+        &render.notes,
+        render.voice_limit,
+        release_frames,
+        render.summary.sample_rate,
+        render.resampling_quality,
+        render.pan_law,
+    );
+    engine.mixer_transforms_by_channel = Some(&render.mixer_transforms_by_channel);
+    let mut block = vec![0.0f32; SAMPLER_BLOCK_FRAMES * 2];
+    let mut block_start = 0u64;
+    let mut next_loop_start = loop_frames;
+    loop {
+        check_cancelled(Some(cancelled))?;
+        if writer.is_cancelled() {
+            return Err("Sampler pattern playback was stopped".to_owned());
+        }
+        let block_end = block_start.saturating_add(SAMPLER_BLOCK_FRAMES as u64);
+        while next_loop_start <= block_end {
+            let repeated_notes = render
+                .notes
+                .iter()
+                .copied()
+                .map(|mut note| {
+                    note.start_frame = note
+                        .start_frame
+                        .checked_add(next_loop_start)
+                        .ok_or_else(|| "Sampler Pattern loop position overflow".to_owned())?;
+                    note.stop_frame = note
+                        .stop_frame
+                        .map(|stop_frame| {
+                            stop_frame
+                                .checked_add(next_loop_start)
+                                .ok_or_else(|| "Sampler Pattern note end overflow".to_owned())
+                        })
+                        .transpose()?;
+                    Ok(note)
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            engine.queue_live_notes(repeated_notes);
+            next_loop_start = next_loop_start
+                .checked_add(loop_frames)
+                .ok_or_else(|| "Sampler Pattern loop position overflow".to_owned())?;
+        }
+
+        let frame_count = SAMPLER_BLOCK_FRAMES;
+        engine.render_block(block_start, frame_count, &mut block);
+        render.master_output.apply(&mut block);
+        writer.write_stereo_samples(&block)?;
+        block_start = block_start.saturating_add(frame_count as u64);
+    }
+}
+
 /// Stream live MIDI note events through one Sampler channel while transport is stopped.
 ///
 /// The pattern is used to prepare the selected channel's sample and routing state. Its saved
