@@ -58,6 +58,7 @@ flp-rebuild roundtrip <input.flp> <output.flp>
 flp-rebuild set-tempo <input.flp> <output.flp> <bpm>
 flp-rebuild create-pattern <input.flp> <output.flp>
 flp-rebuild rename-pattern <input.flp> <output.flp> <pattern-id> <name>
+flp-rebuild delete-pattern <input.flp> <output.flp> <pattern-id>
 flp-rebuild set-project-info <input.flp> <output.flp> <title|-> <author|-> <genre|-> <comments|-> <web-link|->
 flp-rebuild set-project-settings <input.flp> <output.flp> <play-truncated:0|1|-> <fast-declick:0|1|-> [pan-law-raw|-]
 flp-rebuild set-project-master-pitch <input.flp> <output.flp> <cents:-1200..1200>
@@ -152,6 +153,8 @@ The **Project settings…** control edits the currently mapped Advanced options:
 `create-pattern` adds an empty pattern after the highest recognized pattern ID. It only works when the project has a unique, recognized `D0` or `E0` note-event encoding; ambiguous or unrecognized layouts are refused without editing the source.
 
 The **Patterns** menu can rename the selected pattern, and `rename-pattern` edits a Pattern name by ID while preserving its other project events. If the project has no recognized string encoding or the selected name event is ambiguous, the edit is refused.
+
+The same menu can delete the selected Pattern after confirmation. `delete-pattern` removes the Pattern's event region only when its ID is unique and no Playlist Clip references it; projects with an undecodable Playlist layout are refused so unknown clips cannot be orphaned.
 
 `edit-note-properties` updates a note's raw flags/group, fine-pitch, release, raw MIDI-channel, pan, and modulation X/Y fields. Pass `-` for any property to leave it unchanged. The reserved byte remains untouched.
 

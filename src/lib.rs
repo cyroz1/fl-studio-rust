@@ -4678,6 +4678,61 @@ impl FlpDocument {
         Ok(())
     }
 
+    /// Deletes an unreferenced Pattern and its complete event region.
+    ///
+    /// Pattern Clips that still target this Pattern prevent deletion. Projects whose
+    /// arrangement clip layout cannot be decoded are also rejected so unknown references
+    /// cannot be orphaned.
+    pub fn delete_pattern(&mut self, pattern_id: u16) -> Result<(), FlpError> {
+        let patterns = self.patterns()?;
+        if !patterns.iter().any(|pattern| pattern.id == pattern_id) {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested pattern does not exist",
+            ));
+        }
+
+        let mut markers = self.events.iter().enumerate().filter(|(_, event)| {
+            event.opcode == 0x41
+                && event.encoding == PayloadEncoding::Word
+                && event.payload.as_slice() == pattern_id.to_le_bytes()
+        });
+        let Some((marker_index, _)) = markers.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested pattern marker does not exist",
+            ));
+        };
+        if markers.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested pattern id is ambiguous",
+            ));
+        }
+
+        let arrangements = self.arrangements()?;
+        if arrangements.iter().any(|arrangement| {
+            arrangement.clips.iter().any(|clip| {
+                matches!(clip.target(), PlaylistClipTarget::Pattern { id } if id == pattern_id)
+            })
+        }) {
+            return Err(FlpError::UnsupportedEdit(
+                "the pattern is still referenced by a Playlist Clip",
+            ));
+        }
+
+        let region_end = self.events[marker_index + 1..]
+            .iter()
+            .position(|event| {
+                (event.opcode == 0x41 && event.encoding == PayloadEncoding::Word)
+                    || matches!(event.opcode, 0x40 | 0x62 | 0x63)
+            })
+            .map_or(self.events.len(), |offset| marker_index + 1 + offset);
+
+        let mut candidate = self.clone();
+        candidate.events.drain(marker_index..region_end);
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
     /// Creates an empty pattern using the note-event encoding already present in the project.
     ///
     /// Projects without a uniquely recognized pattern-note encoding are rejected rather than
@@ -24117,6 +24172,79 @@ mod tests {
         assert!(rejected.set_pattern_name(7, "bad\0name").is_err());
         assert!(rejected.set_pattern_name(99, "Missing").is_err());
         assert_eq!(rejected.encode_lossless().unwrap(), before);
+    }
+
+    #[test]
+    fn deleting_an_unreferenced_pattern_removes_its_complete_event_region() {
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&[0x40, 0, 0, 0x41, 7, 0, 0xD0, 0x18]);
+        stream.extend_from_slice(&note_record(48, 2, 192, 64, 93));
+        stream.extend_from_slice(&[0xA4, 0x80, 0x07, 0, 0]);
+        append_project_info_string(&mut stream, 0xC1, "Old pattern");
+        stream.extend_from_slice(&[0x41, 8, 0, 0xD0, 0x18]);
+        stream.extend_from_slice(&note_record(0, 0, 96, 60, 100));
+        stream.extend_from_slice(&[0x40, 1, 0, 0x15, 2]);
+        let input = flp_fixture(&stream, &[0xA1], &[0xB2]);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+        let marker_index = document
+            .events()
+            .iter()
+            .position(|event| event.opcode() == 0x41 && event.payload() == 7_u16.to_le_bytes())
+            .unwrap();
+        let next_region_index = document
+            .events()
+            .iter()
+            .enumerate()
+            .skip(marker_index + 1)
+            .find(|(_, event)| event.opcode() == 0x41)
+            .map(|(index, _)| index)
+            .unwrap();
+        let expected_events = document
+            .events()
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index < marker_index || *index >= next_region_index)
+            .map(|(_, event)| event.wire_bytes().to_vec())
+            .collect::<Vec<_>>();
+
+        document
+            .delete_pattern(7)
+            .expect("unreferenced Pattern should be deleted");
+
+        let patterns = document
+            .patterns()
+            .expect("remaining Patterns should decode");
+        assert_eq!(patterns.len(), 1);
+        assert_eq!(patterns[0].id, 8);
+        assert_eq!(patterns[0].notes.len(), 1);
+        assert_eq!(
+            document
+                .events()
+                .iter()
+                .map(|event| event.wire_bytes().to_vec())
+                .collect::<Vec<_>>(),
+            expected_events
+        );
+        let encoded = document.encode_lossless().unwrap();
+        let reopened = FlpDocument::parse(&encoded).expect("deleted project should reparse");
+        assert_eq!(reopened.patterns().unwrap()[0].id, 8);
+        assert_eq!(reopened.trailing_bytes(), &[0xB2]);
+    }
+
+    #[test]
+    fn deleting_a_referenced_or_ambiguous_pattern_is_rejected_atomically() {
+        let mut referenced = adjacent_pattern_clip_fixture(960, 960, 48, 96);
+        let before = referenced.encode_lossless().unwrap();
+        assert!(referenced.delete_pattern(7).is_err());
+        assert_eq!(referenced.encode_lossless().unwrap(), before);
+
+        let stream = vec![0x40, 0, 0, 0x41, 7, 0, 0xD0, 0, 0x41, 7, 0, 0xD0, 0];
+        let input = flp_fixture(&stream, &[], &[]);
+        let mut ambiguous = FlpDocument::parse(&input).expect("fixture should parse");
+        let before = ambiguous.encode_lossless().unwrap();
+        assert!(ambiguous.delete_pattern(7).is_err());
+        assert!(ambiguous.delete_pattern(99).is_err());
+        assert_eq!(ambiguous.encode_lossless().unwrap(), before);
     }
 
     #[test]
