@@ -1494,6 +1494,91 @@ enum StepGraphMode {
     Rep,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StepToggleOperation {
+    Add,
+    Delete,
+    Mute,
+    Unmute,
+}
+
+fn step_toggle_targets(
+    notes: &[&PatternNote],
+    step_start: u64,
+    step_ticks: u64,
+    mute_removed_steps: bool,
+) -> (Vec<usize>, StepToggleOperation, usize, usize) {
+    let step_end = step_start.saturating_add(step_ticks.max(1));
+    let mut all_indices = Vec::new();
+    let mut active_indices = Vec::new();
+    let mut muted_indices = Vec::new();
+    for (note_index, note) in notes.iter().enumerate() {
+        let note_tick = u64::from(note.position);
+        if note_tick < step_start || note_tick >= step_end {
+            continue;
+        }
+        all_indices.push(note_index);
+        if note.is_muted() {
+            muted_indices.push(note_index);
+        } else {
+            active_indices.push(note_index);
+        }
+    }
+    let active_count = active_indices.len();
+    let muted_count = muted_indices.len();
+    if active_count > 0 {
+        if mute_removed_steps {
+            (
+                active_indices,
+                StepToggleOperation::Mute,
+                active_count,
+                muted_count,
+            )
+        } else {
+            (
+                all_indices,
+                StepToggleOperation::Delete,
+                active_count,
+                muted_count,
+            )
+        }
+    } else if muted_count > 0 {
+        (
+            muted_indices,
+            StepToggleOperation::Unmute,
+            active_count,
+            muted_count,
+        )
+    } else {
+        (
+            Vec::new(),
+            StepToggleOperation::Add,
+            active_count,
+            muted_count,
+        )
+    }
+}
+
+fn step_toggle_hover_text(
+    operation: StepToggleOperation,
+    active_count: usize,
+    muted_count: usize,
+) -> String {
+    match operation {
+        StepToggleOperation::Add => "Click to add a C5 note to this step".to_owned(),
+        StepToggleOperation::Delete => format!(
+            "Click to remove {} note(s) from this step",
+            active_count + muted_count
+        ),
+        StepToggleOperation::Mute => format!(
+            "Click to mute {active_count} note(s) and keep their note data; click again to restore them"
+        ),
+        StepToggleOperation::Unmute => {
+            format!("Click to restore {muted_count} muted note(s) in this step")
+        }
+    }
+}
+
 impl StepGraphMode {
     const ALL: [Self; 9] = [
         Self::Note,
@@ -3775,6 +3860,7 @@ struct DawUi {
     playlist_grid_viewport: Option<egui::Rect>,
     playlist_grid_scroll_offset: Vec2,
     step_sequencer_bar: u32,
+    channel_rack_mute_removed_steps: bool,
     step_sequencer_add_note_key: u16,
     selected_graph_channel: Option<u16>,
     selected_rack_channels: BTreeSet<u16>,
@@ -4466,6 +4552,7 @@ impl DawUi {
         let midi_recording_offset_ms = load_midi_recording_offset_ms();
         let piano_roll_nudge_notes_with_mouse_wheel =
             load_piano_roll_nudge_notes_with_mouse_wheel();
+        let channel_rack_mute_removed_steps = load_channel_rack_mute_removed_steps();
         let hide_collapsed_playlist_groups = load_hide_collapsed_playlist_groups();
         let browser_path = initial_project
             .as_deref()
@@ -4563,6 +4650,7 @@ impl DawUi {
             playlist_grid_viewport: None,
             playlist_grid_scroll_offset: Vec2::ZERO,
             step_sequencer_bar: 0,
+            channel_rack_mute_removed_steps,
             step_sequencer_add_note_key: 60,
             selected_graph_channel: None,
             selected_rack_channels: BTreeSet::new(),
@@ -20175,8 +20263,9 @@ impl DawUi {
         let mut channel_swing_edits = Vec::new();
         let mut layer_edits = Vec::new();
         let mut layer_flag_edits = Vec::new();
-        let mut step_toggles = Vec::<(u16, Vec<usize>, u32)>::new();
+        let mut step_toggles = Vec::<(u16, Vec<usize>, u32, StepToggleOperation)>::new();
         let mut step_note_additions = Vec::<(u16, u32, u16)>::new();
+        let mut mute_removed_steps_changed = false;
         let mut dropped_samples = Vec::new();
         let mut new_sampler_sample = None;
         ui.horizontal(|ui| {
@@ -20362,6 +20451,16 @@ impl DawUi {
                     );
                     ui.close();
                 }
+                mute_removed_steps_changed = ui
+                    .checkbox(
+                        &mut self.channel_rack_mute_removed_steps,
+                        "Mute removed steps",
+                    )
+                    .on_hover_text(
+                        "Keep a step's note data muted when switching the step off; click it again to restore the notes.",
+                    )
+                    .changed();
+                ui.separator();
                 if ui
                     .add_enabled(
                         !selected_ids.is_empty(),
@@ -20373,6 +20472,13 @@ impl DawUi {
                     ui.close();
                 }
             });
+            if mute_removed_steps_changed
+                && let Err(error) = save_channel_rack_mute_removed_steps(
+                    self.channel_rack_mute_removed_steps,
+                )
+            {
+                self.status = format!("Could not save Channel Rack step setting: {error}");
+            }
         });
         let selected_pattern = self
             .selected_pattern
@@ -20868,27 +20974,33 @@ impl DawUi {
                                             .saturating_mul(measure_ticks)
                                             .saturating_add((step as u64).saturating_mul(step_ticks));
                                         let position = tick.min(u64::from(u32::MAX)) as u32;
-                                        let step_end = tick.saturating_add(step_ticks);
-                                        let active_notes = channel_notes
-                                            .iter()
-                                            .enumerate()
-                                            .filter_map(|(index, note)| {
-                                                let note_tick = u64::from(note.position);
-                                                (note_tick >= tick && note_tick < step_end)
-                                                    .then_some(index)
-                                            })
-                                            .collect::<Vec<_>>();
-                                        let label = if active_notes.len() > 1 {
-                                            format!("{:02}×{}", step + 1, active_notes.len())
+                                        let (toggle_indices, operation, active_count, muted_count) =
+                                            step_toggle_targets(
+                                                &channel_notes,
+                                                tick,
+                                                step_ticks,
+                                                self.channel_rack_mute_removed_steps,
+                                            );
+                                        let label = if active_count > 1 {
+                                            format!("{:02}×{}", step + 1, active_count)
+                                        } else if active_count == 0 && muted_count > 0 {
+                                            format!("{:02}m", step + 1)
                                         } else {
                                             format!("{:02}", step + 1)
                                         };
-                                        let response = ui.selectable_label(!active_notes.is_empty(), label);
+                                        let response = ui
+                                            .selectable_label(active_count > 0, label)
+                                            .on_hover_text(step_toggle_hover_text(
+                                                operation,
+                                                active_count,
+                                                muted_count,
+                                            ));
                                         if response.clicked() {
                                             step_toggles.push((
                                                 channel.id(),
-                                                active_notes,
+                                                toggle_indices,
                                                 position,
+                                                operation,
                                             ));
                                         }
                                         response.context_menu(|ui| {
@@ -21070,30 +21182,44 @@ impl DawUi {
                 if !zipped && let Some(pattern) = &selected_pattern {
                     ui.horizontal_wrapped(|ui| {
                         ui.small("Steps");
+                        let channel_notes = pattern
+                            .notes
+                            .iter()
+                            .filter(|note| note.channel_id == channel.id())
+                            .collect::<Vec<_>>();
                         for step in 0..steps_per_bar {
                             let tick = u64::from(self.step_sequencer_bar)
                                 .saturating_mul(measure_ticks)
                                 .saturating_add((step as u64).saturating_mul(step_ticks));
                             let position = tick.min(u64::from(u32::MAX)) as u32;
-                            let step_end = tick.saturating_add(step_ticks);
-                            let active_notes = pattern
-                                .notes
-                                .iter()
-                                .filter(|note| note.channel_id == channel.id())
-                                .enumerate()
-                                .filter_map(|(index, note)| {
-                                    let note_tick = u64::from(note.position);
-                                    (note_tick >= tick && note_tick < step_end).then_some(index)
-                                })
-                                .collect::<Vec<_>>();
-                            let label = if active_notes.len() > 1 {
-                                format!("{:02}×{}", step + 1, active_notes.len())
+                            let (toggle_indices, operation, active_count, muted_count) =
+                                step_toggle_targets(
+                                    &channel_notes,
+                                    tick,
+                                    step_ticks,
+                                    self.channel_rack_mute_removed_steps,
+                                );
+                            let label = if active_count > 1 {
+                                format!("{:02}×{}", step + 1, active_count)
+                            } else if active_count == 0 && muted_count > 0 {
+                                format!("{:02}m", step + 1)
                             } else {
                                 format!("{:02}", step + 1)
                             };
-                            let response = ui.selectable_label(!active_notes.is_empty(), label);
+                            let response = ui
+                                .selectable_label(active_count > 0, label)
+                                .on_hover_text(step_toggle_hover_text(
+                                    operation,
+                                    active_count,
+                                    muted_count,
+                                ));
                             if response.clicked() {
-                                step_toggles.push((channel.id(), active_notes, position));
+                                step_toggles.push((
+                                    channel.id(),
+                                    toggle_indices,
+                                    position,
+                                    operation,
+                                ));
                             }
                             response.context_menu(|ui| {
                                 ui.label("Add another note at this step");
@@ -21379,18 +21505,10 @@ impl DawUi {
             let results = if let Some(document) = self.document.as_mut() {
                 step_toggles
                     .into_iter()
-                    .map(|(channel_id, note_indices, position)| {
-                        let removing_count = note_indices.len();
-                        let result = if removing_count > 0 {
-                            document
-                                .delete_pattern_note_selection(
-                                    pattern_id,
-                                    channel_id,
-                                    &note_indices,
-                                )
-                                .map(|_| ())
-                        } else {
-                            document.add_pattern_note(
+                    .map(|(channel_id, note_indices, position, operation)| {
+                        let note_count = note_indices.len();
+                        let result = match operation {
+                            StepToggleOperation::Add => document.add_pattern_note(
                                 pattern_id,
                                 PatternNote {
                                     position,
@@ -21400,11 +21518,33 @@ impl DawUi {
                                     velocity: 100,
                                     ..PatternNote::default()
                                 },
-                            )
+                            ),
+                            StepToggleOperation::Delete => document
+                                .delete_pattern_note_selection(
+                                    pattern_id,
+                                    channel_id,
+                                    &note_indices,
+                                )
+                                .map(|_| ()),
+                            StepToggleOperation::Mute | StepToggleOperation::Unmute => {
+                                let muted = operation == StepToggleOperation::Mute;
+                                note_indices.iter().try_for_each(|note_index| {
+                                    document.edit_pattern_note(
+                                        pattern_id,
+                                        channel_id,
+                                        *note_index,
+                                        PatternNoteEdit {
+                                            muted: Some(muted),
+                                            ..PatternNoteEdit::default()
+                                        },
+                                    )
+                                })
+                            }
                         };
                         (
                             channel_id,
-                            removing_count,
+                            note_count,
+                            operation,
                             result.map_err(|error| error.to_string()),
                         )
                     })
@@ -21412,17 +21552,24 @@ impl DawUi {
             } else {
                 Vec::new()
             };
-            for (channel_id, removing_count, result) in results {
+            for (channel_id, note_count, operation, result) in results {
                 match result {
                     Ok(()) => {
                         self.stop_project_playback();
                         self.dirty = true;
-                        self.status = if removing_count > 0 {
-                            format!(
-                                "Removed {removing_count} note(s) from step in pattern {pattern_id}, channel {channel_id}"
-                            )
-                        } else {
-                            format!("Added step to pattern {pattern_id}, channel {channel_id}")
+                        self.status = match operation {
+                            StepToggleOperation::Add => {
+                                format!("Added step to pattern {pattern_id}, channel {channel_id}")
+                            }
+                            StepToggleOperation::Delete => format!(
+                                "Removed {note_count} note(s) from step in pattern {pattern_id}, channel {channel_id}"
+                            ),
+                            StepToggleOperation::Mute => format!(
+                                "Muted {note_count} note(s) and kept their data in pattern {pattern_id}, channel {channel_id}"
+                            ),
+                            StepToggleOperation::Unmute => format!(
+                                "Restored {note_count} note(s) in pattern {pattern_id}, channel {channel_id}"
+                            ),
                         };
                     }
                     Err(error) => {
@@ -42166,6 +42313,31 @@ fn save_piano_roll_nudge_notes_with_mouse_wheel(enabled: bool) -> Result<(), Str
     let parent = path
         .parent()
         .ok_or_else(|| "the Piano roll mouse-wheel setting path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(&path, format!("{enabled}\n"))
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
+fn channel_rack_mute_removed_steps_settings_file() -> Option<PathBuf> {
+    browser_favorites_file()?
+        .parent()
+        .map(|directory| directory.join("channel-rack-mute-removed-steps.txt"))
+}
+
+fn load_channel_rack_mute_removed_steps() -> bool {
+    channel_rack_mute_removed_steps_settings_file()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|contents| contents.trim().parse::<bool>().ok())
+        .unwrap_or(false)
+}
+
+fn save_channel_rack_mute_removed_steps(enabled: bool) -> Result<(), String> {
+    let path = channel_rack_mute_removed_steps_settings_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the Channel Rack setting path has no parent folder".to_owned())?;
     fs::create_dir_all(parent)
         .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
     fs::write(&path, format!("{enabled}\n"))
