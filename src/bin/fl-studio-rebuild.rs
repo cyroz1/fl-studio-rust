@@ -78,9 +78,10 @@ use midi_input::{
 };
 use midi_output::{
     ConnectedMidiOutput, MIDI_TEST_NOTE_OFF, MIDI_TEST_NOTE_ON, MidiClockScheduler,
-    MidiOutputDevice, MidiPlaylistScheduler, ScheduledMidiFrameMessage, ScheduledMidiMessage,
-    ScheduledMidiTickMessage, connect_output_device, enumerate_output_devices,
-    pattern_preview_messages, playlist_playback_messages,
+    MidiOutputDevice, MidiPatternLoopScheduler, MidiPlaylistScheduler, ScheduledMidiFrameMessage,
+    ScheduledMidiMessage, ScheduledMidiTickMessage, connect_output_device,
+    enumerate_output_devices, pattern_loop_frame_messages, pattern_preview_messages,
+    playlist_playback_messages,
 };
 use midi_thru::{MidiThruSettings, MidiThruWorker};
 
@@ -3731,6 +3732,11 @@ struct ActiveMidiPlaylistPlayback {
     scheduler: MidiPlaylistScheduler,
 }
 
+struct ActiveMidiPatternTransport {
+    pattern_id: u16,
+    scheduler: MidiPatternLoopScheduler,
+}
+
 struct PerformanceLaunchContext<'a> {
     arrangement: &'a Arrangement,
     tracks: &'a [PlaylistTrack],
@@ -3775,6 +3781,7 @@ struct DawUi {
     history_snapshot_available_this_frame: bool,
     playing: bool,
     pattern_playback_mode: bool,
+    pattern_mode_playback_source: Option<(u16, u64)>,
     performance_mode_active: bool,
     held_performance_clips: Vec<(u16, u32, usize)>,
     midi_held_performance_clips: MidiPerformanceHoldMap,
@@ -4051,8 +4058,10 @@ struct DawUi {
     midi_output_connection: Option<ConnectedMidiOutput>,
     midi_output_send_clock: bool,
     midi_output_send_playlist_notes: bool,
+    midi_output_send_pattern_notes: bool,
     midi_output_clock: Option<MidiClockScheduler>,
     midi_playlist_playback: Option<ActiveMidiPlaylistPlayback>,
+    midi_pattern_transport: Option<ActiveMidiPatternTransport>,
     midi_pattern_playback: Option<ActiveMidiPatternPlayback>,
     midi_pattern_play_requested: bool,
     midi_pattern_stop_requested: bool,
@@ -4467,15 +4476,16 @@ impl DawUi {
             Ok(devices) => (devices, None),
             Err(error) => (Vec::new(), Some(error)),
         };
-        let (
-            midi_selected_input_id,
-            midi_selected_output_id,
-            midi_output_send_clock,
-            midi_output_send_playlist_notes,
-            midi_record_fixed_velocity,
-            record_audio_enabled,
-            record_notes_enabled,
-        ) = load_midi_device_selections();
+        let MidiDeviceSelections {
+            input_id: midi_selected_input_id,
+            output_id: midi_selected_output_id,
+            send_clock: midi_output_send_clock,
+            send_playlist_notes: midi_output_send_playlist_notes,
+            send_pattern_notes: midi_output_send_pattern_notes,
+            fixed_velocity: midi_record_fixed_velocity,
+            record_audio: record_audio_enabled,
+            record_notes: record_notes_enabled,
+        } = load_midi_device_selections();
         let (midi_input_thru_snap_to_scale, midi_input_thru_output_channel) =
             load_midi_thru_preferences();
         let mut audio_settings = AudioSettings::default();
@@ -4529,6 +4539,7 @@ impl DawUi {
             history_snapshot_available_this_frame: false,
             playing: false,
             pattern_playback_mode: false,
+            pattern_mode_playback_source: None,
             performance_mode_active: false,
             held_performance_clips: Vec::new(),
             midi_held_performance_clips: BTreeMap::new(),
@@ -4805,8 +4816,10 @@ impl DawUi {
             midi_output_connection: None,
             midi_output_send_clock,
             midi_output_send_playlist_notes,
+            midi_output_send_pattern_notes,
             midi_output_clock: None,
             midi_playlist_playback: None,
+            midi_pattern_transport: None,
             midi_pattern_playback: None,
             midi_pattern_play_requested: false,
             midi_pattern_stop_requested: false,
@@ -9144,7 +9157,9 @@ impl DawUi {
         };
         self.stream_selected_sampler_pattern(Some(loop_length_ticks));
         if self.playing {
+            self.pattern_mode_playback_source = Some((pattern_id, loop_length_ticks));
             self.start_midi_clock(false);
+            self.start_midi_pattern_transport(pattern_id, loop_length_ticks);
         }
     }
 
@@ -9575,7 +9590,13 @@ impl DawUi {
                     self.playing = true;
                     self.status = "Project playback resumed".to_owned();
                     self.start_midi_clock(true);
-                    if !self.pattern_playback_mode {
+                    if self.pattern_playback_mode {
+                        if self.midi_pattern_transport.is_none()
+                            && self.midi_output_send_pattern_notes
+                        {
+                            self.start_midi_pattern_transport_for_active_pattern();
+                        }
+                    } else {
                         self.start_midi_playlist_playback_from_current_position();
                     }
                 }
@@ -9622,6 +9643,8 @@ impl DawUi {
         self.performance_scene_round_robin.clear();
         self.performance_launch_sender = None;
         self.stop_midi_playlist_playback();
+        self.stop_midi_pattern_transport();
+        self.pattern_mode_playback_source = None;
         self.stop_midi_clock();
         self.stop_midi_pattern_preview();
         self.stop_live_sampler_input();
@@ -34900,15 +34923,17 @@ impl DawUi {
     }
 
     fn persist_midi_device_selections(&mut self) {
-        if let Err(error) = save_midi_device_selections(
-            self.midi_selected_input_id.as_deref(),
-            self.midi_selected_output_id.as_deref(),
-            self.midi_output_send_clock,
-            self.midi_output_send_playlist_notes,
-            self.midi_record_fixed_velocity,
-            self.record_audio_enabled,
-            self.record_notes_enabled,
-        ) {
+        let selections = MidiDeviceSelections {
+            input_id: self.midi_selected_input_id.clone(),
+            output_id: self.midi_selected_output_id.clone(),
+            send_clock: self.midi_output_send_clock,
+            send_playlist_notes: self.midi_output_send_playlist_notes,
+            send_pattern_notes: self.midi_output_send_pattern_notes,
+            fixed_velocity: self.midi_record_fixed_velocity,
+            record_audio: self.record_audio_enabled,
+            record_notes: self.record_notes_enabled,
+        };
+        if let Err(error) = save_midi_device_selections(&selections) {
             self.status = format!("Could not save MIDI device selections: {error}");
         }
     }
@@ -35064,6 +35089,10 @@ impl DawUi {
                 if self.playing && self.midi_output_send_playlist_notes {
                     self.start_midi_playlist_playback_from_current_position();
                 }
+                if self.playing && self.pattern_playback_mode && self.midi_output_send_pattern_notes
+                {
+                    self.start_midi_pattern_transport_for_active_pattern();
+                }
             }
             Err(error) => {
                 self.midi_output_error = Some(error.clone());
@@ -35077,6 +35106,7 @@ impl DawUi {
         self.midi_output_test_note_off_at = None;
         self.midi_pattern_playback = None;
         self.stop_midi_playlist_playback();
+        self.stop_midi_pattern_transport();
         self.stop_midi_clock();
         let Some(mut connection) = self.midi_output_connection.take() else {
             return;
@@ -35105,6 +35135,10 @@ impl DawUi {
     }
 
     fn test_midi_output(&mut self) {
+        if self.midi_pattern_transport.is_some() || self.midi_playlist_playback.is_some() {
+            self.status = "Stop transport MIDI output before sending a test note".to_owned();
+            return;
+        }
         let Some(connection) = self.midi_output_connection.as_mut() else {
             self.status = "Connect a MIDI output before sending a test note".to_owned();
             return;
@@ -35376,9 +35410,134 @@ impl DawUi {
         }
     }
 
+    fn start_midi_pattern_transport_for_active_pattern(&mut self) {
+        let Some((pattern_id, loop_length_ticks)) = self.pattern_mode_playback_source else {
+            return;
+        };
+        self.start_midi_pattern_transport(pattern_id, loop_length_ticks);
+    }
+
+    fn start_midi_pattern_transport(&mut self, pattern_id: u16, loop_length_ticks: u64) {
+        self.stop_midi_pattern_transport();
+        if !self.midi_output_send_pattern_notes || self.midi_output_connection.is_none() {
+            return;
+        }
+        let Some(document) = self.document.as_ref() else {
+            self.midi_output_error =
+                Some("Open a project before sending Pattern MIDI notes".to_owned());
+            return;
+        };
+        let ppq = document.header().ppq();
+        let tempo_bpm = document.metadata().tempo_bpm().unwrap_or(140.0);
+        let patterns = match document.patterns() {
+            Ok(patterns) => patterns,
+            Err(error) => {
+                self.midi_output_error = Some(error.to_string());
+                self.status = format!("Could not read Pattern MIDI notes: {error}");
+                return;
+            }
+        };
+        let Some(pattern) = patterns
+            .into_iter()
+            .find(|pattern| pattern.id == pattern_id)
+        else {
+            self.midi_output_error = Some(format!("Pattern {pattern_id} is no longer available"));
+            return;
+        };
+        let Some((sample_rate, playback_clock)) = self
+            .audio_engine
+            .as_ref()
+            .map(|engine| (engine.sample_rate(), engine.project_playback_clock()))
+            .filter(|(sample_rate, _)| *sample_rate > 0)
+        else {
+            let error = "Audio timing is unavailable for Pattern MIDI output".to_owned();
+            self.midi_output_error = Some(error.clone());
+            self.status = error;
+            return;
+        };
+        let (messages, loop_frames) = match pattern_loop_frame_messages(
+            &pattern,
+            ppq,
+            tempo_bpm,
+            sample_rate,
+            loop_length_ticks,
+        ) {
+            Ok(schedule) => schedule,
+            Err(error) => {
+                self.midi_output_error = Some(error.clone());
+                self.status = format!("Could not prepare Pattern MIDI output: {error}");
+                return;
+            }
+        };
+        if messages.is_empty() {
+            self.midi_output_error = None;
+            return;
+        }
+        let Some(output) = self.midi_output_connection.as_ref().cloned() else {
+            return;
+        };
+        match MidiPatternLoopScheduler::start(output, messages, loop_frames, playback_clock) {
+            Ok(scheduler) => {
+                self.midi_pattern_transport = Some(ActiveMidiPatternTransport {
+                    pattern_id,
+                    scheduler,
+                });
+                self.midi_output_error = None;
+            }
+            Err(error) => {
+                self.midi_pattern_transport = None;
+                self.midi_output_error = Some(error.clone());
+                self.status = format!("Could not start Pattern MIDI scheduler: {error}");
+            }
+        }
+    }
+
+    fn stop_midi_pattern_transport(&mut self) {
+        let Some(transport) = self.midi_pattern_transport.take() else {
+            return;
+        };
+        let pattern_id = transport.pattern_id;
+        if let Err(error) = transport.scheduler.stop() {
+            self.midi_output_error = Some(error.clone());
+            self.status = format!("Stopped Pattern {pattern_id} MIDI output: {error}");
+        }
+    }
+
+    fn service_midi_pattern_transport(&mut self) {
+        if self.midi_pattern_transport.is_none() {
+            return;
+        }
+        if !self.midi_output_send_pattern_notes
+            || !self.pattern_playback_mode
+            || !self.project_playback_loaded
+        {
+            self.stop_midi_pattern_transport();
+            return;
+        }
+        if self.audio_engine.is_none() {
+            self.stop_midi_pattern_transport();
+            self.midi_output_error =
+                Some("Audio position was lost during Pattern MIDI output".to_owned());
+            return;
+        }
+        let Some(transport) = self.midi_pattern_transport.as_ref() else {
+            return;
+        };
+        let pattern_id = transport.pattern_id;
+        let error = transport.scheduler.take_error();
+        let finished = transport.scheduler.is_finished();
+        if let Some(error) = error {
+            self.midi_pattern_transport = None;
+            self.midi_output_error = Some(error.clone());
+            self.status = format!("Pattern {pattern_id} MIDI output stopped: {error}");
+        } else if finished {
+            self.midi_pattern_transport = None;
+        }
+    }
+
     fn start_midi_pattern_preview(&mut self) {
-        if self.midi_playlist_playback.is_some() {
-            self.status = "Stop Playlist playback before previewing a MIDI Pattern".to_owned();
+        if self.midi_playlist_playback.is_some() || self.midi_pattern_transport.is_some() {
+            self.status = "Stop transport MIDI output before previewing a MIDI Pattern".to_owned();
             return;
         }
         if self.midi_output_connection.is_none() {
@@ -37813,11 +37972,13 @@ impl DawUi {
             }
             let pattern_preview_active = self.midi_pattern_playback.is_some();
             let playlist_playback_active = self.midi_playlist_playback.is_some();
+            let pattern_transport_active = self.midi_pattern_transport.is_some();
             if ui
                 .add_enabled(
                     self.midi_output_connection.is_some()
                         && !pattern_preview_active
-                        && !playlist_playback_active,
+                        && !playlist_playback_active
+                        && !pattern_transport_active,
                     egui::Button::new("Test C4"),
                 )
                 .clicked()
@@ -37826,6 +37987,7 @@ impl DawUi {
             }
             let pattern_preview_enabled = self.midi_output_connection.is_some()
                 && !playlist_playback_active
+                && !pattern_transport_active
                 && (pattern_preview_active
                     || (self.document.is_some() && self.selected_pattern.is_some()));
             if ui
@@ -37882,11 +38044,38 @@ impl DawUi {
             )
             .color(MUTED),
         );
+        let send_pattern_notes_changed = ui
+            .add_enabled_ui(!self.playing, |ui| {
+                ui.checkbox(
+                    &mut self.midi_output_send_pattern_notes,
+                    "Send Pattern notes to MIDI output",
+                )
+            })
+            .inner
+            .changed();
+        if send_pattern_notes_changed {
+            self.persist_midi_device_selections();
+        }
+        ui.label(
+            egui::RichText::new(
+                "When enabled, Pattern mode loops the selected Pattern's notes in sync with audio playback.",
+            )
+            .color(MUTED),
+        );
         if let Some(playback) = &self.midi_playlist_playback {
             ui.label(
                 egui::RichText::new(format!(
                     "● Sending Arrangement {} notes through MIDI output",
                     playback.arrangement_id
+                ))
+                .color(GREEN),
+            );
+        }
+        if let Some(transport) = &self.midi_pattern_transport {
+            ui.label(
+                egui::RichText::new(format!(
+                    "● Sending Pattern {} notes through MIDI output",
+                    transport.pattern_id
                 ))
                 .color(GREEN),
             );
@@ -39441,6 +39630,7 @@ impl eframe::App for DawUi {
         self.finish_midi_output_test_note();
         self.service_midi_pattern_preview();
         self.service_midi_playlist_playback();
+        self.service_midi_pattern_transport();
         self.service_midi_clock();
         let playlist_clip_shortcuts_enabled =
             self.view == MainView::Playlist && !ui.ctx().egui_wants_keyboard_input();
@@ -41950,25 +42140,44 @@ fn recording_input_targets(
     )
 }
 
-fn load_midi_device_selections() -> (Option<String>, Option<String>, bool, bool, bool, bool, bool) {
+#[derive(Debug, Eq, PartialEq)]
+struct MidiDeviceSelections {
+    input_id: Option<String>,
+    output_id: Option<String>,
+    send_clock: bool,
+    send_playlist_notes: bool,
+    send_pattern_notes: bool,
+    fixed_velocity: bool,
+    record_audio: bool,
+    record_notes: bool,
+}
+
+impl Default for MidiDeviceSelections {
+    fn default() -> Self {
+        Self {
+            input_id: None,
+            output_id: None,
+            send_clock: false,
+            send_playlist_notes: false,
+            send_pattern_notes: false,
+            fixed_velocity: false,
+            record_audio: true,
+            record_notes: true,
+        }
+    }
+}
+
+fn load_midi_device_selections() -> MidiDeviceSelections {
     let Some(path) = midi_device_selections_file() else {
-        return (None, None, false, false, false, true, true);
+        return MidiDeviceSelections::default();
     };
     let Ok(contents) = fs::read_to_string(path) else {
-        return (None, None, false, false, false, true, true);
+        return MidiDeviceSelections::default();
     };
     parse_midi_device_selections(&contents)
 }
 
-fn save_midi_device_selections(
-    input_id: Option<&str>,
-    output_id: Option<&str>,
-    send_clock: bool,
-    send_playlist_notes: bool,
-    fixed_velocity: bool,
-    record_audio: bool,
-    record_notes: bool,
-) -> Result<(), String> {
+fn save_midi_device_selections(selections: &MidiDeviceSelections) -> Result<(), String> {
     let path = midi_device_selections_file()
         .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
     let parent = path
@@ -41976,19 +42185,8 @@ fn save_midi_device_selections(
         .ok_or_else(|| "the MIDI device settings path has no parent folder".to_owned())?;
     fs::create_dir_all(parent)
         .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
-    fs::write(
-        &path,
-        encode_midi_device_selections(
-            input_id,
-            output_id,
-            send_clock,
-            send_playlist_notes,
-            fixed_velocity,
-            record_audio,
-            record_notes,
-        ),
-    )
-    .map_err(|error| format!("could not write {}: {error}", path.display()))
+    fs::write(&path, encode_midi_device_selections(selections))
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
 }
 
 fn load_midi_thru_preferences() -> (bool, Option<u8>) {
@@ -42040,63 +42238,42 @@ fn parse_midi_thru_preferences(contents: &str) -> (bool, Option<u8>) {
     (snap_to_scale, output_channel)
 }
 
-fn encode_midi_device_selections(
-    input_id: Option<&str>,
-    output_id: Option<&str>,
-    send_clock: bool,
-    send_playlist_notes: bool,
-    fixed_velocity: bool,
-    record_audio: bool,
-    record_notes: bool,
-) -> String {
+fn encode_midi_device_selections(selections: &MidiDeviceSelections) -> String {
     format!(
-        "input={}\noutput={}\nclock={}\nplaylist_notes={}\nfixed_velocity={}\nrecord_audio={}\nrecord_notes={}\n",
-        encode_midi_device_id(input_id.unwrap_or_default()),
-        encode_midi_device_id(output_id.unwrap_or_default()),
-        u8::from(send_clock),
-        u8::from(send_playlist_notes),
-        u8::from(fixed_velocity),
-        u8::from(record_audio),
-        u8::from(record_notes)
+        "input={}\noutput={}\nclock={}\nplaylist_notes={}\npattern_notes={}\nfixed_velocity={}\nrecord_audio={}\nrecord_notes={}\n",
+        encode_midi_device_id(selections.input_id.as_deref().unwrap_or_default()),
+        encode_midi_device_id(selections.output_id.as_deref().unwrap_or_default()),
+        u8::from(selections.send_clock),
+        u8::from(selections.send_playlist_notes),
+        u8::from(selections.send_pattern_notes),
+        u8::from(selections.fixed_velocity),
+        u8::from(selections.record_audio),
+        u8::from(selections.record_notes)
     )
 }
 
-fn parse_midi_device_selections(
-    contents: &str,
-) -> (Option<String>, Option<String>, bool, bool, bool, bool, bool) {
-    let mut input_id = None;
-    let mut output_id = None;
-    let mut send_clock = false;
-    let mut send_playlist_notes = false;
-    let mut fixed_velocity = false;
-    let mut record_audio = true;
-    let mut record_notes = true;
+fn parse_midi_device_selections(contents: &str) -> MidiDeviceSelections {
+    let mut selections = MidiDeviceSelections::default();
     for line in contents.lines() {
         if let Some(encoded_id) = line.strip_prefix("input=") {
-            input_id = decode_midi_device_id(encoded_id);
+            selections.input_id = decode_midi_device_id(encoded_id);
         } else if let Some(encoded_id) = line.strip_prefix("output=") {
-            output_id = decode_midi_device_id(encoded_id);
+            selections.output_id = decode_midi_device_id(encoded_id);
         } else if let Some(enabled) = line.strip_prefix("clock=") {
-            send_clock = enabled == "1";
+            selections.send_clock = enabled == "1";
         } else if let Some(enabled) = line.strip_prefix("playlist_notes=") {
-            send_playlist_notes = enabled == "1";
+            selections.send_playlist_notes = enabled == "1";
+        } else if let Some(enabled) = line.strip_prefix("pattern_notes=") {
+            selections.send_pattern_notes = enabled == "1";
         } else if let Some(enabled) = line.strip_prefix("fixed_velocity=") {
-            fixed_velocity = enabled == "1";
+            selections.fixed_velocity = enabled == "1";
         } else if let Some(enabled) = line.strip_prefix("record_audio=") {
-            record_audio = enabled == "1";
+            selections.record_audio = enabled == "1";
         } else if let Some(enabled) = line.strip_prefix("record_notes=") {
-            record_notes = enabled == "1";
+            selections.record_notes = enabled == "1";
         }
     }
-    (
-        input_id,
-        output_id,
-        send_clock,
-        send_playlist_notes,
-        fixed_velocity,
-        record_audio,
-        record_notes,
-    )
+    selections
 }
 
 fn encode_midi_device_id(id: &str) -> String {
@@ -46695,11 +46872,11 @@ mod tests {
         ActivePlaylistClipDrag, Arrangement, ChannelDisplayFilter, DetachedWindowKind,
         DetachedWindowPlacement, DetachedWindowPlacements, DetectedPianoRollScale, FlpDocument,
         MainView, MidiControlChangeMapping, MidiControllerCcBinding, MidiControllerTemplate,
-        PIANO_ROLL_RULER_HEIGHT, Pattern, PatternController, PatternNote, PianoRollChordStamp,
-        PianoRollGrid, PianoRollScale, PianoRollSnap, PlaylistClip, PlaylistClipDragKind,
-        PlaylistTempoMap, PlaylistTrack, PluginCandidate, PluginFormat, TimeSelectionShift,
-        TouchGesture, TouchTapTracker, TouchZoomConfig, WINDOW_LAYOUT_PRESETS_HEADER,
-        WindowLayoutPreset, audio_recording_start_tick_with_offset,
+        MidiDeviceSelections, PIANO_ROLL_RULER_HEIGHT, Pattern, PatternController, PatternNote,
+        PianoRollChordStamp, PianoRollGrid, PianoRollScale, PianoRollSnap, PlaylistClip,
+        PlaylistClipDragKind, PlaylistTempoMap, PlaylistTrack, PluginCandidate, PluginFormat,
+        TimeSelectionShift, TouchGesture, TouchTapTracker, TouchZoomConfig,
+        WINDOW_LAYOUT_PRESETS_HEADER, WindowLayoutPreset, audio_recording_start_tick_with_offset,
         built_in_midi_controller_templates, candidate_matches_vst_identity,
         candidate_mixer_controls, candidate_mixer_stereo_separation, detect_chord_name,
         detect_piano_roll_channel_scale, detect_piano_roll_scale, encode_midi_device_id,
@@ -47689,39 +47866,34 @@ mod tests {
     fn midi_device_selections_round_trip_opaque_port_ids() {
         let input_id = "alsa:card=Keyboard\tport\n雪";
         let output_id = "CoreMIDI:0123456789ABCDEF";
-        let encoded = encode_midi_device_selections(
-            Some(input_id),
-            Some(output_id),
-            true,
-            true,
-            true,
-            false,
-            true,
-        );
+        let selections = MidiDeviceSelections {
+            input_id: Some(input_id.to_owned()),
+            output_id: Some(output_id.to_owned()),
+            send_clock: true,
+            send_playlist_notes: true,
+            send_pattern_notes: true,
+            fixed_velocity: true,
+            record_audio: false,
+            record_notes: true,
+        };
+        let encoded = encode_midi_device_selections(&selections);
 
-        assert_eq!(
-            parse_midi_device_selections(&encoded),
-            (
-                Some(input_id.to_owned()),
-                Some(output_id.to_owned()),
-                true,
-                true,
-                true,
-                false,
-                true
-            )
-        );
+        assert_eq!(parse_midi_device_selections(&encoded), selections);
     }
 
     #[test]
     fn midi_device_selections_skip_malformed_or_unknown_entries() {
         assert_eq!(
             parse_midi_device_selections("input=0\noutput=xyz\nclock=invalid\nother=01\n"),
-            (None, None, false, false, false, true, true)
+            MidiDeviceSelections::default()
         );
         assert_eq!(
             parse_midi_device_selections("input=\noutput=\nclock=1\nfixed_velocity=1\n"),
-            (None, None, true, false, true, true, true)
+            MidiDeviceSelections {
+                send_clock: true,
+                fixed_velocity: true,
+                ..MidiDeviceSelections::default()
+            }
         );
     }
 
