@@ -4267,6 +4267,7 @@ struct PendingSamplerStream {
     receiver: Receiver<Result<SamplerPatternRenderSummary, String>>,
     cancelled: Arc<AtomicBool>,
     worker: thread::JoinHandle<()>,
+    live_midi_senders: BTreeMap<u16, Vst3PlaylistLiveInputSender>,
 }
 
 struct LiveSamplerInputSession {
@@ -28322,6 +28323,7 @@ impl DawUi {
                     receiver,
                     cancelled,
                     worker,
+                    live_midi_senders: BTreeMap::new(),
                 });
                 self.playing = true;
                 self.project_playback_loaded = true;
@@ -28603,6 +28605,7 @@ impl DawUi {
                     receiver,
                     cancelled,
                     worker,
+                    live_midi_senders: BTreeMap::new(),
                 });
                 self.playing = true;
                 self.project_playback_loaded = true;
@@ -28846,6 +28849,10 @@ impl DawUi {
                 return;
             }
         };
+        let live_midi_senders = vst3_processor
+            .as_ref()
+            .map(Vst3PlaylistStreamProcessor::live_midi_input_senders)
+            .unwrap_or_default();
         let vst3_summary = vst3_processor
             .as_ref()
             .map(Vst3PlaylistStreamProcessor::summary);
@@ -28938,6 +28945,7 @@ impl DawUi {
                     receiver,
                     cancelled,
                     worker,
+                    live_midi_senders,
                 });
                 self.playing = true;
                 self.project_playback_loaded = true;
@@ -36736,7 +36744,18 @@ impl DawUi {
     }
 
     fn can_audition_live_midi_input(&self) -> bool {
-        !self.playing || (!self.pattern_playback_mode && !self.performance_mode_active)
+        if !self.playing {
+            return true;
+        }
+        if self.performance_mode_active {
+            return false;
+        }
+        if !self.pattern_playback_mode {
+            return true;
+        }
+        self.pattern_mode_playback_source
+            .is_some_and(|(pattern_id, _)| Some(pattern_id) == self.selected_pattern)
+            && self.pending_sampler_stream.is_some()
     }
 
     fn stop_live_audition_playback_if_stopped(&self) {
@@ -37068,7 +37087,12 @@ impl DawUi {
                 }
             }
         }
-        let playlist_live_senders = if self.playing {
+        let playback_live_senders = if self.playing && self.pattern_playback_mode {
+            self.pending_sampler_stream
+                .as_ref()
+                .map(|pending| pending.live_midi_senders.clone())
+                .unwrap_or_default()
+        } else if self.playing {
             self.pending_audio_render
                 .as_ref()
                 .map(|pending| pending.live_midi_senders.clone())
@@ -37078,7 +37102,7 @@ impl DawUi {
         };
         let separate_vst3_source_count = instances
             .iter()
-            .filter(|(target, _)| !playlist_live_senders.contains_key(&target.channel_id))
+            .filter(|(target, _)| !playback_live_senders.contains_key(&target.channel_id))
             .count();
         let source_count = separate_vst3_source_count + usize::from(!sampler_children.is_empty());
         let (sample_rate, writers) = {
@@ -37132,7 +37156,7 @@ impl DawUi {
         let mut target_sessions = Vec::with_capacity(instances.len());
         for (target, instance_id) in instances {
             if self.playing
-                && let Some(sender) = playlist_live_senders.get(&target.channel_id)
+                && let Some(sender) = playback_live_senders.get(&target.channel_id)
             {
                 target_sessions.push(LiveVst3InputTargetSession {
                     target,
