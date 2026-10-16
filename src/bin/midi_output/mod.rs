@@ -153,6 +153,71 @@ pub fn pattern_preview_messages(
         .collect()
 }
 
+pub fn pattern_loop_frame_messages(
+    pattern: &Pattern,
+    ppq: u16,
+    tempo_bpm: f64,
+    sample_rate: u32,
+    loop_length_ticks: u64,
+) -> Result<(Vec<ScheduledMidiFrameMessage>, u64), String> {
+    if loop_length_ticks == 0 {
+        return Err("Pattern MIDI loop length must be greater than zero".to_owned());
+    }
+    if pattern.notes.len() > MAX_PATTERN_PREVIEW_NOTES {
+        return Err(format!(
+            "Pattern {} exceeds the {}-note MIDI output limit",
+            pattern.id, MAX_PATTERN_PREVIEW_NOTES
+        ));
+    }
+    let tempo_map = PlaylistTempoMap::constant(ppq, tempo_bpm)?;
+    let loop_frames = tempo_map.frame_at_tick(loop_length_ticks, sample_rate)?;
+    if loop_frames == 0 {
+        return Err("Pattern MIDI loop length rounds to zero audio frames".to_owned());
+    }
+
+    let mut ordered = Vec::with_capacity(pattern.notes.len().saturating_mul(2));
+    for (note_index, note) in pattern.notes.iter().enumerate() {
+        let Some(key) = u8::try_from(note.key).ok().filter(|key| *key <= 127) else {
+            continue;
+        };
+        if note.midi_channel > 15 || note.velocity > 127 || note.velocity == 0 {
+            continue;
+        }
+        let channel = note.midi_channel;
+        let start_tick = u64::from(note.position);
+        let end_tick = start_tick.saturating_add(u64::from(note.length.max(1)));
+        let start_frame = tempo_map.frame_at_tick(start_tick, sample_rate)?;
+        let end_frame = tempo_map
+            .frame_at_tick(end_tick, sample_rate)?
+            .max(start_frame.saturating_add(1));
+        ordered.push(OrderedMidiMessage {
+            tick: start_frame % loop_frames,
+            priority: 1,
+            order: note_index.saturating_mul(2),
+            bytes: [0x90 | channel, key, note.velocity],
+        });
+        ordered.push(OrderedMidiMessage {
+            tick: end_frame % loop_frames,
+            priority: 0,
+            order: note_index.saturating_mul(2).saturating_add(1),
+            bytes: [
+                0x80 | channel,
+                key,
+                fl_note_release_to_midi_velocity(note.release),
+            ],
+        });
+    }
+    ordered.sort_unstable_by_key(|event| (event.tick, event.priority, event.order));
+    let messages = ordered
+        .into_iter()
+        .map(|event| ScheduledMidiFrameMessage {
+            frame: event.tick,
+            bytes: event.bytes.to_vec(),
+        })
+        .collect();
+    Ok((messages, loop_frames))
+}
+
 pub fn playlist_playback_messages(
     document: &FlpDocument,
     arrangement_id: u16,
@@ -385,6 +450,96 @@ pub struct MidiPlaylistScheduler {
     worker: Option<JoinHandle<()>>,
 }
 
+pub struct MidiPatternLoopScheduler {
+    stop_sender: Option<Sender<()>>,
+    error_receiver: Receiver<String>,
+    completion_receiver: Receiver<()>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl MidiPatternLoopScheduler {
+    pub fn start(
+        output: ConnectedMidiOutput,
+        messages: Vec<ScheduledMidiFrameMessage>,
+        loop_frames: u64,
+        playback_clock: ProjectPlaybackClock,
+    ) -> Result<Self, String> {
+        if loop_frames == 0 {
+            return Err("Pattern MIDI loop must contain at least one audio frame".to_owned());
+        }
+        if messages.iter().any(|message| message.frame >= loop_frames)
+            || messages
+                .windows(2)
+                .any(|pair| pair[0].frame > pair[1].frame)
+        {
+            return Err("Pattern MIDI messages must be sorted within the audio loop".to_owned());
+        }
+
+        let (stop_sender, stop_receiver) = mpsc::channel();
+        let (error_sender, error_receiver) = mpsc::channel();
+        let (completion_sender, completion_receiver) = mpsc::channel();
+        let worker = thread::Builder::new()
+            .name("Pattern MIDI scheduler".to_owned())
+            .spawn(move || {
+                schedule_midi_pattern_loop(
+                    output,
+                    messages,
+                    loop_frames,
+                    playback_clock,
+                    stop_receiver,
+                    error_sender,
+                    completion_sender,
+                )
+            })
+            .map_err(|error| format!("could not start Pattern MIDI scheduler: {error}"))?;
+
+        Ok(Self {
+            stop_sender: Some(stop_sender),
+            error_receiver,
+            completion_receiver,
+            worker: Some(worker),
+        })
+    }
+
+    pub fn take_error(&self) -> Option<String> {
+        self.error_receiver.try_recv().ok()
+    }
+
+    pub fn is_finished(&self) -> bool {
+        matches!(
+            self.completion_receiver.try_recv(),
+            Ok(()) | Err(mpsc::TryRecvError::Disconnected)
+        )
+    }
+
+    pub fn stop(mut self) -> Result<(), String> {
+        self.shutdown()
+    }
+
+    fn shutdown(&mut self) -> Result<(), String> {
+        if let Some(sender) = self.stop_sender.take() {
+            let _ = sender.send(());
+        }
+        let worker_panicked = self
+            .worker
+            .take()
+            .is_some_and(|worker| worker.join().is_err());
+        if let Ok(error) = self.error_receiver.try_recv() {
+            return Err(error);
+        }
+        if worker_panicked {
+            return Err("Pattern MIDI scheduler stopped unexpectedly".to_owned());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for MidiPatternLoopScheduler {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
+    }
+}
+
 impl MidiPlaylistScheduler {
     pub fn start(
         output: ConnectedMidiOutput,
@@ -525,6 +680,124 @@ fn due_midi_playlist_message_end(
     current_frame: u64,
 ) -> usize {
     start + messages[start..].partition_point(|message| message.frame <= current_frame)
+}
+
+fn schedule_midi_pattern_loop(
+    mut output: ConnectedMidiOutput,
+    messages: Vec<ScheduledMidiFrameMessage>,
+    loop_frames: u64,
+    playback_clock: ProjectPlaybackClock,
+    stop_receiver: Receiver<()>,
+    error_sender: Sender<String>,
+    completion_sender: Sender<()>,
+) {
+    let result = 'scheduler: {
+        let mut next_message = 0;
+        let mut was_active = false;
+        let mut last_cycle = None;
+        let mut last_frame = 0;
+        loop {
+            if midi_playlist_stop_requested(&stop_receiver) {
+                break Ok(());
+            }
+            if !playback_clock.is_active() {
+                if was_active && let Err(error) = output.send_all_notes_off() {
+                    break Err(error);
+                }
+                was_active = false;
+                last_cycle = None;
+                next_message = 0;
+                match stop_receiver.recv_timeout(Duration::from_millis(1)) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break Ok(()),
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                }
+            }
+
+            let current_frame = playback_clock.position_frames();
+            let cycle = current_frame / loop_frames;
+            let phase_frame = current_frame % loop_frames;
+            if !was_active || last_cycle != Some(cycle) || current_frame < last_frame {
+                if let Err(error) = output.send_all_notes_off() {
+                    break Err(error);
+                }
+                for note_on in midi_pattern_active_note_ons(&messages, phase_frame) {
+                    if let Err(error) = output.send(&note_on) {
+                        break 'scheduler Err(error);
+                    }
+                }
+                next_message = messages.partition_point(|message| message.frame < phase_frame);
+                was_active = true;
+                last_cycle = Some(cycle);
+            }
+
+            let due_end = due_midi_playlist_message_end(&messages, next_message, phase_frame);
+            while next_message < due_end {
+                if midi_playlist_stop_requested(&stop_receiver) {
+                    break 'scheduler Ok(());
+                }
+                if let Err(error) = output.send(&messages[next_message].bytes) {
+                    break 'scheduler Err(error);
+                }
+                next_message += 1;
+            }
+            last_frame = current_frame;
+
+            match stop_receiver.recv_timeout(Duration::from_millis(1)) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break Ok(()),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        }
+    };
+
+    let mut errors = Vec::new();
+    if let Err(error) = result {
+        errors.push(error);
+    }
+    if let Err(error) = output.send_all_notes_off() {
+        errors.push(error);
+    }
+    if !errors.is_empty() {
+        let _ = error_sender.send(errors.join("; "));
+    }
+    let _ = completion_sender.send(());
+}
+
+fn midi_pattern_active_note_ons(
+    messages: &[ScheduledMidiFrameMessage],
+    phase_frame: u64,
+) -> Vec<[u8; 3]> {
+    let mut active = Vec::<[u8; 3]>::new();
+    let before_phase = messages.partition_point(|message| message.frame < phase_frame);
+    for message in &messages[..before_phase] {
+        apply_midi_pattern_note_state(&mut active, &message.bytes);
+    }
+    let at_phase_end = messages.partition_point(|message| message.frame <= phase_frame);
+    for message in &messages[before_phase..at_phase_end] {
+        if is_midi_note_off(&message.bytes) {
+            apply_midi_pattern_note_state(&mut active, &message.bytes);
+        }
+    }
+    active
+}
+
+fn apply_midi_pattern_note_state(active: &mut Vec<[u8; 3]>, bytes: &[u8]) {
+    if bytes.len() < 3 {
+        return;
+    }
+    let status = bytes[0] & 0xF0;
+    if status == 0x90 && bytes[2] > 0 {
+        active.push([bytes[0], bytes[1], bytes[2]]);
+    } else if is_midi_note_off(bytes)
+        && let Some(index) = active
+            .iter()
+            .position(|note| note[0] & 0x0F == bytes[0] & 0x0F && note[1] == bytes[1])
+    {
+        active.remove(index);
+    }
+}
+
+fn is_midi_note_off(bytes: &[u8]) -> bool {
+    bytes.len() >= 3 && (bytes[0] & 0xF0 == 0x80 || (bytes[0] & 0xF0 == 0x90 && bytes[2] == 0))
 }
 
 pub struct MidiClockScheduler {
@@ -728,8 +1001,9 @@ mod tests {
 
     use super::{
         ScheduledMidiFrameMessage, all_notes_off_message, due_midi_playlist_message_end,
-        midi_clock_pulse_count_at_tick, midi_clock_pulse_frame, midi_sixteenth_notes_from_tick,
-        midi_song_position_pointer_message, midi_tick_messages, pattern_preview_messages,
+        midi_clock_pulse_count_at_tick, midi_clock_pulse_frame, midi_pattern_active_note_ons,
+        midi_sixteenth_notes_from_tick, midi_song_position_pointer_message, midi_tick_messages,
+        pattern_loop_frame_messages, pattern_preview_messages,
     };
     use flp_rebuild::midi::{MidiChannelMapping, MidiExportNote, MidiExportTrack, MidiFile};
 
@@ -804,6 +1078,87 @@ mod tests {
     fn pattern_preview_rejects_invalid_project_timing() {
         assert!(pattern_preview_messages(&Pattern::default(), 0, 120.0).is_err());
         assert!(pattern_preview_messages(&Pattern::default(), 96, f64::NAN).is_err());
+    }
+
+    #[test]
+    fn pattern_loop_messages_follow_audio_frames_and_wrap_boundary_note_offs() {
+        let pattern = Pattern {
+            notes: vec![
+                PatternNote {
+                    length: 96,
+                    key: 60,
+                    velocity: 96,
+                    ..PatternNote::default()
+                },
+                PatternNote {
+                    position: 24,
+                    length: 24,
+                    key: 64,
+                    velocity: 80,
+                    ..PatternNote::default()
+                },
+            ],
+            ..Pattern::default()
+        };
+
+        let (messages, loop_frames) = pattern_loop_frame_messages(&pattern, 96, 120.0, 48_000, 96)
+            .expect("Pattern messages should use the audio timing map");
+
+        assert_eq!(loop_frames, 24_000);
+        assert_eq!(
+            messages,
+            [
+                ScheduledMidiFrameMessage {
+                    frame: 0,
+                    bytes: vec![0x80, 60, 64],
+                },
+                ScheduledMidiFrameMessage {
+                    frame: 0,
+                    bytes: vec![0x90, 60, 96],
+                },
+                ScheduledMidiFrameMessage {
+                    frame: 6_000,
+                    bytes: vec![0x90, 64, 80],
+                },
+                ScheduledMidiFrameMessage {
+                    frame: 12_000,
+                    bytes: vec![0x80, 64, 64],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn pattern_loop_resume_restores_notes_held_at_the_audio_phase() {
+        let messages = [
+            ScheduledMidiFrameMessage {
+                frame: 10,
+                bytes: vec![0x91, 60, 90],
+            },
+            ScheduledMidiFrameMessage {
+                frame: 20,
+                bytes: vec![0x81, 60, 64],
+            },
+            ScheduledMidiFrameMessage {
+                frame: 30,
+                bytes: vec![0x91, 64, 80],
+            },
+            ScheduledMidiFrameMessage {
+                frame: 40,
+                bytes: vec![0x81, 64, 64],
+            },
+        ];
+
+        assert_eq!(
+            midi_pattern_active_note_ons(&messages, 15),
+            [[0x91, 60, 90]]
+        );
+        assert!(midi_pattern_active_note_ons(&messages, 20).is_empty());
+        assert!(midi_pattern_active_note_ons(&messages, 30).is_empty());
+        assert_eq!(
+            midi_pattern_active_note_ons(&messages, 35),
+            [[0x91, 64, 80]]
+        );
     }
 
     fn midi_file_with_notes(notes: Vec<MidiExportNote>) -> MidiFile {
