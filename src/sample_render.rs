@@ -8503,6 +8503,167 @@ fn sample_source_bounds_at_project_tempo(
     sample_source_bounds_with_timing(clip, audio, clip_index, Some((ppq, base_tempo_bpm)))
 }
 
+/// Finds the nearest Audio Clip source zero crossing within ten milliseconds of a Playlist tick.
+/// The returned tick is suitable for `split_playlist_audio_clip`; `None` means no crossing was
+/// close enough and the caller should keep the requested tick.
+pub fn nearest_playlist_audio_clip_zero_crossing_tick(
+    document: &FlpDocument,
+    project_path: &Path,
+    arrangement_id: u16,
+    clip_index: usize,
+    requested_tick: u32,
+) -> Result<Option<u32>, String> {
+    let arrangements = document.arrangements().map_err(|error| error.to_string())?;
+    let mut matching_arrangements = arrangements
+        .iter()
+        .filter(|arrangement| arrangement.id == arrangement_id);
+    let Some(arrangement) = matching_arrangements.next() else {
+        return Err("the requested Playlist arrangement does not exist".to_owned());
+    };
+    if matching_arrangements.next().is_some() {
+        return Err("the requested Playlist arrangement is ambiguous".to_owned());
+    }
+    let Some(clip) = arrangement.clips.get(clip_index) else {
+        return Err("the requested Playlist Audio Clip does not exist".to_owned());
+    };
+    let PlaylistClipTarget::Channel { id: channel_id } = clip.target() else {
+        return Err("zero-crossing splits apply to Playlist Audio Clips".to_owned());
+    };
+    let channels = document.channels();
+    let mut matching_channels = channels.iter().filter(|channel| channel.id() == channel_id);
+    let Some(channel) = matching_channels.next() else {
+        return Err("the Playlist Audio Clip channel does not exist".to_owned());
+    };
+    if matching_channels.next().is_some() || channel.kind() != Some(4) {
+        return Err("the Playlist clip does not target one Audio Clip channel".to_owned());
+    }
+    if clip
+        .scale
+        .is_some_and(|scale| !scale.is_finite() || (scale - 1.0).abs() > 1e-9)
+    {
+        return Err("zero-crossing splits require the default Audio Clip scale".to_owned());
+    }
+    let relative_tick = requested_tick
+        .checked_sub(clip.position_ticks)
+        .filter(|tick| *tick > 0 && *tick < clip.length_ticks)
+        .ok_or_else(|| "the requested split point must be inside the Audio Clip".to_owned())?;
+    let ppq = document.header().ppq();
+    let tempo_bpm = document.metadata().tempo_bpm().unwrap_or(140.0);
+    if ppq == 0 || !tempo_bpm.is_finite() || tempo_bpm <= 0.0 {
+        return Err("zero-crossing splits require a valid project tempo and PPQ".to_owned());
+    }
+    let clip_end_tick = clip
+        .position_ticks
+        .checked_add(clip.length_ticks)
+        .ok_or_else(|| "the Audio Clip timeline range overflows".to_owned())?;
+    let tempo_channel_ids = channels
+        .iter()
+        .filter(|candidate| {
+            candidate.kind() == Some(5)
+                && candidate
+                    .display_name()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("TEMPO"))
+        })
+        .map(ChannelSummary::id)
+        .collect::<BTreeSet<_>>();
+    if arrangement.clips.iter().any(|candidate| {
+        let PlaylistClipTarget::Channel { id } = candidate.target() else {
+            return false;
+        };
+        tempo_channel_ids.contains(&id)
+            && candidate.position_ticks < clip_end_tick
+            && candidate
+                .position_ticks
+                .saturating_add(candidate.length_ticks)
+                > clip.position_ticks
+    }) {
+        return Err(
+            "zero-crossing splits across Playlist tempo automation are unsupported".to_owned(),
+        );
+    }
+    let sample_path = channel
+        .sample_path()
+        .ok_or_else(|| "the Audio Clip channel has no sample path".to_owned())?;
+    let resolved_path = SamplePathResolver::new(project_path)
+        .resolve(sample_path)
+        .map_err(|error| format!("could not resolve the Audio Clip sample: {error}"))?;
+    let audio = decode_audio_file(&resolved_path)?;
+    if audio.channels.is_empty() || audio.channels.len() > 2 || audio.sample_rate == 0 {
+        return Err("zero-crossing splits support mono or stereo sample files".to_owned());
+    }
+    let source_bounds =
+        sample_source_bounds_at_project_tempo(clip, &audio, clip_index, ppq, tempo_bpm)?;
+    if audio
+        .channels
+        .iter()
+        .any(|channel_samples| channel_samples.len() < source_bounds.end)
+    {
+        return Err("the Audio Clip sample has inconsistent channel lengths".to_owned());
+    }
+    let desired_frame = source_bounds.start as f64
+        + f64::from(relative_tick) * f64::from(audio.sample_rate) * 60.0
+            / (f64::from(ppq) * tempo_bpm);
+    let search_radius = (f64::from(audio.sample_rate) * 0.010).ceil().max(1.0) as usize;
+    let desired_frame = desired_frame.round().clamp(0.0, usize::MAX as f64) as usize;
+    let first_frame = desired_frame
+        .saturating_sub(search_radius)
+        .max(source_bounds.start.saturating_add(1));
+    let last_frame = desired_frame
+        .saturating_add(search_radius)
+        .min(source_bounds.end.saturating_sub(1));
+    let is_zero_crossing = |left: f32, right: f32| {
+        left.is_finite()
+            && right.is_finite()
+            && ((left <= 0.0 && right >= 0.0) || (left >= 0.0 && right <= 0.0))
+    };
+    let mut nearest = None::<(usize, usize, f32, usize)>;
+    for frame in first_frame..=last_frame {
+        let mut crossing_channels = 0usize;
+        let mut peak_amplitude = 0.0f32;
+        for channel_samples in &audio.channels {
+            let left = channel_samples[frame - 1];
+            let right = channel_samples[frame];
+            crossing_channels += usize::from(is_zero_crossing(left, right));
+            peak_amplitude = peak_amplitude.max(left.abs()).max(right.abs());
+        }
+        if crossing_channels == 0 {
+            continue;
+        }
+        let distance = frame.abs_diff(desired_frame);
+        let candidate = (
+            audio.channels.len().saturating_sub(crossing_channels),
+            distance,
+            peak_amplitude,
+            frame,
+        );
+        if nearest.is_none_or(|current| {
+            candidate.0 < current.0
+                || (candidate.0 == current.0
+                    && (candidate.1 < current.1
+                        || (candidate.1 == current.1 && candidate.2.total_cmp(&current.2).is_lt())))
+        }) {
+            nearest = Some(candidate);
+        }
+    }
+    let Some((_, _, _, crossing_frame)) = nearest else {
+        return Ok(None);
+    };
+    let frames_per_tick = f64::from(audio.sample_rate) * 60.0 / (f64::from(ppq) * tempo_bpm);
+    let source_offset_frames = crossing_frame.saturating_sub(source_bounds.start) as f64;
+    let crossing_offset_ticks = (source_offset_frames / frames_per_tick).round();
+    if !crossing_offset_ticks.is_finite()
+        || crossing_offset_ticks < 1.0
+        || crossing_offset_ticks >= f64::from(clip.length_ticks)
+    {
+        return Ok(None);
+    }
+    let crossing_tick = clip
+        .position_ticks
+        .checked_add(crossing_offset_ticks as u32)
+        .filter(|tick| *tick > clip.position_ticks && *tick < clip_end_tick);
+    Ok(crossing_tick)
+}
+
 fn sample_source_bounds_with_timing(
     clip: &PlaylistClip,
     audio: &DecodedAudio,
