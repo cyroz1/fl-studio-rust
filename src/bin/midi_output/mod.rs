@@ -1,10 +1,14 @@
 use std::collections::BTreeMap;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use flp_rebuild::audio::ProjectPlaybackClock;
 use flp_rebuild::midi::{
     MidiChannelMapping, MidiEventKind, MidiFile, fl_note_release_to_midi_velocity,
 };
+use flp_rebuild::sample_render::PlaylistTempoMap;
 use flp_rebuild::{FlpDocument, Pattern};
 use midir::{MidiOutput, MidiOutputConnection as MidirOutputConnection};
 
@@ -368,6 +372,194 @@ impl Drop for SharedMidiOutputConnection {
     }
 }
 
+pub struct MidiClockScheduler {
+    stop_sender: Option<Sender<()>>,
+    error_receiver: Receiver<String>,
+    worker: Option<JoinHandle<()>>,
+}
+
+struct MidiClockSchedule {
+    tempo_map: PlaylistTempoMap,
+    sample_rate: u32,
+    ppq: u16,
+    next_pulse_index: u64,
+    playback_clock: ProjectPlaybackClock,
+    stop_receiver: Receiver<()>,
+    error_sender: Sender<String>,
+}
+
+impl MidiClockScheduler {
+    pub fn start(
+        mut output: ConnectedMidiOutput,
+        resume: bool,
+        current_tick: f64,
+        sample_rate: u32,
+        ppq: u16,
+        tempo_map: PlaylistTempoMap,
+        playback_clock: ProjectPlaybackClock,
+    ) -> Result<Self, String> {
+        if ppq == 0 || sample_rate == 0 || !current_tick.is_finite() || current_tick < 0.0 {
+            return Err(
+                "MIDI clock requires a valid Playlist position and audio timing".to_owned(),
+            );
+        }
+        let next_pulse_index = midi_clock_pulse_count_at_tick(current_tick, ppq).saturating_add(1);
+        let result = if resume || current_tick > 0.0 {
+            output
+                .send(&midi_song_position_pointer_message(
+                    midi_sixteenth_notes_from_tick(current_tick, ppq),
+                ))
+                .and_then(|()| output.send(&MIDI_CONTINUE))
+        } else {
+            output.send(&MIDI_START)
+        };
+        result?;
+
+        let worker_output = output.clone();
+        let (stop_sender, stop_receiver) = mpsc::channel();
+        let (error_sender, error_receiver) = mpsc::channel();
+        let worker = thread::Builder::new()
+            .name("MIDI clock scheduler".to_owned())
+            .spawn(move || {
+                schedule_midi_clock(
+                    worker_output,
+                    MidiClockSchedule {
+                        tempo_map,
+                        sample_rate,
+                        ppq,
+                        next_pulse_index,
+                        playback_clock,
+                        stop_receiver,
+                        error_sender,
+                    },
+                )
+            });
+        let worker = match worker {
+            Ok(worker) => worker,
+            Err(error) => {
+                let _ = output.send(&MIDI_STOP);
+                return Err(format!("could not start MIDI clock scheduler: {error}"));
+            }
+        };
+
+        Ok(Self {
+            stop_sender: Some(stop_sender),
+            error_receiver,
+            worker: Some(worker),
+        })
+    }
+
+    pub fn take_error(&self) -> Option<String> {
+        self.error_receiver.try_recv().ok()
+    }
+
+    pub fn stop(mut self) -> Result<(), String> {
+        self.shutdown()
+    }
+
+    fn shutdown(&mut self) -> Result<(), String> {
+        if let Some(sender) = self.stop_sender.take() {
+            let _ = sender.send(());
+        }
+        let worker_panicked = self
+            .worker
+            .take()
+            .is_some_and(|worker| worker.join().is_err());
+        if let Ok(error) = self.error_receiver.try_recv() {
+            return Err(error);
+        }
+        if worker_panicked {
+            return Err("MIDI clock scheduler stopped unexpectedly".to_owned());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for MidiClockScheduler {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
+    }
+}
+
+fn schedule_midi_clock(mut output: ConnectedMidiOutput, schedule: MidiClockSchedule) {
+    let MidiClockSchedule {
+        tempo_map,
+        sample_rate,
+        ppq,
+        mut next_pulse_index,
+        playback_clock,
+        stop_receiver,
+        error_sender,
+    } = schedule;
+    loop {
+        if !playback_clock.is_active() {
+            stop_clock_output(&mut output, &error_sender);
+            return;
+        }
+        let current_frame = playback_clock.position_frames();
+        let mut sent = 0;
+        while sent < 4 {
+            let pulse_frame =
+                match midi_clock_pulse_frame(&tempo_map, next_pulse_index, sample_rate, ppq) {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        stop_clock_output(&mut output, &error_sender);
+                        let _ = error_sender.send(error);
+                        return;
+                    }
+                };
+            if pulse_frame > current_frame {
+                break;
+            }
+            if let Err(error) = output.send(&MIDI_CLOCK_TICK) {
+                stop_clock_output(&mut output, &error_sender);
+                let _ = error_sender.send(error);
+                return;
+            }
+            let Some(next_index) = next_pulse_index.checked_add(1) else {
+                stop_clock_output(&mut output, &error_sender);
+                let _ = error_sender.send("MIDI clock pulse index overflowed".to_owned());
+                return;
+            };
+            next_pulse_index = next_index;
+            sent += 1;
+        }
+        if sent == 4
+            && let Some(current_tick) = tempo_map.tick_at_frame(current_frame, sample_rate)
+        {
+            next_pulse_index = next_pulse_index
+                .max(midi_clock_pulse_count_at_tick(current_tick, ppq).saturating_add(1));
+        }
+
+        match stop_receiver.recv_timeout(Duration::from_millis(1)) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                stop_clock_output(&mut output, &error_sender);
+                return;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
+fn stop_clock_output(output: &mut ConnectedMidiOutput, error_sender: &Sender<String>) {
+    if let Err(error) = output.send(&MIDI_STOP) {
+        let _ = error_sender.send(error);
+    }
+}
+
+fn midi_clock_pulse_frame(
+    tempo_map: &PlaylistTempoMap,
+    pulse_index: u64,
+    sample_rate: u32,
+    ppq: u16,
+) -> Result<u64, String> {
+    if ppq == 0 {
+        return Err("MIDI clock requires a non-zero project PPQ".to_owned());
+    }
+    let tick = pulse_index as f64 * f64::from(ppq) / 24.0;
+    tempo_map.frame_at_fractional_tick(tick, sample_rate)
+}
+
 fn all_notes_off_message(channel: u8) -> [u8; 3] {
     [0xB0 | (channel & 0x0F), 123, 0]
 }
@@ -376,11 +568,13 @@ fn all_notes_off_message(channel: u8) -> [u8; 3] {
 mod tests {
     use std::time::Duration;
 
+    use flp_rebuild::sample_render::PlaylistTempoMap;
     use flp_rebuild::{Pattern, PatternNote};
 
     use super::{
-        all_notes_off_message, midi_clock_pulse_count_at_tick, midi_sixteenth_notes_from_tick,
-        midi_song_position_pointer_message, midi_tick_messages, pattern_preview_messages,
+        all_notes_off_message, midi_clock_pulse_count_at_tick, midi_clock_pulse_frame,
+        midi_sixteenth_notes_from_tick, midi_song_position_pointer_message, midi_tick_messages,
+        pattern_preview_messages,
     };
     use flp_rebuild::midi::{MidiChannelMapping, MidiExportNote, MidiExportTrack, MidiFile};
 
@@ -606,6 +800,20 @@ mod tests {
         assert_eq!(midi_clock_pulse_count_at_tick(96.0, 96), 24);
         assert_eq!(midi_clock_pulse_count_at_tick(f64::NAN, 96), 0);
         assert_eq!(midi_clock_pulse_count_at_tick(96.0, 0), 0);
+    }
+
+    #[test]
+    fn midi_clock_pulse_frames_follow_project_tempo_and_ppq() {
+        let tempo_map = PlaylistTempoMap::constant(96, 120.0).unwrap();
+
+        assert_eq!(
+            midi_clock_pulse_frame(&tempo_map, 1, 48_000, 96).unwrap(),
+            1_000
+        );
+        assert_eq!(
+            midi_clock_pulse_frame(&tempo_map, 24, 48_000, 96).unwrap(),
+            24_000
+        );
     }
 
     #[test]

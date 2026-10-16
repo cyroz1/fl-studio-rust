@@ -899,6 +899,22 @@ pub struct AudioEngine {
     exclusive_threads: Vec<std::thread::JoinHandle<()>>,
 }
 
+/// A lock-free view of the current Playlist playback frame for realtime schedulers.
+#[derive(Clone)]
+pub struct ProjectPlaybackClock {
+    playback: Arc<PlaybackState>,
+}
+
+impl ProjectPlaybackClock {
+    pub fn position_frames(&self) -> u64 {
+        self.playback.position_frames()
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.playback.is_active()
+    }
+}
+
 impl AudioEngine {
     pub fn start(settings: &AudioSettings) -> Result<Self, String> {
         validate_settings(settings)?;
@@ -1106,6 +1122,13 @@ impl AudioEngine {
     /// Current song position in device frames, including a streaming seek offset when present.
     pub fn project_playback_position_frames(&self) -> u64 {
         self.playback.position_frames()
+    }
+
+    /// Clone a lock-free playback clock for a realtime MIDI or metering worker.
+    pub fn project_playback_clock(&self) -> ProjectPlaybackClock {
+        ProjectPlaybackClock {
+            playback: Arc::clone(&self.playback),
+        }
     }
 
     pub fn input_peak(&self) -> f32 {
@@ -2506,15 +2529,16 @@ impl WasapiSampleSpec {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU8, Ordering};
 
     use super::{
         AUDIO_COMMAND_QUEUE_CAPACITY, AUDIO_SOURCE_INPUT_MONITOR, AUDIO_SOURCE_PROJECT,
         AUDIO_SOURCE_SILENT, AUDIO_SOURCE_STREAM, AUDIO_SOURCE_TEST_TONE, AudioAccess,
         AudioInputRecording, AudioRingBuffer, AudioSettings, InputRecordingState, ParameterCommand,
-        PlaybackState, StereoFrameDelay, TransportCommand, enable_denormal_protection,
-        next_output_frame, output_gain_smoothing_alpha, sanitize_output_sample, smooth_output_gain,
-        tone_sample, validate_settings,
+        PlaybackState, ProjectPlaybackClock, StereoFrameDelay, TransportCommand,
+        enable_denormal_protection, next_output_frame, output_gain_smoothing_alpha,
+        sanitize_output_sample, smooth_output_gain, tone_sample, validate_settings,
     };
 
     #[test]
@@ -2610,6 +2634,24 @@ mod tests {
         assert_eq!(settings.output_gain, 1.0);
         assert_eq!(settings.sample_rate, 48_000);
         assert_eq!(settings.buffer_frames, 256);
+    }
+
+    #[test]
+    fn playback_clock_reads_position_and_active_state_from_audio_transport() {
+        let playback = Arc::new(PlaybackState::new());
+        let clock = ProjectPlaybackClock {
+            playback: Arc::clone(&playback),
+        };
+        assert!(!clock.is_active());
+        assert_eq!(clock.position_frames(), 0);
+
+        playback.start(Vec::new());
+        playback.cursor_frames.store(480, Ordering::Release);
+        assert!(clock.is_active());
+        assert_eq!(clock.position_frames(), 480);
+
+        playback.pause();
+        assert!(!clock.is_active());
     }
 
     #[test]
