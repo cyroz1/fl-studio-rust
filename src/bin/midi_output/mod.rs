@@ -26,6 +26,12 @@ pub struct ScheduledMidiTickMessage {
     pub bytes: Vec<u8>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScheduledMidiFrameMessage {
+    pub frame: u64,
+    pub bytes: Vec<u8>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct OrderedMidiMessage {
     tick: u64,
@@ -372,6 +378,155 @@ impl Drop for SharedMidiOutputConnection {
     }
 }
 
+pub struct MidiPlaylistScheduler {
+    stop_sender: Option<Sender<()>>,
+    error_receiver: Receiver<String>,
+    completion_receiver: Receiver<()>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl MidiPlaylistScheduler {
+    pub fn start(
+        output: ConnectedMidiOutput,
+        messages: Vec<ScheduledMidiFrameMessage>,
+        playback_clock: ProjectPlaybackClock,
+    ) -> Result<Self, String> {
+        if messages
+            .windows(2)
+            .any(|pair| pair[0].frame > pair[1].frame)
+        {
+            return Err("Playlist MIDI messages must be sorted by audio frame".to_owned());
+        }
+
+        let (stop_sender, stop_receiver) = mpsc::channel();
+        let (error_sender, error_receiver) = mpsc::channel();
+        let (completion_sender, completion_receiver) = mpsc::channel();
+        let worker = thread::Builder::new()
+            .name("Playlist MIDI scheduler".to_owned())
+            .spawn(move || {
+                schedule_midi_playlist(
+                    output,
+                    messages,
+                    playback_clock,
+                    stop_receiver,
+                    error_sender,
+                    completion_sender,
+                )
+            })
+            .map_err(|error| format!("could not start Playlist MIDI scheduler: {error}"))?;
+
+        Ok(Self {
+            stop_sender: Some(stop_sender),
+            error_receiver,
+            completion_receiver,
+            worker: Some(worker),
+        })
+    }
+
+    pub fn take_error(&self) -> Option<String> {
+        self.error_receiver.try_recv().ok()
+    }
+
+    pub fn is_finished(&self) -> bool {
+        matches!(
+            self.completion_receiver.try_recv(),
+            Ok(()) | Err(mpsc::TryRecvError::Disconnected)
+        )
+    }
+
+    pub fn stop(mut self) -> Result<(), String> {
+        self.shutdown()
+    }
+
+    fn shutdown(&mut self) -> Result<(), String> {
+        if let Some(sender) = self.stop_sender.take() {
+            let _ = sender.send(());
+        }
+        let worker_panicked = self
+            .worker
+            .take()
+            .is_some_and(|worker| worker.join().is_err());
+        if let Ok(error) = self.error_receiver.try_recv() {
+            return Err(error);
+        }
+        if worker_panicked {
+            return Err("Playlist MIDI scheduler stopped unexpectedly".to_owned());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for MidiPlaylistScheduler {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
+    }
+}
+
+fn schedule_midi_playlist(
+    mut output: ConnectedMidiOutput,
+    messages: Vec<ScheduledMidiFrameMessage>,
+    playback_clock: ProjectPlaybackClock,
+    stop_receiver: Receiver<()>,
+    error_sender: Sender<String>,
+    completion_sender: Sender<()>,
+) {
+    let result = 'scheduler: {
+        let mut next_message = 0;
+        loop {
+            if midi_playlist_stop_requested(&stop_receiver) || !playback_clock.is_active() {
+                break Ok(());
+            }
+
+            let current_frame = playback_clock.position_frames();
+            let due_end = due_midi_playlist_message_end(&messages, next_message, current_frame);
+            while next_message < due_end {
+                if midi_playlist_stop_requested(&stop_receiver) {
+                    break 'scheduler Ok(());
+                }
+                if let Err(error) = output.send(&messages[next_message].bytes) {
+                    break 'scheduler Err(error);
+                }
+                next_message += 1;
+            }
+            if next_message == messages.len() {
+                break Ok(());
+            }
+
+            match stop_receiver.recv_timeout(Duration::from_millis(1)) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break Ok(()),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        }
+    };
+
+    let mut errors = Vec::new();
+    if let Err(error) = result {
+        errors.push(error);
+    }
+    if let Err(error) = output.send_all_notes_off() {
+        errors.push(error);
+    }
+    if !errors.is_empty() {
+        let _ = error_sender.send(errors.join("; "));
+    }
+    let _ = completion_sender.send(());
+}
+
+fn midi_playlist_stop_requested(stop_receiver: &Receiver<()>) -> bool {
+    matches!(
+        stop_receiver.try_recv(),
+        Ok(()) | Err(mpsc::TryRecvError::Disconnected)
+    )
+}
+
+fn due_midi_playlist_message_end(
+    messages: &[ScheduledMidiFrameMessage],
+    start: usize,
+    current_frame: u64,
+) -> usize {
+    start + messages[start..].partition_point(|message| message.frame <= current_frame)
+}
+
 pub struct MidiClockScheduler {
     stop_sender: Option<Sender<()>>,
     error_receiver: Receiver<String>,
@@ -572,9 +727,9 @@ mod tests {
     use flp_rebuild::{Pattern, PatternNote};
 
     use super::{
-        all_notes_off_message, midi_clock_pulse_count_at_tick, midi_clock_pulse_frame,
-        midi_sixteenth_notes_from_tick, midi_song_position_pointer_message, midi_tick_messages,
-        pattern_preview_messages,
+        ScheduledMidiFrameMessage, all_notes_off_message, due_midi_playlist_message_end,
+        midi_clock_pulse_count_at_tick, midi_clock_pulse_frame, midi_sixteenth_notes_from_tick,
+        midi_song_position_pointer_message, midi_tick_messages, pattern_preview_messages,
     };
     use flp_rebuild::midi::{MidiChannelMapping, MidiExportNote, MidiExportTrack, MidiFile};
 
@@ -814,6 +969,34 @@ mod tests {
             midi_clock_pulse_frame(&tempo_map, 24, 48_000, 96).unwrap(),
             24_000
         );
+    }
+
+    #[test]
+    fn playlist_midi_scheduler_groups_due_messages_by_audio_frame() {
+        let messages = [
+            ScheduledMidiFrameMessage {
+                frame: 10,
+                bytes: vec![0x90, 60, 100],
+            },
+            ScheduledMidiFrameMessage {
+                frame: 20,
+                bytes: vec![0x80, 60, 0],
+            },
+            ScheduledMidiFrameMessage {
+                frame: 20,
+                bytes: vec![0xB0, 10, 64],
+            },
+            ScheduledMidiFrameMessage {
+                frame: 50,
+                bytes: vec![0x90, 64, 100],
+            },
+        ];
+
+        assert_eq!(due_midi_playlist_message_end(&messages, 0, 9), 0);
+        assert_eq!(due_midi_playlist_message_end(&messages, 0, 10), 1);
+        assert_eq!(due_midi_playlist_message_end(&messages, 1, 20), 3);
+        assert_eq!(due_midi_playlist_message_end(&messages, 3, 49), 3);
+        assert_eq!(due_midi_playlist_message_end(&messages, 3, 50), 4);
     }
 
     #[test]

@@ -78,8 +78,9 @@ use midi_input::{
 };
 use midi_output::{
     ConnectedMidiOutput, MIDI_TEST_NOTE_OFF, MIDI_TEST_NOTE_ON, MidiClockScheduler,
-    MidiOutputDevice, ScheduledMidiMessage, ScheduledMidiTickMessage, connect_output_device,
-    enumerate_output_devices, pattern_preview_messages, playlist_playback_messages,
+    MidiOutputDevice, MidiPlaylistScheduler, ScheduledMidiFrameMessage, ScheduledMidiMessage,
+    ScheduledMidiTickMessage, connect_output_device, enumerate_output_devices,
+    pattern_preview_messages, playlist_playback_messages,
 };
 use midi_thru::{MidiThruSettings, MidiThruWorker};
 
@@ -96,7 +97,6 @@ const BLUE: Color32 = Color32::from_rgb(59, 99, 251);
 const BLUE_TEXT: Color32 = Color32::from_rgb(86, 129, 255);
 const BLUE_SELECTION: Color32 = Color32::from_rgb(14, 23, 63);
 const RED_SELECTION: Color32 = Color32::from_rgb(62, 22, 20);
-const MIDI_PLAYLIST_MESSAGES_PER_UPDATE: usize = 256;
 const PLAYLIST_LABEL_WIDTH: f32 = 178.0;
 const PURPLE: Color32 = Color32::from_rgb(150, 93, 181);
 const ORANGE: Color32 = Color32::from_rgb(195, 129, 61);
@@ -3709,15 +3709,9 @@ struct ActiveMidiPatternPlayback {
     next_message: usize,
 }
 
-struct ScheduledMidiFrameMessage {
-    frame: u64,
-    bytes: Vec<u8>,
-}
-
 struct ActiveMidiPlaylistPlayback {
     arrangement_id: u16,
-    messages: Vec<ScheduledMidiFrameMessage>,
-    next_message: usize,
+    scheduler: MidiPlaylistScheduler,
 }
 
 struct PerformanceLaunchContext<'a> {
@@ -34949,6 +34943,7 @@ impl DawUi {
         if !self.midi_output_send_playlist_notes || self.midi_output_connection.is_none() {
             return;
         }
+        self.stop_midi_playlist_playback();
         let result =
             (|| {
                 let document = self.document.as_ref().ok_or_else(|| {
@@ -34978,17 +34973,38 @@ impl DawUi {
                     .collect::<Result<Vec<_>, String>>()
             })();
         match result {
-            Ok(messages) if messages.is_empty() => {
-                self.midi_playlist_playback = None;
-                self.midi_output_error = None;
-            }
+            Ok(messages) if messages.is_empty() => self.midi_output_error = None,
             Ok(messages) => {
-                self.midi_playlist_playback = Some(ActiveMidiPlaylistPlayback {
-                    arrangement_id,
-                    messages,
-                    next_message: 0,
-                });
-                self.midi_output_error = None;
+                let output = self.midi_output_connection.as_ref().cloned();
+                let playback_clock = self
+                    .audio_engine
+                    .as_ref()
+                    .map(AudioEngine::project_playback_clock);
+                match (output, playback_clock) {
+                    (Some(output), Some(playback_clock)) => {
+                        match MidiPlaylistScheduler::start(output, messages, playback_clock) {
+                            Ok(scheduler) => {
+                                self.midi_playlist_playback = Some(ActiveMidiPlaylistPlayback {
+                                    arrangement_id,
+                                    scheduler,
+                                });
+                                self.midi_output_error = None;
+                            }
+                            Err(error) => {
+                                self.midi_playlist_playback = None;
+                                self.midi_output_error = Some(error.clone());
+                                self.status =
+                                    format!("Could not start Playlist MIDI scheduler: {error}");
+                            }
+                        }
+                    }
+                    _ => {
+                        self.midi_playlist_playback = None;
+                        let error = "Audio timing or MIDI output is unavailable".to_owned();
+                        self.midi_output_error = Some(error.clone());
+                        self.status = format!("Could not start Playlist MIDI scheduler: {error}");
+                    }
+                }
             }
             Err(error) => {
                 self.midi_playlist_playback = None;
@@ -35020,14 +35036,10 @@ impl DawUi {
         let Some(playback) = self.midi_playlist_playback.take() else {
             return;
         };
-        if let Some(connection) = self.midi_output_connection.as_mut()
-            && let Err(error) = connection.send_all_notes_off()
-        {
+        let arrangement_id = playback.arrangement_id;
+        if let Err(error) = playback.scheduler.stop() {
             self.midi_output_error = Some(error.clone());
-            self.status = format!(
-                "Stopped Arrangement {} MIDI playback; All Notes Off failed: {error}",
-                playback.arrangement_id
-            );
+            self.status = format!("Stopped Arrangement {arrangement_id} MIDI playback: {error}");
         }
     }
 
@@ -35035,64 +35047,29 @@ impl DawUi {
         if self.midi_playlist_playback.is_none() {
             return;
         }
-        if !self.playing || !self.playlist_playback_loaded {
+        if !self.midi_output_send_playlist_notes || !self.playing || !self.playlist_playback_loaded
+        {
             self.stop_midi_playlist_playback();
             return;
         }
-        let Some(current_frame) = self
-            .audio_engine
-            .as_ref()
-            .map(AudioEngine::project_playback_position_frames)
-        else {
+        if self.audio_engine.is_none() {
             self.stop_midi_playlist_playback();
             self.midi_output_error =
                 Some("Audio position was lost during MIDI playback".to_owned());
             return;
-        };
-        let mut send_error = None;
-        let mut completed_arrangement = None;
-        if let (Some(playback), Some(connection)) = (
-            self.midi_playlist_playback.as_mut(),
-            self.midi_output_connection.as_mut(),
-        ) {
-            let mut sent = 0;
-            while let Some(message) = playback.messages.get(playback.next_message) {
-                if message.frame > current_frame || sent >= MIDI_PLAYLIST_MESSAGES_PER_UPDATE {
-                    break;
-                }
-                if let Err(error) = connection.send(&message.bytes) {
-                    send_error = Some(error);
-                    break;
-                }
-                playback.next_message += 1;
-                sent += 1;
-            }
-            if send_error.is_none() && playback.next_message == playback.messages.len() {
-                completed_arrangement = Some(playback.arrangement_id);
-            }
-        } else {
-            send_error = Some("MIDI output disconnected during Playlist playback".to_owned());
         }
-
-        if let Some(error) = send_error {
+        let Some(playback) = self.midi_playlist_playback.as_ref() else {
+            return;
+        };
+        let arrangement_id = playback.arrangement_id;
+        let error = playback.scheduler.take_error();
+        let finished = playback.scheduler.is_finished();
+        if let Some(error) = error {
             self.midi_playlist_playback = None;
-            if let Some(connection) = self.midi_output_connection.as_mut() {
-                let _ = connection.send_all_notes_off();
-            }
             self.midi_output_error = Some(error.clone());
-            self.status = format!("Playlist MIDI playback stopped: {error}");
-        } else if let Some(arrangement_id) = completed_arrangement {
+            self.status = format!("Arrangement {arrangement_id} MIDI playback stopped: {error}");
+        } else if finished {
             self.midi_playlist_playback = None;
-            let cleanup_error = self
-                .midi_output_connection
-                .as_mut()
-                .and_then(|connection| connection.send_all_notes_off().err());
-            if let Some(error) = cleanup_error {
-                self.midi_output_error = Some(error.clone());
-                self.status = format!(
-                    "Arrangement {arrangement_id} MIDI playback finished; All Notes Off failed: {error}"
-                );
-            }
         }
     }
 
@@ -39304,12 +39281,11 @@ impl eframe::App for DawUi {
             || self.midi_playlist_playback.is_some()
             || self.midi_output_clock.is_some()
         {
-            let repaint_delay =
-                if self.midi_pattern_playback.is_some() || self.midi_playlist_playback.is_some() {
-                    Duration::from_millis(5)
-                } else {
-                    Duration::from_millis(33)
-                };
+            let repaint_delay = if self.midi_pattern_playback.is_some() {
+                Duration::from_millis(5)
+            } else {
+                Duration::from_millis(33)
+            };
             ui.ctx().request_repaint_after(repaint_delay);
         }
         let width = ui.available_width();
