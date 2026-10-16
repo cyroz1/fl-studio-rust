@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use flp_rebuild::midi::{
@@ -42,10 +43,15 @@ pub struct MidiOutputDevice {
     pub name: String,
 }
 
+#[derive(Clone)]
 pub struct ConnectedMidiOutput {
-    connection: MidirOutputConnection,
+    connection: Arc<SharedMidiOutputConnection>,
     pub device_id: String,
     pub device_name: String,
+}
+
+struct SharedMidiOutputConnection {
+    connection: Mutex<MidirOutputConnection>,
 }
 
 pub const MIDI_TEST_NOTE_ON: [u8; 3] = [0x90, 60, 96];
@@ -309,7 +315,9 @@ pub fn connect_output_device(device_id: &str) -> Result<ConnectedMidiOutput, Str
         .connect(&port, "FL Studio Rebuild")
         .map_err(|error| format!("could not connect to MIDI output: {error}"))?;
     Ok(ConnectedMidiOutput {
-        connection,
+        connection: Arc::new(SharedMidiOutputConnection {
+            connection: Mutex::new(connection),
+        }),
         device_id: device_id.to_owned(),
         device_name,
     })
@@ -318,14 +326,24 @@ pub fn connect_output_device(device_id: &str) -> Result<ConnectedMidiOutput, Str
 impl ConnectedMidiOutput {
     pub fn send(&mut self, message: &[u8]) -> Result<(), String> {
         self.connection
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .send(message)
             .map_err(|error| format!("could not send MIDI output: {error}"))
     }
 
     pub fn send_all_notes_off(&mut self) -> Result<(), String> {
+        let mut connection = self
+            .connection
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut first_error = None;
         for channel in 0..16 {
-            if let Err(error) = self.send(&all_notes_off_message(channel))
+            if let Err(error) = connection
+                .send(&all_notes_off_message(channel))
+                .map_err(|error| format!("could not send MIDI output: {error}"))
                 && first_error.is_none()
             {
                 first_error = Some(error);
@@ -338,9 +356,15 @@ impl ConnectedMidiOutput {
     }
 }
 
-impl Drop for ConnectedMidiOutput {
+impl Drop for SharedMidiOutputConnection {
     fn drop(&mut self) {
-        let _ = self.send_all_notes_off();
+        let connection = self
+            .connection
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for channel in 0..16 {
+            let _ = connection.send(&all_notes_off_message(channel));
+        }
     }
 }
 
