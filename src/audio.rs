@@ -44,6 +44,7 @@ pub struct MixerTrackPeakMeters {
     peaks: [AtomicU32; MIXER_TRACK_METER_COUNT],
     live_master_fader_gain: Arc<AtomicU32>,
     live_master_pan_raw: Arc<AtomicI32>,
+    live_master_stereo_separation_raw: Arc<AtomicI32>,
 }
 
 impl Default for MixerTrackPeakMeters {
@@ -52,6 +53,7 @@ impl Default for MixerTrackPeakMeters {
             peaks: std::array::from_fn(|_| AtomicU32::new(0.0_f32.to_bits())),
             live_master_fader_gain: Arc::new(AtomicU32::new(1.0_f32.to_bits())),
             live_master_pan_raw: Arc::new(AtomicI32::new(i32::MIN)),
+            live_master_stereo_separation_raw: Arc::new(AtomicI32::new(i32::MIN)),
         }
     }
 }
@@ -101,6 +103,21 @@ impl MixerTrackPeakMeters {
 
     pub(crate) fn live_master_pan_raw(&self) -> Arc<AtomicI32> {
         Arc::clone(&self.live_master_pan_raw)
+    }
+
+    /// Set the live Playlist stream's target Master stereo separation.
+    ///
+    /// The render worker reads this value without taking a lock and smooths changes over 20 ms.
+    pub fn set_live_master_stereo_separation_raw(&self, separation_raw: Option<i32>) {
+        let separation_raw = separation_raw
+            .filter(|separation_raw| (-64..=64).contains(separation_raw))
+            .unwrap_or(i32::MIN);
+        self.live_master_stereo_separation_raw
+            .store(separation_raw, Ordering::Release);
+    }
+
+    pub(crate) fn live_master_stereo_separation_raw(&self) -> Arc<AtomicI32> {
+        Arc::clone(&self.live_master_stereo_separation_raw)
     }
 
     pub(crate) fn publish_peak(&self, track: usize, peak: f32) {
