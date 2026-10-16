@@ -8,8 +8,11 @@ binaries-dir = "target/release"
 formats = ["default"]
 icons = ["assets/icon.png"]
 resources = ["assets/fonts/Inter-OFL.txt", "assets/licenses/LGPL-3.0.txt", "docs/third-party-notices.md"]
-binaries = [{ path = "fl-studio-rebuild", main = true }]
-before-packaging-command = "cargo build --release --bin fl-studio-rebuild"
+binaries = [
+    { path = "fl-studio-rebuild", main = true },
+    { path = "vst3-host-helper" },
+]
+before-packaging-command = "python scripts/build_desktop_binaries.py --profile release"
 
 [[file-associations]]
 extensions = ["flp"]

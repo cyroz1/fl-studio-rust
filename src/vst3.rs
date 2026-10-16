@@ -1163,7 +1163,7 @@ impl Vst3HostRuntime {
         let host = Vst3Host::builder()
             .sample_rate(sample_rate)
             .block_size(block_size)
-            .with_process_isolation(false)
+            .with_process_isolation(true)
             .build()
             .map_err(|error| error.to_string())?;
         Ok(Self {
