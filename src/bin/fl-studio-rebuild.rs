@@ -4081,7 +4081,7 @@ struct DawUi {
     midi_input_thru_notes: BTreeMap<(u8, u8), u8>,
     midi_input_thru_note_mapping: BTreeMap<(u8, u8), VecDeque<(u8, u8)>>,
     midi_live_sampler_note_mapping: BTreeMap<(u8, u8), VecDeque<u8>>,
-    midi_live_vst3_note_mapping: BTreeMap<(u8, u8), VecDeque<u8>>,
+    midi_live_vst3_note_mapping: BTreeMap<(u8, u8), VecDeque<Option<u8>>>,
     midi_live_sampler_sustain_channels: BTreeSet<u8>,
     midi_input_thru_sustain_channels: BTreeSet<u8>,
     midi_output_gain_mapping: Option<MidiControlChangeMapping>,
@@ -36098,6 +36098,13 @@ impl DawUi {
         if !self.channel_vst3_instances.contains_key(&channel_id) {
             return false;
         }
+        let key_region = self.document.as_ref().and_then(|document| {
+            document
+                .channels()
+                .into_iter()
+                .find(|channel| channel.id() == channel_id)
+                .and_then(|channel| channel.keyboard_key_region())
+        });
         if self.live_vst3_input.as_ref().is_some_and(|session| {
             session.pattern_id != pattern_id || session.channel_id != channel_id
         }) {
@@ -36125,6 +36132,16 @@ impl DawUi {
                 } else {
                     key
                 };
+                let source_note = (channel & 0x0F, key.min(127));
+                if key_region
+                    .is_some_and(|(low, high)| !(low..=high).contains(&u16::from(audition_key)))
+                {
+                    self.midi_live_vst3_note_mapping
+                        .entry(source_note)
+                        .or_default()
+                        .push_back(None);
+                    return true;
+                }
                 let Some(channel) = Vst3MidiChannel::from_index(channel & 0x0F) else {
                     return true;
                 };
@@ -36134,7 +36151,7 @@ impl DawUi {
                         note: audition_key,
                         velocity,
                     },
-                    Some(((channel.as_index(), key.min(127)), audition_key)),
+                    Some(((channel.as_index(), key.min(127)), Some(audition_key))),
                 )
             }
             MidiInputEvent::NoteOn {
@@ -36147,18 +36164,11 @@ impl DawUi {
                 key,
                 velocity: _,
             } => {
-                if self.live_vst3_input.is_none() {
-                    return true;
-                }
-                let Some(channel_enum) = Vst3MidiChannel::from_index(channel & 0x0F) else {
-                    return true;
-                };
                 let source_note = (channel & 0x0F, key.min(127));
                 let mapped_key = self
                     .midi_live_vst3_note_mapping
                     .get_mut(&source_note)
-                    .and_then(VecDeque::pop_front)
-                    .unwrap_or(key.min(127));
+                    .and_then(VecDeque::pop_front);
                 let remove_mapping = self
                     .midi_live_vst3_note_mapping
                     .get(&source_note)
@@ -36166,6 +36176,13 @@ impl DawUi {
                 if remove_mapping {
                     self.midi_live_vst3_note_mapping.remove(&source_note);
                 }
+                let mapped_key = match mapped_key {
+                    Some(None) | None => return true,
+                    Some(Some(mapped_key)) => mapped_key,
+                };
+                let Some(channel_enum) = Vst3MidiChannel::from_index(channel & 0x0F) else {
+                    return true;
+                };
                 let release_velocity = match event {
                     MidiInputEvent::NoteOff { velocity, .. } => velocity,
                     _ => 0,
@@ -36238,8 +36255,17 @@ impl DawUi {
                     .get(&source_note)
                     .and_then(VecDeque::front)
                     .copied()
-                    .unwrap_or_else(|| {
-                        if self.midi_record_snap_to_scale
+                    .flatten()
+                    .or_else(|| {
+                        if self
+                            .midi_live_vst3_note_mapping
+                            .get(&source_note)
+                            .and_then(VecDeque::front)
+                            .is_some()
+                        {
+                            return None;
+                        }
+                        let mapped = if self.midi_record_snap_to_scale
                             && self.piano_roll_scale != PianoRollScale::None
                         {
                             snap_piano_roll_key_to_scale(
@@ -36251,8 +36277,14 @@ impl DawUi {
                             ) as u8
                         } else {
                             key
-                        }
+                        };
+                        key_region
+                            .is_none_or(|(low, high)| (low..=high).contains(&u16::from(mapped)))
+                            .then_some(mapped)
                     });
+                let Some(mapped_key) = mapped_key else {
+                    return true;
+                };
                 (
                     Vst3MidiEvent::PolyAftertouch {
                         channel: channel_enum,
@@ -36270,11 +36302,11 @@ impl DawUi {
         if let Some(session) = &self.live_vst3_input {
             match session.stream.try_send(live_event) {
                 Ok(()) => {
-                    if let Some((source_note, audition_key)) = mapped_note_on {
+                    if let Some((source_note, Some(audition_key))) = mapped_note_on {
                         self.midi_live_vst3_note_mapping
                             .entry(source_note)
                             .or_default()
-                            .push_back(audition_key);
+                            .push_back(Some(audition_key));
                     }
                 }
                 Err(error) => {
