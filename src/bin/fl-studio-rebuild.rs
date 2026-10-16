@@ -31,20 +31,21 @@ use flp_rebuild::sample_render::{
     AudioRenderEncodingOptions, AudioRenderOutput, MP3_BITRATES_KBPS, MixerStemRenderOptions,
     PlaylistPerformanceCommand, PlaylistPerformanceLaunch, PlaylistPerformanceStream,
     PlaylistRenderOptions, PlaylistRenderRange, PlaylistRenderSummary, PlaylistStreamMonitor,
-    PlaylistTempoMap, ResamplingQuality, SamplerPatternRenderOptions, SamplerPatternRenderSummary,
-    Vst3PatternLoopPlayback, WavChannelMode, WavDitherMode, WavSampleFormat,
-    nearest_playlist_audio_clip_zero_crossing_tick, playlist_performance_clip_indices_with_vst3,
-    playlist_performance_static_document_with_vst3, playlist_performance_vst3_channel_ids,
-    playlist_performance_vst3_clip_indices, render_audio_clips_to_file,
-    render_playlist_mixer_stems_with_vst3_cancellable,
+    PlaylistTempoMap, ResamplingQuality, SamplerPatternLoopPlayback, SamplerPatternRenderOptions,
+    SamplerPatternRenderSummary, Vst3PatternLoopPlayback, WavChannelMode, WavDitherMode,
+    WavSampleFormat, nearest_playlist_audio_clip_zero_crossing_tick,
+    playlist_performance_clip_indices_with_vst3, playlist_performance_static_document_with_vst3,
+    playlist_performance_vst3_channel_ids, playlist_performance_vst3_clip_indices,
+    render_audio_clips_to_file, render_playlist_mixer_stems_with_vst3_cancellable,
     render_playlist_with_vst3_to_file_from_frame_cancellable,
     render_playlist_with_vst3_to_flac_cancellable, render_playlist_with_vst3_to_mp3_cancellable,
     render_playlist_with_vst3_to_ogg_cancellable, render_playlist_with_vst3_to_wav_cancellable,
-    render_sampler_pattern_to_file, stream_pattern_loop_with_vst3_from_tick_to_device,
+    render_sampler_pattern_to_file,
+    stream_pattern_loop_with_vst3_from_tick_to_device_with_live_master_controls,
     stream_playlist_performance_with_vst3_to_device,
     stream_playlist_with_vst3_to_device_with_monitor, stream_sampler_midi_input_to_device,
-    stream_sampler_pattern_loop_from_tick_to_device, stream_sampler_pattern_to_device,
-    write_input_recording_to_wav,
+    stream_sampler_pattern_loop_from_tick_to_device_with_live_master_controls,
+    stream_sampler_pattern_to_device, write_input_recording_to_wav,
 };
 use flp_rebuild::vst3::{
     MAX_REPORTED_TAIL_SECONDS, Vst3HostRuntime, Vst3LiveInputStreamHandle,
@@ -28927,6 +28928,10 @@ impl DawUi {
             .as_ref()
             .map(Vst3PlaylistStreamProcessor::summary);
 
+        if loop_length_ticks.is_some() {
+            self.initialize_live_master_mixer_targets(document);
+        }
+
         self.stop_project_playback();
         if let Some(engine) = &self.audio_engine {
             engine.set_test_tone(false);
@@ -28953,6 +28958,7 @@ impl DawUi {
         let worker_cancelled = Arc::clone(&cancelled);
         let read_sample_root_note = self.read_sample_root_note;
         let resampling_quality = self.live_resampling_quality;
+        let worker_mixer_meters = Arc::clone(&self.mixer_track_peak_meters);
         let (sender, receiver) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
             .name(if loop_length_ticks.is_some() {
@@ -28973,7 +28979,7 @@ impl DawUi {
                         };
                         if let Some(loop_length_ticks) = loop_length_ticks {
                             if let Some(vst3_processor) = vst3_processor {
-                                stream_pattern_loop_with_vst3_from_tick_to_device(
+                                stream_pattern_loop_with_vst3_from_tick_to_device_with_live_master_controls(
                                     &document,
                                     &project_path,
                                     options,
@@ -28982,16 +28988,20 @@ impl DawUi {
                                         start_tick: loop_start_tick,
                                         processor: vst3_processor,
                                     },
+                                    &worker_mixer_meters,
                                     &writer,
                                     &worker_cancelled,
                                 )
                             } else {
-                                stream_sampler_pattern_loop_from_tick_to_device(
+                                stream_sampler_pattern_loop_from_tick_to_device_with_live_master_controls(
                                     &document,
                                     &project_path,
                                     options,
-                                    loop_length_ticks,
-                                    loop_start_tick,
+                                    SamplerPatternLoopPlayback {
+                                        loop_length_ticks,
+                                        start_tick: loop_start_tick,
+                                    },
+                                    &worker_mixer_meters,
                                     &writer,
                                     &worker_cancelled,
                                 )
