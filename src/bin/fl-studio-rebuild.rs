@@ -9200,6 +9200,9 @@ impl DawUi {
             }
         };
         self.stream_selected_sampler_pattern(Some(loop_length_ticks));
+        if self.playing {
+            self.start_midi_clock(false);
+        }
     }
 
     fn selected_pattern_loop_length_ticks(&self, pattern_id: u16) -> Result<u64, String> {
@@ -9638,8 +9641,8 @@ impl DawUi {
                 Ok(()) => {
                     self.playing = true;
                     self.status = "Project playback resumed".to_owned();
+                    self.start_midi_clock(true);
                     if !self.pattern_playback_mode {
-                        self.start_midi_clock(true);
                         self.start_midi_playlist_playback_from_current_position();
                     }
                 }
@@ -35250,17 +35253,7 @@ impl DawUi {
         if self.midi_output_clock.is_some() {
             self.stop_midi_clock();
         }
-        let Some(current_tick) = self.current_playhead_tick() else {
-            self.midi_output_error =
-                Some("Playlist position is unavailable for MIDI clock".to_owned());
-            return;
-        };
         let Some(output) = self.midi_output_connection.as_ref().cloned() else {
-            return;
-        };
-        let Some(tempo_map) = self.playlist_tempo_map.clone() else {
-            self.midi_output_error =
-                Some("Playlist tempo map is unavailable for MIDI clock".to_owned());
             return;
         };
         let Some((sample_rate, playback_clock)) = self
@@ -35277,6 +35270,46 @@ impl DawUi {
             .as_ref()
             .map(|document| document.header().ppq().max(1))
             .unwrap_or(1);
+        let (tempo_map, current_tick) = if self.pattern_playback_mode {
+            let tempo_bpm = self
+                .document
+                .as_ref()
+                .and_then(|document| document.metadata().tempo_bpm())
+                .unwrap_or(self.tempo_bpm);
+            let tempo_map = match PlaylistTempoMap::constant(ppq, tempo_bpm) {
+                Ok(tempo_map) => tempo_map,
+                Err(error) => {
+                    self.midi_output_error = Some(error.clone());
+                    self.status = format!("Could not start MIDI clock: {error}");
+                    return;
+                }
+            };
+            let current_tick = if resume {
+                let Some(current_tick) =
+                    tempo_map.tick_at_frame(playback_clock.position_frames(), sample_rate)
+                else {
+                    self.midi_output_error =
+                        Some("Pattern position is unavailable for MIDI clock".to_owned());
+                    return;
+                };
+                current_tick
+            } else {
+                0.0
+            };
+            (tempo_map, current_tick)
+        } else {
+            let Some(current_tick) = self.current_playhead_tick() else {
+                self.midi_output_error =
+                    Some("Playlist position is unavailable for MIDI clock".to_owned());
+                return;
+            };
+            let Some(tempo_map) = self.playlist_tempo_map.clone() else {
+                self.midi_output_error =
+                    Some("Playlist tempo map is unavailable for MIDI clock".to_owned());
+                return;
+            };
+            (tempo_map, current_tick)
+        };
         match MidiClockScheduler::start(
             output,
             resume,

@@ -972,6 +972,21 @@ mod tests {
     }
 
     #[test]
+    fn pattern_mode_midi_clock_tempo_remains_continuous_across_loop_boundaries() {
+        let tempo_map = PlaylistTempoMap::constant(96, 120.0).unwrap();
+
+        assert_eq!(tempo_map.tick_at_frame(96_000, 48_000), Some(384.0));
+        assert_eq!(
+            midi_clock_pulse_frame(&tempo_map, 96, 48_000, 96).unwrap(),
+            96_000
+        );
+        assert_eq!(
+            midi_clock_pulse_frame(&tempo_map, 97, 48_000, 96).unwrap(),
+            97_000
+        );
+    }
+
+    #[test]
     fn playlist_midi_scheduler_groups_due_messages_by_audio_frame() {
         let messages = [
             ScheduledMidiFrameMessage {
