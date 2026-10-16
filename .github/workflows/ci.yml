@@ -1379,7 +1379,7 @@ jobs:
           sleep 3
           echo "Installed macOS app remained running after launch."
 
-      - name: Stage exactly one platform installer
+      - name: Verify and stage exactly one platform installer
         if: runner.os != 'macOS' || steps.macos-signing-status.outputs.available == 'true'
         shell: bash
         run: |
