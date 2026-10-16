@@ -1302,6 +1302,7 @@ pub struct PlaylistStreamMonitor<'a> {
     live_master_pan_raw: Option<Arc<AtomicI32>>,
     live_master_stereo_separation_raw: Option<Arc<AtomicI32>>,
     live_master_enabled: Option<Arc<AtomicI32>>,
+    live_master_signal_flags: Option<Arc<AtomicI32>>,
 }
 
 impl<'a> PlaylistStreamMonitor<'a> {
@@ -1314,6 +1315,7 @@ impl<'a> PlaylistStreamMonitor<'a> {
             live_master_pan_raw: None,
             live_master_stereo_separation_raw: None,
             live_master_enabled: None,
+            live_master_signal_flags: None,
         }
     }
 
@@ -1326,6 +1328,7 @@ impl<'a> PlaylistStreamMonitor<'a> {
             live_master_pan_raw: Some(meters.live_master_pan_raw()),
             live_master_stereo_separation_raw: Some(meters.live_master_stereo_separation_raw()),
             live_master_enabled: Some(meters.live_master_enabled()),
+            live_master_signal_flags: Some(meters.live_master_signal_flags()),
         }
     }
 }
@@ -1839,6 +1842,7 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
     let live_master_pan_raw = monitor.live_master_pan_raw;
     let live_master_stereo_separation_raw = monitor.live_master_stereo_separation_raw;
     let live_master_enabled = monitor.live_master_enabled;
+    let live_master_signal_flags = monitor.live_master_signal_flags;
     let project_path = project_path.as_ref();
     let mut master_output = MixerMasterOutput::from_document(document);
     if let Some(gain_target) = live_master_fader_gain {
@@ -1853,6 +1857,10 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
     }
     if let Some(enabled_target) = live_master_enabled {
         master_output = master_output.with_live_enabled_target(enabled_target, options.sample_rate);
+    }
+    if let Some(signal_flags_target) = live_master_signal_flags {
+        master_output =
+            master_output.with_live_signal_flags_target(signal_flags_target, options.sample_rate);
     }
     let audio = prepare_audio_clip_render(
         document,
@@ -3791,6 +3799,9 @@ struct MixerMasterOutput {
     live_enabled_target: Option<Arc<AtomicI32>>,
     live_enabled_gain_current: Cell<Option<f32>>,
     live_enabled_smoothing_alpha: f32,
+    live_signal_flags_target: Option<Arc<AtomicI32>>,
+    live_signal_flags_current: Cell<Option<(f32, f32)>>,
+    live_signal_flags_smoothing_alpha: f32,
 }
 
 impl MixerMasterOutput {
@@ -3851,6 +3862,17 @@ impl MixerMasterOutput {
         self
     }
 
+    fn with_live_signal_flags_target(
+        mut self,
+        signal_flags_target: Arc<AtomicI32>,
+        sample_rate: u32,
+    ) -> Self {
+        self.live_signal_flags_target = Some(signal_flags_target);
+        self.live_signal_flags_smoothing_alpha =
+            crate::audio::output_gain_smoothing_alpha(sample_rate as f32);
+        self
+    }
+
     fn apply(&self, stereo_samples: &mut [f32]) {
         if self.enabled == Some(false) && self.live_enabled_target.is_none() {
             stereo_samples.fill(0.0);
@@ -3875,13 +3897,62 @@ impl MixerMasterOutput {
                 self.fader_volume_raw
             });
         for frame in frames {
-            if self.swap_left_right == Some(true) {
-                frame.swap(0, 1);
-            }
-            if self.polarity_reversed == Some(true) {
-                frame[0] = -frame[0];
-                frame[1] = -frame[1];
-            }
+            let (polarity_mix, swap_mix) = self
+                .live_signal_flags_target
+                .as_ref()
+                .and_then(|target| {
+                    let flags = target.load(Ordering::Acquire);
+                    (0..=3).contains(&flags).then_some(flags)
+                })
+                .map_or_else(
+                    || {
+                        (
+                            if self.polarity_reversed.unwrap_or(false) {
+                                1.0
+                            } else {
+                                0.0
+                            },
+                            if self.swap_left_right.unwrap_or(false) {
+                                1.0
+                            } else {
+                                0.0
+                            },
+                        )
+                    },
+                    |target_flags| {
+                        let target_polarity_mix = if target_flags & 1 == 0 { 0.0 } else { 1.0 };
+                        let target_swap_mix = if target_flags & 2 == 0 { 0.0 } else { 1.0 };
+                        let (current_polarity_mix, current_swap_mix) =
+                            self.live_signal_flags_current.get().unwrap_or_else(|| {
+                                (
+                                    if self.polarity_reversed.unwrap_or(false) {
+                                        1.0
+                                    } else {
+                                        0.0
+                                    },
+                                    if self.swap_left_right.unwrap_or(false) {
+                                        1.0
+                                    } else {
+                                        0.0
+                                    },
+                                )
+                            });
+                        let next_polarity_mix = crate::audio::smooth_output_gain(
+                            current_polarity_mix,
+                            target_polarity_mix,
+                            self.live_signal_flags_smoothing_alpha,
+                        );
+                        let next_swap_mix = crate::audio::smooth_output_gain(
+                            current_swap_mix,
+                            target_swap_mix,
+                            self.live_signal_flags_smoothing_alpha,
+                        );
+                        self.live_signal_flags_current
+                            .set(Some((next_polarity_mix, next_swap_mix)));
+                        (next_polarity_mix, next_swap_mix)
+                    },
+                );
+            apply_master_signal_transform(frame, polarity_mix, swap_mix);
             master_transform.apply_frame(frame);
             if let Some(target) = &self.live_stereo_separation_raw_target {
                 let target_separation_raw = target.load(Ordering::Acquire);
@@ -3964,6 +4035,15 @@ impl MixerMasterOutput {
             }
         }
     }
+}
+
+fn apply_master_signal_transform(frame: &mut [f32; 2], polarity_mix: f32, swap_mix: f32) {
+    let left = frame[0];
+    let right = frame[1];
+    let polarity_gain = 1.0 - 2.0 * polarity_mix.clamp(0.0, 1.0);
+    let swap_mix = swap_mix.clamp(0.0, 1.0);
+    frame[0] = (left * (1.0 - swap_mix) + right * swap_mix) * polarity_gain;
+    frame[1] = (right * (1.0 - swap_mix) + left * swap_mix) * polarity_gain;
 }
 
 fn stream_prepared_playlist_render(
@@ -9767,6 +9847,45 @@ mod tests {
         }
         .apply(&mut output);
         assert_eq!(output, [0.5, -0.25, 1.0, -0.75]);
+    }
+
+    #[test]
+    fn master_signal_transform_supports_smooth_intermediate_values() {
+        let mut frame = [1.0, 0.25];
+        apply_master_signal_transform(&mut frame, 0.0, 0.5);
+        assert_eq!(frame, [0.625, 0.625]);
+
+        frame = [1.0, 0.25];
+        apply_master_signal_transform(&mut frame, 0.5, 0.0);
+        assert_eq!(frame, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn live_master_signal_flags_are_smoothed_from_saved_state() {
+        let target = Arc::new(AtomicI32::new(0));
+        let output = MixerMasterOutput {
+            enabled: Some(true),
+            live_signal_flags_target: Some(Arc::clone(&target)),
+            live_signal_flags_smoothing_alpha: crate::audio::output_gain_smoothing_alpha(48_000.0),
+            ..MixerMasterOutput::default()
+        };
+
+        let mut frame = [1.0, 0.25];
+        output.apply(&mut frame);
+        assert_eq!(frame, [1.0, 0.25]);
+
+        target.store(3, Ordering::Release);
+        frame = [1.0, 0.25];
+        output.apply(&mut frame);
+        assert!(frame[0] > 0.99 && frame[0] < 1.0);
+        assert!(frame[1] > 0.24 && frame[1] < 0.26);
+
+        for _ in 0..100_000 {
+            frame = [1.0, 0.25];
+            output.apply(&mut frame);
+        }
+        assert!((frame[0] + 0.25).abs() < 0.001);
+        assert!((frame[1] + 1.0).abs() < 0.001);
     }
 
     #[test]
