@@ -3865,6 +3865,8 @@ struct DawUi {
     piano_roll_event_editor_open: bool,
     piano_roll_event_target: PianoRollEventTarget,
     piano_roll_controller_stream: Option<(u8, u8)>,
+    piano_roll_controller_new_channel: u8,
+    piano_roll_controller_new_flags: u8,
     piano_roll_controller_tool: PianoRollControllerTool,
     piano_roll_controller_stroke: Option<PianoRollControllerStroke>,
     piano_roll_controller_selection: Option<PianoRollControllerSelectionDrag>,
@@ -4663,6 +4665,8 @@ impl DawUi {
             piano_roll_event_editor_open: false,
             piano_roll_event_target: PianoRollEventTarget::Velocity,
             piano_roll_controller_stream: None,
+            piano_roll_controller_new_channel: 0,
+            piano_roll_controller_new_flags: 0,
             piano_roll_controller_tool: PianoRollControllerTool::Edit,
             piano_roll_controller_stroke: None,
             piano_roll_controller_selection: None,
@@ -33367,6 +33371,7 @@ impl DawUi {
             self.piano_roll_controller_stream = None;
         }
 
+        let mut create_stream_requested = false;
         ui.horizontal_wrapped(|ui| {
             ui.strong("Pattern controller data");
             piano_roll_event_target_selector(ui, &mut self.piano_roll_event_target);
@@ -33424,6 +33429,22 @@ impl DawUi {
                         }
                     });
             }
+            if streams.is_empty() {
+                ui.separator();
+                ui.label("New raw stream");
+                ui.add(
+                    egui::DragValue::new(&mut self.piano_roll_controller_new_channel)
+                        .range(0..=u8::MAX)
+                        .prefix("Channel "),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut self.piano_roll_controller_new_flags)
+                        .range(0..=u8::MAX)
+                        .hexadecimal(2, false, true)
+                        .prefix("Flags 0x"),
+                );
+                create_stream_requested = ui.button("Create").clicked();
+            }
             ui.weak(match self.piano_roll_controller_tool {
                 PianoRollControllerTool::Edit => {
                     "Drag to edit · click empty space to duplicate · right-click to delete"
@@ -33434,6 +33455,27 @@ impl DawUi {
                 PianoRollControllerTool::Erase => "Drag to erase selected points",
             });
         });
+        if create_stream_requested {
+            let channel = self.piano_roll_controller_new_channel;
+            let flags = self.piano_roll_controller_new_flags;
+            if let Some(document) = &mut self.document {
+                match document.create_pattern_controller_stream(pattern.id, channel, flags, 0, 0.0)
+                {
+                    Ok(_) => {
+                        self.piano_roll_controller_stream = Some((channel, flags));
+                        self.dirty = true;
+                        self.status = format!(
+                            "Created raw Pattern controller stream · channel {channel} · flags 0x{flags:02X}"
+                        );
+                    }
+                    Err(error) => {
+                        self.status =
+                            format!("Could not create raw Pattern controller stream: {error}");
+                    }
+                }
+            }
+            return;
+        }
 
         let size = Vec2::new(ui.available_width().max(1.0), 116.0);
         let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
