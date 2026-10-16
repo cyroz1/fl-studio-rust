@@ -43,6 +43,7 @@ pub const MIXER_TRACK_METER_COUNT: usize = i8::MAX as usize + 1;
 /// consumes each value with [`take_peak`](Self::take_peak), keeping the audio thread lock-free.
 pub struct MixerTrackPeakMeters {
     peaks: [AtomicU32; MIXER_TRACK_METER_COUNT],
+    live_mixer_insert_fader_raw: [Arc<AtomicI32>; MIXER_TRACK_METER_COUNT],
     live_master_fader_gain: Arc<AtomicU32>,
     live_master_pan_raw: Arc<AtomicI32>,
     live_master_stereo_separation_raw: Arc<AtomicI32>,
@@ -54,6 +55,9 @@ impl Default for MixerTrackPeakMeters {
     fn default() -> Self {
         Self {
             peaks: std::array::from_fn(|_| AtomicU32::new(0.0_f32.to_bits())),
+            live_mixer_insert_fader_raw: std::array::from_fn(|_| {
+                Arc::new(AtomicI32::new(i32::MIN))
+            }),
             live_master_fader_gain: Arc::new(AtomicU32::new(1.0_f32.to_bits())),
             live_master_pan_raw: Arc::new(AtomicI32::new(i32::MIN)),
             live_master_stereo_separation_raw: Arc::new(AtomicI32::new(i32::MIN)),
@@ -90,6 +94,24 @@ impl MixerTrackPeakMeters {
         };
         self.live_master_fader_gain
             .store(gain.to_bits(), Ordering::Release);
+    }
+
+    /// Set a non-Master Mixer insert's live fader target in FLP raw units.
+    ///
+    /// Sampler Pattern playback reads the target without taking a lock and smooths supported
+    /// direct-route changes over 20 ms. `None` keeps the saved route transform in effect.
+    pub fn set_live_mixer_insert_fader_raw(&self, track: usize, volume_raw: Option<i32>) {
+        let Some(target) = self.live_mixer_insert_fader_raw.get(track) else {
+            return;
+        };
+        let value = volume_raw
+            .filter(|value| (0..=16_000).contains(value))
+            .unwrap_or(i32::MIN);
+        target.store(value, Ordering::Release);
+    }
+
+    pub(crate) fn live_mixer_insert_fader_raw(&self, track: usize) -> Option<Arc<AtomicI32>> {
+        self.live_mixer_insert_fader_raw.get(track).cloned()
     }
 
     pub(crate) fn live_master_fader_gain(&self) -> Arc<AtomicU32> {

@@ -4717,6 +4717,12 @@ fn stream_sampler_pattern_loop_from_tick_with_vst3_to_device(
         render.pan_law,
     );
     engine.mixer_transforms_by_channel = Some(&render.mixer_transforms_by_channel);
+    if let Some(meters) = live_master_meters {
+        engine.live_mixer_fader_transforms_by_channel =
+            Some(&render.live_mixer_fader_transforms_by_channel);
+        engine.live_mixer_faders_by_channel = Some(&render.live_mixer_faders_by_channel);
+        engine.live_mixer_fader_targets = Some(meters);
+    }
     if let Some(processor) = playback.vst3_processor.as_mut() {
         processor.start_processing()?;
     }
@@ -6039,9 +6045,17 @@ struct PreparedSamplerPattern {
     notes: Vec<ScheduledSamplerNote>,
     sources_by_channel: HashMap<u16, SamplerVoiceSource>,
     mixer_transforms_by_channel: HashMap<u16, MixerSourceRouteTransform>,
+    live_mixer_fader_transforms_by_channel: HashMap<u16, MixerSourceRouteTransform>,
+    live_mixer_faders_by_channel: HashMap<u16, LiveMixerFaderSpec>,
     master_output: MixerMasterOutput,
     voice_limit: usize,
     resampling_quality: ResamplingQuality,
+}
+
+#[derive(Clone, Copy)]
+struct LiveMixerFaderSpec {
+    track: usize,
+    saved_gain: f32,
 }
 
 #[derive(Clone)]
@@ -8079,6 +8093,8 @@ fn prepare_sampler_pattern_for_channel_internal(
             notes: Vec::new(),
             sources_by_channel: HashMap::new(),
             mixer_transforms_by_channel: HashMap::new(),
+            live_mixer_fader_transforms_by_channel: HashMap::new(),
+            live_mixer_faders_by_channel: HashMap::new(),
             master_output: MixerMasterOutput::from_document(document),
             voice_limit: options.voice_limit,
             resampling_quality: options.resampling_quality,
@@ -8089,6 +8105,9 @@ fn prepare_sampler_pattern_for_channel_internal(
     let mut decoded_by_path = HashMap::<PathBuf, Arc<DecodedAudio>>::new();
     let mut sources_by_channel = HashMap::<u16, SamplerVoiceSource>::new();
     let mut mixer_transforms_by_channel = HashMap::<u16, MixerSourceRouteTransform>::new();
+    let mut live_mixer_fader_transforms_by_channel =
+        HashMap::<u16, MixerSourceRouteTransform>::new();
+    let mut live_mixer_faders_by_channel = HashMap::<u16, LiveMixerFaderSpec>::new();
     let mut unresolved_sample_channels = std::collections::BTreeSet::new();
     let mut notes = Vec::with_capacity(sampler_note_count);
     let mut skipped_unresolved = 0usize;
@@ -8181,6 +8200,21 @@ fn prepare_sampler_pattern_for_channel_internal(
                 target_channel_id,
                 mixer_route_audibility.source_route_transform_for_channel(channel.mixer_track()),
             );
+            if let Some((transform, volume_raw)) = mixer_route_audibility
+                .direct_source_fader_transform_for_channel(channel.mixer_track())
+                && let Some(track) = channel
+                    .mixer_track()
+                    .and_then(|track| usize::try_from(track).ok())
+            {
+                live_mixer_fader_transforms_by_channel.insert(target_channel_id, transform);
+                live_mixer_faders_by_channel.insert(
+                    target_channel_id,
+                    LiveMixerFaderSpec {
+                        track,
+                        saved_gain: volume_raw as f32 / 10_000.0,
+                    },
+                );
+            }
         }
         let Some(source) = sources_by_channel.get(&target_channel_id) else {
             continue;
@@ -8299,6 +8333,8 @@ fn prepare_sampler_pattern_for_channel_internal(
         notes,
         sources_by_channel,
         mixer_transforms_by_channel,
+        live_mixer_fader_transforms_by_channel,
+        live_mixer_faders_by_channel,
         master_output: MixerMasterOutput::from_document(document),
         voice_limit: options.voice_limit,
         resampling_quality: options.resampling_quality,
@@ -8310,6 +8346,9 @@ struct SamplerVoiceEngine<'a> {
     notes: &'a [ScheduledSamplerNote],
     live_notes: Vec<ScheduledSamplerNote>,
     mixer_transforms_by_channel: Option<&'a HashMap<u16, MixerSourceRouteTransform>>,
+    live_mixer_fader_transforms_by_channel: Option<&'a HashMap<u16, MixerSourceRouteTransform>>,
+    live_mixer_faders_by_channel: Option<&'a HashMap<u16, LiveMixerFaderSpec>>,
+    live_mixer_fader_targets: Option<&'a MixerTrackPeakMeters>,
     mixer_meter_transforms_by_channel:
         Option<&'a HashMap<u16, Vec<(usize, MixerSourceRouteTransform)>>>,
     pan_law: PanLaw,
@@ -8344,8 +8383,43 @@ struct SamplerVoice {
     left_gain: f32,
     right_gain: f32,
     mixer_transform: MixerSourceRouteTransform,
+    live_mixer_fader: Option<LiveMixerFader>,
     mixer_meter_transforms: Vec<(usize, MixerSourceRouteTransform)>,
     release_remaining: Option<usize>,
+}
+
+struct LiveMixerFader {
+    target_raw: Arc<AtomicI32>,
+    current_gain: f32,
+    smoothing_alpha: f32,
+}
+
+impl LiveMixerFader {
+    fn new(target_raw: Arc<AtomicI32>, saved_gain: f32, sample_rate: u32) -> Self {
+        let target = target_raw.load(Ordering::Acquire);
+        let current_gain = if (0..=16_000).contains(&target) {
+            target as f32 / 10_000.0
+        } else {
+            saved_gain
+        };
+        Self {
+            target_raw,
+            current_gain,
+            smoothing_alpha: crate::audio::output_gain_smoothing_alpha(sample_rate as f32),
+        }
+    }
+
+    fn apply(&mut self, frame: &mut [f32; 2]) {
+        let target_raw = self.target_raw.load(Ordering::Acquire);
+        if !(0..=16_000).contains(&target_raw) {
+            return;
+        }
+        let target_gain = target_raw as f32 / 10_000.0;
+        self.current_gain =
+            crate::audio::smooth_output_gain(self.current_gain, target_gain, self.smoothing_alpha);
+        frame[0] *= self.current_gain;
+        frame[1] *= self.current_gain;
+    }
 }
 
 impl<'a> SamplerVoiceEngine<'a> {
@@ -8382,6 +8456,9 @@ impl<'a> SamplerVoiceEngine<'a> {
             notes,
             live_notes: Vec::new(),
             mixer_transforms_by_channel: None,
+            live_mixer_fader_transforms_by_channel: None,
+            live_mixer_faders_by_channel: None,
+            live_mixer_fader_targets: None,
             mixer_meter_transforms_by_channel: None,
             pan_law,
             next_note: 0,
@@ -8482,6 +8559,9 @@ impl<'a> SamplerVoiceEngine<'a> {
                     right * gain * voice.right_gain,
                 ];
                 voice.mixer_transform.apply_frame(&mut routed_frame);
+                if let Some(live_fader) = voice.live_mixer_fader.as_mut() {
+                    live_fader.apply(&mut routed_frame);
+                }
                 output_frame[0] += routed_frame[0];
                 output_frame[1] += routed_frame[1];
                 if let Some(meter_buses) = meter_buses.as_deref_mut() {
@@ -8555,10 +8635,29 @@ impl<'a> SamplerVoiceEngine<'a> {
             self.pan_law,
         );
         let velocity_gain = f32::from(note.velocity.min(127)) / 127.0;
-        let mixer_transform = self
-            .mixer_transforms_by_channel
-            .and_then(|transforms| transforms.get(&note.channel_id).copied())
-            .unwrap_or_default();
+        let live_fader = self
+            .live_mixer_faders_by_channel
+            .and_then(|faders| faders.get(&note.channel_id))
+            .and_then(|spec| {
+                let target = self
+                    .live_mixer_fader_targets?
+                    .live_mixer_insert_fader_raw(spec.track)?;
+                Some((
+                    *spec,
+                    LiveMixerFader::new(target, spec.saved_gain, self.output_sample_rate),
+                ))
+            });
+        let mixer_transform = if live_fader.is_some() {
+            self.live_mixer_fader_transforms_by_channel
+                .and_then(|transforms| transforms.get(&note.channel_id).copied())
+        } else {
+            None
+        }
+        .or_else(|| {
+            self.mixer_transforms_by_channel
+                .and_then(|transforms| transforms.get(&note.channel_id).copied())
+        })
+        .unwrap_or_default();
         let mixer_meter_transforms = self
             .mixer_meter_transforms_by_channel
             .and_then(|transforms| transforms.get(&note.channel_id))
@@ -8586,6 +8685,7 @@ impl<'a> SamplerVoiceEngine<'a> {
             left_gain,
             right_gain,
             mixer_transform,
+            live_mixer_fader: live_fader.map(|(_, fader)| fader),
             mixer_meter_transforms,
             release_remaining: None,
         });
@@ -10499,6 +10599,29 @@ mod tests {
         }
         assert!((frame[0] + 0.25).abs() < 0.001);
         assert!((frame[1] + 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn live_insert_fader_smooths_changes_from_its_saved_gain() {
+        let target = Arc::new(AtomicI32::new(10_000));
+        let mut fader = LiveMixerFader::new(Arc::clone(&target), 1.0, 48_000);
+
+        let mut frame = [1.0, 0.5];
+        fader.apply(&mut frame);
+        assert_eq!(frame, [1.0, 0.5]);
+
+        target.store(0, Ordering::Release);
+        frame = [1.0, 0.5];
+        fader.apply(&mut frame);
+        assert!(frame[0] < 1.0 && frame[0] > 0.99);
+        assert_eq!(frame[1], frame[0] * 0.5);
+
+        for _ in 0..100_000 {
+            frame = [1.0, 0.5];
+            fader.apply(&mut frame);
+        }
+        assert!(frame[0] < 0.001);
+        assert_eq!(frame[1], frame[0] * 0.5);
     }
 
     #[test]
