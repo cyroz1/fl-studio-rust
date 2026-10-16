@@ -36821,6 +36821,9 @@ impl DawUi {
         let initial_pan = self
             .midi_input_channel_state
             .map(MidiInputChannelState::raw_pan);
+        let initial_expression = self
+            .midi_input_channel_state
+            .map(MidiInputChannelState::raw_expression);
         let initial_sustain_channels = self
             .midi_live_sampler_sustain_channels
             .iter()
@@ -36861,6 +36864,12 @@ impl DawUi {
                 }
                 for (channel, value) in initial_pan.into_iter().enumerate() {
                     let _ = event_sender.send(SamplerLiveNoteEvent::Pan {
+                        channel: channel as u8,
+                        value,
+                    });
+                }
+                for (channel, value) in initial_expression.into_iter().enumerate() {
+                    let _ = event_sender.send(SamplerLiveNoteEvent::Expression {
                         channel: channel as u8,
                         value,
                     });
@@ -37408,6 +37417,11 @@ impl DawUi {
                 controller: 10,
                 value,
             } => (SamplerLiveNoteEvent::Pan { channel, value }, None),
+            MidiInputEvent::ControlChange {
+                channel,
+                controller: 11,
+                value,
+            } => (SamplerLiveNoteEvent::Expression { channel, value }, None),
             MidiInputEvent::ControlChange {
                 channel,
                 controller: 120,

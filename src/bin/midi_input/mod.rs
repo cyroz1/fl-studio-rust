@@ -86,6 +86,7 @@ pub enum MidiInputEvent {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MidiInputChannelState {
     pan: u8,
+    expression: u8,
     mod_x: u8,
     mod_y: u8,
     pitch_bend_value: u16,
@@ -99,6 +100,7 @@ impl Default for MidiInputChannelState {
     fn default() -> Self {
         Self {
             pan: 64,
+            expression: 127,
             mod_x: 64,
             mod_y: 64,
             pitch_bend_value: 8192,
@@ -119,6 +121,11 @@ impl MidiInputChannelState {
                 ..
             } => self.pan = value.min(127),
             MidiInputEvent::ControlChange {
+                controller: 11,
+                value,
+                ..
+            } => self.expression = value.min(127),
+            MidiInputEvent::ControlChange {
                 controller: 74,
                 value,
                 ..
@@ -132,6 +139,7 @@ impl MidiInputChannelState {
                 controller: 121, ..
             } => {
                 self.pan = 64;
+                self.expression = 127;
                 self.mod_x = 64;
                 self.mod_y = 64;
                 self.pitch_bend_sensitivity_semitones = 2;
@@ -172,6 +180,10 @@ impl MidiInputChannelState {
 
     pub fn raw_pan(self) -> u8 {
         self.pan
+    }
+
+    pub fn raw_expression(self) -> u8 {
+        self.expression
     }
 
     fn note_mod_x(self) -> u8 {
@@ -1157,6 +1169,26 @@ mod tests {
             value: -8192,
         });
         assert_eq!(state.note_fine_pitch(), 100);
+    }
+
+    #[test]
+    fn expression_controller_resets_to_its_midi_default() {
+        let mut state = MidiInputChannelState::default();
+        assert_eq!(state.raw_expression(), 127);
+
+        state.update(MidiInputEvent::ControlChange {
+            channel: 0,
+            controller: 11,
+            value: 48,
+        });
+        assert_eq!(state.raw_expression(), 48);
+
+        state.update(MidiInputEvent::ControlChange {
+            channel: 0,
+            controller: 121,
+            value: 0,
+        });
+        assert_eq!(state.raw_expression(), 127);
     }
 
     #[test]
