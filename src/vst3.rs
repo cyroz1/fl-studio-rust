@@ -272,6 +272,13 @@ struct PlaylistPluginStream {
     live_performance: bool,
     active_performance_notes: HashMap<i32, ScheduledMidiEvent>,
     note_pitch_offset_semitones: i16,
+    pattern_loop: Option<PatternLoopEventQueue>,
+}
+
+struct PatternLoopEventQueue {
+    loop_frames: u64,
+    template_events: Vec<ScheduledMidiEvent>,
+    next_cycle: u64,
 }
 
 /// Prepared VST3 instrument channels for blockwise Playlist Song transport.
@@ -639,6 +646,7 @@ impl PlaylistPluginStream {
                         .min(self.render.block_size as u64) as usize
                 };
                 let block_end = self.source_frame + source_count as u64;
+                self.queue_pattern_loop_events_before(block_end)?;
                 let mut buffers = AudioBuffers::new(
                     0,
                     self.render.output_channels,
@@ -727,6 +735,41 @@ impl PlaylistPluginStream {
         Ok(())
     }
 
+    fn queue_pattern_loop_events_before(&mut self, block_end: u64) -> Result<(), String> {
+        let Some(queue) = &mut self.pattern_loop else {
+            return Ok(());
+        };
+        if queue.loop_frames == 0 || queue.template_events.is_empty() {
+            return Ok(());
+        }
+        let first_event_frame = queue
+            .template_events
+            .iter()
+            .map(|event| event.frame)
+            .min()
+            .unwrap_or(0);
+        while queue
+            .loop_frames
+            .checked_mul(queue.next_cycle)
+            .and_then(|cycle_start| cycle_start.checked_add(first_event_frame))
+            .is_some_and(|first_frame| first_frame < block_end)
+        {
+            let cycle_start = queue
+                .loop_frames
+                .checked_mul(queue.next_cycle)
+                .ok_or_else(|| "VST3 Pattern loop position overflow".to_owned())?;
+            let repeated = repeat_pattern_loop_events(&queue.template_events, cycle_start)?;
+            self.render.events.extend(repeated);
+            self.render.events[self.next_event..]
+                .sort_unstable_by_key(|event| (event.frame, event.priority));
+            queue.next_cycle = queue
+                .next_cycle
+                .checked_add(1)
+                .ok_or_else(|| "VST3 Pattern loop count overflow".to_owned())?;
+        }
+        Ok(())
+    }
+
     fn push_interleaved(&mut self, samples: &[f32]) -> Result<(), String> {
         if !samples.len().is_multiple_of(2) {
             return Err("VST3 Playlist resampler returned a partial stereo frame".to_owned());
@@ -740,6 +783,27 @@ impl PlaylistPluginStream {
         );
         Ok(())
     }
+}
+
+fn repeat_pattern_loop_events(
+    template_events: &[ScheduledMidiEvent],
+    cycle_start: u64,
+) -> Result<Vec<ScheduledMidiEvent>, String> {
+    let mut note_ids = HashMap::new();
+    template_events
+        .iter()
+        .map(|template_event| {
+            let mut event = *template_event;
+            event.frame = event
+                .frame
+                .checked_add(cycle_start)
+                .ok_or_else(|| "VST3 Pattern event position overflow".to_owned())?;
+            event.note_id = *note_ids
+                .entry(event.note_id)
+                .or_insert_with(next_vst3_note_expression_id);
+            Ok(event)
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1593,6 +1657,223 @@ impl Vst3HostRuntime {
         )
     }
 
+    /// Prepare loaded VST3 channels for repeated playback of one Pattern.
+    ///
+    /// The returned streams keep processing on the playback worker and enqueue each Pattern
+    /// iteration at its loop frame, so plug-in state and notes crossing the loop boundary remain
+    /// continuous.
+    pub fn prepare_pattern_loop_stream(
+        &self,
+        document: &FlpDocument,
+        pattern_id: u16,
+        loop_length_ticks: u64,
+        output_sample_rate: u32,
+        channel_instances: &BTreeMap<u16, u64>,
+    ) -> Result<Vst3PlaylistStreamProcessor, String> {
+        if !(8_000..=384_000).contains(&output_sample_rate) {
+            return Err("Pattern audio rate must be between 8000 and 384000 Hz".to_owned());
+        }
+        if loop_length_ticks == 0 {
+            return Err("Pattern VST3 loop length must be greater than zero".to_owned());
+        }
+        let ppq = document.header().ppq();
+        if ppq == 0 {
+            return Err("project PPQ must be greater than zero".to_owned());
+        }
+        let tempo_bpm = document.metadata().tempo_bpm().unwrap_or(140.0);
+        let tempo_map = PlaylistTempoMap::constant(ppq, tempo_bpm)?;
+        let pattern = document
+            .patterns()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|pattern| pattern.id == pattern_id)
+            .ok_or_else(|| format!("Pattern {pattern_id} was not found"))?;
+        let channels = document.channels();
+        let channels_by_id = channels
+            .iter()
+            .map(|channel| (channel.id(), channel))
+            .collect::<BTreeMap<_, _>>();
+        let mut plugin_channels = document
+            .channel_plugin_states()
+            .into_iter()
+            .map(|state| state.channel_id())
+            .collect::<BTreeSet<_>>();
+        plugin_channels.extend(
+            channels
+                .iter()
+                .filter(|channel| channel.plugin_identifier().is_some())
+                .map(|channel| channel.id()),
+        );
+        let router = ChannelNoteRouter::new(channels.clone());
+        let mixer_route_audibility = MixerRouteAudibility::from_document(document);
+        let global_swing_mix_raw = document.metadata().global_swing_mix();
+        let mut notes_by_channel = BTreeMap::<u16, Vec<PlaylistMidiNote>>::new();
+        for (note_index, note) in pattern.notes.iter().enumerate() {
+            if note.is_muted() {
+                continue;
+            }
+            let nominal_start_tick = u64::from(note.position);
+            let source_swing_mix = channels_by_id
+                .get(&note.channel_id)
+                .map_or(128, |channel| channel.swing_mix());
+            let start_tick = swing_note_start_tick(
+                nominal_start_tick,
+                ppq,
+                global_swing_mix_raw,
+                source_swing_mix,
+            )?;
+            let swing_offset = start_tick.saturating_sub(nominal_start_tick);
+            let stop_tick = nominal_start_tick
+                .checked_add(u64::from(note.length.max(1)))
+                .and_then(|tick| tick.checked_add(swing_offset))
+                .ok_or_else(|| "Pattern VST3 note end position overflow".to_owned())?;
+            for target_channel_id in
+                router.targets_for_note(note.channel_id, note_index as u64, note.key)
+            {
+                if !plugin_channels.contains(&target_channel_id)
+                    || !channels_by_id
+                        .get(&target_channel_id)
+                        .is_some_and(|channel| {
+                            channel.enabled() != Some(false)
+                                && mixer_route_audibility.allows_channel(channel.mixer_track())
+                        })
+                {
+                    continue;
+                }
+                notes_by_channel
+                    .entry(target_channel_id)
+                    .or_default()
+                    .push(PlaylistMidiNote {
+                        start_tick,
+                        stop_tick,
+                        key: note.key,
+                        velocity: note.velocity,
+                        midi_channel: note.midi_channel,
+                        fine_pitch_offset_cents: note.fine_pitch_offset_cents(),
+                        pan: note.pan,
+                        release: note.release,
+                    });
+            }
+        }
+
+        let loop_output_frames = tempo_map
+            .frame_at_tick(loop_length_ticks, output_sample_rate)?
+            .max(1);
+        let pan_law = project_pan_law(document);
+        let project_master_pitch_cents = document.metadata().master_pitch_cents();
+        let mut streams = Vec::new();
+        let mut unloaded_plugin_channels = BTreeSet::new();
+        let mut notes_scheduled = 0usize;
+        for (channel_id, notes) in notes_by_channel {
+            let Some(instance_id) = channel_instances.get(&channel_id).copied() else {
+                unloaded_plugin_channels.insert(channel_id);
+                continue;
+            };
+            let Ok(plugin) = self.plugin(instance_id).cloned() else {
+                unloaded_plugin_channels.insert(channel_id);
+                continue;
+            };
+            let channel = channels_by_id.get(&channel_id).copied();
+            let pitch_offset_cents = channel.map_or(0, |channel| {
+                channel.master_pitch_render_offset_cents(project_master_pitch_cents)
+            });
+            let note_pitch_offset_semitones = channel.map_or(0, |channel| {
+                channel.master_pitch_note_offset_semitones(project_master_pitch_cents)
+            });
+            let (gain, pan) = channel_gain_pan(
+                channel.and_then(|channel| channel.volume()),
+                channel.and_then(|channel| channel.pan()),
+            );
+            let route_plan = channel
+                .map(|channel| {
+                    mixer_route_audibility.source_route_plan_for_channel(channel.mixer_track())
+                })
+                .unwrap_or_default();
+            let (render, latency_frames, loop_frames) = {
+                let plugin_guard = plugin
+                    .lock()
+                    .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
+                let plugin_sample_rate = plugin_guard.sample_rate();
+                if !plugin_sample_rate.is_finite()
+                    || !(8_000.0..=384_000.0).contains(&plugin_sample_rate)
+                {
+                    return Err(format!(
+                        "VST3 channel {channel_id} has an invalid sample rate"
+                    ));
+                }
+                let plugin_sample_rate_u32 = plugin_sample_rate.round() as u32;
+                let loop_frames = tempo_map
+                    .frame_at_tick(loop_length_ticks, plugin_sample_rate_u32)?
+                    .max(1);
+                let latency_frames = plugin_latency_in_output_frames(
+                    channel_id,
+                    plugin_guard.latency_samples(),
+                    plugin_sample_rate,
+                    output_sample_rate,
+                )?;
+                let render = prepare_playlist_pattern_render(
+                    &plugin_guard,
+                    &notes,
+                    &tempo_map,
+                    loop_frames,
+                    pitch_offset_cents,
+                    note_pitch_offset_semitones,
+                    false,
+                )?;
+                (render, latency_frames, loop_frames)
+            };
+            let (left_pan_gain, right_pan_gain) =
+                channel_pan_gains(pan, render.output_channels == 1, pan_law);
+            let resampler = StereoStreamResampler::new(render.sample_rate_u32, output_sample_rate)?;
+            notes_scheduled = notes_scheduled.saturating_add(render.note_count);
+            let template_events = render.events.clone();
+            streams.push(PlaylistPluginStream {
+                channel_id,
+                plugin,
+                render,
+                resampler,
+                pending_output: VecDeque::new(),
+                source_frame: 0,
+                next_event: 0,
+                resampler_finished: false,
+                latency_frames,
+                delay_line: StereoFrameDelay::default(),
+                gain,
+                left_pan_gain,
+                right_pan_gain,
+                mixer_transform: route_plan.output_transform,
+                mixer_meter_transforms: route_plan.insert_meter_transforms,
+                live_performance: true,
+                active_performance_notes: HashMap::new(),
+                note_pitch_offset_semitones,
+                pattern_loop: Some(PatternLoopEventQueue {
+                    loop_frames,
+                    template_events,
+                    next_cycle: 1,
+                }),
+            });
+        }
+
+        let stream_latencies = streams
+            .iter()
+            .map(|stream| stream.latency_frames)
+            .collect::<Vec<_>>();
+        let (maximum_latency_frames, _) = plan_pdc_delays(&stream_latencies);
+        let mut processor = Vst3PlaylistStreamProcessor {
+            streams,
+            tempo_map,
+            output_sample_rate,
+            content_frames: loop_output_frames,
+            output_frames: loop_output_frames,
+            maximum_latency_frames,
+            notes_scheduled,
+            unloaded_plugin_channels: unloaded_plugin_channels.into_iter().collect(),
+            started_count: 0,
+        };
+        processor.extend_to_output_frames(loop_output_frames)?;
+        Ok(processor)
+    }
+
     fn prepare_playlist_stream_inner(
         &self,
         document: &FlpDocument,
@@ -1827,6 +2108,7 @@ impl Vst3HostRuntime {
                 live_performance: live_performance_channels.contains(&channel_id),
                 active_performance_notes: HashMap::new(),
                 note_pitch_offset_semitones,
+                pattern_loop: None,
             });
         }
         if streams.is_empty() {
@@ -3293,6 +3575,50 @@ fn reported_tail_seconds(tail_samples: u32, sample_rate_hz: f64) -> Option<f64> 
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn pattern_loop_event_repeats_get_shifted_frames_and_distinct_note_ids() {
+        let channel = MidiChannel::from_index(0).expect("channel 1 is supported");
+        let template = [
+            ScheduledMidiEvent {
+                frame: 12,
+                priority: 1,
+                event: MidiEvent::NoteOn {
+                    channel,
+                    note: 60,
+                    velocity: 100,
+                },
+                fine_pitch_offset_cents: 0,
+                note_id: 7,
+                note_pan: 64,
+                note_release: 64,
+                performance_track_id: None,
+            },
+            ScheduledMidiEvent {
+                frame: 40,
+                priority: 0,
+                event: MidiEvent::NoteOff {
+                    channel,
+                    note: 60,
+                    velocity: 0,
+                },
+                fine_pitch_offset_cents: 0,
+                note_id: 7,
+                note_pan: 64,
+                note_release: 64,
+                performance_track_id: None,
+            },
+        ];
+
+        let repeated = repeat_pattern_loop_events(&template, 384)
+            .expect("the next Pattern iteration should schedule");
+        assert_eq!(repeated.len(), 2);
+        assert_eq!(repeated[0].frame, 396);
+        assert_eq!(repeated[1].frame, 424);
+        assert_ne!(repeated[0].note_id, template[0].note_id);
+        assert_eq!(repeated[0].note_id, repeated[1].note_id);
+        assert!(repeat_pattern_loop_events(&template, u64::MAX).is_err());
+    }
 
     #[test]
     fn parameter_automation_uses_pattern_beats_and_emits_block_offsets() {

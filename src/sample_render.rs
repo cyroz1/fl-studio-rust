@@ -25,7 +25,8 @@ use vorbis_rs::VorbisDecoder;
 use vorbis_rs::{VorbisBitrateManagementStrategy, VorbisEncoder, VorbisEncoderBuilder};
 
 use crate::audio::{
-    AudioInputRecording, MIXER_TRACK_METER_COUNT, MixerTrackPeakMeters, StreamingAudioWriter,
+    AudioInputRecording, MIXER_TRACK_METER_COUNT, MixerTrackPeakMeters, StereoFrameDelay,
+    StreamingAudioWriter,
 };
 use crate::media::{DecodedAudio, SamplePathResolver, decode_audio_file, wav_sampler_metadata};
 use crate::vst3::{PlaylistMidiNote, Vst3PlaylistStreamProcessor};
@@ -538,6 +539,13 @@ pub struct SamplerPatternRenderOptions {
     pub wav_channel_mode: WavChannelMode,
     pub resampling_quality: ResamplingQuality,
     pub read_sample_root_note: bool,
+}
+
+/// Timing and prepared plug-in stream for live Pattern-mode playback.
+pub struct Vst3PatternLoopPlayback {
+    pub loop_length_ticks: u64,
+    pub start_tick: u64,
+    pub processor: Vst3PlaylistStreamProcessor,
 }
 
 impl Default for SamplerPatternRenderOptions {
@@ -4376,6 +4384,61 @@ pub fn stream_sampler_pattern_loop_from_tick_to_device(
     writer: &StreamingAudioWriter,
     cancelled: &AtomicBool,
 ) -> Result<SamplerPatternRenderSummary, String> {
+    stream_sampler_pattern_loop_from_tick_with_vst3_to_device(
+        document,
+        project_path,
+        options,
+        PatternLoopStreamConfig {
+            loop_length_ticks,
+            start_tick,
+            vst3_processor: None,
+            allow_empty_sampler: false,
+        },
+        writer,
+        cancelled,
+    )
+}
+
+/// Stream a Pattern loop with enabled Sampler channels and loaded VST3 instruments in one mix.
+pub fn stream_pattern_loop_with_vst3_from_tick_to_device(
+    document: &FlpDocument,
+    project_path: impl AsRef<Path>,
+    options: SamplerPatternRenderOptions,
+    playback: Vst3PatternLoopPlayback,
+    writer: &StreamingAudioWriter,
+    cancelled: &AtomicBool,
+) -> Result<SamplerPatternRenderSummary, String> {
+    stream_sampler_pattern_loop_from_tick_with_vst3_to_device(
+        document,
+        project_path,
+        options,
+        PatternLoopStreamConfig {
+            loop_length_ticks: playback.loop_length_ticks,
+            start_tick: playback.start_tick,
+            vst3_processor: Some(playback.processor),
+            allow_empty_sampler: true,
+        },
+        writer,
+        cancelled,
+    )
+}
+
+struct PatternLoopStreamConfig {
+    loop_length_ticks: u64,
+    start_tick: u64,
+    vst3_processor: Option<Vst3PlaylistStreamProcessor>,
+    allow_empty_sampler: bool,
+}
+
+fn stream_sampler_pattern_loop_from_tick_with_vst3_to_device(
+    document: &FlpDocument,
+    project_path: impl AsRef<Path>,
+    options: SamplerPatternRenderOptions,
+    mut playback: PatternLoopStreamConfig,
+    writer: &StreamingAudioWriter,
+    cancelled: &AtomicBool,
+) -> Result<SamplerPatternRenderSummary, String> {
+    let loop_length_ticks = playback.loop_length_ticks;
     if loop_length_ticks == 0 {
         return Err("pattern loop length must be greater than zero".to_owned());
     }
@@ -4385,13 +4448,32 @@ pub fn stream_sampler_pattern_loop_from_tick_to_device(
     if loop_frames == 0 {
         return Err("pattern loop length rounds to zero audio frames".to_owned());
     }
-    let start_tick = start_tick % loop_length_ticks;
+    let start_tick = playback.start_tick % loop_length_ticks;
     let start_frame = ticks_to_frames(start_tick, ppq, tempo_bpm, options.sample_rate)?;
     if start_frame >= loop_frames {
         return Err("Pattern seek position rounds outside its audio loop".to_owned());
     }
-    let render =
-        prepare_sampler_pattern(document, project_path.as_ref(), options, Some(cancelled))?;
+    let render = if playback.allow_empty_sampler {
+        prepare_sampler_pattern_allow_empty(
+            document,
+            project_path.as_ref(),
+            options,
+            Some(cancelled),
+        )?
+    } else {
+        prepare_sampler_pattern(document, project_path.as_ref(), options, Some(cancelled))?
+    };
+    if render.summary.notes_rendered == 0
+        && playback
+            .vst3_processor
+            .as_ref()
+            .is_none_or(|processor| processor.summary().plugin_channels_rendered == 0)
+    {
+        return Err(format!(
+            "Pattern {} has no supported Sampler notes or loaded VST3 instruments",
+            options.pattern_id
+        ));
+    }
     crate::audio::enable_denormal_protection();
     let release_frames = (f64::from(render.summary.sample_rate) * SAMPLER_RELEASE_SECONDS)
         .round()
@@ -4406,56 +4488,85 @@ pub fn stream_sampler_pattern_loop_from_tick_to_device(
         render.pan_law,
     );
     engine.mixer_transforms_by_channel = Some(&render.mixer_transforms_by_channel);
-    let mut block = vec![0.0f32; SAMPLER_BLOCK_FRAMES * 2];
-    let mut block_start = 0u64;
-    while block_start < start_frame {
-        check_cancelled(Some(cancelled))?;
-        if writer.is_cancelled() {
-            return Err("Sampler Pattern playback was stopped".to_owned());
-        }
-        let frame_count = (start_frame - block_start).min(SAMPLER_BLOCK_FRAMES as u64) as usize;
-        engine.render_block(block_start, frame_count, &mut block[..frame_count * 2]);
-        block_start += frame_count as u64;
+    if let Some(processor) = playback.vst3_processor.as_mut() {
+        processor.start_processing()?;
     }
-    let mut next_loop_start = loop_frames;
-    loop {
-        check_cancelled(Some(cancelled))?;
-        if writer.is_cancelled() {
-            return Err("Sampler pattern playback was stopped".to_owned());
+    let sampler_delay_frames = playback.vst3_processor.as_ref().map_or(
+        0,
+        Vst3PlaylistStreamProcessor::pdc_direct_source_delay_frames,
+    );
+    let mut sampler_delay = StereoFrameDelay::new(sampler_delay_frames)?;
+    let mut block = vec![0.0f32; SAMPLER_BLOCK_FRAMES * 2];
+    let mut vst3_block = vec![0.0f32; SAMPLER_BLOCK_FRAMES * 2];
+    let stream_result = (|| {
+        let mut block_start = 0u64;
+        while block_start < start_frame {
+            check_cancelled(Some(cancelled))?;
+            if writer.is_cancelled() {
+                return Err("Sampler Pattern playback was stopped".to_owned());
+            }
+            let frame_count = (start_frame - block_start).min(SAMPLER_BLOCK_FRAMES as u64) as usize;
+            engine.render_block(block_start, frame_count, &mut block[..frame_count * 2]);
+            sampler_delay.process_interleaved(&mut block[..frame_count * 2])?;
+            if let Some(processor) = playback.vst3_processor.as_mut() {
+                vst3_block[..frame_count * 2].fill(0.0);
+                processor.mix_next_block(&mut vst3_block[..frame_count * 2])?;
+            }
+            block_start += frame_count as u64;
         }
-        let block_end = block_start.saturating_add(SAMPLER_BLOCK_FRAMES as u64);
-        while next_loop_start <= block_end {
-            let repeated_notes = render
-                .notes
-                .iter()
-                .copied()
-                .map(|mut note| {
-                    note.start_frame = note
-                        .start_frame
-                        .checked_add(next_loop_start)
-                        .ok_or_else(|| "Sampler Pattern loop position overflow".to_owned())?;
-                    note.stop_frame = note
-                        .stop_frame
-                        .map(|stop_frame| {
-                            stop_frame
-                                .checked_add(next_loop_start)
-                                .ok_or_else(|| "Sampler Pattern note end overflow".to_owned())
-                        })
-                        .transpose()?;
-                    Ok(note)
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-            engine.queue_live_notes(repeated_notes);
-            next_loop_start = next_loop_start
-                .checked_add(loop_frames)
-                .ok_or_else(|| "Sampler Pattern loop position overflow".to_owned())?;
-        }
+        let mut next_loop_start = loop_frames;
+        loop {
+            check_cancelled(Some(cancelled))?;
+            if writer.is_cancelled() {
+                return Err("Sampler pattern playback was stopped".to_owned());
+            }
+            let block_end = block_start.saturating_add(SAMPLER_BLOCK_FRAMES as u64);
+            while next_loop_start <= block_end {
+                let repeated_notes = render
+                    .notes
+                    .iter()
+                    .copied()
+                    .map(|mut note| {
+                        note.start_frame = note
+                            .start_frame
+                            .checked_add(next_loop_start)
+                            .ok_or_else(|| "Sampler Pattern loop position overflow".to_owned())?;
+                        note.stop_frame = note
+                            .stop_frame
+                            .map(|stop_frame| {
+                                stop_frame
+                                    .checked_add(next_loop_start)
+                                    .ok_or_else(|| "Sampler Pattern note end overflow".to_owned())
+                            })
+                            .transpose()?;
+                        Ok(note)
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                engine.queue_live_notes(repeated_notes);
+                next_loop_start = next_loop_start
+                    .checked_add(loop_frames)
+                    .ok_or_else(|| "Sampler Pattern loop position overflow".to_owned())?;
+            }
 
-        let frame_count = SAMPLER_BLOCK_FRAMES;
-        engine.render_block(block_start, frame_count, &mut block);
-        render.master_output.apply(&mut block);
-        writer.write_stereo_samples(&block)?;
-        block_start = block_start.saturating_add(frame_count as u64);
+            let frame_count = SAMPLER_BLOCK_FRAMES;
+            engine.render_block(block_start, frame_count, &mut block);
+            sampler_delay.process_interleaved(&mut block)?;
+            if let Some(processor) = playback.vst3_processor.as_mut() {
+                processor.mix_next_block(&mut block)?;
+            }
+            render.master_output.apply(&mut block);
+            writer.write_stereo_samples(&block)?;
+            block_start = block_start.saturating_add(frame_count as u64);
+        }
+    })();
+    let stop_result = playback
+        .vst3_processor
+        .as_mut()
+        .map_or(Ok(()), Vst3PlaylistStreamProcessor::stop_processing);
+    match (stream_result, stop_result) {
+        (Err(stream_error), _) => Err(stream_error),
+        (Ok(_), Err(stop_error)) => Err(stop_error),
+        (Ok(()), Ok(())) => Ok(render.summary),
     }
 }
 
@@ -7483,6 +7594,40 @@ fn prepare_sampler_pattern_for_channel(
     cancelled: Option<&AtomicBool>,
     channel_filter: Option<u16>,
 ) -> Result<PreparedSamplerPattern, String> {
+    prepare_sampler_pattern_for_channel_internal(
+        document,
+        project_path,
+        options,
+        cancelled,
+        channel_filter,
+        false,
+    )
+}
+
+fn prepare_sampler_pattern_allow_empty(
+    document: &FlpDocument,
+    project_path: &Path,
+    options: SamplerPatternRenderOptions,
+    cancelled: Option<&AtomicBool>,
+) -> Result<PreparedSamplerPattern, String> {
+    prepare_sampler_pattern_for_channel_internal(
+        document,
+        project_path,
+        options,
+        cancelled,
+        None,
+        true,
+    )
+}
+
+fn prepare_sampler_pattern_for_channel_internal(
+    document: &FlpDocument,
+    project_path: &Path,
+    options: SamplerPatternRenderOptions,
+    cancelled: Option<&AtomicBool>,
+    channel_filter: Option<u16>,
+    allow_empty: bool,
+) -> Result<PreparedSamplerPattern, String> {
     check_cancelled(cancelled)?;
     if !(8_000..=384_000).contains(&options.sample_rate) {
         return Err("sampler render rate must be between 8000 and 384000 Hz".to_owned());
@@ -7540,11 +7685,32 @@ fn prepare_sampler_pattern_for_channel(
         })
         .collect::<Vec<_>>();
     let sampler_note_count = sampler_notes.len();
-    if sampler_note_count == 0 {
+    if sampler_note_count == 0 && !allow_empty {
         return Err(format!(
             "pattern {} contains no notes on enabled Sampler channels",
             options.pattern_id
         ));
+    }
+    if sampler_note_count == 0 {
+        return Ok(PreparedSamplerPattern {
+            summary: SamplerPatternRenderSummary {
+                frames: 0,
+                sample_rate: options.sample_rate,
+                notes_rendered: 0,
+                voices_stolen: 0,
+                sampler_channels_rendered: 0,
+                source_files: 0,
+                notes_skipped_unresolved_sample: 0,
+                unresolved_sample_channels: Vec::new(),
+            },
+            pan_law,
+            notes: Vec::new(),
+            sources_by_channel: HashMap::new(),
+            mixer_transforms_by_channel: HashMap::new(),
+            master_output: MixerMasterOutput::from_document(document),
+            voice_limit: options.voice_limit,
+            resampling_quality: options.resampling_quality,
+        });
     }
 
     let resolver = SamplePathResolver::new(project_path);
