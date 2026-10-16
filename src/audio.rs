@@ -5,7 +5,7 @@
 //! exclusive-access errors are visible to the application.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -43,6 +43,7 @@ pub const MIXER_TRACK_METER_COUNT: usize = i8::MAX as usize + 1;
 pub struct MixerTrackPeakMeters {
     peaks: [AtomicU32; MIXER_TRACK_METER_COUNT],
     live_master_fader_gain: Arc<AtomicU32>,
+    live_master_pan_raw: Arc<AtomicI32>,
 }
 
 impl Default for MixerTrackPeakMeters {
@@ -50,6 +51,7 @@ impl Default for MixerTrackPeakMeters {
         Self {
             peaks: std::array::from_fn(|_| AtomicU32::new(0.0_f32.to_bits())),
             live_master_fader_gain: Arc::new(AtomicU32::new(1.0_f32.to_bits())),
+            live_master_pan_raw: Arc::new(AtomicI32::new(i32::MIN)),
         }
     }
 }
@@ -85,6 +87,20 @@ impl MixerTrackPeakMeters {
 
     pub(crate) fn live_master_fader_gain(&self) -> Arc<AtomicU32> {
         Arc::clone(&self.live_master_fader_gain)
+    }
+
+    /// Set the live Playlist stream's target Master pan, or clear it when no valid control exists.
+    ///
+    /// The render worker reads this value without taking a lock and smooths changes over 20 ms.
+    pub fn set_live_master_pan_raw(&self, pan_raw: Option<i32>) {
+        let pan_raw = pan_raw
+            .filter(|pan_raw| (-6_400..=6_400).contains(pan_raw))
+            .unwrap_or(i32::MIN);
+        self.live_master_pan_raw.store(pan_raw, Ordering::Release);
+    }
+
+    pub(crate) fn live_master_pan_raw(&self) -> Arc<AtomicI32> {
+        Arc::clone(&self.live_master_pan_raw)
     }
 
     pub(crate) fn publish_peak(&self, track: usize, peak: f32) {
