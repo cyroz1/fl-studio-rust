@@ -1,14 +1,15 @@
 # macOS CI packaging
 
-The macOS CI job always runs formatting, Clippy, tests, and a launch smoke check of the packaged app. It uploads a separate `macos-native-gui-preview` artifact with a screenshot of the native startup window. Without signing credentials, it also builds an unsigned `.app`, checks that its executable and `.flp` file association are present, and uploads a short-lived `macos-unsigned-gui-preview` artifact for local UI review. The `.app` is inside a tar archive because GitHub Actions ZIP artifacts reset file permissions and can strip the app executable bit ([`actions/upload-artifact` permission behavior](https://github.com/actions/upload-artifact#permission-loss)). CI verifies that the executable bit survives the tar archive. This artifact is not a distributable installer and Gatekeeper may report that the app is “damaged” because it is unsigned and quarantined. Extract the Actions artifact once; `README-FIRST.txt` and the app archive are together in the extracted folder. To open a preview from this trusted repository, open Terminal, change to that folder, and run:
+The macOS CI job runs formatting, Clippy, tests, and a launch smoke check of the packaged app. It builds the app and a disk image, verifies the image with `hdiutil`, mounts it to confirm it contains the app bundle, and checks the app executable and `.flp` file association. CI uploads one artifact, `installers-macos-latest`, containing only the `.dmg` installer.
+
+When signing credentials are unavailable, the disk image is unsigned. After downloading this trusted CI build, macOS may block the app or report that it is damaged because the quarantined app has no Developer ID signature. For local testing, mount the DMG, drag `FL Studio Rebuild.app` to Applications, then remove quarantine from that app in Terminal and open it:
 
 ```sh
-tar -xzf "FL Studio Rebuild.app.tar.gz"
-xattr -dr com.apple.quarantine "FL Studio Rebuild.app"
-open "FL Studio Rebuild.app"
+xattr -dr com.apple.quarantine "/Applications/FL Studio Rebuild.app"
+open "/Applications/FL Studio Rebuild.app"
 ```
 
-For a normal downloadable build that Gatekeeper can verify, CI creates and uploads a disk image only when it can sign the app with a Developer ID Application certificate and notarize it with Apple. Apple describes the Developer ID requirement for software distributed outside the Mac App Store in its [Gatekeeper signing guidance](https://developer.apple.com/developer-id/). The packaged app registers `.flp` project files and opens a project passed as its launch argument.
+This workaround is for local testing of a trusted CI artifact; it does not make the app Gatekeeper verified. With signing credentials, CI signs the app with a Developer ID Application certificate, notarizes it with Apple, checks its signature and stapled ticket, and uploads the verified disk image under the same artifact name. Apple describes the Developer ID requirement for software distributed outside the Mac App Store in its [Gatekeeper signing guidance](https://developer.apple.com/developer-id/). The packaged app registers `.flp` project files and opens a project passed as its launch argument.
 
 Add these repository Actions secrets under **Settings → Secrets and variables → Actions**:
 
@@ -21,4 +22,4 @@ Add these repository Actions secrets under **Settings → Secrets and variables 
 | `APPLE_API_ISSUER` | App Store Connect issuer ID |
 | `APPLE_API_KEY_CONTENT` | Contents of the API key `.p8` file |
 
-The workflow writes the API key and a temporary signed Packager config into the runner's workspace, signs and notarizes the app, checks the signature and stapled ticket with Apple's tools, and uploads only the `.dmg`. Temporary signing files are removed after the job. If no secrets are configured, macOS tests still run and CI uploads only the clearly labeled unsigned GUI preview. A partial set of secrets fails the job so a misconfigured package cannot be mistaken for a verified one.
+The workflow writes the API key and a temporary signed Packager config into the runner's workspace. Temporary signing files are removed after the job. If no secrets are configured, macOS tests and packaging still run and CI uploads only the unsigned installer. A partial set of secrets fails the job so a misconfigured package cannot be mistaken for a verified one.
