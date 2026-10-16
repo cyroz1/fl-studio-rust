@@ -12801,6 +12801,21 @@ impl FlpDocument {
         self.add_pattern_notes(pattern_id, &[note])
     }
 
+    /// Returns a MIDI track name safe for use as a Channel Rack display name.
+    fn midi_track_display_name(track: &midi::MidiTrack, track_index: usize) -> String {
+        let fallback_name = format!("Track {}", track_index + 1);
+        let source_name = track
+            .name()
+            .filter(|name| !name.is_empty())
+            .unwrap_or(fallback_name.clone());
+        let display_name = source_name.replace('\0', " ");
+        if display_name.trim().is_empty() {
+            fallback_name
+        } else {
+            display_name
+        }
+    }
+
     /// Imports the note events from one Standard MIDI File track into an existing FLP
     /// pattern and channel. Note times are converted through the MIDI tempo map or
     /// SMPTE clock, then expressed against the existing FLP tempo. MIDI CC 10 pan
@@ -12894,24 +12909,54 @@ impl FlpDocument {
         let mut candidate = self.clone();
         let mut channel_ids = Vec::with_capacity(midi.tracks().len());
         for (track_index, track) in midi.tracks().iter().enumerate() {
-            let fallback_name = format!("Track {}", track_index + 1);
-            let source_name = track
-                .name()
-                .filter(|name| !name.is_empty())
-                .unwrap_or(fallback_name.clone());
-            let display_name = source_name.replace('\0', " ");
-            let display_name = if display_name.trim().is_empty() {
-                fallback_name
-            } else {
-                display_name
-            };
-            channel_ids
-                .push(candidate.duplicate_sampler_channel(template_channel_id, &display_name)?);
+            channel_ids.push(candidate.duplicate_sampler_channel(
+                template_channel_id,
+                &Self::midi_track_display_name(track, track_index),
+            )?);
         }
 
         let imported = candidate.import_midi_tracks(midi, pattern_id, &channel_ids)?;
         *self = candidate;
         Ok((imported, channel_ids))
+    }
+
+    /// Imports every independent sequence in a Format-2 MIDI file into its own new Pattern and
+    /// named Sampler channel. Each Sampler copies the selected kind-0 template, and the complete
+    /// operation rolls back if a Pattern cannot be created or any track fails to import.
+    pub fn import_midi_format2_tracks_to_sampler_patterns(
+        &mut self,
+        midi: &midi::MidiFile,
+        template_channel_id: u16,
+    ) -> Result<(usize, Vec<(u16, u16)>), FlpError> {
+        if midi.format() != 2 {
+            return Err(FlpError::UnsupportedEdit(
+                "separate Pattern import requires a Format-2 MIDI file",
+            ));
+        }
+        if midi.tracks().is_empty() {
+            return Err(FlpError::UnsupportedEdit(
+                "the MIDI file contains no tracks to import",
+            ));
+        }
+
+        let mut candidate = self.clone();
+        let mut destinations = Vec::with_capacity(midi.tracks().len());
+        let mut total_imported = 0usize;
+        for (track_index, track) in midi.tracks().iter().enumerate() {
+            let pattern_id = candidate.create_pattern()?;
+            let channel_id = candidate.duplicate_sampler_channel(
+                template_channel_id,
+                &Self::midi_track_display_name(track, track_index),
+            )?;
+            let imported =
+                candidate.import_midi_track(midi, track_index, pattern_id, channel_id)?;
+            total_imported = total_imported
+                .checked_add(imported)
+                .ok_or(FlpError::LengthOverflow)?;
+            destinations.push((pattern_id, channel_id));
+        }
+        *self = candidate;
+        Ok((total_imported, destinations))
     }
 
     fn import_midi_track_in_place(
@@ -25188,6 +25233,102 @@ mod tests {
                 .is_err()
         );
         assert_eq!(rejected_non_sampler.encode_lossless().unwrap(), non_sampler);
+    }
+
+    #[test]
+    fn imports_format_two_midi_tracks_into_separate_sampler_patterns() {
+        let midi = MidiFile::parse(&midi_tracks_fixture(
+            &[
+                &[
+                    0x00, 0xFF, 0x03, 0x05, b'P', b'i', b'a', b'n', b'o', 0x00, 0x90, 0x3C, 0x64,
+                    0x83, 0x60, 0x80, 0x3C, 0x00, 0x00, 0xFF, 0x2F, 0x00,
+                ],
+                &[
+                    0x00, 0xFF, 0x03, 0x04, b'B', b'a', b's', b's', 0x00, 0x90, 0x43, 0x50, 0x81,
+                    0x70, 0x80, 0x43, 0x00, 0x00, 0xFF, 0x2F, 0x00,
+                ],
+            ],
+            2,
+            480,
+        ))
+        .expect("Format-2 MIDI fixture should parse");
+        let mut stream = Vec::new();
+        append_data_event(&mut stream, 0xC7, b"26.0.0\0");
+        stream.extend_from_slice(&[0x40, 0, 0, 0x15, 0, 0x00, 1]);
+        let sample_path = "/samples/template.wav"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .chain([0, 0])
+            .collect::<Vec<_>>();
+        append_data_event(&mut stream, 0xC4, &sample_path);
+        let template_name = "Template"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .chain([0, 0])
+            .collect::<Vec<_>>();
+        append_data_event(&mut stream, 0xCB, &template_name);
+        stream.extend_from_slice(&[0x62, 0, 0, 0x41, 7, 0, 0xD0, 0]);
+        let original = flp_fixture(&stream, &[], &[]);
+        let mut document = FlpDocument::parse(&original).expect("project fixture should parse");
+
+        let (imported, destinations) = document
+            .import_midi_format2_tracks_to_sampler_patterns(&midi, 0)
+            .expect("each independent sequence should import into its own Pattern");
+
+        assert_eq!(imported, 2);
+        assert_eq!(destinations.len(), 2);
+        assert_ne!(destinations[0].0, destinations[1].0);
+        assert_ne!(destinations[0].1, destinations[1].1);
+        let patterns = document.patterns().unwrap();
+        let first_pattern = patterns
+            .iter()
+            .find(|pattern| pattern.id == destinations[0].0)
+            .expect("first sequence Pattern should exist");
+        let second_pattern = patterns
+            .iter()
+            .find(|pattern| pattern.id == destinations[1].0)
+            .expect("second sequence Pattern should exist");
+        assert_eq!(first_pattern.notes.len(), 1);
+        assert_eq!(
+            (
+                first_pattern.notes[0].channel_id,
+                first_pattern.notes[0].key
+            ),
+            (destinations[0].1, 60)
+        );
+        assert_eq!(second_pattern.notes.len(), 1);
+        assert_eq!(
+            (
+                second_pattern.notes[0].channel_id,
+                second_pattern.notes[0].key
+            ),
+            (destinations[1].1, 67)
+        );
+        let channels = document.channels();
+        for ((_, channel_id), expected_name) in destinations.iter().zip(["Piano", "Bass"]) {
+            let channel = channels
+                .iter()
+                .find(|channel| channel.id() == *channel_id)
+                .expect("sequence Sampler should exist");
+            assert_eq!(channel.display_name(), Some(expected_name));
+            assert_eq!(channel.sample_path(), Some("/samples/template.wav"));
+        }
+
+        let mut non_sampler_stream = stream;
+        let kind_event = non_sampler_stream
+            .windows(2)
+            .position(|window| window == [0x15, 0])
+            .expect("fixture Sampler kind event should exist");
+        non_sampler_stream[kind_event + 1] = 2;
+        let non_sampler = flp_fixture(&non_sampler_stream, &[], &[]);
+        let mut rejected =
+            FlpDocument::parse(&non_sampler).expect("non-Sampler fixture should parse");
+        assert!(
+            rejected
+                .import_midi_format2_tracks_to_sampler_patterns(&midi, 0)
+                .is_err()
+        );
+        assert_eq!(rejected.encode_lossless().unwrap(), non_sampler);
     }
 
     #[test]
