@@ -50,7 +50,8 @@ use flp_rebuild::sample_render::{
     LayerLiveInputEvent, SamplerLiveInputRouting, SamplerLiveNoteEvent, Vst3LiveInputEvent,
 };
 use flp_rebuild::vst3::{
-    MAX_REPORTED_TAIL_SECONDS, Vst3HostRuntime, Vst3PatternRenderOptions, Vst3PatternStreamHandle,
+    MAX_REPORTED_TAIL_SECONDS, Vst3HostRuntime, Vst3PatternRenderOptions,
+    Vst3PatternStreamHandle,
 };
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, Arrangement, ArticulateOptions, AutomationChannel,
@@ -8888,6 +8889,7 @@ impl DawUi {
             self.start_performance_mode_playback();
             return;
         }
+        self.stop_live_vst3_input();
         let Some(project_path) = self.sample_project_path() else {
             self.status = "Save the project to a file before playing its audio clips".to_owned();
             return;
@@ -9144,6 +9146,7 @@ impl DawUi {
             self.status = "Project audio is already being prepared".to_owned();
             return;
         }
+        self.stop_live_vst3_input();
         let Some(document) = self.document.as_ref() else {
             self.status = "Open an FL Studio project before playing".to_owned();
             return;
@@ -34590,6 +34593,7 @@ impl DawUi {
                 self.midi_input_error = None;
                 if connected_device_missing {
                     self.stop_live_sampler_input_for_device_change();
+                    self.stop_live_vst3_input_for_device_change();
                     self.stop_midi_input_thru();
                     self.midi_output_gain_learning = false;
                     self.midi_play_pause_learning = false;
@@ -34646,6 +34650,7 @@ impl DawUi {
         self.midi_play_pause_cc_active = false;
         self.release_all_midi_performance_clips();
         self.stop_live_sampler_input_for_device_change();
+        self.stop_live_vst3_input_for_device_change();
         self.stop_midi_input_thru();
         let previous_connection = self.midi_input_connection.take();
         drop(previous_connection);
@@ -34674,6 +34679,7 @@ impl DawUi {
     fn disconnect_midi_input(&mut self) {
         self.release_all_midi_performance_clips();
         self.stop_live_sampler_input_for_device_change();
+        self.stop_live_vst3_input_for_device_change();
         self.stop_midi_input_thru();
         self.midi_output_gain_learning = false;
         self.midi_play_pause_learning = false;
@@ -36700,6 +36706,12 @@ impl DawUi {
             self.status = "Enable the selected Sampler channel for live MIDI audition".to_owned();
             return false;
         }
+        if self.live_vst3_input.is_some() {
+            self.stop_live_vst3_input();
+            if let Some(engine) = &self.audio_engine {
+                engine.stop_project_playback();
+            }
+        }
         let Some(target_channel_ids) = self.live_sampler_target_channels(channel_id) else {
             self.status = "Live Sampler audition needs a Sampler channel or a Layer whose enabled descendants are Samplers".to_owned();
             return false;
@@ -38117,13 +38129,13 @@ impl DawUi {
                     "Snap live Sampler and recorded notes to selected scale",
                 )
                 .on_hover_text(
-                    "Move live Sampler audition and recorded pitches to the nearest pitch in the selected Piano roll scale.",
+                    "Move live Sampler/VST3 audition and recorded pitches to the nearest pitch in the selected Piano roll scale.",
                 );
             },
         );
         if self.midi_record_snap_to_scale && self.piano_roll_scale != PianoRollScale::None {
             ui.small(format!(
-                "Using {} {} for live Sampler audition and the next recording take.",
+                "Using {} {} for live instrument audition and the next recording take.",
                 PITCH_CLASSES[usize::from(self.piano_roll_scale_root)],
                 self.piano_roll_scale.label()
             ));
@@ -41111,6 +41123,9 @@ impl Drop for DawUi {
             self.vst3_workers.push(stream);
         }
         for worker in self.vst3_workers.drain(..) {
+            let _ = worker.join();
+        }
+        for worker in self.live_vst3_workers.drain(..) {
             let _ = worker.join();
         }
         if let Some(backup) = self.pending_backup_write.take() {
