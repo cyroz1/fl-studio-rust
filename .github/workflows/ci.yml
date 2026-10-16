@@ -1244,14 +1244,12 @@ jobs:
           sleep 3
           echo "Packaged macOS app remained running after launch."
 
-      - name: Upload Linux installers
+      - name: Upload Linux installer
         if: runner.os == 'Linux'
         uses: actions/upload-artifact@v4
         with:
           name: installers-${{ matrix.os }}
-          path: |
-            dist/*.AppImage
-            dist/*.deb
+          path: dist/*.deb
           if-no-files-found: error
           retention-days: 14
 
