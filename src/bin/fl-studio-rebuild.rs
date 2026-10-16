@@ -4042,6 +4042,7 @@ struct DawUi {
     audio_record_stop_requested: bool,
     midi_input_devices: Vec<MidiInputDevice>,
     midi_selected_input_id: Option<String>,
+    midi_connect_input_on_startup: bool,
     midi_input_error: Option<String>,
     midi_input_connection: Option<ConnectedMidiInput>,
     midi_message_sender: SyncSender<ReceivedMidiMessage>,
@@ -4672,6 +4673,7 @@ impl DawUi {
         };
         let MidiDeviceSelections {
             input_id: midi_selected_input_id,
+            connect_input_on_startup: midi_connect_input_on_startup,
             output_id: midi_selected_output_id,
             send_clock: midi_output_send_clock,
             send_playlist_notes: midi_output_send_playlist_notes,
@@ -4975,6 +4977,7 @@ impl DawUi {
             audio_record_stop_requested: false,
             midi_input_devices,
             midi_selected_input_id,
+            midi_connect_input_on_startup,
             midi_input_error,
             midi_input_connection: None,
             midi_message_sender,
@@ -5124,6 +5127,13 @@ impl DawUi {
             app.backup_retention = backup_retention;
         }
         app.refresh_browser_directory();
+        if should_auto_connect_midi_input(
+            app.midi_connect_input_on_startup,
+            app.midi_selected_input_id.as_deref(),
+            &app.midi_input_devices,
+        ) {
+            app.connect_selected_midi_input();
+        }
         if let Some(path) = initial_project.as_deref() {
             app.open_project(path);
         } else if let Some(prompt) = latest_recovery_prompt() {
@@ -35379,6 +35389,7 @@ impl DawUi {
     fn persist_midi_device_selections(&mut self) {
         let selections = MidiDeviceSelections {
             input_id: self.midi_selected_input_id.clone(),
+            connect_input_on_startup: self.midi_connect_input_on_startup,
             output_id: self.midi_selected_output_id.clone(),
             send_clock: self.midi_output_send_clock,
             send_playlist_notes: self.midi_output_send_playlist_notes,
@@ -38430,6 +38441,16 @@ impl DawUi {
                 self.midi_input_toggle_requested = true;
             }
         });
+        if ui
+            .checkbox(
+                &mut self.midi_connect_input_on_startup,
+                "Connect this MIDI input when the app starts",
+            )
+            .on_hover_text("Reconnects the saved input device when it is available at startup.")
+            .changed()
+        {
+            self.persist_midi_device_selections();
+        }
         ui.horizontal(|ui| {
             ui.add_enabled_ui(self.midi_recording.is_none(), |ui| {
                 ui.label("Input quantize");
@@ -42908,6 +42929,7 @@ fn recording_input_targets(
 #[derive(Debug, Eq, PartialEq)]
 struct MidiDeviceSelections {
     input_id: Option<String>,
+    connect_input_on_startup: bool,
     output_id: Option<String>,
     send_clock: bool,
     send_playlist_notes: bool,
@@ -42922,6 +42944,7 @@ impl Default for MidiDeviceSelections {
     fn default() -> Self {
         Self {
             input_id: None,
+            connect_input_on_startup: false,
             output_id: None,
             send_clock: false,
             send_playlist_notes: false,
@@ -43007,8 +43030,9 @@ fn parse_midi_thru_preferences(contents: &str) -> (bool, Option<u8>) {
 
 fn encode_midi_device_selections(selections: &MidiDeviceSelections) -> String {
     format!(
-        "input={}\noutput={}\nclock={}\nplaylist_notes={}\npattern_notes={}\nfixed_velocity={}\nperformance_channel={}\nrecord_audio={}\nrecord_notes={}\n",
+        "input={}\nconnect_input_on_startup={}\noutput={}\nclock={}\nplaylist_notes={}\npattern_notes={}\nfixed_velocity={}\nperformance_channel={}\nrecord_audio={}\nrecord_notes={}\n",
         encode_midi_device_id(selections.input_id.as_deref().unwrap_or_default()),
+        u8::from(selections.connect_input_on_startup),
         encode_midi_device_id(selections.output_id.as_deref().unwrap_or_default()),
         u8::from(selections.send_clock),
         u8::from(selections.send_playlist_notes),
@@ -43025,6 +43049,8 @@ fn parse_midi_device_selections(contents: &str) -> MidiDeviceSelections {
     for line in contents.lines() {
         if let Some(encoded_id) = line.strip_prefix("input=") {
             selections.input_id = decode_midi_device_id(encoded_id);
+        } else if let Some(enabled) = line.strip_prefix("connect_input_on_startup=") {
+            selections.connect_input_on_startup = enabled == "1";
         } else if let Some(encoded_id) = line.strip_prefix("output=") {
             selections.output_id = decode_midi_device_id(encoded_id);
         } else if let Some(enabled) = line.strip_prefix("clock=") {
@@ -43048,6 +43074,16 @@ fn parse_midi_device_selections(contents: &str) -> MidiDeviceSelections {
         }
     }
     selections
+}
+
+fn should_auto_connect_midi_input(
+    connect_on_startup: bool,
+    selected_id: Option<&str>,
+    devices: &[MidiInputDevice],
+) -> bool {
+    connect_on_startup
+        && selected_id
+            .is_some_and(|selected_id| devices.iter().any(|device| device.id == selected_id))
 }
 
 fn encode_midi_device_id(id: &str) -> String {
@@ -47685,12 +47721,12 @@ mod tests {
         ActivePlaylistClipDrag, Arrangement, ChannelDisplayFilter, ChannelNoteRouter,
         DetachedWindowKind, DetachedWindowPlacement, DetachedWindowPlacements,
         DetectedPianoRollScale, FlpDocument, MainView, MidiControlChangeMapping,
-        MidiControllerCcBinding, MidiControllerTemplate, MidiDeviceSelections, MidiInputEvent,
-        PIANO_ROLL_RULER_HEIGHT, Pattern, PatternController, PatternNote, PianoRollChordStamp,
-        PianoRollGrid, PianoRollScale, PianoRollSnap, PlaylistClip, PlaylistClipDragKind,
-        PlaylistTempoMap, PlaylistTrack, PluginCandidate, PluginFormat, TimeSelectionShift,
-        TouchGesture, TouchTapTracker, TouchZoomConfig, WINDOW_LAYOUT_PRESETS_HEADER,
-        WindowLayoutPreset, audio_recording_start_tick_with_offset,
+        MidiControllerCcBinding, MidiControllerTemplate, MidiDeviceSelections, MidiInputDevice,
+        MidiInputEvent, PIANO_ROLL_RULER_HEIGHT, Pattern, PatternController, PatternNote,
+        PianoRollChordStamp, PianoRollGrid, PianoRollScale, PianoRollSnap, PlaylistClip,
+        PlaylistClipDragKind, PlaylistTempoMap, PlaylistTrack, PluginCandidate, PluginFormat,
+        TimeSelectionShift, TouchGesture, TouchTapTracker, TouchZoomConfig,
+        WINDOW_LAYOUT_PRESETS_HEADER, WindowLayoutPreset, audio_recording_start_tick_with_offset,
         built_in_midi_controller_templates, candidate_matches_vst_identity,
         candidate_mixer_controls, candidate_mixer_stereo_separation, detect_chord_name,
         detect_piano_roll_channel_scale, detect_piano_roll_scale, encode_midi_device_id,
@@ -47717,11 +47753,11 @@ mod tests {
         playlist_signature_at_tick, playlist_song_position_label, playlist_track_group_range,
         playlist_track_is_hidden, recolor_piano_roll_notes, recording_input_targets,
         resolve_live_vst3_input_targets, sample_editor_selection_for_drag,
-        serialize_midi_controller_templates, serialize_window_layout_presets, snap_note_tick,
-        snap_piano_roll_key_to_scale, snap_recorded_midi_notes_to_scale,
-        toggle_piano_roll_note_group_selection, touch_pan_zoom_scroll_offset, track_two_finger_tap,
-        update_channel_rack_selection, update_layer_child_selection,
-        update_piano_roll_box_selection, zoom_to_fit,
+        serialize_midi_controller_templates, serialize_window_layout_presets,
+        should_auto_connect_midi_input, snap_note_tick, snap_piano_roll_key_to_scale,
+        snap_recorded_midi_notes_to_scale, toggle_piano_roll_note_group_selection,
+        touch_pan_zoom_scroll_offset, track_two_finger_tap, update_channel_rack_selection,
+        update_layer_child_selection, update_piano_roll_box_selection, zoom_to_fit,
     };
 
     type LiveVst3LayerFixtureChild = (u16, u8, Option<(u32, u32)>);
@@ -48748,6 +48784,7 @@ mod tests {
         let output_id = "CoreMIDI:0123456789ABCDEF";
         let selections = MidiDeviceSelections {
             input_id: Some(input_id.to_owned()),
+            connect_input_on_startup: true,
             output_id: Some(output_id.to_owned()),
             send_clock: true,
             send_playlist_notes: true,
@@ -48778,6 +48815,31 @@ mod tests {
                 ..MidiDeviceSelections::default()
             }
         );
+    }
+
+    #[test]
+    fn midi_input_auto_connect_requires_opt_in_and_matching_saved_device() {
+        let devices = vec![MidiInputDevice {
+            id: "alsa:keyboard".to_owned(),
+            name: "Keyboard".to_owned(),
+        }];
+
+        assert!(!should_auto_connect_midi_input(
+            false,
+            Some("alsa:keyboard"),
+            &devices
+        ));
+        assert!(!should_auto_connect_midi_input(
+            true,
+            Some("alsa:missing"),
+            &devices
+        ));
+        assert!(!should_auto_connect_midi_input(true, None, &devices));
+        assert!(should_auto_connect_midi_input(
+            true,
+            Some("alsa:keyboard"),
+            &devices
+        ));
     }
 
     #[test]
