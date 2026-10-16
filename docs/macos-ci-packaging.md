@@ -1,16 +1,15 @@
 # macOS CI packaging
 
-The macOS CI job always runs formatting, Clippy, tests, and a launch smoke check of the packaged app. It uploads a separate `macos-native-gui-preview` artifact with a screenshot of the native startup window. Without signing credentials, it also builds an unsigned `.app`, checks that its executable and `.flp` file association are present, and uploads a short-lived `macos-unsigned-gui-preview` artifact for local UI review. The `.app` is inside a tar archive because GitHub Actions ZIP artifacts reset file permissions and can strip the app executable bit ([`actions/upload-artifact` permission behavior](https://github.com/actions/upload-artifact#permission-loss)). CI verifies that the executable bit survives the tar archive. This artifact is not a distributable installer and Gatekeeper may report that the app is “damaged” because it is unsigned and quarantined. Extract the Actions artifact once; `README-FIRST.txt` and the app archive are together in the extracted folder. To open a preview from this trusted repository, open Terminal, change to that folder, and run:
+The macOS CI job runs formatting, Clippy, tests, and a packaged-app launch smoke check. CI uploads installer files only: the Ubuntu `.deb`, the Windows setup `.exe`, and a macOS `.dmg` only after it has been signed and notarized. If Apple signing secrets are absent, CI still builds and inspects an unsigned app for its smoke check, but it does not upload a macOS artifact. This prevents an unsigned app from being mistaken for a Gatekeeper-ready installer.
+
+Gatekeeper may report a quarantined, unsigned app as “damaged.” A Developer ID Application signature and Apple notarization are required for a normal download that Gatekeeper can verify. Removing quarantine is only a local testing workaround for an app build you trust; it does not make the app verified:
 
 ```sh
-tar -xzf "FL Studio Rebuild.app.tar.gz"
-xattr -dr com.apple.quarantine "FL Studio Rebuild.app"
-open "FL Studio Rebuild.app"
+xattr -dr com.apple.quarantine "/Applications/FL Studio Rebuild.app"
+open "/Applications/FL Studio Rebuild.app"
 ```
 
-For a normal downloadable build that Gatekeeper can verify, CI creates and uploads a disk image only when it can sign the app with a Developer ID Application certificate and notarize it with Apple. Apple describes the Developer ID requirement for software distributed outside the Mac App Store in its [Gatekeeper signing guidance](https://developer.apple.com/developer-id/). The packaged app registers `.flp` project files and opens a project passed as its launch argument.
-
-Add these repository Actions secrets under **Settings → Secrets and variables → Actions**:
+Configure these repository Actions secrets under **Settings → Secrets and variables → Actions** to publish the signed macOS installer:
 
 | Secret | Value |
 |---|---|
@@ -21,4 +20,4 @@ Add these repository Actions secrets under **Settings → Secrets and variables 
 | `APPLE_API_ISSUER` | App Store Connect issuer ID |
 | `APPLE_API_KEY_CONTENT` | Contents of the API key `.p8` file |
 
-The workflow writes the API key and a temporary signed Packager config into the runner's workspace, signs and notarizes the app, checks the signature and stapled ticket with Apple's tools, and uploads only the `.dmg`. Temporary signing files are removed after the job. If no secrets are configured, macOS tests still run and CI uploads only the clearly labeled unsigned GUI preview. A partial set of secrets fails the job so a misconfigured package cannot be mistaken for a verified one.
+With all six secrets configured, CI signs and notarizes the app, validates its signature and stapled ticket, checks Gatekeeper assessment, and uploads only the `.dmg` as `installers-macos-latest`. A partial set of secrets fails the job so a misconfigured package cannot be mistaken for a verified installer. Apple describes the Developer ID requirement for software distributed outside the Mac App Store in its [Gatekeeper signing guidance](https://developer.apple.com/developer-id/).
