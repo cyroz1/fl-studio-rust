@@ -2500,6 +2500,7 @@ fn stream_live_midi_input(
     }
 
     let mut active_notes = BTreeMap::<(u8, u8), usize>::new();
+    let mut sustain_channels = BTreeSet::<u8>::new();
     let render_result = (|| {
         loop {
             if cancelled.load(Ordering::Acquire) || writer.is_cancelled() {
@@ -2536,7 +2537,9 @@ fn stream_live_midi_input(
                     }
                     if note_pitch_offset_semitones != 0 {
                         match &mut event {
-                            MidiEvent::NoteOn { note, .. } | MidiEvent::NoteOff { note, .. } => {
+                            MidiEvent::NoteOn { note, .. }
+                            | MidiEvent::NoteOff { note, .. }
+                            | MidiEvent::PolyAftertouch { note, .. } => {
                                 *note = (i16::from(*note) + note_pitch_offset_semitones)
                                     .clamp(0, 127) as u8;
                             }
@@ -2547,19 +2550,26 @@ fn stream_live_midi_input(
                         MidiEvent::NoteOff { velocity, .. } => velocity,
                         _ => 0,
                     };
-                    send_scheduled_midi_event(
-                        &mut plugin,
-                        event,
-                        0,
-                        pitch_offset_cents,
-                        0,
-                        ScheduledVst3Note {
-                            note_id: 0,
-                            note_pan: 64,
-                            note_release: release,
-                            supports_pan: false,
-                        },
-                    )?;
+                    match event {
+                        MidiEvent::NoteOn { .. } | MidiEvent::NoteOff { .. } => {
+                            send_scheduled_midi_event(
+                                &mut plugin,
+                                event,
+                                0,
+                                pitch_offset_cents,
+                                0,
+                                ScheduledVst3Note {
+                                    note_id: 0,
+                                    note_pan: 64,
+                                    note_release: release,
+                                    supports_pan: false,
+                                },
+                            )?;
+                        }
+                        _ => plugin
+                            .send_midi_event_at(event, 0)
+                            .map_err(|error| error.to_string())?,
+                    }
                     match event {
                         MidiEvent::NoteOn {
                             channel,
@@ -2578,6 +2588,29 @@ fn stream_live_midi_input(
                                     *count -= 1;
                                 }
                             }
+                        }
+                        MidiEvent::ControlChange {
+                            channel,
+                            controller: 64,
+                            value,
+                        } if value >= 64 => {
+                            sustain_channels.insert(channel.as_index());
+                        }
+                        MidiEvent::ControlChange {
+                            channel,
+                            controller: 64 | 121,
+                            ..
+                        } => {
+                            sustain_channels.remove(&channel.as_index());
+                        }
+                        MidiEvent::ControlChange {
+                            channel,
+                            controller,
+                            ..
+                        } if controller == 120 || (123..=127).contains(&controller) => {
+                            active_notes.retain(|(active_channel, _), _| {
+                                *active_channel != channel.as_index()
+                            });
                         }
                         _ => {}
                     }
@@ -2612,6 +2645,21 @@ fn stream_live_midi_input(
         let mut plugin = plugin
             .lock()
             .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
+        for channel in sustain_channels {
+            let Some(channel) = MidiChannel::from_index(channel) else {
+                continue;
+            };
+            plugin
+                .send_midi_event_at(
+                    MidiEvent::ControlChange {
+                        channel,
+                        controller: 64,
+                        value: 0,
+                    },
+                    0,
+                )
+                .map_err(|error| error.to_string())?;
+        }
         for ((channel, note), count) in active_notes {
             let Some(channel) = MidiChannel::from_index(channel) else {
                 continue;

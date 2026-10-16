@@ -36179,6 +36179,89 @@ impl DawUi {
                     None,
                 )
             }
+            MidiInputEvent::ControlChange {
+                channel,
+                controller,
+                value,
+            } => {
+                if controller == 120 || (123..=127).contains(&controller) {
+                    self.midi_live_vst3_note_mapping
+                        .retain(|(note_channel, _), _| *note_channel != (channel & 0x0F));
+                }
+                let Some(channel) = Vst3MidiChannel::from_index(channel & 0x0F) else {
+                    return true;
+                };
+                (
+                    Vst3MidiEvent::ControlChange {
+                        channel,
+                        controller,
+                        value,
+                    },
+                    None,
+                )
+            }
+            MidiInputEvent::ProgramChange { channel, program } => {
+                let Some(channel) = Vst3MidiChannel::from_index(channel & 0x0F) else {
+                    return true;
+                };
+                (Vst3MidiEvent::ProgramChange { channel, program }, None)
+            }
+            MidiInputEvent::ChannelPressure { channel, pressure } => {
+                let Some(channel) = Vst3MidiChannel::from_index(channel & 0x0F) else {
+                    return true;
+                };
+                (Vst3MidiEvent::ChannelAftertouch { channel, pressure }, None)
+            }
+            MidiInputEvent::PitchBend { channel, value } => {
+                let Some(channel) = Vst3MidiChannel::from_index(channel & 0x0F) else {
+                    return true;
+                };
+                (
+                    Vst3MidiEvent::PitchBend {
+                        channel,
+                        value: (i32::from(value) + 8192).clamp(0, 0x3FFF) as u16,
+                    },
+                    None,
+                )
+            }
+            MidiInputEvent::PolyphonicPressure {
+                channel,
+                key,
+                pressure,
+            } => {
+                let Some(channel_enum) = Vst3MidiChannel::from_index(channel & 0x0F) else {
+                    return true;
+                };
+                let source_note = (channel & 0x0F, key.min(127));
+                let mapped_key = self
+                    .midi_live_vst3_note_mapping
+                    .get(&source_note)
+                    .and_then(VecDeque::front)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        if self.midi_record_snap_to_scale
+                            && self.piano_roll_scale != PianoRollScale::None
+                        {
+                            snap_piano_roll_key_to_scale(
+                                u16::from(key),
+                                self.piano_roll_scale,
+                                self.piano_roll_scale_root,
+                                0,
+                                127,
+                            ) as u8
+                        } else {
+                            key
+                        }
+                    });
+                (
+                    Vst3MidiEvent::PolyAftertouch {
+                        channel: channel_enum,
+                        note: mapped_key,
+                        pressure,
+                    },
+                    None,
+                )
+            }
             _ => return true,
         };
         if self.live_vst3_input.is_none() && !self.start_live_vst3_input(pattern_id, channel_id) {
