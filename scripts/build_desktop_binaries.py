@@ -30,16 +30,28 @@ def main() -> None:
             text=True,
         )
     )
-    helper_package = next(
-        (
-            package
-            for package in metadata["packages"]
-            if package["name"] == "vst3-host" and package["version"] == "0.9.0"
-        ),
-        None,
+    root_manifest = (root / "Cargo.toml").resolve()
+    root_package = next(
+        package
+        for package in metadata["packages"]
+        if Path(package["manifest_path"]).resolve() == root_manifest
     )
-    if helper_package is None:
-        raise SystemExit("cargo metadata did not resolve vst3-host 0.9.0")
+    root_node = next(
+        node for node in metadata["resolve"]["nodes"] if node["id"] == root_package["id"]
+    )
+    host_dependency_ids = {
+        dependency["pkg"]
+        for dependency in root_node["deps"]
+        if dependency["name"].replace("_", "-") == "vst3-host"
+    }
+    helper_packages = [
+        package
+        for package in metadata["packages"]
+        if package["name"] == "vst3-host" and package["id"] in host_dependency_ids
+    ]
+    if len(helper_packages) != 1:
+        raise SystemExit("cargo metadata did not resolve one direct vst3-host dependency")
+    helper_package = helper_packages[0]
 
     build_env = os.environ.copy()
     build_env["CARGO_TARGET_DIR"] = metadata["target_directory"]
