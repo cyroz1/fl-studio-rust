@@ -973,6 +973,12 @@ struct ChannelGroupDialog {
     name: String,
 }
 
+#[derive(Clone)]
+struct PatternRenameDialog {
+    pattern_id: u16,
+    name: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PlaylistWaveformMode {
     Combined,
@@ -3855,6 +3861,7 @@ struct DawUi {
     selected_pattern: Option<u16>,
     channel_display_filter: ChannelDisplayFilter,
     channel_group_dialog: Option<ChannelGroupDialog>,
+    pattern_rename_dialog: Option<PatternRenameDialog>,
     selected_note_channel: Option<u16>,
     selected_note: Option<(u16, u16, usize)>,
     selected_piano_notes: BTreeSet<(u16, u16, usize)>,
@@ -4602,6 +4609,7 @@ impl DawUi {
             selected_pattern: None,
             channel_display_filter: ChannelDisplayFilter::All,
             channel_group_dialog: None,
+            pattern_rename_dialog: None,
             selected_note_channel: None,
             selected_note: None,
             selected_piano_notes: BTreeSet::new(),
@@ -5538,6 +5546,100 @@ impl DawUi {
             self.apply_channel_group_dialog(dialog);
         } else if open && !cancel {
             self.channel_group_dialog = Some(dialog);
+        }
+    }
+
+    fn open_pattern_rename_dialog(&mut self, pattern_id: u16) {
+        let Some(document) = &self.document else {
+            self.status = "Open a project before renaming a Pattern".to_owned();
+            return;
+        };
+        let Some(pattern) = document.patterns().ok().and_then(|patterns| {
+            patterns
+                .into_iter()
+                .find(|pattern| pattern.id == pattern_id)
+        }) else {
+            self.status = format!("Pattern {pattern_id} is no longer available");
+            return;
+        };
+        self.pattern_rename_dialog = Some(PatternRenameDialog {
+            pattern_id,
+            name: pattern.name.unwrap_or_default(),
+        });
+    }
+
+    fn apply_pattern_rename_dialog(&mut self, dialog: PatternRenameDialog) {
+        let before = self
+            .document
+            .as_ref()
+            .and_then(|document| document.encode_lossless().ok());
+        let result = self
+            .document
+            .as_mut()
+            .map(|document| document.set_pattern_name(dialog.pattern_id, &dialog.name));
+        match result {
+            Some(Ok(())) => {
+                let changed = self
+                    .document
+                    .as_ref()
+                    .and_then(|document| document.encode_lossless().ok())
+                    .zip(before)
+                    .is_some_and(|(after, before)| after != before);
+                if changed {
+                    self.stop_project_playback();
+                    self.dirty = true;
+                    self.status =
+                        format!("Renamed Pattern {} to {}", dialog.pattern_id, dialog.name);
+                } else {
+                    self.status = format!(
+                        "Pattern {} is already named {}",
+                        dialog.pattern_id, dialog.name
+                    );
+                }
+            }
+            Some(Err(error)) => {
+                self.status = format!("Could not rename Pattern: {error}");
+                self.pattern_rename_dialog = Some(dialog);
+            }
+            None => self.status = "Open a project before renaming a Pattern".to_owned(),
+        }
+    }
+
+    fn pattern_rename_dialog(&mut self, context: &egui::Context) {
+        let Some(mut dialog) = self.pattern_rename_dialog.take() else {
+            return;
+        };
+        let mut open = true;
+        let mut apply = false;
+        let mut cancel = false;
+        egui::Window::new("Rename Pattern")
+            .id(Id::new("pattern-rename-dialog"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(340.0)
+            .show(context, |ui| {
+                ui.label(format!("Pattern {} name", dialog.pattern_id));
+                ui.text_edit_singleline(&mut dialog.name);
+                ui.horizontal(|ui| {
+                    if ui.button("Rename").clicked() {
+                        apply = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+                if ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                    apply = true;
+                }
+                if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                    cancel = true;
+                }
+            });
+        if apply {
+            self.apply_pattern_rename_dialog(dialog);
+        } else if open && !cancel {
+            self.pattern_rename_dialog = Some(dialog);
         }
     }
 
@@ -10173,6 +10275,14 @@ impl DawUi {
                     && ui.button("Duplicate selected pattern  Alt/Opt+C").clicked()
                 {
                     self.duplicate_pattern(pattern_id);
+                    ui.close();
+                }
+                if let Some(pattern_id) = self
+                    .selected_pattern
+                    .filter(|pattern_id| patterns.iter().any(|pattern| pattern.id == *pattern_id))
+                    && ui.button("Rename selected pattern…").clicked()
+                {
+                    self.open_pattern_rename_dialog(pattern_id);
                     ui.close();
                 }
                 if patterns.is_empty() {
@@ -40377,6 +40487,7 @@ impl eframe::App for DawUi {
         self.project_info_dialog(ui.ctx());
         self.project_settings_dialog(ui.ctx());
         self.channel_group_dialog(ui.ctx());
+        self.pattern_rename_dialog(ui.ctx());
         self.playlist_render_options_dialog(ui.ctx());
         self.browser_tag_editor_dialog(ui.ctx());
         self.browser_bulk_tag_editor_dialog(ui.ctx());

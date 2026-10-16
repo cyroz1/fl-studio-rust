@@ -4591,7 +4591,8 @@ impl FlpDocument {
         Ok(())
     }
 
-    fn set_pattern_name(&mut self, pattern_id: u16, name: &str) -> Result<(), FlpError> {
+    /// Renames a recognized Pattern while preserving its other events and string suffix bytes.
+    pub fn set_pattern_name(&mut self, pattern_id: u16, name: &str) -> Result<(), FlpError> {
         if name.contains('\0') {
             return Err(FlpError::UnsupportedEdit(
                 "pattern names cannot contain an embedded NUL character",
@@ -24024,6 +24025,98 @@ mod tests {
         assert_eq!(reopened_duplicate.length_ticks, Some(1920));
         assert_eq!(reopened_duplicate.name.as_deref(), Some("Verse"));
         assert_eq!(reopened.trailing_bytes(), &[0xB2]);
+    }
+
+    #[test]
+    fn renaming_patterns_preserves_unrelated_events_and_adds_missing_names() {
+        let mut stream = Vec::new();
+        append_data_event(&mut stream, 0xC7, b"26.0.0\0");
+        stream.extend_from_slice(&[0x40, 0, 0, 0x41, 7, 0, 0xD0, 0]);
+        let mut old_name = utf16_project_string("Verse");
+        old_name.extend_from_slice(&[0xA5, 0x5A]);
+        append_data_event(&mut stream, 0xC1, &old_name);
+        stream.extend_from_slice(&[0x41, 8, 0, 0xD0, 0]);
+        stream.extend_from_slice(&[0x40, 1, 0, 0x15, 2]);
+        let input = flp_fixture(&stream, &[0xA1], &[0xB2]);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+        let unrelated_events = document
+            .events()
+            .iter()
+            .filter(|event| event.opcode() != 0xC1)
+            .map(|event| event.wire_bytes().to_vec())
+            .collect::<Vec<_>>();
+
+        document
+            .set_pattern_name(7, "Verse – lead")
+            .expect("the named Pattern should be renamed");
+        document
+            .set_pattern_name(8, "Chorus")
+            .expect("a missing Pattern name should be added");
+
+        let patterns = document.patterns().expect("Patterns should decode");
+        assert_eq!(
+            patterns
+                .iter()
+                .find(|pattern| pattern.id == 7)
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("Verse – lead")
+        );
+        assert_eq!(
+            patterns
+                .iter()
+                .find(|pattern| pattern.id == 8)
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("Chorus")
+        );
+        assert_eq!(
+            document
+                .events()
+                .iter()
+                .filter(|event| event.opcode() != 0xC1)
+                .map(|event| event.wire_bytes().to_vec())
+                .collect::<Vec<_>>(),
+            unrelated_events
+        );
+        assert!(
+            document
+                .events()
+                .iter()
+                .filter(|event| event.opcode() == 0xC1)
+                .any(|event| event.payload().ends_with(&[0xA5, 0x5A]))
+        );
+
+        let encoded = document.encode_lossless().expect("project should encode");
+        let reopened = FlpDocument::parse(&encoded).expect("renamed project should reparse");
+        let reopened_patterns = reopened.patterns().unwrap();
+        assert_eq!(
+            reopened_patterns
+                .iter()
+                .find(|pattern| pattern.id == 7)
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("Verse – lead")
+        );
+        assert_eq!(
+            reopened_patterns
+                .iter()
+                .find(|pattern| pattern.id == 8)
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("Chorus")
+        );
+        assert_eq!(reopened.trailing_bytes(), &[0xB2]);
+
+        let before = reopened.encode_lossless().unwrap();
+        let mut rejected = reopened;
+        assert!(rejected.set_pattern_name(7, "bad\0name").is_err());
+        assert!(rejected.set_pattern_name(99, "Missing").is_err());
+        assert_eq!(rejected.encode_lossless().unwrap(), before);
     }
 
     #[test]

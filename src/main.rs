@@ -276,6 +276,14 @@ fn run(args: Vec<String>) -> Result<(), String> {
         [command, input, output] if command == "create-pattern" => {
             create_pattern(Path::new(input), Path::new(output))
         }
+        [command, input, output, pattern_id, name] if command == "rename-pattern" => {
+            rename_pattern(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                name,
+            )
+        }
         [command, input, output, cents] if command == "set-project-master-pitch" => {
             write_project_settings(
                 Path::new(input),
@@ -1131,6 +1139,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild roundtrip <input.flp> <output.flp>\n",
             "  flp-rebuild set-tempo <input.flp> <output.flp> <bpm>\n",
             "  flp-rebuild create-pattern <input.flp> <output.flp>\n",
+            "  flp-rebuild rename-pattern <input.flp> <output.flp> <pattern-id> <name>\n",
             "  flp-rebuild set-project-info <input.flp> <output.flp> <title|-> <author|-> <genre|-> <comments|-> <web-link|->\n",
             "  flp-rebuild set-project-settings <input.flp> <output.flp> <play-truncated:0|1|-> <fast-declick:0|1|-> [pan-law-raw|-]\n",
             "  flp-rebuild set-project-master-pitch <input.flp> <output.flp> <cents:-1200..1200>\n",
@@ -3512,6 +3521,23 @@ fn create_pattern(input: &Path, output: &Path) -> Result<(), String> {
     fs::write(output, bytes)
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!("created empty pattern {pattern_id} in {}", output.display());
+    Ok(())
+}
+
+fn rename_pattern(input: &Path, output: &Path, pattern_id: u16, name: &str) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .set_pattern_name(pattern_id, name)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "renamed Pattern {pattern_id} to {name:?} in {}",
+        output.display()
+    );
     Ok(())
 }
 
