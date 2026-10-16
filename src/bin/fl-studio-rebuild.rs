@@ -51,13 +51,13 @@ use flp_rebuild::{
     AutomationPoint, AutomationPointEdit, ChannelGroupSummary, ChannelSortOrder, ChannelSummary,
     ChannelType, ClawMachineOptions, FlamOptions, FlpDocument, FlpError, FstPreset, FstPresetKind,
     LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerParameterKind,
-    MixerParameterRecord, PATTERN_NOTE_DEFAULT_FLAGS, PATTERN_NOTE_DEFAULT_RELEASE, Pattern,
-    PatternController, PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation,
-    PayloadEncoding, PlaylistClip, PlaylistClipEdit, PlaylistClipSelectionClipboard,
-    PlaylistClipTarget, PlaylistTrack, PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress,
-    PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions, RiffMachineOptions,
-    RiffMachineQuantizeMode, ScaleLevelsOptions, TimeMarker, TimeMarkerEdit,
-    VstPluginStateMetadata,
+    MixerParameterRecord, PATTERN_NOTE_DEFAULT_FLAGS, PATTERN_NOTE_DEFAULT_RELEASE,
+    PATTERN_NOTE_SLIDE_FLAG, Pattern, PatternController, PatternControllerEdit, PatternNote,
+    PatternNoteEdit, PatternNoteRotation, PayloadEncoding, PlaylistClip, PlaylistClipEdit,
+    PlaylistClipSelectionClipboard, PlaylistClipTarget, PlaylistTrack, PlaylistTrackEdit,
+    PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit,
+    ProjectSettingsEdit, RandomizerOptions, RiffMachineOptions, RiffMachineQuantizeMode,
+    ScaleLevelsOptions, TimeMarker, TimeMarkerEdit, VstPluginStateMetadata,
 };
 use md5::{Digest, Md5};
 
@@ -2298,10 +2298,11 @@ enum PianoRollChordStamp {
     TopDownSeventh,
     BottomUpTriad,
     BottomUpSeventh,
+    SlideUp,
 }
 
 impl PianoRollChordStamp {
-    const ALL: [Self; 36] = [
+    const ALL: [Self; 37] = [
         Self::Major,
         Self::Minor,
         Self::Diminished,
@@ -2338,6 +2339,7 @@ impl PianoRollChordStamp {
         Self::TopDownSeventh,
         Self::BottomUpTriad,
         Self::BottomUpSeventh,
+        Self::SlideUp,
     ];
 
     fn label(self) -> &'static str {
@@ -2378,10 +2380,14 @@ impl PianoRollChordStamp {
             Self::TopDownSeventh => "Top-down seventh",
             Self::BottomUpTriad => "Bottom-up triad",
             Self::BottomUpSeventh => "Bottom-up seventh",
+            Self::SlideUp => "Slide up",
         }
     }
 
     fn pitches(self, root_key: u16, scale: PianoRollScale, scale_root: u8) -> Vec<u16> {
+        if self.is_slide_up() {
+            return vec![root_key];
+        }
         if let Some(note_count) = self.top_down_note_count() {
             return scale_chord_pitches_from_top(root_key, scale, scale_root, note_count);
         }
@@ -2420,6 +2426,7 @@ impl PianoRollChordStamp {
             | Self::ScaleThirteenth
             | Self::BottomUpTriad
             | Self::BottomUpSeventh => &[],
+            Self::SlideUp => unreachable!("slide stamps return before chord interval selection"),
             Self::TopDownTriad | Self::TopDownSeventh => unreachable!(),
         };
         if !intervals.is_empty() {
@@ -2439,6 +2446,7 @@ impl PianoRollChordStamp {
                 Self::ScaleThirteenth => &[0, 4, 7, 11, 14, 17, 21],
                 Self::BottomUpTriad => &[0, 4, 7],
                 Self::BottomUpSeventh => &[0, 4, 7, 11],
+                Self::SlideUp => unreachable!("slide stamps return before scale selection"),
                 _ => unreachable!("manual chord stamps return before scale-degree selection"),
             };
             return intervals
@@ -2467,6 +2475,7 @@ impl PianoRollChordStamp {
             Self::ScaleThirteenth => &[0, 2, 4, 6, 8, 10, 12],
             Self::BottomUpTriad => &[0, 2, 4],
             Self::BottomUpSeventh => &[0, 2, 4, 6],
+            Self::SlideUp => unreachable!("slide stamps return before scale-degree selection"),
             _ => unreachable!("manual chord stamps return before scale-degree selection"),
         };
         let scale_anchor = i32::from(snapped_root) - i32::from(scale_intervals[scale_degree]);
@@ -2501,6 +2510,10 @@ impl PianoRollChordStamp {
             Self::BottomUpSeventh => Some(4),
             _ => None,
         }
+    }
+
+    fn is_slide_up(self) -> bool {
+        self == Self::SlideUp
     }
 }
 
@@ -24614,7 +24627,8 @@ impl DawUi {
                             ("Advanced", &all_stamps[10..27]),
                             ("Scale-derived", &all_stamps[27..32]),
                             ("Top-down", &all_stamps[32..34]),
-                            ("Bottom-up", &all_stamps[34..]),
+                            ("Bottom-up", &all_stamps[34..36]),
+                            ("Special", &all_stamps[36..]),
                         ] {
                             ui.weak(heading);
                             for &stamp in stamps {
@@ -24636,6 +24650,9 @@ impl DawUi {
                 } else if self.piano_roll_chord_stamp.bottom_up_note_count().is_some() {
                     self.piano_roll_chord_inversion = 0;
                     ui.label("Voicing: follows the nearest chord in this pattern");
+                } else if self.piano_roll_chord_stamp.is_slide_up() {
+                    self.piano_roll_chord_inversion = 0;
+                    ui.label("Place above an overlapping note to slide it up");
                 } else {
                     let max_inversion = self
                         .piano_roll_chord_stamp
@@ -24677,10 +24694,16 @@ impl DawUi {
                 }
                 if ui
                     .add_enabled(
-                        self.selected_pattern.is_some() && self.selected_note_channel.is_some(),
+                        self.selected_pattern.is_some()
+                            && self.selected_note_channel.is_some()
+                            && !self.piano_roll_chord_stamp.is_slide_up(),
                         egui::Button::new("Preview C5"),
                     )
-                    .on_hover_text("Audition this chord stamp and voicing at C5")
+                    .on_hover_text(if self.piano_roll_chord_stamp.is_slide_up() {
+                        "Slide notes do not produce sound on their own"
+                    } else {
+                        "Audition this chord stamp and voicing at C5"
+                    })
                     .clicked()
                 {
                     chord_preview_requested = true;
@@ -26306,6 +26329,10 @@ impl DawUi {
     }
 
     fn preview_piano_roll_chord_stamp(&mut self, note_length: u32) {
+        if self.piano_roll_chord_stamp.is_slide_up() {
+            self.status = "Slide notes do not produce sound on their own".to_owned();
+            return;
+        }
         let (Some(pattern_id), Some(channel_id)) =
             (self.selected_pattern, self.selected_note_channel)
         else {
@@ -30824,6 +30851,7 @@ impl DawUi {
                     note_from_grid_position(pointer, grid_geometry, channel_id)
             {
                 root_note.length = snap_ticks.max(1);
+                let slide_up = self.piano_roll_chord_stamp.is_slide_up();
                 let bottom_up_note_count =
                     self.piano_roll_chord_stamp.bottom_up_note_count();
                 let mut chord_pitches = if let Some(note_count) = bottom_up_note_count {
@@ -30859,6 +30887,7 @@ impl DawUi {
                         "Bottom-up chord does not fit the MIDI pitch range at the clicked pitch"
                             .to_owned();
                 } else if bottom_up_note_count.is_none()
+                    && !slide_up
                     && !apply_piano_roll_chord_inversion(
                         &mut chord_pitches,
                         self.piano_roll_chord_inversion,
@@ -30869,6 +30898,9 @@ impl DawUi {
                     notes_to_add.extend(chord_pitches.into_iter().map(|key| {
                         let mut note = root_note.clone();
                         note.key = key;
+                        if slide_up {
+                            note.flags |= PATTERN_NOTE_SLIDE_FLAG;
+                        }
                         note
                     }));
                 }
