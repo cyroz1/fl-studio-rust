@@ -402,6 +402,13 @@ fn candidate_mixer_controls(
     ))
 }
 
+fn candidate_mixer_master_fader_gain(document: &FlpDocument) -> f32 {
+    let parameters = document.mixer_parameter_records().unwrap_or_default();
+    unique_candidate_mixer_parameter(&parameters, 0, MixerParameterKind::Volume)
+        .filter(|record| (0..=16_000).contains(&record.value()))
+        .map_or(1.0, |record| record.value() as f32 / 10_000.0)
+}
+
 fn candidate_mixer_stereo_separation(
     parameters: &[MixerParameterRecord],
     insert_ordinal: usize,
@@ -8869,6 +8876,12 @@ impl DawUi {
         };
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
+        let live_master_fader_gain = self
+            .document
+            .as_ref()
+            .map_or(1.0, candidate_mixer_master_fader_gain);
+        self.mixer_track_peak_meters
+            .set_live_master_fader_gain(live_master_fader_gain);
         let worker_mixer_meters = Arc::clone(&self.mixer_track_peak_meters);
         worker_mixer_meters.clear();
         self.mixer_insert_peak_holds.fill(0.0);
@@ -33211,6 +33224,7 @@ impl DawUi {
         let mut rename_edits = Vec::new();
         let mut flag_edits = Vec::new();
         let mut parameter_edits = Vec::new();
+        let mut live_master_fader_gain_edit = None;
         let mut send_flag_edits = Vec::new();
         let mut load_insert_state = None;
         let mut save_insert_state = None;
@@ -33512,6 +33526,17 @@ impl DawUi {
                                                                     volume_record.record_index(),
                                                                     volume_value,
                                                                 ));
+                                                                if insert.ordinal() == 0 {
+                                                                    live_master_fader_gain_edit =
+                                                                        Some((
+                                                                            volume_record
+                                                                                .event_index(),
+                                                                            volume_record
+                                                                                .record_index(),
+                                                                            volume_value as f32
+                                                                                / 10_000.0,
+                                                                        ));
+                                                                }
                                                             }
                                                             ui.small(volume_value.to_string());
                                                         } else {
@@ -34004,9 +34029,17 @@ impl DawUi {
         if !parameter_edits.is_empty()
             && let Some(document) = self.document.as_mut()
         {
+            let mut applied_live_master_fader_gain = None;
             for (event_index, record_index, value) in parameter_edits {
                 match document.set_mixer_parameter_record_value(event_index, record_index, value) {
                     Ok(()) => {
+                        if let Some((master_event, master_record, gain)) =
+                            live_master_fader_gain_edit
+                            && master_event == event_index
+                            && master_record == record_index
+                        {
+                            applied_live_master_fader_gain = Some(gain);
+                        }
                         self.dirty = true;
                         self.status = format!(
                             "Edited Mixer parameter event {event_index}, record {record_index}"
@@ -34016,6 +34049,10 @@ impl DawUi {
                         self.status = format!("Could not edit Mixer parameter: {error}");
                     }
                 }
+            }
+            if let Some(gain) = applied_live_master_fader_gain {
+                self.mixer_track_peak_meters
+                    .set_live_master_fader_gain(gain);
             }
         }
         if !send_flag_edits.is_empty()

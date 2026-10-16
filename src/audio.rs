@@ -42,12 +42,14 @@ pub const MIXER_TRACK_METER_COUNT: usize = i8::MAX as usize + 1;
 /// consumes each value with [`take_peak`](Self::take_peak), keeping the audio thread lock-free.
 pub struct MixerTrackPeakMeters {
     peaks: [AtomicU32; MIXER_TRACK_METER_COUNT],
+    live_master_fader_gain: Arc<AtomicU32>,
 }
 
 impl Default for MixerTrackPeakMeters {
     fn default() -> Self {
         Self {
             peaks: std::array::from_fn(|_| AtomicU32::new(0.0_f32.to_bits())),
+            live_master_fader_gain: Arc::new(AtomicU32::new(1.0_f32.to_bits())),
         }
     }
 }
@@ -66,6 +68,23 @@ impl MixerTrackPeakMeters {
         for peak in &self.peaks {
             peak.store(0.0_f32.to_bits(), Ordering::Release);
         }
+    }
+
+    /// Set the live Playlist stream's target Master fader gain.
+    ///
+    /// The render worker reads this value without taking a lock and smooths changes over 20 ms.
+    pub fn set_live_master_fader_gain(&self, gain: f32) {
+        let gain = if gain.is_finite() {
+            gain.clamp(0.0, 1.6)
+        } else {
+            1.0
+        };
+        self.live_master_fader_gain
+            .store(gain.to_bits(), Ordering::Release);
+    }
+
+    pub(crate) fn live_master_fader_gain(&self) -> Arc<AtomicU32> {
+        Arc::clone(&self.live_master_fader_gain)
     }
 
     pub(crate) fn publish_peak(&self, track: usize, peak: f32) {
@@ -1840,14 +1859,14 @@ fn next_output_frame_with_browser_preview(inputs: AudioFrameInputs<'_>) -> [f32;
     ]
 }
 
-fn output_gain_smoothing_alpha(sample_rate: f32) -> f32 {
+pub(crate) fn output_gain_smoothing_alpha(sample_rate: f32) -> f32 {
     if !sample_rate.is_finite() || sample_rate <= 0.0 {
         return 1.0;
     }
     1.0 - (-1.0 / (sample_rate * OUTPUT_GAIN_SMOOTHING_SECONDS)).exp()
 }
 
-fn smooth_output_gain(current: f32, target: f32, alpha: f32) -> f32 {
+pub(crate) fn smooth_output_gain(current: f32, target: f32, alpha: f32) -> f32 {
     current + (target - current) * alpha.clamp(0.0, 1.0)
 }
 
