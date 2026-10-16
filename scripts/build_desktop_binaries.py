@@ -28,6 +28,7 @@ def main() -> None:
             ["cargo", "metadata", "--format-version", "1"],
             cwd=root,
             text=True,
+            encoding="utf-8",
         )
     )
     root_manifest = (root / "Cargo.toml").resolve()
