@@ -1491,10 +1491,11 @@ enum StepGraphMode {
     ModX,
     ModY,
     Shift,
+    Rep,
 }
 
 impl StepGraphMode {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::Note,
         Self::Velocity,
         Self::Pan,
@@ -1503,6 +1504,7 @@ impl StepGraphMode {
         Self::ModX,
         Self::ModY,
         Self::Shift,
+        Self::Rep,
     ];
 
     fn label(self) -> &'static str {
@@ -1515,6 +1517,7 @@ impl StepGraphMode {
             Self::ModX => "Mod X",
             Self::ModY => "Mod Y",
             Self::Shift => "Shift (%)",
+            Self::Rep => "Rep",
         }
     }
 
@@ -1525,6 +1528,7 @@ impl StepGraphMode {
             Self::Pan => 128.0,
             Self::FinePitch | Self::ModX | Self::ModY => 255.0,
             Self::Shift => 100.0,
+            Self::Rep => 8.0,
         }
     }
 
@@ -1542,6 +1546,7 @@ impl StepGraphMode {
             Self::Velocity => 100.0,
             Self::Pan => 64.0,
             Self::Release | Self::Shift => 0.0,
+            Self::Rep => 1.0,
             Self::FinePitch | Self::ModX | Self::ModY => 128.0,
         }
     }
@@ -1560,6 +1565,7 @@ impl StepGraphMode {
                 let offset = u64::from(note.position).saturating_sub(step_start);
                 (offset as f32 / max_shift as f32 * 100.0).clamp(0.0, 100.0)
             }
+            Self::Rep => 1.0,
         }
     }
 
@@ -1604,6 +1610,7 @@ impl StepGraphMode {
                     ..PatternNoteEdit::default()
                 }
             }
+            Self::Rep => PatternNoteEdit::default(),
         }
     }
 
@@ -1634,6 +1641,137 @@ impl StepGraphMode {
             note.mod_y = value;
         }
     }
+}
+
+fn step_graph_repeat_note_matches(note: &PatternNote, root: &PatternNote) -> bool {
+    note.channel_id == root.channel_id
+        && note.flags == root.flags
+        && note.length == root.length
+        && note.key == root.key
+        && note.group == root.group
+        && note.fine_pitch == root.fine_pitch
+        && note.reserved == root.reserved
+        && note.release == root.release
+        && note.midi_channel == root.midi_channel
+        && note.pan == root.pan
+        && note.velocity == root.velocity
+        && note.mod_x == root.mod_x
+        && note.mod_y == root.mod_y
+}
+
+fn step_graph_repeat_count(
+    notes: &[(usize, &PatternNote)],
+    root_note_index: usize,
+    step_start: u64,
+    step_ticks: u64,
+) -> u8 {
+    let Some(root_note) = notes
+        .iter()
+        .find(|(note_index, _)| *note_index == root_note_index)
+        .map(|(_, note)| *note)
+    else {
+        return 1;
+    };
+    let step_end = step_start.saturating_add(step_ticks.max(1));
+    notes
+        .iter()
+        .filter(|(_, note)| {
+            let position = u64::from(note.position);
+            position >= step_start
+                && position < step_end
+                && step_graph_repeat_note_matches(note, root_note)
+        })
+        .count()
+        .clamp(1, 8) as u8
+}
+
+fn step_graph_repeated_notes(
+    root_note: &PatternNote,
+    step_start: u64,
+    step_ticks: u64,
+    repeat_count: u8,
+) -> Vec<PatternNote> {
+    let step_end = step_start
+        .saturating_add(step_ticks.max(1))
+        .min(u64::from(u32::MAX) + 1);
+    let root_position = u64::from(root_note.position).clamp(
+        step_start.min(u64::from(u32::MAX)),
+        step_end.saturating_sub(1),
+    );
+    let available_ticks = step_end.saturating_sub(root_position).max(1);
+    let repeat_count = usize::from(repeat_count.clamp(1, 8))
+        .min(available_ticks.min(usize::MAX as u64) as usize)
+        .max(1);
+    (0..repeat_count)
+        .map(|index| {
+            let offset = available_ticks.saturating_mul(index as u64) / repeat_count as u64;
+            let mut note = root_note.clone();
+            note.position = root_position
+                .saturating_add(offset)
+                .min(u64::from(u32::MAX)) as u32;
+            note
+        })
+        .collect()
+}
+
+fn set_step_graph_note_repeats(
+    document: &mut FlpDocument,
+    pattern_id: u16,
+    channel_id: u16,
+    step_start: u32,
+    step_ticks: u64,
+    value: f32,
+) -> Result<(), FlpError> {
+    let step_start = u64::from(step_start);
+    let step_end = step_start
+        .saturating_add(step_ticks.max(1))
+        .min(u64::from(u32::MAX) + 1);
+    let pattern = document
+        .patterns()?
+        .into_iter()
+        .find(|pattern| pattern.id == pattern_id)
+        .ok_or(FlpError::UnsupportedEdit(
+            "the target pattern could not be read for the Rep lane",
+        ))?;
+    let source = pattern
+        .notes
+        .iter()
+        .find(|note| {
+            note.channel_id == channel_id
+                && u64::from(note.position) >= step_start
+                && u64::from(note.position) < step_end
+        })
+        .cloned()
+        .unwrap_or_else(|| PatternNote {
+            position: step_start.min(u64::from(u32::MAX)) as u32,
+            channel_id,
+            length: step_ticks.min(u64::from(u32::MAX)) as u32,
+            key: 60,
+            velocity: 100,
+            ..PatternNote::default()
+        });
+    let repeat_indices = pattern
+        .notes
+        .iter()
+        .filter(|note| note.channel_id == channel_id)
+        .enumerate()
+        .filter_map(|(note_index, note)| {
+            (u64::from(note.position) >= step_start
+                && u64::from(note.position) < step_end
+                && step_graph_repeat_note_matches(note, &source))
+            .then_some(note_index)
+        })
+        .collect::<Vec<_>>();
+    if !repeat_indices.is_empty() {
+        document.delete_pattern_note_selection(pattern_id, channel_id, &repeat_indices)?;
+    }
+    let repeated_notes = step_graph_repeated_notes(
+        &source,
+        step_start,
+        step_ticks,
+        value.round().clamp(1.0, 8.0) as u8,
+    );
+    document.add_pattern_notes(pattern_id, &repeated_notes)
 }
 
 impl PianoRollSnap {
@@ -21462,9 +21600,11 @@ impl DawUi {
         let graph_size = Vec2::new(ui.available_width().max(280.0), 142.0);
         let (graph_rect, graph_response) =
             ui.allocate_exact_size(graph_size, Sense::click_and_drag());
-        let graph_response = graph_response.on_hover_text(
-            "Left-click or drag to edit. Ctrl-drag adjusts all active values together. Alt-click or drag resets active values. Right-drag ramps values across steps. Clicking an empty step adds a C5 note.",
-        );
+        let graph_response = graph_response.on_hover_text(if self.step_graph_mode == StepGraphMode::Rep {
+            "Rep sets 1–8 evenly spaced hits in a step. Ctrl-drag adjusts all active values together. Alt-click or drag resets active values to one hit. Right-drag ramps values across steps. Clicking an empty step adds repeated C5 notes."
+        } else {
+            "Left-click or drag to edit. Ctrl-drag adjusts all active values together. Alt-click or drag resets active values. Right-drag ramps values across steps. Clicking an empty step adds a C5 note."
+        });
         let painter = ui.painter_at(graph_rect);
         painter.rect_filled(graph_rect, egui::CornerRadius::same(3), PANEL_DARK);
         painter.rect_stroke(
@@ -21523,8 +21663,14 @@ impl DawUi {
                 ],
                 Stroke::new(if step % 4 == 0 { 1.0 } else { 0.5 }, GRID),
             );
-            if let Some((_, note)) = active_note {
-                let value = mode.value(note, tick, step_ticks);
+            if let Some((note_index, note)) = active_note {
+                let value = if mode == StepGraphMode::Rep {
+                    f32::from(step_graph_repeat_count(
+                        &notes, note_index, tick, step_ticks,
+                    ))
+                } else {
+                    mode.value(note, tick, step_ticks)
+                };
                 let value_y = plot_rect.bottom() - value / maximum * plot_rect.height();
                 let baseline_y = mode.center().map_or(plot_rect.bottom(), |center| {
                     plot_rect.bottom() - center / maximum * plot_rect.height()
@@ -21594,6 +21740,18 @@ impl DawUi {
                 })
                 .map(|(note_index, note)| (*note_index, *note))
         };
+        let value_at_step = |step: usize, note_index: usize, note: &PatternNote| {
+            if mode == StepGraphMode::Rep {
+                f32::from(step_graph_repeat_count(
+                    &notes,
+                    note_index,
+                    tick_at_step(step),
+                    step_ticks,
+                ))
+            } else {
+                mode.value(note, tick_at_step(step), step_ticks)
+            }
+        };
         let (primary_pressed, primary_down, primary_released, modifiers) = ui.input(|input| {
             (
                 input.pointer.button_pressed(PointerButton::Primary),
@@ -21619,14 +21777,16 @@ impl DawUi {
                     bar_index,
                     last_step: start_step,
                 });
-            } else if scale_all_modifier && let Some((_, note)) = active_note_at_step(start_step) {
-                let start_value = mode.value(note, tick_at_step(start_step), step_ticks);
+            } else if scale_all_modifier
+                && let Some((start_note_index, note)) = active_note_at_step(start_step)
+            {
+                let start_value = value_at_step(start_step, start_note_index, note);
                 let values = (0..step_count)
                     .filter_map(|step| {
                         active_note_at_step(step).map(|(note_index, note)| StepGraphScaleValue {
                             step,
                             note_index,
-                            start_value: mode.value(note, tick_at_step(step), step_ticks),
+                            start_value: value_at_step(step, note_index, note),
                         })
                     })
                     .collect();
@@ -21657,7 +21817,7 @@ impl DawUi {
                 .saturating_mul(measure_ticks)
                 .saturating_add((start_step as u64).saturating_mul(step_ticks));
             let step_end = tick.saturating_add(step_ticks);
-            if let Some((_, note)) = notes.iter().find(|(_, note)| {
+            if let Some((note_index, note)) = notes.iter().find(|(_, note)| {
                 let note_tick = u64::from(note.position);
                 note_tick >= tick && note_tick < step_end
             }) {
@@ -21666,7 +21826,7 @@ impl DawUi {
                     channel_id,
                     mode,
                     start_step,
-                    start_value: mode.value(note, tick, step_ticks),
+                    start_value: value_at_step(start_step, *note_index, note),
                 });
             }
         }
@@ -21710,7 +21870,7 @@ impl DawUi {
                 if let Some((note_index, note)) = active_note_at_step(step) {
                     let tick = tick_at_step(step);
                     let reset_value = mode.reset_value();
-                    if (mode.value(note, tick, step_ticks) - reset_value).abs() > 0.01 {
+                    if (value_at_step(step, note_index, note) - reset_value).abs() > 0.01 {
                         graph_actions.push((
                             step,
                             tick.min(u64::from(u32::MAX)) as u32,
@@ -21812,20 +21972,36 @@ impl DawUi {
             let result = if let Some(document) = updated.as_mut() {
                 graph_actions.iter().try_for_each(
                     |(_, position, note_index, value)| -> Result<(), _> {
-                        let edit = mode.edit(*value, u64::from(*position), step_ticks);
-                        if let Some(note_index) = note_index {
-                            document.edit_pattern_note(pattern_id, channel_id, *note_index, edit)
+                        if mode == StepGraphMode::Rep {
+                            set_step_graph_note_repeats(
+                                document, pattern_id, channel_id, *position, step_ticks, *value,
+                            )
                         } else {
-                            let mut note = PatternNote {
-                                position: *position,
-                                channel_id,
-                                length: step_ticks.min(u64::from(u32::MAX)) as u32,
-                                key: 60,
-                                velocity: 100,
-                                ..PatternNote::default()
-                            };
-                            mode.apply_to_note(&mut note, *value, u64::from(*position), step_ticks);
-                            document.add_pattern_note(pattern_id, note)
+                            let edit = mode.edit(*value, u64::from(*position), step_ticks);
+                            if let Some(note_index) = note_index {
+                                document.edit_pattern_note(
+                                    pattern_id,
+                                    channel_id,
+                                    *note_index,
+                                    edit,
+                                )
+                            } else {
+                                let mut note = PatternNote {
+                                    position: *position,
+                                    channel_id,
+                                    length: step_ticks.min(u64::from(u32::MAX)) as u32,
+                                    key: 60,
+                                    velocity: 100,
+                                    ..PatternNote::default()
+                                };
+                                mode.apply_to_note(
+                                    &mut note,
+                                    *value,
+                                    u64::from(*position),
+                                    step_ticks,
+                                );
+                                document.add_pattern_note(pattern_id, note)
+                            }
                         }
                     },
                 )
