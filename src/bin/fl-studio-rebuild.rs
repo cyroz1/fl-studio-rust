@@ -32,8 +32,8 @@ use flp_rebuild::sample_render::{
     PlaylistPerformanceLaunch, PlaylistPerformanceStream, PlaylistRenderOptions,
     PlaylistRenderRange, PlaylistRenderSummary, PlaylistStreamMonitor, PlaylistTempoMap,
     ResamplingQuality, SamplerLiveInputRouting, SamplerLiveNoteEvent, SamplerPatternRenderOptions,
-    SamplerPatternRenderSummary, Vst3LiveInputEvent, Vst3PatternLoopPlayback, WavChannelMode,
-    WavDitherMode, WavSampleFormat, nearest_playlist_audio_clip_zero_crossing_tick,
+    SamplerPatternRenderSummary, Vst3LiveInputEvent, WavChannelMode, WavDitherMode,
+    WavSampleFormat, nearest_playlist_audio_clip_zero_crossing_tick,
     playlist_performance_clip_indices_with_vst3, playlist_performance_static_document_with_vst3,
     playlist_performance_vst3_channel_ids, playlist_performance_vst3_clip_indices,
     render_audio_clips_to_file, render_playlist_mixer_stems_with_vst3_cancellable,
@@ -41,15 +41,14 @@ use flp_rebuild::sample_render::{
     render_playlist_with_vst3_to_flac_cancellable, render_playlist_with_vst3_to_mp3_cancellable,
     render_playlist_with_vst3_to_ogg_cancellable, render_playlist_with_vst3_to_wav_cancellable,
     render_sampler_pattern_to_file, stream_mixed_layer_midi_input_to_device,
-    stream_pattern_loop_with_vst3_from_tick_to_device,
     stream_playlist_performance_with_vst3_to_device,
     stream_playlist_with_vst3_to_device_with_monitor, stream_sampler_midi_input_to_device,
     stream_sampler_pattern_loop_from_tick_to_device, stream_sampler_pattern_to_device,
     stream_vst3_midi_input_to_device, write_input_recording_to_wav,
 };
 use flp_rebuild::vst3::{
-    MAX_REPORTED_TAIL_SECONDS, Vst3HostRuntime, Vst3LiveInputStreamHandle,
-    Vst3PatternRenderOptions, Vst3PatternStreamHandle, Vst3PlaylistStreamProcessor,
+    MAX_REPORTED_TAIL_SECONDS, Vst3HostRuntime, Vst3PatternRenderOptions, Vst3PatternStreamHandle,
+    Vst3PlaylistLiveInputSender, Vst3PlaylistLiveInputSession, Vst3PlaylistStreamProcessor,
 };
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, Arrangement, ArticulateOptions, AutomationChannel,
@@ -66,6 +65,7 @@ use flp_rebuild::{
     ScaleLevelsOptions, StrumOptions, TimeMarker, TimeMarkerEdit, VstPluginStateMetadata,
 };
 use md5::{Digest, Md5};
+use vst3_host::midi::{MidiChannel as Vst3MidiChannel, MidiEvent as Vst3MidiEvent};
 
 #[path = "fl-studio-rebuild/clap_probe.rs"]
 mod clap_probe;
@@ -4127,6 +4127,7 @@ struct DawUi {
     live_sampler_workers: Vec<thread::JoinHandle<()>>,
     live_layer_input: Option<LiveLayerInputSession>,
     live_vst3_input: Option<LiveVst3InputSession>,
+    live_playlist_vst3_input: Option<LivePlaylistVst3InputSession>,
     live_vst3_workers: Vec<thread::JoinHandle<()>>,
     sampler_workers: Vec<PendingSamplerStream>,
     audio_waveform_paths: BTreeMap<u16, PathBuf>,
@@ -4212,6 +4213,7 @@ struct PendingAudioRender {
     receiver: Receiver<Result<PlaylistRenderSummary, String>>,
     cancelled: Arc<AtomicBool>,
     worker: thread::JoinHandle<()>,
+    live_midi_senders: BTreeMap<u16, Vst3PlaylistLiveInputSender>,
 }
 
 struct PendingAudioClipExport {
@@ -4327,6 +4329,65 @@ struct LiveVst3InputSession {
     receiver: Receiver<Result<(), String>>,
     cancelled: Arc<AtomicBool>,
     worker: thread::JoinHandle<()>,
+}
+
+struct LivePlaylistVst3InputSession {
+    pattern_id: u16,
+    channel_id: u16,
+    target_channel_ids: BTreeSet<u16>,
+    sessions: BTreeMap<u16, Vst3PlaylistLiveInputSession>,
+}
+
+fn vst3_playlist_midi_event(event: Vst3LiveInputEvent) -> Option<Vst3MidiEvent> {
+    let channel = match event {
+        Vst3LiveInputEvent::NoteOn { channel, .. }
+        | Vst3LiveInputEvent::NoteOff { channel, .. }
+        | Vst3LiveInputEvent::ControlChange { channel, .. }
+        | Vst3LiveInputEvent::ProgramChange { channel, .. }
+        | Vst3LiveInputEvent::PitchBend { channel, .. }
+        | Vst3LiveInputEvent::ChannelPressure { channel, .. }
+        | Vst3LiveInputEvent::PolyphonicPressure { channel, .. } => {
+            Vst3MidiChannel::from_index(channel & 0x0F)?
+        }
+    };
+    Some(match event {
+        Vst3LiveInputEvent::NoteOn { key, velocity, .. } => Vst3MidiEvent::NoteOn {
+            channel,
+            note: key.min(127),
+            velocity: velocity.min(127),
+        },
+        Vst3LiveInputEvent::NoteOff { key, .. } => Vst3MidiEvent::NoteOff {
+            channel,
+            note: key.min(127),
+            velocity: 0,
+        },
+        Vst3LiveInputEvent::ControlChange {
+            controller, value, ..
+        } => Vst3MidiEvent::ControlChange {
+            channel,
+            controller: controller.min(127),
+            value: value.min(127),
+        },
+        Vst3LiveInputEvent::ProgramChange { program, .. } => Vst3MidiEvent::ProgramChange {
+            channel,
+            program: program.min(127),
+        },
+        Vst3LiveInputEvent::PitchBend { value, .. } => Vst3MidiEvent::PitchBend {
+            channel,
+            value: value.min(16_383),
+        },
+        Vst3LiveInputEvent::ChannelPressure { pressure, .. } => Vst3MidiEvent::ChannelAftertouch {
+            channel,
+            pressure: pressure.min(127),
+        },
+        Vst3LiveInputEvent::PolyphonicPressure { key, pressure, .. } => {
+            Vst3MidiEvent::PolyAftertouch {
+                channel,
+                note: key.min(127),
+                pressure: pressure.min(127),
+            }
+        }
+    })
 }
 
 struct PendingWaveformLoad {
@@ -4932,6 +4993,7 @@ impl DawUi {
             live_sampler_workers: Vec::new(),
             live_layer_input: None,
             live_vst3_input: None,
+            live_playlist_vst3_input: None,
             live_vst3_workers: Vec::new(),
             sampler_workers: Vec::new(),
             audio_waveform_paths: BTreeMap::new(),
@@ -9130,6 +9192,10 @@ impl DawUi {
                 return;
             }
         };
+        let live_midi_senders = vst3_processor
+            .as_ref()
+            .map(Vst3PlaylistStreamProcessor::live_midi_input_senders)
+            .unwrap_or_default();
         let start_frame = match playlist_seek_tick_to_frame(
             self.playlist_seek_tick,
             &playlist_tempo_map,
@@ -9228,6 +9294,7 @@ impl DawUi {
                     receiver,
                     cancelled,
                     worker,
+                    live_midi_senders,
                 });
                 self.stop_midi_pattern_preview();
                 self.status =
@@ -9572,6 +9639,7 @@ impl DawUi {
                     receiver,
                     cancelled,
                     worker,
+                    live_midi_senders: BTreeMap::new(),
                 });
                 self.stop_midi_pattern_preview();
                 self.status = format!(
@@ -9718,6 +9786,8 @@ impl DawUi {
             return;
         }
         if self.playing {
+            self.stop_live_sampler_input();
+            self.stop_live_vst3_input();
             if let Some(engine) = &self.audio_engine {
                 engine.pause_project_playback();
             }
@@ -37015,6 +37085,92 @@ impl DawUi {
         result
     }
 
+    fn can_audition_live_midi_input(&self) -> bool {
+        !self.playing || (!self.pattern_playback_mode && !self.performance_mode_active)
+    }
+
+    fn stop_live_audition_playback_if_stopped(&self) {
+        if !self.playing
+            && let Some(engine) = &self.audio_engine
+        {
+            engine.stop_project_playback();
+        }
+    }
+
+    fn start_live_playlist_vst3_input(&mut self, pattern_id: u16, channel_id: u16) -> bool {
+        if !self.playing || self.pattern_playback_mode || self.performance_mode_active {
+            return false;
+        }
+        let Some(target_channel_ids) = self.live_vst3_target_channels(channel_id) else {
+            return false;
+        };
+        if target_channel_ids != BTreeSet::from([channel_id]) {
+            self.status =
+                "Playlist live audition currently requires a directly selected loaded VST3 channel"
+                    .to_owned();
+            return false;
+        }
+        let Some(senders) = self
+            .pending_audio_render
+            .as_ref()
+            .map(|pending| &pending.live_midi_senders)
+        else {
+            return false;
+        };
+        let Some(sender) = senders.get(&channel_id) else {
+            self.status =
+                "The selected VST3 channel is not part of the active Playlist stream".to_owned();
+            return false;
+        };
+        let session = sender.begin_session();
+        for (channel_index, state) in self.midi_input_channel_state.iter().copied().enumerate() {
+            let channel = channel_index as u8;
+            for (controller, value) in [
+                (10, state.raw_pan()),
+                (74, state.raw_mod_x()),
+                (71, state.raw_mod_y()),
+                (101, 0),
+                (100, 0),
+                (6, state.raw_pitch_bend_sensitivity_semitones()),
+                (38, state.raw_pitch_bend_sensitivity_cents()),
+                (101, 127),
+                (100, 127),
+                (
+                    64,
+                    if self.midi_live_sampler_sustain_channels.contains(&channel) {
+                        127
+                    } else {
+                        0
+                    },
+                ),
+            ] {
+                let event = Vst3LiveInputEvent::ControlChange {
+                    channel,
+                    controller,
+                    value,
+                };
+                if let Some(event) = vst3_playlist_midi_event(event) {
+                    let _ = session.try_send(event);
+                }
+            }
+            if let Some(event) = vst3_playlist_midi_event(Vst3LiveInputEvent::PitchBend {
+                channel,
+                value: state.raw_pitch_bend_value(),
+            }) {
+                let _ = session.try_send(event);
+            }
+        }
+        self.live_playlist_vst3_input = Some(LivePlaylistVst3InputSession {
+            pattern_id,
+            channel_id,
+            target_channel_ids,
+            sessions: BTreeMap::from([(channel_id, session)]),
+        });
+        self.status =
+            format!("Sending live MIDI to VST3 channel {channel_id} during Playlist playback");
+        true
+    }
+
     fn start_live_vst3_input(&mut self, pattern_id: u16, channel_id: u16) -> bool {
         let Some(document) = self.document.as_ref().cloned() else {
             return false;
@@ -37428,11 +37584,9 @@ impl DawUi {
             self.status = "Enable the selected Sampler channel for live MIDI audition".to_owned();
             return false;
         }
-        if self.live_vst3_input.is_some() {
+        if self.live_vst3_input.is_some() || self.live_playlist_vst3_input.is_some() {
             self.stop_live_vst3_input();
-            if let Some(engine) = &self.audio_engine {
-                engine.stop_project_playback();
-            }
+            self.stop_live_audition_playback_if_stopped();
         }
         let Some(target_channel_ids) = self.live_sampler_target_channels(channel_id) else {
             self.status = "Live Sampler audition needs a Sampler channel or a Layer whose enabled descendants are Samplers".to_owned();
@@ -37488,7 +37642,12 @@ impl DawUi {
         }
         self.audio_test_tone = false;
         self.audio_monitor_input = false;
-        let writer = match engine.begin_live_streaming_playback() {
+        let writer_result = if self.playing {
+            engine.begin_live_streaming_overlay()
+        } else {
+            engine.begin_live_streaming_playback()
+        };
+        let writer = match writer_result {
             Ok(writer) => writer,
             Err(error) => {
                 self.status = format!("Could not start Sampler input audition: {error}");
@@ -37585,7 +37744,7 @@ impl DawUi {
                 true
             }
             Err(error) => {
-                engine.stop_project_playback();
+                self.stop_live_audition_playback_if_stopped();
                 self.status = format!("Could not start Sampler input worker: {error}");
                 false
             }
@@ -37595,6 +37754,11 @@ impl DawUi {
     fn stop_live_vst3_input(&mut self) {
         self.midi_live_vst3_note_mapping.clear();
         self.stop_live_layer_input();
+        if let Some(session) = self.live_playlist_vst3_input.take() {
+            for playlist_session in session.sessions.values() {
+                playlist_session.stop();
+            }
+        }
         if let Some(session) = self.live_vst3_input.take() {
             session.cancelled.store(true, Ordering::Release);
             self.live_vst3_workers.push(session.worker);
@@ -37625,8 +37789,8 @@ impl DawUi {
         self.stop_live_sampler_input();
         self.stop_live_vst3_input();
         self.midi_live_sampler_sustain_channels.clear();
-        if was_auditioning && let Some(engine) = &self.audio_engine {
-            engine.stop_project_playback();
+        if was_auditioning {
+            self.stop_live_audition_playback_if_stopped();
         }
     }
 
@@ -37648,21 +37812,15 @@ impl DawUi {
                 || session.targets != targets
         }) {
             self.stop_live_layer_input();
-            if let Some(engine) = &self.audio_engine {
-                engine.stop_project_playback();
-            }
+            self.stop_live_audition_playback_if_stopped();
         }
         if self.live_sampler_input.is_some() {
             self.stop_live_sampler_input();
-            if let Some(engine) = &self.audio_engine {
-                engine.stop_project_playback();
-            }
+            self.stop_live_audition_playback_if_stopped();
         }
-        if self.live_vst3_input.is_some() {
+        if self.live_vst3_input.is_some() || self.live_playlist_vst3_input.is_some() {
             self.stop_live_vst3_input();
-            if let Some(engine) = &self.audio_engine {
-                engine.stop_project_playback();
-            }
+            self.stop_live_audition_playback_if_stopped();
         }
 
         let mut queued_events = Vec::new();
@@ -37812,15 +37970,13 @@ impl DawUi {
             }
         } else if self.live_layer_input.is_some() {
             self.stop_live_layer_input();
-            if let Some(engine) = &self.audio_engine {
-                engine.stop_project_playback();
-            }
+            self.stop_live_audition_playback_if_stopped();
         }
         true
     }
 
     fn handle_live_sampler_input(&mut self, event: MidiInputEvent) {
-        if self.playing {
+        if !self.can_audition_live_midi_input() {
             return;
         }
         let (Some(pattern_id), Some(channel_id)) =
@@ -37833,23 +37989,17 @@ impl DawUi {
         }
         if self.live_layer_input.is_some() {
             self.stop_live_layer_input();
-            if let Some(engine) = &self.audio_engine {
-                engine.stop_project_playback();
-            }
+            self.stop_live_audition_playback_if_stopped();
         }
-        if self.live_vst3_input.is_some() {
+        if self.live_vst3_input.is_some() || self.live_playlist_vst3_input.is_some() {
             self.stop_live_vst3_input();
-            if let Some(engine) = &self.audio_engine {
-                engine.stop_project_playback();
-            }
+            self.stop_live_audition_playback_if_stopped();
         }
         if self.live_sampler_input.as_ref().is_some_and(|session| {
             session.pattern_id != pattern_id || session.channel_id != channel_id
         }) {
             self.stop_live_sampler_input();
-            if let Some(engine) = &self.audio_engine {
-                engine.stop_project_playback();
-            }
+            self.stop_live_audition_playback_if_stopped();
         }
         let (live_event, mapped_note_on) = match event {
             MidiInputEvent::NoteOn {
@@ -37988,9 +38138,7 @@ impl DawUi {
             }
         } else if self.live_sampler_input.is_some() {
             self.stop_live_sampler_input();
-            if let Some(engine) = &self.audio_engine {
-                engine.stop_project_playback();
-            }
+            self.stop_live_audition_playback_if_stopped();
         }
     }
 
@@ -37999,7 +38147,7 @@ impl DawUi {
             self.midi_live_sampler_sustain_channels.clear();
         }
         if self.live_sampler_input.as_ref().is_some_and(|session| {
-            self.playing
+            !self.can_audition_live_midi_input()
                 || self.midi_input_connection.is_none()
                 || Some(session.pattern_id) != self.selected_pattern
                 || Some(session.channel_id) != self.selected_note_channel
@@ -38009,9 +38157,7 @@ impl DawUi {
                     != Some(&session.target_channel_ids)
         }) {
             self.stop_live_sampler_input();
-            if let Some(engine) = &self.audio_engine {
-                engine.stop_project_playback();
-            }
+            self.stop_live_audition_playback_if_stopped();
         }
         let completed = self.live_sampler_input.as_ref().and_then(|session| {
             match session.receiver.try_recv() {
@@ -38028,9 +38174,7 @@ impl DawUi {
                 .take()
                 .is_some_and(|session| session.worker.join().is_err());
             self.midi_live_sampler_note_mapping.clear();
-            if let Some(engine) = &self.audio_engine {
-                engine.stop_project_playback();
-            }
+            self.stop_live_audition_playback_if_stopped();
             if panicked {
                 self.status = "Sampler input worker panicked".to_owned();
             } else if let Err(error) = result {
@@ -38060,9 +38204,7 @@ impl DawUi {
                     != Some(&session.targets)
         }) {
             self.stop_live_layer_input();
-            if let Some(engine) = &self.audio_engine {
-                engine.stop_project_playback();
-            }
+            self.stop_live_audition_playback_if_stopped();
         }
         let completed =
             self.live_layer_input
@@ -38080,9 +38222,7 @@ impl DawUi {
                 .take()
                 .is_some_and(|session| session.worker.join().is_err());
             self.midi_live_layer_note_mapping.clear();
-            if let Some(engine) = &self.audio_engine {
-                engine.stop_project_playback();
-            }
+            self.stop_live_audition_playback_if_stopped();
             if panicked {
                 self.status = "Layer input worker panicked".to_owned();
             } else if let Err(error) = result {
@@ -38092,7 +38232,7 @@ impl DawUi {
     }
 
     fn handle_live_vst3_input(&mut self, event: MidiInputEvent) {
-        if self.playing {
+        if !self.can_audition_live_midi_input() {
             return;
         }
         let (Some(pattern_id), Some(channel_id)) =
@@ -38101,6 +38241,9 @@ impl DawUi {
             return;
         };
         if self.live_vst3_target_channels(channel_id).is_none() {
+            return;
+        }
+        if self.playing && !self.channel_vst3_instances.contains_key(&channel_id) {
             return;
         }
         let key_region = self.document.as_ref().and_then(|document| {
@@ -38112,23 +38255,27 @@ impl DawUi {
         });
         if self.live_layer_input.is_some() {
             self.stop_live_layer_input();
-            if let Some(engine) = &self.audio_engine {
-                engine.stop_project_playback();
-            }
+            self.stop_live_audition_playback_if_stopped();
         }
         if self.live_sampler_input.is_some() {
             self.stop_live_sampler_input();
-            if let Some(engine) = &self.audio_engine {
-                engine.stop_project_playback();
-            }
+            self.stop_live_audition_playback_if_stopped();
         }
         if self.live_vst3_input.as_ref().is_some_and(|session| {
             session.pattern_id != pattern_id || session.channel_id != channel_id
         }) {
             self.stop_live_vst3_input();
-            if let Some(engine) = &self.audio_engine {
-                engine.stop_project_playback();
-            }
+            self.stop_live_audition_playback_if_stopped();
+        }
+        if self
+            .live_playlist_vst3_input
+            .as_ref()
+            .is_some_and(|session| {
+                session.pattern_id != pattern_id || session.channel_id != channel_id
+            })
+        {
+            self.stop_live_vst3_input();
+            self.stop_live_audition_playback_if_stopped();
         }
 
         let (live_event, mapped_note_on) = match event {
@@ -38186,7 +38333,11 @@ impl DawUi {
                 let mapped_key = match mapped_key {
                     Some(None) => return,
                     Some(Some(mapped_key)) => mapped_key,
-                    None if self.live_vst3_input.is_some() => key.min(127),
+                    None if self.live_vst3_input.is_some()
+                        || self.live_playlist_vst3_input.is_some() =>
+                    {
+                        key.min(127)
+                    }
                     None => return,
                 };
                 (
@@ -38281,29 +38432,65 @@ impl DawUi {
                 .retain(|(mapped_channel, _), _| *mapped_channel != channel);
         }
         if self.live_vst3_input.is_none()
+            && self.live_playlist_vst3_input.is_none()
             && matches!(live_event, Vst3LiveInputEvent::NoteOn { .. })
-            && !self.start_live_vst3_input(pattern_id, channel_id)
         {
-            return;
+            let started = if self.playing {
+                self.start_live_playlist_vst3_input(pattern_id, channel_id)
+            } else {
+                self.start_live_vst3_input(pattern_id, channel_id)
+            };
+            if !started {
+                return;
+            }
         }
-        if let Some(session) = &self.live_vst3_input
-            && session.sender.send(live_event).is_ok()
-        {
+        let sent = if let Some(session) = &self.live_playlist_vst3_input {
+            session.sessions.values().all(|playlist_session| {
+                vst3_playlist_midi_event(live_event)
+                    .is_some_and(|event| playlist_session.try_send(event).is_ok())
+            })
+        } else if let Some(session) = &self.live_vst3_input {
+            session.sender.send(live_event).is_ok()
+        } else {
+            false
+        };
+        if sent {
             if let Some((source_note, Some(audition_key))) = mapped_note_on {
                 self.midi_live_vst3_note_mapping
                     .entry(source_note)
                     .or_default()
                     .push_back(Some(audition_key));
             }
-        } else if self.live_vst3_input.is_some() {
+        } else if self.live_vst3_input.is_some() || self.live_playlist_vst3_input.is_some() {
             self.stop_live_vst3_input();
-            if let Some(engine) = &self.audio_engine {
-                engine.stop_project_playback();
-            }
+            self.stop_live_audition_playback_if_stopped();
         }
     }
 
     fn poll_live_vst3_input(&mut self) {
+        if self
+            .live_playlist_vst3_input
+            .as_ref()
+            .is_some_and(|session| {
+                !self.playing
+                    || self.pattern_playback_mode
+                    || self.performance_mode_active
+                    || self.midi_input_connection.is_none()
+                    || Some(session.pattern_id) != self.selected_pattern
+                    || Some(session.channel_id) != self.selected_note_channel
+                    || self.live_vst3_target_channels(session.channel_id).as_ref()
+                        != Some(&session.target_channel_ids)
+                    || self.pending_audio_render.as_ref().is_none_or(|pending| {
+                        session
+                            .target_channel_ids
+                            .iter()
+                            .any(|channel_id| !pending.live_midi_senders.contains_key(channel_id))
+                    })
+            })
+        {
+            self.stop_live_vst3_input();
+            self.stop_live_audition_playback_if_stopped();
+        }
         if self.live_vst3_input.as_ref().is_some_and(|session| {
             self.playing
                 || self.midi_input_connection.is_none()
@@ -38313,9 +38500,7 @@ impl DawUi {
                     != Some(&session.target_channel_ids)
         }) {
             self.stop_live_vst3_input();
-            if let Some(engine) = &self.audio_engine {
-                engine.stop_project_playback();
-            }
+            self.stop_live_audition_playback_if_stopped();
         }
         let completed =
             self.live_vst3_input
@@ -38333,9 +38518,7 @@ impl DawUi {
                 .take()
                 .is_some_and(|session| session.worker.join().is_err());
             self.midi_live_vst3_note_mapping.clear();
-            if let Some(engine) = &self.audio_engine {
-                engine.stop_project_playback();
-            }
+            self.stop_live_audition_playback_if_stopped();
             if panicked {
                 self.status = "VST3 input worker panicked".to_owned();
             } else if let Err(error) = result {
