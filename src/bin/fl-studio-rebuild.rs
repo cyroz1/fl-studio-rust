@@ -2189,6 +2189,7 @@ struct PianoRollGhostClipKey {
 struct PianoRollNoteView<'a> {
     project_time_signature: Option<(u8, u8)>,
     scale_highlight: Option<DetectedPianoRollScale>,
+    transport_playhead_tick: Option<f64>,
     cross_pattern_ghost_notes: &'a [PianoRollGhostNote],
 }
 
@@ -10757,11 +10758,52 @@ impl DawUi {
         tempo_map.tick_at_frame(frames, engine.sample_rate())
     }
 
+    fn current_pattern_mode_playhead_tick(&self) -> Option<(u16, f64)> {
+        let (pattern_id, loop_length_ticks) = self.pattern_mode_playback_source?;
+        let document = self.document.as_ref()?;
+        let engine = self.audio_engine.as_ref()?;
+        let tick = pattern_loop_tick_at_frame(
+            engine.project_playback_position_frames(),
+            engine.sample_rate(),
+            document.header().ppq(),
+            document.metadata().tempo_bpm().unwrap_or(140.0),
+            loop_length_ticks,
+        )?;
+        Some((pattern_id, tick))
+    }
+
     fn song_position_label(&self) -> String {
-        let Some(tick) = self.current_playhead_tick() else {
+        let pattern_position = self.current_pattern_mode_playhead_tick();
+        let Some(document) = self.document.as_ref() else {
             return "1:01:000".to_owned();
         };
-        let Some(document) = self.document.as_ref() else {
+        if let Some((pattern_id, tick)) = pattern_position
+            && let Some(pattern) = document.patterns().ok().and_then(|patterns| {
+                patterns
+                    .into_iter()
+                    .find(|pattern| pattern.id == pattern_id)
+            })
+        {
+            let signature_changes = pattern
+                .time_markers
+                .iter()
+                .filter(|marker| marker.is_signature())
+                .filter_map(|marker| {
+                    Some((
+                        marker.position_ticks(),
+                        marker.numerator()?,
+                        marker.denominator()?,
+                    ))
+                })
+                .collect::<Vec<_>>();
+            return playlist_song_position_label(
+                tick,
+                document.header().ppq(),
+                document.metadata().time_signature(),
+                &signature_changes,
+            );
+        }
+        let Some(tick) = self.current_playhead_tick() else {
             return "1:01:000".to_owned();
         };
         let arrangement_id = self.selected_arrangement.unwrap_or(0);
@@ -27623,6 +27665,10 @@ impl DawUi {
             PianoRollNoteView {
                 project_time_signature,
                 scale_highlight,
+                transport_playhead_tick: self
+                    .current_pattern_mode_playhead_tick()
+                    .filter(|(active_pattern_id, _)| *active_pattern_id == pattern.id)
+                    .map(|(_, tick)| tick),
                 cross_pattern_ghost_notes: if cross_pattern_ghost_pattern_id == Some(pattern.id) {
                     &visible_cross_pattern_ghost_notes
                 } else {
@@ -30840,6 +30886,7 @@ impl DawUi {
         let PianoRollNoteView {
             project_time_signature,
             scale_highlight,
+            transport_playhead_tick,
             cross_pattern_ghost_notes,
         } = view;
         let key_low = 36u16;
@@ -31981,6 +32028,18 @@ impl DawUi {
                             Stroke::new(2.0, Color32::from_rgb(255, 166, 64)),
                         );
                     }
+                }
+            }
+            if let Some(tick) = transport_playhead_tick {
+                let playhead_x = grid_rect.left() + keyboard_width + tick as f32 * tick_scale;
+                if playhead_x >= grid_body_rect.left() && playhead_x <= grid_body_rect.right() {
+                    painter.line_segment(
+                        [
+                            egui::pos2(playhead_x, grid_body_rect.top()),
+                            egui::pos2(playhead_x, grid_body_rect.bottom()),
+                        ],
+                        Stroke::new(1.5, Color32::from_rgb(92, 220, 132)),
+                    );
                 }
             }
             let draw_mode_active = !self.piano_roll_paint_mode
@@ -45874,6 +45933,24 @@ fn playlist_song_position_label(
     format!("{bar}:{beat:02}:{tick_in_beat:03}")
 }
 
+fn pattern_loop_tick_at_frame(
+    frame: u64,
+    sample_rate: u32,
+    ppq: u16,
+    tempo_bpm: f64,
+    loop_length_ticks: u64,
+) -> Option<f64> {
+    if loop_length_ticks == 0 {
+        return None;
+    }
+    let tempo_map = PlaylistTempoMap::constant(ppq, tempo_bpm).ok()?;
+    let loop_length_frames = tempo_map
+        .frame_at_tick(loop_length_ticks, sample_rate)
+        .ok()?
+        .max(1);
+    tempo_map.tick_at_frame(frame % loop_length_frames, sample_rate)
+}
+
 fn playlist_signature_at_tick(
     initial_time_signature: Option<(u8, u8)>,
     signature_changes: &[(u32, u8, u8)],
@@ -46883,12 +46960,12 @@ mod tests {
         encode_midi_device_selections, first_available_playlist_track, midi_button_press_edge,
         midi_controller_binding_for_device, next_piano_roll_note_group, note_from_grid_position,
         parse_midi_control_change_mapping, parse_midi_controller_templates,
-        parse_midi_device_selections, parse_window_layout_presets, piano_roll_color_group_note_ids,
-        piano_roll_controller_stroke_points, piano_roll_controller_value_at,
-        piano_roll_controller_value_range, piano_roll_cross_pattern_ghost_notes,
-        piano_roll_discard_length_edit, piano_roll_duplicate_offset,
-        piano_roll_ghost_note_is_visible, piano_roll_key_at_y, piano_roll_note_group_members,
-        piano_roll_note_nudge_edit, piano_roll_odd_note_selection,
+        parse_midi_device_selections, parse_window_layout_presets, pattern_loop_tick_at_frame,
+        piano_roll_color_group_note_ids, piano_roll_controller_stroke_points,
+        piano_roll_controller_value_at, piano_roll_controller_value_range,
+        piano_roll_cross_pattern_ghost_notes, piano_roll_discard_length_edit,
+        piano_roll_duplicate_offset, piano_roll_ghost_note_is_visible, piano_roll_key_at_y,
+        piano_roll_note_group_members, piano_roll_note_nudge_edit, piano_roll_odd_note_selection,
         piano_roll_overlap_note_selection, piano_roll_pitch_range_note_selection,
         piano_roll_random_note_selection, piano_roll_selection_time_range,
         piano_roll_shift_time_range, piano_roll_time_range_from_drag,
@@ -48701,6 +48778,28 @@ mod tests {
             playlist_song_position_label(1_900.0, 96, Some((4, 4)), &signature_changes),
             "8:03:028"
         );
+    }
+
+    #[test]
+    fn pattern_mode_playhead_wraps_at_the_pattern_loop() {
+        assert_eq!(
+            pattern_loop_tick_at_frame(0, 48_000, 96, 120.0, 384),
+            Some(0.0)
+        );
+        assert_eq!(
+            pattern_loop_tick_at_frame(24_000, 48_000, 96, 120.0, 384),
+            Some(96.0)
+        );
+        assert_eq!(
+            pattern_loop_tick_at_frame(120_000, 48_000, 96, 120.0, 384),
+            Some(96.0)
+        );
+        assert_eq!(
+            pattern_loop_tick_at_frame(96_000, 48_000, 96, 120.0, 384),
+            Some(0.0)
+        );
+        assert_eq!(pattern_loop_tick_at_frame(0, 48_000, 96, 120.0, 0), None);
+        assert_eq!(pattern_loop_tick_at_frame(0, 0, 96, 120.0, 384), None);
     }
 
     #[test]
