@@ -12813,6 +12813,71 @@ impl FlpDocument {
         pattern_id: u16,
         channel_id: u16,
     ) -> Result<usize, FlpError> {
+        let mut candidate = self.clone();
+        let imported = candidate.import_midi_track_in_place(
+            midi,
+            track_index,
+            pattern_id,
+            channel_id,
+            true,
+        )?;
+        *self = candidate;
+        Ok(imported)
+    }
+
+    /// Imports every track from one Standard MIDI File into one existing Pattern.
+    /// Each source track is assigned to the corresponding destination Channel Rack channel in
+    /// `channel_ids`; provide one channel ID for every MIDI track. Format-2 files are rejected
+    /// because their tracks are independent sequences and cannot be combined into one Pattern.
+    /// The operation is atomic, so a bad track or destination leaves the project unchanged.
+    pub fn import_midi_tracks(
+        &mut self,
+        midi: &midi::MidiFile,
+        pattern_id: u16,
+        channel_ids: &[u16],
+    ) -> Result<usize, FlpError> {
+        if midi.format() == 2 {
+            return Err(FlpError::UnsupportedEdit(
+                "Format-2 MIDI tracks are independent sequences; import them one at a time",
+            ));
+        }
+        if midi.tracks().is_empty() {
+            return Err(FlpError::UnsupportedEdit(
+                "the MIDI file contains no tracks to import",
+            ));
+        }
+        if channel_ids.len() != midi.tracks().len() {
+            return Err(FlpError::UnsupportedEdit(
+                "provide one destination channel for every MIDI track",
+            ));
+        }
+
+        let mut candidate = self.clone();
+        let mut total_imported = 0usize;
+        for (track_index, channel_id) in channel_ids.iter().copied().enumerate() {
+            let imported = candidate.import_midi_track_in_place(
+                midi,
+                track_index,
+                pattern_id,
+                channel_id,
+                track_index == 0,
+            )?;
+            total_imported = total_imported
+                .checked_add(imported)
+                .ok_or(FlpError::LengthOverflow)?;
+        }
+        *self = candidate;
+        Ok(total_imported)
+    }
+
+    fn import_midi_track_in_place(
+        &mut self,
+        midi: &midi::MidiFile,
+        track_index: usize,
+        pattern_id: u16,
+        channel_id: u16,
+        import_time_signatures: bool,
+    ) -> Result<usize, FlpError> {
         self.require_unique_channel(channel_id)?;
         if !self
             .patterns()?
@@ -12922,12 +12987,14 @@ impl FlpDocument {
             });
         }
 
-        let signature_tracks: Vec<usize> = if midi.format() == 1 {
+        let mut signatures = Vec::new();
+        let signature_tracks: Vec<usize> = if !import_time_signatures {
+            Vec::new()
+        } else if midi.format() == 1 {
             (0..midi.tracks().len()).collect()
         } else {
             vec![track_index]
         };
-        let mut signatures = Vec::new();
         for signature_track_index in signature_tracks {
             let signature_track =
                 midi.tracks()
@@ -12984,14 +13051,12 @@ impl FlpDocument {
             return Ok(0);
         }
 
-        let mut candidate = self.clone();
         if !imported.is_empty() {
-            candidate.add_pattern_notes(pattern_id, &imported)?;
+            self.add_pattern_notes(pattern_id, &imported)?;
         }
         for (position, numerator, denominator) in imported_signatures {
-            candidate.set_pattern_time_signature(pattern_id, position, numerator, denominator)?;
+            self.set_pattern_time_signature(pattern_id, position, numerator, denominator)?;
         }
-        *self = candidate;
         Ok(imported.len())
     }
 
@@ -19670,6 +19735,21 @@ mod tests {
         bytes
     }
 
+    fn midi_tracks_fixture(tracks: &[&[u8]], format: u16, division: u16) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"MThd");
+        bytes.extend_from_slice(&6u32.to_be_bytes());
+        bytes.extend_from_slice(&format.to_be_bytes());
+        bytes.extend_from_slice(&(tracks.len() as u16).to_be_bytes());
+        bytes.extend_from_slice(&division.to_be_bytes());
+        for track in tracks {
+            bytes.extend_from_slice(b"MTrk");
+            bytes.extend_from_slice(&(track.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(track);
+        }
+        bytes
+    }
+
     #[test]
     fn decodes_observed_mixer_insert_fields_without_rewriting_source_events() {
         let mut event_stream = Vec::new();
@@ -24719,6 +24799,92 @@ mod tests {
 
         let reparsed = FlpDocument::parse(&document.encode_lossless().unwrap()).unwrap();
         assert_eq!(reparsed.patterns().unwrap()[0].notes.len(), 3);
+    }
+
+    #[test]
+    fn imports_all_midi_tracks_to_their_mapped_channels_atomically() {
+        let midi = MidiFile::parse(&midi_tracks_fixture(
+            &[
+                &[
+                    0x00, 0x90, 0x3C, 0x64, // Track 1: C4 at tick 0.
+                    0x83, 0x60, 0x80, 0x3C, 0x00, // Note off at tick 480.
+                    0x00, 0xFF, 0x2F, 0x00,
+                ],
+                &[
+                    0x00, 0x90, 0x43, 0x50, // Track 2: G4 at tick 0.
+                    0x81, 0x70, 0x80, 0x43, 0x00, // Note off at tick 240.
+                    0x00, 0xFF, 0x2F, 0x00,
+                ],
+            ],
+            1,
+            480,
+        ))
+        .expect("two-track MIDI fixture should parse");
+        let mut project_events = vec![
+            0x40, 0, 0, 0x15, 0, // Destination channel 0.
+            0x40, 1, 0, 0x15, 0, // Destination channel 1.
+            0x41, 7, 0, 0xD0, 0, // Existing empty Pattern 7.
+        ];
+        project_events.extend_from_slice(&[0x63, 0, 0, 0xFF, 0x02, 0xAA, 0xBB]);
+        let original = flp_fixture(&project_events, &[], &[]);
+        let mut document = FlpDocument::parse(&original).expect("project fixture should parse");
+
+        assert_eq!(
+            document
+                .import_midi_tracks(&midi, 7, &[0, 1])
+                .expect("both MIDI tracks should import"),
+            2
+        );
+        let notes = &document.patterns().unwrap()[0].notes;
+        assert_eq!(notes.len(), 2);
+        assert_eq!(
+            (notes[0].channel_id, notes[0].key, notes[0].length),
+            (0, 60, 96)
+        );
+        assert_eq!(
+            (notes[1].channel_id, notes[1].key, notes[1].length),
+            (1, 67, 48)
+        );
+        assert_eq!(
+            document.events().last().unwrap().wire_bytes(),
+            &[0xFF, 0x02, 0xAA, 0xBB]
+        );
+
+        let mut rejected = FlpDocument::parse(&original).expect("project fixture should parse");
+        assert!(rejected.import_midi_tracks(&midi, 7, &[0, 99]).is_err());
+        assert_eq!(
+            rejected.encode_lossless().unwrap(),
+            original,
+            "a failed destination mapping must leave every project byte unchanged"
+        );
+    }
+
+    #[test]
+    fn all_track_midi_import_rejects_incomplete_maps_and_format_two_files() {
+        let one_track = MidiFile::parse(&midi_fixture(
+            &[
+                0x00, 0x90, 0x3C, 0x64, 0x81, 0x70, 0x80, 0x3C, 0x00, 0x00, 0xFF, 0x2F, 0x00,
+            ],
+            480,
+        ))
+        .expect("single-track MIDI fixture should parse");
+        let format_two = MidiFile::parse(&midi_tracks_fixture(
+            &[&[0x00, 0xFF, 0x2F, 0x00], &[0x00, 0xFF, 0x2F, 0x00]],
+            2,
+            480,
+        ))
+        .expect("Format-2 MIDI fixture should parse");
+        let original = pattern_fixture(&[], &[]);
+        let mut document = FlpDocument::parse(&original).expect("project fixture should parse");
+
+        assert!(document.import_midi_tracks(&one_track, 7, &[]).is_err());
+        assert_eq!(document.encode_lossless().unwrap(), original);
+        assert!(
+            document
+                .import_midi_tracks(&format_two, 7, &[0, 0])
+                .is_err()
+        );
+        assert_eq!(document.encode_lossless().unwrap(), original);
     }
 
     #[test]

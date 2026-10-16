@@ -3368,6 +3368,8 @@ struct PendingMidiImport {
     path: PathBuf,
     midi: MidiFile,
     selected_track: usize,
+    import_all_tracks: bool,
+    track_channel_ids: Vec<u16>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -11195,10 +11197,14 @@ impl DawUi {
             Some("mid" | "midi") => match fs::read(&path) {
                 Ok(bytes) => match MidiFile::parse(&bytes) {
                     Ok(midi) if !midi.tracks().is_empty() => {
+                        let track_channel_ids =
+                            self.default_midi_import_channels(midi.tracks().len());
                         self.pending_midi_import = Some(PendingMidiImport {
                             path: path.clone(),
                             midi,
                             selected_track: 0,
+                            import_all_tracks: false,
+                            track_channel_ids,
                         });
                         self.view = MainView::PianoRoll;
                         self.status = format!("Loaded MIDI file {}", path.display());
@@ -11213,6 +11219,36 @@ impl DawUi {
             }
             _ => self.status = format!("Selected {}", path.display()),
         }
+    }
+
+    fn default_midi_import_channels(&self, track_count: usize) -> Vec<u16> {
+        let channel_ids = self
+            .document
+            .as_ref()
+            .map(|document| {
+                document
+                    .channels()
+                    .into_iter()
+                    .filter(|channel| channel.kind() != Some(5))
+                    .map(|channel| channel.id())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if channel_ids.is_empty() {
+            return vec![self.selected_note_channel.unwrap_or_default(); track_count];
+        }
+
+        let preferred = self
+            .selected_note_channel
+            .filter(|channel_id| channel_ids.contains(channel_id))
+            .unwrap_or(channel_ids[0]);
+        let start = channel_ids
+            .iter()
+            .position(|channel_id| *channel_id == preferred)
+            .unwrap_or(0);
+        (0..track_count)
+            .map(|offset| channel_ids[(start + offset) % channel_ids.len()])
+            .collect()
     }
 
     fn inspect_browser_preset(&mut self, path: &Path) {
@@ -27191,10 +27227,14 @@ impl DawUi {
             match fs::read(&path) {
                 Ok(bytes) => match MidiFile::parse(&bytes) {
                     Ok(midi) if !midi.tracks().is_empty() => {
+                        let track_channel_ids =
+                            self.default_midi_import_channels(midi.tracks().len());
                         self.pending_midi_import = Some(PendingMidiImport {
                             path: path.clone(),
                             midi,
                             selected_track: 0,
+                            import_all_tracks: false,
+                            track_channel_ids,
                         });
                         self.status = format!("Loaded MIDI file {}", path.display());
                     }
@@ -27205,7 +27245,19 @@ impl DawUi {
             }
         }
 
+        let available_midi_channels = self
+            .document
+            .as_ref()
+            .map(|document| {
+                document
+                    .channels()
+                    .into_iter()
+                    .filter(|channel| channel.kind() != Some(5))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let mut import_midi_request = None;
+        let mut import_all_midi_request = None;
         let mut clear_midi_import = false;
         if let Some(pending) = &mut self.pending_midi_import {
             ui.horizontal(|ui| {
@@ -27213,46 +27265,120 @@ impl DawUi {
                     || "MIDI".to_owned(),
                     |name| name.to_string_lossy().into_owned(),
                 ));
-                let selected_track_label = pending
-                    .midi
-                    .tracks()
-                    .get(pending.selected_track)
-                    .map(|track| {
-                        track
-                            .name()
-                            .filter(|name| !name.is_empty())
-                            .unwrap_or_else(|| format!("Track {}", pending.selected_track + 1))
-                    })
-                    .unwrap_or_else(|| "No track".to_owned());
-                egui::ComboBox::from_id_salt("midi-import-track-picker")
-                    .selected_text(selected_track_label)
-                    .show_ui(ui, |ui| {
-                        for (index, track) in pending.midi.tracks().iter().enumerate() {
-                            let label = track
+                ui.checkbox(&mut pending.import_all_tracks, "Route all tracks");
+                if !pending.import_all_tracks {
+                    let selected_track_label = pending
+                        .midi
+                        .tracks()
+                        .get(pending.selected_track)
+                        .map(|track| {
+                            track
                                 .name()
                                 .filter(|name| !name.is_empty())
-                                .unwrap_or_else(|| format!("Track {}", index + 1));
-                            ui.selectable_value(&mut pending.selected_track, index, label);
-                        }
-                    });
-                if ui
-                    .add_enabled(
-                        self.selected_pattern.is_some() && self.selected_note_channel.is_some(),
-                        egui::Button::new("Import track"),
-                    )
-                    .clicked()
-                    && let (Some(pattern_id), Some(channel_id)) =
-                        (self.selected_pattern, self.selected_note_channel)
-                {
-                    import_midi_request = Some((
-                        pending.midi.clone(),
-                        pending.selected_track,
-                        pattern_id,
-                        channel_id,
-                    ));
+                                .unwrap_or_else(|| format!("Track {}", pending.selected_track + 1))
+                        })
+                        .unwrap_or_else(|| "No track".to_owned());
+                    egui::ComboBox::from_id_salt("midi-import-track-picker")
+                        .selected_text(selected_track_label)
+                        .show_ui(ui, |ui| {
+                            for (index, track) in pending.midi.tracks().iter().enumerate() {
+                                let label = track
+                                    .name()
+                                    .filter(|name| !name.is_empty())
+                                    .unwrap_or_else(|| format!("Track {}", index + 1));
+                                ui.selectable_value(&mut pending.selected_track, index, label);
+                            }
+                        });
+                    if ui
+                        .add_enabled(
+                            self.selected_pattern.is_some() && self.selected_note_channel.is_some(),
+                            egui::Button::new("Import track"),
+                        )
+                        .clicked()
+                        && let (Some(pattern_id), Some(channel_id)) =
+                            (self.selected_pattern, self.selected_note_channel)
+                    {
+                        import_midi_request = Some((
+                            pending.midi.clone(),
+                            pending.selected_track,
+                            pattern_id,
+                            channel_id,
+                        ));
+                    }
+                } else {
+                    let mapping_is_valid = pending.track_channel_ids.len()
+                        == pending.midi.tracks().len()
+                        && pending.track_channel_ids.iter().all(|channel_id| {
+                            available_midi_channels
+                                .iter()
+                                .any(|channel| channel.id() == *channel_id)
+                        });
+                    if ui
+                        .add_enabled(
+                            self.selected_pattern.is_some()
+                                && mapping_is_valid
+                                && pending.midi.format() != 2,
+                            egui::Button::new("Import all tracks"),
+                        )
+                        .clicked()
+                        && let Some(pattern_id) = self.selected_pattern
+                    {
+                        import_all_midi_request = Some((
+                            pending.midi.clone(),
+                            pending.track_channel_ids.clone(),
+                            pattern_id,
+                        ));
+                    }
                 }
                 clear_midi_import = ui.button("Clear").clicked();
             });
+            if pending.import_all_tracks {
+                ui.vertical(|ui| {
+                    ui.small("Choose a destination Channel Rack channel for each MIDI track.");
+                    if pending.midi.format() == 2 {
+                        ui.weak(
+                            "Format-2 tracks are independent sequences; import them one at a time.",
+                        );
+                    }
+                    for (track_index, track) in pending.midi.tracks().iter().enumerate() {
+                        let track_name = track
+                            .name()
+                            .filter(|name| !name.is_empty())
+                            .unwrap_or_else(|| format!("Track {}", track_index + 1));
+                        ui.horizontal(|ui| {
+                            ui.label(track_name);
+                            if let Some(destination) =
+                                pending.track_channel_ids.get_mut(track_index)
+                            {
+                                let selected_channel_label = available_midi_channels
+                                    .iter()
+                                    .find(|channel| channel.id() == *destination)
+                                    .map(|channel| {
+                                        channel.display_name().map_or_else(
+                                            || format!("Channel {}", channel.id()),
+                                            |name| format!("{name} ({})", channel.id()),
+                                        )
+                                    })
+                                    .unwrap_or_else(|| "Choose channel".to_owned());
+                                egui::ComboBox::from_id_salt((
+                                    "midi-import-destination",
+                                    track_index,
+                                ))
+                                .selected_text(selected_channel_label)
+                                .show_ui(ui, |ui| {
+                                    for channel in &available_midi_channels {
+                                        let label = channel.display_name().map_or_else(
+                                            || format!("Channel {}", channel.id()),
+                                            |name| format!("{name} ({})", channel.id()),
+                                        );
+                                        ui.selectable_value(destination, channel.id(), label);
+                                    }
+                                });
+                            }
+                        });
+                    }
+                });
+            }
         }
         if clear_midi_import {
             self.pending_midi_import = None;
@@ -27284,6 +27410,50 @@ impl DawUi {
                         }
                         self.status =
                             format!("Imported {imported} MIDI notes into pattern {pattern_id}");
+                    }
+                    Err(error) => self.status = error.to_string(),
+                }
+            }
+        }
+        if let Some((midi, channel_ids, pattern_id)) = import_all_midi_request {
+            let channel_id = midi
+                .tracks()
+                .iter()
+                .enumerate()
+                .find(|(_, track)| !track.notes().is_empty())
+                .and_then(|(track_index, _)| channel_ids.get(track_index).copied())
+                .or_else(|| channel_ids.first().copied())
+                .unwrap_or_default();
+            let first_note_index = patterns
+                .iter()
+                .find(|pattern| pattern.id == pattern_id)
+                .map(|pattern| {
+                    pattern
+                        .notes
+                        .iter()
+                        .filter(|note| note.channel_id == channel_id)
+                        .count()
+                })
+                .unwrap_or(0);
+            if let Some(document) = &mut self.document {
+                match document.import_midi_tracks(&midi, pattern_id, &channel_ids) {
+                    Ok(imported) => {
+                        self.stop_project_playback();
+                        self.selected_note_channel = Some(channel_id);
+                        if imported > 0 {
+                            self.selected_note = Some((pattern_id, channel_id, first_note_index));
+                            self.selected_piano_notes.clear();
+                            self.selected_piano_notes.insert((
+                                pattern_id,
+                                channel_id,
+                                first_note_index,
+                            ));
+                        }
+                        self.dirty = true;
+                        self.status = format!(
+                            "Imported {imported} MIDI notes from {} tracks into pattern {pattern_id}",
+                            midi.tracks().len()
+                        );
                     }
                     Err(error) => self.status = error.to_string(),
                 }
