@@ -1244,6 +1244,26 @@ jobs:
           sleep 3
           echo "Packaged macOS app remained running after launch."
 
+      - name: Verify platform installer artifact
+        shell: bash
+        run: |
+          shopt -s nullglob
+          case "$RUNNER_OS" in
+            Linux) installers=(dist/*.deb) ;;
+            Windows) installers=(dist/*-setup.exe) ;;
+            macOS) installers=(dist/*.dmg) ;;
+            *)
+              echo "::error::Unsupported installer platform: $RUNNER_OS"
+              exit 1
+              ;;
+          esac
+          if (( ${#installers[@]} != 1 )); then
+            echo "::error::Expected exactly one $RUNNER_OS installer in dist; found ${#installers[@]}."
+            printf '%s\n' "${installers[@]}"
+            exit 1
+          fi
+          echo "Verified installer: ${installers[0]}"
+
       - name: Upload Linux installer
         if: runner.os == 'Linux'
         uses: actions/upload-artifact@v4
@@ -1258,7 +1278,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: installers-${{ matrix.os }}
-          path: dist/*.exe
+          path: dist/*-setup.exe
           if-no-files-found: error
           retention-days: 14
 
