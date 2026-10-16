@@ -976,6 +976,26 @@ fn playlist_performance_sampler_clip_candidates(
             };
             let track_id = clip.playlist_track_id()?;
             let pattern = patterns.get(&id)?;
+            let notes = pattern
+                .notes
+                .iter()
+                .filter(|note| !note.is_muted())
+                .collect::<Vec<_>>();
+            let mut has_sampler_route = notes.is_empty();
+            let notes_supported = notes.iter().all(|note| {
+                let sampler_route = playlist_performance_sampler_source_supported(
+                    note.channel_id,
+                    &channels,
+                    loaded_vst3_channels,
+                );
+                let vst3_route = playlist_performance_vst3_source_loaded(
+                    note.channel_id,
+                    &channels,
+                    loaded_vst3_channels,
+                );
+                has_sampler_route |= sampler_route;
+                sampler_route || vst3_route
+            });
             (clip.position_ticks < performance_zone_end_tick
                 && clip.length_ticks > 0
                 && !clip.is_muted()
@@ -984,15 +1004,9 @@ fn playlist_performance_sampler_clip_candidates(
                     .scale
                     .is_none_or(|scale| scale.is_finite() && (scale - 1.0).abs() <= 1e-9)
                 && pattern.controllers.is_empty()
-                && pattern.notes.iter().all(|note| {
-                    note.is_muted()
-                        || playlist_performance_sampler_source_supported(
-                            note.channel_id,
-                            &channels,
-                            loaded_vst3_channels,
-                        )
-                }))
-            .then_some(index)
+                && notes_supported
+                && has_sampler_route)
+                .then_some(index)
         })
         .collect::<BTreeSet<_>>();
     Ok(candidates)
@@ -1042,6 +1056,21 @@ fn playlist_performance_sampler_source_supported(
         }
         _ => false,
     }
+}
+
+fn playlist_performance_vst3_source_loaded(
+    source_channel_id: u16,
+    channels_by_id: &HashMap<u16, ChannelSummary>,
+    loaded_vst3_channels: &BTreeSet<u16>,
+) -> bool {
+    playlist_performance_vst3_source_targets(source_channel_id, channels_by_id).is_some_and(
+        |targets| {
+            !targets.is_empty()
+                && targets
+                    .iter()
+                    .all(|target| loaded_vst3_channels.contains(target))
+        },
+    )
 }
 
 /// Return enabled Audio Clips before the Start marker that can be launched in Performance Mode.
@@ -1140,6 +1169,21 @@ fn playlist_performance_vst3_clip_candidates(
                 .iter()
                 .filter(|note| !note.is_muted())
                 .collect::<Vec<_>>();
+            let mut has_vst3_route = false;
+            let notes_supported = notes.iter().all(|note| {
+                let sampler_route = playlist_performance_sampler_source_supported(
+                    note.channel_id,
+                    &channels,
+                    loaded_vst3_channels,
+                );
+                let vst3_route = playlist_performance_vst3_source_loaded(
+                    note.channel_id,
+                    &channels,
+                    loaded_vst3_channels,
+                );
+                has_vst3_route |= vst3_route;
+                sampler_route || vst3_route
+            });
             (clip.position_ticks < performance_zone_end_tick
                 && clip.length_ticks > 0
                 && !clip.is_muted()
@@ -1149,15 +1193,9 @@ fn playlist_performance_vst3_clip_candidates(
                     .is_none_or(|scale| scale.is_finite() && (scale - 1.0).abs() <= 1e-9)
                 && pattern.controllers.is_empty()
                 && !notes.is_empty()
-                && notes.iter().all(|note| {
-                    playlist_performance_vst3_source_targets(note.channel_id, &channels)
-                        .is_some_and(|targets| {
-                            targets
-                                .iter()
-                                .all(|target| loaded_vst3_channels.contains(target))
-                        })
-                }))
-            .then_some(index)
+                && notes_supported
+                && has_vst3_route)
+                .then_some(index)
         })
         .collect())
 }
@@ -1217,7 +1255,7 @@ pub fn playlist_performance_clip_indices(
     )
 }
 
-/// Return supported Performance Mode clips, including Layers with loaded VST3 and Sampler children.
+/// Return supported Performance Mode clips, including mixed Sampler/VST3 Patterns and Layers.
 pub fn playlist_performance_clip_indices_with_vst3(
     document: &FlpDocument,
     arrangement_id: u16,
@@ -10545,6 +10583,61 @@ mod tests {
         FlpDocument::parse(&bytes).expect("Performance Mode Layer fixture should parse")
     }
 
+    fn performance_mixed_sampler_vst3_source_fixture() -> FlpDocument {
+        fn append_data_event(event_stream: &mut Vec<u8>, opcode: u8, payload: &[u8]) {
+            assert!(payload.len() < 128);
+            event_stream.extend_from_slice(&[opcode, payload.len() as u8]);
+            event_stream.extend_from_slice(payload);
+        }
+
+        let mut event_stream = Vec::new();
+        append_data_event(&mut event_stream, 0xC7, b"26.0.0\0");
+        event_stream.extend_from_slice(&[0x40, 0, 0, 0x15, 0]);
+        event_stream.extend_from_slice(&[0x40, 1, 0, 0x15, 4]);
+        let identifier = "VST3 Instrument 1";
+        let payload = identifier
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        append_data_event(&mut event_stream, 0xC9, &payload);
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+
+        event_stream.extend_from_slice(&[0x41, 7, 0]);
+        let mut pattern_notes = Vec::new();
+        for channel_id in [0_u16, 1] {
+            let mut note = [0_u8; 24];
+            note[6..8].copy_from_slice(&channel_id.to_le_bytes());
+            note[8..12].copy_from_slice(&96_u32.to_le_bytes());
+            note[12..14].copy_from_slice(&60_u16.to_le_bytes());
+            note[21] = 100;
+            pattern_notes.extend_from_slice(&note);
+        }
+        append_data_event(&mut event_stream, 0xD0, &pattern_notes);
+
+        event_stream.extend_from_slice(&[0x63, 0, 0]);
+        let mut playlist_clip = [0_u8; 80];
+        playlist_clip[4..6].copy_from_slice(&0x5000_u16.to_le_bytes());
+        playlist_clip[6..8].copy_from_slice(&0x5007_u16.to_le_bytes());
+        playlist_clip[8..12].copy_from_slice(&384_u32.to_le_bytes());
+        playlist_clip[12..14].copy_from_slice(&499_u16.to_le_bytes());
+        playlist_clip[24..28].copy_from_slice(&(-1.0_f32).to_le_bytes());
+        playlist_clip[28..32].copy_from_slice(&(-1.0_f32).to_le_bytes());
+        playlist_clip[64..72].copy_from_slice(&1.0_f64.to_le_bytes());
+        append_data_event(&mut event_stream, 0xE9, &playlist_clip);
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"FLhd");
+        bytes.extend_from_slice(&6_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&96_u16.to_le_bytes());
+        bytes.extend_from_slice(b"FLdt");
+        bytes.extend_from_slice(&(event_stream.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&event_stream);
+        FlpDocument::parse(&bytes).expect("mixed-source Performance Mode fixture should parse")
+    }
+
     #[test]
     fn performance_mode_vst3_clips_route_through_loaded_vst3_layer_children() {
         let document = performance_vst3_layer_fixture([4, 4]);
@@ -10594,6 +10687,108 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1, 2, 1, 2, 1, 2, 1, 2]
         );
+    }
+
+    #[test]
+    fn performance_mode_accepts_patterns_with_mixed_sampler_and_vst3_sources() {
+        let document = performance_mixed_sampler_vst3_source_fixture();
+        let loaded_vst3_channels = BTreeSet::from([1]);
+
+        assert_eq!(
+            playlist_performance_sampler_clip_candidates(&document, 0, 384, &loaded_vst3_channels,)
+                .expect("mixed Pattern should include its Sampler stream"),
+            BTreeSet::from([0])
+        );
+        assert_eq!(
+            playlist_performance_vst3_clip_indices(&document, 0, 384, &loaded_vst3_channels,)
+                .expect("mixed Pattern should include its VST3 stream"),
+            BTreeSet::from([0])
+        );
+        assert_eq!(
+            playlist_performance_clip_indices_with_vst3(&document, 0, 384, &loaded_vst3_channels,)
+                .expect("mixed Pattern should be launchable"),
+            BTreeSet::from([0])
+        );
+        assert_eq!(
+            playlist_performance_vst3_channel_ids(&document, 0, &BTreeSet::from([0]))
+                .expect("mixed Pattern VST3 destination should be found"),
+            loaded_vst3_channels
+        );
+        assert!(
+            playlist_performance_clip_indices_with_vst3(&document, 0, 384, &BTreeSet::new(),)
+                .expect("unloaded VST3 source should be handled")
+                .is_empty()
+        );
+
+        let channels = document.channels();
+        let router = ChannelNoteRouter::new(channels.clone());
+        let sampler_channel_ids = channels
+            .iter()
+            .filter(|channel| channel.channel_type() == Some(ChannelType::Sampler))
+            .map(ChannelSummary::id)
+            .collect::<BTreeSet<_>>();
+        let patterns = document.patterns().expect("mixed Pattern should decode");
+        let arrangement = document
+            .arrangements()
+            .expect("mixed Playlist should decode")
+            .remove(0);
+        let sampler_schedule = schedule_playlist_pattern_notes(
+            &patterns,
+            &arrangement,
+            PlaylistTrackFilter::new(&BTreeSet::new(), None),
+            PlaylistPatternScheduleOptions {
+                ppq: 96,
+                global_swing_mix_raw: 0,
+                play_truncated_notes_in_clips: false,
+            },
+            |_| 128,
+            |source_channel_id, note_seed, key| {
+                router
+                    .targets_for_note(source_channel_id, note_seed, key)
+                    .into_iter()
+                    .filter(|channel_id| sampler_channel_ids.contains(channel_id))
+                    .collect()
+            },
+        )
+        .expect("Sampler stream notes should schedule");
+        let vst3_schedule = schedule_playlist_pattern_notes(
+            &patterns,
+            &arrangement,
+            PlaylistTrackFilter::new(&BTreeSet::new(), None),
+            PlaylistPatternScheduleOptions {
+                ppq: 96,
+                global_swing_mix_raw: 0,
+                play_truncated_notes_in_clips: false,
+            },
+            |_| 128,
+            |source_channel_id, note_seed, key| {
+                router
+                    .targets_for_note(source_channel_id, note_seed, key)
+                    .into_iter()
+                    .filter(|channel_id| loaded_vst3_channels.contains(channel_id))
+                    .collect()
+            },
+        )
+        .expect("VST3 stream notes should schedule");
+
+        assert_eq!(
+            sampler_schedule
+                .notes
+                .iter()
+                .map(|note| note.target_channel_id)
+                .collect::<Vec<_>>(),
+            vec![0; 4]
+        );
+        assert_eq!(
+            vst3_schedule
+                .notes
+                .iter()
+                .map(|note| note.target_channel_id)
+                .collect::<Vec<_>>(),
+            vec![1; 4]
+        );
+        assert_eq!(router.targets_for_note(0, 1, 60), vec![0]);
+        assert_eq!(router.targets_for_note(1, 2, 60), vec![1]);
     }
 
     #[test]
