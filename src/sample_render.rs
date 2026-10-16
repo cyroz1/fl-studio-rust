@@ -1,10 +1,11 @@
 //! Offline rendering for Playlist clips that reference FLP audio channels.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1611,10 +1612,11 @@ struct WavCuePoint {
 }
 
 /// Optional live Playlist meter output and seek position for device streaming.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct PlaylistStreamMonitor<'a> {
     start_frame: u64,
     meters: Option<&'a MixerTrackPeakMeters>,
+    live_master_fader_gain: Option<Arc<AtomicU32>>,
 }
 
 impl<'a> PlaylistStreamMonitor<'a> {
@@ -1623,14 +1625,16 @@ impl<'a> PlaylistStreamMonitor<'a> {
         Self {
             start_frame,
             meters: None,
+            live_master_fader_gain: None,
         }
     }
 
     /// Stream from a frame and publish peaks for supported direct and send insert routes.
-    pub const fn with_meters(start_frame: u64, meters: &'a MixerTrackPeakMeters) -> Self {
+    pub fn with_meters(start_frame: u64, meters: &'a MixerTrackPeakMeters) -> Self {
         Self {
             start_frame,
             meters: Some(meters),
+            live_master_fader_gain: Some(meters.live_master_fader_gain()),
         }
     }
 }
@@ -2146,8 +2150,12 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
 ) -> Result<PlaylistRenderSummary, String> {
     let start_frame = monitor.start_frame;
     let meters = monitor.meters;
+    let live_master_fader_gain = monitor.live_master_fader_gain;
     let project_path = project_path.as_ref();
-    let master_output = MixerMasterOutput::from_document(document);
+    let mut master_output = MixerMasterOutput::from_document(document);
+    if let Some(gain_target) = live_master_fader_gain {
+        master_output = master_output.with_live_fader_gain_target(gain_target, options.sample_rate);
+    }
     let audio = prepare_audio_clip_render(
         document,
         project_path,
@@ -4064,7 +4072,7 @@ struct PreparedPlaylistBlockMix<'a> {
     vst3_processor: Option<&'a mut Vst3PlaylistStreamProcessor>,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Debug, Default)]
 struct MixerMasterOutput {
     enabled: Option<bool>,
     polarity_reversed: Option<bool>,
@@ -4073,6 +4081,9 @@ struct MixerMasterOutput {
     mixer_pan_raw: Option<i32>,
     stereo_separation_raw: Option<i32>,
     mixer_pan_law_raw: Option<u8>,
+    live_fader_gain_target: Option<Arc<AtomicU32>>,
+    live_fader_gain_current: Cell<Option<f32>>,
+    live_fader_smoothing_alpha: f32,
 }
 
 impl MixerMasterOutput {
@@ -4089,10 +4100,22 @@ impl MixerMasterOutput {
             mixer_pan_raw: routing.master_pan_raw(),
             stereo_separation_raw: routing.master_stereo_separation_raw(),
             mixer_pan_law_raw: document.metadata().pan_law_raw(),
+            ..Self::default()
         }
     }
 
-    fn apply(self, stereo_samples: &mut [f32]) {
+    fn with_live_fader_gain_target(
+        mut self,
+        gain_target: Arc<AtomicU32>,
+        sample_rate: u32,
+    ) -> Self {
+        self.live_fader_gain_target = Some(gain_target);
+        self.live_fader_smoothing_alpha =
+            crate::audio::output_gain_smoothing_alpha(sample_rate as f32);
+        self
+    }
+
+    fn apply(&self, stereo_samples: &mut [f32]) {
         if self.enabled == Some(false) {
             stereo_samples.fill(0.0);
             return;
@@ -4102,7 +4125,11 @@ impl MixerMasterOutput {
             .with_stereo_separation_raw(self.stereo_separation_raw)
             .with_mixer_pan_raw(self.mixer_pan_raw)
             .with_mixer_pan_law_raw(self.mixer_pan_law_raw)
-            .with_fader_volume_raw(self.fader_volume_raw);
+            .with_fader_volume_raw(if self.live_fader_gain_target.is_some() {
+                None
+            } else {
+                self.fader_volume_raw
+            });
         for frame in frames {
             if self.swap_left_right == Some(true) {
                 frame.swap(0, 1);
@@ -4112,6 +4139,22 @@ impl MixerMasterOutput {
                 frame[1] = -frame[1];
             }
             master_transform.apply_frame(frame);
+            if let Some(target) = &self.live_fader_gain_target {
+                let current_gain = self.live_fader_gain_current.get().unwrap_or_else(|| {
+                    self.fader_volume_raw.map_or(1.0, |volume_raw| {
+                        volume_raw.clamp(0, 16_000) as f32 / 10_000.0
+                    })
+                });
+                let target_gain = f32::from_bits(target.load(Ordering::Acquire));
+                let next_gain = crate::audio::smooth_output_gain(
+                    current_gain,
+                    target_gain,
+                    self.live_fader_smoothing_alpha,
+                );
+                self.live_fader_gain_current.set(Some(next_gain));
+                frame[0] *= next_gain;
+                frame[1] *= next_gain;
+            }
         }
     }
 }
