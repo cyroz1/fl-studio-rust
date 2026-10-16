@@ -68,11 +68,12 @@ use vst3_host::midi::{MidiChannel as Vst3MidiChannel, MidiEvent as Vst3MidiEvent
 mod clap_probe;
 mod midi_input;
 mod midi_output;
+mod midi_thru;
 
 use midi_input::{
     ConnectedMidiInput, MidiInputChannelState, MidiInputDevice, MidiInputEvent,
-    MidiPatternRecorder, MidiPatternRecorderSettings, MidiTransportCommand, ReceivedMidiMessage,
-    connect_input_device, describe_event, enumerate_input_devices,
+    MidiPatternRecorder, MidiPatternRecorderSettings, MidiThruInputQueue, MidiTransportCommand,
+    ReceivedMidiMessage, connect_input_device, describe_event, enumerate_input_devices,
 };
 use midi_output::{
     ConnectedMidiOutput, MIDI_CLOCK_TICK, MIDI_CONTINUE, MIDI_START, MIDI_STOP, MIDI_TEST_NOTE_OFF,
@@ -81,6 +82,7 @@ use midi_output::{
     midi_sixteenth_notes_from_tick, midi_song_position_pointer_message, pattern_preview_messages,
     playlist_playback_messages,
 };
+use midi_thru::{MidiThruSettings, MidiThruWorker};
 
 const APP_BACKGROUND: Color32 = Color32::from_rgb(27, 27, 27);
 const PANEL: Color32 = Color32::from_rgb(44, 44, 44);
@@ -96,7 +98,6 @@ const BLUE_TEXT: Color32 = Color32::from_rgb(86, 129, 255);
 const BLUE_SELECTION: Color32 = Color32::from_rgb(14, 23, 63);
 const RED_SELECTION: Color32 = Color32::from_rgb(62, 22, 20);
 const MIDI_PLAYLIST_MESSAGES_PER_UPDATE: usize = 256;
-const MIDI_THRU_NOTE_STACK_LIMIT: u8 = 16;
 const PLAYLIST_LABEL_WIDTH: f32 = 178.0;
 const PURPLE: Color32 = Color32::from_rgb(150, 93, 181);
 const ORANGE: Color32 = Color32::from_rgb(195, 129, 61);
@@ -124,81 +125,6 @@ fn state_preset_file_stem(name: &str, fallback: &str) -> String {
     } else {
         stem.to_owned()
     }
-}
-
-fn midi_input_thru_message(event: MidiInputEvent) -> Option<([u8; 3], usize)> {
-    let (bytes, length) = match event {
-        MidiInputEvent::NoteOn {
-            channel,
-            key,
-            velocity,
-        } => (
-            [0x90 | (channel & 0x0F), key.min(127), velocity.min(127)],
-            3,
-        ),
-        MidiInputEvent::NoteOff {
-            channel,
-            key,
-            velocity,
-        } => (
-            [0x80 | (channel & 0x0F), key.min(127), velocity.min(127)],
-            3,
-        ),
-        MidiInputEvent::PolyphonicPressure {
-            channel,
-            key,
-            pressure,
-        } => (
-            [0xA0 | (channel & 0x0F), key.min(127), pressure.min(127)],
-            3,
-        ),
-        MidiInputEvent::ControlChange {
-            channel,
-            controller,
-            value,
-        } => (
-            [0xB0 | (channel & 0x0F), controller.min(127), value.min(127)],
-            3,
-        ),
-        MidiInputEvent::ProgramChange { channel, program } => {
-            ([0xC0 | (channel & 0x0F), program.min(127), 0], 2)
-        }
-        MidiInputEvent::ChannelPressure { channel, pressure } => {
-            ([0xD0 | (channel & 0x0F), pressure.min(127), 0], 2)
-        }
-        MidiInputEvent::PitchBend { channel, value } => {
-            let value = (i32::from(value) + 8192).clamp(0, 0x3FFF) as u16;
-            (
-                [
-                    0xE0 | (channel & 0x0F),
-                    (value & 0x7F) as u8,
-                    ((value >> 7) & 0x7F) as u8,
-                ],
-                3,
-            )
-        }
-        MidiInputEvent::TimingClock => ([0xF8, 0, 0], 1),
-        MidiInputEvent::SongPosition { sixteenth_notes } => {
-            let position = sixteenth_notes.min(0x3FFF);
-            (
-                [
-                    0xF2,
-                    (position & 0x7F) as u8,
-                    ((position >> 7) & 0x7F) as u8,
-                ],
-                3,
-            )
-        }
-        MidiInputEvent::Transport(MidiTransportCommand::Start) => ([0xFA, 0, 0], 1),
-        MidiInputEvent::Transport(MidiTransportCommand::Continue) => ([0xFB, 0, 0], 1),
-        MidiInputEvent::Transport(MidiTransportCommand::Stop) => ([0xFC, 0, 0], 1),
-        MidiInputEvent::Transport(
-            MidiTransportCommand::Pause
-            | MidiTransportCommand::RecordStart
-            | MidiTransportCommand::RecordStop,
-        ) => return None,
-    };
-    Some((bytes, length))
 }
 
 const MENU_BAR_HEIGHT: f32 = 32.0;
@@ -4088,12 +4014,11 @@ struct DawUi {
     midi_input_thru_output: bool,
     midi_input_thru_snap_to_scale: bool,
     midi_input_thru_output_channel: Option<u8>,
-    midi_input_thru_notes: BTreeMap<(u8, u8), u8>,
-    midi_input_thru_note_mapping: BTreeMap<(u8, u8), VecDeque<(u8, u8)>>,
+    midi_thru_worker: MidiThruWorker,
+    midi_thru_input_queue: MidiThruInputQueue,
     midi_live_sampler_note_mapping: BTreeMap<(u8, u8), VecDeque<u8>>,
     midi_live_vst3_note_mapping: BTreeMap<(u8, u8), VecDeque<Option<u8>>>,
     midi_live_sampler_sustain_channels: BTreeSet<u8>,
-    midi_input_thru_sustain_channels: BTreeSet<u8>,
     midi_output_gain_mapping: Option<MidiControlChangeMapping>,
     midi_controller_templates: Vec<MidiControllerTemplate>,
     midi_controller_template_index: Option<usize>,
@@ -4522,6 +4447,8 @@ impl DawUi {
         let audio_catalog = enumerate_devices();
         let (midi_message_sender, midi_message_receiver) =
             mpsc::sync_channel(midi_input::MIDI_INPUT_QUEUE_CAPACITY);
+        let midi_thru_worker = MidiThruWorker::new();
+        let midi_thru_input_queue = midi_thru_worker.input_queue();
         let (midi_input_devices, midi_input_error) = match enumerate_input_devices() {
             Ok(devices) => (devices, None),
             Err(error) => (Vec::new(), Some(error)),
@@ -4837,12 +4764,11 @@ impl DawUi {
             midi_input_thru_output: false,
             midi_input_thru_snap_to_scale,
             midi_input_thru_output_channel,
-            midi_input_thru_notes: BTreeMap::new(),
-            midi_input_thru_note_mapping: BTreeMap::new(),
+            midi_thru_worker,
+            midi_thru_input_queue,
             midi_live_sampler_note_mapping: BTreeMap::new(),
             midi_live_vst3_note_mapping: BTreeMap::new(),
             midi_live_sampler_sustain_channels: BTreeSet::new(),
-            midi_input_thru_sustain_channels: BTreeSet::new(),
             midi_output_gain_mapping,
             midi_controller_templates,
             midi_controller_template_index: None,
@@ -34765,6 +34691,7 @@ impl DawUi {
         match connect_input_device(
             &device_id,
             self.midi_message_sender.clone(),
+            self.midi_thru_input_queue.clone(),
             Arc::clone(&self.midi_dropped_messages),
         ) {
             Ok(connection) => {
@@ -36035,243 +35962,57 @@ impl DawUi {
         }
     }
 
-    fn stop_midi_input_thru(&mut self) {
-        self.midi_input_thru_output = false;
-        let active_notes = std::mem::take(&mut self.midi_input_thru_notes);
-        self.midi_input_thru_note_mapping.clear();
-        let sustain_channels = std::mem::take(&mut self.midi_input_thru_sustain_channels);
-        let Some(connection) = self.midi_output_connection.as_mut() else {
+    fn midi_thru_settings(&self) -> MidiThruSettings {
+        let pitch_class_mask = if self.midi_input_thru_snap_to_scale
+            && self.piano_roll_scale != PianoRollScale::None
+        {
+            let mut mask = 0_u16;
+            for key in 0..12 {
+                if self
+                    .piano_roll_scale
+                    .contains(key, self.piano_roll_scale_root)
+                {
+                    mask |= 1 << key;
+                }
+            }
+            Some(mask)
+        } else {
+            None
+        };
+        MidiThruSettings {
+            output_channel: self.midi_input_thru_output_channel,
+            pitch_class_mask,
+        }
+    }
+
+    fn update_midi_thru_settings(&self) {
+        self.midi_thru_worker
+            .set_settings(self.midi_thru_settings());
+    }
+
+    fn start_midi_input_thru(&mut self) {
+        let Some(connection) = self.midi_output_connection.as_ref().cloned() else {
+            self.midi_input_thru_output = false;
+            self.status = "Connect a MIDI output before enabling MIDI Thru".to_owned();
             return;
         };
-        for channel in sustain_channels {
-            let sustain_off = [0xB0 | (channel & 0x0F), 64, 0];
-            let _ = connection.send(&sustain_off);
-        }
-        for ((channel, key), count) in active_notes {
-            let note_off = [0x80 | (channel & 0x0F), key.min(127), 0];
-            for _ in 0..count {
-                let _ = connection.send(&note_off);
+        self.update_midi_thru_settings();
+        match self.midi_thru_worker.enable(connection) {
+            Ok(()) => self.midi_input_thru_output = true,
+            Err(error) => {
+                self.midi_input_thru_output = false;
+                let _ = self.midi_thru_worker.disable();
+                self.midi_output_error = Some(error.clone());
+                self.status = format!("Could not start MIDI Thru: {error}");
             }
         }
     }
 
-    fn forward_midi_input_thru(&mut self, event: MidiInputEvent) {
-        if !self.midi_input_thru_output {
-            return;
-        }
-        let input_channel = match event {
-            MidiInputEvent::NoteOn { channel, .. }
-            | MidiInputEvent::NoteOff { channel, .. }
-            | MidiInputEvent::PolyphonicPressure { channel, .. }
-            | MidiInputEvent::ControlChange { channel, .. }
-            | MidiInputEvent::ProgramChange { channel, .. }
-            | MidiInputEvent::ChannelPressure { channel, .. }
-            | MidiInputEvent::PitchBend { channel, .. } => Some(channel & 0x0F),
-            _ => None,
-        };
-        let output_channel = input_channel
-            .map(|channel| self.midi_input_thru_output_channel.unwrap_or(channel) & 0x0F);
-        let output_event = match event {
-            MidiInputEvent::NoteOn {
-                channel,
-                key,
-                velocity,
-            } => {
-                let key = if self.midi_input_thru_snap_to_scale
-                    && self.piano_roll_scale != PianoRollScale::None
-                {
-                    snap_piano_roll_key_to_scale(
-                        u16::from(key),
-                        self.piano_roll_scale,
-                        self.piano_roll_scale_root,
-                        0,
-                        127,
-                    ) as u8
-                } else {
-                    key
-                };
-                MidiInputEvent::NoteOn {
-                    channel: output_channel.unwrap_or(channel),
-                    key,
-                    velocity,
-                }
-            }
-            MidiInputEvent::NoteOff {
-                channel,
-                key,
-                velocity,
-            } => {
-                let (mapped_channel, mapped_key) = self
-                    .midi_input_thru_note_mapping
-                    .get(&(channel & 0x0F, key.min(127)))
-                    .and_then(VecDeque::front)
-                    .copied()
-                    .unwrap_or((output_channel.unwrap_or(channel), key));
-                MidiInputEvent::NoteOff {
-                    channel: mapped_channel,
-                    key: mapped_key,
-                    velocity,
-                }
-            }
-            MidiInputEvent::PolyphonicPressure {
-                channel,
-                key,
-                pressure,
-            } => MidiInputEvent::PolyphonicPressure {
-                channel: output_channel.unwrap_or(channel),
-                key,
-                pressure,
-            },
-            MidiInputEvent::ControlChange {
-                channel,
-                controller,
-                value,
-            } => MidiInputEvent::ControlChange {
-                channel: output_channel.unwrap_or(channel),
-                controller,
-                value,
-            },
-            MidiInputEvent::ProgramChange { channel, program } => MidiInputEvent::ProgramChange {
-                channel: output_channel.unwrap_or(channel),
-                program,
-            },
-            MidiInputEvent::ChannelPressure { channel, pressure } => {
-                MidiInputEvent::ChannelPressure {
-                    channel: output_channel.unwrap_or(channel),
-                    pressure,
-                }
-            }
-            MidiInputEvent::PitchBend { channel, value } => MidiInputEvent::PitchBend {
-                channel: output_channel.unwrap_or(channel),
-                value,
-            },
-            event => event,
-        };
-        let Some((bytes, length)) = midi_input_thru_message(output_event) else {
-            return;
-        };
-        let result = self
-            .midi_output_connection
-            .as_mut()
-            .map(|connection| connection.send(&bytes[..length]));
-        match result {
-            Some(Ok(())) => {}
-            Some(Err(error)) => {
-                self.stop_midi_input_thru();
-                self.midi_output_error = Some(error);
-                return;
-            }
-            None => {
-                self.stop_midi_input_thru();
-                return;
-            }
-        }
-        match (event, output_event) {
-            (
-                MidiInputEvent::NoteOn { channel, key, .. },
-                MidiInputEvent::NoteOn {
-                    channel: output_channel,
-                    key: output_key,
-                    ..
-                },
-            ) => {
-                let count = self
-                    .midi_input_thru_notes
-                    .entry((output_channel & 0x0F, output_key.min(127)))
-                    .or_default();
-                *count = count.saturating_add(1).min(MIDI_THRU_NOTE_STACK_LIMIT);
-                let mapping = self
-                    .midi_input_thru_note_mapping
-                    .entry((channel & 0x0F, key.min(127)))
-                    .or_default();
-                if mapping.len() < usize::from(MIDI_THRU_NOTE_STACK_LIMIT) {
-                    mapping.push_back((output_channel & 0x0F, output_key.min(127)));
-                }
-            }
-            (
-                MidiInputEvent::NoteOff { channel, key, .. },
-                MidiInputEvent::NoteOff {
-                    channel: output_channel,
-                    key: output_key,
-                    ..
-                },
-            ) => {
-                let source_note = (channel & 0x0F, key.min(127));
-                let remove_mapping = self
-                    .midi_input_thru_note_mapping
-                    .get_mut(&source_note)
-                    .is_some_and(|mapping| {
-                        mapping.pop_front();
-                        mapping.is_empty()
-                    });
-                if remove_mapping {
-                    self.midi_input_thru_note_mapping.remove(&source_note);
-                }
-                let note = (output_channel & 0x0F, output_key.min(127));
-                let remove = self
-                    .midi_input_thru_notes
-                    .get_mut(&note)
-                    .is_some_and(|count| {
-                        if *count <= 1 {
-                            true
-                        } else {
-                            *count -= 1;
-                            false
-                        }
-                    });
-                if remove {
-                    self.midi_input_thru_notes.remove(&note);
-                }
-            }
-            (
-                MidiInputEvent::ControlChange {
-                    controller: 64,
-                    value,
-                    ..
-                },
-                MidiInputEvent::ControlChange {
-                    channel: output_channel,
-                    ..
-                },
-            ) => {
-                let channel = output_channel & 0x0F;
-                if value >= 64 {
-                    self.midi_input_thru_sustain_channels.insert(channel);
-                } else {
-                    self.midi_input_thru_sustain_channels.remove(&channel);
-                }
-            }
-            (
-                MidiInputEvent::ControlChange {
-                    controller: 120 | 123..=127,
-                    ..
-                },
-                MidiInputEvent::ControlChange {
-                    channel: output_channel,
-                    ..
-                },
-            ) => {
-                let channel = output_channel & 0x0F;
-                self.midi_input_thru_notes
-                    .retain(|(note_channel, _), _| *note_channel != channel);
-                self.midi_input_thru_note_mapping.retain(|_, mapping| {
-                    mapping.retain(|(note_channel, _)| *note_channel != channel);
-                    !mapping.is_empty()
-                });
-            }
-            (
-                MidiInputEvent::ControlChange {
-                    controller: 121, ..
-                },
-                MidiInputEvent::ControlChange {
-                    channel: output_channel,
-                    ..
-                },
-            ) => {
-                self.midi_input_thru_sustain_channels
-                    .remove(&(output_channel & 0x0F));
-            }
-            _ => {}
+    fn stop_midi_input_thru(&mut self) {
+        self.midi_input_thru_output = false;
+        if let Err(error) = self.midi_thru_worker.disable() {
+            self.midi_output_error = Some(error.clone());
+            self.status = format!("Could not stop MIDI Thru cleanly: {error}");
         }
     }
 
@@ -37080,12 +36821,17 @@ impl DawUi {
     }
 
     fn poll_midi_input(&mut self, history_snapshot_available: bool) {
+        self.update_midi_thru_settings();
+        for error in self.midi_thru_worker.take_errors() {
+            self.midi_input_thru_output = false;
+            self.midi_output_error = Some(error.clone());
+            self.status = format!("MIDI Thru stopped: {error}");
+        }
         for _ in 0..midi_input::MIDI_INPUT_QUEUE_CAPACITY {
             let message = match self.midi_message_receiver.try_recv() {
                 Ok(message) => message,
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             };
-            self.forward_midi_input_thru(message.event);
             self.midi_activity = Some((describe_event(message.event), message.received_at));
             if let MidiInputEvent::ControlChange { channel, .. }
             | MidiInputEvent::PitchBend { channel, .. } = message.event
@@ -37707,8 +37453,12 @@ impl DawUi {
             })
             .inner
             .changed();
-        if midi_input_thru_changed && !self.midi_input_thru_output {
-            self.stop_midi_input_thru();
+        if midi_input_thru_changed {
+            if self.midi_input_thru_output {
+                self.start_midi_input_thru();
+            } else {
+                self.stop_midi_input_thru();
+            }
         }
         ui.label(
             egui::RichText::new(
@@ -37776,6 +37526,15 @@ impl DawUi {
         if dropped > 0 {
             ui.label(
                 egui::RichText::new(format!("Dropped MIDI messages: {dropped}")).color(ORANGE),
+            );
+        }
+        let dropped_thru = self.midi_thru_worker.dropped_count();
+        if dropped_thru > 0 {
+            ui.label(
+                egui::RichText::new(format!(
+                    "Dropped MIDI Thru messages: {dropped_thru}; active Thru notes were released."
+                ))
+                .color(ORANGE),
             );
         }
         if let Some(recorder) = &self.midi_recording {

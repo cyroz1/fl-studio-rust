@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::time::{Duration, Instant};
 
@@ -16,6 +16,7 @@ use midir::{Ignore, MidiInput, MidiInputConnection as MidirInputConnection};
 use flp_rebuild::sample_render::PlaylistTempoMap;
 
 pub const MIDI_INPUT_QUEUE_CAPACITY: usize = 4_096;
+pub const MIDI_THRU_INPUT_QUEUE_CAPACITY: usize = 4_096;
 const MAX_CAPTURED_NOTES: usize = 100_000;
 const MAX_NOTE_TICK: u32 = u32::MAX - 1;
 
@@ -201,6 +202,58 @@ pub struct ReceivedMidiMessage {
     pub event: MidiInputEvent,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct MidiThruInputMessage {
+    pub generation: u64,
+    pub event: MidiInputEvent,
+}
+
+#[derive(Clone)]
+pub struct MidiThruInputQueue {
+    sender: SyncSender<MidiThruInputMessage>,
+    enabled: Arc<AtomicBool>,
+    generation: Arc<AtomicU64>,
+    dropped_messages: Arc<AtomicU64>,
+}
+
+impl MidiThruInputQueue {
+    pub(super) fn new(
+        sender: SyncSender<MidiThruInputMessage>,
+        enabled: Arc<AtomicBool>,
+        generation: Arc<AtomicU64>,
+        dropped_messages: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            sender,
+            enabled,
+            generation,
+            dropped_messages,
+        }
+    }
+
+    fn try_send(&self, event: MidiInputEvent) {
+        if !self.enabled.load(Ordering::Acquire) {
+            return;
+        }
+        let message = MidiThruInputMessage {
+            generation: self.generation.load(Ordering::Acquire),
+            event,
+        };
+        if let Err(TrySendError::Full(_)) = self.sender.try_send(message) {
+            self.dropped_messages.fetch_add(1, Ordering::Relaxed);
+            self.generation.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    pub(super) fn dropped_count(&self) -> u64 {
+        self.dropped_messages.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn enabled(&self) -> &AtomicBool {
+        &self.enabled
+    }
+}
+
 pub fn enumerate_input_devices() -> Result<Vec<MidiInputDevice>, String> {
     let input = MidiInput::new("FL Studio Rebuild MIDI Input")
         .map_err(|error| format!("could not initialize MIDI input: {error}"))?;
@@ -222,6 +275,7 @@ pub fn enumerate_input_devices() -> Result<Vec<MidiInputDevice>, String> {
 pub fn connect_input_device(
     device_id: &str,
     sender: SyncSender<ReceivedMidiMessage>,
+    thru_queue: MidiThruInputQueue,
     dropped_messages: Arc<AtomicU64>,
 ) -> Result<ConnectedMidiInput, String> {
     let mut input = MidiInput::new("FL Studio Rebuild MIDI Input")
@@ -251,6 +305,7 @@ pub fn connect_input_device(
                 if let Err(TrySendError::Full(_)) = sender.try_send(message) {
                     dropped_messages.fetch_add(1, Ordering::Relaxed);
                 }
+                thru_queue.try_send(event);
             },
             (),
         )
@@ -1386,5 +1441,26 @@ mod tests {
         assert_eq!(result.notes.len(), 1);
         assert_eq!(result.notes[0].position, 72);
         assert_eq!(result.notes[0].length, 48);
+    }
+
+    #[test]
+    fn full_thru_queue_advances_generation_to_invalidate_stale_events() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let enabled = Arc::new(AtomicBool::new(true));
+        let generation = Arc::new(AtomicU64::new(0));
+        let dropped_messages = Arc::new(AtomicU64::new(0));
+        let queue = MidiThruInputQueue::new(
+            sender,
+            enabled,
+            Arc::clone(&generation),
+            Arc::clone(&dropped_messages),
+        );
+
+        queue.try_send(MidiInputEvent::TimingClock);
+        queue.try_send(MidiInputEvent::TimingClock);
+
+        assert_eq!(receiver.try_recv().unwrap().generation, 0);
+        assert_eq!(generation.load(Ordering::Relaxed), 1);
+        assert_eq!(dropped_messages.load(Ordering::Relaxed), 1);
     }
 }
