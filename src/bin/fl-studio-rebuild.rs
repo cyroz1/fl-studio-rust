@@ -2177,6 +2177,12 @@ struct DetectedPianoRollScale {
     scale: PianoRollScale,
 }
 
+struct PianoRollNoteView<'a> {
+    project_time_signature: Option<(u8, u8)>,
+    scale_highlight: Option<DetectedPianoRollScale>,
+    cross_pattern_ghost_notes: &'a [PianoRollGhostNote],
+}
+
 fn detect_piano_roll_scale(pitches: &[u16]) -> Option<DetectedPianoRollScale> {
     if pitches.len() < 3 {
         return None;
@@ -23871,6 +23877,33 @@ impl DawUi {
         {
             self.selected_pattern = patterns.first().map(|pattern| pattern.id);
         }
+        let cross_pattern_ghost_pattern_id = self.selected_pattern;
+        let cross_pattern_ghost_notes = if self.piano_roll_ghost_channels {
+            self.selected_pattern
+                .and_then(|pattern_id| {
+                    let arrangement_id = self.selected_arrangement.unwrap_or(0);
+                    let arrangement = document
+                        .arrangements()
+                        .ok()?
+                        .into_iter()
+                        .find(|arrangement| arrangement.id == arrangement_id)?;
+                    let disabled_track_ids = document
+                        .playlist_tracks_in_arrangement(arrangement_id)
+                        .into_iter()
+                        .filter(|track| track.enabled == Some(false))
+                        .map(|track| track.id)
+                        .collect::<BTreeSet<_>>();
+                    Some(piano_roll_cross_pattern_ghost_notes(
+                        pattern_id,
+                        &patterns,
+                        &arrangement,
+                        &disabled_track_ids,
+                    ))
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let time_signature = self
             .selected_pattern
             .and_then(|pattern_id| patterns.iter().find(|pattern| pattern.id == pattern_id))
@@ -23928,7 +23961,7 @@ impl DawUi {
                         )
                     })
             });
-        let ghost_channel_options: Vec<(u16, String)> = self
+        let mut ghost_channel_ids = self
             .selected_pattern
             .and_then(|pattern_id| patterns.iter().find(|pattern| pattern.id == pattern_id))
             .map(|pattern| {
@@ -23936,25 +23969,27 @@ impl DawUi {
                     .notes
                     .iter()
                     .map(|note| note.channel_id)
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
                     .filter(|channel_id| Some(*channel_id) != self.selected_note_channel)
-                    .map(|channel_id| {
-                        let label = channels
-                            .iter()
-                            .find(|channel| channel.id() == channel_id)
-                            .and_then(|channel| {
-                                channel
-                                    .display_name()
-                                    .or(channel.plugin_identifier())
-                                    .map(str::to_owned)
-                            })
-                            .unwrap_or_else(|| format!("Channel {channel_id}"));
-                        (channel_id, label)
-                    })
-                    .collect()
+                    .collect::<BTreeSet<_>>()
             })
             .unwrap_or_default();
+        ghost_channel_ids.extend(cross_pattern_ghost_notes.iter().map(|note| note.channel_id));
+        let ghost_channel_options: Vec<(u16, String)> = ghost_channel_ids
+            .into_iter()
+            .map(|channel_id| {
+                let label = channels
+                    .iter()
+                    .find(|channel| channel.id() == channel_id)
+                    .and_then(|channel| {
+                        channel
+                            .display_name()
+                            .or(channel.plugin_identifier())
+                            .map(str::to_owned)
+                    })
+                    .unwrap_or_else(|| format!("Channel {channel_id}"));
+                (channel_id, label)
+            })
+            .collect();
         let visible_ghost_count = ghost_channel_options
             .iter()
             .filter(|(channel_id, _)| !self.piano_roll_hidden_ghost_channels.contains(channel_id))
@@ -25558,7 +25593,7 @@ impl DawUi {
                     ),
                     |ui| {
                         if ghost_channel_options.is_empty() {
-                            ui.weak("No other note channels in this pattern.");
+                            ui.weak("No other channels or overlapping clips to show.");
                             return;
                         }
                         if ui.button("Show all").clicked() {
@@ -27792,8 +27827,15 @@ impl DawUi {
             &pattern,
             ppq,
             snap_ticks,
-            project_time_signature,
-            scale_highlight,
+            PianoRollNoteView {
+                project_time_signature,
+                scale_highlight,
+                cross_pattern_ghost_notes: if cross_pattern_ghost_pattern_id == Some(pattern.id) {
+                    &cross_pattern_ghost_notes
+                } else {
+                    &[]
+                },
+            },
         );
         let editor_pattern = self
             .document
@@ -31000,9 +31042,13 @@ impl DawUi {
         pattern: &Pattern,
         ppq: u16,
         snap_ticks: u32,
-        project_time_signature: Option<(u8, u8)>,
-        scale_highlight: Option<DetectedPianoRollScale>,
+        view: PianoRollNoteView<'_>,
     ) {
+        let PianoRollNoteView {
+            project_time_signature,
+            scale_highlight,
+            cross_pattern_ghost_notes,
+        } = view;
         let key_low = 36u16;
         let key_high = 83u16;
         let key_height = 13.0 * self.piano_roll_vertical_zoom;
@@ -31553,6 +31599,40 @@ impl DawUi {
                     Stroke::new(1.0, BLUE),
                     egui::StrokeKind::Inside,
                 );
+            }
+
+            if self.piano_roll_ghost_channels {
+                for ghost_note in cross_pattern_ghost_notes {
+                    if self
+                        .piano_roll_hidden_ghost_channels
+                        .contains(&ghost_note.channel_id)
+                        || !(key_low..=key_high).contains(&ghost_note.key)
+                    {
+                        continue;
+                    }
+                    let left = rect.left()
+                        + keyboard_width
+                        + ghost_note.position_ticks as f32 * tick_scale;
+                    let y = grid_rect.top()
+                        + f32::from(key_high.saturating_sub(ghost_note.key)) * key_height
+                        + 1.0;
+                    let note_rect = egui::Rect::from_min_size(
+                        egui::pos2(left, y),
+                        Vec2::new(
+                            (ghost_note.length_ticks as f32 * tick_scale).max(4.0),
+                            key_height - 2.0,
+                        ),
+                    )
+                    .intersect(grid_rect);
+                    if note_rect.is_positive() {
+                        painter.rect_stroke(
+                            note_rect,
+                            egui::CornerRadius::same(2),
+                            Stroke::new(1.2, Color32::from_rgb(154, 170, 191)),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                }
             }
 
             let mut per_channel = BTreeMap::<u16, usize>::new();
@@ -41528,6 +41608,154 @@ fn paint_channel_type_icon(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct PianoRollGhostNote {
+    channel_id: u16,
+    key: u16,
+    position_ticks: u32,
+    length_ticks: u32,
+}
+
+fn piano_roll_cross_pattern_ghost_notes(
+    current_pattern_id: u16,
+    patterns: &[Pattern],
+    arrangement: &Arrangement,
+    disabled_track_ids: &BTreeSet<u32>,
+) -> Vec<PianoRollGhostNote> {
+    const MAX_GHOST_NOTES: usize = 20_000;
+
+    let patterns_by_id = patterns
+        .iter()
+        .map(|pattern| (pattern.id, pattern))
+        .collect::<BTreeMap<_, _>>();
+    let clip_track_is_enabled = |clip: &PlaylistClip| {
+        clip.playlist_track_id()
+            .is_none_or(|track_id| !disabled_track_ids.contains(&track_id))
+    };
+    let clip_has_default_scale = |clip: &PlaylistClip| {
+        clip.scale
+            .is_none_or(|scale| scale.is_finite() && (scale - 1.0).abs() <= 1e-9)
+    };
+    let mut ghosts = BTreeSet::new();
+
+    'anchors: for anchor in &arrangement.clips {
+        if anchor.is_muted()
+            || !clip_track_is_enabled(anchor)
+            || !clip_has_default_scale(anchor)
+            || anchor.length_ticks == 0
+            || !matches!(
+                anchor.target(),
+                PlaylistClipTarget::Pattern { id } if id == current_pattern_id
+            )
+        {
+            continue;
+        }
+        let anchor_start = u64::from(anchor.position_ticks);
+        let anchor_end = anchor_start.saturating_add(u64::from(anchor.length_ticks));
+
+        for source_clip in &arrangement.clips {
+            if source_clip.is_muted()
+                || !clip_track_is_enabled(source_clip)
+                || !clip_has_default_scale(source_clip)
+                || source_clip.length_ticks == 0
+            {
+                continue;
+            }
+            let PlaylistClipTarget::Pattern {
+                id: source_pattern_id,
+            } = source_clip.target()
+            else {
+                continue;
+            };
+            if source_pattern_id == current_pattern_id {
+                continue;
+            }
+            let source_start = u64::from(source_clip.position_ticks);
+            let source_length = u64::from(source_clip.length_ticks);
+            let source_end = source_start.saturating_add(source_length);
+            if source_start >= anchor_end || anchor_start >= source_end {
+                continue;
+            }
+            let Some(source_pattern) = patterns_by_id.get(&source_pattern_id).copied() else {
+                continue;
+            };
+            let inferred_length = source_pattern
+                .notes
+                .iter()
+                .filter(|note| note.length > 0)
+                .map(|note| u64::from(note.position).saturating_add(u64::from(note.length)))
+                .max()
+                .unwrap_or(0);
+            let loop_length = source_pattern
+                .length_ticks
+                .map(u64::from)
+                .filter(|length| *length > 0)
+                .unwrap_or(if inferred_length > 0 {
+                    inferred_length
+                } else {
+                    source_length
+                });
+            if loop_length == 0 {
+                continue;
+            }
+
+            for note in source_pattern.notes.iter().filter(|note| !note.is_muted()) {
+                let note_position = u64::from(note.position);
+                let note_duration = u64::from(note.length.max(1));
+                let first_note_start = source_start.saturating_add(note_position);
+                let first_repetition =
+                    if anchor_start >= first_note_start.saturating_add(note_duration) {
+                        (anchor_start - first_note_start - note_duration) / loop_length + 1
+                    } else {
+                        0
+                    };
+                let mut repetition = first_repetition;
+                loop {
+                    let relative_start = repetition
+                        .checked_mul(loop_length)
+                        .and_then(|offset| offset.checked_add(note_position));
+                    let Some(relative_start) = relative_start else {
+                        break;
+                    };
+                    if relative_start >= source_length {
+                        break;
+                    }
+                    let note_start = source_start.saturating_add(relative_start);
+                    if note_start >= anchor_end {
+                        break;
+                    }
+                    let visible_start = note_start.max(anchor_start);
+                    let visible_end = note_start
+                        .saturating_add(note_duration)
+                        .min(source_end)
+                        .min(anchor_end);
+                    if visible_start < visible_end {
+                        let position_ticks =
+                            u32::try_from(visible_start - anchor_start).unwrap_or(u32::MAX);
+                        let length_ticks =
+                            u32::try_from(visible_end - visible_start).unwrap_or(u32::MAX);
+                        ghosts.insert(PianoRollGhostNote {
+                            channel_id: note.channel_id,
+                            key: note.key,
+                            position_ticks,
+                            length_ticks,
+                        });
+                        if ghosts.len() >= MAX_GHOST_NOTES {
+                            break 'anchors;
+                        }
+                    }
+                    let Some(next_repetition) = repetition.checked_add(1) else {
+                        break;
+                    };
+                    repetition = next_repetition;
+                }
+            }
+        }
+    }
+
+    ghosts.into_iter().collect()
+}
+
 fn piano_roll_note_group_members(
     pattern: &Pattern,
     pattern_id: u16,
@@ -47317,10 +47545,10 @@ mod tests {
         DetachedWindowPlacement, DetachedWindowPlacements, DetectedPianoRollScale, FlpDocument,
         MainView, MidiControlChangeMapping, MidiControllerCcBinding, MidiControllerTemplate,
         PIANO_ROLL_RULER_HEIGHT, Pattern, PatternController, PatternNote, PianoRollChordStamp,
-        PianoRollGrid, PianoRollScale, PianoRollSnap, PlaylistClip, PlaylistClipDragKind,
-        PlaylistTempoMap, PlaylistTrack, PluginCandidate, PluginFormat, TimeSelectionShift,
-        TouchGesture, TouchTapTracker, TouchZoomConfig, WINDOW_LAYOUT_PRESETS_HEADER,
-        WindowLayoutPreset, audio_recording_start_tick_with_offset,
+        PianoRollGhostNote, PianoRollGrid, PianoRollScale, PianoRollSnap, PlaylistClip,
+        PlaylistClipDragKind, PlaylistTempoMap, PlaylistTrack, PluginCandidate, PluginFormat,
+        TimeSelectionShift, TouchGesture, TouchTapTracker, TouchZoomConfig,
+        WINDOW_LAYOUT_PRESETS_HEADER, WindowLayoutPreset, audio_recording_start_tick_with_offset,
         built_in_midi_controller_templates, candidate_matches_vst_identity,
         candidate_mixer_controls, candidate_mixer_stereo_separation, detect_chord_name,
         detect_piano_roll_channel_scale, detect_piano_roll_scale, encode_midi_device_id,
@@ -47329,9 +47557,9 @@ mod tests {
         parse_midi_control_change_mapping, parse_midi_controller_templates,
         parse_midi_device_selections, parse_window_layout_presets, piano_roll_color_group_note_ids,
         piano_roll_controller_stroke_points, piano_roll_controller_value_at,
-        piano_roll_controller_value_range, piano_roll_discard_length_edit,
-        piano_roll_duplicate_offset, piano_roll_key_at_y, piano_roll_note_group_members,
-        piano_roll_note_nudge_edit, piano_roll_odd_note_selection,
+        piano_roll_controller_value_range, piano_roll_cross_pattern_ghost_notes,
+        piano_roll_discard_length_edit, piano_roll_duplicate_offset, piano_roll_key_at_y,
+        piano_roll_note_group_members, piano_roll_note_nudge_edit, piano_roll_odd_note_selection,
         piano_roll_overlap_note_selection, piano_roll_pitch_range_note_selection,
         piano_roll_random_note_selection, piano_roll_selection_time_range,
         piano_roll_shift_time_range, piano_roll_time_range_from_drag,
@@ -47388,6 +47616,84 @@ mod tests {
             .arrangements()
             .expect("Playlist fixture should have an arrangement")
             .remove(0)
+    }
+
+    fn playlist_pattern_ghost_arrangement_fixture(clips: &[(u32, u32, u16, u16)]) -> Arrangement {
+        let mut event_stream = vec![0x63, 3, 0];
+        let mut clip_payload = Vec::with_capacity(clips.len() * 80);
+        for (position, length, pattern_id, track_index) in clips {
+            let mut record = [0u8; 80];
+            record[0..4].copy_from_slice(&position.to_le_bytes());
+            record[4..6].copy_from_slice(&0x5000u16.to_le_bytes());
+            record[6..8].copy_from_slice(&(0x5000u16 + pattern_id).to_le_bytes());
+            record[8..12].copy_from_slice(&length.to_le_bytes());
+            let raw_track_index = 499u16.saturating_sub(*track_index);
+            record[12..14].copy_from_slice(&raw_track_index.to_le_bytes());
+            record[20..24].copy_from_slice(&[0x40, 0x64, 0x80, 0x80]);
+            record[24..28].copy_from_slice(&(-1.0f32).to_le_bytes());
+            record[28..32].copy_from_slice(&(-1.0f32).to_le_bytes());
+            record[64..72].copy_from_slice(&1.0f64.to_le_bytes());
+            clip_payload.extend_from_slice(&record);
+        }
+        event_stream.push(0xE9);
+        let mut encoded_length = clip_payload.len() as u32;
+        while encoded_length >= 0x80 {
+            event_stream.push((encoded_length as u8) | 0x80);
+            encoded_length >>= 7;
+        }
+        event_stream.push(encoded_length as u8);
+        event_stream.extend_from_slice(&clip_payload);
+
+        let mut bytes = b"FLhd".to_vec();
+        bytes.extend_from_slice(&6u32.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&96u16.to_le_bytes());
+        bytes.extend_from_slice(b"FLdt");
+        bytes.extend_from_slice(&(event_stream.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&event_stream);
+        FlpDocument::parse(&bytes)
+            .expect("Pattern ghost fixture should parse")
+            .arrangements()
+            .expect("Pattern ghost fixture should have an arrangement")
+            .remove(0)
+    }
+
+    fn piano_roll_ghost_test_pattern(
+        id: u16,
+        length_ticks: u32,
+        notes: Vec<PatternNote>,
+    ) -> Pattern {
+        Pattern {
+            id,
+            length_ticks: Some(length_ticks),
+            notes,
+            ..Pattern::default()
+        }
+    }
+
+    fn piano_roll_ghost_test_note(
+        channel_id: u16,
+        key: u16,
+        position: u32,
+        length: u32,
+    ) -> PatternNote {
+        PatternNote {
+            position,
+            flags: 0x4000,
+            channel_id,
+            length,
+            key,
+            group: 0,
+            fine_pitch: 0,
+            reserved: 0,
+            release: 64,
+            midi_channel: 0,
+            pan: 64,
+            velocity: 100,
+            mod_x: 0,
+            mod_y: 0,
+        }
     }
 
     fn mixer_parameter_fixture(records: &[(u8, u16, i32)]) -> FlpDocument {
@@ -48564,6 +48870,76 @@ mod tests {
         assert_eq!(
             playlist_clip_local_recording_offset(f64::NAN, 100, 200),
             None
+        );
+    }
+
+    #[test]
+    fn piano_roll_cross_pattern_ghosts_follow_overlapping_clip_repeats_and_boundaries() {
+        let arrangement = playlist_pattern_ghost_arrangement_fixture(&[
+            (100, 96, 1, 0),
+            (148, 96, 2, 1),
+            (196, 96, 3, 2),
+        ]);
+        let patterns = vec![
+            piano_roll_ghost_test_pattern(1, 96, Vec::new()),
+            piano_roll_ghost_test_pattern(
+                2,
+                48,
+                vec![
+                    piano_roll_ghost_test_note(5, 67, 12, 24),
+                    piano_roll_ghost_test_note(6, 55, 30, 24),
+                ],
+            ),
+            piano_roll_ghost_test_pattern(3, 48, vec![piano_roll_ghost_test_note(7, 60, 0, 48)]),
+        ];
+
+        let ghosts =
+            piano_roll_cross_pattern_ghost_notes(1, &patterns, &arrangement, &BTreeSet::new());
+
+        assert_eq!(
+            ghosts,
+            vec![
+                PianoRollGhostNote {
+                    channel_id: 5,
+                    key: 67,
+                    position_ticks: 60,
+                    length_ticks: 24,
+                },
+                PianoRollGhostNote {
+                    channel_id: 6,
+                    key: 55,
+                    position_ticks: 78,
+                    length_ticks: 18,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn piano_roll_cross_pattern_ghosts_ignore_disabled_muted_and_scaled_clips() {
+        let patterns = vec![
+            piano_roll_ghost_test_pattern(1, 96, Vec::new()),
+            piano_roll_ghost_test_pattern(2, 48, vec![piano_roll_ghost_test_note(5, 67, 12, 24)]),
+        ];
+        let mut arrangement =
+            playlist_pattern_ghost_arrangement_fixture(&[(100, 96, 1, 0), (148, 96, 2, 1)]);
+
+        assert!(
+            piano_roll_cross_pattern_ghost_notes(1, &patterns, &arrangement, &BTreeSet::from([2]),)
+                .is_empty()
+        );
+
+        arrangement.clips[1].muted = true;
+        assert!(
+            piano_roll_cross_pattern_ghost_notes(1, &patterns, &arrangement, &BTreeSet::new(),)
+                .is_empty()
+        );
+
+        arrangement.clips[1].muted = false;
+        arrangement.clips[1].scale = Some(0.5);
+        assert!(
+            piano_roll_cross_pattern_ghost_notes(1, &patterns, &arrangement, &BTreeSet::new(),)
+                .is_empty()
         );
     }
 
