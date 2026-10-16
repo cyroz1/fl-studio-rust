@@ -4676,6 +4676,30 @@ pub fn stream_sampler_pattern_loop_to_device(
     writer: &StreamingAudioWriter,
     cancelled: &AtomicBool,
 ) -> Result<SamplerPatternRenderSummary, String> {
+    stream_sampler_pattern_loop_from_tick_to_device(
+        document,
+        project_path,
+        options,
+        loop_length_ticks,
+        0,
+        writer,
+        cancelled,
+    )
+}
+
+/// Stream a Sampler Pattern repeatedly, starting at a local tick within its loop.
+///
+/// The voice engine renders and discards the portion before `start_tick`, so notes that are
+/// already sounding at the seek point continue from their correct sample position.
+pub fn stream_sampler_pattern_loop_from_tick_to_device(
+    document: &FlpDocument,
+    project_path: impl AsRef<Path>,
+    options: SamplerPatternRenderOptions,
+    loop_length_ticks: u64,
+    start_tick: u64,
+    writer: &StreamingAudioWriter,
+    cancelled: &AtomicBool,
+) -> Result<SamplerPatternRenderSummary, String> {
     if loop_length_ticks == 0 {
         return Err("pattern loop length must be greater than zero".to_owned());
     }
@@ -4684,6 +4708,11 @@ pub fn stream_sampler_pattern_loop_to_device(
     let loop_frames = ticks_to_frames(loop_length_ticks, ppq, tempo_bpm, options.sample_rate)?;
     if loop_frames == 0 {
         return Err("pattern loop length rounds to zero audio frames".to_owned());
+    }
+    let start_tick = start_tick % loop_length_ticks;
+    let start_frame = ticks_to_frames(start_tick, ppq, tempo_bpm, options.sample_rate)?;
+    if start_frame >= loop_frames {
+        return Err("Pattern seek position rounds outside its audio loop".to_owned());
     }
     let render =
         prepare_sampler_pattern(document, project_path.as_ref(), options, Some(cancelled))?;
@@ -4703,6 +4732,15 @@ pub fn stream_sampler_pattern_loop_to_device(
     engine.mixer_transforms_by_channel = Some(&render.mixer_transforms_by_channel);
     let mut block = vec![0.0f32; SAMPLER_BLOCK_FRAMES * 2];
     let mut block_start = 0u64;
+    while block_start < start_frame {
+        check_cancelled(Some(cancelled))?;
+        if writer.is_cancelled() {
+            return Err("Sampler Pattern playback was stopped".to_owned());
+        }
+        let frame_count = (start_frame - block_start).min(SAMPLER_BLOCK_FRAMES as u64) as usize;
+        engine.render_block(block_start, frame_count, &mut block[..frame_count * 2]);
+        block_start += frame_count as u64;
+    }
     let mut next_loop_start = loop_frames;
     loop {
         check_cancelled(Some(cancelled))?;
@@ -12116,6 +12154,51 @@ mod tests {
         assert!((whole[2] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
         assert!((whole[3] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
         assert_eq!(&whole[14..], &[0.0, 0.0]);
+    }
+
+    #[test]
+    fn sampler_loop_seek_warmup_preserves_the_current_voice_sample_position() {
+        let sources = HashMap::from([(
+            7,
+            SamplerVoiceSource {
+                audio: Arc::new(DecodedAudio {
+                    sample_rate: 8,
+                    channels: vec![(0..16).map(|frame| frame as f32 / 16.0).collect()],
+                }),
+                gain: 1.0,
+                pan: 0.0,
+                reverse: false,
+                root_key: SAMPLER_ROOT_KEY,
+                fine_tune_cents: 0.0,
+                loop_bounds: None,
+                ping_pong_loop: false,
+            },
+        )]);
+        let notes = [ScheduledSamplerNote {
+            clip_index: 0,
+            playlist_track_id: None,
+            start_tick: 0,
+            stop_tick: Some(10),
+            start_frame: 1,
+            stop_frame: Some(10),
+            channel_id: 7,
+            key: SAMPLER_ROOT_KEY,
+            velocity: 127,
+            pan: 64,
+            fine_pitch_offset_cents: 0,
+        }];
+
+        let mut complete_engine = SamplerVoiceEngine::new(&sources, &notes, 1, 4, 8);
+        let mut complete = vec![0.0; 24];
+        complete_engine.render_block(0, 12, &mut complete);
+
+        let mut seek_engine = SamplerVoiceEngine::new(&sources, &notes, 1, 4, 8);
+        let mut warmup = vec![0.0; 10];
+        seek_engine.render_block(0, 5, &mut warmup);
+        let mut sought_frame = [0.0; 2];
+        seek_engine.render_block(5, 1, &mut sought_frame);
+
+        assert_eq!(sought_frame, [complete[10], complete[11]]);
     }
 
     #[test]
