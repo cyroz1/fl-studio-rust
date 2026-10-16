@@ -896,10 +896,12 @@ pub fn playlist_performance_sampler_clip_indices(
     arrangement_id: u16,
     performance_zone_end_tick: u32,
 ) -> Result<BTreeSet<usize>, String> {
+    let loaded_vst3_channels = BTreeSet::new();
     let candidates = playlist_performance_sampler_clip_candidates(
         document,
         arrangement_id,
         performance_zone_end_tick,
+        &loaded_vst3_channels,
     )?;
     let arrangement = document
         .arrangements()
@@ -938,6 +940,7 @@ fn playlist_performance_sampler_clip_candidates(
     document: &FlpDocument,
     arrangement_id: u16,
     performance_zone_end_tick: u32,
+    loaded_vst3_channels: &BTreeSet<u16>,
 ) -> Result<BTreeSet<usize>, String> {
     let arrangement = document
         .arrangements()
@@ -983,7 +986,11 @@ fn playlist_performance_sampler_clip_candidates(
                 && pattern.controllers.is_empty()
                 && pattern.notes.iter().all(|note| {
                     note.is_muted()
-                        || playlist_performance_sampler_source_supported(note.channel_id, &channels)
+                        || playlist_performance_sampler_source_supported(
+                            note.channel_id,
+                            &channels,
+                            loaded_vst3_channels,
+                        )
                 }))
             .then_some(index)
         })
@@ -991,12 +998,12 @@ fn playlist_performance_sampler_clip_candidates(
     Ok(candidates)
 }
 
-/// Check whether a Performance Mode note source routes only to Samplers.
-/// A Layer is supported only when every enabled child is a Sampler, avoiding partial playback
-/// when the same note would also route to a plug-in or another unsupported child type.
+/// Check whether a Performance Mode note source has a Sampler route and no unsupported children.
+/// VST3 Layer children must be loaded so a mixed Layer can be launched through both streams.
 fn playlist_performance_sampler_source_supported(
     source_channel_id: u16,
     channels_by_id: &HashMap<u16, ChannelSummary>,
+    loaded_vst3_channels: &BTreeSet<u16>,
 ) -> bool {
     let Some(source) = channels_by_id.get(&source_channel_id) else {
         return false;
@@ -1018,15 +1025,18 @@ fn playlist_performance_sampler_source_supported(
                 .filter(|child_id| seen.insert(*child_id))
             {
                 let Some(child) = channels_by_id.get(&child_id) else {
-                    continue;
+                    return false;
                 };
                 if child.enabled() == Some(false) {
                     continue;
                 }
-                if child.channel_type() != Some(ChannelType::Sampler) {
-                    return false;
+                match child.channel_type() {
+                    Some(ChannelType::Sampler) => has_enabled_sampler = true,
+                    Some(ChannelType::Instrument)
+                        if child.plugin_identifier().is_some()
+                            && loaded_vst3_channels.contains(&child_id) => {}
+                    _ => return false,
                 }
-                has_enabled_sampler = true;
             }
             has_enabled_sampler
         }
@@ -1152,10 +1162,8 @@ fn playlist_performance_vst3_clip_candidates(
         .collect())
 }
 
-/// Return the potential plug-in destinations a Performance Mode note source can reach.
-/// A Layer is supported only when every enabled child is a direct plug-in instrument, so a
-/// Random choice or a note-key region can never route live Performance audio to an unsupported
-/// Sampler, nested Layer, or unloaded child.
+/// Return the plug-in destinations a Performance Mode note source can reach.
+/// Layers may mix Sampler and direct plug-in children, but unsupported child types are rejected.
 fn playlist_performance_vst3_source_targets(
     source_channel_id: u16,
     channels_by_id: &HashMap<u16, ChannelSummary>,
@@ -1170,23 +1178,26 @@ fn playlist_performance_vst3_source_targets(
         }
         Some(ChannelType::Layer) => {
             let mut seen = BTreeSet::new();
-            let children = source
+            let mut plugin_targets = Vec::new();
+            for child_id in source
                 .layer_child_ids()?
                 .iter()
                 .copied()
                 .filter(|child_id| seen.insert(*child_id))
-                .filter_map(|child_id| channels_by_id.get(&child_id))
-                .filter(|child| child.enabled() != Some(false))
-                .collect::<Vec<_>>();
-            if children.is_empty()
-                || children.iter().any(|child| {
-                    child.channel_type() != Some(ChannelType::Instrument)
-                        || child.plugin_identifier().is_none()
-                })
             {
-                return None;
+                let child = channels_by_id.get(&child_id)?;
+                if child.enabled() == Some(false) {
+                    continue;
+                }
+                match child.channel_type() {
+                    Some(ChannelType::Sampler) => {}
+                    Some(ChannelType::Instrument) if child.plugin_identifier().is_some() => {
+                        plugin_targets.push(child_id);
+                    }
+                    _ => return None,
+                }
             }
-            Some(children.iter().map(|child| child.id()).collect())
+            (!plugin_targets.is_empty()).then_some(plugin_targets)
         }
         _ => None,
     }
@@ -1206,8 +1217,7 @@ pub fn playlist_performance_clip_indices(
     )
 }
 
-/// Return supported Performance Mode clips, treating loaded VST3 instruments and Layers whose
-/// enabled children are all loaded VST3 instruments as launchable plugin sources.
+/// Return supported Performance Mode clips, including Layers with loaded VST3 and Sampler children.
 pub fn playlist_performance_clip_indices_with_vst3(
     document: &FlpDocument,
     arrangement_id: u16,
@@ -1218,6 +1228,7 @@ pub fn playlist_performance_clip_indices_with_vst3(
         document,
         arrangement_id,
         performance_zone_end_tick,
+        loaded_vst3_channels,
     )?;
     clip_indices.extend(playlist_performance_audio_clip_indices(
         document,
@@ -1804,6 +1815,7 @@ pub fn stream_playlist_performance_with_vst3_to_device(
         document,
         options.arrangement_id,
         performance.performance_zone_end_tick,
+        &loaded_vst3_channels,
     )?;
     let mut performance_audio_clip_indices = playlist_performance_audio_clip_indices(
         document,
@@ -7122,21 +7134,38 @@ impl PlaylistPerformanceRuntime {
         sampler_engine: &mut SamplerVoiceEngine<'_>,
         vst3_processor: Option<&mut Vst3PlaylistStreamProcessor>,
     ) -> Result<(), String> {
-        let is_sampler_clip = self.clips_by_index.contains_key(&launch.clip_index);
-        let is_audio_clip = self.audio_clips_by_index.contains_key(&launch.clip_index);
-        let (track_id, length_ticks) =
-            if let Some(clip) = self.clips_by_index.get(&launch.clip_index) {
-                (clip.track_id, clip.length_ticks)
-            } else if let Some(clip) = self.audio_clips_by_index.get(&launch.clip_index) {
-                (clip.track_id, clip.length_ticks)
-            } else if let Some(clip) = self.vst3_clips_by_index.get(&launch.clip_index) {
-                (clip.track_id, clip.length_ticks)
-            } else {
-                return Err(format!(
+        let sampler_clip_length = self
+            .clips_by_index
+            .get(&launch.clip_index)
+            .map(|clip| clip.length_ticks);
+        let audio_clip_length = self
+            .audio_clips_by_index
+            .get(&launch.clip_index)
+            .map(|clip| clip.length_ticks);
+        let vst3_clip_length = self
+            .vst3_clips_by_index
+            .get(&launch.clip_index)
+            .map(|clip| clip.length_ticks);
+        let (track_id, length_ticks) = self
+            .clips_by_index
+            .get(&launch.clip_index)
+            .map(|clip| (clip.track_id, clip.length_ticks))
+            .or_else(|| {
+                self.audio_clips_by_index
+                    .get(&launch.clip_index)
+                    .map(|clip| (clip.track_id, clip.length_ticks))
+            })
+            .or_else(|| {
+                self.vst3_clips_by_index
+                    .get(&launch.clip_index)
+                    .map(|clip| (clip.track_id, clip.length_ticks))
+            })
+            .ok_or_else(|| {
+                format!(
                     "Playlist Clip {} is not supported in Performance Mode",
                     launch.clip_index + 1
-                ));
-            };
+                )
+            })?;
         let offset_ticks = launch.position_offset_ticks.min(length_ticks);
         let first_loop_length = if offset_ticks >= length_ticks {
             length_ticks
@@ -7148,7 +7177,7 @@ impl PlaylistPerformanceRuntime {
             .checked_add(first_loop_length)
             .ok_or_else(|| "Performance Mode loop tick overflow".to_owned())?;
         self.stop_track_at(track_id, launch.start_frame, sampler_engine, vst3_processor)?;
-        if is_sampler_clip {
+        if let Some(clip_length_ticks) = sampler_clip_length {
             self.active_by_track.insert(
                 track_id,
                 ActivePerformanceSamplerClip {
@@ -7156,11 +7185,12 @@ impl PlaylistPerformanceRuntime {
                     next_loop_tick: launch.start_tick,
                     initial_offset_ticks: launch.position_offset_ticks,
                     first_loop_end_tick,
-                    loop_period_ticks: length_ticks,
+                    loop_period_ticks: clip_length_ticks,
                     first_pass_scheduled: false,
                 },
             );
-        } else if is_audio_clip {
+        }
+        if let Some(clip_length_ticks) = audio_clip_length {
             self.active_audio_by_track.insert(
                 track_id,
                 ActivePerformanceAudioClip {
@@ -7168,11 +7198,12 @@ impl PlaylistPerformanceRuntime {
                     next_loop_tick: launch.start_tick,
                     initial_offset_ticks: launch.position_offset_ticks,
                     first_loop_end_tick,
-                    loop_period_ticks: length_ticks,
+                    loop_period_ticks: clip_length_ticks,
                     first_pass_scheduled: false,
                 },
             );
-        } else {
+        }
+        if let Some(clip_length_ticks) = vst3_clip_length {
             self.active_vst3_by_track.insert(
                 track_id,
                 ActivePerformanceVst3Clip {
@@ -7180,7 +7211,7 @@ impl PlaylistPerformanceRuntime {
                     next_loop_tick: launch.start_tick,
                     initial_offset_ticks: launch.position_offset_ticks,
                     first_loop_end_tick,
-                    loop_period_ticks: length_ticks,
+                    loop_period_ticks: clip_length_ticks,
                     first_pass_scheduled: false,
                 },
             );
@@ -7517,8 +7548,9 @@ fn performance_motion_clip_groups(
 ) -> (HashMap<u32, Vec<usize>>, HashMap<usize, usize>) {
     let mut clips_by_track_and_group =
         BTreeMap::<u32, BTreeMap<PerformanceMotionGroupKey, Vec<(u32, usize)>>>::new();
+    let mut seen_clip_indices = BTreeSet::new();
     for (track_id, start_tick, clip_group, clip_index) in clips {
-        if start_tick >= performance_zone_end_tick {
+        if start_tick >= performance_zone_end_tick || !seen_clip_indices.insert(clip_index) {
             continue;
         }
         let group_key = if clip_group != 0 {
@@ -10565,7 +10597,7 @@ mod tests {
     }
 
     #[test]
-    fn performance_mode_rejects_layer_clips_with_unloaded_or_non_vst3_children() {
+    fn performance_mode_rejects_layer_clips_with_unloaded_or_unsupported_children() {
         let document = performance_vst3_layer_fixture([4, 4]);
         assert!(
             playlist_performance_vst3_clip_indices(&document, 0, 384, &BTreeSet::from([1]))
@@ -10574,21 +10606,141 @@ mod tests {
         );
 
         let mixed_layer = performance_vst3_layer_fixture([4, 0]);
-        assert!(
-            playlist_performance_vst3_clip_indices(&mixed_layer, 0, 384, &BTreeSet::from([1]),)
-                .expect("mixed Layer should be handled")
-                .is_empty()
+        let loaded_vst3_channels = BTreeSet::from([1]);
+        assert_eq!(
+            playlist_performance_sampler_clip_candidates(
+                &mixed_layer,
+                0,
+                384,
+                &loaded_vst3_channels,
+            )
+            .expect("mixed Layer Sampler route should be handled"),
+            BTreeSet::from([0])
         );
-        assert!(
+        assert_eq!(
+            playlist_performance_vst3_clip_indices(&mixed_layer, 0, 384, &loaded_vst3_channels,)
+                .expect("mixed Layer VST3 route should be handled"),
+            BTreeSet::from([0])
+        );
+        assert_eq!(
             playlist_performance_clip_indices_with_vst3(
                 &mixed_layer,
                 0,
                 384,
+                &loaded_vst3_channels,
+            )
+            .expect("mixed Sampler/VST3 Layer should be supported"),
+            BTreeSet::from([0])
+        );
+        assert_eq!(
+            playlist_performance_vst3_channel_ids(&mixed_layer, 0, &BTreeSet::from([0]))
+                .expect("mixed Layer VST3 destination should be found"),
+            BTreeSet::from([1])
+        );
+        assert_eq!(
+            ChannelNoteRouter::new(mixed_layer.channels()).targets_for_note(0, 1, 60),
+            vec![1, 2]
+        );
+
+        assert!(
+            playlist_performance_clip_indices_with_vst3(&mixed_layer, 0, 384, &BTreeSet::new())
+                .expect("unloaded mixed Layer should be handled")
+                .is_empty()
+        );
+
+        let unsupported_layer = performance_vst3_layer_fixture([4, 3]);
+        assert!(
+            playlist_performance_clip_indices_with_vst3(
+                &unsupported_layer,
+                0,
+                384,
                 &BTreeSet::from([1]),
             )
-            .expect("mixed Sampler/VST3 Layer should be handled")
+            .expect("unsupported Layer child should be handled")
             .is_empty()
         );
+    }
+
+    #[test]
+    fn performance_mode_launch_activates_both_engines_for_mixed_layers() {
+        let sampler_sources = HashMap::new();
+        let sampler_notes = [];
+        let mut sampler_engine =
+            SamplerVoiceEngine::new(&sampler_sources, &sampler_notes, 16, 1, 8_000);
+        let (launches, receiver) = std::sync::mpsc::channel();
+        drop(launches);
+        let mut runtime = PlaylistPerformanceRuntime {
+            performance_zone_end_tick: 0,
+            start_frame: 0,
+            sample_rate: 8_000,
+            tempo_map: PlaylistTempoMap::constant(96, 120.0)
+                .expect("constant tempo map should build"),
+            launches: receiver,
+            pending_commands: Vec::new(),
+            queued_by_track: BTreeMap::new(),
+            motion_by_track: HashMap::new(),
+            motion_clip_order_by_track: HashMap::new(),
+            motion_group_clip_by_index: HashMap::new(),
+            press_by_track: HashMap::new(),
+            position_sync_by_track: HashMap::new(),
+            ppq: 96,
+            initial_time_signature: None,
+            signature_changes: Vec::new(),
+            clips_by_index: HashMap::from([(
+                0,
+                PerformanceSamplerClip {
+                    track_id: 1,
+                    source_start_tick: 0,
+                    length_ticks: 96,
+                    notes: Vec::new(),
+                },
+            )]),
+            audio_clips_by_index: HashMap::new(),
+            vst3_clips_by_index: HashMap::from([(
+                0,
+                PerformanceVst3Clip {
+                    track_id: 1,
+                    source_start_tick: 0,
+                    length_ticks: 96,
+                    notes: Vec::new(),
+                },
+            )]),
+            active_by_track: BTreeMap::new(),
+            active_audio_by_track: BTreeMap::new(),
+            active_vst3_by_track: BTreeMap::new(),
+            active_audio_playbacks: Vec::new(),
+        };
+
+        runtime
+            .activate_launch(
+                PlaylistPerformanceLaunch {
+                    clip_index: 0,
+                    start_tick: 0,
+                    start_frame: 0,
+                    position_offset_ticks: 0,
+                },
+                &mut sampler_engine,
+                None,
+            )
+            .expect("mixed Layer clip should activate both routes");
+
+        assert_eq!(runtime.active_by_track[&1].clip_index, 0);
+        assert_eq!(runtime.active_vst3_by_track[&1].clip_index, 0);
+    }
+
+    #[test]
+    fn performance_motion_clip_groups_ignore_duplicate_stream_entries() {
+        let (order_by_track, group_by_clip) = performance_motion_clip_groups(
+            [(1, 0, 0, 3), (1, 0, 0, 3), (1, 384, 0, 4)],
+            &[],
+            768,
+            96,
+            Some((4, 4)),
+            &[],
+        );
+
+        assert_eq!(order_by_track[&1], vec![3, 4]);
+        assert_eq!(group_by_clip, HashMap::from([(3, 3), (4, 4)]));
     }
 
     #[test]
