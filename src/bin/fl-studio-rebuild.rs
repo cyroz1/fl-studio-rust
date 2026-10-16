@@ -928,9 +928,13 @@ impl PlaylistWaveformMode {
 enum PianoRollSnap {
     None,
     QuarterBeat,
+    TripletSixteenth,
     HalfBeat,
+    TripletEighth,
     Beat,
+    TripletQuarter,
     TwoBeats,
+    TripletHalf,
     Bar,
 }
 
@@ -1826,12 +1830,16 @@ fn set_step_graph_note_repeats(
 }
 
 impl PianoRollSnap {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 10] = [
         Self::None,
         Self::QuarterBeat,
+        Self::TripletSixteenth,
         Self::HalfBeat,
+        Self::TripletEighth,
         Self::Beat,
+        Self::TripletQuarter,
         Self::TwoBeats,
+        Self::TripletHalf,
         Self::Bar,
     ];
 
@@ -1839,9 +1847,13 @@ impl PianoRollSnap {
         match self {
             Self::None => "None",
             Self::QuarterBeat => "1/4 beat",
+            Self::TripletSixteenth => "1/16 triplet",
             Self::HalfBeat => "1/2 beat",
+            Self::TripletEighth => "1/8 triplet",
             Self::Beat => "1 beat",
+            Self::TripletQuarter => "1/4 triplet",
             Self::TwoBeats => "2 beats",
+            Self::TripletHalf => "1/2 triplet",
             Self::Bar => "1 bar",
         }
     }
@@ -1851,9 +1863,13 @@ impl PianoRollSnap {
         match self {
             Self::None => 1,
             Self::QuarterBeat => (ppq / 4).max(1),
+            Self::TripletSixteenth => ppq / 6,
             Self::HalfBeat => (ppq / 2).max(1),
+            Self::TripletEighth => ppq / 3,
             Self::Beat => ppq,
+            Self::TripletQuarter => ppq.saturating_mul(2) / 3,
             Self::TwoBeats => ppq.saturating_mul(2),
+            Self::TripletHalf => ppq.saturating_mul(4) / 3,
             Self::Bar => {
                 let (numerator, denominator) = time_signature.unwrap_or((4, 4));
                 let numerator = u32::from(numerator.max(1));
@@ -49411,10 +49427,15 @@ mod tests {
     fn piano_roll_snap_sizes_follow_project_ppq_and_meter() {
         assert_eq!(PianoRollSnap::None.ticks(96, None), 1);
         assert_eq!(PianoRollSnap::QuarterBeat.ticks(96, None), 24);
+        assert_eq!(PianoRollSnap::TripletSixteenth.ticks(96, None), 16);
         assert_eq!(PianoRollSnap::HalfBeat.ticks(96, None), 48);
+        assert_eq!(PianoRollSnap::TripletEighth.ticks(96, None), 32);
         assert_eq!(PianoRollSnap::Beat.ticks(96, None), 96);
+        assert_eq!(PianoRollSnap::TripletQuarter.ticks(96, None), 64);
         assert_eq!(PianoRollSnap::TwoBeats.ticks(96, None), 192);
+        assert_eq!(PianoRollSnap::TripletHalf.ticks(96, None), 128);
         assert_eq!(PianoRollSnap::Bar.ticks(96, Some((3, 4))), 288);
+        assert_eq!(PianoRollSnap::TripletSixteenth.ticks(1, None), 1);
     }
 
     #[test]

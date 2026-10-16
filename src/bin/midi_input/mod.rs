@@ -1333,6 +1333,49 @@ mod tests {
     }
 
     #[test]
+    fn quantizes_recorded_notes_to_a_triplet_grid() {
+        let started_at = Instant::now();
+        let mut recorder = MidiPatternRecorder::new(
+            MidiPatternRecorderSettings {
+                pattern_id: 1,
+                channel_id: 2,
+                project_path: None,
+                ppq: 96,
+                tempo_bpm: 120.0,
+                start_tick: 0,
+                snap_ticks: Some(32),
+                timing_offset_ms: 0,
+                song_timeline_start: None,
+            },
+            started_at,
+        )
+        .expect("valid triplet timing should create a recorder");
+        recorder.record(ReceivedMidiMessage {
+            timestamp_micros: 1_150_000,
+            received_at: started_at + Duration::from_millis(150),
+            event: MidiInputEvent::NoteOn {
+                channel: 0,
+                key: 60,
+                velocity: 90,
+            },
+        });
+        recorder.record(ReceivedMidiMessage {
+            timestamp_micros: 1_350_000,
+            received_at: started_at + Duration::from_millis(350),
+            event: MidiInputEvent::NoteOff {
+                channel: 0,
+                key: 60,
+                velocity: 0,
+            },
+        });
+
+        let result = recorder.finish(None, started_at + Duration::from_millis(500));
+        assert_eq!(result.notes.len(), 1);
+        assert_eq!(result.notes[0].position, 32);
+        assert_eq!(result.notes[0].length, 32);
+    }
+
+    #[test]
     fn rejects_a_zero_length_recording_snap() {
         assert!(matches!(
             MidiPatternRecorder::new(
