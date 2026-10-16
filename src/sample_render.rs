@@ -582,6 +582,10 @@ pub enum SamplerLiveNoteEvent {
         channel: u8,
         value: u8,
     },
+    Expression {
+        channel: u8,
+        value: u8,
+    },
     AllNotesOff {
         channel: u8,
     },
@@ -5161,6 +5165,9 @@ pub fn stream_sampler_midi_input_to_device(
                 Ok(SamplerLiveNoteEvent::Pan { channel, value }) => {
                     engine.apply_live_pan(channel, value);
                 }
+                Ok(SamplerLiveNoteEvent::Expression { channel, value }) => {
+                    engine.apply_live_expression(channel, value);
+                }
                 Ok(SamplerLiveNoteEvent::AllNotesOff { channel }) => {
                     note_targets.retain(|(midi_channel, _), _| *midi_channel != (channel & 0x0F));
                     engine.release_live_notes(channel);
@@ -5179,6 +5186,7 @@ pub fn stream_sampler_midi_input_to_device(
                 }) => {
                     engine.set_live_sustain(channel, false);
                     engine.apply_live_pan(channel, pan);
+                    engine.apply_live_expression(channel, 127);
                     engine.apply_live_pitch_bend(channel, pitch_bend_cents);
                 }
                 Err(TryRecvError::Empty) => break,
@@ -8875,6 +8883,7 @@ struct SamplerVoiceEngine<'a> {
     voices_stolen: usize,
     pitch_bend_cents: [i16; 16],
     live_midi_pan: [u8; 16],
+    live_midi_expression: [u8; 16],
     sustain_down: [bool; 16],
 }
 
@@ -8945,6 +8954,7 @@ impl<'a> SamplerVoiceEngine<'a> {
             voices_stolen: 0,
             pitch_bend_cents: [0; 16],
             live_midi_pan: [64; 16],
+            live_midi_expression: [127; 16],
             sustain_down: [false; 16],
         }
     }
@@ -8962,6 +8972,7 @@ impl<'a> SamplerVoiceEngine<'a> {
         meter_stride_samples: usize,
     ) {
         output.fill(0.0);
+        let live_midi_expression = self.live_midi_expression;
         for offset in 0..frame_count {
             let frame = block_start + offset as u64;
             while self
@@ -9023,7 +9034,10 @@ impl<'a> SamplerVoiceEngine<'a> {
                         self.resampling_quality,
                     )
                 };
-                let gain = voice.gain * fade;
+                let expression = voice
+                    .input_midi_channel
+                    .map_or(127, |channel| live_midi_expression[usize::from(channel)]);
+                let gain = voice.gain * (f32::from(expression) / 127.0) * fade;
                 let mut routed_frame = [
                     left * gain * voice.left_gain,
                     right * gain * voice.right_gain,
@@ -9220,6 +9234,10 @@ impl<'a> SamplerVoiceEngine<'a> {
                     channel_pan_gains(effective_pan, source.audio.channels.len() == 1, pan_law);
             }
         }
+    }
+
+    fn apply_live_expression(&mut self, channel: u8, value: u8) {
+        self.live_midi_expression[usize::from(channel & 0x0F)] = value.min(127);
     }
 
     fn release_live_notes(&mut self, channel: u8) {
@@ -12427,6 +12445,55 @@ mod tests {
                 assert!((output[sample_index + 1] - expected.1).abs() < 1.0e-6);
             }
         }
+    }
+
+    #[test]
+    fn sampler_live_expression_scales_existing_voices_by_midi_channel() {
+        let sources = HashMap::from([(
+            7,
+            SamplerVoiceSource {
+                audio: Arc::new(DecodedAudio {
+                    sample_rate: 4,
+                    channels: vec![vec![1.0; 8]],
+                }),
+                gain: 1.0,
+                pan: 0.0,
+                reverse: false,
+                root_key: SAMPLER_ROOT_KEY,
+                fine_tune_cents: 0.0,
+                loop_bounds: None,
+                ping_pong_loop: false,
+            },
+        )]);
+        let mut engine = SamplerVoiceEngine::new(&sources, &[], 1, 4, 4);
+        let slot_index = engine
+            .start_voice(ScheduledSamplerNote {
+                clip_index: 0,
+                playlist_track_id: None,
+                start_tick: 0,
+                stop_tick: None,
+                start_frame: 0,
+                stop_frame: None,
+                channel_id: 7,
+                key: SAMPLER_ROOT_KEY,
+                velocity: 127,
+                pan: 64,
+                fine_pitch_offset_cents: 0,
+            })
+            .expect("live voice should start");
+        engine.set_voice_input_midi_channel(slot_index, 2);
+        engine.apply_live_expression(2, 64);
+
+        let mut output = [0.0; 4];
+        engine.render_block(0, 1, &mut output[..2]);
+        let expected_expression_gain = std::f32::consts::FRAC_1_SQRT_2 * (64.0 / 127.0);
+        assert!((output[0] - expected_expression_gain).abs() < 1e-6);
+        assert!((output[1] - expected_expression_gain).abs() < 1e-6);
+
+        engine.apply_live_expression(2, 127);
+        engine.render_block(1, 1, &mut output[2..]);
+        assert!((output[2] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
+        assert!((output[3] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
     }
 
     #[test]
