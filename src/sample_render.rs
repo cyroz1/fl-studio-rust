@@ -1301,6 +1301,7 @@ pub struct PlaylistStreamMonitor<'a> {
     live_master_fader_gain: Option<Arc<AtomicU32>>,
     live_master_pan_raw: Option<Arc<AtomicI32>>,
     live_master_stereo_separation_raw: Option<Arc<AtomicI32>>,
+    live_master_enabled: Option<Arc<AtomicI32>>,
 }
 
 impl<'a> PlaylistStreamMonitor<'a> {
@@ -1312,6 +1313,7 @@ impl<'a> PlaylistStreamMonitor<'a> {
             live_master_fader_gain: None,
             live_master_pan_raw: None,
             live_master_stereo_separation_raw: None,
+            live_master_enabled: None,
         }
     }
 
@@ -1323,6 +1325,7 @@ impl<'a> PlaylistStreamMonitor<'a> {
             live_master_fader_gain: Some(meters.live_master_fader_gain()),
             live_master_pan_raw: Some(meters.live_master_pan_raw()),
             live_master_stereo_separation_raw: Some(meters.live_master_stereo_separation_raw()),
+            live_master_enabled: Some(meters.live_master_enabled()),
         }
     }
 }
@@ -1835,6 +1838,7 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
     let live_master_fader_gain = monitor.live_master_fader_gain;
     let live_master_pan_raw = monitor.live_master_pan_raw;
     let live_master_stereo_separation_raw = monitor.live_master_stereo_separation_raw;
+    let live_master_enabled = monitor.live_master_enabled;
     let project_path = project_path.as_ref();
     let mut master_output = MixerMasterOutput::from_document(document);
     if let Some(gain_target) = live_master_fader_gain {
@@ -1846,6 +1850,9 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
     if let Some(separation_target) = live_master_stereo_separation_raw {
         master_output = master_output
             .with_live_stereo_separation_target(separation_target, options.sample_rate);
+    }
+    if let Some(enabled_target) = live_master_enabled {
+        master_output = master_output.with_live_enabled_target(enabled_target, options.sample_rate);
     }
     let audio = prepare_audio_clip_render(
         document,
@@ -3781,6 +3788,9 @@ struct MixerMasterOutput {
     live_stereo_separation_raw_target: Option<Arc<AtomicI32>>,
     live_stereo_separation_raw_current: Cell<Option<f32>>,
     live_stereo_separation_smoothing_alpha: f32,
+    live_enabled_target: Option<Arc<AtomicI32>>,
+    live_enabled_gain_current: Cell<Option<f32>>,
+    live_enabled_smoothing_alpha: f32,
 }
 
 impl MixerMasterOutput {
@@ -3830,8 +3840,19 @@ impl MixerMasterOutput {
         self
     }
 
+    fn with_live_enabled_target(
+        mut self,
+        enabled_target: Arc<AtomicI32>,
+        sample_rate: u32,
+    ) -> Self {
+        self.live_enabled_target = Some(enabled_target);
+        self.live_enabled_smoothing_alpha =
+            crate::audio::output_gain_smoothing_alpha(sample_rate as f32);
+        self
+    }
+
     fn apply(&self, stereo_samples: &mut [f32]) {
-        if self.enabled == Some(false) {
+        if self.enabled == Some(false) && self.live_enabled_target.is_none() {
             stereo_samples.fill(0.0);
             return;
         }
@@ -3913,6 +3934,31 @@ impl MixerMasterOutput {
                     self.live_fader_smoothing_alpha,
                 );
                 self.live_fader_gain_current.set(Some(next_gain));
+                frame[0] *= next_gain;
+                frame[1] *= next_gain;
+            }
+            if let Some(target) = &self.live_enabled_target {
+                let target_enabled = match target.load(Ordering::Acquire) {
+                    0 => Some(false),
+                    1 => Some(true),
+                    _ => None,
+                }
+                .or(self.enabled)
+                .unwrap_or(true);
+                let target_gain = if target_enabled { 1.0 } else { 0.0 };
+                let current_gain = self.live_enabled_gain_current.get().unwrap_or_else(|| {
+                    if self.enabled == Some(false) {
+                        0.0
+                    } else {
+                        1.0
+                    }
+                });
+                let next_gain = crate::audio::smooth_output_gain(
+                    current_gain,
+                    target_gain,
+                    self.live_enabled_smoothing_alpha,
+                );
+                self.live_enabled_gain_current.set(Some(next_gain));
                 frame[0] *= next_gain;
                 frame[1] *= next_gain;
             }

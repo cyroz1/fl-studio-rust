@@ -421,6 +421,14 @@ fn candidate_mixer_master_stereo_separation_raw(document: &FlpDocument) -> Optio
     candidate_mixer_stereo_separation(&parameters, 0).map(MixerParameterRecord::value)
 }
 
+fn candidate_mixer_master_enabled(document: &FlpDocument) -> Option<bool> {
+    document
+        .mixer_inserts()
+        .into_iter()
+        .find(|insert| insert.ordinal() == 0)
+        .and_then(|master| master.enabled())
+}
+
 fn candidate_mixer_stereo_separation(
     parameters: &[MixerParameterRecord],
     insert_ordinal: usize,
@@ -8906,6 +8914,12 @@ impl DawUi {
             .and_then(candidate_mixer_master_stereo_separation_raw);
         self.mixer_track_peak_meters
             .set_live_master_stereo_separation_raw(live_master_stereo_separation_raw);
+        let live_master_enabled = self
+            .document
+            .as_ref()
+            .and_then(candidate_mixer_master_enabled);
+        self.mixer_track_peak_meters
+            .set_live_master_enabled(live_master_enabled);
         let worker_mixer_meters = Arc::clone(&self.mixer_track_peak_meters);
         worker_mixer_meters.clear();
         self.mixer_insert_peak_holds.fill(0.0);
@@ -34053,6 +34067,12 @@ impl DawUi {
             for (insert_ordinal, edit) in flag_edits {
                 match document.edit_mixer_insert_flags(insert_ordinal, edit) {
                     Ok(()) => {
+                        if insert_ordinal == 0
+                            && let Some(enabled) = edit.enabled
+                        {
+                            self.mixer_track_peak_meters
+                                .set_live_master_enabled(Some(enabled));
+                        }
                         self.dirty = true;
                         let track_name = if insert_ordinal == 0 {
                             "Master".to_owned()
