@@ -983,14 +983,55 @@ fn playlist_performance_sampler_clip_candidates(
                 && pattern.controllers.is_empty()
                 && pattern.notes.iter().all(|note| {
                     note.is_muted()
-                        || channels.get(&note.channel_id).is_some_and(|channel| {
-                            channel.kind() == Some(0) && channel.enabled() != Some(false)
-                        })
+                        || playlist_performance_sampler_source_supported(note.channel_id, &channels)
                 }))
             .then_some(index)
         })
         .collect::<BTreeSet<_>>();
     Ok(candidates)
+}
+
+/// Check whether a Performance Mode note source routes only to Samplers.
+/// A Layer is supported only when every enabled child is a Sampler, avoiding partial playback
+/// when the same note would also route to a plug-in or another unsupported child type.
+fn playlist_performance_sampler_source_supported(
+    source_channel_id: u16,
+    channels_by_id: &HashMap<u16, ChannelSummary>,
+) -> bool {
+    let Some(source) = channels_by_id.get(&source_channel_id) else {
+        return false;
+    };
+    if source.enabled() == Some(false) {
+        return false;
+    }
+    match source.channel_type() {
+        Some(ChannelType::Sampler) => true,
+        Some(ChannelType::Layer) => {
+            let mut seen = BTreeSet::new();
+            let Some(child_ids) = source.layer_child_ids() else {
+                return false;
+            };
+            let mut has_enabled_sampler = false;
+            for child_id in child_ids
+                .iter()
+                .copied()
+                .filter(|child_id| seen.insert(*child_id))
+            {
+                let Some(child) = channels_by_id.get(&child_id) else {
+                    continue;
+                };
+                if child.enabled() == Some(false) {
+                    continue;
+                }
+                if child.channel_type() != Some(ChannelType::Sampler) {
+                    return false;
+                }
+                has_enabled_sampler = true;
+            }
+            has_enabled_sampler
+        }
+        _ => false,
+    }
 }
 
 /// Return enabled Audio Clips before the Start marker that can be launched in Performance Mode.
@@ -10538,6 +10579,33 @@ mod tests {
                 .expect("mixed Layer should be handled")
                 .is_empty()
         );
+        assert!(
+            playlist_performance_clip_indices_with_vst3(
+                &mixed_layer,
+                0,
+                384,
+                &BTreeSet::from([1]),
+            )
+            .expect("mixed Sampler/VST3 Layer should be handled")
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn performance_mode_sampler_clips_route_through_sampler_layer_children() {
+        let document = performance_vst3_layer_fixture([0, 0]);
+        assert_eq!(
+            playlist_performance_sampler_clip_indices(&document, 0, 384)
+                .expect("Sampler Layer clip should be eligible"),
+            BTreeSet::from([0])
+        );
+        assert_eq!(
+            playlist_performance_clip_indices_with_vst3(&document, 0, 384, &BTreeSet::new(),)
+                .expect("supported Performance clips should include the Sampler Layer"),
+            BTreeSet::from([0])
+        );
+        let router = ChannelNoteRouter::new(document.channels());
+        assert_eq!(router.targets_for_note(0, 1, 60), vec![1, 2]);
     }
 
     #[test]
