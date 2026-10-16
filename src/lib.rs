@@ -12012,6 +12012,50 @@ impl FlpDocument {
         Ok(total_imported)
     }
 
+    /// Creates one named Sampler channel per format-0/1 MIDI track by copying the selected
+    /// kind-0 Sampler template, then imports each track into its new channel in `pattern_id`.
+    /// The operation is atomic: if any channel cannot be copied or the MIDI import fails, the
+    /// project remains unchanged. Format-2 tracks are independent sequences and are rejected.
+    pub fn import_midi_tracks_to_sampler_channels(
+        &mut self,
+        midi: &midi::MidiFile,
+        pattern_id: u16,
+        template_channel_id: u16,
+    ) -> Result<(usize, Vec<u16>), FlpError> {
+        if midi.format() == 2 {
+            return Err(FlpError::UnsupportedEdit(
+                "Format-2 MIDI tracks are independent sequences; import them one at a time",
+            ));
+        }
+        if midi.tracks().is_empty() {
+            return Err(FlpError::UnsupportedEdit(
+                "the MIDI file contains no tracks to import",
+            ));
+        }
+
+        let mut candidate = self.clone();
+        let mut channel_ids = Vec::with_capacity(midi.tracks().len());
+        for (track_index, track) in midi.tracks().iter().enumerate() {
+            let fallback_name = format!("Track {}", track_index + 1);
+            let source_name = track
+                .name()
+                .filter(|name| !name.is_empty())
+                .unwrap_or(fallback_name.clone());
+            let display_name = source_name.replace('\0', " ");
+            let display_name = if display_name.trim().is_empty() {
+                fallback_name
+            } else {
+                display_name
+            };
+            channel_ids
+                .push(candidate.duplicate_sampler_channel(template_channel_id, &display_name)?);
+        }
+
+        let imported = candidate.import_midi_tracks(midi, pattern_id, &channel_ids)?;
+        *self = candidate;
+        Ok((imported, channel_ids))
+    }
+
     fn import_midi_track_in_place(
         &mut self,
         midi: &midi::MidiFile,
@@ -14140,6 +14184,120 @@ impl FlpDocument {
         candidate.refresh_event_offsets()?;
         *self = candidate;
         Ok(())
+    }
+
+    /// Adds a Sampler channel by copying one existing kind-0 Sampler channel.
+    /// The clone retains its sample and channel settings byte-for-byte, receives a unique
+    /// channel ID, and uses the supplied display name. Other channel types are rejected because
+    /// their state may contain references or plug-in instance data that cannot be cloned safely.
+    pub fn duplicate_sampler_channel(
+        &mut self,
+        source_channel_id: u16,
+        display_name: &str,
+    ) -> Result<u16, FlpError> {
+        if display_name.contains('\0') {
+            return Err(FlpError::UnsupportedEdit(
+                "channel names cannot contain an embedded NUL character",
+            ));
+        }
+
+        let channels = self.channels();
+        let mut matching = channels
+            .iter()
+            .filter(|channel| channel.id() == source_channel_id);
+        let Some(source) = matching.next() else {
+            return Err(FlpError::ChannelNotFound(source_channel_id));
+        };
+        if matching.next().is_some() {
+            return Err(FlpError::AmbiguousChannelId(source_channel_id));
+        }
+        if source.kind() != Some(0) {
+            return Err(FlpError::UnsupportedEdit(
+                "only a kind-0 Sampler channel can be duplicated safely",
+            ));
+        }
+
+        let source_range = source.event_range();
+        if source_range
+            .clone()
+            .any(|index| matches!(self.events[index].opcode, 0x41 | 0x63))
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "the Sampler channel range includes pattern or arrangement data",
+            ));
+        }
+        let marker_indices = source_range
+            .clone()
+            .filter(|index| {
+                self.events[*index].opcode == 0x40
+                    && self.events[*index].encoding == PayloadEncoding::Word
+                    && self.events[*index].payload.len() == 2
+            })
+            .collect::<Vec<_>>();
+        if marker_indices.len() != 1 {
+            return Err(FlpError::UnsupportedEdit(
+                "the Sampler channel has no unique recognized ID marker",
+            ));
+        }
+        let name_events = source_range
+            .clone()
+            .filter(|index| {
+                self.events[*index].opcode == 0xCB
+                    && matches!(self.events[*index].encoding, PayloadEncoding::Data { .. })
+            })
+            .collect::<Vec<_>>();
+        if name_events.len() != 1 {
+            return Err(FlpError::UnsupportedEdit(
+                "the Sampler channel has no unique recognized display-name event",
+            ));
+        }
+        if !project_string_is_utf16(
+            &self.events[name_events[0]].payload,
+            self.project_version.as_deref(),
+        ) {
+            return Err(FlpError::UnsupportedEdit(
+                "the Sampler channel display name is not verified UTF-16LE",
+            ));
+        }
+
+        let used_ids = channels
+            .iter()
+            .map(ChannelSummary::id)
+            .collect::<HashSet<_>>();
+        let new_channel_id = used_ids
+            .iter()
+            .max()
+            .copied()
+            .and_then(|value| value.checked_add(1))
+            .filter(|candidate| !used_ids.contains(candidate))
+            .or_else(|| (0..=u16::MAX).find(|candidate| !used_ids.contains(candidate)))
+            .ok_or(FlpError::UnsupportedEdit(
+                "the project has no unused channel IDs",
+            ))?;
+        let new_channel_count = u16::try_from(channels.len().checked_add(1).ok_or(
+            FlpError::UnsupportedEdit("the project has too many channels to add another"),
+        )?)
+        .map_err(|_| {
+            FlpError::UnsupportedEdit("the project has too many channels to add another")
+        })?;
+        let insertion_index = channels
+            .last()
+            .map(|channel| channel.event_range().end)
+            .or_else(|| self.events.iter().position(|event| event.opcode == 0x62))
+            .unwrap_or(self.events.len());
+        let mut copied_events = self.events[source_range].to_vec();
+        let copied_marker_index = marker_indices[0] - source.first_event_index;
+        copied_events[copied_marker_index].replace_word_payload(new_channel_id)?;
+
+        let mut candidate = self.clone();
+        candidate
+            .events
+            .splice(insertion_index..insertion_index, copied_events);
+        candidate.header.legacy_channel_count = new_channel_count;
+        candidate.refresh_event_offsets()?;
+        candidate.set_channel_name(new_channel_id, display_name)?;
+        *self = candidate;
+        Ok(new_channel_id)
     }
 
     /// Adds a Sampler channel with the given source path and display name.
@@ -24024,6 +24182,151 @@ mod tests {
                 .is_err()
         );
         assert_eq!(document.encode_lossless().unwrap(), original);
+    }
+
+    #[test]
+    fn imports_midi_tracks_to_named_sampler_clones_atomically() {
+        let midi = MidiFile::parse(&midi_tracks_fixture(
+            &[
+                &[
+                    0x00, 0xFF, 0x03, 0x05, b'P', b'i', b'a', b'n', b'o', 0x00, 0x90, 0x3C,
+                    0x64, // C4 at tick 0.
+                    0x83, 0x60, 0x80, 0x3C, 0x00, // Note off at tick 480.
+                    0x00, 0xFF, 0x2F, 0x00,
+                ],
+                &[
+                    0x00, 0xFF, 0x03, 0x04, b'B', b'a', b's', b's', 0x00, 0x90, 0x43,
+                    0x50, // G4 at tick 0.
+                    0x81, 0x70, 0x80, 0x43, 0x00, // Note off at tick 240.
+                    0x00, 0xFF, 0x2F, 0x00,
+                ],
+            ],
+            1,
+            480,
+        ))
+        .expect("named format-1 MIDI fixture should parse");
+
+        let utf16 = |value: &str| {
+            value
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .chain([0, 0])
+                .collect::<Vec<_>>()
+        };
+        let mut project_events = Vec::new();
+        append_data_event(&mut project_events, 0xC7, b"26.0.0\0");
+        project_events.extend_from_slice(&[
+            0x40, 0, 0, // Sampler template, channel ID 0.
+            0x15, 0, // Kind-0 Sampler.
+            0x00, 1, // Enabled.
+            0x46, 0x34, 0x12, // Sampler FX flags retained by each clone.
+        ]);
+        append_data_event(&mut project_events, 0xC4, &utf16("/samples/template.wav"));
+        append_data_event(&mut project_events, 0xCB, &utf16("Template"));
+        project_events.extend_from_slice(&[
+            0x62, 0, 0, // End of Channel Rack data.
+            0x41, 7, 0, 0xD0, 0, // Empty pattern 7.
+        ]);
+        let original = flp_fixture(&project_events, &[], &[]);
+        let mut document = FlpDocument::parse(&original).expect("project fixture should parse");
+        let original_template = document
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id() == 0)
+            .expect("template Sampler should be recognized");
+        let original_template_events = document.events()[original_template.event_range()]
+            .iter()
+            .map(|event| event.wire_bytes().to_vec())
+            .collect::<Vec<_>>();
+
+        let (imported, channel_ids) = document
+            .import_midi_tracks_to_sampler_channels(&midi, 7, 0)
+            .expect("both tracks should import into cloned Samplers");
+
+        assert_eq!(imported, 2);
+        assert_eq!(channel_ids.len(), 2);
+        assert_ne!(channel_ids[0], channel_ids[1]);
+        assert_eq!(document.header().legacy_channel_count(), 3);
+        let channels = document.channels();
+        let template = channels
+            .iter()
+            .find(|channel| channel.id() == 0)
+            .expect("original template should remain");
+        assert_eq!(
+            document.events()[template.event_range()]
+                .iter()
+                .map(FlpEvent::wire_bytes)
+                .map(<[u8]>::to_vec)
+                .collect::<Vec<_>>(),
+            original_template_events,
+            "cloning must not modify the template channel bytes"
+        );
+        for (channel_id, expected_name) in channel_ids.iter().zip(["Piano", "Bass"]) {
+            let channel = channels
+                .iter()
+                .find(|channel| channel.id() == *channel_id)
+                .expect("new Sampler channel should be recognized");
+            assert_eq!(channel.kind(), Some(0));
+            assert_eq!(channel.display_name(), Some(expected_name));
+            assert_eq!(channel.sample_path(), Some("/samples/template.wav"));
+            let preserved_fields = channel
+                .event_range()
+                .filter(|index| !matches!(document.events()[*index].opcode, 0x40 | 0xCB))
+                .map(|index| document.events()[index].wire_bytes().to_vec())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                preserved_fields,
+                original_template_events[1..original_template_events.len() - 1]
+            );
+        }
+
+        let notes = &document.patterns().unwrap()[0].notes;
+        assert_eq!(notes.len(), 2);
+        assert_eq!((notes[0].channel_id, notes[0].key), (channel_ids[0], 60));
+        assert_eq!((notes[1].channel_id, notes[1].key), (channel_ids[1], 67));
+
+        let mut rejected = FlpDocument::parse(&original).expect("project fixture should parse");
+        assert!(
+            rejected
+                .import_midi_tracks_to_sampler_channels(&midi, 99, 0)
+                .is_err()
+        );
+        assert_eq!(
+            rejected.encode_lossless().unwrap(),
+            original,
+            "a failed import after channel cloning must leave the project unchanged"
+        );
+
+        let format_two = MidiFile::parse(&midi_tracks_fixture(
+            &[&[0x00, 0xFF, 0x2F, 0x00], &[0x00, 0xFF, 0x2F, 0x00]],
+            2,
+            480,
+        ))
+        .expect("Format-2 MIDI fixture should parse");
+        let mut rejected_format_two =
+            FlpDocument::parse(&original).expect("project fixture should parse");
+        assert!(
+            rejected_format_two
+                .import_midi_tracks_to_sampler_channels(&format_two, 7, 0)
+                .is_err()
+        );
+        assert_eq!(rejected_format_two.encode_lossless().unwrap(), original);
+
+        let mut native_template_events = project_events.clone();
+        let kind_event = native_template_events
+            .windows(2)
+            .position(|window| window == [0x15, 0])
+            .expect("fixture Sampler kind event should exist");
+        native_template_events[kind_event + 1] = 2;
+        let non_sampler = flp_fixture(&native_template_events, &[], &[]);
+        let mut rejected_non_sampler =
+            FlpDocument::parse(&non_sampler).expect("non-Sampler fixture should parse");
+        assert!(
+            rejected_non_sampler
+                .import_midi_tracks_to_sampler_channels(&midi, 7, 0)
+                .is_err()
+        );
+        assert_eq!(rejected_non_sampler.encode_lossless().unwrap(), non_sampler);
     }
 
     #[test]
