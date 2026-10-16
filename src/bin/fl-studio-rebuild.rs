@@ -3868,6 +3868,7 @@ struct DawUi {
     channel_display_filter: ChannelDisplayFilter,
     channel_group_dialog: Option<ChannelGroupDialog>,
     pattern_rename_dialog: Option<PatternRenameDialog>,
+    pattern_delete_dialog: Option<u16>,
     selected_note_channel: Option<u16>,
     selected_note: Option<(u16, u16, usize)>,
     selected_piano_notes: BTreeSet<(u16, u16, usize)>,
@@ -4662,6 +4663,7 @@ impl DawUi {
             channel_display_filter: ChannelDisplayFilter::All,
             channel_group_dialog: None,
             pattern_rename_dialog: None,
+            pattern_delete_dialog: None,
             selected_note_channel: None,
             selected_note: None,
             selected_piano_notes: BTreeSet::new(),
@@ -5717,6 +5719,88 @@ impl DawUi {
             self.apply_pattern_rename_dialog(dialog);
         } else if open && !cancel {
             self.pattern_rename_dialog = Some(dialog);
+        }
+    }
+
+    fn delete_pattern_from_ui(&mut self, pattern_id: u16) {
+        let result = self
+            .document
+            .as_mut()
+            .ok_or_else(|| "no project is open".to_owned())
+            .and_then(|document| {
+                document
+                    .delete_pattern(pattern_id)
+                    .map_err(|error| error.to_string())
+            });
+        match result {
+            Ok(()) => {
+                self.stop_project_playback();
+                self.dirty = true;
+                self.selected_pattern = self
+                    .document
+                    .as_ref()
+                    .and_then(|document| document.patterns().ok())
+                    .and_then(|patterns| patterns.first().map(|pattern| pattern.id));
+                self.selected_note = None;
+                self.selected_piano_notes.clear();
+                self.piano_roll_time_selection = None;
+                self.selected_pattern_time_signature = None;
+                self.selected_pattern_time_signature_pattern = None;
+                self.status = format!("Deleted unused Pattern {pattern_id}");
+            }
+            Err(error) => self.status = format!("Could not delete Pattern {pattern_id}: {error}"),
+        }
+    }
+
+    fn pattern_delete_dialog(&mut self, context: &egui::Context) {
+        let Some(pattern_id) = self.pattern_delete_dialog.take() else {
+            return;
+        };
+        let pattern_label = self
+            .document
+            .as_ref()
+            .and_then(|document| document.patterns().ok())
+            .and_then(|patterns| {
+                patterns
+                    .into_iter()
+                    .find(|pattern| pattern.id == pattern_id)
+            })
+            .and_then(|pattern| pattern.name)
+            .map_or_else(
+                || format!("Pattern {pattern_id}"),
+                |name| format!("{name} (Pattern {pattern_id})"),
+            );
+        let mut open = true;
+        let mut confirm = false;
+        let mut cancel = false;
+        egui::Window::new("Delete Pattern")
+            .id(Id::new("pattern-delete-dialog"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(360.0)
+            .show(context, |ui| {
+                ui.label(format!("Delete {pattern_label}?"));
+                ui.label("Patterns used by Playlist Clips cannot be deleted.");
+                ui.horizontal(|ui| {
+                    if ui.button("Delete Pattern").clicked() {
+                        confirm = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+                if ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                    confirm = true;
+                }
+                if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                    cancel = true;
+                }
+            });
+        if confirm {
+            self.delete_pattern_from_ui(pattern_id);
+        } else if open && !cancel {
+            self.pattern_delete_dialog = Some(pattern_id);
         }
     }
 
@@ -10380,6 +10464,14 @@ impl DawUi {
                     && ui.button("Rename selected pattern…").clicked()
                 {
                     self.open_pattern_rename_dialog(pattern_id);
+                    ui.close();
+                }
+                if let Some(pattern_id) = self
+                    .selected_pattern
+                    .filter(|pattern_id| patterns.iter().any(|pattern| pattern.id == *pattern_id))
+                    && ui.button("Delete selected pattern…").clicked()
+                {
+                    self.pattern_delete_dialog = Some(pattern_id);
                     ui.close();
                 }
                 if patterns.is_empty() {
@@ -41519,6 +41611,7 @@ impl eframe::App for DawUi {
         self.project_settings_dialog(ui.ctx());
         self.channel_group_dialog(ui.ctx());
         self.pattern_rename_dialog(ui.ctx());
+        self.pattern_delete_dialog(ui.ctx());
         self.playlist_render_options_dialog(ui.ctx());
         self.browser_tag_editor_dialog(ui.ctx());
         self.browser_bulk_tag_editor_dialog(ui.ctx());
