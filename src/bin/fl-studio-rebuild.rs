@@ -36562,20 +36562,50 @@ impl DawUi {
         let Some(document) = self.document.as_ref().cloned() else {
             return false;
         };
-        let Some(channel) = document
-            .channels()
-            .into_iter()
-            .find(|channel| channel.id() == channel_id)
-        else {
+        let channels = document.channels();
+        let Some(channel) = channels.iter().find(|channel| channel.id() == channel_id) else {
             return false;
         };
-        if channel.kind() != Some(0) {
-            self.status = "Select a Sampler channel for live MIDI audition".to_owned();
-            return false;
-        }
-        if channel.enabled() == Some(false) {
-            self.status = "Enable the selected Sampler channel for live MIDI audition".to_owned();
-            return false;
+        match channel.kind() {
+            Some(0) => {
+                if channel.enabled() == Some(false) {
+                    self.status =
+                        "Enable the selected Sampler channel for live MIDI audition".to_owned();
+                    return false;
+                }
+            }
+            Some(3) => {
+                if channel.enabled() == Some(false) {
+                    self.status =
+                        "Enable the selected Layer channel for live MIDI audition".to_owned();
+                    return false;
+                }
+                let mut sampler_children = BTreeSet::new();
+                for child_id in channel.layer_child_ids().unwrap_or_default() {
+                    let Some(child) = channels.iter().find(|child| child.id() == *child_id) else {
+                        continue;
+                    };
+                    if child.enabled() == Some(false) {
+                        continue;
+                    }
+                    if child.kind() != Some(0) {
+                        self.status =
+                            "Live Layer audition currently requires enabled Sampler children only"
+                                .to_owned();
+                        return false;
+                    }
+                    sampler_children.insert(*child_id);
+                }
+                if sampler_children.is_empty() {
+                    self.status =
+                        "The selected Layer has no enabled Sampler children to audition".to_owned();
+                    return false;
+                }
+            }
+            _ => {
+                self.status = "Select a Sampler or Layer channel for live MIDI audition".to_owned();
+                return false;
+            }
         }
         if self.live_vst3_input.is_some() {
             self.stop_live_vst3_input();
@@ -36739,8 +36769,13 @@ impl DawUi {
                     cancelled,
                     worker,
                 });
-                self.status =
-                    format!("Preparing live MIDI audition on Sampler channel {channel_id}");
+                self.status = if channel.kind() == Some(3) {
+                    format!(
+                        "Preparing live MIDI audition through Sampler children of Layer channel {channel_id}"
+                    )
+                } else {
+                    format!("Preparing live MIDI audition on Sampler channel {channel_id}")
+                };
                 true
             }
             Err(error) => {

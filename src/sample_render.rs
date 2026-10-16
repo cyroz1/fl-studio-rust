@@ -31,9 +31,10 @@ use crate::audio::{
 use crate::media::{DecodedAudio, SamplePathResolver, decode_audio_file, wav_sampler_metadata};
 use crate::vst3::{PlaylistMidiNote, Vst3PlaylistStreamProcessor};
 use crate::{
-    Arrangement, ChannelNoteRouter, ChannelSummary, FlpDocument, MixerInsertSignalTransform,
-    MixerRouteAudibility, MixerSourceRoutePlan, MixerSourceRouteTransform, Pattern, PatternNote,
-    PlaylistClip, PlaylistClipTarget, PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync,
+    Arrangement, ChannelNoteRouter, ChannelSummary, ChannelType, FlpDocument,
+    MixerInsertSignalTransform, MixerRouteAudibility, MixerSourceRoutePlan,
+    MixerSourceRouteTransform, Pattern, PatternNote, PlaylistClip, PlaylistClipTarget,
+    PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync,
 };
 
 const DEFAULT_SAMPLE_RATE: u32 = 44_100;
@@ -4584,37 +4585,70 @@ pub fn stream_sampler_midi_input_to_device(
     cancelled: &AtomicBool,
 ) -> Result<(), String> {
     let channels = document.channels();
-    let channel = channels
+    let source_channel = channels
         .iter()
         .find(|channel| channel.id() == channel_id)
-        .ok_or_else(|| format!("Sampler channel {channel_id} was not found"))?;
-    if channel.kind() != Some(0) || channel.enabled() == Some(false) {
-        return Err(format!(
-            "channel {channel_id} is not an enabled Sampler channel"
-        ));
+        .ok_or_else(|| format!("input channel {channel_id} was not found"))?;
+    if source_channel.enabled() == Some(false) {
+        return Err(format!("input channel {channel_id} is disabled"));
     }
+    let channels_by_id = channels
+        .iter()
+        .map(|channel| (channel.id(), channel))
+        .collect::<HashMap<_, _>>();
+    let sampler_channel_ids = match source_channel.channel_type() {
+        Some(ChannelType::Sampler) => BTreeSet::from([channel_id]),
+        Some(ChannelType::Layer) => {
+            let mut sampler_channel_ids = BTreeSet::new();
+            for child_id in source_channel.layer_child_ids().unwrap_or_default() {
+                let Some(child) = channels_by_id.get(child_id) else {
+                    continue;
+                };
+                if child.enabled() == Some(false) {
+                    continue;
+                }
+                if child.channel_type() != Some(ChannelType::Sampler) {
+                    return Err(format!(
+                        "Layer channel {channel_id} live audition currently supports Sampler children only; child {child_id} is not a Sampler"
+                    ));
+                }
+                sampler_channel_ids.insert(*child_id);
+            }
+            if sampler_channel_ids.is_empty() {
+                return Err(format!(
+                    "Layer channel {channel_id} has no enabled Sampler children for live audition"
+                ));
+            }
+            sampler_channel_ids
+        }
+        _ => {
+            return Err(format!(
+                "channel {channel_id} is not an enabled Sampler or Layer channel"
+            ));
+        }
+    };
 
     let mut preview_document = document.clone();
-    let pattern = preview_document
+    preview_document
         .patterns()
         .map_err(|error| error.to_string())?
         .into_iter()
         .find(|pattern| pattern.id == options.pattern_id)
         .ok_or_else(|| format!("pattern {} was not found", options.pattern_id))?;
-    if !pattern
-        .notes
-        .iter()
-        .any(|note| note.channel_id == channel_id && !note.is_muted())
-    {
+    for &sampler_channel_id in &sampler_channel_ids {
+        let key = channels_by_id
+            .get(&sampler_channel_id)
+            .and_then(|channel| channel.keyboard_key_region())
+            .map_or(SAMPLER_ROOT_KEY, |(low, _)| low);
         preview_document
             .add_pattern_note(
                 options.pattern_id,
                 PatternNote {
                     position: 0,
                     flags: crate::PATTERN_NOTE_DEFAULT_FLAGS,
-                    channel_id,
+                    channel_id: sampler_channel_id,
                     length: 1,
-                    key: SAMPLER_ROOT_KEY,
+                    key,
                     group: 0,
                     fine_pitch: 120,
                     reserved: 0,
@@ -4629,22 +4663,44 @@ pub fn stream_sampler_midi_input_to_device(
             .map_err(|error| format!("could not prepare Sampler input audition: {error}"))?;
     }
 
-    let render = prepare_sampler_pattern_for_channel(
+    let render = prepare_sampler_pattern_for_channels(
         &preview_document,
         project_path.as_ref(),
         options,
         Some(cancelled),
-        Some(channel_id),
+        &sampler_channel_ids,
     )?;
-    let source = render
-        .sources_by_channel
-        .get(&channel_id)
-        .ok_or_else(|| format!("Sampler channel {channel_id} has no resolved sample"))?;
-    let pitch_offset = sampler_note_pitch_offset_semitones(
-        channel,
-        source.root_key,
-        document.metadata().master_pitch_cents(),
-    );
+    let missing_channels = sampler_channel_ids
+        .iter()
+        .filter(|child_id| !render.sources_by_channel.contains_key(child_id))
+        .copied()
+        .collect::<Vec<_>>();
+    if !missing_channels.is_empty() {
+        return Err(format!(
+            "Sampler child channel(s) {} have no resolved sample for live audition",
+            missing_channels
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    let pitch_offsets = sampler_channel_ids
+        .iter()
+        .filter_map(|child_id| {
+            let channel = channels_by_id.get(child_id).copied()?;
+            let source = render.sources_by_channel.get(child_id)?;
+            Some((
+                *child_id,
+                sampler_note_pitch_offset_semitones(
+                    channel,
+                    source.root_key,
+                    document.metadata().master_pitch_cents(),
+                ),
+            ))
+        })
+        .collect::<HashMap<_, _>>();
+    let note_router = ChannelNoteRouter::new(channels);
     let empty_notes = [];
     let mut engine = SamplerVoiceEngine::with_resampling_quality_and_pan_law(
         &render.sources_by_channel,
@@ -4662,6 +4718,8 @@ pub fn stream_sampler_midi_input_to_device(
     const LIVE_BLOCK_FRAMES: usize = 128;
     let mut block = vec![0.0f32; LIVE_BLOCK_FRAMES * 2];
     let mut block_start = 0u64;
+    let mut next_note_seed = 0u64;
+    let mut active_notes = LiveSamplerInputNoteTargets::new();
     loop {
         check_cancelled(Some(cancelled))?;
         if writer.is_cancelled() {
@@ -4675,10 +4733,14 @@ pub fn stream_sampler_midi_input_to_device(
                     velocity,
                 }) => {
                     let input_key = u16::from(key.min(127));
-                    if channel
-                        .keyboard_key_region()
-                        .is_none_or(|(low, high)| (low..=high).contains(&input_key))
-                    {
+                    let targets =
+                        note_router.targets_for_note(channel_id, next_note_seed, input_key);
+                    next_note_seed = next_note_seed.wrapping_add(1);
+                    let mut active_targets = Vec::with_capacity(targets.len());
+                    for target_channel_id in targets {
+                        let Some(&pitch_offset) = pitch_offsets.get(&target_channel_id) else {
+                            continue;
+                        };
                         let note_key = transpose_sampler_note_key(input_key, pitch_offset);
                         if let Some(slot_index) = engine.start_voice(ScheduledSamplerNote {
                             clip_index: 0,
@@ -4694,13 +4756,22 @@ pub fn stream_sampler_midi_input_to_device(
                             fine_pitch_offset_cents: 0,
                         }) {
                             engine.set_voice_input_midi_channel(slot_index, midi_channel);
+                            active_targets.push((target_channel_id, note_key));
                         }
+                    }
+                    if !active_targets.is_empty() {
+                        active_notes
+                            .entry((midi_channel & 0x0F, key.min(127)))
+                            .or_default()
+                            .push_back(active_targets);
                     }
                 }
                 Ok(SamplerLiveNoteEvent::NoteOff { channel, key }) => {
-                    let input_key = u16::from(key.min(127));
-                    let note_key = transpose_sampler_note_key(input_key, pitch_offset);
-                    engine.release_note(channel_id, note_key, channel);
+                    for (target_channel_id, note_key) in
+                        pop_live_sampler_target_notes(&mut active_notes, channel, key)
+                    {
+                        engine.release_note(target_channel_id, note_key, channel);
+                    }
                 }
                 Ok(SamplerLiveNoteEvent::PitchBend { channel, cents }) => {
                     engine.apply_live_pitch_bend(channel, cents);
@@ -4710,9 +4781,11 @@ pub fn stream_sampler_midi_input_to_device(
                 }
                 Ok(SamplerLiveNoteEvent::AllNotesOff { channel }) => {
                     engine.release_live_notes(channel);
+                    active_notes.retain(|(note_channel, _), _| *note_channel != (channel & 0x0F));
                 }
                 Ok(SamplerLiveNoteEvent::AllSoundOff { channel }) => {
                     engine.stop_live_voices(channel);
+                    active_notes.retain(|(note_channel, _), _| *note_channel != (channel & 0x0F));
                 }
                 Ok(SamplerLiveNoteEvent::Sustain { channel, down }) => {
                     engine.set_live_sustain(channel, down);
@@ -4736,6 +4809,26 @@ pub fn stream_sampler_midi_input_to_device(
         block_start = block_start.saturating_add(LIVE_BLOCK_FRAMES as u64);
     }
 }
+
+fn pop_live_sampler_target_notes(
+    active_notes: &mut LiveSamplerInputNoteTargets,
+    midi_channel: u8,
+    key: u8,
+) -> Vec<(u16, u16)> {
+    let source_note = (midi_channel & 0x0F, key.min(127));
+    let targets = active_notes
+        .get_mut(&source_note)
+        .and_then(VecDeque::pop_front);
+    if active_notes
+        .get(&source_note)
+        .is_some_and(VecDeque::is_empty)
+    {
+        active_notes.remove(&source_note);
+    }
+    targets.unwrap_or_default()
+}
+
+type LiveSamplerInputNoteTargets = HashMap<(u8, u8), VecDeque<Vec<(u16, u16)>>>;
 
 fn stream_prepared_sampler_pattern(
     render: &PreparedSamplerPattern,
@@ -7594,12 +7687,30 @@ fn prepare_sampler_pattern_for_channel(
     cancelled: Option<&AtomicBool>,
     channel_filter: Option<u16>,
 ) -> Result<PreparedSamplerPattern, String> {
+    let channel_filter = channel_filter.map(|channel_id| BTreeSet::from([channel_id]));
     prepare_sampler_pattern_for_channel_internal(
         document,
         project_path,
         options,
         cancelled,
-        channel_filter,
+        channel_filter.as_ref(),
+        false,
+    )
+}
+
+fn prepare_sampler_pattern_for_channels(
+    document: &FlpDocument,
+    project_path: &Path,
+    options: SamplerPatternRenderOptions,
+    cancelled: Option<&AtomicBool>,
+    channel_filter: &BTreeSet<u16>,
+) -> Result<PreparedSamplerPattern, String> {
+    prepare_sampler_pattern_for_channel_internal(
+        document,
+        project_path,
+        options,
+        cancelled,
+        Some(channel_filter),
         false,
     )
 }
@@ -7625,7 +7736,7 @@ fn prepare_sampler_pattern_for_channel_internal(
     project_path: &Path,
     options: SamplerPatternRenderOptions,
     cancelled: Option<&AtomicBool>,
-    channel_filter: Option<u16>,
+    channel_filter: Option<&BTreeSet<u16>>,
     allow_empty: bool,
 ) -> Result<PreparedSamplerPattern, String> {
     check_cancelled(cancelled)?;
@@ -7681,7 +7792,7 @@ fn prepare_sampler_pattern_for_channel_internal(
                 .map(move |target_channel_id| (note, target_channel_id))
         })
         .filter(|(_, target_channel_id)| {
-            channel_filter.is_none_or(|channel_id| *target_channel_id == channel_id)
+            channel_filter.is_none_or(|channel_ids| channel_ids.contains(target_channel_id))
         })
         .collect::<Vec<_>>();
     let sampler_note_count = sampler_notes.len();
@@ -9794,6 +9905,33 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64};
 
     static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn live_layer_note_offs_reuse_each_overlapping_note_on_target_set() {
+        let first_targets = vec![(4, 61), (7, 64)];
+        let second_targets = vec![(6, 62)];
+        let mut active_notes = HashMap::from([
+            (
+                (2, 60),
+                VecDeque::from([first_targets.clone(), second_targets.clone()]),
+            ),
+            ((3, 60), VecDeque::from([vec![(9, 60)]])),
+        ]);
+
+        assert_eq!(
+            pop_live_sampler_target_notes(&mut active_notes, 2, 60),
+            first_targets
+        );
+        assert_eq!(
+            pop_live_sampler_target_notes(&mut active_notes, 2, 60),
+            second_targets
+        );
+        assert!(pop_live_sampler_target_notes(&mut active_notes, 2, 60).is_empty());
+        assert_eq!(
+            pop_live_sampler_target_notes(&mut active_notes, 3, 60),
+            vec![(9, 60)]
+        );
+    }
 
     #[test]
     fn latched_performance_clip_stops_on_retrigger_only() {
