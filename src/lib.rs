@@ -3981,6 +3981,94 @@ impl FlpDocument {
         Ok(patterns)
     }
 
+    /// Creates one raw point in a new controller stream, inserting a `0xDF` event if needed.
+    /// The new point starts with zeroed reserved bytes; channel and flags are kept uninterpreted.
+    pub fn create_pattern_controller_stream(
+        &mut self,
+        pattern_id: u16,
+        channel: u8,
+        flags: u8,
+        position: u32,
+        value: f32,
+    ) -> Result<usize, FlpError> {
+        if !value.is_finite() {
+            return Err(FlpError::UnsupportedEdit(
+                "Pattern controller values must be finite",
+            ));
+        }
+
+        let pattern = self
+            .patterns()?
+            .into_iter()
+            .find(|pattern| pattern.id == pattern_id)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested Pattern does not exist",
+            ))?;
+        if pattern
+            .controllers
+            .iter()
+            .any(|controller| (controller.channel, controller.flags) == (channel, flags))
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested raw Pattern controller stream already exists",
+            ));
+        }
+
+        let mut matching_markers = self.events.iter().enumerate().filter_map(|(index, event)| {
+            (event.opcode == 0x41
+                && event.payload.len() == 2
+                && event.payload.as_slice() == pattern_id.to_le_bytes())
+            .then_some(index)
+        });
+        let marker_index = matching_markers.next().ok_or(FlpError::UnsupportedEdit(
+            "the requested Pattern has no source marker",
+        ))?;
+        if matching_markers.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested Pattern ID is ambiguous",
+            ));
+        }
+
+        let region_start = marker_index + 1;
+        let region_end = self.events[region_start..]
+            .iter()
+            .position(|event| {
+                (event.opcode == 0x41 && event.payload.len() == 2)
+                    || matches!(event.opcode, 0x40 | 0x62 | 0x63)
+            })
+            .map_or(self.events.len(), |offset| region_start + offset);
+        let new_index = pattern.controllers.len();
+        let controller = PatternController {
+            position,
+            reserved: [0; 2],
+            channel,
+            flags,
+            value_bits: value.to_bits(),
+        };
+
+        let mut candidate = self.clone();
+        if let Some(event_index) = (region_start..region_end)
+            .rev()
+            .find(|index| candidate.events[*index].opcode == 0xDF)
+        {
+            let mut payload = candidate.events[event_index].payload.clone();
+            payload
+                .len()
+                .checked_add(FLP_PATTERN_CONTROLLER_RECORD_SIZE)
+                .ok_or(FlpError::LengthOverflow)?;
+            payload.extend_from_slice(&controller.encode());
+            candidate.events[event_index].replace_data_payload(payload)?;
+        } else {
+            candidate.events.insert(
+                region_end,
+                FlpEvent::new_data(0xDF, controller.encode().to_vec())?,
+            );
+        }
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(new_index)
+    }
+
     /// Edits position or value in one raw Pattern controller record without changing its length.
     /// Controller channel and flags bytes remain untouched because their target semantics are
     /// still unknown.
@@ -16005,12 +16093,12 @@ mod tests {
         FstPreset, FstPresetKind, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit,
         MixerInsertSummary, MixerParameterKind, MixerParameterRecord, MixerRouteAudibility,
         MixerSendSummary, MixerSourceRouteTransform, PATTERN_NOTE_DEFAULT_FLAGS,
-        PATTERN_NOTE_SLIDE_FLAG, PLAYLIST_CLIP_MUTED_FLAG, PatternControllerEdit, PatternNote,
-        PatternNoteEdit, PatternNoteRotation, PayloadEncoding, PlaylistClipEdit,
-        PlaylistClipTarget, PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress,
-        PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions,
-        RiffMachineOptions, RiffMachineQuantizeMode, ScaleLevelsOptions, TimeMarkerEdit,
-        apply_mixer_pan, apply_mixer_stereo_separation, midi::MidiChannelMapping,
+        PATTERN_NOTE_SLIDE_FLAG, PLAYLIST_CLIP_MUTED_FLAG, PatternController,
+        PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation, PayloadEncoding,
+        PlaylistClipEdit, PlaylistClipTarget, PlaylistTrackEdit, PlaylistTrackMotion,
+        PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit,
+        RandomizerOptions, RiffMachineOptions, RiffMachineQuantizeMode, ScaleLevelsOptions,
+        TimeMarkerEdit, apply_mixer_pan, apply_mixer_stereo_separation, midi::MidiChannelMapping,
         midi::MidiEventKind, midi::MidiFile, note_pitch_in_scale, parse_vst_plugin_state_metadata,
         riff_machine_groove_note_timing,
     };
@@ -21951,6 +22039,97 @@ mod tests {
             Err(FlpError::InvalidEvent { .. })
         ));
         assert_eq!(document.encode_lossless().unwrap(), input);
+    }
+
+    #[test]
+    fn create_pattern_controller_stream_inserts_event_without_a_template_and_roundtrips() {
+        let mut trailing_events = vec![0xFE, 0x02, 0xAA, 0xBB, 0x41, 8, 0];
+        append_data_event(&mut trailing_events, 0xD0, &[]);
+        let input = pattern_fixture(&[], &trailing_events);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+
+        let controller_index = document
+            .create_pattern_controller_stream(7, 3, 0x91, 240, 0.75)
+            .expect("a new raw stream should not need an existing record template");
+        assert_eq!(controller_index, 0);
+        let patterns = document.patterns().expect("patterns should decode");
+        assert_eq!(patterns[0].id, 7);
+        assert_eq!(patterns[0].controllers.len(), 1);
+        assert_eq!(
+            patterns[0].controllers[0],
+            PatternController {
+                position: 240,
+                reserved: [0; 2],
+                channel: 3,
+                flags: 0x91,
+                value_bits: 0.75f32.to_bits(),
+            }
+        );
+        assert!(patterns[1].controllers.is_empty());
+
+        let events = document.events();
+        let controller_event_index = events
+            .iter()
+            .position(|event| event.opcode() == 0xDF)
+            .expect("creating the stream should add a 0xDF event");
+        let next_pattern_index = events
+            .iter()
+            .position(|event| event.opcode() == 0x41 && event.payload() == [8, 0])
+            .expect("the following Pattern marker should remain");
+        assert!(controller_event_index < next_pattern_index);
+        assert_eq!(
+            events
+                .iter()
+                .find(|event| event.opcode() == 0xFE)
+                .expect("unrelated event should remain")
+                .wire_bytes(),
+            &[0xFE, 0x02, 0xAA, 0xBB]
+        );
+
+        let encoded = document
+            .encode_lossless()
+            .expect("new stream should encode");
+        let reparsed = FlpDocument::parse(&encoded).expect("new stream should parse again");
+        assert_eq!(reparsed.patterns().unwrap(), document.patterns().unwrap());
+        assert_eq!(reparsed.encode_lossless().unwrap(), encoded);
+    }
+
+    #[test]
+    fn create_pattern_controller_stream_appends_to_existing_event_and_rejects_duplicates() {
+        let existing_record =
+            pattern_controller_record(120, [0xA5, 0x5A], 7, 0x2A, 0.5f32.to_bits());
+        let mut controller_event = Vec::new();
+        append_data_event(&mut controller_event, 0xDF, &existing_record);
+        let input = pattern_fixture(&[], &controller_event);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+
+        let controller_index = document
+            .create_pattern_controller_stream(7, 3, 0x91, 240, 0.75)
+            .expect("a new raw stream should append alongside an unrelated stream");
+        assert_eq!(controller_index, 1);
+        let controllers = &document.patterns().unwrap()[0].controllers;
+        assert_eq!(controllers.len(), 2);
+        assert_eq!(controllers[0].encode(), existing_record);
+        assert_eq!(controllers[1].channel, 3);
+        assert_eq!(controllers[1].flags, 0x91);
+        assert_eq!(controllers[1].value(), 0.75);
+
+        let before_invalid_edit = document.encode_lossless().unwrap();
+        assert!(
+            document
+                .create_pattern_controller_stream(7, 3, 0x91, 480, 1.0)
+                .is_err()
+        );
+        assert!(
+            document
+                .create_pattern_controller_stream(7, 4, 0x90, 480, f32::INFINITY)
+                .is_err()
+        );
+        assert_eq!(document.encode_lossless().unwrap(), before_invalid_edit);
+
+        let encoded = document.encode_lossless().unwrap();
+        let reparsed = FlpDocument::parse(&encoded).expect("created streams should parse again");
+        assert_eq!(reparsed.patterns().unwrap(), document.patterns().unwrap());
     }
 
     #[test]
