@@ -2301,10 +2301,12 @@ enum PianoRollChordStamp {
     ScaleThirteenth,
     TopDownTriad,
     TopDownSeventh,
+    BottomUpTriad,
+    BottomUpSeventh,
 }
 
 impl PianoRollChordStamp {
-    const ALL: [Self; 34] = [
+    const ALL: [Self; 36] = [
         Self::Major,
         Self::Minor,
         Self::Diminished,
@@ -2339,6 +2341,8 @@ impl PianoRollChordStamp {
         Self::ScaleThirteenth,
         Self::TopDownTriad,
         Self::TopDownSeventh,
+        Self::BottomUpTriad,
+        Self::BottomUpSeventh,
     ];
 
     fn label(self) -> &'static str {
@@ -2377,6 +2381,8 @@ impl PianoRollChordStamp {
             Self::ScaleThirteenth => "Scale thirteenth",
             Self::TopDownTriad => "Top-down triad",
             Self::TopDownSeventh => "Top-down seventh",
+            Self::BottomUpTriad => "Bottom-up triad",
+            Self::BottomUpSeventh => "Bottom-up seventh",
         }
     }
 
@@ -2416,7 +2422,9 @@ impl PianoRollChordStamp {
             | Self::ScaleSeventh
             | Self::ScaleNinth
             | Self::ScaleEleventh
-            | Self::ScaleThirteenth => &[],
+            | Self::ScaleThirteenth
+            | Self::BottomUpTriad
+            | Self::BottomUpSeventh => &[],
             Self::TopDownTriad | Self::TopDownSeventh => unreachable!(),
         };
         if !intervals.is_empty() {
@@ -2434,6 +2442,8 @@ impl PianoRollChordStamp {
                 Self::ScaleNinth => &[0, 4, 7, 11, 14],
                 Self::ScaleEleventh => &[0, 4, 7, 11, 14, 17],
                 Self::ScaleThirteenth => &[0, 4, 7, 11, 14, 17, 21],
+                Self::BottomUpTriad => &[0, 4, 7],
+                Self::BottomUpSeventh => &[0, 4, 7, 11],
                 _ => unreachable!("manual chord stamps return before scale-degree selection"),
             };
             return intervals
@@ -2460,6 +2470,8 @@ impl PianoRollChordStamp {
             Self::ScaleNinth => &[0, 2, 4, 6, 8],
             Self::ScaleEleventh => &[0, 2, 4, 6, 8, 10],
             Self::ScaleThirteenth => &[0, 2, 4, 6, 8, 10, 12],
+            Self::BottomUpTriad => &[0, 2, 4],
+            Self::BottomUpSeventh => &[0, 2, 4, 6],
             _ => unreachable!("manual chord stamps return before scale-degree selection"),
         };
         let scale_anchor = i32::from(snapped_root) - i32::from(scale_intervals[scale_degree]);
@@ -2487,6 +2499,14 @@ impl PianoRollChordStamp {
             _ => None,
         }
     }
+
+    fn bottom_up_note_count(self) -> Option<usize> {
+        match self {
+            Self::BottomUpTriad => Some(3),
+            Self::BottomUpSeventh => Some(4),
+            _ => None,
+        }
+    }
 }
 
 fn apply_piano_roll_chord_inversion(pitches: &mut Vec<u16>, inversion: u8) -> bool {
@@ -2506,6 +2526,102 @@ fn apply_piano_roll_chord_inversion(pitches: &mut Vec<u16>, inversion: u8) -> bo
     }
     pitches.sort_unstable();
     true
+}
+
+#[derive(Clone, Copy)]
+struct PianoRollChordContext<'a> {
+    pattern_notes: &'a [PatternNote],
+    channel_id: u16,
+    position_ticks: u32,
+    window_ticks: u32,
+}
+
+fn piano_roll_bottom_up_chord_pitches(
+    clicked_key: u16,
+    scale: PianoRollScale,
+    scale_root: u8,
+    chord_context: PianoRollChordContext<'_>,
+    note_count: usize,
+) -> Vec<u16> {
+    let stamp = match note_count {
+        3 => PianoRollChordStamp::ScaleTriad,
+        4 => PianoRollChordStamp::ScaleSeventh,
+        _ => return Vec::new(),
+    };
+    let scale = if scale == PianoRollScale::None {
+        PianoRollScale::Major
+    } else {
+        scale
+    };
+    let nearest_context_onset = chord_context
+        .pattern_notes
+        .iter()
+        .filter(|note| note.channel_id == chord_context.channel_id)
+        .map(|note| note.position)
+        .filter(|onset| onset.abs_diff(chord_context.position_ticks) <= chord_context.window_ticks)
+        .min_by_key(|onset| (onset.abs_diff(chord_context.position_ticks), *onset));
+    let mut nearby_chord = nearest_context_onset
+        .into_iter()
+        .flat_map(|onset| {
+            chord_context
+                .pattern_notes
+                .iter()
+                .filter(move |note| {
+                    note.channel_id == chord_context.channel_id && note.position == onset
+                })
+                .map(|note| note.key)
+        })
+        .collect::<Vec<_>>();
+    nearby_chord.sort_unstable();
+
+    let minimum_root = clicked_key.saturating_sub(12);
+    let maximum_root = clicked_key.saturating_add(12).min(127);
+    let mut best: Option<(u32, u16, u8, u16, Vec<u16>)> = None;
+    for root in minimum_root..=maximum_root {
+        if !scale.contains(root, scale_root) {
+            continue;
+        }
+        let base = stamp.pitches(root, scale, scale_root);
+        if base.len() != note_count {
+            continue;
+        }
+        for inversion in 0..note_count {
+            let mut chord = base.clone();
+            if !apply_piano_roll_chord_inversion(&mut chord, inversion as u8) {
+                continue;
+            }
+            for octave_shift in [-24, -12, 0, 12, 24] {
+                let Some(voicing) = chord
+                    .iter()
+                    .map(|pitch| u16::try_from(i32::from(*pitch) + octave_shift).ok())
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    continue;
+                };
+                let voice_leading_cost = voicing
+                    .iter()
+                    .zip(&nearby_chord)
+                    .map(|(pitch, context_pitch)| u32::from(pitch.abs_diff(*context_pitch)))
+                    .sum::<u32>()
+                    .saturating_add((voicing.len().abs_diff(nearby_chord.len()) as u32) * 12);
+                let score = (
+                    voice_leading_cost,
+                    root.abs_diff(clicked_key),
+                    inversion as u8,
+                    root,
+                    voicing,
+                );
+                if best
+                    .as_ref()
+                    .is_none_or(|current| score.cmp(current).is_lt())
+                {
+                    best = Some(score);
+                }
+            }
+        }
+    }
+    best.map(|(_, _, _, _, pitches)| pitches)
+        .unwrap_or_else(|| stamp.pitches(clicked_key, scale, scale_root))
 }
 
 fn scale_chord_pitches_from_top(
@@ -24632,7 +24748,8 @@ impl DawUi {
                             ("Basic", &all_stamps[..10]),
                             ("Advanced", &all_stamps[10..27]),
                             ("Scale-derived", &all_stamps[27..32]),
-                            ("Top-down", &all_stamps[32..]),
+                            ("Top-down", &all_stamps[32..34]),
+                            ("Bottom-up", &all_stamps[34..]),
                         ] {
                             ui.weak(heading);
                             for &stamp in stamps {
@@ -24651,6 +24768,9 @@ impl DawUi {
                 if self.piano_roll_chord_stamp.top_down_note_count().is_some() {
                     self.piano_roll_chord_inversion = 0;
                     ui.label("Inversion: clicked pitch stays highest");
+                } else if self.piano_roll_chord_stamp.bottom_up_note_count().is_some() {
+                    self.piano_roll_chord_inversion = 0;
+                    ui.label("Voicing: follows the nearest chord in this pattern");
                 } else {
                     let max_inversion = self
                         .piano_roll_chord_stamp
@@ -26607,11 +26727,27 @@ impl DawUi {
             self.status = format!("Pattern {pattern_id} was not found");
             return;
         };
-        let mut pitches = self.piano_roll_chord_stamp.pitches(
-            60,
-            self.piano_roll_scale,
-            self.piano_roll_scale_root,
-        );
+        let bottom_up_note_count = self.piano_roll_chord_stamp.bottom_up_note_count();
+        let mut pitches = if let Some(note_count) = bottom_up_note_count {
+            piano_roll_bottom_up_chord_pitches(
+                60,
+                self.piano_roll_scale,
+                self.piano_roll_scale_root,
+                PianoRollChordContext {
+                    pattern_notes: &pattern.notes,
+                    channel_id,
+                    position_ticks: 0,
+                    window_ticks: note_length.saturating_mul(16).max(1),
+                },
+                note_count,
+            )
+        } else {
+            self.piano_roll_chord_stamp.pitches(
+                60,
+                self.piano_roll_scale,
+                self.piano_roll_scale_root,
+            )
+        };
         if self
             .piano_roll_chord_stamp
             .top_down_note_count()
@@ -26620,7 +26756,13 @@ impl DawUi {
             self.status = "Top-down chord needs more MIDI pitch range below C5".to_owned();
             return;
         }
-        if !apply_piano_roll_chord_inversion(&mut pitches, self.piano_roll_chord_inversion) {
+        if bottom_up_note_count.is_some_and(|expected| pitches.len() < expected) {
+            self.status = "Bottom-up chord does not fit the MIDI pitch range around C5".to_owned();
+            return;
+        }
+        if bottom_up_note_count.is_none()
+            && !apply_piano_roll_chord_inversion(&mut pitches, self.piano_roll_chord_inversion)
+        {
             self.status = "Chord inversion exceeds the MIDI pitch range".to_owned();
             return;
         }
@@ -31079,23 +31221,46 @@ impl DawUi {
                     note_from_grid_position(pointer, grid_geometry, channel_id)
             {
                 root_note.length = snap_ticks.max(1);
-                let mut chord_pitches = self.piano_roll_chord_stamp.pitches(
-                    root_note.key,
-                    self.piano_roll_scale,
-                    self.piano_roll_scale_root,
-                );
-                if self
-                    .piano_roll_chord_stamp
-                    .top_down_note_count()
-                    .is_some_and(|expected| chord_pitches.len() < expected)
-                {
+                let bottom_up_note_count =
+                    self.piano_roll_chord_stamp.bottom_up_note_count();
+                let mut chord_pitches = if let Some(note_count) = bottom_up_note_count {
+                    piano_roll_bottom_up_chord_pitches(
+                        root_note.key,
+                        self.piano_roll_scale,
+                        self.piano_roll_scale_root,
+                        PianoRollChordContext {
+                            pattern_notes: &pattern.notes,
+                            channel_id,
+                            position_ticks: root_note.position,
+                            window_ticks: snap_ticks.saturating_mul(16).max(1),
+                        },
+                        note_count,
+                    )
+                } else {
+                    self.piano_roll_chord_stamp.pitches(
+                        root_note.key,
+                        self.piano_roll_scale,
+                        self.piano_roll_scale_root,
+                    )
+                };
+                if self.piano_roll_chord_stamp.top_down_note_count().is_some_and(|expected| {
+                    chord_pitches.len() < expected
+                }) {
                     self.status =
                         "Top-down chord needs more MIDI pitch range below the clicked note"
                             .to_owned();
-                } else if !apply_piano_roll_chord_inversion(
-                    &mut chord_pitches,
-                    self.piano_roll_chord_inversion,
-                ) {
+                } else if bottom_up_note_count
+                    .is_some_and(|expected| chord_pitches.len() < expected)
+                {
+                    self.status =
+                        "Bottom-up chord does not fit the MIDI pitch range at the clicked pitch"
+                            .to_owned();
+                } else if bottom_up_note_count.is_none()
+                    && !apply_piano_roll_chord_inversion(
+                        &mut chord_pitches,
+                        self.piano_roll_chord_inversion,
+                    )
+                {
                     self.status = "Chord inversion exceeds the MIDI pitch range".to_owned();
                 } else {
                     notes_to_add.extend(chord_pitches.into_iter().map(|key| {
