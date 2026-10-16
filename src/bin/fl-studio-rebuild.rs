@@ -32,6 +32,7 @@ use flp_rebuild::sample_render::{
     PlaylistPerformanceStream, PlaylistRenderOptions, PlaylistRenderRange, PlaylistRenderSummary,
     PlaylistStreamMonitor, PlaylistTempoMap, ResamplingQuality, SamplerPatternRenderOptions,
     SamplerPatternRenderSummary, WavChannelMode, WavDitherMode, WavSampleFormat,
+    nearest_playlist_audio_clip_zero_crossing_tick,
     playlist_performance_clip_indices_with_vst3, playlist_performance_static_document_with_vst3,
     playlist_performance_vst3_channel_ids, playlist_performance_vst3_clip_indices,
     render_audio_clips_to_file, render_playlist_mixer_stems_with_vst3_cancellable,
@@ -4004,6 +4005,7 @@ struct DawUi {
     soloed_playlist_track_range: Option<(u32, u32)>,
     collapsed_playlist_groups: BTreeSet<(u16, u32)>,
     hide_collapsed_playlist_groups: bool,
+    playlist_zero_crossing_splits: bool,
     active_playlist_clip_drag: Option<ActivePlaylistClipDrag>,
     active_playlist_clip_drag_targets: Vec<PlaylistClipDragTarget>,
     selected_time_marker: Option<usize>,
@@ -4561,6 +4563,7 @@ impl DawUi {
             load_piano_roll_nudge_notes_with_mouse_wheel();
         let channel_rack_mute_removed_steps = load_channel_rack_mute_removed_steps();
         let hide_collapsed_playlist_groups = load_hide_collapsed_playlist_groups();
+        let playlist_zero_crossing_splits = load_playlist_zero_crossing_splits();
         let browser_path = initial_project
             .as_deref()
             .and_then(Path::parent)
@@ -4825,6 +4828,7 @@ impl DawUi {
             timeline_zoom: 0.10,
             playlist_track_zoom: 1.0,
             playlist_waveform_mode: PlaylistWaveformMode::Combined,
+            playlist_zero_crossing_splits,
             plugin_candidates,
             clap_inspection_sender,
             clap_inspection_receiver,
@@ -16083,6 +16087,23 @@ impl DawUi {
                                             ui.close();
                                         }
                                     });
+                                    if ui
+                                        .checkbox(
+                                            &mut self.playlist_zero_crossing_splits,
+                                            "Zero-crossing splits",
+                                        )
+                                        .on_hover_text(
+                                            "Snap Audio Clip splits to a nearby source zero crossing (within 10 ms). If none is found, split at the cursor.",
+                                        )
+                                        .changed()
+                                        && let Err(error) = save_playlist_zero_crossing_splits(
+                                            self.playlist_zero_crossing_splits,
+                                        )
+                                    {
+                                        self.status = format!(
+                                            "Could not save the Playlist split setting: {error}"
+                                        );
+                                    }
                                     let selected_audio_clip_indices =
                                         (self.selected_arrangement == Some(arrangement.id)
                                             && self
@@ -18042,32 +18063,50 @@ impl DawUi {
         if let Some((clip_index, split_position_ticks, full_source_length_ms)) =
             split_clip_requested
         {
-            if let Some(document) = self.document.as_mut() {
-                match document.split_playlist_audio_clip(
-                    arrangement.id,
-                    clip_index,
-                    split_position_ticks,
-                    full_source_length_ms,
-                ) {
-                    Ok(right_clip_index) => {
-                        self.stop_project_playback();
-                        self.selected_arrangement = Some(arrangement.id);
-                        self.selected_clip = Some(right_clip_index);
-                        self.playlist_clip_context_split = None;
-                        self.active_playlist_clip_drag = None;
-                        self.dirty = true;
-                        self.status = format!(
-                            "Split Audio Clip {} at tick {split_position_ticks}",
-                            clip_index + 1
-                        );
-                        playlist_clip_list_changed = true;
-                    }
-                    Err(error) => {
-                        self.status = format!("Could not split Audio Clip: {error}");
+            match self.playlist_audio_clip_split_position(
+                arrangement.id,
+                clip_index,
+                split_position_ticks,
+            ) {
+                Ok((effective_split_ticks, snapped)) => {
+                    if let Some(document) = self.document.as_mut() {
+                        match document.split_playlist_audio_clip(
+                            arrangement.id,
+                            clip_index,
+                            effective_split_ticks,
+                            full_source_length_ms,
+                        ) {
+                            Ok(right_clip_index) => {
+                                self.stop_project_playback();
+                                self.selected_arrangement = Some(arrangement.id);
+                                self.selected_clip = Some(right_clip_index);
+                                self.playlist_clip_context_split = None;
+                                self.active_playlist_clip_drag = None;
+                                self.dirty = true;
+                                self.status = if snapped {
+                                    format!(
+                                        "Split Audio Clip {} at zero crossing (tick {effective_split_ticks})",
+                                        clip_index + 1
+                                    )
+                                } else {
+                                    format!(
+                                        "Split Audio Clip {} at tick {effective_split_ticks}",
+                                        clip_index + 1
+                                    )
+                                };
+                                playlist_clip_list_changed = true;
+                            }
+                            Err(error) => {
+                                self.status = format!("Could not split Audio Clip: {error}");
+                            }
+                        }
+                    } else {
+                        self.status = "Open a project to split Playlist Audio Clips".to_owned();
                     }
                 }
-            } else {
-                self.status = "Open a project to split Playlist Audio Clips".to_owned();
+                Err(error) => {
+                    self.status = format!("Could not choose an Audio Clip split point: {error}");
+                }
             }
         }
 
@@ -18733,6 +18772,34 @@ impl DawUi {
         }
     }
 
+    fn playlist_audio_clip_split_position(
+        &self,
+        arrangement_id: u16,
+        clip_index: usize,
+        requested_tick: u32,
+    ) -> Result<(u32, bool), String> {
+        if !self.playlist_zero_crossing_splits {
+            return Ok((requested_tick, false));
+        }
+        let document = self
+            .document
+            .as_ref()
+            .ok_or_else(|| "open a project first".to_owned())?;
+        let project_path = self
+            .sample_project_path()
+            .ok_or_else(|| "the project path is not available".to_owned())?;
+        match nearest_playlist_audio_clip_zero_crossing_tick(
+            document,
+            &project_path,
+            arrangement_id,
+            clip_index,
+            requested_tick,
+        )? {
+            Some(tick) => Ok((tick, true)),
+            None => Ok((requested_tick, false)),
+        }
+    }
+
     fn split_selected_playlist_audio_clips(
         &mut self,
         arrangement_id: u16,
@@ -18745,6 +18812,26 @@ impl DawUi {
         if clip_indices.len() < 2 {
             self.status = "Select at least two Audio Clips to split together".to_owned();
             return false;
+        }
+
+        let mut split_positions = BTreeMap::new();
+        let mut snapped_count = 0usize;
+        for clip_index in &clip_indices {
+            match self.playlist_audio_clip_split_position(
+                arrangement_id,
+                *clip_index,
+                split_position_ticks,
+            ) {
+                Ok((position_ticks, snapped)) => {
+                    split_positions.insert(*clip_index, position_ticks);
+                    snapped_count += usize::from(snapped);
+                }
+                Err(error) => {
+                    self.status =
+                        format!("Could not choose split points for selected Audio Clips: {error}");
+                    return false;
+                }
+            }
         }
 
         let result = self.document.as_ref().map(|document| {
@@ -18797,19 +18884,28 @@ impl DawUi {
                 .collect::<BTreeMap<_, _>>();
             let ppq = updated.header().ppq();
             let tempo_bpm = updated.metadata().tempo_bpm().unwrap_or(140.0);
-            let split_context = PlaylistAudioSplitContext {
-                full_source_lengths_ms: &full_source_lengths,
-                split_position_ticks,
-                channel_kinds: &channel_kinds,
-                tempo_channel_ids: &tempo_channel_ids,
-                ppq,
-                tempo_bpm,
-            };
-            if !playlist_audio_clip_selection_split_supported(
-                &arrangement.clips,
-                &clip_indices,
-                &split_context,
-            ) {
+            let all_splits_supported = clip_indices.iter().all(|clip_index| {
+                let (Some(clip), Some(split_position_ticks)) = (
+                    arrangement.clips.get(*clip_index),
+                    split_positions.get(clip_index),
+                ) else {
+                    return false;
+                };
+                playlist_audio_clip_split_supported(
+                    *clip_index,
+                    clip,
+                    &arrangement.clips,
+                    &PlaylistAudioSplitContext {
+                        full_source_lengths_ms: &full_source_lengths,
+                        split_position_ticks: *split_position_ticks,
+                        channel_kinds: &channel_kinds,
+                        tempo_channel_ids: &tempo_channel_ids,
+                        ppq,
+                        tempo_bpm,
+                    },
+                )
+            });
+            if !all_splits_supported {
                 return Err(
                     "Every selected Audio Clip must support the requested split point".to_owned(),
                 );
@@ -18822,16 +18918,12 @@ impl DawUi {
                         *current_index += 1;
                     }
                 }
-                let full_source_length_ms = split_context
-                    .full_source_lengths_ms
-                    .get(clip_index)
-                    .copied()
-                    .flatten();
+                let full_source_length_ms = full_source_lengths.get(clip_index).copied().flatten();
                 let right_clip_index = updated
                     .split_playlist_audio_clip(
                         arrangement_id,
                         *clip_index,
-                        split_position_ticks,
+                        split_positions[clip_index],
                         full_source_length_ms,
                     )
                     .map_err(|error| error.to_string())?;
@@ -18875,10 +18967,17 @@ impl DawUi {
                 self.playlist_clip_context_split = None;
                 self.active_playlist_clip_drag = None;
                 self.dirty = true;
-                self.status = format!(
-                    "Split {} selected Audio Clips at tick {split_position_ticks}",
-                    clip_indices.len()
-                );
+                self.status = if snapped_count > 0 {
+                    format!(
+                        "Split {} selected Audio Clips; {snapped_count} split(s) used a zero crossing",
+                        clip_indices.len()
+                    )
+                } else {
+                    format!(
+                        "Split {} selected Audio Clips at the cursor",
+                        clip_indices.len()
+                    )
+                };
                 true
             }
             Some(Err(error)) => {
@@ -42517,6 +42616,31 @@ fn save_hide_collapsed_playlist_groups(enabled: bool) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| "the Playlist view settings path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(&path, format!("{enabled}\n"))
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
+fn playlist_zero_crossing_splits_settings_file() -> Option<PathBuf> {
+    browser_favorites_file()?
+        .parent()
+        .map(|directory| directory.join("playlist-zero-crossing-splits.txt"))
+}
+
+fn load_playlist_zero_crossing_splits() -> bool {
+    playlist_zero_crossing_splits_settings_file()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|contents| contents.trim().parse::<bool>().ok())
+        .unwrap_or(false)
+}
+
+fn save_playlist_zero_crossing_splits(enabled: bool) -> Result<(), String> {
+    let path = playlist_zero_crossing_splits_settings_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the Playlist split settings path has no parent folder".to_owned())?;
     fs::create_dir_all(parent)
         .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
     fs::write(&path, format!("{enabled}\n"))
