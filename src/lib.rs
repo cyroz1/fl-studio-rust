@@ -2124,6 +2124,17 @@ pub(crate) struct MixerSourceRoutePlan {
     pub(crate) insert_meter_transforms: Vec<(usize, MixerSourceRouteTransform)>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct MixerLiveSourceRoutePlan {
+    pub(crate) track: usize,
+    pub(crate) source_transform: MixerSourceRouteTransform,
+    pub(crate) saved_fader_gain: f32,
+    pub(crate) saved_pan_raw: Option<i32>,
+    pub(crate) pan_law_raw: Option<u8>,
+    pub(crate) output_transform: MixerSourceRouteTransform,
+    pub(crate) insert_meter_transforms: Vec<(usize, MixerSourceRouteTransform)>,
+}
+
 impl Default for MixerSourceRouteTransform {
     fn default() -> Self {
         Self {
@@ -2397,24 +2408,40 @@ impl MixerRouteAudibility {
             .unwrap_or_default()
     }
 
-    /// Returns the route plan with the source insert fader removed and its saved fader value.
-    /// This preserves complete send graphs so a live source fader can scale every supported
-    /// output and insert meter path together.
-    pub(crate) fn source_fader_route_plan_for_channel(
+    /// Splits a source insert's static signal controls from the transforms on its routed paths.
+    /// The source fader and pan can then follow live targets before direct and send branches split.
+    pub(crate) fn live_source_route_plan_for_channel(
         &self,
         route: Option<i8>,
-    ) -> Option<(usize, i32, MixerSourceRoutePlan)> {
+    ) -> Option<MixerLiveSourceRoutePlan> {
         let track = route.filter(|track| *track > 0 && self.known_tracks.contains(track))?;
-        let fader_volume_raw = *self.source_fader_volume_raw.get(&track)?;
-        let mut faderless_routes = self.clone();
-        let source_transform = faderless_routes.source_transforms.get_mut(&track)?;
-        *source_transform = source_transform.with_fader_volume_raw(None);
-        faderless_routes.source_fader_volume_raw.remove(&track);
-        Some((
-            track as usize,
-            fader_volume_raw,
-            faderless_routes.source_route_plan_for_channel(Some(track)),
-        ))
+        let source_transform = *self.source_transforms.get(&track)?;
+        let saved_fader_raw = self.source_fader_volume_raw.get(&track).copied();
+        if saved_fader_raw.is_none() && source_transform.mixer_pan_raw.is_none() {
+            return None;
+        }
+
+        let source_transform_without_fader_or_pan =
+            MixerSourceRouteTransform::from_insert_transform(
+                source_transform
+                    .with_fader_volume_raw(None)
+                    .with_mixer_pan_raw(None),
+            );
+        let mut downstream_routes = self.clone();
+        downstream_routes
+            .source_transforms
+            .insert(track, MixerInsertSignalTransform::default());
+        let route_plan = downstream_routes.source_route_plan_for_channel(Some(track));
+
+        Some(MixerLiveSourceRoutePlan {
+            track: track as usize,
+            source_transform: source_transform_without_fader_or_pan,
+            saved_fader_gain: saved_fader_raw.map_or(1.0, mixer_fader_gain),
+            saved_pan_raw: source_transform.mixer_pan_raw,
+            pan_law_raw: source_transform.mixer_pan_law_raw,
+            output_transform: route_plan.output_transform,
+            insert_meter_transforms: route_plan.insert_meter_transforms,
+        })
     }
 
     /// Returns the final pre-Master route plus each insert's summed pre-effect meter path.
@@ -2587,7 +2614,15 @@ fn apply_mixer_stereo_separation(frame: &mut [f32; 2], separation_raw: i32) {
 }
 
 fn apply_mixer_pan(frame: &mut [f32; 2], pan_raw: i32, pan_law_raw: Option<u8>) {
-    let pan = pan_raw.clamp(-6_400, 6_400) as f32 / 6_400.0;
+    apply_mixer_pan_raw_f32(frame, pan_raw as f32, pan_law_raw);
+}
+
+pub(crate) fn apply_mixer_pan_raw_f32(frame: &mut [f32; 2], pan_raw: f32, pan_law_raw: Option<u8>) {
+    let pan = if pan_raw.is_finite() {
+        pan_raw.clamp(-6_400.0, 6_400.0) / 6_400.0
+    } else {
+        0.0
+    };
     let left = frame[0];
     let right = frame[1];
     if pan < 0.0 {
@@ -19640,7 +19675,7 @@ mod tests {
     }
 
     #[test]
-    fn mixer_source_fader_route_plan_removes_the_source_fader_from_send_paths() {
+    fn live_mixer_source_route_plan_splits_pan_and_fader_before_send_branches() {
         let insert = |ordinal| MixerInsertSummary {
             ordinal,
             input_raw: -1,
@@ -19653,6 +19688,15 @@ mod tests {
             first_event_index: 0,
             end_event_index: 0,
         };
+        let parameter = |parameter_id: u8, value| MixerParameterRecord {
+            event_index: 0,
+            record_index: usize::from(parameter_id == 193),
+            prefix: [0; 4],
+            parameter_id,
+            reserved: 0,
+            channel_data: 65 << 6,
+            value,
+        };
         let send = |source_track: usize, destination_track: u8, level_raw| MixerSendSummary {
             insert_ordinal: source_track,
             route_parameter_id: 64 + destination_track,
@@ -19662,41 +19706,34 @@ mod tests {
             event_index: 0,
             record_index: 0,
         };
-        let fader = MixerParameterRecord {
-            event_index: 0,
-            record_index: 0,
-            prefix: [0; 4],
-            parameter_id: 192,
-            reserved: 0,
-            channel_data: 65 << 6,
-            value: 5_000,
-        };
+        let parameters = [parameter(192, 5_000), parameter(193, -3_200)];
         let mut routing = MixerRouteAudibility::from_inserts_with_parameters(
             [insert(0), insert(1), insert(2)],
-            &[fader],
-            None,
+            &parameters,
+            Some(2),
         );
         routing.add_send_summaries([send(1, 0, 12_800), send(1, 2, 6_400), send(2, 0, 12_800)]);
 
-        let mut saved_frame = [1.0, 0.0];
-        routing
-            .source_route_plan_for_channel(Some(1))
-            .output_transform
-            .apply_frame(&mut saved_frame);
-        assert_eq!(saved_frame, [0.75, 0.0]);
+        let plan = routing
+            .live_source_route_plan_for_channel(Some(1))
+            .expect("recognized source pan and fader with a complete send graph");
+        assert_eq!(plan.track, 1);
+        assert_eq!(plan.saved_fader_gain, 0.5);
+        assert_eq!(plan.saved_pan_raw, Some(-3_200));
+        assert_eq!(plan.pan_law_raw, Some(2));
 
-        let (track, saved_gain_raw, faderless_plan) = routing
-            .source_fader_route_plan_for_channel(Some(1))
-            .expect("recognized source fader and complete send graph");
-        assert_eq!(track, 1);
-        assert_eq!(saved_gain_raw, 5_000);
-        let mut faderless_frame = [1.0, 0.0];
-        faderless_plan
-            .output_transform
-            .apply_frame(&mut faderless_frame);
-        assert_eq!(faderless_frame, [1.5, 0.0]);
+        let mut source_stage = [1.0, 1.0];
+        plan.source_transform.apply_frame(&mut source_stage);
+        assert_eq!(source_stage, [1.0, 1.0]);
+        super::apply_mixer_pan_raw_f32(&mut source_stage, -3_200.0, plan.pan_law_raw);
+        source_stage[0] *= plan.saved_fader_gain;
+        source_stage[1] *= plan.saved_fader_gain;
+
+        let mut output = source_stage;
+        plan.output_transform.apply_frame(&mut output);
+        assert_eq!(output, [1.125, 0.375]);
         assert_eq!(
-            faderless_plan.insert_meter_transforms,
+            plan.insert_meter_transforms,
             vec![
                 (1, MixerSourceRouteTransform::default()),
                 (2, MixerSourceRouteTransform::default().scaled(0.5)),
@@ -19742,16 +19779,27 @@ mod tests {
 
         assert_eq!(routing.master_fader_raw(), Some(2_500));
         assert_eq!(routing.master_pan_raw(), Some(3_200));
-        let (track, saved_volume_raw, live_route_plan) = routing
-            .source_fader_route_plan_for_channel(Some(1))
+        let live_route_plan = routing
+            .live_source_route_plan_for_channel(Some(1))
             .expect("the direct insert fader should expose a live transform");
-        assert_eq!(track, 1);
-        assert_eq!(saved_volume_raw, 5_000);
+        assert_eq!(live_route_plan.track, 1);
+        assert_eq!(live_route_plan.saved_fader_gain, 0.5);
+        assert_eq!(live_route_plan.saved_pan_raw, Some(-3_200));
         let mut live_frame = [1.0, 2.0];
+        live_route_plan
+            .source_transform
+            .apply_frame(&mut live_frame);
+        super::apply_mixer_pan_raw_f32(
+            &mut live_frame,
+            live_route_plan.saved_pan_raw.unwrap() as f32,
+            live_route_plan.pan_law_raw,
+        );
+        live_frame[0] *= live_route_plan.saved_fader_gain;
+        live_frame[1] *= live_route_plan.saved_fader_gain;
         live_route_plan
             .output_transform
             .apply_frame(&mut live_frame);
-        assert_eq!(live_frame, [2.0, 1.0]);
+        assert_eq!(live_frame, [1.0, 0.5]);
         let mut insert_frame = [1.0, 2.0];
         routing
             .transform_for_channel(Some(1))
@@ -19775,7 +19823,7 @@ mod tests {
         }]);
         assert!(
             send_routing
-                .source_fader_route_plan_for_channel(Some(1))
+                .live_source_route_plan_for_channel(Some(1))
                 .is_some()
         );
 

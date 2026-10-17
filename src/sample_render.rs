@@ -25,16 +25,16 @@ use vorbis_rs::VorbisDecoder;
 use vorbis_rs::{VorbisBitrateManagementStrategy, VorbisEncoder, VorbisEncoderBuilder};
 
 use crate::audio::{
-    AudioInputRecording, MIXER_TRACK_METER_COUNT, MixerTrackPeakMeters, StereoFrameDelay,
-    StreamingAudioWriter,
+    AudioInputRecording, LiveMixerSourceControl, LiveMixerSourceTargets, MIXER_TRACK_METER_COUNT,
+    MixerTrackPeakMeters, StereoFrameDelay, StreamingAudioWriter,
 };
 use crate::media::{DecodedAudio, SamplePathResolver, decode_audio_file, wav_sampler_metadata};
 use crate::vst3::{PlaylistMidiNote, Vst3PlaylistStreamProcessor};
 use crate::{
     Arrangement, ChannelNoteRouter, ChannelSummary, ChannelType, FlpDocument,
-    MixerInsertSignalTransform, MixerRouteAudibility, MixerSourceRoutePlan,
-    MixerSourceRouteTransform, Pattern, PatternNote, PlaylistClip, PlaylistClipTarget,
-    PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync,
+    MixerInsertSignalTransform, MixerLiveSourceRoutePlan, MixerRouteAudibility,
+    MixerSourceRoutePlan, MixerSourceRouteTransform, Pattern, PatternNote, PlaylistClip,
+    PlaylistClipTarget, PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync,
 };
 
 const DEFAULT_SAMPLE_RATE: u32 = 44_100;
@@ -4266,13 +4266,9 @@ fn stream_prepared_playlist_render_with_performance(
     );
     sampler_engine.mixer_transforms_by_channel = Some(&render.sampler.mixer_transforms_by_channel);
     if let Some(meters) = meters {
-        sampler_engine.live_mixer_fader_transforms_by_channel =
-            Some(&render.sampler.live_mixer_fader_transforms_by_channel);
-        sampler_engine.live_mixer_faders_by_channel =
-            Some(&render.sampler.live_mixer_faders_by_channel);
-        sampler_engine.live_mixer_fader_targets = Some(meters);
-        sampler_engine.live_mixer_fader_meter_transforms_by_channel =
-            Some(&render.sampler.live_mixer_fader_meter_transforms_by_channel);
+        sampler_engine.live_mixer_source_routes_by_channel =
+            Some(&render.sampler.live_mixer_source_routes_by_channel);
+        sampler_engine.live_mixer_source_targets = Some(meters);
     }
     sampler_engine.mixer_meter_transforms_by_channel =
         Some(&render.sampler.mixer_meter_transforms_by_channel);
@@ -4290,7 +4286,7 @@ fn stream_prepared_playlist_render_with_performance(
     let mut direct_source_delay = crate::audio::StereoFrameDelay::new(direct_source_delay_frames)?;
     if let Some(processor) = render.vst3_processor.as_deref_mut() {
         if let Some(meters) = meters {
-            processor.set_live_mixer_fader_targets(meters);
+            processor.set_live_mixer_source_targets(meters);
         }
         processor.start_processing()?;
     }
@@ -4304,7 +4300,7 @@ fn stream_prepared_playlist_render_with_performance(
         sample_rate: options.sample_rate,
         resampling_quality: options.resampling_quality,
         cancelled,
-        live_mixer_fader_targets: if performance.is_none() { meters } else { None },
+        live_mixer_source_targets: if performance.is_none() { meters } else { None },
     };
     let performance_audio_mix_context = PreparedAudioClipMixContext {
         clips: &render.audio.clips,
@@ -4312,7 +4308,7 @@ fn stream_prepared_playlist_render_with_performance(
         sample_rate: options.sample_rate,
         resampling_quality: options.resampling_quality,
         cancelled,
-        live_mixer_fader_targets: meters,
+        live_mixer_source_targets: meters,
     };
     let mix_result = std::thread::scope(|scope| {
         let mut parallel_mixer = if worker_count > 1 {
@@ -4731,14 +4727,13 @@ fn stream_sampler_pattern_loop_from_tick_with_vst3_to_device(
     );
     engine.mixer_transforms_by_channel = Some(&render.mixer_transforms_by_channel);
     if let Some(meters) = live_master_meters {
-        engine.live_mixer_fader_transforms_by_channel =
-            Some(&render.live_mixer_fader_transforms_by_channel);
-        engine.live_mixer_faders_by_channel = Some(&render.live_mixer_faders_by_channel);
-        engine.live_mixer_fader_targets = Some(meters);
+        engine.live_mixer_source_routes_by_channel =
+            Some(&render.live_mixer_source_routes_by_channel);
+        engine.live_mixer_source_targets = Some(meters);
     }
     if let Some(processor) = playback.vst3_processor.as_mut() {
         if let Some(meters) = live_master_meters {
-            processor.set_live_mixer_fader_targets(meters);
+            processor.set_live_mixer_source_targets(meters);
         }
         processor.start_processing()?;
     }
@@ -5421,7 +5416,7 @@ fn prepare_audio_clip_render(
 
     let mut clips = Vec::with_capacity(candidate_clips.len());
     let mut output_frames = timeline_frames;
-    let mut live_fader_routes_by_track = HashMap::new();
+    let mut live_source_routes_by_track = HashMap::new();
     for (
         clip_index,
         clip,
@@ -5473,21 +5468,14 @@ fn prepare_audio_clip_render(
             .checked_add(duration_frames)
             .ok_or_else(|| "render timeline length overflow".to_owned())?;
         output_frames = output_frames.max(end_frame);
-        let live_mixer_fader = (*mixer_track).and_then(|track| {
-            let route_plan = live_fader_routes_by_track
+        let live_mixer_source_control = (*mixer_track).and_then(|track| {
+            let route_plan = live_source_routes_by_track
                 .entry(track)
                 .or_insert_with(|| {
-                    mixer_route_audibility.source_fader_route_plan_for_channel(Some(track))
+                    mixer_route_audibility.live_source_route_plan_for_channel(Some(track))
                 })
                 .clone()?;
-            let (track, volume_raw, route_plan) = route_plan;
-            Some(PreparedClipLiveFader::new(
-                track,
-                volume_raw as f32 / 10_000.0,
-                route_plan.output_transform,
-                route_plan.insert_meter_transforms,
-                options.sample_rate,
-            ))
+            Some(LiveMixerSourceControl::new(route_plan, options.sample_rate))
         });
         clips.push(PreparedClip {
             clip_index: *clip_index,
@@ -5503,7 +5491,7 @@ fn prepare_audio_clip_render(
             pan: *pan,
             pan_law,
             mixer_transform: mixer_route_plan.output_transform,
-            live_mixer_fader,
+            live_mixer_source_control,
             mixer_meter_transforms: mixer_route_plan.insert_meter_transforms.clone(),
         });
     }
@@ -5754,11 +5742,8 @@ struct PreparedSamplerArrangement {
     notes: Vec<ScheduledSamplerNote>,
     sources_by_channel: HashMap<u16, SamplerVoiceSource>,
     mixer_transforms_by_channel: HashMap<u16, MixerSourceRouteTransform>,
-    live_mixer_fader_transforms_by_channel: HashMap<u16, MixerSourceRouteTransform>,
-    live_mixer_faders_by_channel: HashMap<u16, LiveMixerFaderSpec>,
+    live_mixer_source_routes_by_channel: HashMap<u16, MixerLiveSourceRoutePlan>,
     mixer_meter_transforms_by_channel: HashMap<u16, Vec<(usize, MixerSourceRouteTransform)>>,
-    live_mixer_fader_meter_transforms_by_channel:
-        HashMap<u16, Vec<(usize, MixerSourceRouteTransform)>>,
     pattern_clips_rendered: usize,
     pattern_clips_skipped_unsupported_scale: usize,
     source_paths: std::collections::BTreeSet<PathBuf>,
@@ -5859,10 +5844,8 @@ fn prepare_sampler_arrangement(
             notes: Vec::new(),
             sources_by_channel: HashMap::new(),
             mixer_transforms_by_channel: HashMap::new(),
-            live_mixer_fader_transforms_by_channel: HashMap::new(),
-            live_mixer_faders_by_channel: HashMap::new(),
+            live_mixer_source_routes_by_channel: HashMap::new(),
             mixer_meter_transforms_by_channel: HashMap::new(),
-            live_mixer_fader_meter_transforms_by_channel: HashMap::new(),
             pattern_clips_rendered: 0,
             pattern_clips_skipped_unsupported_scale: schedule.clips_skipped_unsupported_scale,
             source_paths: std::collections::BTreeSet::new(),
@@ -5874,12 +5857,8 @@ fn prepare_sampler_arrangement(
     let mut decoded_by_path = HashMap::<PathBuf, Arc<DecodedAudio>>::new();
     let mut sources_by_channel = HashMap::<u16, SamplerVoiceSource>::new();
     let mut mixer_transforms_by_channel = HashMap::<u16, MixerSourceRouteTransform>::new();
-    let mut live_mixer_fader_transforms_by_channel =
-        HashMap::<u16, MixerSourceRouteTransform>::new();
-    let mut live_mixer_faders_by_channel = HashMap::<u16, LiveMixerFaderSpec>::new();
+    let mut live_mixer_source_routes_by_channel = HashMap::<u16, MixerLiveSourceRoutePlan>::new();
     let mut mixer_meter_transforms_by_channel =
-        HashMap::<u16, Vec<(usize, MixerSourceRouteTransform)>>::new();
-    let mut live_mixer_fader_meter_transforms_by_channel =
         HashMap::<u16, Vec<(usize, MixerSourceRouteTransform)>>::new();
     let mut unresolved_sample_channels = std::collections::BTreeSet::new();
     let mut unresolved_clip_indices = BTreeSet::new();
@@ -5978,22 +5957,11 @@ fn prepare_sampler_arrangement(
                 mixer_route_audibility.source_route_plan_for_channel(channel.mixer_track());
             mixer_transforms_by_channel
                 .insert(placed.target_channel_id, route_plan.output_transform);
-            if let Some((track, volume_raw, live_route_plan)) =
-                mixer_route_audibility.source_fader_route_plan_for_channel(channel.mixer_track())
+            if let Some(live_route_plan) =
+                mixer_route_audibility.live_source_route_plan_for_channel(channel.mixer_track())
             {
-                live_mixer_fader_transforms_by_channel
-                    .insert(placed.target_channel_id, live_route_plan.output_transform);
-                live_mixer_faders_by_channel.insert(
-                    placed.target_channel_id,
-                    LiveMixerFaderSpec {
-                        track,
-                        saved_gain: volume_raw as f32 / 10_000.0,
-                    },
-                );
-                live_mixer_fader_meter_transforms_by_channel.insert(
-                    placed.target_channel_id,
-                    live_route_plan.insert_meter_transforms,
-                );
+                live_mixer_source_routes_by_channel
+                    .insert(placed.target_channel_id, live_route_plan);
             }
             mixer_meter_transforms_by_channel
                 .insert(placed.target_channel_id, route_plan.insert_meter_transforms);
@@ -6094,10 +6062,8 @@ fn prepare_sampler_arrangement(
         notes,
         sources_by_channel,
         mixer_transforms_by_channel,
-        live_mixer_fader_transforms_by_channel,
-        live_mixer_faders_by_channel,
+        live_mixer_source_routes_by_channel,
         mixer_meter_transforms_by_channel,
-        live_mixer_fader_meter_transforms_by_channel,
         pattern_clips_rendered: rendered_pattern_clip_indices.len(),
         pattern_clips_skipped_unsupported_scale: schedule.clips_skipped_unsupported_scale,
         source_paths: decoded_by_path.keys().cloned().collect(),
@@ -6111,17 +6077,10 @@ struct PreparedSamplerPattern {
     notes: Vec<ScheduledSamplerNote>,
     sources_by_channel: HashMap<u16, SamplerVoiceSource>,
     mixer_transforms_by_channel: HashMap<u16, MixerSourceRouteTransform>,
-    live_mixer_fader_transforms_by_channel: HashMap<u16, MixerSourceRouteTransform>,
-    live_mixer_faders_by_channel: HashMap<u16, LiveMixerFaderSpec>,
+    live_mixer_source_routes_by_channel: HashMap<u16, MixerLiveSourceRoutePlan>,
     master_output: MixerMasterOutput,
     voice_limit: usize,
     resampling_quality: ResamplingQuality,
-}
-
-#[derive(Clone, Copy)]
-struct LiveMixerFaderSpec {
-    track: usize,
-    saved_gain: f32,
 }
 
 #[derive(Clone)]
@@ -7284,7 +7243,7 @@ impl PlaylistPerformanceRuntime {
             sample_rate: audio_context.sample_rate,
             resampling_quality: audio_context.resampling_quality,
             cancelled: audio_context.cancelled,
-            live_mixer_fader_targets: audio_context.live_mixer_fader_targets,
+            live_mixer_source_targets: audio_context.live_mixer_source_targets,
         };
         mix_prepared_audio_clip_block(
             &dynamic_audio_context,
@@ -8160,8 +8119,7 @@ fn prepare_sampler_pattern_for_channel_internal(
             notes: Vec::new(),
             sources_by_channel: HashMap::new(),
             mixer_transforms_by_channel: HashMap::new(),
-            live_mixer_fader_transforms_by_channel: HashMap::new(),
-            live_mixer_faders_by_channel: HashMap::new(),
+            live_mixer_source_routes_by_channel: HashMap::new(),
             master_output: MixerMasterOutput::from_document(document),
             voice_limit: options.voice_limit,
             resampling_quality: options.resampling_quality,
@@ -8172,9 +8130,7 @@ fn prepare_sampler_pattern_for_channel_internal(
     let mut decoded_by_path = HashMap::<PathBuf, Arc<DecodedAudio>>::new();
     let mut sources_by_channel = HashMap::<u16, SamplerVoiceSource>::new();
     let mut mixer_transforms_by_channel = HashMap::<u16, MixerSourceRouteTransform>::new();
-    let mut live_mixer_fader_transforms_by_channel =
-        HashMap::<u16, MixerSourceRouteTransform>::new();
-    let mut live_mixer_faders_by_channel = HashMap::<u16, LiveMixerFaderSpec>::new();
+    let mut live_mixer_source_routes_by_channel = HashMap::<u16, MixerLiveSourceRoutePlan>::new();
     let mut unresolved_sample_channels = std::collections::BTreeSet::new();
     let mut notes = Vec::with_capacity(sampler_note_count);
     let mut skipped_unresolved = 0usize;
@@ -8266,18 +8222,10 @@ fn prepare_sampler_pattern_for_channel_internal(
             let route_plan =
                 mixer_route_audibility.source_route_plan_for_channel(channel.mixer_track());
             mixer_transforms_by_channel.insert(target_channel_id, route_plan.output_transform);
-            if let Some((track, volume_raw, live_route_plan)) =
-                mixer_route_audibility.source_fader_route_plan_for_channel(channel.mixer_track())
+            if let Some(live_route_plan) =
+                mixer_route_audibility.live_source_route_plan_for_channel(channel.mixer_track())
             {
-                live_mixer_fader_transforms_by_channel
-                    .insert(target_channel_id, live_route_plan.output_transform);
-                live_mixer_faders_by_channel.insert(
-                    target_channel_id,
-                    LiveMixerFaderSpec {
-                        track,
-                        saved_gain: volume_raw as f32 / 10_000.0,
-                    },
-                );
+                live_mixer_source_routes_by_channel.insert(target_channel_id, live_route_plan);
             }
         }
         let Some(source) = sources_by_channel.get(&target_channel_id) else {
@@ -8397,8 +8345,7 @@ fn prepare_sampler_pattern_for_channel_internal(
         notes,
         sources_by_channel,
         mixer_transforms_by_channel,
-        live_mixer_fader_transforms_by_channel,
-        live_mixer_faders_by_channel,
+        live_mixer_source_routes_by_channel,
         master_output: MixerMasterOutput::from_document(document),
         voice_limit: options.voice_limit,
         resampling_quality: options.resampling_quality,
@@ -8410,12 +8357,9 @@ struct SamplerVoiceEngine<'a> {
     notes: &'a [ScheduledSamplerNote],
     live_notes: Vec<ScheduledSamplerNote>,
     mixer_transforms_by_channel: Option<&'a HashMap<u16, MixerSourceRouteTransform>>,
-    live_mixer_fader_transforms_by_channel: Option<&'a HashMap<u16, MixerSourceRouteTransform>>,
-    live_mixer_faders_by_channel: Option<&'a HashMap<u16, LiveMixerFaderSpec>>,
-    live_mixer_fader_targets: Option<&'a MixerTrackPeakMeters>,
+    live_mixer_source_routes_by_channel: Option<&'a HashMap<u16, MixerLiveSourceRoutePlan>>,
+    live_mixer_source_targets: Option<&'a MixerTrackPeakMeters>,
     mixer_meter_transforms_by_channel:
-        Option<&'a HashMap<u16, Vec<(usize, MixerSourceRouteTransform)>>>,
-    live_mixer_fader_meter_transforms_by_channel:
         Option<&'a HashMap<u16, Vec<(usize, MixerSourceRouteTransform)>>>,
     pan_law: PanLaw,
     next_note: usize,
@@ -8449,47 +8393,9 @@ struct SamplerVoice {
     left_gain: f32,
     right_gain: f32,
     mixer_transform: MixerSourceRouteTransform,
-    live_mixer_fader: Option<LiveMixerFader>,
+    live_mixer_source_control: Option<(LiveMixerSourceControl, LiveMixerSourceTargets)>,
     mixer_meter_transforms: Vec<(usize, MixerSourceRouteTransform)>,
     release_remaining: Option<usize>,
-}
-
-struct LiveMixerFader {
-    target_raw: Arc<AtomicI32>,
-    saved_gain: f32,
-    current_gain: f32,
-    smoothing_alpha: f32,
-}
-
-impl LiveMixerFader {
-    fn new(target_raw: Arc<AtomicI32>, saved_gain: f32, sample_rate: u32) -> Self {
-        let target = target_raw.load(Ordering::Acquire);
-        let current_gain = if (0..=16_000).contains(&target) {
-            target as f32 / 10_000.0
-        } else {
-            saved_gain
-        };
-        Self {
-            target_raw,
-            saved_gain,
-            current_gain,
-            smoothing_alpha: crate::audio::output_gain_smoothing_alpha(sample_rate as f32),
-        }
-    }
-
-    fn apply(&mut self, frame: &mut [f32; 2]) -> f32 {
-        let target_raw = self.target_raw.load(Ordering::Acquire);
-        let target_gain = if (0..=16_000).contains(&target_raw) {
-            target_raw as f32 / 10_000.0
-        } else {
-            self.saved_gain
-        };
-        self.current_gain =
-            crate::audio::smooth_output_gain(self.current_gain, target_gain, self.smoothing_alpha);
-        frame[0] *= self.current_gain;
-        frame[1] *= self.current_gain;
-        self.current_gain
-    }
 }
 
 impl<'a> SamplerVoiceEngine<'a> {
@@ -8526,11 +8432,9 @@ impl<'a> SamplerVoiceEngine<'a> {
             notes,
             live_notes: Vec::new(),
             mixer_transforms_by_channel: None,
-            live_mixer_fader_transforms_by_channel: None,
-            live_mixer_faders_by_channel: None,
-            live_mixer_fader_targets: None,
+            live_mixer_source_routes_by_channel: None,
+            live_mixer_source_targets: None,
             mixer_meter_transforms_by_channel: None,
-            live_mixer_fader_meter_transforms_by_channel: None,
             pan_law,
             next_note: 0,
             next_live_note: 0,
@@ -8629,11 +8533,18 @@ impl<'a> SamplerVoiceEngine<'a> {
                     left * gain * voice.left_gain,
                     right * gain * voice.right_gain,
                 ];
-                voice.mixer_transform.apply_frame(&mut routed_frame);
-                let live_fader_gain = voice
-                    .live_mixer_fader
-                    .as_mut()
-                    .map(|live_fader| live_fader.apply(&mut routed_frame));
+                let live_controls =
+                    voice
+                        .live_mixer_source_control
+                        .as_ref()
+                        .map(|(source_control, targets)| {
+                            let controls = source_control.next_frame_controls(targets);
+                            source_control.apply_output_frame(controls, &mut routed_frame);
+                            (source_control, controls)
+                        });
+                if live_controls.is_none() {
+                    voice.mixer_transform.apply_frame(&mut routed_frame);
+                }
                 output_frame[0] += routed_frame[0];
                 output_frame[1] += routed_frame[1];
                 if let Some(meter_buses) = meter_buses.as_deref_mut() {
@@ -8641,13 +8552,21 @@ impl<'a> SamplerVoiceEngine<'a> {
                         left * gain * voice.left_gain,
                         right * gain * voice.right_gain,
                     ];
-                    for (track, transform) in &voice.mixer_meter_transforms {
+                    let meter_transforms = live_controls.map_or_else(
+                        || voice.mixer_meter_transforms.as_slice(),
+                        |(source_control, _)| source_control.insert_meter_transforms(),
+                    );
+                    for (track, transform) in meter_transforms {
                         debug_assert!(*track < MIXER_TRACK_METER_COUNT);
                         let mut meter_frame = source_frame;
-                        transform.apply_frame(&mut meter_frame);
-                        if let Some(gain) = live_fader_gain {
-                            meter_frame[0] *= gain;
-                            meter_frame[1] *= gain;
+                        if let Some((source_control, controls)) = live_controls {
+                            source_control.apply_meter_frame(
+                                controls,
+                                *transform,
+                                &mut meter_frame,
+                            );
+                        } else {
+                            transform.apply_frame(&mut meter_frame);
                         }
                         let meter_offset = *track * meter_stride_samples + offset * 2;
                         meter_buses[meter_offset] += meter_frame[0];
@@ -8711,37 +8630,22 @@ impl<'a> SamplerVoiceEngine<'a> {
             self.pan_law,
         );
         let velocity_gain = f32::from(note.velocity.min(127)) / 127.0;
-        let live_fader = self
-            .live_mixer_faders_by_channel
-            .and_then(|faders| faders.get(&note.channel_id))
-            .and_then(|spec| {
-                let target = self
-                    .live_mixer_fader_targets?
-                    .live_mixer_insert_fader_raw(spec.track)?;
-                Some((
-                    *spec,
-                    LiveMixerFader::new(target, spec.saved_gain, self.output_sample_rate),
-                ))
+        let live_mixer_source_control = self
+            .live_mixer_source_routes_by_channel
+            .and_then(|routes| routes.get(&note.channel_id))
+            .and_then(|route_plan| {
+                let control =
+                    LiveMixerSourceControl::new(route_plan.clone(), self.output_sample_rate);
+                let targets = control.targets(self.live_mixer_source_targets?)?;
+                Some((control, targets))
             });
-        let mixer_transform = if live_fader.is_some() {
-            self.live_mixer_fader_transforms_by_channel
-                .and_then(|transforms| transforms.get(&note.channel_id).copied())
-        } else {
-            None
-        }
-        .or_else(|| {
-            self.mixer_transforms_by_channel
-                .and_then(|transforms| transforms.get(&note.channel_id).copied())
-        })
-        .unwrap_or_default();
-        let mixer_meter_transforms = (live_fader.is_some())
-            .then_some(self.live_mixer_fader_meter_transforms_by_channel)
-            .flatten()
+        let mixer_transform = self
+            .mixer_transforms_by_channel
+            .and_then(|transforms| transforms.get(&note.channel_id).copied())
+            .unwrap_or_default();
+        let mixer_meter_transforms = self
+            .mixer_meter_transforms_by_channel
             .and_then(|transforms| transforms.get(&note.channel_id))
-            .or_else(|| {
-                self.mixer_meter_transforms_by_channel
-                    .and_then(|transforms| transforms.get(&note.channel_id))
-            })
             .cloned()
             .unwrap_or_default();
         self.voices[slot_index] = Some(SamplerVoice {
@@ -8766,7 +8670,7 @@ impl<'a> SamplerVoiceEngine<'a> {
             left_gain,
             right_gain,
             mixer_transform,
-            live_mixer_fader: live_fader.map(|(_, fader)| fader),
+            live_mixer_source_control,
             mixer_meter_transforms,
             release_remaining: None,
         });
@@ -9169,65 +9073,8 @@ struct PreparedClip {
     pan: f32,
     pan_law: PanLaw,
     mixer_transform: MixerSourceRouteTransform,
-    live_mixer_fader: Option<PreparedClipLiveFader>,
+    live_mixer_source_control: Option<LiveMixerSourceControl>,
     mixer_meter_transforms: Vec<(usize, MixerSourceRouteTransform)>,
-}
-
-#[derive(Clone, Debug)]
-struct PreparedClipLiveFader {
-    track: usize,
-    transform: MixerSourceRouteTransform,
-    meter_transforms: Vec<(usize, MixerSourceRouteTransform)>,
-    current_gain_bits: Arc<AtomicU32>,
-    started: Arc<AtomicBool>,
-    smoothing_alpha: f32,
-}
-
-impl PreparedClipLiveFader {
-    fn new(
-        track: usize,
-        saved_gain: f32,
-        transform: MixerSourceRouteTransform,
-        meter_transforms: Vec<(usize, MixerSourceRouteTransform)>,
-        sample_rate: u32,
-    ) -> Self {
-        Self {
-            track,
-            transform,
-            meter_transforms,
-            current_gain_bits: Arc::new(AtomicU32::new(saved_gain.to_bits())),
-            started: Arc::new(AtomicBool::new(false)),
-            smoothing_alpha: crate::audio::output_gain_smoothing_alpha(sample_rate as f32),
-        }
-    }
-
-    fn apply(&self, target: &AtomicI32, frame: &mut [f32; 2]) -> Option<f32> {
-        let target_raw = target.load(Ordering::Acquire);
-        if !(0..=16_000).contains(&target_raw) {
-            return None;
-        }
-        let target_gain = target_raw as f32 / 10_000.0;
-        let current_gain = if self.started.swap(true, Ordering::Relaxed) {
-            f32::from_bits(self.current_gain_bits.load(Ordering::Relaxed))
-        } else {
-            target_gain
-        };
-        let next_gain =
-            crate::audio::smooth_output_gain(current_gain, target_gain, self.smoothing_alpha);
-        self.current_gain_bits
-            .store(next_gain.to_bits(), Ordering::Relaxed);
-        self.transform.apply_frame(frame);
-        frame[0] *= next_gain;
-        frame[1] *= next_gain;
-        Some(next_gain)
-    }
-
-    fn meter_transform(&self, track: usize) -> Option<MixerSourceRouteTransform> {
-        self.meter_transforms
-            .iter()
-            .find(|(meter_track, _)| *meter_track == track)
-            .map(|(_, transform)| *transform)
-    }
 }
 
 struct PreparedAudioClipRender {
@@ -9270,7 +9117,7 @@ struct AudioClipMixWorkerTask<'a> {
     sample_rate: u32,
     resampling_quality: ResamplingQuality,
     cancelled: &'a AtomicBool,
-    live_mixer_fader_targets: Option<&'a MixerTrackPeakMeters>,
+    live_mixer_source_targets: Option<&'a MixerTrackPeakMeters>,
     control: Arc<AudioClipMixWorkerControl>,
     scratch: Arc<Vec<Mutex<AudioClipMixWorkerScratch>>>,
 }
@@ -9281,7 +9128,7 @@ struct PreparedAudioClipMixContext<'a> {
     sample_rate: u32,
     resampling_quality: ResamplingQuality,
     cancelled: &'a AtomicBool,
-    live_mixer_fader_targets: Option<&'a MixerTrackPeakMeters>,
+    live_mixer_source_targets: Option<&'a MixerTrackPeakMeters>,
 }
 
 struct ParallelAudioClipMixer<'scope> {
@@ -9383,7 +9230,7 @@ impl<'scope> ParallelAudioClipMixer<'scope> {
                         sample_rate: audio_context.sample_rate,
                         resampling_quality: audio_context.resampling_quality,
                         cancelled: audio_context.cancelled,
-                        live_mixer_fader_targets: audio_context.live_mixer_fader_targets,
+                        live_mixer_source_targets: audio_context.live_mixer_source_targets,
                         control: worker_control,
                         scratch: worker_scratch,
                     });
@@ -9509,7 +9356,7 @@ fn audio_clip_mix_worker(task: AudioClipMixWorkerTask<'_>) {
         sample_rate,
         resampling_quality,
         cancelled,
-        live_mixer_fader_targets,
+        live_mixer_source_targets,
         control,
         scratch,
     } = task;
@@ -9572,7 +9419,7 @@ fn audio_clip_mix_worker(task: AudioClipMixWorkerTask<'_>) {
                         cancelled: Some(cancelled),
                         meter_buses: meter_buses.as_deref_mut(),
                         meter_stride_samples: sample_count,
-                        live_mixer_fader_targets,
+                        live_mixer_source_targets,
                     },
                 )
                 .map_err(|error| {
@@ -9629,7 +9476,7 @@ fn mix_prepared_audio_clip_block(
                 cancelled: Some(context.cancelled),
                 meter_buses: meter_buses.as_deref_mut(),
                 meter_stride_samples,
-                live_mixer_fader_targets: context.live_mixer_fader_targets,
+                live_mixer_source_targets: context.live_mixer_source_targets,
             },
         )
         .map_err(|error| {
@@ -10008,7 +9855,7 @@ fn mix_clip_window_into_stereo_with_quality(
             cancelled,
             meter_buses: None,
             meter_stride_samples: mix.len(),
-            live_mixer_fader_targets: None,
+            live_mixer_source_targets: None,
         },
     )
 }
@@ -10017,7 +9864,7 @@ struct ClipMixMonitor<'a> {
     cancelled: Option<&'a AtomicBool>,
     meter_buses: Option<&'a mut [f32]>,
     meter_stride_samples: usize,
-    live_mixer_fader_targets: Option<&'a MixerTrackPeakMeters>,
+    live_mixer_source_targets: Option<&'a MixerTrackPeakMeters>,
 }
 
 fn mix_clip_window_into_stereo_with_quality_and_meter(
@@ -10033,7 +9880,7 @@ fn mix_clip_window_into_stereo_with_quality_and_meter(
         cancelled,
         mut meter_buses,
         meter_stride_samples,
-        live_mixer_fader_targets,
+        live_mixer_source_targets,
     } = monitor;
     if source.channels.is_empty() || source.channels.len() > 2 {
         return Err("source must have one or two channels".to_owned());
@@ -10073,11 +9920,12 @@ fn mix_clip_window_into_stereo_with_quality_and_meter(
     if overlap_start >= overlap_end {
         return Ok(());
     }
-    let live_fader_target = clip
-        .live_mixer_fader
+    let live_mixer_targets = clip
+        .live_mixer_source_control
         .as_ref()
-        .and_then(|fader| live_mixer_fader_targets?.live_mixer_insert_fader_raw(fader.track))
-        .filter(|target| (0..=16_000).contains(&target.load(Ordering::Acquire)));
+        .and_then(|source_control| {
+            live_mixer_source_targets.and_then(|meters| source_control.targets(meters))
+        });
     let (left_pan_gain, right_pan_gain) =
         channel_pan_gains(clip.pan, source.channels.len() == 1, clip.pan_law);
     let source_frames_per_output =
@@ -10114,17 +9962,28 @@ fn mix_clip_window_into_stereo_with_quality_and_meter(
             left * clip.gain * left_pan_gain,
             right * clip.gain * right_pan_gain,
         ];
-        let live_fader_gain = match (clip.live_mixer_fader.as_ref(), live_fader_target.as_deref()) {
-            (Some(fader), Some(target)) => fader.apply(target, &mut frame),
+        let live_controls = match (
+            clip.live_mixer_source_control.as_ref(),
+            live_mixer_targets.as_ref(),
+        ) {
+            (Some(source_control), Some(targets)) => {
+                let controls = source_control.next_frame_controls(targets);
+                source_control.apply_output_frame(controls, &mut frame);
+                Some((source_control, controls))
+            }
             _ => None,
         };
-        if live_fader_gain.is_none() {
+        if live_controls.is_none() {
             clip.mixer_transform.apply_frame(&mut frame);
         }
         mix[output_index] += frame[0];
         mix[output_index + 1] += frame[1];
         if let Some(meter_buses) = meter_buses.as_deref_mut() {
-            for (track, transform) in &clip.mixer_meter_transforms {
+            let meter_transforms = live_controls.map_or_else(
+                || clip.mixer_meter_transforms.as_slice(),
+                |(source_control, _)| source_control.insert_meter_transforms(),
+            );
+            for (track, transform) in meter_transforms {
                 if *track >= MIXER_TRACK_METER_COUNT {
                     return Err("Mixer meter route exceeds the supported track range".to_owned());
                 }
@@ -10132,12 +9991,8 @@ fn mix_clip_window_into_stereo_with_quality_and_meter(
                     left * clip.gain * left_pan_gain,
                     right * clip.gain * right_pan_gain,
                 ];
-                if let (Some(fader), Some(gain)) = (clip.live_mixer_fader.as_ref(), live_fader_gain)
-                    && let Some(transform) = fader.meter_transform(*track)
-                {
-                    transform.apply_frame(&mut meter_frame);
-                    meter_frame[0] *= gain;
-                    meter_frame[1] *= gain;
+                if let Some((source_control, controls)) = live_controls {
+                    source_control.apply_meter_frame(controls, *transform, &mut meter_frame);
                 } else {
                     transform.apply_frame(&mut meter_frame);
                 }
@@ -10440,6 +10295,28 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64};
 
     static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(1);
+
+    fn test_live_mixer_source_control(
+        track: usize,
+        saved_fader_gain: f32,
+        saved_pan_raw: Option<i32>,
+        output_transform: MixerSourceRouteTransform,
+        insert_meter_transforms: Vec<(usize, MixerSourceRouteTransform)>,
+        sample_rate: u32,
+    ) -> LiveMixerSourceControl {
+        LiveMixerSourceControl::new(
+            MixerLiveSourceRoutePlan {
+                track,
+                source_transform: MixerSourceRouteTransform::default(),
+                saved_fader_gain,
+                saved_pan_raw,
+                pan_law_raw: Some(2),
+                output_transform,
+                insert_meter_transforms,
+            },
+            sample_rate,
+        )
+    }
 
     #[test]
     fn live_layer_note_offs_reuse_each_overlapping_note_on_target_set() {
@@ -10766,63 +10643,128 @@ mod tests {
     }
 
     #[test]
-    fn live_insert_fader_smooths_changes_from_its_saved_gain() {
-        let target = Arc::new(AtomicI32::new(10_000));
-        let mut fader = LiveMixerFader::new(Arc::clone(&target), 1.0, 48_000);
+    fn live_mixer_source_fader_smooths_changes_from_its_saved_gain() {
+        let source_control = test_live_mixer_source_control(
+            1,
+            1.0,
+            None,
+            MixerSourceRouteTransform::default(),
+            Vec::new(),
+            48_000,
+        );
+        let meters = MixerTrackPeakMeters::default();
+        meters.set_live_mixer_insert_fader_raw(1, Some(10_000));
+        let targets = source_control.targets(&meters).unwrap();
 
         let mut frame = [1.0, 0.5];
-        fader.apply(&mut frame);
+        let controls = source_control.next_frame_controls(&targets);
+        source_control.apply_output_frame(controls, &mut frame);
         assert_eq!(frame, [1.0, 0.5]);
 
-        target.store(0, Ordering::Release);
+        meters.set_live_mixer_insert_fader_raw(1, Some(0));
         frame = [1.0, 0.5];
-        fader.apply(&mut frame);
+        let controls = source_control.next_frame_controls(&targets);
+        source_control.apply_output_frame(controls, &mut frame);
         assert!(frame[0] < 1.0 && frame[0] > 0.99);
         assert_eq!(frame[1], frame[0] * 0.5);
 
         for _ in 0..100_000 {
             frame = [1.0, 0.5];
-            fader.apply(&mut frame);
+            let controls = source_control.next_frame_controls(&targets);
+            source_control.apply_output_frame(controls, &mut frame);
         }
         assert!(frame[0] < 0.001);
         assert_eq!(frame[1], frame[0] * 0.5);
 
-        target.store(i32::MIN, Ordering::Release);
+        meters.set_live_mixer_insert_fader_raw(1, None);
         for _ in 0..100_000 {
             frame = [1.0, 0.5];
-            fader.apply(&mut frame);
+            let controls = source_control.next_frame_controls(&targets);
+            source_control.apply_output_frame(controls, &mut frame);
         }
         assert!(frame[0] > 0.999);
         assert_eq!(frame[1], frame[0] * 0.5);
     }
 
     #[test]
-    fn live_playlist_audio_clip_fader_smooths_changes_from_its_current_gain() {
-        let fader = PreparedClipLiveFader::new(
+    fn cloned_live_mixer_sources_keep_independent_smoothing_state() {
+        let source_control = test_live_mixer_source_control(
             1,
             1.0,
+            None,
             MixerSourceRouteTransform::default(),
             Vec::new(),
             48_000,
         );
-        let target = AtomicI32::new(10_000);
+        let meters = MixerTrackPeakMeters::default();
+        meters.set_live_mixer_insert_fader_raw(1, Some(10_000));
+        let targets = source_control.targets(&meters).unwrap();
+        let mut frame = [1.0, 1.0];
+        let controls = source_control.next_frame_controls(&targets);
+        source_control.apply_output_frame(controls, &mut frame);
+
+        meters.set_live_mixer_insert_fader_raw(1, Some(0));
+        let controls = source_control.next_frame_controls(&targets);
+        frame = [1.0, 1.0];
+        source_control.apply_output_frame(controls, &mut frame);
+        let cloned_control = source_control.clone();
+        let cloned_targets = cloned_control.targets(&meters).unwrap();
+
+        for _ in 0..100_000 {
+            let controls = source_control.next_frame_controls(&targets);
+            frame = [1.0, 1.0];
+            source_control.apply_output_frame(controls, &mut frame);
+        }
+        assert!(frame[0] < 0.001);
+
+        let controls = cloned_control.next_frame_controls(&cloned_targets);
+        let mut cloned_frame = [1.0, 1.0];
+        cloned_control.apply_output_frame(controls, &mut cloned_frame);
+        assert!(cloned_frame[0] > 0.99);
+    }
+
+    #[test]
+    fn live_playlist_audio_clip_fader_smooths_changes_from_its_current_gain() {
+        let source_control = test_live_mixer_source_control(
+            1,
+            1.0,
+            None,
+            MixerSourceRouteTransform::default(),
+            Vec::new(),
+            48_000,
+        );
+        let meters = MixerTrackPeakMeters::default();
+        meters.set_live_mixer_insert_fader_raw(1, Some(10_000));
+        let targets = source_control.targets(&meters).unwrap();
 
         let mut frame = [1.0, 0.5];
-        assert_eq!(fader.apply(&target, &mut frame), Some(1.0));
+        let controls = source_control.next_frame_controls(&targets);
+        source_control.apply_output_frame(controls, &mut frame);
         assert_eq!(frame, [1.0, 0.5]);
 
-        target.store(0, Ordering::Release);
+        meters.set_live_mixer_insert_fader_raw(1, Some(0));
         frame = [1.0, 0.5];
-        let gain = fader.apply(&target, &mut frame).unwrap();
+        let controls = source_control.next_frame_controls(&targets);
+        source_control.apply_output_frame(controls, &mut frame);
+        let gain = frame[0];
         assert!(gain < 1.0 && gain > 0.99);
         assert_eq!(frame[1], frame[0] * 0.5);
 
         for _ in 0..100_000 {
             frame = [1.0, 0.5];
-            fader.apply(&target, &mut frame);
+            let controls = source_control.next_frame_controls(&targets);
+            source_control.apply_output_frame(controls, &mut frame);
         }
         assert!(frame[0] < 0.001);
         assert_eq!(frame[1], frame[0] * 0.5);
+
+        meters.set_live_mixer_insert_fader_raw(1, None);
+        for _ in 0..100_000 {
+            frame = [1.0, 0.5];
+            let controls = source_control.next_frame_controls(&targets);
+            source_control.apply_output_frame(controls, &mut frame);
+        }
+        assert!((frame[0] - 1.0).abs() < 0.001);
     }
 
     #[test]
@@ -10846,9 +10788,10 @@ mod tests {
             pan: 0.0,
             pan_law: PanLaw::Circular,
             mixer_transform: saved_transform,
-            live_mixer_fader: Some(PreparedClipLiveFader::new(
+            live_mixer_source_control: Some(test_live_mixer_source_control(
                 1,
                 1.5,
+                None,
                 MixerSourceRouteTransform::default().scaled(1.5),
                 vec![
                     (1, MixerSourceRouteTransform::default()),
@@ -10877,7 +10820,7 @@ mod tests {
                 cancelled: None,
                 meter_buses: Some(&mut meter_buses),
                 meter_stride_samples: 4,
-                live_mixer_fader_targets: Some(&meters),
+                live_mixer_source_targets: Some(&meters),
             },
         )
         .unwrap();
@@ -10886,7 +10829,6 @@ mod tests {
         assert_eq!(&meter_buses[4..8], &[0.5, 0.125, 0.25, -0.5]);
         assert_eq!(&meter_buses[8..12], &[0.25, 0.0625, 0.125, -0.25]);
 
-        let offline_meters = MixerTrackPeakMeters::default();
         let mut offline_mix = vec![0.0; 4];
         mix_clip_window_into_stereo_with_quality_and_meter(
             &mut offline_mix,
@@ -10899,11 +10841,94 @@ mod tests {
                 cancelled: None,
                 meter_buses: None,
                 meter_stride_samples: 4,
-                live_mixer_fader_targets: Some(&offline_meters),
+                live_mixer_source_targets: None,
             },
         )
         .unwrap();
         assert_eq!(offline_mix, vec![2.25, 0.5625, 1.125, -2.25]);
+    }
+
+    #[test]
+    fn live_playlist_audio_clip_pan_smooths_before_send_routes() {
+        let source = DecodedAudio {
+            sample_rate: 1_000,
+            channels: vec![vec![1.0; 2], vec![1.0; 2]],
+        };
+        let meter_transforms = vec![
+            (1, MixerSourceRouteTransform::default()),
+            (2, MixerSourceRouteTransform::default().scaled(0.5)),
+        ];
+        let clip = PreparedClip {
+            clip_index: 0,
+            playlist_track_id: None,
+            channel_id: 1,
+            mixer_track: Some(1),
+            path: PathBuf::new(),
+            start_frame: 0,
+            source_bounds: SampleBounds { start: 0, end: 2 },
+            pitch_ratio: 1.0,
+            duration_frames: 2,
+            gain: 1.0,
+            pan: 0.0,
+            pan_law: PanLaw::Triangular,
+            mixer_transform: MixerSourceRouteTransform::default(),
+            live_mixer_source_control: Some(test_live_mixer_source_control(
+                1,
+                1.0,
+                Some(0),
+                MixerSourceRouteTransform::default(),
+                meter_transforms.clone(),
+                1_000,
+            )),
+            mixer_meter_transforms: meter_transforms,
+        };
+        let meters = MixerTrackPeakMeters::default();
+        meters.set_live_mixer_insert_fader_raw(1, Some(10_000));
+        meters.set_live_mixer_insert_pan_raw(1, Some(0));
+        let mut initial_mix = vec![0.0; 2];
+        let mut initial_meter_buses = vec![0.0; MIXER_TRACK_METER_COUNT * 2];
+        mix_clip_window_into_stereo_with_quality_and_meter(
+            &mut initial_mix,
+            0,
+            &source,
+            &clip,
+            1_000,
+            ResamplingQuality::Linear,
+            ClipMixMonitor {
+                cancelled: None,
+                meter_buses: Some(&mut initial_meter_buses),
+                meter_stride_samples: 2,
+                live_mixer_source_targets: Some(&meters),
+            },
+        )
+        .unwrap();
+        assert_eq!(initial_mix, vec![1.0, 1.0]);
+
+        meters.set_live_mixer_insert_pan_raw(1, Some(6_400));
+        let mut changed_mix = vec![0.0; 2];
+        let mut changed_meter_buses = vec![0.0; MIXER_TRACK_METER_COUNT * 2];
+        mix_clip_window_into_stereo_with_quality_and_meter(
+            &mut changed_mix,
+            1,
+            &source,
+            &clip,
+            1_000,
+            ResamplingQuality::Linear,
+            ClipMixMonitor {
+                cancelled: None,
+                meter_buses: Some(&mut changed_meter_buses),
+                meter_stride_samples: 2,
+                live_mixer_source_targets: Some(&meters),
+            },
+        )
+        .unwrap();
+
+        assert!(changed_mix[0] < 1.0 && changed_mix[0] > 0.9);
+        assert!(changed_mix[1] > 1.0 && changed_mix[1] < 1.1);
+        assert!(changed_meter_buses[2] < 1.0 && changed_meter_buses[2] > 0.9);
+        assert!(changed_meter_buses[3] > 1.0 && changed_meter_buses[3] < 1.1);
+        assert!((changed_meter_buses[4] - changed_mix[0] * 0.5).abs() < 1e-6);
+        assert!((changed_meter_buses[5] - changed_mix[1] * 0.5).abs() < 1e-6);
     }
 
     #[test]
@@ -10926,7 +10951,7 @@ mod tests {
             sample_rate: 1_000,
             resampling_quality: ResamplingQuality::Linear,
             cancelled: &cancelled,
-            live_mixer_fader_targets: Some(&meters),
+            live_mixer_source_targets: Some(&meters),
         };
         let mixer_transform = MixerSourceRouteTransform::default().scaled(2.0);
         let meter_transforms = vec![
@@ -10947,9 +10972,10 @@ mod tests {
             pan: 0.0,
             pan_law: PanLaw::Circular,
             mixer_transform,
-            live_mixer_fader: Some(PreparedClipLiveFader::new(
+            live_mixer_source_control: Some(test_live_mixer_source_control(
                 1,
                 1.0,
+                None,
                 MixerSourceRouteTransform::default(),
                 meter_transforms.clone(),
                 1_000,
@@ -12162,7 +12188,7 @@ mod tests {
                 mixer_transform: MixerSourceRouteTransform::from_insert_transform(
                     MixerInsertSignalTransform::default().with_fader_volume_raw(Some(15_000)),
                 ),
-                live_mixer_fader: None,
+                live_mixer_source_control: None,
                 mixer_meter_transforms: vec![
                     (1, MixerSourceRouteTransform::default()),
                     (
@@ -12220,15 +12246,19 @@ mod tests {
                 2,
                 MixerSourceRouteTransform::default().scaled(2.25),
             )]),
-            live_mixer_fader_transforms_by_channel: HashMap::from([(
+            live_mixer_source_routes_by_channel: HashMap::from([(
                 2,
-                MixerSourceRouteTransform::default().scaled(1.5),
-            )]),
-            live_mixer_faders_by_channel: HashMap::from([(
-                2,
-                LiveMixerFaderSpec {
+                MixerLiveSourceRoutePlan {
                     track: 1,
-                    saved_gain: 1.5,
+                    source_transform: MixerSourceRouteTransform::default(),
+                    saved_fader_gain: 1.5,
+                    saved_pan_raw: None,
+                    pan_law_raw: Some(2),
+                    output_transform: MixerSourceRouteTransform::default().scaled(1.5),
+                    insert_meter_transforms: vec![
+                        (1, MixerSourceRouteTransform::default()),
+                        (2, MixerSourceRouteTransform::default().scaled(0.5)),
+                    ],
                 },
             )]),
             mixer_meter_transforms_by_channel: HashMap::from([(
@@ -12236,19 +12266,6 @@ mod tests {
                 vec![
                     (1, MixerSourceRouteTransform::default().scaled(1.5)),
                     (2, MixerSourceRouteTransform::default().scaled(0.75)),
-                ],
-            )]),
-            live_mixer_fader_meter_transforms_by_channel: HashMap::from([(
-                2,
-                vec![
-                    (1, MixerSourceRouteTransform::default()),
-                    (
-                        2,
-                        MixerSourceRouteTransform::from_insert_transform(
-                            MixerInsertSignalTransform::default()
-                                .with_fader_volume_raw(Some(5_000)),
-                        ),
-                    ),
                 ],
             )]),
             pattern_clips_rendered: 1,
@@ -12520,7 +12537,7 @@ mod tests {
                 pan: 0.0,
                 pan_law: PanLaw::Circular,
                 mixer_transform: transform,
-                live_mixer_fader: None,
+                live_mixer_source_control: None,
                 mixer_meter_transforms: vec![(usize::try_from(mixer_track).unwrap(), transform)],
             }
         })
@@ -12533,7 +12550,7 @@ mod tests {
             sample_rate: 8,
             resampling_quality: ResamplingQuality::Linear,
             cancelled: &cancelled,
-            live_mixer_fader_targets: None,
+            live_mixer_source_targets: None,
         };
         let mut serial = vec![0.0; 16];
         let mut serial_meters = vec![0.0; MIXER_TRACK_METER_COUNT * 16];
@@ -12594,7 +12611,7 @@ mod tests {
             pan: 0.0,
             pan_law: PanLaw::Circular,
             mixer_transform: MixerSourceRouteTransform::default(),
-            live_mixer_fader: None,
+            live_mixer_source_control: None,
             mixer_meter_transforms: Vec::new(),
         };
         let mut mix = vec![0.0; 8];
@@ -12643,7 +12660,7 @@ mod tests {
             pan: 0.0,
             pan_law: PanLaw::Circular,
             mixer_transform: MixerSourceRouteTransform::default(),
-            live_mixer_fader: None,
+            live_mixer_source_control: None,
             mixer_meter_transforms: Vec::new(),
         };
         let mut mix = vec![0.0; 4];
@@ -12674,7 +12691,7 @@ mod tests {
             mixer_transform: MixerSourceRouteTransform::from_insert_transform(
                 MixerInsertSignalTransform::new(true, true),
             ),
-            live_mixer_fader: None,
+            live_mixer_source_control: None,
             mixer_meter_transforms: Vec::new(),
         };
         let mut mix = vec![0.0; 2];
@@ -12708,7 +12725,7 @@ mod tests {
             pan: 0.5,
             pan_law: PanLaw::Circular,
             mixer_transform: MixerSourceRouteTransform::default(),
-            live_mixer_fader: None,
+            live_mixer_source_control: None,
             mixer_meter_transforms: Vec::new(),
         };
         let render = PreparedAudioClipRender {
