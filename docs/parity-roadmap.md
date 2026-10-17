@@ -362,11 +362,12 @@ are applied where the Mixer rows below describe. Full export surface:
   selected VST3 channel's pattern notes to WAV, FLAC, Ogg Vorbis, or MP3 through
   the loaded instrument and either save the file or insert it as a new Audio
   Clip on the selected Playlist track at the current transport or seek position.
-  It uses the shared render depth, dither, bitrate, and channel-mode settings;
-  VST3 output buses must be mono or stereo. FL Studio renders selected patterns
-  to audio clips with configurable render settings; full-pattern multi-channel
-  VST3 rendering, all native render options, and complete Mixer routing/effects
-  remain incomplete ([Image-Line Patterns
+  The Audio menu can also sum every loaded VST3 channel with notes in the
+  selected Pattern into one file or Audio Clip, using each channel's swing and
+  pitch settings. These VST3 renders use the shared render depth, dither,
+  bitrate, and channel-mode settings; output buses must be mono or stereo.
+  Mixer routing/effects and all native render options remain incomplete
+  ([Image-Line Patterns
   manual](https://www.image-line.com/fl-studio-learning-content/fl-studio-online-manual/html/menu_patterns.htm)).
 - `[obsolete]` Burn to CD-era options.
 
