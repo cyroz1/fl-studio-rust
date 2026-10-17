@@ -4387,7 +4387,9 @@ fn live_layer_sampler_children(document: &FlpDocument, source_channel_id: u16) -
         .filter(|child_id| seen.insert(**child_id))
         .filter_map(|child_id| channels.iter().find(|channel| channel.id() == *child_id))
         .filter(|child| {
-            child.enabled() != Some(false) && child.channel_type() == Some(ChannelType::Sampler)
+            child.enabled() != Some(false)
+                && (child.channel_type() == Some(ChannelType::Sampler)
+                    || child.is_sample_backed_instrument())
         })
         .map(ChannelSummary::id)
         .collect()
@@ -4433,7 +4435,10 @@ fn resolve_live_vst3_input_targets(
     }
 
     match source.channel_type() {
-        Some(ChannelType::Instrument) if loaded_vst3_channels.contains(&source_channel_id) => {
+        Some(ChannelType::Instrument)
+            if source.plugin_identifier().is_some()
+                && loaded_vst3_channels.contains(&source_channel_id) =>
+        {
             Ok(Some(vec![LiveVst3InputTarget {
                 channel_id: source_channel_id,
                 key_regions: source.keyboard_key_region().into_iter().collect(),
@@ -4456,15 +4461,22 @@ fn resolve_live_vst3_input_targets(
             }
             let sampler_children = enabled_children
                 .iter()
-                .filter(|child| child.channel_type() == Some(ChannelType::Sampler))
+                .filter(|child| {
+                    child.channel_type() == Some(ChannelType::Sampler)
+                        || child.is_sample_backed_instrument()
+                })
                 .count();
             let vst3_children = enabled_children
                 .iter()
-                .filter(|child| child.channel_type() == Some(ChannelType::Instrument))
+                .filter(|child| {
+                    child.channel_type() == Some(ChannelType::Instrument)
+                        && !child.is_sample_backed_instrument()
+                })
                 .count();
             if sampler_children + vst3_children != enabled_children.len() {
                 return Err(
-                    "Live Layer audition supports Sampler and VST3 children only".to_owned(),
+                    "Live Layer audition supports Sampler, sample-backed Instrument, and VST3 children only"
+                        .to_owned(),
                 );
             }
             if sampler_children == enabled_children.len() {
@@ -4472,7 +4484,10 @@ fn resolve_live_vst3_input_targets(
             }
             enabled_children
                 .iter()
-                .filter(|child| child.channel_type() == Some(ChannelType::Instrument))
+                .filter(|child| {
+                    child.channel_type() == Some(ChannelType::Instrument)
+                        && !child.is_sample_backed_instrument()
+                })
                 .map(|child| {
                     if !loaded_vst3_channels.contains(&child.id()) {
                         return Err(format!(
@@ -24584,7 +24599,10 @@ impl DawUi {
             .count();
         let sampler_channel_ids: BTreeSet<_> = channels
             .iter()
-            .filter(|channel| channel.kind() == Some(0) && channel.enabled() != Some(false))
+            .filter(|channel| {
+                (channel.kind() == Some(0) || channel.is_sample_backed_instrument())
+                    && channel.enabled() != Some(false)
+            })
             .map(|channel| channel.id())
             .collect();
         let has_sampler_notes =
@@ -28420,13 +28438,13 @@ impl DawUi {
             .channels()
             .into_iter()
             .find(|channel| channel.id() == channel_id);
-        let is_sampler = channel
-            .as_ref()
-            .is_some_and(|channel| channel.kind() == Some(0));
+        let is_sampler = channel.as_ref().is_some_and(|channel| {
+            channel.kind() == Some(0) || channel.is_sample_backed_instrument()
+        });
         let instance_id = self.channel_vst3_instances.get(&channel_id).copied();
         if instance_id.is_none() && !is_sampler {
             self.status =
-                "Select a Sampler channel or load a VST3 instrument to preview this chord"
+                "Select a Sampler or sample-backed Instrument channel, or load a VST3 instrument to preview this chord"
                     .to_owned();
             return;
         }
@@ -28693,7 +28711,9 @@ impl DawUi {
             .channels()
             .into_iter()
             .find(|channel| channel.id() == channel_id)
-            .is_some_and(|channel| channel.kind() == Some(0));
+            .is_some_and(|channel| {
+                channel.kind() == Some(0) || channel.is_sample_backed_instrument()
+            });
         let pitch_offset_cents = project_channel_master_pitch_offset_cents(document, channel_id);
         let note_pitch_offset_semitones =
             project_channel_vst3_note_pitch_offset_semitones(document, channel_id);
@@ -37227,6 +37247,14 @@ impl DawUi {
                     return false;
                 }
             }
+            Some(4) if channel.is_sample_backed_instrument() => {
+                if channel.enabled() == Some(false) {
+                    self.status =
+                        "Enable the selected sample-backed Instrument channel for live MIDI audition"
+                            .to_owned();
+                    return false;
+                }
+            }
             Some(3) => {
                 if channel.enabled() == Some(false) {
                     self.status =
@@ -37243,10 +37271,11 @@ impl DawUi {
                     }
                     match child.channel_type() {
                         Some(ChannelType::Sampler) => {}
+                        Some(ChannelType::Instrument) if child.is_sample_backed_instrument() => {}
                         Some(ChannelType::Instrument) => continue,
                         _ => {
                             self.status =
-                                "Live Layer audition supports Sampler and VST3 children only"
+                                "Live Layer audition supports Sampler, sample-backed Instrument, and VST3 children only"
                                     .to_owned();
                             return false;
                         }
@@ -37255,12 +37284,15 @@ impl DawUi {
                 }
                 if sampler_children.is_empty() {
                     self.status =
-                        "The selected Layer has no enabled Sampler children to audition".to_owned();
+                        "The selected Layer has no enabled sample-playback children to audition"
+                            .to_owned();
                     return false;
                 }
             }
             _ => {
-                self.status = "Select a Sampler or Layer channel for live MIDI audition".to_owned();
+                self.status =
+                    "Select a Sampler, sample-backed Instrument, or Layer channel for live MIDI audition"
+                        .to_owned();
                 return false;
             }
         }
@@ -46450,7 +46482,10 @@ fn playlist_freeze_pattern_sources_supported(
         }
         match source.channel_type() {
             Some(ChannelType::Sampler) => {}
-            Some(ChannelType::Instrument) if loaded_vst3_channels.contains(&source.id()) => {}
+            Some(ChannelType::Instrument) if source.is_sample_backed_instrument() => {}
+            Some(ChannelType::Instrument)
+                if source.plugin_identifier().is_some()
+                    && loaded_vst3_channels.contains(&source.id()) => {}
             Some(ChannelType::Instrument) => {
                 return Err(format!(
                     "Pattern {} uses an unloaded instrument channel",
@@ -46487,8 +46522,10 @@ fn playlist_freeze_pattern_sources_supported(
                     }
                     match child.channel_type() {
                         Some(ChannelType::Sampler) => {}
+                        Some(ChannelType::Instrument) if child.is_sample_backed_instrument() => {}
                         Some(ChannelType::Instrument)
-                            if loaded_vst3_channels.contains(&child.id()) => {}
+                            if child.plugin_identifier().is_some()
+                                && loaded_vst3_channels.contains(&child.id()) => {}
                         _ => {
                             return Err(format!(
                                 "Pattern {} has a Layer child that this renderer cannot process",

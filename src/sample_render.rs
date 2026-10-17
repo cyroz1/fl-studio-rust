@@ -426,9 +426,22 @@ fn resolve_sampler_channel_root_key(
     // Add to Key applies the channel root as a note-input offset. Keep the
     // sample's embedded or default root key as the source pitch reference.
     let saved_root_key = (!channel.keyboard_add_to_key_enabled())
-        .then(|| channel.sampler_root_key())
+        .then(|| sample_note_channel_root_key(channel))
         .flatten();
     resolve_sampler_root_key(saved_root_key, sample_root_key, read_sample_root_note)
+}
+
+fn sample_note_channel_root_key(channel: &ChannelSummary) -> Option<u16> {
+    channel.sampler_root_key().or_else(|| {
+        channel
+            .is_sample_backed_instrument()
+            .then(|| channel.instrument_root_key())
+            .flatten()
+    })
+}
+
+fn is_sample_note_channel(channel: &ChannelSummary) -> bool {
+    channel.kind() == Some(0) || channel.is_sample_backed_instrument()
 }
 
 fn sampler_note_pitch_offset_semitones(
@@ -439,7 +452,7 @@ fn sampler_note_pitch_offset_semitones(
     let root_key_offset = if channel.keyboard_add_to_key_enabled() {
         // A saved root above the sample root moves the incoming note down.
         i16::from(sample_root_key as u8)
-            - i16::from(channel.sampler_root_key().unwrap_or(sample_root_key) as u8)
+            - i16::from(sample_note_channel_root_key(channel).unwrap_or(sample_root_key) as u8)
     } else {
         0
     };
@@ -1034,6 +1047,7 @@ fn playlist_performance_sampler_source_supported(
     }
     match source.channel_type() {
         Some(ChannelType::Sampler) => true,
+        Some(ChannelType::Instrument) if source.is_sample_backed_instrument() => true,
         Some(ChannelType::Layer) => {
             let mut seen = BTreeSet::new();
             let Some(child_ids) = source.layer_child_ids() else {
@@ -1053,6 +1067,9 @@ fn playlist_performance_sampler_source_supported(
                 }
                 match child.channel_type() {
                     Some(ChannelType::Sampler) => has_enabled_sampler = true,
+                    Some(ChannelType::Instrument) if child.is_sample_backed_instrument() => {
+                        has_enabled_sampler = true;
+                    }
                     Some(ChannelType::Instrument)
                         if child.plugin_identifier().is_some()
                             && loaded_vst3_channels.contains(&child_id) => {}
@@ -1236,6 +1253,7 @@ fn playlist_performance_vst3_source_targets(
                 }
                 match child.channel_type() {
                     Some(ChannelType::Sampler) => {}
+                    Some(ChannelType::Instrument) if child.is_sample_backed_instrument() => {}
                     Some(ChannelType::Instrument) if child.plugin_identifier().is_some() => {
                         plugin_targets.push(child_id);
                     }
@@ -4872,6 +4890,9 @@ pub fn stream_sampler_midi_input_to_device(
         .collect::<HashMap<_, _>>();
     let sampler_channel_ids = match source_channel.channel_type() {
         Some(ChannelType::Sampler) => BTreeSet::from([channel_id]),
+        Some(ChannelType::Instrument) if source_channel.is_sample_backed_instrument() => {
+            BTreeSet::from([channel_id])
+        }
         Some(ChannelType::Layer) => {
             let mut sampler_channel_ids = BTreeSet::new();
             for child_id in source_channel.layer_child_ids().unwrap_or_default() {
@@ -4883,6 +4904,9 @@ pub fn stream_sampler_midi_input_to_device(
                 }
                 match child.channel_type() {
                     Some(ChannelType::Sampler) => {
+                        sampler_channel_ids.insert(*child_id);
+                    }
+                    Some(ChannelType::Instrument) if child.is_sample_backed_instrument() => {
                         sampler_channel_ids.insert(*child_id);
                     }
                     Some(ChannelType::Instrument) => continue,
@@ -5852,7 +5876,7 @@ fn prepare_sampler_arrangement(
                     channels_by_id
                         .get(target_channel_id)
                         .is_some_and(|channel| {
-                            channel.kind() == Some(0)
+                            is_sample_note_channel(channel)
                                 && channel.enabled() != Some(false)
                                 && if include_muted_mixer_sources {
                                     mixer_route_audibility
@@ -5915,7 +5939,7 @@ fn prepare_sampler_arrangement(
         let Some(channel) = channels_by_id.get(&placed.target_channel_id) else {
             continue;
         };
-        if channel.kind() != Some(0) || channel.enabled() == Some(false) {
+        if !is_sample_note_channel(channel) || channel.enabled() == Some(false) {
             continue;
         }
         if let std::collections::hash_map::Entry::Vacant(source_entry) =
@@ -5937,8 +5961,8 @@ fn prepare_sampler_arrangement(
                 }
             };
             let wave_metadata = wav_sampler_metadata(&resolved_path).unwrap_or_default();
-            let loop_points = channel
-                .sampler_uses_loop_points()
+            let sampler_options_apply = channel.kind() == Some(0);
+            let loop_points = (sampler_options_apply && channel.sampler_uses_loop_points())
                 .then_some(wave_metadata.loop_points)
                 .flatten();
             let audio = if let Some(audio) = decoded_by_path.get(&resolved_path) {
@@ -5946,14 +5970,14 @@ fn prepare_sampler_arrangement(
             } else {
                 let audio = decode_audio_file(&resolved_path).map_err(|error| {
                     format!(
-                        "could not decode sample for Sampler channel {} at {}: {error}",
+                        "could not decode sample for sample-playback channel {} at {}: {error}",
                         placed.target_channel_id,
                         resolved_path.display()
                     )
                 })?;
                 if !(1..=2).contains(&audio.channels.len()) {
                     return Err(format!(
-                        "Sampler channel {} uses a {}-channel sample; only mono and stereo are supported by this renderer",
+                        "sample-playback channel {} uses a {}-channel sample; only mono and stereo are supported by this renderer",
                         placed.target_channel_id,
                         audio.channels.len()
                     ));
@@ -5978,7 +6002,7 @@ fn prepare_sampler_arrangement(
                 audio,
                 gain: gain * sampler_wav_gain(wave_metadata.gain_db),
                 pan,
-                reverse: channel.sample_reversed(),
+                reverse: sampler_options_apply && channel.sample_reversed(),
                 root_key: resolve_sampler_channel_root_key(
                     channel,
                     wave_metadata.root_key,
@@ -5989,7 +6013,7 @@ fn prepare_sampler_arrangement(
                         document.metadata().master_pitch_cents(),
                     )),
                 loop_bounds,
-                ping_pong_loop: channel.sampler_ping_pong_loop_enabled(),
+                ping_pong_loop: sampler_options_apply && channel.sampler_ping_pong_loop_enabled(),
             });
             let route_plan =
                 mixer_route_audibility.source_route_plan_for_channel(channel.mixer_track());
@@ -8141,7 +8165,7 @@ fn prepare_sampler_pattern_for_channel_internal(
                     channels_by_id
                         .get(target_channel_id)
                         .is_some_and(|channel| {
-                            channel.kind() == Some(0)
+                            is_sample_note_channel(channel)
                                 && channel.enabled() != Some(false)
                                 && if include_muted_mixer_sources {
                                     mixer_route_audibility
@@ -8160,7 +8184,7 @@ fn prepare_sampler_pattern_for_channel_internal(
     let sampler_note_count = sampler_notes.len();
     if sampler_note_count == 0 && !allow_empty {
         return Err(format!(
-            "pattern {} contains no notes on enabled Sampler channels",
+            "pattern {} contains no notes on enabled Sampler or sample-backed Instrument channels",
             options.pattern_id
         ));
     }
@@ -8206,7 +8230,7 @@ fn prepare_sampler_pattern_for_channel_internal(
         let Some(channel) = channels_by_id.get(&target_channel_id) else {
             continue;
         };
-        if channel.kind() != Some(0) || channel.enabled() == Some(false) {
+        if !is_sample_note_channel(channel) || channel.enabled() == Some(false) {
             continue;
         }
         if let std::collections::hash_map::Entry::Vacant(source_entry) =
@@ -8226,8 +8250,8 @@ fn prepare_sampler_pattern_for_channel_internal(
                 }
             };
             let wave_metadata = wav_sampler_metadata(&resolved_path).unwrap_or_default();
-            let loop_points = channel
-                .sampler_uses_loop_points()
+            let sampler_options_apply = channel.kind() == Some(0);
+            let loop_points = (sampler_options_apply && channel.sampler_uses_loop_points())
                 .then_some(wave_metadata.loop_points)
                 .flatten();
             let audio = if let Some(audio) = decoded_by_path.get(&resolved_path) {
@@ -8235,14 +8259,14 @@ fn prepare_sampler_pattern_for_channel_internal(
             } else {
                 let audio = decode_audio_file(&resolved_path).map_err(|error| {
                     format!(
-                        "could not decode sample for Sampler channel {} at {}: {error}",
+                        "could not decode sample for sample-playback channel {} at {}: {error}",
                         target_channel_id,
                         resolved_path.display()
                     )
                 })?;
                 if !(1..=2).contains(&audio.channels.len()) {
                     return Err(format!(
-                        "Sampler channel {} uses a {}-channel sample; only mono and stereo are supported by this renderer",
+                        "sample-playback channel {} uses a {}-channel sample; only mono and stereo are supported by this renderer",
                         target_channel_id,
                         audio.channels.len()
                     ));
@@ -8267,7 +8291,7 @@ fn prepare_sampler_pattern_for_channel_internal(
                 audio,
                 gain: gain * sampler_wav_gain(wave_metadata.gain_db),
                 pan,
-                reverse: channel.sample_reversed(),
+                reverse: sampler_options_apply && channel.sample_reversed(),
                 root_key: resolve_sampler_channel_root_key(
                     channel,
                     wave_metadata.root_key,
@@ -8278,7 +8302,7 @@ fn prepare_sampler_pattern_for_channel_internal(
                         document.metadata().master_pitch_cents(),
                     )),
                 loop_bounds,
-                ping_pong_loop: channel.sampler_ping_pong_loop_enabled(),
+                ping_pong_loop: sampler_options_apply && channel.sampler_ping_pong_loop_enabled(),
             });
             let route_plan =
                 mixer_route_audibility.source_route_plan_for_channel(channel.mixer_track());
@@ -12060,7 +12084,7 @@ mod tests {
         let router = ChannelNoteRouter::new(channels.clone());
         let sampler_channel_ids = channels
             .iter()
-            .filter(|channel| channel.channel_type() == Some(ChannelType::Sampler))
+            .filter(|channel| is_sample_note_channel(channel))
             .map(ChannelSummary::id)
             .collect::<BTreeSet<_>>();
         let patterns = document.patterns().expect("mixed Pattern should decode");
@@ -13923,6 +13947,94 @@ mod tests {
             SAMPLER_ROOT_KEY
         );
         assert_eq!(resolve_sampler_root_key(None, None, true), SAMPLER_ROOT_KEY);
+    }
+
+    #[test]
+    fn sample_backed_instrument_notes_play_and_apply_root_key_and_add_to_key() {
+        fn sample_backed_instrument_fixture(add_to_key: bool) -> FlpDocument {
+            fn append_data_event(event_stream: &mut Vec<u8>, opcode: u8, payload: &[u8]) {
+                assert!(payload.len() < 128);
+                event_stream.extend_from_slice(&[opcode, payload.len() as u8]);
+                event_stream.extend_from_slice(payload);
+            }
+
+            let mut event_stream = vec![0x40, 0, 0, 0x15, 4, 0x87];
+            event_stream.extend_from_slice(&64_u32.to_le_bytes());
+            append_data_event(&mut event_stream, 0xC4, b"sample.wav\0");
+            let mut parameters = vec![0_u8; 80];
+            parameters[63] = u8::from(add_to_key);
+            parameters[68..72].copy_from_slice(&0_u32.to_le_bytes());
+            parameters[72..76].copy_from_slice(&127_u32.to_le_bytes());
+            append_data_event(&mut event_stream, 0xC7, &parameters);
+
+            event_stream.extend_from_slice(&[0x41, 7, 0, 0xD0, 24]);
+            let mut note = [0_u8; 24];
+            note[4..6].copy_from_slice(&0x4000_u16.to_le_bytes());
+            note[8..12].copy_from_slice(&96_u32.to_le_bytes());
+            note[12..14].copy_from_slice(&60_u16.to_le_bytes());
+            note[21] = 100;
+            event_stream.extend_from_slice(&note);
+            event_stream.extend_from_slice(&[0x62, 0, 0]);
+
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(b"FLhd");
+            bytes.extend_from_slice(&6_u32.to_le_bytes());
+            bytes.extend_from_slice(&0_u16.to_le_bytes());
+            bytes.extend_from_slice(&0_u16.to_le_bytes());
+            bytes.extend_from_slice(&96_u16.to_le_bytes());
+            bytes.extend_from_slice(b"FLdt");
+            bytes.extend_from_slice(&(event_stream.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&event_stream);
+            FlpDocument::parse(&bytes).expect("sample-backed Instrument fixture should parse")
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "flp-sample-backed-instrument-{}-{}",
+            std::process::id(),
+            NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).expect("temporary test folder should be created");
+        let project_path = root.join("song.flp");
+        fs::write(&project_path, b"FLP fixture").expect("project fixture should be written");
+        let sample_path = root.join("sample.wav");
+        write_stereo_wav_from_buffer(
+            &sample_path,
+            &[0.25_f32; 32],
+            48_000,
+            16,
+            WavSampleFormat::Float32,
+            WavDitherMode::Off,
+            WavChannelMode::Stereo,
+        )
+        .expect("sample fixture should be written");
+
+        let options = SamplerPatternRenderOptions {
+            pattern_id: 7,
+            sample_rate: 48_000,
+            ..SamplerPatternRenderOptions::default()
+        };
+        let default_root_document = sample_backed_instrument_fixture(false);
+        assert!(default_root_document.channels()[0].is_sample_backed_instrument());
+        let default_root =
+            prepare_sampler_pattern(&default_root_document, &project_path, options, false, None)
+                .expect("sample-backed Instrument pattern should prepare");
+        assert_eq!(default_root.summary.notes_rendered, 1);
+        assert_eq!(default_root.sources_by_channel[&0].root_key, 64);
+        assert_eq!(default_root.notes[0].key, 60);
+
+        let add_to_key_document = sample_backed_instrument_fixture(true);
+        let add_to_key =
+            prepare_sampler_pattern(&add_to_key_document, &project_path, options, false, None)
+                .expect("Add to Key sample-backed Instrument pattern should prepare");
+        assert_eq!(add_to_key.sources_by_channel[&0].root_key, 60);
+        assert_eq!(add_to_key.notes[0].key, 56);
+        let (mix, summary) =
+            render_sampler_pattern_to_stereo_buffer(&add_to_key_document, &project_path, options)
+                .expect("sample-backed Instrument notes should render");
+        assert_eq!(summary.notes_rendered, 1);
+        assert!(mix.iter().any(|sample| sample.abs() > 0.0));
+
+        fs::remove_dir_all(root).expect("temporary test folder should be removed");
     }
 
     #[test]

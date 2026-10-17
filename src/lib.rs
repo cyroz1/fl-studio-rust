@@ -752,6 +752,13 @@ impl ChannelSummary {
             .map(|note| note as u16)
     }
 
+    /// Whether a kind-4 Instrument is backed by one sample instead of a plug-in.
+    pub fn is_sample_backed_instrument(&self) -> bool {
+        self.kind == Some(ChannelType::Instrument.raw())
+            && self.sample_path.is_some()
+            && self.plugin_identifier().is_none()
+    }
+
     /// Saved root key for a Layer channel, when the raw value is a MIDI key number.
     pub fn layer_root_key(&self) -> Option<u16> {
         if self.kind != Some(ChannelType::Layer.raw()) {
@@ -14033,9 +14040,9 @@ impl FlpDocument {
             if matching_children.next().is_some() {
                 return Err(FlpError::AmbiguousChannelId(child_id));
             }
-            if !matches!(child.kind, Some(0 | 2)) {
+            if !matches!(child.kind, Some(0 | 2)) && !child.is_sample_backed_instrument() {
                 return Err(FlpError::UnsupportedEdit(
-                    "Layer splitting supports Sampler and Native instrument children only",
+                    "Layer splitting supports Sampler, Native instrument, and sample-backed Instrument children only",
                 ));
             }
 
@@ -14065,7 +14072,7 @@ impl FlpDocument {
                 60
             } else {
                 return Err(FlpError::UnsupportedEdit(
-                    "each Sampler child must have one recognized root-key event",
+                    "each Sampler or sample-backed Instrument child must have one recognized root-key event",
                 ));
             };
             let offset = u32::try_from(child_offset).map_err(|_| {
@@ -27385,6 +27392,43 @@ mod tests {
         let encoded = document
             .encode_lossless()
             .expect("split project should encode");
+        let reopened = FlpDocument::parse(&encoded).expect("split project should reopen");
+        assert_eq!(reopened.channels(), document.channels());
+        assert_eq!(reopened.encode_lossless().unwrap(), encoded);
+    }
+
+    #[test]
+    fn splitting_layer_sample_backed_instrument_children_assigns_keys_and_shifts_roots() {
+        let mut event_stream = vec![0x40, 0, 0, 0x15, 3, 0x87];
+        event_stream.extend_from_slice(&60_u32.to_le_bytes());
+        event_stream.extend_from_slice(&[0x5E, 1, 0, 0x5E, 2, 0]);
+        for (channel_id, root_key, sample_path) in [(1_u8, 72_u32, "low.wav"), (2, 48, "high.wav")]
+        {
+            event_stream.extend_from_slice(&[0x40, channel_id, 0, 0x15, 4, 0x87]);
+            event_stream.extend_from_slice(&root_key.to_le_bytes());
+            append_data_event(
+                &mut event_stream,
+                0xC4,
+                &[sample_path.as_bytes(), b"\0"].concat(),
+            );
+        }
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        let original = flp_fixture(&event_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&original).expect("sample-backed Layer parses");
+        assert!(document.channels()[1].is_sample_backed_instrument());
+
+        document
+            .split_layer_children_across_keyboard(0)
+            .expect("sample-backed Instrument children should split");
+
+        let channels = document.channels();
+        assert_eq!(channels[1].instrument_root_key(), Some(72));
+        assert_eq!(channels[1].keyboard_key_region(), Some((60, 60)));
+        assert_eq!(channels[2].instrument_root_key(), Some(49));
+        assert_eq!(channels[2].keyboard_key_region(), Some((61, 61)));
+        let encoded = document
+            .encode_lossless()
+            .expect("split sample-backed Layer should encode");
         let reopened = FlpDocument::parse(&encoded).expect("split project should reopen");
         assert_eq!(reopened.channels(), document.channels());
         assert_eq!(reopened.encode_lossless().unwrap(), encoded);
