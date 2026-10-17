@@ -3945,7 +3945,7 @@ fn apply_stereo_mixer_transform(
     if !stereo.len().is_multiple_of(2) {
         return Err("VST3 Pattern mixer transform requires interleaved stereo samples".to_owned());
     }
-    for frame in stereo.chunks_exact_mut(2) {
+    for frame in stereo.as_chunks_mut::<2>().0 {
         let mut routed_frame = [frame[0], frame[1]];
         transform.apply_frame(&mut routed_frame);
         frame[0] = finite_sample(routed_frame[0]);
