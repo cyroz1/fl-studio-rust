@@ -378,9 +378,7 @@ fn candidate_live_mixer_send_key(
     sends: &[MixerSendSummary],
     selected_send: &MixerSendSummary,
 ) -> Option<(usize, usize)> {
-    if selected_send.enabled() != Some(true) {
-        return None;
-    }
+    selected_send.enabled()?;
     let destination_track = usize::from(selected_send.route_parameter_id().checked_sub(64)?);
     if destination_track >= MIXER_TRACK_METER_COUNT {
         return None;
@@ -388,7 +386,7 @@ fn candidate_live_mixer_send_key(
     let matching_routes = sends
         .iter()
         .filter(|send| {
-            send.enabled() == Some(true)
+            send.enabled().is_some()
                 && send.insert_ordinal() == selected_send.insert_ordinal()
                 && send.route_parameter_id() == selected_send.route_parameter_id()
         })
@@ -9540,6 +9538,11 @@ impl DawUi {
                     source_track,
                     destination_track,
                     Some(send.value()),
+                );
+                self.mixer_track_peak_meters.set_live_mixer_send_enabled(
+                    source_track,
+                    destination_track,
+                    send.enabled(),
                 );
             }
         }
@@ -35840,9 +35843,22 @@ impl DawUi {
         if !send_flag_edits.is_empty()
             && let Some(document) = self.document.as_mut()
         {
+            let sends = document.mixer_send_summaries().unwrap_or_default();
+            let mut applied_live_mixer_send_enabled = Vec::new();
             for (event_index, flag_index, enabled) in send_flag_edits {
+                let live_send_key = sends
+                    .iter()
+                    .find(|send| send.routing_flag_location() == Some((event_index, flag_index)))
+                    .and_then(|send| candidate_live_mixer_send_key(&sends, send));
                 match document.set_mixer_routing_flag(event_index, flag_index, enabled) {
                     Ok(()) => {
+                        if let Some((source_track, destination_track)) = live_send_key {
+                            applied_live_mixer_send_enabled.push((
+                                source_track,
+                                destination_track,
+                                enabled,
+                            ));
+                        }
                         self.dirty = true;
                         self.status =
                             format!("Updated Mixer routing event {event_index}, flag {flag_index}");
@@ -35851,6 +35867,13 @@ impl DawUi {
                         self.status = format!("Could not edit Mixer routing flag: {error}");
                     }
                 }
+            }
+            for (source_track, destination_track, enabled) in applied_live_mixer_send_enabled {
+                self.mixer_track_peak_meters.set_live_mixer_send_enabled(
+                    source_track,
+                    destination_track,
+                    Some(enabled),
+                );
             }
         }
     }
@@ -48790,15 +48813,15 @@ mod tests {
         PlaylistTempoMap, PlaylistTrack, PluginCandidate, PluginFormat, TimeSelectionShift,
         TouchGesture, TouchTapTracker, TouchZoomConfig, WINDOW_LAYOUT_PRESETS_HEADER,
         WindowLayoutPreset, audio_recording_start_tick_with_offset,
-        built_in_midi_controller_templates, candidate_matches_vst_identity,
-        candidate_mixer_controls, candidate_mixer_stereo_separation, detect_chord_name,
-        detect_piano_roll_channel_scale, detect_piano_roll_scale, encode_midi_device_id,
-        encode_midi_device_selections, first_available_playlist_track,
-        is_performance_clip_trigger_channel_event, midi_button_press_edge,
-        midi_controller_binding_for_device, next_piano_roll_note_group, note_from_grid_position,
-        parse_midi_control_change_mapping, parse_midi_controller_templates,
-        parse_midi_device_selections, parse_window_layout_presets, pattern_loop_frame_at_tick,
-        pattern_loop_tick_at_frame, piano_roll_color_group_note_ids,
+        built_in_midi_controller_templates, candidate_live_mixer_send_key,
+        candidate_matches_vst_identity, candidate_mixer_controls,
+        candidate_mixer_stereo_separation, detect_chord_name, detect_piano_roll_channel_scale,
+        detect_piano_roll_scale, encode_midi_device_id, encode_midi_device_selections,
+        first_available_playlist_track, is_performance_clip_trigger_channel_event,
+        midi_button_press_edge, midi_controller_binding_for_device, next_piano_roll_note_group,
+        note_from_grid_position, parse_midi_control_change_mapping,
+        parse_midi_controller_templates, parse_midi_device_selections, parse_window_layout_presets,
+        pattern_loop_frame_at_tick, pattern_loop_tick_at_frame, piano_roll_color_group_note_ids,
         piano_roll_controller_stroke_points, piano_roll_controller_value_at,
         piano_roll_controller_value_range, piano_roll_cross_pattern_ghost_notes,
         piano_roll_discard_length_edit, piano_roll_duplicate_offset,
@@ -48822,6 +48845,69 @@ mod tests {
         touch_pan_zoom_scroll_offset, track_two_finger_tap, update_channel_rack_selection,
         update_layer_child_selection, update_piano_roll_box_selection, zoom_to_fit,
     };
+
+    fn mixer_send_route_fixture() -> FlpDocument {
+        fn append_data_event(event_stream: &mut Vec<u8>, opcode: u8, payload: &[u8]) {
+            event_stream.push(opcode);
+            let mut size = payload.len() as u32;
+            while size >= 0x80 {
+                event_stream.push((size as u8) | 0x80);
+                size >>= 7;
+            }
+            event_stream.push(size as u8);
+            event_stream.extend_from_slice(payload);
+        }
+
+        let mut event_stream = Vec::new();
+        for (ordinal, color, routing_flags) in [
+            (0_usize, 0x001C_1F8C_u32, &[][..]),
+            (1, 0x001D_2792, &[0][..]),
+            (2, 0x001E_3A81, &[1][..]),
+        ] {
+            event_stream.push(0x9A);
+            event_stream.extend_from_slice(&(-1_i32).to_le_bytes());
+            event_stream.push(0x93);
+            event_stream.extend_from_slice(&(-1_i32).to_le_bytes());
+            event_stream.push(0x95);
+            event_stream.extend_from_slice(&color.to_le_bytes());
+            append_data_event(&mut event_stream, 0xE7, &[b'A' + ordinal as u8, 0]);
+            append_data_event(&mut event_stream, 0xEB, routing_flags);
+        }
+
+        let mut parameter_payload = Vec::new();
+        for (source_insert, route_id, value) in [(65_u16, 66_u8, 6_400_i32), (66, 64, 12_800)] {
+            parameter_payload.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+            parameter_payload.extend_from_slice(&[route_id, 0]);
+            parameter_payload.extend_from_slice(&(source_insert << 6).to_le_bytes());
+            parameter_payload.extend_from_slice(&value.to_le_bytes());
+        }
+        append_data_event(&mut event_stream, 0xE1, &parameter_payload);
+
+        let mut bytes = b"FLhd".to_vec();
+        bytes.extend_from_slice(&6_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&96_u16.to_le_bytes());
+        bytes.extend_from_slice(b"FLdt");
+        bytes.extend_from_slice(&(event_stream.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&event_stream);
+        FlpDocument::parse(&bytes).expect("Mixer send route fixture should parse")
+    }
+
+    #[test]
+    fn unique_disabled_mixer_send_has_a_live_target_key() {
+        let document = mixer_send_route_fixture();
+        let sends = document
+            .mixer_send_summaries()
+            .expect("Mixer send summary should decode");
+        let send = sends
+            .iter()
+            .find(|send| send.insert_ordinal() == 1 && send.route_parameter_id() == 66)
+            .expect("the disabled send should be present");
+
+        assert_eq!(send.enabled(), Some(false));
+        assert_eq!(candidate_live_mixer_send_key(&sends, send), Some((1, 2)));
+    }
 
     fn playlist_track_arrangement_fixture(clips: &[(u32, u32, u16)]) -> Arrangement {
         let mut event_stream = vec![0x63, 3, 0];
