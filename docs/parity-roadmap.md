@@ -352,17 +352,20 @@ are applied where the Mixer rows below describe. Full export surface:
   ([Image-Line Playlist
   manual](https://www.image-line.com/fl-studio-learning-content/fl-studio-online-manual/html/playlist.htm)).
 - `[partial]` Playlist track freeze: **Freeze track from song start…** renders the selected track from tick zero, places the resulting Audio Clip on the same track, and mutes all original clips in one undoable edit. The action uses the selected Playlist output format and leaves the arrangement unchanged when known scaled clips, unresolved Sampler sources, unloaded VST3 channels, or a changed project prevent safe placement. Mixer effects and automation are not rendered; non-render-based smart disable and native output comparison remain incomplete.
-- `[partial]` Pattern render: the Piano roll can render enabled Sampler notes
-  from the selected pattern to WAV with the shared bit depth, dither, and
-  channel-mode settings, applying supported directly
-  assigned insert mute/solo/phase/swap state and Master flags; a mapped VST3 channel can
-  render its selected pattern notes to the selected WAV, FLAC, Ogg Vorbis, or
-  MP3 format through the loaded instrument, using the shared render depth, dither,
-  bitrate, and channel-mode settings. VST3 output buses must be mono or stereo.
-  FL Studio renders selected patterns to audio clips with configurable render
-  settings; these exports are separate files and do not add an Audio Clip, apply
-  all native render options, or include complete Mixer routing/effects ([Image-Line
-  Patterns manual](https://www.image-line.com/fl-studio-learning-content/fl-studio-online-manual/html/menu_patterns.htm)).
+- `[partial]` Pattern render: the Piano roll can render enabled Sampler and
+  sample-backed Instrument notes from the selected pattern to WAV, FLAC, Ogg
+  Vorbis, or MP3 with the shared depth, dither, bitrate, and channel-mode
+  settings, applying supported directly assigned insert mute/solo/phase/swap
+  state and Master flags. The File menu can also place this sample-backed
+  pattern render as a new Audio Clip on the selected Playlist track at the
+  current transport or seek position. A mapped VST3 channel can render its
+  selected pattern notes to WAV, FLAC, Ogg Vorbis, or MP3 through the loaded
+  instrument, using the shared render depth, dither, bitrate, and channel-mode
+  settings; VST3 output buses must be mono or stereo. FL Studio renders selected
+  patterns to audio clips with configurable render settings; full-pattern VST3
+  rendering, all native render options, and complete Mixer routing/effects
+  remain incomplete ([Image-Line Patterns
+  manual](https://www.image-line.com/fl-studio-learning-content/fl-studio-online-manual/html/menu_patterns.htm)).
 - `[obsolete]` Burn to CD-era options.
 
 ---
