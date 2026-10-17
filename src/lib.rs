@@ -2438,15 +2438,6 @@ impl MixerRouteAudibility {
         ))
     }
 
-    /// Returns the pre-Master transform for all supported insert-to-insert send paths.
-    /// The final Master transform remains applied once after sources are summed.
-    pub(crate) fn source_route_transform_for_channel(
-        &self,
-        route: Option<i8>,
-    ) -> MixerSourceRouteTransform {
-        self.source_route_plan_for_channel(route).output_transform
-    }
-
     /// Returns the final pre-Master route plus each insert's summed pre-effect meter path.
     pub(crate) fn source_route_plan_for_channel(&self, route: Option<i8>) -> MixerSourceRoutePlan {
         let Some(track) = route.filter(|track| *track > 0 && self.known_tracks.contains(track))
@@ -19662,7 +19653,8 @@ mod tests {
         assert!(solo_routing.allows_channel(Some(1)));
         let mut solo_frame = [0.25, 0.5];
         solo_routing
-            .source_route_transform_for_channel(Some(1))
+            .source_route_plan_for_channel(Some(1))
+            .output_transform
             .apply_frame(&mut solo_frame);
         assert_eq!(solo_frame, [0.25, 0.5]);
         assert!(!solo_routing.allows_channel(None));

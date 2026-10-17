@@ -4271,6 +4271,8 @@ fn stream_prepared_playlist_render_with_performance(
         sampler_engine.live_mixer_faders_by_channel =
             Some(&render.sampler.live_mixer_faders_by_channel);
         sampler_engine.live_mixer_fader_targets = Some(meters);
+        sampler_engine.live_mixer_fader_meter_transforms_by_channel =
+            Some(&render.sampler.live_mixer_fader_meter_transforms_by_channel);
     }
     sampler_engine.mixer_meter_transforms_by_channel =
         Some(&render.sampler.mixer_meter_transforms_by_channel);
@@ -5747,6 +5749,8 @@ struct PreparedSamplerArrangement {
     live_mixer_fader_transforms_by_channel: HashMap<u16, MixerSourceRouteTransform>,
     live_mixer_faders_by_channel: HashMap<u16, LiveMixerFaderSpec>,
     mixer_meter_transforms_by_channel: HashMap<u16, Vec<(usize, MixerSourceRouteTransform)>>,
+    live_mixer_fader_meter_transforms_by_channel:
+        HashMap<u16, Vec<(usize, MixerSourceRouteTransform)>>,
     pattern_clips_rendered: usize,
     pattern_clips_skipped_unsupported_scale: usize,
     source_paths: std::collections::BTreeSet<PathBuf>,
@@ -5850,6 +5854,7 @@ fn prepare_sampler_arrangement(
             live_mixer_fader_transforms_by_channel: HashMap::new(),
             live_mixer_faders_by_channel: HashMap::new(),
             mixer_meter_transforms_by_channel: HashMap::new(),
+            live_mixer_fader_meter_transforms_by_channel: HashMap::new(),
             pattern_clips_rendered: 0,
             pattern_clips_skipped_unsupported_scale: schedule.clips_skipped_unsupported_scale,
             source_paths: std::collections::BTreeSet::new(),
@@ -5865,6 +5870,8 @@ fn prepare_sampler_arrangement(
         HashMap::<u16, MixerSourceRouteTransform>::new();
     let mut live_mixer_faders_by_channel = HashMap::<u16, LiveMixerFaderSpec>::new();
     let mut mixer_meter_transforms_by_channel =
+        HashMap::<u16, Vec<(usize, MixerSourceRouteTransform)>>::new();
+    let mut live_mixer_fader_meter_transforms_by_channel =
         HashMap::<u16, Vec<(usize, MixerSourceRouteTransform)>>::new();
     let mut unresolved_sample_channels = std::collections::BTreeSet::new();
     let mut unresolved_clip_indices = BTreeSet::new();
@@ -5963,19 +5970,21 @@ fn prepare_sampler_arrangement(
                 mixer_route_audibility.source_route_plan_for_channel(channel.mixer_track());
             mixer_transforms_by_channel
                 .insert(placed.target_channel_id, route_plan.output_transform);
-            if let Some((transform, volume_raw)) = mixer_route_audibility
-                .direct_source_fader_transform_for_channel(channel.mixer_track())
-                && let Some(track) = channel
-                    .mixer_track()
-                    .and_then(|track| usize::try_from(track).ok())
+            if let Some((track, volume_raw, live_route_plan)) =
+                mixer_route_audibility.source_fader_route_plan_for_channel(channel.mixer_track())
             {
-                live_mixer_fader_transforms_by_channel.insert(placed.target_channel_id, transform);
+                live_mixer_fader_transforms_by_channel
+                    .insert(placed.target_channel_id, live_route_plan.output_transform);
                 live_mixer_faders_by_channel.insert(
                     placed.target_channel_id,
                     LiveMixerFaderSpec {
                         track,
                         saved_gain: volume_raw as f32 / 10_000.0,
                     },
+                );
+                live_mixer_fader_meter_transforms_by_channel.insert(
+                    placed.target_channel_id,
+                    live_route_plan.insert_meter_transforms,
                 );
             }
             mixer_meter_transforms_by_channel
@@ -6080,6 +6089,7 @@ fn prepare_sampler_arrangement(
         live_mixer_fader_transforms_by_channel,
         live_mixer_faders_by_channel,
         mixer_meter_transforms_by_channel,
+        live_mixer_fader_meter_transforms_by_channel,
         pattern_clips_rendered: rendered_pattern_clip_indices.len(),
         pattern_clips_skipped_unsupported_scale: schedule.clips_skipped_unsupported_scale,
         source_paths: decoded_by_path.keys().cloned().collect(),
@@ -8245,17 +8255,14 @@ fn prepare_sampler_pattern_for_channel_internal(
                 loop_bounds,
                 ping_pong_loop: channel.sampler_ping_pong_loop_enabled(),
             });
-            mixer_transforms_by_channel.insert(
-                target_channel_id,
-                mixer_route_audibility.source_route_transform_for_channel(channel.mixer_track()),
-            );
-            if let Some((transform, volume_raw)) = mixer_route_audibility
-                .direct_source_fader_transform_for_channel(channel.mixer_track())
-                && let Some(track) = channel
-                    .mixer_track()
-                    .and_then(|track| usize::try_from(track).ok())
+            let route_plan =
+                mixer_route_audibility.source_route_plan_for_channel(channel.mixer_track());
+            mixer_transforms_by_channel.insert(target_channel_id, route_plan.output_transform);
+            if let Some((track, volume_raw, live_route_plan)) =
+                mixer_route_audibility.source_fader_route_plan_for_channel(channel.mixer_track())
             {
-                live_mixer_fader_transforms_by_channel.insert(target_channel_id, transform);
+                live_mixer_fader_transforms_by_channel
+                    .insert(target_channel_id, live_route_plan.output_transform);
                 live_mixer_faders_by_channel.insert(
                     target_channel_id,
                     LiveMixerFaderSpec {
@@ -8400,6 +8407,8 @@ struct SamplerVoiceEngine<'a> {
     live_mixer_fader_targets: Option<&'a MixerTrackPeakMeters>,
     mixer_meter_transforms_by_channel:
         Option<&'a HashMap<u16, Vec<(usize, MixerSourceRouteTransform)>>>,
+    live_mixer_fader_meter_transforms_by_channel:
+        Option<&'a HashMap<u16, Vec<(usize, MixerSourceRouteTransform)>>>,
     pan_law: PanLaw,
     next_note: usize,
     next_live_note: usize,
@@ -8439,6 +8448,7 @@ struct SamplerVoice {
 
 struct LiveMixerFader {
     target_raw: Arc<AtomicI32>,
+    saved_gain: f32,
     current_gain: f32,
     smoothing_alpha: f32,
 }
@@ -8453,21 +8463,24 @@ impl LiveMixerFader {
         };
         Self {
             target_raw,
+            saved_gain,
             current_gain,
             smoothing_alpha: crate::audio::output_gain_smoothing_alpha(sample_rate as f32),
         }
     }
 
-    fn apply(&mut self, frame: &mut [f32; 2]) {
+    fn apply(&mut self, frame: &mut [f32; 2]) -> f32 {
         let target_raw = self.target_raw.load(Ordering::Acquire);
-        if !(0..=16_000).contains(&target_raw) {
-            return;
-        }
-        let target_gain = target_raw as f32 / 10_000.0;
+        let target_gain = if (0..=16_000).contains(&target_raw) {
+            target_raw as f32 / 10_000.0
+        } else {
+            self.saved_gain
+        };
         self.current_gain =
             crate::audio::smooth_output_gain(self.current_gain, target_gain, self.smoothing_alpha);
         frame[0] *= self.current_gain;
         frame[1] *= self.current_gain;
+        self.current_gain
     }
 }
 
@@ -8509,6 +8522,7 @@ impl<'a> SamplerVoiceEngine<'a> {
             live_mixer_faders_by_channel: None,
             live_mixer_fader_targets: None,
             mixer_meter_transforms_by_channel: None,
+            live_mixer_fader_meter_transforms_by_channel: None,
             pan_law,
             next_note: 0,
             next_live_note: 0,
@@ -8608,9 +8622,10 @@ impl<'a> SamplerVoiceEngine<'a> {
                     right * gain * voice.right_gain,
                 ];
                 voice.mixer_transform.apply_frame(&mut routed_frame);
-                if let Some(live_fader) = voice.live_mixer_fader.as_mut() {
-                    live_fader.apply(&mut routed_frame);
-                }
+                let live_fader_gain = voice
+                    .live_mixer_fader
+                    .as_mut()
+                    .map(|live_fader| live_fader.apply(&mut routed_frame));
                 output_frame[0] += routed_frame[0];
                 output_frame[1] += routed_frame[1];
                 if let Some(meter_buses) = meter_buses.as_deref_mut() {
@@ -8622,6 +8637,10 @@ impl<'a> SamplerVoiceEngine<'a> {
                         debug_assert!(*track < MIXER_TRACK_METER_COUNT);
                         let mut meter_frame = source_frame;
                         transform.apply_frame(&mut meter_frame);
+                        if let Some(gain) = live_fader_gain {
+                            meter_frame[0] *= gain;
+                            meter_frame[1] *= gain;
+                        }
                         let meter_offset = *track * meter_stride_samples + offset * 2;
                         meter_buses[meter_offset] += meter_frame[0];
                         meter_buses[meter_offset + 1] += meter_frame[1];
@@ -8691,10 +8710,6 @@ impl<'a> SamplerVoiceEngine<'a> {
                 let target = self
                     .live_mixer_fader_targets?
                     .live_mixer_insert_fader_raw(spec.track)?;
-                let target_raw = target.load(Ordering::Acquire);
-                if !(0..=16_000).contains(&target_raw) {
-                    return None;
-                }
                 Some((
                     *spec,
                     LiveMixerFader::new(target, spec.saved_gain, self.output_sample_rate),
@@ -8711,9 +8726,14 @@ impl<'a> SamplerVoiceEngine<'a> {
                 .and_then(|transforms| transforms.get(&note.channel_id).copied())
         })
         .unwrap_or_default();
-        let mixer_meter_transforms = self
-            .mixer_meter_transforms_by_channel
+        let mixer_meter_transforms = (live_fader.is_some())
+            .then_some(self.live_mixer_fader_meter_transforms_by_channel)
+            .flatten()
             .and_then(|transforms| transforms.get(&note.channel_id))
+            .or_else(|| {
+                self.mixer_meter_transforms_by_channel
+                    .and_then(|transforms| transforms.get(&note.channel_id))
+            })
             .cloned()
             .unwrap_or_default();
         self.voices[slot_index] = Some(SamplerVoice {
@@ -10758,6 +10778,14 @@ mod tests {
         }
         assert!(frame[0] < 0.001);
         assert_eq!(frame[1], frame[0] * 0.5);
+
+        target.store(i32::MIN, Ordering::Release);
+        for _ in 0..100_000 {
+            frame = [1.0, 0.5];
+            fader.apply(&mut frame);
+        }
+        assert!(frame[0] > 0.999);
+        assert_eq!(frame[1], frame[0] * 0.5);
     }
 
     #[test]
@@ -12046,13 +12074,11 @@ mod tests {
             )]),
             mixer_transforms_by_channel: HashMap::from([(
                 2,
-                MixerSourceRouteTransform::from_insert_transform(
-                    MixerInsertSignalTransform::default().with_fader_volume_raw(Some(15_000)),
-                ),
+                MixerSourceRouteTransform::default().scaled(2.25),
             )]),
             live_mixer_fader_transforms_by_channel: HashMap::from([(
                 2,
-                MixerSourceRouteTransform::default(),
+                MixerSourceRouteTransform::default().scaled(1.5),
             )]),
             live_mixer_faders_by_channel: HashMap::from([(
                 2,
@@ -12062,6 +12088,13 @@ mod tests {
                 },
             )]),
             mixer_meter_transforms_by_channel: HashMap::from([(
+                2,
+                vec![
+                    (1, MixerSourceRouteTransform::default().scaled(1.5)),
+                    (2, MixerSourceRouteTransform::default().scaled(0.75)),
+                ],
+            )]),
+            live_mixer_fader_meter_transforms_by_channel: HashMap::from([(
                 2,
                 vec![
                     (1, MixerSourceRouteTransform::default()),
@@ -12116,9 +12149,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(voices_stolen, 0);
-        assert_eq!(rendered, vec![1.75, 1.5, 3.25, 3.0]);
-        assert_eq!(meters.take_peak(1), 3.5);
-        assert_eq!(meters.take_peak(2), 1.75);
+        assert_eq!(rendered, vec![2.25, 1.5, 3.75, 3.0]);
+        assert_eq!(meters.take_peak(1), 2.5);
+        assert_eq!(meters.take_peak(2), 1.25);
         assert_eq!(meters.take_peak(1), 0.0);
     }
 
