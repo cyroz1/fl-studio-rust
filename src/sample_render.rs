@@ -4255,6 +4255,17 @@ impl MixerMasterOutput {
     }
 }
 
+pub(crate) fn apply_mixer_master_output_to_stereo(
+    document: &FlpDocument,
+    stereo_samples: &mut [f32],
+) -> Result<(), String> {
+    if !stereo_samples.len().is_multiple_of(2) {
+        return Err("Mixer Master output requires interleaved stereo samples".to_owned());
+    }
+    MixerMasterOutput::from_document(document).apply(stereo_samples);
+    Ok(())
+}
+
 fn apply_master_signal_transform(frame: &mut [f32; 2], polarity_mix: f32, swap_mix: f32) {
     crate::apply_mixer_signal_flags_f32(frame, polarity_mix, swap_mix);
 }
