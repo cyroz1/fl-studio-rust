@@ -2397,30 +2397,9 @@ impl MixerRouteAudibility {
             .unwrap_or_default()
     }
 
-    /// Returns the direct-route transform without the source insert fader and the saved fader
-    /// value. This lets live Sampler playback apply that fader as a smoothed gain while retaining
-    /// the other recognized insert controls. Send-routed tracks are left on their static route.
-    pub(crate) fn direct_source_fader_transform_for_channel(
-        &self,
-        route: Option<i8>,
-    ) -> Option<(MixerSourceRouteTransform, i32)> {
-        let track = route.filter(|track| *track > 0 && self.known_tracks.contains(track))?;
-        if self.complete_send_sources.contains(&track) {
-            return None;
-        }
-        let fader_volume_raw = *self.source_fader_volume_raw.get(&track)?;
-        let transform = self
-            .transform_for_channel(Some(track))
-            .with_fader_volume_raw(None);
-        Some((
-            MixerSourceRouteTransform::from_insert_transform(transform),
-            fader_volume_raw,
-        ))
-    }
-
     /// Returns the route plan with the source insert fader removed and its saved fader value.
-    /// Unlike the direct-route helper, this preserves complete send graphs so a live source fader
-    /// can scale every supported output and insert meter path together.
+    /// This preserves complete send graphs so a live source fader can scale every supported
+    /// output and insert meter path together.
     pub(crate) fn source_fader_route_plan_for_channel(
         &self,
         route: Option<i8>,
@@ -19763,12 +19742,15 @@ mod tests {
 
         assert_eq!(routing.master_fader_raw(), Some(2_500));
         assert_eq!(routing.master_pan_raw(), Some(3_200));
-        let (live_transform, saved_volume_raw) = routing
-            .direct_source_fader_transform_for_channel(Some(1))
+        let (track, saved_volume_raw, live_route_plan) = routing
+            .source_fader_route_plan_for_channel(Some(1))
             .expect("the direct insert fader should expose a live transform");
+        assert_eq!(track, 1);
         assert_eq!(saved_volume_raw, 5_000);
         let mut live_frame = [1.0, 2.0];
-        live_transform.apply_frame(&mut live_frame);
+        live_route_plan
+            .output_transform
+            .apply_frame(&mut live_frame);
         assert_eq!(live_frame, [2.0, 1.0]);
         let mut insert_frame = [1.0, 2.0];
         routing
@@ -19793,8 +19775,8 @@ mod tests {
         }]);
         assert!(
             send_routing
-                .direct_source_fader_transform_for_channel(Some(1))
-                .is_none()
+                .source_fader_route_plan_for_channel(Some(1))
+                .is_some()
         );
 
         for invalid in [
