@@ -383,6 +383,8 @@ pub(crate) struct LiveMixerSourceControl {
     current_solo_gain_bits: Arc<AtomicU32>,
     current_send_gain_bits: Vec<Arc<AtomicU32>>,
     current_send_enabled_gain_bits: Vec<Arc<AtomicU32>>,
+    current_send_output_solo_gain_bits: Vec<Arc<AtomicU32>>,
+    current_send_meter_solo_gain_bits: Vec<Arc<AtomicU32>>,
     current_insert_enabled_gain_bits: Vec<Arc<AtomicU32>>,
     gain_started: Arc<AtomicBool>,
     pan_started: Arc<AtomicBool>,
@@ -392,6 +394,8 @@ pub(crate) struct LiveMixerSourceControl {
     solo_started: Arc<AtomicBool>,
     send_started: Vec<Arc<AtomicBool>>,
     send_enabled_started: Vec<Arc<AtomicBool>>,
+    send_output_solo_started: Vec<Arc<AtomicBool>>,
+    send_meter_solo_started: Vec<Arc<AtomicBool>>,
     insert_enabled_started: Vec<Arc<AtomicBool>>,
     smoothing_alpha: f32,
 }
@@ -432,6 +436,16 @@ impl Clone for LiveMixerSourceControl {
                 .iter()
                 .map(|gain| Arc::new(AtomicU32::new(gain.load(Ordering::Relaxed))))
                 .collect(),
+            current_send_output_solo_gain_bits: self
+                .current_send_output_solo_gain_bits
+                .iter()
+                .map(|gain| Arc::new(AtomicU32::new(gain.load(Ordering::Relaxed))))
+                .collect(),
+            current_send_meter_solo_gain_bits: self
+                .current_send_meter_solo_gain_bits
+                .iter()
+                .map(|gain| Arc::new(AtomicU32::new(gain.load(Ordering::Relaxed))))
+                .collect(),
             current_insert_enabled_gain_bits: self
                 .current_insert_enabled_gain_bits
                 .iter()
@@ -456,6 +470,16 @@ impl Clone for LiveMixerSourceControl {
                 .collect(),
             send_enabled_started: self
                 .send_enabled_started
+                .iter()
+                .map(|started| Arc::new(AtomicBool::new(started.load(Ordering::Relaxed))))
+                .collect(),
+            send_output_solo_started: self
+                .send_output_solo_started
+                .iter()
+                .map(|started| Arc::new(AtomicBool::new(started.load(Ordering::Relaxed))))
+                .collect(),
+            send_meter_solo_started: self
+                .send_meter_solo_started
                 .iter()
                 .map(|started| Arc::new(AtomicBool::new(started.load(Ordering::Relaxed))))
                 .collect(),
@@ -519,6 +543,26 @@ impl LiveMixerSourceControl {
             .iter()
             .map(|_| Arc::new(AtomicBool::new(false)))
             .collect();
+        let current_send_output_solo_gain_bits = route_plan
+            .saved_live_send_output_solo_gains
+            .iter()
+            .map(|gain| Arc::new(AtomicU32::new(gain.to_bits())))
+            .collect();
+        let send_output_solo_started = route_plan
+            .saved_live_send_output_solo_gains
+            .iter()
+            .map(|_| Arc::new(AtomicBool::new(false)))
+            .collect();
+        let current_send_meter_solo_gain_bits = route_plan
+            .saved_live_send_meter_solo_gains
+            .iter()
+            .map(|gain| Arc::new(AtomicU32::new(gain.to_bits())))
+            .collect();
+        let send_meter_solo_started = route_plan
+            .saved_live_send_meter_solo_gains
+            .iter()
+            .map(|_| Arc::new(AtomicBool::new(false)))
+            .collect();
         let current_insert_enabled_gain_bits = route_plan
             .saved_live_insert_enabled
             .iter()
@@ -578,6 +622,8 @@ impl LiveMixerSourceControl {
             current_solo_gain_bits: Arc::new(AtomicU32::new(initial_solo_gain.to_bits())),
             current_send_gain_bits,
             current_send_enabled_gain_bits,
+            current_send_output_solo_gain_bits,
+            current_send_meter_solo_gain_bits,
             current_insert_enabled_gain_bits,
             gain_started: Arc::new(AtomicBool::new(false)),
             pan_started: Arc::new(AtomicBool::new(false)),
@@ -587,6 +633,8 @@ impl LiveMixerSourceControl {
             solo_started: Arc::new(AtomicBool::new(false)),
             send_started,
             send_enabled_started,
+            send_output_solo_started,
+            send_meter_solo_started,
             insert_enabled_started,
             smoothing_alpha: output_gain_smoothing_alpha(sample_rate as f32),
             route_plan,
@@ -614,7 +662,9 @@ impl LiveMixerSourceControl {
             .iter()
             .map(|track| meters.live_mixer_insert_enabled(*track))
             .collect::<Option<Vec<_>>>()?;
-        let solo_mask = if self.route_plan.live_solo.is_some() {
+        let solo_mask = if self.route_plan.live_solo.is_some()
+            || self.route_plan.live_send_output_paths.is_some()
+        {
             Some(meters.live_mixer_solo_mask())
         } else {
             None
@@ -752,23 +802,23 @@ impl LiveMixerSourceControl {
             next_gain
         });
 
+        let live_solo_mask = targets
+            .solo_mask
+            .as_ref()
+            .and_then(|target| target.load_full());
         let solo_gain = self.route_plan.live_solo.map(|saved_solo| {
-            let live_mask = targets
-                .solo_mask
-                .as_ref()
-                .and_then(|target| target.load_full());
-            let (any_soloed, soloed) =
-                live_mask
-                    .as_ref()
-                    .map_or((saved_solo.any_soloed, saved_solo.soloed), |mask| {
-                        let track_mask = 1_u64 << (self.route_plan.track % u64::BITS as usize);
-                        let track_word = self.route_plan.track / u64::BITS as usize;
-                        (
-                            mask.iter().any(|word| *word != 0),
-                            mask.get(track_word)
-                                .is_some_and(|word| word & track_mask != 0),
-                        )
-                    });
+            let (any_soloed, soloed) = live_solo_mask.as_ref().map_or(
+                (saved_solo.any_soloed, saved_solo.soloed),
+                |mask| {
+                    let track_mask = 1_u64 << (self.route_plan.track % u64::BITS as usize);
+                    let track_word = self.route_plan.track / u64::BITS as usize;
+                    (
+                        mask.iter().any(|word| *word != 0),
+                        mask.get(track_word)
+                            .is_some_and(|word| word & track_mask != 0),
+                    )
+                },
+            );
             let target_gain = if !any_soloed || soloed { 1.0 } else { 0.0 };
             let current_gain = if self.solo_started.swap(true, Ordering::Relaxed) {
                 f32::from_bits(self.current_solo_gain_bits.load(Ordering::Relaxed))
@@ -780,6 +830,44 @@ impl LiveMixerSourceControl {
                 .store(next_gain.to_bits(), Ordering::Relaxed);
             next_gain
         });
+
+        for (((path_tracks, current_gain_bits), started), saved_gain) in self
+            .route_plan
+            .live_send_output_solo_tracks
+            .iter()
+            .zip(&self.current_send_output_solo_gain_bits)
+            .zip(&self.send_output_solo_started)
+            .zip(&self.route_plan.saved_live_send_output_solo_gains)
+        {
+            let target_gain =
+                live_solo_path_gain(live_solo_mask.as_deref(), path_tracks, *saved_gain);
+            let current_gain = if started.swap(true, Ordering::Relaxed) {
+                f32::from_bits(current_gain_bits.load(Ordering::Relaxed))
+            } else {
+                target_gain
+            };
+            let next_gain = smooth_output_gain(current_gain, target_gain, self.smoothing_alpha);
+            current_gain_bits.store(next_gain.to_bits(), Ordering::Relaxed);
+        }
+
+        for (((path_tracks, current_gain_bits), started), saved_gain) in self
+            .route_plan
+            .live_send_meter_solo_tracks
+            .iter()
+            .zip(&self.current_send_meter_solo_gain_bits)
+            .zip(&self.send_meter_solo_started)
+            .zip(&self.route_plan.saved_live_send_meter_solo_gains)
+        {
+            let target_gain =
+                live_solo_path_gain(live_solo_mask.as_deref(), path_tracks, *saved_gain);
+            let current_gain = if started.swap(true, Ordering::Relaxed) {
+                f32::from_bits(current_gain_bits.load(Ordering::Relaxed))
+            } else {
+                target_gain
+            };
+            let next_gain = smooth_output_gain(current_gain, target_gain, self.smoothing_alpha);
+            current_gain_bits.store(next_gain.to_bits(), Ordering::Relaxed);
+        }
 
         for (((target, current_gain_bits), started), saved_gain) in targets
             .send_levels
@@ -891,8 +979,13 @@ impl LiveMixerSourceControl {
         if let Some(paths) = &self.route_plan.live_send_output_paths {
             let source_frame = *frame;
             let mut routed_frame = [0.0; 2];
-            for path in paths {
-                let gain = self.send_path_gain(&path.send_gains, &path.insert_enabled_gains);
+            for (path_index, path) in paths.iter().enumerate() {
+                let solo_gain = self
+                    .current_send_output_solo_gain_bits
+                    .get(path_index)
+                    .map_or(1.0, |gain| f32::from_bits(gain.load(Ordering::Relaxed)));
+                let gain =
+                    self.send_path_gain(&path.send_gains, &path.insert_enabled_gains, solo_gain);
                 if gain == 0.0 {
                     continue;
                 }
@@ -939,14 +1032,20 @@ impl LiveMixerSourceControl {
             let source_frame = *frame;
             let mut meter_frame = [0.0; 2];
             let mut found_path = false;
-            for path in self
+            for (path_index, path) in self
                 .route_plan
                 .live_send_meter_paths
                 .iter()
-                .filter(|path| path.track == track)
+                .enumerate()
+                .filter(|(_, path)| path.track == track)
             {
                 found_path = true;
-                let gain = self.send_path_gain(&path.send_gains, &path.insert_enabled_gains);
+                let solo_gain = self
+                    .current_send_meter_solo_gain_bits
+                    .get(path_index)
+                    .map_or(1.0, |gain| f32::from_bits(gain.load(Ordering::Relaxed)));
+                let gain =
+                    self.send_path_gain(&path.send_gains, &path.insert_enabled_gains, solo_gain);
                 if gain == 0.0 {
                     continue;
                 }
@@ -969,6 +1068,7 @@ impl LiveMixerSourceControl {
         &self,
         send_gains: &[crate::MixerLiveSendGain],
         insert_enabled_gains: &[crate::MixerLiveInsertEnabledGain],
+        solo_gain: f32,
     ) -> f32 {
         let send_gain = send_gains.iter().fold(1.0, |gain, route| {
             let send_gain = route.target_index.map_or(route.saved_gain, |index| {
@@ -1002,7 +1102,26 @@ impl LiveMixerSourceControl {
                             })
                     });
             gain * enabled_gain
+        }) * solo_gain
+    }
+}
+
+fn live_solo_path_gain(mask: Option<&[u64; 2]>, path_tracks: &[usize], saved_gain: f32) -> f32 {
+    let Some(mask) = mask else {
+        return saved_gain;
+    };
+    let any_soloed = mask.iter().any(|word| *word != 0);
+    if !any_soloed
+        || path_tracks.iter().any(|track| {
+            let track_word = track / u64::BITS as usize;
+            let track_mask = 1_u64 << (track % u64::BITS as usize);
+            mask.get(track_word)
+                .is_some_and(|word| word & track_mask != 0)
         })
+    {
+        1.0
+    } else {
+        0.0
     }
 }
 

@@ -11089,6 +11089,10 @@ mod tests {
                 ],
                 saved_live_send_gains: vec![0.5, 1.0],
                 saved_live_send_enabled: vec![true, true],
+                live_send_output_solo_tracks: vec![vec![1, 2]],
+                saved_live_send_output_solo_gains: vec![1.0],
+                live_send_meter_solo_tracks: vec![vec![1, 2], vec![1, 2]],
+                saved_live_send_meter_solo_gains: vec![1.0, 1.0],
                 live_insert_enabled_tracks: vec![2],
                 saved_live_insert_enabled: vec![true],
                 live_send_output_paths: Some(vec![crate::MixerLiveSendOutputPath {
@@ -11271,6 +11275,54 @@ mod tests {
         frame = [1.0, 0.25];
         source_control.apply_output_frame(controls, &mut frame);
         assert!((frame[0] - 0.5).abs() < 0.001);
+
+        meters.set_live_mixer_soloed_tracks(&[3]);
+        controls = source_control.next_frame_controls(&targets);
+        frame = [1.0, 0.25];
+        source_control.apply_output_frame(controls, &mut frame);
+        assert!(frame[0] < 0.5 && frame[0] > 0.49);
+        destination_meter = [1.0, 0.25];
+        source_control.apply_meter_frame(
+            controls,
+            2,
+            MixerSourceRouteTransform::default().scaled(0.5),
+            &mut destination_meter,
+        );
+        assert!(destination_meter[0] < 1.0 && destination_meter[0] > 0.99);
+        for _ in 0..100_000 {
+            controls = source_control.next_frame_controls(&targets);
+        }
+        frame = [1.0, 0.25];
+        source_control.apply_output_frame(controls, &mut frame);
+        assert!(frame[0].abs() < 0.001);
+        destination_meter = [1.0, 0.25];
+        source_control.apply_meter_frame(
+            controls,
+            2,
+            MixerSourceRouteTransform::default().scaled(0.5),
+            &mut destination_meter,
+        );
+        assert!(destination_meter[0].abs() < 0.001);
+
+        meters.set_live_mixer_soloed_tracks(&[2]);
+        controls = source_control.next_frame_controls(&targets);
+        frame = [1.0, 0.25];
+        source_control.apply_output_frame(controls, &mut frame);
+        assert!(frame[0] > 0.0 && frame[0] < 0.001);
+        for _ in 0..100_000 {
+            controls = source_control.next_frame_controls(&targets);
+        }
+        frame = [1.0, 0.25];
+        source_control.apply_output_frame(controls, &mut frame);
+        assert!((frame[0] - 0.5).abs() < 0.001);
+        destination_meter = [1.0, 0.25];
+        source_control.apply_meter_frame(
+            controls,
+            2,
+            MixerSourceRouteTransform::default().scaled(0.5),
+            &mut destination_meter,
+        );
+        assert!((destination_meter[0] - 1.0).abs() < 0.001);
     }
 
     #[test]
