@@ -365,9 +365,10 @@ are applied where the Mixer rows below describe. Full export surface:
   Clip on the selected Playlist track at the current transport or seek position,
   subject to a saved project with an Audio Clip template. VST3 output buses must
   be mono or stereo.
-  The Audio menu can also sum all loaded VST3 channels with notes in the selected
-  Pattern to one file or Audio Clip, using each channel's swing and pitch settings.
-  Layer routing and Mixer processing remain incomplete.
+  The Audio menu can also sum all loaded VST3 channels with direct or Layer-routed
+  notes in the selected Pattern to one file or Audio Clip. The mix applies source
+  channel swing, supported Mixer routes, and Master controls. Complete Mixer
+  processing/effects and automation remain incomplete.
   FL Studio renders selected patterns to audio clips with configurable render
   settings; these exports are separate files and do not add an Audio Clip, apply
   all native render options, or include complete Mixer routing/effects ([Image-Line

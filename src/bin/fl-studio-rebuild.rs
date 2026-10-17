@@ -25360,12 +25360,17 @@ impl DawUi {
                         !note.is_muted() && sampler_channel_ids.contains(&note.channel_id)
                     })
                 });
+        let pattern_note_router = ChannelNoteRouter::new(channels.clone());
         let has_loaded_vst3_pattern_notes = self
             .selected_pattern
             .and_then(|pattern_id| patterns.iter().find(|pattern| pattern.id == pattern_id))
             .is_some_and(|pattern| {
-                pattern.notes.iter().any(|note| {
-                    !note.is_muted() && self.channel_vst3_instances.contains_key(&note.channel_id)
+                pattern.notes.iter().enumerate().any(|(note_index, note)| {
+                    !note.is_muted()
+                        && pattern_note_router
+                            .targets_for_note(note.channel_id, note_index as u64, note.key)
+                            .iter()
+                            .any(|channel_id| self.channel_vst3_instances.contains_key(channel_id))
                 })
             });
         let mut add_note_requested = false;
@@ -27117,7 +27122,7 @@ impl DawUi {
                         egui::Button::new("Render loaded VST3 channels…"),
                     )
                     .on_hover_text(
-                        "Render and sum every loaded VST3 channel with notes in the selected Pattern",
+                    "Render loaded VST3 channels with direct or Layer-routed notes and sum them into one file",
                     )
                     .clicked()
                 {
@@ -27135,7 +27140,7 @@ impl DawUi {
                         egui::Button::new("Render and insert loaded VST3 channels…"),
                     )
                     .on_hover_text(
-                        "Sum loaded VST3 Pattern channels into one file and insert it as an Audio Clip",
+                        "Sum loaded VST3 Pattern channels, including Layer-routed notes, into one Audio Clip",
                     )
                     .clicked()
                 {
@@ -29889,10 +29894,16 @@ impl DawUi {
             }
         };
         let instances = self.channel_vst3_instances.clone();
+        let project_channels = document.channels();
+        let note_router = ChannelNoteRouter::new(project_channels);
         let channel_ids = notes
             .iter()
-            .filter(|note| !note.is_muted() && instances.contains_key(&note.channel_id))
-            .map(|note| note.channel_id)
+            .enumerate()
+            .filter(|(_, note)| !note.is_muted())
+            .flat_map(|(note_index, note)| {
+                note_router.targets_for_note(note.channel_id, note_index as u64, note.key)
+            })
+            .filter(|channel_id| instances.contains_key(channel_id))
             .collect::<BTreeSet<_>>();
         if channel_ids.is_empty() {
             self.status = "The selected Pattern has no notes on loaded VST3 channels".to_owned();
@@ -29918,24 +29929,19 @@ impl DawUi {
 
         let ppq = document.header().ppq();
         let tempo_bpm = document.metadata().tempo_bpm().unwrap_or(self.tempo_bpm);
-        let global_swing_mix_raw = document.metadata().global_swing_mix();
         let channels = channel_ids
             .iter()
             .filter_map(|channel_id| {
                 let instance_id = instances.get(channel_id).copied()?;
                 Some(Vst3PatternChannelRenderRequest {
                     instance_id,
-                    notes: &notes,
                     options: Vst3PatternRenderOptions {
                         channel_id: *channel_id,
                         ppq,
                         tempo_bpm,
                         tail_seconds: 2.0,
-                        global_swing_mix_raw,
-                        channel_swing_mix_raw: project_channel_swing_mix_raw(
-                            &document,
-                            *channel_id,
-                        ),
+                        global_swing_mix_raw: 0,
+                        channel_swing_mix_raw: 0,
                         pitch_offset_cents: project_channel_master_pitch_offset_cents(
                             &document,
                             *channel_id,
@@ -29986,6 +29992,8 @@ impl DawUi {
             .ok_or_else(|| "VST3 host is not initialized".to_owned())
             .and_then(|host| {
                 host.render_pattern_channels_to_file(
+                    &document,
+                    &notes,
                     &channels,
                     &path,
                     AudioFileRenderOptions {

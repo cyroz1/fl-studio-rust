@@ -18,8 +18,9 @@ use crate::audio::{
 };
 use crate::sample_render::{
     AudioFileRenderOptions, PlaylistPatternScheduleOptions, PlaylistRenderOptions,
-    PlaylistTempoMap, PlaylistTrackFilter, channel_gain_pan, channel_pan_gains, project_pan_law,
-    render_stereo_audio_to_file, schedule_playlist_pattern_notes, swing_note_start_tick,
+    PlaylistTempoMap, PlaylistTrackFilter, apply_mixer_master_output_to_stereo, channel_gain_pan,
+    channel_pan_gains, project_pan_law, render_stereo_audio_to_file,
+    schedule_playlist_pattern_notes, swing_note_start_tick,
 };
 use crate::{
     ChannelNoteRouter, ChannelPluginState, FlpDocument, MixerRouteAudibility,
@@ -80,10 +81,9 @@ pub struct Vst3RenderSummary {
     pub notes_rendered: usize,
 }
 
-/// One loaded VST3 instance and its Pattern notes for a summed offline render.
-pub struct Vst3PatternChannelRenderRequest<'a> {
+/// One loaded VST3 instance and its target project channel for a summed offline render.
+pub struct Vst3PatternChannelRenderRequest {
     pub instance_id: u64,
-    pub notes: &'a [PatternNote],
     pub options: Vst3PatternRenderOptions,
 }
 
@@ -2031,17 +2031,78 @@ impl Vst3HostRuntime {
 
     /// Render several loaded VST3 channels from the same Pattern into one stereo audio file.
     ///
-    /// Each request is rendered with its own channel timing and pitch options. The resulting
-    /// stereo buffers are summed, padded to the longest channel render, and encoded using the
-    /// shared audio output settings. Mixer routing and effects are not applied.
+    /// Notes are routed through supported Layer children and Mixer paths before the resulting
+    /// stereo buffers are summed and encoded using the shared audio output settings. Mixer
+    /// effects are not applied.
     pub fn render_pattern_channels_to_file(
         &self,
-        channels: &[Vst3PatternChannelRenderRequest<'_>],
+        document: &FlpDocument,
+        notes: &[PatternNote],
+        channels: &[Vst3PatternChannelRenderRequest],
         path: impl AsRef<Path>,
         file_options: AudioFileRenderOptions,
     ) -> Result<Vst3PatternMixRenderSummary, String> {
         if channels.is_empty() {
             return Err("no loaded VST3 Pattern channels have notes to render".to_owned());
+        }
+
+        let project_channels = document.channels();
+        let channels_by_id = project_channels
+            .iter()
+            .map(|channel| (channel.id(), channel))
+            .collect::<BTreeMap<_, _>>();
+        let note_router = ChannelNoteRouter::new(project_channels.clone());
+        let mixer_route_audibility = MixerRouteAudibility::from_document(document);
+        let global_swing_mix_raw = document.metadata().global_swing_mix();
+        let mut routed_notes_by_channel = BTreeMap::<u16, Vec<PatternNote>>::new();
+        for channel in channels {
+            let channel_id = channel.options.channel_id;
+            if !channels_by_id.contains_key(&channel_id) {
+                return Err(format!(
+                    "VST3 Pattern channel {channel_id} was not found in the project"
+                ));
+            }
+            if routed_notes_by_channel
+                .insert(channel_id, Vec::new())
+                .is_some()
+            {
+                return Err(format!(
+                    "VST3 Pattern channel {channel_id} was requested more than once"
+                ));
+            }
+        }
+        for (note_index, note) in notes.iter().enumerate() {
+            if note.is_muted() {
+                continue;
+            }
+            let targets =
+                note_router.targets_for_note(note.channel_id, note_index as u64, note.key);
+            if !targets
+                .iter()
+                .any(|channel_id| routed_notes_by_channel.contains_key(channel_id))
+            {
+                continue;
+            }
+            let source_swing_mix_raw = channels_by_id
+                .get(&note.channel_id)
+                .map_or(128, |source| source.swing_mix());
+            let swung_position = swing_note_start_tick(
+                u64::from(note.position),
+                document.header().ppq(),
+                global_swing_mix_raw,
+                source_swing_mix_raw,
+            )?;
+            let position = u32::try_from(swung_position)
+                .map_err(|_| "swing-adjusted VST3 note position exceeds 32-bit ticks")?;
+            for channel_id in targets {
+                let Some(routed_notes) = routed_notes_by_channel.get_mut(&channel_id) else {
+                    continue;
+                };
+                let mut routed_note = note.clone();
+                routed_note.position = position;
+                routed_note.channel_id = channel_id;
+                routed_notes.push(routed_note);
+            }
         }
 
         let mut mixed_stereo = Vec::new();
@@ -2050,10 +2111,29 @@ impl Vst3HostRuntime {
         let mut notes_rendered = 0usize;
         let mut channels_rendered = 0usize;
         for channel in channels {
-            let (stereo, summary) = self.render_pattern_channel_to_stereo_buffer(
+            let channel_id = channel.options.channel_id;
+            let target_channel = channels_by_id
+                .get(&channel_id)
+                .expect("Pattern target channels were validated above");
+            if target_channel.enabled() == Some(false)
+                || !mixer_route_audibility.allows_channel(target_channel.mixer_track())
+            {
+                continue;
+            }
+            let routed_notes = routed_notes_by_channel
+                .get(&channel_id)
+                .expect("Pattern target channels were validated above");
+            if routed_notes.is_empty() {
+                continue;
+            }
+
+            let mut options = channel.options;
+            options.global_swing_mix_raw = 0;
+            options.channel_swing_mix_raw = 0;
+            let (mut stereo, summary) = self.render_pattern_channel_to_stereo_buffer(
                 channel.instance_id,
-                channel.notes,
-                channel.options,
+                routed_notes,
+                options,
             )?;
             if let Some(expected_rate) = sample_rate
                 && summary.sample_rate != expected_rate
@@ -2064,6 +2144,9 @@ impl Vst3HostRuntime {
                 ));
             }
             sample_rate.get_or_insert(summary.sample_rate);
+            let route_plan =
+                mixer_route_audibility.source_route_plan_for_channel(target_channel.mixer_track());
+            apply_stereo_mixer_transform(&mut stereo, route_plan.output_transform)?;
             mix_stereo_pattern_render_buffer(
                 &mut mixed_stereo,
                 &mut mixed_frames,
@@ -2078,8 +2161,10 @@ impl Vst3HostRuntime {
                 .ok_or_else(|| "rendered VST3 channel count overflow".to_owned())?;
         }
 
-        let sample_rate = sample_rate
-            .ok_or_else(|| "no loaded VST3 Pattern channels have notes to render".to_owned())?;
+        let sample_rate = sample_rate.ok_or_else(|| {
+            "no loaded VST3 Pattern channels have audible notes to render".to_owned()
+        })?;
+        apply_mixer_master_output_to_stereo(document, &mut mixed_stereo)?;
         let summary = Vst3PatternMixRenderSummary {
             frames: mixed_frames,
             sample_rate,
@@ -4030,6 +4115,22 @@ fn mix_stereo_pattern_render_buffer(
     Ok(())
 }
 
+fn apply_stereo_mixer_transform(
+    stereo: &mut [f32],
+    transform: MixerSourceRouteTransform,
+) -> Result<(), String> {
+    if !stereo.len().is_multiple_of(2) {
+        return Err("VST3 Pattern mixer transform requires interleaved stereo samples".to_owned());
+    }
+    for frame in stereo.chunks_exact_mut(2) {
+        let mut routed_frame = [frame[0], frame[1]];
+        transform.apply_frame(&mut routed_frame);
+        frame[0] = finite_sample(routed_frame[0]);
+        frame[1] = finite_sample(routed_frame[1]);
+    }
+    Ok(())
+}
+
 fn scheduled_pattern_events(
     notes: &[PatternNote],
     channel_id: u16,
@@ -4259,7 +4360,7 @@ fn reported_tail_seconds(tail_samples: u32, sample_rate_hz: f64) -> Option<f64> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::MixerLiveSourceRoutePlan;
+    use crate::{MixerInsertSignalTransform, MixerLiveSourceRoutePlan};
     use std::io::Write;
 
     #[test]
@@ -5295,6 +5396,20 @@ mod tests {
             .unwrap();
         assert_eq!(frames, 1);
         assert_eq!(mixed, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn pattern_render_applies_supported_mixer_signal_transforms() {
+        let transform = MixerSourceRouteTransform::from_insert_transform(
+            MixerInsertSignalTransform::new(true, true).with_fader_volume_raw(Some(5_000)),
+        );
+        let mut stereo = [0.25, 0.5, 1.0, -1.0];
+        apply_stereo_mixer_transform(&mut stereo, transform).unwrap();
+        assert!((stereo[0] + 0.25).abs() < f32::EPSILON);
+        assert!((stereo[1] + 0.125).abs() < f32::EPSILON);
+        assert!((stereo[2] - 0.5).abs() < f32::EPSILON);
+        assert!((stereo[3] + 0.5).abs() < f32::EPSILON);
+        assert!(apply_stereo_mixer_transform(&mut [0.0], transform).is_err());
     }
 
     #[test]
