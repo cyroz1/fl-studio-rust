@@ -362,6 +362,16 @@ fn candidate_mixer_master_enabled(document: &FlpDocument) -> Option<bool> {
         .and_then(|master| master.enabled())
 }
 
+fn candidate_mixer_insert_enabled(
+    inserts: &[MixerInsertSummary],
+    insert_ordinal: usize,
+) -> Option<bool> {
+    inserts
+        .iter()
+        .find(|insert| insert.ordinal() == insert_ordinal)
+        .and_then(MixerInsertSummary::enabled)
+}
+
 fn candidate_mixer_master_signal_flags(document: &FlpDocument) -> Option<(bool, bool)> {
     candidate_mixer_insert_signal_flags(&document.mixer_inserts(), 0)
 }
@@ -9485,6 +9495,10 @@ impl DawUi {
                     track,
                     candidate_mixer_insert_signal_flags(&inserts, track),
                 );
+            self.mixer_track_peak_meters.set_live_mixer_insert_enabled(
+                track,
+                candidate_mixer_insert_enabled(&inserts, track),
+            );
         }
     }
 
@@ -35348,6 +35362,10 @@ impl DawUi {
                             );
                         } else {
                             let inserts = document.mixer_inserts();
+                            self.mixer_track_peak_meters.set_live_mixer_insert_enabled(
+                                insert_ordinal,
+                                candidate_mixer_insert_enabled(&inserts, insert_ordinal),
+                            );
                             self.mixer_track_peak_meters
                                 .set_live_mixer_insert_signal_flags(
                                     insert_ordinal,

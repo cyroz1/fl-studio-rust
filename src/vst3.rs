@@ -2055,7 +2055,8 @@ impl Vst3HostRuntime {
                         .get(&target_channel_id)
                         .is_some_and(|channel| {
                             channel.enabled() != Some(false)
-                                && mixer_route_audibility.allows_channel(channel.mixer_track())
+                                && mixer_route_audibility
+                                    .allows_live_source_channel(channel.mixer_track())
                         })
                 {
                     continue;
@@ -2303,7 +2304,8 @@ impl Vst3HostRuntime {
                             && channels_by_id
                                 .get(target_channel_id)
                                 .is_some_and(|channel| {
-                                    mixer_route_audibility.allows_channel(channel.mixer_track())
+                                    mixer_route_audibility
+                                        .allows_live_source_channel(channel.mixer_track())
                                 })
                     })
                     .collect()
@@ -3999,6 +4001,7 @@ mod tests {
                     saved_pan_raw: Some(-6_400),
                     saved_stereo_separation_raw: None,
                     saved_signal_flags: None,
+                    saved_enabled: None,
                     pan_law_raw: Some(2),
                     output_transform: MixerSourceRouteTransform::default(),
                     insert_meter_transforms: Vec::new(),
@@ -4042,6 +4045,7 @@ mod tests {
                 saved_pan_raw: None,
                 saved_stereo_separation_raw: None,
                 saved_signal_flags: None,
+                saved_enabled: None,
                 pan_law_raw: Some(2),
                 output_transform: MixerSourceRouteTransform::default(),
                 insert_meter_transforms: vec![

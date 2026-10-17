@@ -2091,6 +2091,7 @@ pub(crate) struct MixerRouteAudibility {
     source_transforms: HashMap<i8, MixerInsertSignalTransform>,
     source_fader_volume_raw: HashMap<i8, i32>,
     source_signal_flags: HashMap<i8, (bool, bool)>,
+    source_enabled: HashMap<i8, bool>,
     send_routes_by_source: HashMap<i8, Vec<MixerSendRouteEdge>>,
     complete_send_sources: HashSet<i8>,
     master_fader_raw: Option<i32>,
@@ -2133,6 +2134,7 @@ pub(crate) struct MixerLiveSourceRoutePlan {
     pub(crate) saved_pan_raw: Option<i32>,
     pub(crate) saved_stereo_separation_raw: Option<i32>,
     pub(crate) saved_signal_flags: Option<(bool, bool)>,
+    pub(crate) saved_enabled: Option<bool>,
     pub(crate) pan_law_raw: Option<u8>,
     pub(crate) output_transform: MixerSourceRouteTransform,
     pub(crate) insert_meter_transforms: Vec<(usize, MixerSourceRouteTransform)>,
@@ -2343,7 +2345,11 @@ impl MixerRouteAudibility {
                     .source_fader_volume_raw
                     .insert(track, fader_volume_raw);
             }
-            if insert.enabled() == Some(false) {
+            // Missing flags already mean an insert is active for static routing. Record that
+            // effective default too, so a Mute edit can attach a live smoother during playback.
+            let enabled = insert.enabled().unwrap_or(true);
+            routing.source_enabled.insert(track, enabled);
+            if !enabled {
                 routing.disabled_tracks.insert(track);
             }
             if insert.soloed() == Some(true) {
@@ -2398,8 +2404,63 @@ impl MixerRouteAudibility {
         }
     }
 
+    /// Tests the static solo policy while allowing the source insert's own mute to be controlled
+    /// by the live source smoother.
+    pub(crate) fn allows_live_source_channel(&self, route: Option<i8>) -> bool {
+        let Some(source_track) =
+            route.filter(|track| *track > 0 && self.known_tracks.contains(track))
+        else {
+            return self.allows_channel(route);
+        };
+        self.allows_channel_with_source_mute_override(route, Some(source_track))
+    }
+
+    fn allows_channel_with_source_mute_override(
+        &self,
+        route: Option<i8>,
+        source_mute_override: Option<i8>,
+    ) -> bool {
+        let track = match route {
+            None => 0,
+            Some(track) if track < 0 => return true,
+            Some(track) => track,
+        };
+        if track != 0 && !self.known_tracks.contains(&track) {
+            return true;
+        }
+        if self.disabled_tracks.contains(&track) && source_mute_override != Some(track) {
+            return false;
+        }
+        if self.soloed_insert_tracks.is_empty() {
+            return true;
+        }
+        if track == 0 {
+            return false;
+        }
+        if self.complete_send_sources.contains(&track) {
+            self.route_can_reach_soloed_insert_with_source_mute_override(
+                track,
+                &mut HashSet::new(),
+                source_mute_override,
+            )
+        } else {
+            self.soloed_insert_tracks.contains(&track)
+        }
+    }
+
     fn route_can_reach_soloed_insert(&self, track: i8, visited: &mut HashSet<i8>) -> bool {
-        if self.disabled_tracks.contains(&track) || !visited.insert(track) {
+        self.route_can_reach_soloed_insert_with_source_mute_override(track, visited, None)
+    }
+
+    fn route_can_reach_soloed_insert_with_source_mute_override(
+        &self,
+        track: i8,
+        visited: &mut HashSet<i8>,
+        source_mute_override: Option<i8>,
+    ) -> bool {
+        if (self.disabled_tracks.contains(&track) && source_mute_override != Some(track))
+            || !visited.insert(track)
+        {
             return false;
         }
         if self.soloed_insert_tracks.contains(&track) {
@@ -2413,7 +2474,11 @@ impl MixerRouteAudibility {
             .flatten()
             .any(|route| {
                 mixer_send_gain_raw(route.level_raw).unwrap_or_default() > 0.0
-                    && self.route_can_reach_soloed_insert(route.destination_track, visited)
+                    && self.route_can_reach_soloed_insert_with_source_mute_override(
+                        route.destination_track,
+                        visited,
+                        source_mute_override,
+                    )
             });
         visited.remove(&track);
         reaches_solo
@@ -2443,10 +2508,12 @@ impl MixerRouteAudibility {
             .unwrap_or_default();
         let saved_fader_raw = self.source_fader_volume_raw.get(&track).copied();
         let saved_signal_flags = self.source_signal_flags.get(&track).copied();
+        let saved_enabled = self.source_enabled.get(&track).copied();
         if saved_fader_raw.is_none()
             && source_transform.mixer_pan_raw.is_none()
             && source_transform.stereo_separation_raw.is_none()
             && saved_signal_flags.is_none()
+            && saved_enabled.is_none()
         {
             return None;
         }
@@ -2464,6 +2531,7 @@ impl MixerRouteAudibility {
                     .with_stereo_separation_raw(None),
             );
         let mut downstream_routes = self.clone();
+        downstream_routes.disabled_tracks.remove(&track);
         downstream_routes
             .source_transforms
             .insert(track, MixerInsertSignalTransform::default());
@@ -2476,6 +2544,7 @@ impl MixerRouteAudibility {
             saved_pan_raw: source_transform.mixer_pan_raw,
             saved_stereo_separation_raw: source_transform.stereo_separation_raw,
             saved_signal_flags,
+            saved_enabled,
             pan_law_raw: source_transform.mixer_pan_law_raw,
             output_transform: route_plan.output_transform,
             insert_meter_transforms: route_plan.insert_meter_transforms,
@@ -19847,6 +19916,68 @@ mod tests {
         assert_eq!(frame, [1.0, 0.25]);
         super::apply_mixer_signal_flags_f32(&mut frame, 1.0, 1.0);
         assert_eq!(frame, [-0.25, -1.0]);
+    }
+
+    #[test]
+    fn live_mixer_source_route_plan_extracts_enabled_state_for_smoothing() {
+        let insert = |ordinal, flags| MixerInsertSummary {
+            ordinal,
+            input_raw: -1,
+            output_raw: -1,
+            color_raw: 0,
+            icon_raw: None,
+            name: None,
+            flags: Some(flags),
+            flags_event_index: None,
+            first_event_index: 0,
+            end_event_index: 0,
+        };
+        let routing = MixerRouteAudibility::from_inserts_with_parameters(
+            [insert(0, 1 << 3), insert(1, 0)],
+            &[],
+            None,
+        );
+
+        assert!(!routing.allows_channel(Some(1)));
+        assert!(routing.allows_live_source_channel(Some(1)));
+        // Offline/static routing rejects the saved-muted source before rendering, while live
+        // routing keeps it available so the per-source smoother can mute or unmute it.
+        assert_eq!(
+            routing
+                .source_route_plan_for_channel(Some(1))
+                .output_transform,
+            MixerSourceRouteTransform::default()
+        );
+        let plan = routing
+            .live_source_route_plan_for_channel(Some(1))
+            .expect("saved enabled state should produce a live source plan");
+        assert_eq!(plan.saved_enabled, Some(false));
+        let mut frame = [1.0, 0.25];
+        plan.output_transform.apply_frame(&mut frame);
+        assert_eq!(frame, [1.0, 0.25]);
+    }
+
+    #[test]
+    fn live_mixer_source_route_plan_defaults_missing_enabled_flags_to_active() {
+        let insert = MixerInsertSummary {
+            ordinal: 1,
+            input_raw: -1,
+            output_raw: -1,
+            color_raw: 0,
+            icon_raw: None,
+            name: None,
+            flags: None,
+            flags_event_index: None,
+            first_event_index: 0,
+            end_event_index: 0,
+        };
+        let routing = MixerRouteAudibility::from_inserts_with_parameters([insert], &[], None);
+
+        assert!(routing.allows_channel(Some(1)));
+        let plan = routing
+            .live_source_route_plan_for_channel(Some(1))
+            .expect("an insert with default-enabled state should support live mute edits");
+        assert_eq!(plan.saved_enabled, Some(true));
     }
 
     #[test]
