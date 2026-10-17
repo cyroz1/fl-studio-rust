@@ -2090,6 +2090,7 @@ pub(crate) struct MixerRouteAudibility {
     soloed_insert_tracks: HashSet<i8>,
     source_transforms: HashMap<i8, MixerInsertSignalTransform>,
     source_fader_volume_raw: HashMap<i8, i32>,
+    source_signal_flags: HashMap<i8, (bool, bool)>,
     send_routes_by_source: HashMap<i8, Vec<MixerSendRouteEdge>>,
     complete_send_sources: HashSet<i8>,
     master_fader_raw: Option<i32>,
@@ -2131,6 +2132,7 @@ pub(crate) struct MixerLiveSourceRoutePlan {
     pub(crate) saved_fader_gain: f32,
     pub(crate) saved_pan_raw: Option<i32>,
     pub(crate) saved_stereo_separation_raw: Option<i32>,
+    pub(crate) saved_signal_flags: Option<(bool, bool)>,
     pub(crate) pan_law_raw: Option<u8>,
     pub(crate) output_transform: MixerSourceRouteTransform,
     pub(crate) insert_meter_transforms: Vec<(usize, MixerSourceRouteTransform)>,
@@ -2196,6 +2198,16 @@ impl MixerInsertSignalTransform {
             stereo_separation_raw: None,
             mixer_pan_law_raw: None,
         }
+    }
+
+    pub(crate) const fn with_signal_flags(
+        mut self,
+        polarity_reversed: bool,
+        swap_left_right: bool,
+    ) -> Self {
+        self.polarity_reversed = polarity_reversed;
+        self.swap_left_right = swap_left_right;
+        self
     }
 
     pub(crate) const fn with_fader_volume_raw(mut self, volume_raw: Option<i32>) -> Self {
@@ -2337,6 +2349,13 @@ impl MixerRouteAudibility {
             if insert.soloed() == Some(true) {
                 routing.soloed_insert_tracks.insert(track);
             }
+            if let (Some(polarity_reversed), Some(swap_left_right)) =
+                (insert.polarity_reversed(), insert.swap_left_right())
+            {
+                routing
+                    .source_signal_flags
+                    .insert(track, (polarity_reversed, swap_left_right));
+            }
             let transform = MixerInsertSignalTransform::new(
                 insert.polarity_reversed() == Some(true),
                 insert.swap_left_right() == Some(true),
@@ -2410,21 +2429,33 @@ impl MixerRouteAudibility {
     }
 
     /// Splits a source insert's static signal controls from the transforms on its routed paths.
-    /// The source fader, pan, and stereo separation can then follow live targets before routes split.
+    /// The source fader, pan, stereo separation, phase, and channel swap can then follow live
+    /// targets before routes split.
     pub(crate) fn live_source_route_plan_for_channel(
         &self,
         route: Option<i8>,
     ) -> Option<MixerLiveSourceRoutePlan> {
         let track = route.filter(|track| *track > 0 && self.known_tracks.contains(track))?;
-        let source_transform = *self.source_transforms.get(&track)?;
+        let source_transform = self
+            .source_transforms
+            .get(&track)
+            .copied()
+            .unwrap_or_default();
         let saved_fader_raw = self.source_fader_volume_raw.get(&track).copied();
+        let saved_signal_flags = self.source_signal_flags.get(&track).copied();
         if saved_fader_raw.is_none()
             && source_transform.mixer_pan_raw.is_none()
             && source_transform.stereo_separation_raw.is_none()
+            && saved_signal_flags.is_none()
         {
             return None;
         }
 
+        let source_transform = if saved_signal_flags.is_some() {
+            source_transform.with_signal_flags(false, false)
+        } else {
+            source_transform
+        };
         let source_transform_without_live_controls =
             MixerSourceRouteTransform::from_insert_transform(
                 source_transform
@@ -2444,6 +2475,7 @@ impl MixerRouteAudibility {
             saved_fader_gain: saved_fader_raw.map_or(1.0, mixer_fader_gain),
             saved_pan_raw: source_transform.mixer_pan_raw,
             saved_stereo_separation_raw: source_transform.stereo_separation_raw,
+            saved_signal_flags,
             pan_law_raw: source_transform.mixer_pan_law_raw,
             output_transform: route_plan.output_transform,
             insert_meter_transforms: route_plan.insert_meter_transforms,
@@ -2626,6 +2658,23 @@ pub(crate) fn apply_mixer_stereo_separation_raw_f32(frame: &mut [f32; 2], separa
     let side_gain = 1.0 - separation_raw / 64.0;
     frame[0] = mid + side * side_gain;
     frame[1] = mid - side * side_gain;
+}
+
+pub(crate) fn apply_mixer_signal_flags_f32(frame: &mut [f32; 2], polarity_mix: f32, swap_mix: f32) {
+    let polarity_mix = if polarity_mix.is_finite() {
+        polarity_mix.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let swap_mix = if swap_mix.is_finite() {
+        swap_mix.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let input = *frame;
+    let polarity_gain = 1.0 - 2.0 * polarity_mix;
+    frame[0] = (input[0] + (input[1] - input[0]) * swap_mix) * polarity_gain;
+    frame[1] = (input[1] + (input[0] - input[1]) * swap_mix) * polarity_gain;
 }
 
 fn apply_mixer_pan(frame: &mut [f32; 2], pan_raw: i32, pan_law_raw: Option<u8>) {
@@ -19767,6 +19816,37 @@ mod tests {
                 (2, MixerSourceRouteTransform::default().scaled(0.5)),
             ]
         );
+    }
+
+    #[test]
+    fn live_mixer_source_route_plan_extracts_signal_flags_for_smoothing() {
+        let insert = |ordinal, flags| MixerInsertSummary {
+            ordinal,
+            input_raw: -1,
+            output_raw: -1,
+            color_raw: 0,
+            icon_raw: None,
+            name: None,
+            flags: Some(flags),
+            flags_event_index: None,
+            first_event_index: 0,
+            end_event_index: 0,
+        };
+        let routing = MixerRouteAudibility::from_inserts_with_parameters(
+            [insert(0, 1 << 3), insert(1, (1 << 3) | 1 | (1 << 1))],
+            &[],
+            None,
+        );
+
+        let plan = routing
+            .live_source_route_plan_for_channel(Some(1))
+            .expect("saved signal flags should produce a live source plan");
+        assert_eq!(plan.saved_signal_flags, Some((true, true)));
+        let mut frame = [1.0, 0.25];
+        plan.source_transform.apply_frame(&mut frame);
+        assert_eq!(frame, [1.0, 0.25]);
+        super::apply_mixer_signal_flags_f32(&mut frame, 1.0, 1.0);
+        assert_eq!(frame, [-0.25, -1.0]);
     }
 
     #[test]

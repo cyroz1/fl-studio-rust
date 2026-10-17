@@ -1,11 +1,11 @@
 # Rust DAW compatibility rebuild
 
-## Parity progress — 2026-10-09
+## Parity progress — 2026-10-17
 
 **Early prototype; not yet suitable as a full FL Studio replacement.** The [parity roadmap](docs/parity-roadmap.md) is an unweighted checklist: partial items cover only their stated subsets, and a completed small item does not count as the same amount of work as a complete subsystem.
 
 - **Working foundations:** lossless FLP parsing and round-trip writing, selected project and note edits, MIDI import and partial export, and cross-platform CI packaging.
-- **Partial runtime and editing:** early Playlist, Channel Rack, Piano roll, Mixer, plug-in, and audio views; Windows shared and exclusive audio; playback and a first combined WAV render for supported audio clips, Sampler notes, and mapped installed VST3 instruments.
+- **Partial runtime and editing:** early Playlist, Channel Rack, Piano roll, Mixer, plug-in, and audio views; Windows shared and exclusive audio; playback and a first combined WAV render for supported audio clips, Sampler notes, and mapped installed VST3 instruments. Supported Mixer direct and complete send paths include live fader, pan, stereo-width, phase, and channel-swap smoothing, with route and parameter mappings still provisional.
 - **Major parity gaps:** complete song rendering through automation, Mixer routing/effects, and PDC; automation playback; broad VST compatibility and state write-back; full FL Studio window/control behavior; and verified compatibility across FL Studio versions.
 
 See the roadmap for subsystem-level status and evidence.

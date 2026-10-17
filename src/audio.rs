@@ -46,6 +46,7 @@ pub struct MixerTrackPeakMeters {
     live_mixer_insert_fader_raw: [Arc<AtomicI32>; MIXER_TRACK_METER_COUNT],
     live_mixer_insert_pan_raw: [Arc<AtomicI32>; MIXER_TRACK_METER_COUNT],
     live_mixer_insert_stereo_separation_raw: [Arc<AtomicI32>; MIXER_TRACK_METER_COUNT],
+    live_mixer_insert_signal_flags: [Arc<AtomicI32>; MIXER_TRACK_METER_COUNT],
     live_master_fader_gain: Arc<AtomicU32>,
     live_master_pan_raw: Arc<AtomicI32>,
     live_master_stereo_separation_raw: Arc<AtomicI32>,
@@ -62,6 +63,9 @@ impl Default for MixerTrackPeakMeters {
             }),
             live_mixer_insert_pan_raw: std::array::from_fn(|_| Arc::new(AtomicI32::new(i32::MIN))),
             live_mixer_insert_stereo_separation_raw: std::array::from_fn(|_| {
+                Arc::new(AtomicI32::new(i32::MIN))
+            }),
+            live_mixer_insert_signal_flags: std::array::from_fn(|_| {
                 Arc::new(AtomicI32::new(i32::MIN))
             }),
             live_master_fader_gain: Arc::new(AtomicU32::new(1.0_f32.to_bits())),
@@ -166,6 +170,24 @@ impl MixerTrackPeakMeters {
             .cloned()
     }
 
+    /// Set a non-Master Mixer insert's live polarity and stereo-swap flags.
+    ///
+    /// The render worker reads this packed target without taking a lock and crossfades live
+    /// changes over 20 ms. `None` uses the saved flags when available.
+    pub fn set_live_mixer_insert_signal_flags(&self, track: usize, flags: Option<(bool, bool)>) {
+        let Some(target) = self.live_mixer_insert_signal_flags.get(track) else {
+            return;
+        };
+        let encoded = flags.map_or(i32::MIN, |(polarity_reversed, swap_left_right)| {
+            i32::from(polarity_reversed) | (i32::from(swap_left_right) << 1)
+        });
+        target.store(encoded, Ordering::Release);
+    }
+
+    pub(crate) fn live_mixer_insert_signal_flags(&self, track: usize) -> Option<Arc<AtomicI32>> {
+        self.live_mixer_insert_signal_flags.get(track).cloned()
+    }
+
     pub(crate) fn live_master_fader_gain(&self) -> Arc<AtomicU32> {
         Arc::clone(&self.live_master_fader_gain)
     }
@@ -245,9 +267,12 @@ pub(crate) struct LiveMixerSourceControl {
     current_gain_bits: Arc<AtomicU32>,
     current_pan_raw_bits: Arc<AtomicU32>,
     current_stereo_separation_raw_bits: Arc<AtomicU32>,
+    current_polarity_mix_bits: Arc<AtomicU32>,
+    current_swap_mix_bits: Arc<AtomicU32>,
     gain_started: Arc<AtomicBool>,
     pan_started: Arc<AtomicBool>,
     stereo_separation_started: Arc<AtomicBool>,
+    signal_flags_started: Arc<AtomicBool>,
     smoothing_alpha: f32,
 }
 
@@ -265,10 +290,19 @@ impl Clone for LiveMixerSourceControl {
                 self.current_stereo_separation_raw_bits
                     .load(Ordering::Relaxed),
             )),
+            current_polarity_mix_bits: Arc::new(AtomicU32::new(
+                self.current_polarity_mix_bits.load(Ordering::Relaxed),
+            )),
+            current_swap_mix_bits: Arc::new(AtomicU32::new(
+                self.current_swap_mix_bits.load(Ordering::Relaxed),
+            )),
             gain_started: Arc::new(AtomicBool::new(self.gain_started.load(Ordering::Relaxed))),
             pan_started: Arc::new(AtomicBool::new(self.pan_started.load(Ordering::Relaxed))),
             stereo_separation_started: Arc::new(AtomicBool::new(
                 self.stereo_separation_started.load(Ordering::Relaxed),
+            )),
+            signal_flags_started: Arc::new(AtomicBool::new(
+                self.signal_flags_started.load(Ordering::Relaxed),
             )),
             smoothing_alpha: self.smoothing_alpha,
         }
@@ -280,6 +314,7 @@ pub(crate) struct LiveMixerSourceTargets {
     fader_raw: Arc<AtomicI32>,
     pan_raw: Arc<AtomicI32>,
     stereo_separation_raw: Arc<AtomicI32>,
+    signal_flags: Arc<AtomicI32>,
 }
 
 #[derive(Clone, Copy)]
@@ -287,6 +322,7 @@ pub(crate) struct LiveMixerSourceFrameControls {
     gain: f32,
     pan_raw: Option<f32>,
     stereo_separation_raw: Option<f32>,
+    signal_flags_mix: Option<(f32, f32)>,
     pan_law_raw: Option<u8>,
 }
 
@@ -300,9 +336,30 @@ impl LiveMixerSourceControl {
             current_stereo_separation_raw_bits: Arc::new(AtomicU32::new(
                 (route_plan.saved_stereo_separation_raw.unwrap_or_default() as f32).to_bits(),
             )),
+            current_polarity_mix_bits: Arc::new(AtomicU32::new(
+                if route_plan
+                    .saved_signal_flags
+                    .is_some_and(|(polarity_reversed, _)| polarity_reversed)
+                {
+                    1.0_f32.to_bits()
+                } else {
+                    0.0_f32.to_bits()
+                },
+            )),
+            current_swap_mix_bits: Arc::new(AtomicU32::new(
+                if route_plan
+                    .saved_signal_flags
+                    .is_some_and(|(_, swap_left_right)| swap_left_right)
+                {
+                    1.0_f32.to_bits()
+                } else {
+                    0.0_f32.to_bits()
+                },
+            )),
             gain_started: Arc::new(AtomicBool::new(false)),
             pan_started: Arc::new(AtomicBool::new(false)),
             stereo_separation_started: Arc::new(AtomicBool::new(false)),
+            signal_flags_started: Arc::new(AtomicBool::new(false)),
             smoothing_alpha: output_gain_smoothing_alpha(sample_rate as f32),
             route_plan,
         }
@@ -314,6 +371,7 @@ impl LiveMixerSourceControl {
             pan_raw: meters.live_mixer_insert_pan_raw(self.route_plan.track)?,
             stereo_separation_raw: meters
                 .live_mixer_insert_stereo_separation_raw(self.route_plan.track)?,
+            signal_flags: meters.live_mixer_insert_signal_flags(self.route_plan.track)?,
         })
     }
 
@@ -384,10 +442,43 @@ impl LiveMixerSourceControl {
             next_separation_raw
         });
 
+        let signal_flags_mix = self.route_plan.saved_signal_flags.map(|saved_flags| {
+            let flags_target = targets.signal_flags.load(Ordering::Acquire);
+            let target_polarity_mix = if flags_target == i32::MIN {
+                if saved_flags.0 { 1.0 } else { 0.0 }
+            } else {
+                if flags_target & 1 != 0 { 1.0 } else { 0.0 }
+            };
+            let target_swap_mix = if flags_target == i32::MIN {
+                if saved_flags.1 { 1.0 } else { 0.0 }
+            } else {
+                if flags_target & 2 != 0 { 1.0 } else { 0.0 }
+            };
+            let (current_polarity_mix, current_swap_mix) =
+                if self.signal_flags_started.swap(true, Ordering::Relaxed) {
+                    (
+                        f32::from_bits(self.current_polarity_mix_bits.load(Ordering::Relaxed)),
+                        f32::from_bits(self.current_swap_mix_bits.load(Ordering::Relaxed)),
+                    )
+                } else {
+                    (target_polarity_mix, target_swap_mix)
+                };
+            let polarity_mix = current_polarity_mix
+                + (target_polarity_mix - current_polarity_mix) * self.smoothing_alpha;
+            let swap_mix =
+                current_swap_mix + (target_swap_mix - current_swap_mix) * self.smoothing_alpha;
+            self.current_polarity_mix_bits
+                .store(polarity_mix.to_bits(), Ordering::Relaxed);
+            self.current_swap_mix_bits
+                .store(swap_mix.to_bits(), Ordering::Relaxed);
+            (polarity_mix, swap_mix)
+        });
+
         LiveMixerSourceFrameControls {
             gain,
             pan_raw,
             stereo_separation_raw,
+            signal_flags_mix,
             pan_law_raw: self.route_plan.pan_law_raw,
         }
     }
@@ -398,6 +489,9 @@ impl LiveMixerSourceControl {
         frame: &mut [f32; 2],
     ) {
         self.route_plan.source_transform.apply_frame(frame);
+        if let Some((polarity_mix, swap_mix)) = controls.signal_flags_mix {
+            crate::apply_mixer_signal_flags_f32(frame, polarity_mix, swap_mix);
+        }
         if let Some(separation_raw) = controls.stereo_separation_raw {
             crate::apply_mixer_stereo_separation_raw_f32(frame, separation_raw);
         }
@@ -416,6 +510,9 @@ impl LiveMixerSourceControl {
         frame: &mut [f32; 2],
     ) {
         self.route_plan.source_transform.apply_frame(frame);
+        if let Some((polarity_mix, swap_mix)) = controls.signal_flags_mix {
+            crate::apply_mixer_signal_flags_f32(frame, polarity_mix, swap_mix);
+        }
         if let Some(separation_raw) = controls.stereo_separation_raw {
             crate::apply_mixer_stereo_separation_raw_f32(frame, separation_raw);
         }
