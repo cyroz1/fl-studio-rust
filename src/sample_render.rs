@@ -11047,6 +11047,8 @@ mod tests {
                 ],
                 saved_live_send_gains: vec![0.5, 1.0],
                 saved_live_send_enabled: vec![true, true],
+                live_insert_enabled_tracks: vec![2],
+                saved_live_insert_enabled: vec![true],
                 live_send_output_paths: Some(vec![crate::MixerLiveSendOutputPath {
                     transform: MixerSourceRouteTransform::default(),
                     send_gains: vec![
@@ -11063,12 +11065,17 @@ mod tests {
                             saved_enabled: true,
                         },
                     ],
+                    insert_enabled_gains: vec![crate::MixerLiveInsertEnabledGain {
+                        target_index: Some(0),
+                        saved_enabled: true,
+                    }],
                 }]),
                 live_send_meter_paths: vec![
                     crate::MixerLiveSendMeterPath {
                         track: 1,
                         transform: MixerSourceRouteTransform::default(),
                         send_gains: Vec::new(),
+                        insert_enabled_gains: Vec::new(),
                     },
                     crate::MixerLiveSendMeterPath {
                         track: 2,
@@ -11077,6 +11084,10 @@ mod tests {
                             target_index: Some(0),
                             saved_gain: 0.5,
                             enabled_target_index: Some(0),
+                            saved_enabled: true,
+                        }],
+                        insert_enabled_gains: vec![crate::MixerLiveInsertEnabledGain {
+                            target_index: Some(0),
                             saved_enabled: true,
                         }],
                     },
@@ -11167,6 +11178,46 @@ mod tests {
         assert!(destination_meter[0].abs() < 0.001);
 
         meters.set_live_mixer_send_enabled(1, 2, Some(true));
+        controls = source_control.next_frame_controls(&targets);
+        frame = [1.0, 0.25];
+        source_control.apply_output_frame(controls, &mut frame);
+        assert!(frame[0] > 0.0 && frame[0] < 0.001);
+        for _ in 0..100_000 {
+            controls = source_control.next_frame_controls(&targets);
+        }
+        frame = [1.0, 0.25];
+        source_control.apply_output_frame(controls, &mut frame);
+        assert!((frame[0] - 0.5).abs() < 0.001);
+
+        meters.set_live_mixer_insert_enabled(2, Some(false));
+        controls = source_control.next_frame_controls(&targets);
+        frame = [1.0, 0.25];
+        source_control.apply_output_frame(controls, &mut frame);
+        assert!(frame[0] < 0.5 && frame[0] > 0.49);
+        destination_meter = [1.0, 0.25];
+        source_control.apply_meter_frame(
+            controls,
+            2,
+            MixerSourceRouteTransform::default().scaled(0.5),
+            &mut destination_meter,
+        );
+        assert!(destination_meter[0] < 1.0 && destination_meter[0] > 0.99);
+        for _ in 0..100_000 {
+            controls = source_control.next_frame_controls(&targets);
+        }
+        frame = [1.0, 0.25];
+        source_control.apply_output_frame(controls, &mut frame);
+        assert!(frame[0].abs() < 0.001);
+        destination_meter = [1.0, 0.25];
+        source_control.apply_meter_frame(
+            controls,
+            2,
+            MixerSourceRouteTransform::default().scaled(0.5),
+            &mut destination_meter,
+        );
+        assert!(destination_meter[0].abs() < 0.001);
+
+        meters.set_live_mixer_insert_enabled(2, Some(true));
         controls = source_control.next_frame_controls(&targets);
         frame = [1.0, 0.25];
         source_control.apply_output_frame(controls, &mut frame);
