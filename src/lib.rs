@@ -14918,6 +14918,77 @@ impl FlpDocument {
         Ok(())
     }
 
+    /// Sets a Sampler or Layer root key using the channel's `0x87` dword event.
+    ///
+    /// If the channel has no saved root key, a new event is inserted after its
+    /// recognized kind event. Other channel events are retained.
+    pub fn set_channel_root_key(&mut self, channel_id: u16, root_key: u16) -> Result<(), FlpError> {
+        if root_key > 127 {
+            return Err(FlpError::UnsupportedEdit(
+                "the root key must be a MIDI key from 0 through 127",
+            ));
+        }
+        self.require_unique_channel(channel_id)?;
+        let channel = self
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id() == channel_id)
+            .expect("the unique channel was checked above");
+        if !matches!(channel.kind, Some(0 | 3)) {
+            return Err(FlpError::UnsupportedEdit(
+                "root keys can only be edited on Sampler and Layer channels",
+            ));
+        }
+
+        let root_events = channel
+            .event_range()
+            .filter(|index| self.events[*index].opcode == 0x87)
+            .collect::<Vec<_>>();
+        if root_events.len() > 1 {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel has multiple `0x87` root-key events",
+            ));
+        }
+
+        let mut candidate = self.clone();
+        if let Some(root_event_index) = root_events.first().copied() {
+            let root_event = &candidate.events[root_event_index];
+            if root_event.encoding != PayloadEncoding::Dword || root_event.payload.len() != 4 {
+                return Err(FlpError::UnsupportedEdit(
+                    "the selected channel's `0x87` root-key event is not a dword",
+                ));
+            }
+            candidate.events[root_event_index].replace_dword_payload(u32::from(root_key))?;
+        } else {
+            let mut kind_events = channel
+                .event_range()
+                .filter(|index| self.events[*index].opcode == 0x15);
+            let Some(kind_index) = kind_events.next() else {
+                return Err(FlpError::UnsupportedEdit(
+                    "the selected channel has no recognized `0x15` kind event",
+                ));
+            };
+            if kind_events.next().is_some()
+                || candidate.events[kind_index].encoding != PayloadEncoding::Byte
+                || candidate.events[kind_index].payload.as_slice()
+                    != [channel
+                        .kind
+                        .expect("supported channel kind was checked above")]
+            {
+                return Err(FlpError::UnsupportedEdit(
+                    "the selected channel's `0x15` kind event is ambiguous or malformed",
+                ));
+            }
+            candidate.events.insert(
+                kind_index + 1,
+                FlpEvent::new_dword(0x87, u32::from(root_key)),
+            );
+        }
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
     /// Sets the per-channel multiplier for Channel Rack swing in FL's 0..=128 range.
     /// The `0x61` word event defaults to 128 (100%) when absent. Sampler and Native instrument (generator)
     /// channels can be edited; audio, Layer, Automation, and unknown channel types are not supported.
@@ -22019,6 +22090,82 @@ mod tests {
             assert_eq!(document.channels()[0].sampler_root_key(), expected_root_key);
             assert_eq!(document.encode_lossless().unwrap(), input);
         }
+    }
+
+    #[test]
+    fn edits_sampler_and_layer_root_keys_without_changing_other_channel_events() {
+        let original = layer_sampler_split_fixture(60, &[2, 1]);
+        let original_document = FlpDocument::parse(&original).expect("fixture should parse");
+        let original_sampler = original_document
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id() == 1)
+            .expect("Sampler child should exist");
+        let original_parameters = original_sampler
+            .event_range()
+            .map(|index| &original_document.events()[index])
+            .find(|event| event.opcode() == 0xC7)
+            .expect("Parameters event should exist")
+            .payload()
+            .to_vec();
+        let mut document = original_document.clone();
+
+        document
+            .set_channel_root_key(0, 62)
+            .expect("Layer root key should be editable");
+        document
+            .set_channel_root_key(1, 80)
+            .expect("Sampler root key should be editable");
+
+        let channels = document.channels();
+        assert_eq!(channels[0].layer_root_key(), Some(62));
+        assert_eq!(channels[1].sampler_root_key(), Some(80));
+        let edited_parameters = channels[1]
+            .event_range()
+            .map(|index| &document.events()[index])
+            .find(|event| event.opcode() == 0xC7)
+            .expect("Parameters event should remain present")
+            .payload();
+        assert_eq!(edited_parameters, original_parameters);
+        let encoded = document
+            .encode_lossless()
+            .expect("edited project should encode");
+        let reopened = FlpDocument::parse(&encoded).expect("edited project should reopen");
+        assert_eq!(reopened.channels(), document.channels());
+    }
+
+    #[test]
+    fn root_key_editor_inserts_a_missing_event_and_rejects_unsupported_edits_atomically() {
+        let layer_bytes = flp_fixture(&[0x40, 7, 0, 0x15, 3, 0x62, 0, 0], &[], &[]);
+        let mut layer = FlpDocument::parse(&layer_bytes).expect("Layer fixture should parse");
+        layer
+            .set_channel_root_key(7, 60)
+            .expect("missing root key should be inserted");
+        assert_eq!(layer.channels()[0].layer_root_key(), Some(60));
+        let inserted_root_index = layer.channels()[0]
+            .event_range()
+            .find(|index| layer.events()[*index].opcode() == 0x87)
+            .expect("root-key event should be inserted");
+        assert_eq!(
+            layer.events()[inserted_root_index].payload(),
+            &60_u32.to_le_bytes()
+        );
+
+        let before = layer.clone();
+        assert!(matches!(
+            layer.set_channel_root_key(7, 128),
+            Err(FlpError::UnsupportedEdit(_))
+        ));
+        assert_eq!(layer, before);
+
+        let native_bytes = flp_fixture(&[0x40, 8, 0, 0x15, 2, 0x62, 0, 0], &[], &[]);
+        let mut native = FlpDocument::parse(&native_bytes).expect("Native fixture should parse");
+        let native_before = native.clone();
+        assert!(matches!(
+            native.set_channel_root_key(8, 60),
+            Err(FlpError::UnsupportedEdit(_))
+        ));
+        assert_eq!(native, native_before);
     }
 
     #[test]

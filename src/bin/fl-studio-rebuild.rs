@@ -21078,6 +21078,7 @@ impl DawUi {
         let mut layer_edits = Vec::new();
         let mut layer_flag_edits = Vec::new();
         let mut layer_split_edits = Vec::new();
+        let mut channel_root_key_edits = Vec::new();
         let mut channel_key_range_edits = Vec::new();
         let mut step_toggles = Vec::<(u16, Vec<usize>, u32, StepToggleOperation)>::new();
         let mut step_note_additions = Vec::<(u16, u32, u16)>::new();
@@ -22034,6 +22035,32 @@ impl DawUi {
                                 channel_key_range_edits.push((channel.id(), low_key, high_key));
                             }
                         }
+                        let current_root_key = match channel.kind() {
+                            Some(0) => Some(channel.sampler_root_key()),
+                            Some(3) => Some(channel.layer_root_key()),
+                            _ => None,
+                        };
+                        if let Some(current_root_key) = current_root_key {
+                            let mut root_key = current_root_key.unwrap_or(60);
+                            let mut root_key_changed = false;
+                            ui.horizontal(|ui| {
+                                ui.strong("Root key");
+                                root_key_changed = ui
+                                    .add(
+                                        egui::DragValue::new(&mut root_key)
+                                            .range(0..=127),
+                                    )
+                                    .on_hover_text("Saved Sampler or Layer root MIDI key (0–127)")
+                                    .changed();
+                                if current_root_key.is_none() {
+                                    ui.small("not saved");
+                                    root_key_changed |= ui.small_button("Set").clicked();
+                                }
+                            });
+                            if root_key_changed {
+                                channel_root_key_edits.push((channel.id(), root_key));
+                            }
+                        }
                         }
                     });
                 if volume_changed || pan_changed {
@@ -22504,6 +22531,21 @@ impl DawUi {
                     }
                     Err(error) => {
                         self.status = format!("Could not update Layer children: {error}");
+                    }
+                }
+            }
+        }
+        if !channel_root_key_edits.is_empty()
+            && let Some(document) = self.document.as_mut()
+        {
+            for (channel_id, root_key) in channel_root_key_edits {
+                match document.set_channel_root_key(channel_id, root_key) {
+                    Ok(()) => {
+                        self.dirty = true;
+                        self.status = format!("Channel {channel_id} root key set to {root_key}");
+                    }
+                    Err(error) => {
+                        self.status = format!("Could not update channel root key: {error}");
                     }
                 }
             }

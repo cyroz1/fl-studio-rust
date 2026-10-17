@@ -464,6 +464,14 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_midi_key(high_key, "high key")?,
             )
         }
+        [command, input, output, channel_id, root_key] if command == "set-channel-root-key" => {
+            set_channel_root_key(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(channel_id, "channel id")?,
+                parse_midi_key(root_key, "root key")?,
+            )
+        }
         [command, input, output, channel_id, volume, pan] if command == "set-channel-levels" => {
             set_channel_levels(
                 Path::new(input),
@@ -1201,6 +1209,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild set-channel-main-pitch <input.flp> <output.flp> <channel-id> <0|1>\n",
             "  flp-rebuild set-channel-add-to-key <input.flp> <output.flp> <channel-id> <0|1>\n",
             "  flp-rebuild set-channel-key-range <input.flp> <output.flp> <channel-id> <low-key-0..127> <high-key-0..127>\n",
+            "  flp-rebuild set-channel-root-key <input.flp> <output.flp> <channel-id> <root-key-0..127>\n",
             "  flp-rebuild edit-channel-level-adjustments <input.flp> <output.flp> <channel-id> <event-index> <pan-raw|-> <volume-raw|-> <mod-x-raw|-> <mod-y-raw|->\n",
             "  flp-rebuild set-channel-swing <input.flp> <output.flp> <channel-id> <percent-0..100>\n",
             "  flp-rebuild set-layer-children <input.flp> <output.flp> <layer-channel-id> <child-ids-comma-separated|->\n",
@@ -2282,7 +2291,7 @@ fn list_channels(path: &Path) -> Result<(), String> {
     println!("channels: {}", channels.len());
     for channel in channels {
         println!(
-            "id={} kind={} type={:?} enabled={} main_pitch={} add_to_key={} color={:?} volume={:?} pan={:?} level_adjusts_raw={:?} swing_mix_raw={:?} layer_children={:?} layer_flags={:?} plugin={} name={} sample_path={:?} events={:?}",
+            "id={} kind={} type={:?} enabled={} main_pitch={} add_to_key={} sampler_root_key={:?} layer_root_key={:?} keyboard_key_region={:?} color={:?} volume={:?} pan={:?} level_adjusts_raw={:?} swing_mix_raw={:?} layer_children={:?} layer_flags={:?} plugin={} name={} sample_path={:?} events={:?}",
             channel.id(),
             channel
                 .kind()
@@ -2293,6 +2302,9 @@ fn list_channels(path: &Path) -> Result<(), String> {
                 .map_or_else(|| "unknown".to_owned(), |enabled| enabled.to_string()),
             channel.keyboard_main_pitch_enabled(),
             channel.keyboard_add_to_key_enabled(),
+            channel.sampler_root_key(),
+            channel.layer_root_key(),
+            channel.keyboard_key_region(),
             channel.color(),
             channel.volume(),
             channel.pan(),
@@ -3067,6 +3079,28 @@ fn set_channel_keyboard_key_region(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "set channel {channel_id} keyboard range to {low_key}..={high_key} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn set_channel_root_key(
+    input: &Path,
+    output: &Path,
+    channel_id: u16,
+    root_key: u16,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .set_channel_root_key(channel_id, root_key)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "set channel {channel_id} root key to {root_key} in {}",
         output.display()
     );
     Ok(())
