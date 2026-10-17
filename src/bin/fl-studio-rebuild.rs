@@ -22039,6 +22039,7 @@ impl DawUi {
                             Some(0) => Some(channel.sampler_root_key()),
                             Some(2) => Some(channel.native_instrument_root_key()),
                             Some(3) => Some(channel.layer_root_key()),
+                            Some(4) => Some(channel.instrument_root_key()),
                             _ => None,
                         };
                         if let Some(current_root_key) = current_root_key {
@@ -22052,7 +22053,7 @@ impl DawUi {
                                             .range(0..=127),
                                     )
                                     .on_hover_text(
-                                        "Saved Sampler, Native instrument, or Layer root MIDI key (0–127)",
+                                        "Saved Sampler, Native instrument, sample-backed Instrument, or Layer root MIDI key (0–127)",
                                     )
                                     .changed();
                                 if current_root_key.is_none() {

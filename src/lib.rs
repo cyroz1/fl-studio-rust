@@ -742,6 +742,16 @@ impl ChannelSummary {
             .map(|note| note as u16)
     }
 
+    /// Saved root key for a kind-4 sample-backed Instrument channel.
+    pub fn instrument_root_key(&self) -> Option<u16> {
+        if self.kind != Some(ChannelType::Instrument.raw()) {
+            return None;
+        }
+        self.sampler_root_note
+            .filter(|note| *note <= 127)
+            .map(|note| note as u16)
+    }
+
     /// Saved root key for a Layer channel, when the raw value is a MIDI key number.
     pub fn layer_root_key(&self) -> Option<u16> {
         if self.kind != Some(ChannelType::Layer.raw()) {
@@ -14937,7 +14947,9 @@ impl FlpDocument {
         Ok(())
     }
 
-    /// Sets a Sampler, Native instrument, or Layer root key using the `0x87` dword event.
+    /// Sets a Sampler, Native instrument, sample-backed Instrument, or Layer root key.
+    ///
+    /// The saved value is stored in the channel's `0x87` dword event.
     ///
     /// If the channel has no saved root key, a new event is inserted after its
     /// recognized kind event. Other channel events are retained.
@@ -14953,9 +14965,9 @@ impl FlpDocument {
             .into_iter()
             .find(|channel| channel.id() == channel_id)
             .expect("the unique channel was checked above");
-        if !matches!(channel.kind, Some(0 | 2 | 3)) {
+        if !matches!(channel.kind, Some(0 | 2 | 3 | 4)) {
             return Err(FlpError::UnsupportedEdit(
-                "root keys can only be edited on Sampler, Native instrument, and Layer channels",
+                "root keys can only be edited on Sampler, Native instrument, sample-backed Instrument, and Layer channels",
             ));
         }
 
@@ -22096,13 +22108,20 @@ mod tests {
     }
 
     #[test]
-    fn decodes_sampler_and_native_instrument_root_notes() {
-        for (kind, root_note, expected_sampler_root_key, expected_native_root_key) in [
-            (0, 72_u32, Some(72_u16), None),
-            (0, 128, None, None),
-            (2, 72, None, Some(72)),
-            (2, 128, None, None),
-            (4, 72, None, None),
+    fn decodes_sampler_native_and_sample_backed_instrument_root_notes() {
+        for (
+            kind,
+            root_note,
+            expected_sampler_root_key,
+            expected_native_root_key,
+            expected_instrument_root_key,
+        ) in [
+            (0, 72_u32, Some(72_u16), None, None),
+            (0, 128, None, None, None),
+            (2, 72, None, Some(72), None),
+            (2, 128, None, None, None),
+            (4, 72, None, None, Some(72)),
+            (4, 128, None, None, None),
         ] {
             let mut event_stream = vec![0x40, 7, 0, 0x15, kind, 0x87];
             event_stream.extend_from_slice(&root_note.to_le_bytes());
@@ -22117,6 +22136,10 @@ mod tests {
             assert_eq!(
                 document.channels()[0].native_instrument_root_key(),
                 expected_native_root_key
+            );
+            assert_eq!(
+                document.channels()[0].instrument_root_key(),
+                expected_instrument_root_key
             );
             assert_eq!(document.encode_lossless().unwrap(), input);
         }
@@ -22202,12 +22225,24 @@ mod tests {
         let instrument_bytes = flp_fixture(&[0x40, 9, 0, 0x15, 4, 0x62, 0, 0], &[], &[]);
         let mut instrument =
             FlpDocument::parse(&instrument_bytes).expect("Instrument fixture should parse");
-        let instrument_before = instrument.clone();
+        instrument
+            .set_channel_root_key(9, 60)
+            .expect("sample-backed Instrument root key should be inserted");
+        assert_eq!(instrument.channels()[0].instrument_root_key(), Some(60));
+        instrument
+            .set_channel_root_key(9, 73)
+            .expect("sample-backed Instrument root key should be editable");
+        assert_eq!(instrument.channels()[0].instrument_root_key(), Some(73));
+
+        let automation_bytes = flp_fixture(&[0x40, 10, 0, 0x15, 5, 0x62, 0, 0], &[], &[]);
+        let mut automation =
+            FlpDocument::parse(&automation_bytes).expect("Automation fixture should parse");
+        let automation_before = automation.clone();
         assert!(matches!(
-            instrument.set_channel_root_key(9, 60),
+            automation.set_channel_root_key(10, 60),
             Err(FlpError::UnsupportedEdit(_))
         ));
-        assert_eq!(instrument, instrument_before);
+        assert_eq!(automation, automation_before);
     }
 
     #[test]

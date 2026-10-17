@@ -2291,7 +2291,7 @@ fn list_channels(path: &Path) -> Result<(), String> {
     println!("channels: {}", channels.len());
     for channel in channels {
         println!(
-            "id={} kind={} type={:?} enabled={} main_pitch={} add_to_key={} sampler_root_key={:?} native_instrument_root_key={:?} layer_root_key={:?} keyboard_key_region={:?} color={:?} volume={:?} pan={:?} level_adjusts_raw={:?} swing_mix_raw={:?} layer_children={:?} layer_flags={:?} plugin={} name={} sample_path={:?} events={:?}",
+            "id={} kind={} type={:?} enabled={} main_pitch={} add_to_key={} sampler_root_key={:?} native_instrument_root_key={:?} instrument_root_key={:?} layer_root_key={:?} keyboard_key_region={:?} color={:?} volume={:?} pan={:?} level_adjusts_raw={:?} swing_mix_raw={:?} layer_children={:?} layer_flags={:?} plugin={} name={} sample_path={:?} events={:?}",
             channel.id(),
             channel
                 .kind()
@@ -2304,6 +2304,7 @@ fn list_channels(path: &Path) -> Result<(), String> {
             channel.keyboard_add_to_key_enabled(),
             channel.sampler_root_key(),
             channel.native_instrument_root_key(),
+            channel.instrument_root_key(),
             channel.layer_root_key(),
             channel.keyboard_key_region(),
             channel.color(),
