@@ -14825,6 +14825,99 @@ impl FlpDocument {
         Ok(())
     }
 
+    /// Sets a channel's inclusive MIDI keyboard range in its Parameters (`0xC7`) event.
+    ///
+    /// Sampler, Native instrument, Layer, and sample-backed Instrument channels are
+    /// supported. Existing Parameters bytes outside the two range fields are kept.
+    pub fn set_channel_keyboard_key_region(
+        &mut self,
+        channel_id: u16,
+        low_key: u16,
+        high_key: u16,
+    ) -> Result<(), FlpError> {
+        if low_key > 127 || high_key > 127 || low_key > high_key {
+            return Err(FlpError::UnsupportedEdit(
+                "the keyboard key range must be ordered MIDI keys from 0 through 127",
+            ));
+        }
+        self.require_unique_channel(channel_id)?;
+        let channel = self
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id() == channel_id)
+            .expect("the unique channel was checked above");
+        if !matches!(channel.kind, Some(0 | 2 | 3 | 4)) {
+            return Err(FlpError::UnsupportedEdit(
+                "keyboard key ranges can only be edited on Sampler, Native instrument, Layer, or sample-backed Instrument channels",
+            ));
+        }
+
+        let c7_events = channel
+            .event_range()
+            .filter(|index| self.events[*index].opcode == 0xC7)
+            .collect::<Vec<_>>();
+        let mut parameter_events = c7_events.iter().copied().filter(|index| {
+            matches!(self.events[*index].encoding, PayloadEncoding::Data { .. })
+                && ascii_version(&self.events[*index].payload).is_none()
+        });
+        let parameters_index = parameter_events.next();
+        if parameter_events.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel has multiple Parameters (`0xC7`) events",
+            ));
+        }
+        if parameters_index.is_none() && !c7_events.is_empty() {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel's `0xC7` event is not a recognized Parameters payload",
+            ));
+        }
+
+        let kind_index = if parameters_index.is_none() {
+            let mut kind_events = channel
+                .event_range()
+                .filter(|index| self.events[*index].opcode == 0x15);
+            let Some(kind_index) = kind_events.next() else {
+                return Err(FlpError::UnsupportedEdit(
+                    "the selected channel has no recognized `0x15` kind event",
+                ));
+            };
+            if kind_events.next().is_some()
+                || self.events[kind_index].encoding != PayloadEncoding::Byte
+                || self.events[kind_index].payload.as_slice()
+                    != [channel
+                        .kind
+                        .expect("supported channel kind was checked above")]
+            {
+                return Err(FlpError::UnsupportedEdit(
+                    "the selected channel's `0x15` kind event is ambiguous or malformed",
+                ));
+            }
+            Some(kind_index)
+        } else {
+            None
+        };
+
+        let mut candidate = self.clone();
+        if let Some(parameters_index) = parameters_index {
+            let mut payload = candidate.events[parameters_index].payload.clone();
+            payload.resize(payload.len().max(76), 0);
+            payload[68..72].copy_from_slice(&u32::from(low_key).to_le_bytes());
+            payload[72..76].copy_from_slice(&u32::from(high_key).to_le_bytes());
+            candidate.events[parameters_index].replace_data_payload(payload)?;
+        } else {
+            let mut payload = vec![0; 76];
+            payload[68..72].copy_from_slice(&u32::from(low_key).to_le_bytes());
+            payload[72..76].copy_from_slice(&u32::from(high_key).to_le_bytes());
+            candidate.events.insert(
+                kind_index.expect("missing Parameters requires a kind index") + 1,
+                FlpEvent::new_data(0xC7, payload)?,
+            );
+        }
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
     /// Sets the per-channel multiplier for Channel Rack swing in FL's 0..=128 range.
     /// The `0x61` word event defaults to 128 (100%) when absent. Sampler and Native instrument (generator)
     /// channels can be edited; audio, Layer, Automation, and unknown channel types are not supported.
@@ -21951,6 +22044,111 @@ mod tests {
         let short_document = FlpDocument::parse(&flp_fixture(&short_event_stream, &[], &[]))
             .expect("short parameters fixture should parse");
         assert_eq!(short_document.channels()[0].keyboard_key_region(), None);
+    }
+
+    #[test]
+    fn editing_channel_keyboard_key_region_preserves_other_parameters_bytes() {
+        let original = layer_sampler_split_fixture(60, &[2, 1]);
+        let original_document = FlpDocument::parse(&original).expect("fixture should parse");
+        let original_child = original_document
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id() == 1)
+            .expect("Sampler channel should exist");
+        let original_parameters = original_child
+            .event_range()
+            .map(|index| &original_document.events()[index])
+            .find(|event| event.opcode() == 0xC7)
+            .expect("Parameters event should exist")
+            .payload();
+        let mut document = original_document.clone();
+
+        document
+            .set_channel_keyboard_key_region(1, 40, 55)
+            .expect("valid inclusive MIDI range should be editable");
+
+        let edited_child = document
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id() == 1)
+            .expect("edited Sampler channel should exist");
+        assert_eq!(edited_child.keyboard_key_region(), Some((40, 55)));
+        let edited_parameters = edited_child
+            .event_range()
+            .map(|index| &document.events()[index])
+            .find(|event| event.opcode() == 0xC7)
+            .expect("edited Parameters event should exist")
+            .payload();
+        assert_eq!(&edited_parameters[..68], &original_parameters[..68]);
+        assert_eq!(&edited_parameters[76..], &original_parameters[76..]);
+        assert_eq!(edited_child.sampler_root_key(), Some(72));
+        let encoded = document
+            .encode_lossless()
+            .expect("edited project should encode");
+        let reopened = FlpDocument::parse(&encoded).expect("edited project should reopen");
+        assert_eq!(reopened.channels(), document.channels());
+    }
+
+    #[test]
+    fn editing_channel_keyboard_key_region_inserts_parameters_and_rejects_invalid_ranges() {
+        let mut event_stream = vec![0x40, 7, 0, 0x15, 0, 0x87];
+        event_stream.extend_from_slice(&60_u32.to_le_bytes());
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        let input = flp_fixture(&event_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+
+        document
+            .set_channel_keyboard_key_region(7, 12, 24)
+            .expect("valid range should insert Parameters");
+        assert_eq!(document.channels()[0].keyboard_key_region(), Some((12, 24)));
+
+        let before = document.clone();
+        for (low_key, high_key) in [(25, 24), (0, 128), (128, 128)] {
+            assert!(matches!(
+                document.set_channel_keyboard_key_region(7, low_key, high_key),
+                Err(FlpError::UnsupportedEdit(_))
+            ));
+            assert_eq!(document, before);
+        }
+
+        let mut short_stream = vec![0x40, 8, 0, 0x15, 0];
+        append_data_event(&mut short_stream, 0xC7, &[0xA5; 75]);
+        short_stream.extend_from_slice(&[0x62, 0, 0]);
+        let short_bytes = flp_fixture(&short_stream, &[], &[]);
+        let mut short_document =
+            FlpDocument::parse(&short_bytes).expect("short Parameters fixture should parse");
+        let short_original = short_document
+            .events()
+            .iter()
+            .find(|event| event.opcode() == 0xC7)
+            .expect("short Parameters event should exist")
+            .payload()
+            .to_vec();
+        short_document
+            .set_channel_keyboard_key_region(8, 32, 48)
+            .expect("short Parameters payload should be extended safely");
+        let short_channels = short_document.channels();
+        let short_child = &short_channels[0];
+        assert_eq!(short_child.keyboard_key_region(), Some((32, 48)));
+        let short_edited = short_child
+            .event_range()
+            .map(|index| &short_document.events()[index])
+            .find(|event| event.opcode() == 0xC7)
+            .expect("edited Parameters event should exist")
+            .payload();
+        assert_eq!(short_edited.len(), 76);
+        assert_eq!(&short_edited[..68], &short_original[..68]);
+
+        let automation_stream = vec![0x40, 7, 0, 0x15, 5, 0x62, 0, 0];
+        let automation_bytes = flp_fixture(&automation_stream, &[], &[]);
+        let mut automation =
+            FlpDocument::parse(&automation_bytes).expect("automation fixture should parse");
+        let automation_before = automation.clone();
+        assert!(matches!(
+            automation.set_channel_keyboard_key_region(7, 12, 24),
+            Err(FlpError::UnsupportedEdit(_))
+        ));
+        assert_eq!(automation, automation_before);
     }
 
     #[test]

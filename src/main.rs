@@ -453,6 +453,17 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_bool(enabled, "Add to Key setting")?,
             )
         }
+        [command, input, output, channel_id, low_key, high_key]
+            if command == "set-channel-key-range" =>
+        {
+            set_channel_keyboard_key_region(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(channel_id, "channel id")?,
+                parse_midi_key(low_key, "low key")?,
+                parse_midi_key(high_key, "high key")?,
+            )
+        }
         [command, input, output, channel_id, volume, pan] if command == "set-channel-levels" => {
             set_channel_levels(
                 Path::new(input),
@@ -1189,6 +1200,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild set-channel-levels <input.flp> <output.flp> <channel-id> <volume-0..12800> <pan-0..12800>\n",
             "  flp-rebuild set-channel-main-pitch <input.flp> <output.flp> <channel-id> <0|1>\n",
             "  flp-rebuild set-channel-add-to-key <input.flp> <output.flp> <channel-id> <0|1>\n",
+            "  flp-rebuild set-channel-key-range <input.flp> <output.flp> <channel-id> <low-key-0..127> <high-key-0..127>\n",
             "  flp-rebuild edit-channel-level-adjustments <input.flp> <output.flp> <channel-id> <event-index> <pan-raw|-> <volume-raw|-> <mod-x-raw|-> <mod-y-raw|->\n",
             "  flp-rebuild set-channel-swing <input.flp> <output.flp> <channel-id> <percent-0..100>\n",
             "  flp-rebuild set-layer-children <input.flp> <output.flp> <layer-channel-id> <child-ids-comma-separated|->\n",
@@ -1296,6 +1308,16 @@ fn parse_u16(value: &str, description: &str) -> Result<u16, String> {
     value
         .parse::<u16>()
         .map_err(|_| format!("{description} must be an integer from 0 through 65535"))
+}
+
+fn parse_midi_key(value: &str, description: &str) -> Result<u16, String> {
+    let key = parse_u16(value, description)?;
+    if key > 127 {
+        return Err(format!(
+            "{description} must be a MIDI key from 0 through 127"
+        ));
+    }
+    Ok(key)
 }
 
 fn parse_i16(value: &str, description: &str) -> Result<i16, String> {
@@ -3022,6 +3044,29 @@ fn set_channel_add_to_key(
     println!(
         "{} Add to Key on channel {channel_id} in {}",
         if enabled { "enabled" } else { "disabled" },
+        output.display()
+    );
+    Ok(())
+}
+
+fn set_channel_keyboard_key_region(
+    input: &Path,
+    output: &Path,
+    channel_id: u16,
+    low_key: u16,
+    high_key: u16,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .set_channel_keyboard_key_region(channel_id, low_key, high_key)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "set channel {channel_id} keyboard range to {low_key}..={high_key} in {}",
         output.display()
     );
     Ok(())

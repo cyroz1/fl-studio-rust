@@ -21078,6 +21078,7 @@ impl DawUi {
         let mut layer_edits = Vec::new();
         let mut layer_flag_edits = Vec::new();
         let mut layer_split_edits = Vec::new();
+        let mut channel_key_range_edits = Vec::new();
         let mut step_toggles = Vec::<(u16, Vec<usize>, u32, StepToggleOperation)>::new();
         let mut step_note_additions = Vec::<(u16, u32, u16)>::new();
         let mut mute_removed_steps_changed = false;
@@ -21999,6 +22000,40 @@ impl DawUi {
                                 ui.small("Set a Layer root key and add children to split");
                             }
                         }
+                        if matches!(channel.kind(), Some(0 | 2 | 3 | 4)) {
+                            let (mut low_key, mut high_key) =
+                                channel.keyboard_key_region().unwrap_or((0, 127));
+                            let mut low_changed = false;
+                            let mut high_changed = false;
+                            ui.horizontal(|ui| {
+                                ui.strong("Key range");
+                                low_changed = ui
+                                    .add(
+                                        egui::DragValue::new(&mut low_key)
+                                            .range(0..=127)
+                                            .prefix("Low "),
+                                    )
+                                    .on_hover_text("Inclusive lower MIDI key (0–127)")
+                                    .changed();
+                                high_changed = ui
+                                    .add(
+                                        egui::DragValue::new(&mut high_key)
+                                            .range(0..=127)
+                                            .prefix("High "),
+                                    )
+                                    .on_hover_text("Inclusive upper MIDI key (0–127)")
+                                    .changed();
+                                ui.small("default 0–127");
+                            });
+                            if low_changed && low_key > high_key {
+                                high_key = low_key;
+                            } else if high_changed && high_key < low_key {
+                                low_key = high_key;
+                            }
+                            if low_changed || high_changed {
+                                channel_key_range_edits.push((channel.id(), low_key, high_key));
+                            }
+                        }
                         }
                     });
                 if volume_changed || pan_changed {
@@ -22469,6 +22504,22 @@ impl DawUi {
                     }
                     Err(error) => {
                         self.status = format!("Could not update Layer children: {error}");
+                    }
+                }
+            }
+        }
+        if !channel_key_range_edits.is_empty()
+            && let Some(document) = self.document.as_mut()
+        {
+            for (channel_id, low_key, high_key) in channel_key_range_edits {
+                match document.set_channel_keyboard_key_region(channel_id, low_key, high_key) {
+                    Ok(()) => {
+                        self.dirty = true;
+                        self.status =
+                            format!("Channel {channel_id} key range set to {low_key}–{high_key}");
+                    }
+                    Err(error) => {
+                        self.status = format!("Could not update channel key range: {error}");
                     }
                 }
             }
