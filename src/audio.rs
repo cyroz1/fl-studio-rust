@@ -37,6 +37,12 @@ const TEST_TONE_LEVEL: f32 = 0.12;
 /// Number of Mixer tracks that can be named by a channel's signed-byte assignment.
 pub const MIXER_TRACK_METER_COUNT: usize = i8::MAX as usize + 1;
 
+#[derive(Clone)]
+pub(crate) struct LiveMixerSendTargetAtomics {
+    pub(crate) level_raw: Arc<AtomicI32>,
+    pub(crate) enabled: Arc<AtomicI32>,
+}
+
 /// Block-peak snapshots for the supported live Playlist Mixer routes.
 ///
 /// The render worker publishes the maximum sample for each insert between UI reads. The UI
@@ -48,7 +54,7 @@ pub struct MixerTrackPeakMeters {
     live_mixer_insert_stereo_separation_raw: [Arc<AtomicI32>; MIXER_TRACK_METER_COUNT],
     live_mixer_insert_signal_flags: [Arc<AtomicI32>; MIXER_TRACK_METER_COUNT],
     live_mixer_insert_enabled: [Arc<AtomicI32>; MIXER_TRACK_METER_COUNT],
-    live_mixer_send_levels: Mutex<HashMap<(usize, usize), Arc<AtomicI32>>>,
+    live_mixer_send_targets: Mutex<HashMap<(usize, usize), LiveMixerSendTargetAtomics>>,
     live_master_fader_gain: Arc<AtomicU32>,
     live_master_pan_raw: Arc<AtomicI32>,
     live_master_stereo_separation_raw: Arc<AtomicI32>,
@@ -71,7 +77,7 @@ impl Default for MixerTrackPeakMeters {
                 Arc::new(AtomicI32::new(i32::MIN))
             }),
             live_mixer_insert_enabled: std::array::from_fn(|_| Arc::new(AtomicI32::new(i32::MIN))),
-            live_mixer_send_levels: Mutex::new(HashMap::new()),
+            live_mixer_send_targets: Mutex::new(HashMap::new()),
             live_master_fader_gain: Arc::new(AtomicU32::new(1.0_f32.to_bits())),
             live_master_pan_raw: Arc::new(AtomicI32::new(i32::MIN)),
             live_master_stereo_separation_raw: Arc::new(AtomicI32::new(i32::MIN)),
@@ -210,7 +216,7 @@ impl MixerTrackPeakMeters {
         self.live_mixer_insert_enabled.get(track).cloned()
     }
 
-    /// Set a paired, enabled Mixer send's live raw level target.
+    /// Set a uniquely paired Mixer send's live raw level target.
     ///
     /// The render worker receives the atomic target during stream preparation and smooths
     /// supported route changes over 20 ms without taking a lock on the audio thread.
@@ -220,41 +226,54 @@ impl MixerTrackPeakMeters {
         destination_track: usize,
         level_raw: Option<i32>,
     ) {
-        let Some(target) = self.live_mixer_send_level_target(source_track, destination_track)
-        else {
+        let Some(targets) = self.live_mixer_send_targets(source_track, destination_track) else {
             return;
         };
         let value = level_raw
             .filter(|value| (0..=16_000).contains(value))
             .unwrap_or(i32::MIN);
-        target.store(value, Ordering::Release);
+        targets.level_raw.store(value, Ordering::Release);
     }
 
-    pub(crate) fn live_mixer_send_level_raw(
+    /// Set the live enabled target for one uniquely paired Mixer send route.
+    ///
+    /// The render worker smooths the route state over 20 ms without locking the audio callback.
+    pub fn set_live_mixer_send_enabled(
         &self,
         source_track: usize,
         destination_track: usize,
-    ) -> Option<Arc<AtomicI32>> {
-        self.live_mixer_send_level_target(source_track, destination_track)
+        enabled: Option<bool>,
+    ) {
+        let Some(targets) = self.live_mixer_send_targets(source_track, destination_track) else {
+            return;
+        };
+        targets.enabled.store(
+            enabled.map_or(i32::MIN, |enabled| if enabled { 1 } else { 0 }),
+            Ordering::Release,
+        );
     }
 
-    fn live_mixer_send_level_target(
+    pub(crate) fn live_mixer_send_targets(
         &self,
         source_track: usize,
         destination_track: usize,
-    ) -> Option<Arc<AtomicI32>> {
+    ) -> Option<LiveMixerSendTargetAtomics> {
         if source_track >= MIXER_TRACK_METER_COUNT || destination_track >= MIXER_TRACK_METER_COUNT {
             return None;
         }
-        let mut levels = self
-            .live_mixer_send_levels
+        let mut targets = self
+            .live_mixer_send_targets
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Some(Arc::clone(
-            levels
+        Some(
+            targets
                 .entry((source_track, destination_track))
-                .or_insert_with(|| Arc::new(AtomicI32::new(i32::MIN))),
-        ))
+                .or_insert_with(|| LiveMixerSendTargetAtomics {
+                    level_raw: Arc::new(AtomicI32::new(i32::MIN)),
+                    enabled: Arc::new(AtomicI32::new(i32::MIN)),
+                })
+                .clone(),
+        )
     }
 
     pub(crate) fn live_master_fader_gain(&self) -> Arc<AtomicU32> {
@@ -340,12 +359,14 @@ pub(crate) struct LiveMixerSourceControl {
     current_swap_mix_bits: Arc<AtomicU32>,
     current_enabled_gain_bits: Arc<AtomicU32>,
     current_send_gain_bits: Vec<Arc<AtomicU32>>,
+    current_send_enabled_gain_bits: Vec<Arc<AtomicU32>>,
     gain_started: Arc<AtomicBool>,
     pan_started: Arc<AtomicBool>,
     stereo_separation_started: Arc<AtomicBool>,
     signal_flags_started: Arc<AtomicBool>,
     enabled_started: Arc<AtomicBool>,
     send_started: Vec<Arc<AtomicBool>>,
+    send_enabled_started: Vec<Arc<AtomicBool>>,
     smoothing_alpha: f32,
 }
 
@@ -377,6 +398,11 @@ impl Clone for LiveMixerSourceControl {
                 .iter()
                 .map(|gain| Arc::new(AtomicU32::new(gain.load(Ordering::Relaxed))))
                 .collect(),
+            current_send_enabled_gain_bits: self
+                .current_send_enabled_gain_bits
+                .iter()
+                .map(|gain| Arc::new(AtomicU32::new(gain.load(Ordering::Relaxed))))
+                .collect(),
             gain_started: Arc::new(AtomicBool::new(self.gain_started.load(Ordering::Relaxed))),
             pan_started: Arc::new(AtomicBool::new(self.pan_started.load(Ordering::Relaxed))),
             stereo_separation_started: Arc::new(AtomicBool::new(
@@ -393,6 +419,11 @@ impl Clone for LiveMixerSourceControl {
                 .iter()
                 .map(|started| Arc::new(AtomicBool::new(started.load(Ordering::Relaxed))))
                 .collect(),
+            send_enabled_started: self
+                .send_enabled_started
+                .iter()
+                .map(|started| Arc::new(AtomicBool::new(started.load(Ordering::Relaxed))))
+                .collect(),
             smoothing_alpha: self.smoothing_alpha,
         }
     }
@@ -406,6 +437,7 @@ pub(crate) struct LiveMixerSourceTargets {
     signal_flags: Arc<AtomicI32>,
     enabled: Arc<AtomicI32>,
     send_levels: Vec<Arc<AtomicI32>>,
+    send_enabled: Vec<Arc<AtomicI32>>,
 }
 
 #[derive(Clone, Copy)]
@@ -427,6 +459,20 @@ impl LiveMixerSourceControl {
             .collect();
         let send_started = route_plan
             .saved_live_send_gains
+            .iter()
+            .map(|_| Arc::new(AtomicBool::new(false)))
+            .collect();
+        let current_send_enabled_gain_bits = route_plan
+            .saved_live_send_enabled
+            .iter()
+            .map(|enabled| {
+                Arc::new(AtomicU32::new(
+                    if *enabled { 1.0_f32 } else { 0.0 }.to_bits(),
+                ))
+            })
+            .collect();
+        let send_enabled_started = route_plan
+            .saved_live_send_enabled
             .iter()
             .map(|_| Arc::new(AtomicBool::new(false)))
             .collect();
@@ -466,24 +512,34 @@ impl LiveMixerSourceControl {
                 },
             )),
             current_send_gain_bits,
+            current_send_enabled_gain_bits,
             gain_started: Arc::new(AtomicBool::new(false)),
             pan_started: Arc::new(AtomicBool::new(false)),
             stereo_separation_started: Arc::new(AtomicBool::new(false)),
             signal_flags_started: Arc::new(AtomicBool::new(false)),
             enabled_started: Arc::new(AtomicBool::new(false)),
             send_started,
+            send_enabled_started,
             smoothing_alpha: output_gain_smoothing_alpha(sample_rate as f32),
             route_plan,
         }
     }
 
     pub(crate) fn targets(&self, meters: &MixerTrackPeakMeters) -> Option<LiveMixerSourceTargets> {
-        let send_levels = self
+        let send_targets = self
             .route_plan
             .live_send_target_keys
             .iter()
-            .map(|key| meters.live_mixer_send_level_raw(key.source_track, key.destination_track))
+            .map(|key| meters.live_mixer_send_targets(key.source_track, key.destination_track))
             .collect::<Option<Vec<_>>>()?;
+        let send_levels = send_targets
+            .iter()
+            .map(|targets| Arc::clone(&targets.level_raw))
+            .collect();
+        let send_enabled = send_targets
+            .into_iter()
+            .map(|targets| targets.enabled)
+            .collect();
         Some(LiveMixerSourceTargets {
             fader_raw: meters.live_mixer_insert_fader_raw(self.route_plan.track)?,
             pan_raw: meters.live_mixer_insert_pan_raw(self.route_plan.track)?,
@@ -492,6 +548,7 @@ impl LiveMixerSourceControl {
             signal_flags: meters.live_mixer_insert_signal_flags(self.route_plan.track)?,
             enabled: meters.live_mixer_insert_enabled(self.route_plan.track)?,
             send_levels,
+            send_enabled,
         })
     }
 
@@ -637,6 +694,30 @@ impl LiveMixerSourceControl {
             current_gain_bits.store(next_gain.to_bits(), Ordering::Relaxed);
         }
 
+        for (((target, current_enabled_gain_bits), started), saved_enabled) in targets
+            .send_enabled
+            .iter()
+            .zip(&self.current_send_enabled_gain_bits)
+            .zip(&self.send_enabled_started)
+            .zip(&self.route_plan.saved_live_send_enabled)
+        {
+            let enabled_target = target.load(Ordering::Acquire);
+            let target_gain = match enabled_target {
+                0 => 0.0,
+                1 => 1.0,
+                _ if *saved_enabled => 1.0,
+                _ => 0.0,
+            };
+            let current_gain = if started.swap(true, Ordering::Relaxed) {
+                f32::from_bits(current_enabled_gain_bits.load(Ordering::Relaxed))
+            } else {
+                target_gain
+            };
+            let next_gain =
+                crate::audio::smooth_output_gain(current_gain, target_gain, self.smoothing_alpha);
+            current_enabled_gain_bits.store(next_gain.to_bits(), Ordering::Relaxed);
+        }
+
         LiveMixerSourceFrameControls {
             gain,
             pan_raw,
@@ -743,17 +824,25 @@ impl LiveMixerSourceControl {
     }
 
     fn send_path_gain(&self, send_gains: &[crate::MixerLiveSendGain]) -> f32 {
-        send_gains.iter().fold(1.0, |gain, send_gain| {
-            let send_gain = send_gain
-                .target_index
-                .map_or(send_gain.saved_gain, |index| {
-                    self.current_send_gain_bits
+        send_gains.iter().fold(1.0, |gain, route| {
+            let send_gain = route.target_index.map_or(route.saved_gain, |index| {
+                self.current_send_gain_bits
+                    .get(index)
+                    .map_or(route.saved_gain, |target| {
+                        f32::from_bits(target.load(Ordering::Relaxed))
+                    })
+            });
+            let enabled_gain = route.enabled_target_index.map_or(
+                if route.saved_enabled { 1.0 } else { 0.0 },
+                |index| {
+                    self.current_send_enabled_gain_bits
                         .get(index)
-                        .map_or(send_gain.saved_gain, |target| {
+                        .map_or(if route.saved_enabled { 1.0 } else { 0.0 }, |target| {
                             f32::from_bits(target.load(Ordering::Relaxed))
                         })
-                });
-            gain * send_gain
+                },
+            );
+            gain * send_gain * enabled_gain
         })
     }
 }

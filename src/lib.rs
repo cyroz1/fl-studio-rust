@@ -2103,6 +2103,7 @@ pub(crate) struct MixerRouteAudibility {
 struct MixerSendRouteEdge {
     destination_track: i8,
     level_raw: i32,
+    enabled: bool,
     live_control: bool,
 }
 
@@ -2131,6 +2132,8 @@ pub(crate) struct MixerLiveSendTargetKey {
 pub(crate) struct MixerLiveSendGain {
     pub(crate) target_index: Option<usize>,
     pub(crate) saved_gain: f32,
+    pub(crate) enabled_target_index: Option<usize>,
+    pub(crate) saved_enabled: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2166,6 +2169,7 @@ pub(crate) struct MixerLiveSourceRoutePlan {
     pub(crate) insert_meter_transforms: Vec<(usize, MixerSourceRouteTransform)>,
     pub(crate) live_send_target_keys: Vec<MixerLiveSendTargetKey>,
     pub(crate) saved_live_send_gains: Vec<f32>,
+    pub(crate) saved_live_send_enabled: Vec<bool>,
     pub(crate) live_send_output_paths: Option<Vec<MixerLiveSendOutputPath>>,
     pub(crate) live_send_meter_paths: Vec<MixerLiveSendMeterPath>,
 }
@@ -2176,6 +2180,7 @@ struct MixerLiveSourceRouteData {
     meter_paths: Vec<MixerLiveSendMeterPath>,
     target_keys: Vec<MixerLiveSendTargetKey>,
     saved_target_gains: Vec<f32>,
+    saved_target_enabled: Vec<bool>,
 }
 
 impl Default for MixerSourceRouteTransform {
@@ -2308,7 +2313,7 @@ impl MixerRouteAudibility {
         let sends = sends.into_iter().collect::<Vec<_>>();
         let mut live_control_counts = HashMap::<(i8, i8), usize>::new();
         for send in &sends {
-            if send.enabled() != Some(true) || mixer_send_gain_raw(send.value()).is_none() {
+            if send.enabled().is_none() || mixer_send_gain_raw(send.value()).is_none() {
                 continue;
             }
             let Ok(source_track) = i8::try_from(send.insert_ordinal()) else {
@@ -2343,6 +2348,27 @@ impl MixerRouteAudibility {
                 continue;
             };
             if !enabled {
+                let Some(destination_ordinal) = send.route_parameter_id().checked_sub(64) else {
+                    continue;
+                };
+                let Ok(destination_track) = i8::try_from(destination_ordinal) else {
+                    continue;
+                };
+                if !self.known_tracks.contains(&destination_track)
+                    || mixer_send_gain_raw(send.value()).is_none()
+                {
+                    continue;
+                }
+                self.send_routes_by_source
+                    .entry(source_track)
+                    .or_default()
+                    .push(MixerSendRouteEdge {
+                        destination_track,
+                        level_raw: send.value(),
+                        enabled: false,
+                        live_control: live_control_counts.get(&(source_track, destination_track))
+                            == Some(&1),
+                    });
                 continue;
             }
             let Some(destination_ordinal) = send.route_parameter_id().checked_sub(64) else {
@@ -2365,6 +2391,7 @@ impl MixerRouteAudibility {
                 .push(MixerSendRouteEdge {
                     destination_track,
                     level_raw: send.value(),
+                    enabled,
                     live_control: live_control_counts.get(&(source_track, destination_track))
                         == Some(&1),
                 });
@@ -2542,7 +2569,7 @@ impl MixerRouteAudibility {
             .into_iter()
             .flatten()
             .any(|route| {
-                (mixer_send_gain_raw(route.level_raw).unwrap_or_default() > 0.0
+                ((route.enabled && mixer_send_gain_raw(route.level_raw).unwrap_or_default() > 0.0)
                     || (include_live_zero_sends && route.live_control))
                     && self.route_can_reach_soloed_insert_with_source_mute_override(
                         route.destination_track,
@@ -2580,7 +2607,7 @@ impl MixerRouteAudibility {
         let saved_fader_raw = self.source_fader_volume_raw.get(&track).copied();
         let saved_signal_flags = self.source_signal_flags.get(&track).copied();
         let saved_enabled = self.source_enabled.get(&track).copied();
-        let has_live_send_levels = self
+        let has_live_send_controls = self
             .send_routes_by_source
             .get(&track)
             .is_some_and(|routes| routes.iter().any(|route| route.live_control));
@@ -2589,7 +2616,7 @@ impl MixerRouteAudibility {
             && source_transform.stereo_separation_raw.is_none()
             && saved_signal_flags.is_none()
             && saved_enabled.is_none()
-            && !has_live_send_levels
+            && !has_live_send_controls
         {
             return None;
         }
@@ -2626,6 +2653,7 @@ impl MixerRouteAudibility {
             insert_meter_transforms: live_route_data.route_plan.insert_meter_transforms,
             live_send_target_keys: live_route_data.target_keys,
             saved_live_send_gains: live_route_data.saved_target_gains,
+            saved_live_send_enabled: live_route_data.saved_target_enabled,
             live_send_output_paths: live_route_data.output_paths,
             live_send_meter_paths: live_route_data.meter_paths,
         })
@@ -2639,6 +2667,7 @@ impl MixerRouteAudibility {
                 meter_paths: Vec::new(),
                 target_keys: Vec::new(),
                 saved_target_gains: Vec::new(),
+                saved_target_enabled: Vec::new(),
             };
         }
 
@@ -2648,6 +2677,7 @@ impl MixerRouteAudibility {
         let mut target_indices = HashMap::new();
         let mut target_keys = Vec::new();
         let mut saved_target_gains = Vec::new();
+        let mut saved_target_enabled = Vec::new();
         self.collect_live_send_paths(
             source_track,
             MixerSourceRouteTransform::default(),
@@ -2657,6 +2687,7 @@ impl MixerRouteAudibility {
             &mut target_indices,
             &mut target_keys,
             &mut saved_target_gains,
+            &mut saved_target_enabled,
             &mut output_paths,
             &mut meter_paths,
         );
@@ -2687,6 +2718,7 @@ impl MixerRouteAudibility {
             meter_paths,
             target_keys,
             saved_target_gains,
+            saved_target_enabled,
         }
     }
 
@@ -2701,6 +2733,7 @@ impl MixerRouteAudibility {
         target_indices: &mut HashMap<MixerLiveSendTargetKey, usize>,
         target_keys: &mut Vec<MixerLiveSendTargetKey>,
         saved_target_gains: &mut Vec<f32>,
+        saved_target_enabled: &mut Vec<bool>,
         output_paths: &mut Vec<MixerLiveSendOutputPath>,
         meter_paths: &mut Vec<MixerLiveSendMeterPath>,
     ) {
@@ -2740,6 +2773,9 @@ impl MixerRouteAudibility {
         if self.complete_send_sources.contains(&track) {
             if let Some(routes) = self.send_routes_by_source.get(&track) {
                 for route in routes {
+                    if !route.enabled && !route.live_control {
+                        continue;
+                    }
                     let saved_gain = mixer_send_gain_raw(route.level_raw).unwrap_or_default();
                     let key = MixerLiveSendTargetKey {
                         source_track: track as usize,
@@ -2750,6 +2786,7 @@ impl MixerRouteAudibility {
                             let index = target_keys.len();
                             target_keys.push(key);
                             saved_target_gains.push(saved_gain);
+                            saved_target_enabled.push(route.enabled);
                             index
                         }))
                     } else {
@@ -2758,6 +2795,8 @@ impl MixerRouteAudibility {
                     send_gains.push(MixerLiveSendGain {
                         target_index,
                         saved_gain,
+                        enabled_target_index: target_index,
+                        saved_enabled: route.enabled,
                     });
                     self.collect_live_send_paths(
                         route.destination_track,
@@ -2768,6 +2807,7 @@ impl MixerRouteAudibility {
                         target_indices,
                         target_keys,
                         saved_target_gains,
+                        saved_target_enabled,
                         output_paths,
                         meter_paths,
                     );
@@ -2859,6 +2899,9 @@ impl MixerRouteAudibility {
         if self.complete_send_sources.contains(&track) {
             if let Some(routes) = self.send_routes_by_source.get(&track) {
                 for route in routes {
+                    if !route.enabled {
+                        continue;
+                    }
                     let gain = mixer_send_gain_raw(route.level_raw).unwrap_or_default();
                     self.accumulate_send_paths(
                         route.destination_track,
@@ -2899,7 +2942,7 @@ fn mixer_send_gain_raw(value: i32) -> Option<f32> {
 fn saved_send_path_gain(send_gains: &[MixerLiveSendGain]) -> f32 {
     send_gains
         .iter()
-        .map(|send_gain| send_gain.saved_gain)
+        .map(|send_gain| send_gain.saved_gain * if send_gain.saved_enabled { 1.0 } else { 0.0 })
         .product()
 }
 
@@ -20296,14 +20339,87 @@ mod tests {
                     MixerLiveSendGain {
                         target_index: Some(0),
                         saved_gain: 0.5,
+                        enabled_target_index: Some(0),
+                        saved_enabled: true,
                     },
                     MixerLiveSendGain {
                         target_index: Some(1),
                         saved_gain: 1.0,
+                        enabled_target_index: Some(1),
+                        saved_enabled: true,
                     },
                 ],
             }])
         );
+    }
+
+    #[test]
+    fn live_mixer_source_route_plan_keeps_disabled_unique_sends_toggleable() {
+        let insert = |ordinal| MixerInsertSummary {
+            ordinal,
+            input_raw: -1,
+            output_raw: -1,
+            color_raw: 0,
+            icon_raw: None,
+            name: None,
+            flags: Some(if ordinal == 2 {
+                (1 << 3) | (1 << 12)
+            } else {
+                1 << 3
+            }),
+            flags_event_index: None,
+            first_event_index: 0,
+            end_event_index: 0,
+        };
+        let mut routing = MixerRouteAudibility::from_inserts_with_parameters(
+            [insert(0), insert(1), insert(2)],
+            &[],
+            None,
+        );
+        routing.add_send_summaries([
+            MixerSendSummary {
+                insert_ordinal: 1,
+                route_parameter_id: 66,
+                value: 6_400,
+                enabled: Some(false),
+                routing_flag_location: Some((1, 0)),
+                event_index: 0,
+                record_index: 0,
+            },
+            MixerSendSummary {
+                insert_ordinal: 2,
+                route_parameter_id: 64,
+                value: 12_800,
+                enabled: Some(true),
+                routing_flag_location: Some((1, 1)),
+                event_index: 0,
+                record_index: 1,
+            },
+        ]);
+        assert!(!routing.allows_channel(Some(1)));
+        assert!(routing.allows_live_source_channel(Some(1)));
+
+        let plan = routing
+            .live_source_route_plan_for_channel(Some(1))
+            .expect("a uniquely paired disabled send should remain live-toggleable");
+        assert_eq!(plan.saved_live_send_gains, vec![0.5, 1.0]);
+        assert_eq!(plan.saved_live_send_enabled, vec![false, true]);
+        assert_eq!(
+            plan.live_send_target_keys,
+            vec![
+                MixerLiveSendTargetKey {
+                    source_track: 1,
+                    destination_track: 2,
+                },
+                MixerLiveSendTargetKey {
+                    source_track: 2,
+                    destination_track: 0,
+                },
+            ]
+        );
+        let mut frame = [1.0, 0.25];
+        plan.output_transform.apply_frame(&mut frame);
+        assert_eq!(frame, [0.0, 0.0]);
     }
 
     #[test]
