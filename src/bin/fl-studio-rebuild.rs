@@ -9493,6 +9493,13 @@ impl DawUi {
 
         let parameters = document.mixer_parameter_records().unwrap_or_default();
         let inserts = document.mixer_inserts();
+        let soloed_tracks = inserts
+            .iter()
+            .filter(|insert| insert.ordinal() > 0 && insert.soloed() == Some(true))
+            .map(MixerInsertSummary::ordinal)
+            .collect::<Vec<_>>();
+        self.mixer_track_peak_meters
+            .set_live_mixer_soloed_tracks(&soloed_tracks);
         for track in 1..=i8::MAX as usize {
             let live_fader_raw =
                 unique_candidate_mixer_parameter(&parameters, track, MixerParameterKind::Volume)
@@ -35409,6 +35416,14 @@ impl DawUi {
                                     candidate_mixer_insert_signal_flags(&inserts, insert_ordinal),
                                 );
                         }
+                        let soloed_tracks = document
+                            .mixer_inserts()
+                            .into_iter()
+                            .filter(|insert| insert.ordinal() > 0 && insert.soloed() == Some(true))
+                            .map(|insert| insert.ordinal())
+                            .collect::<Vec<_>>();
+                        self.mixer_track_peak_meters
+                            .set_live_mixer_soloed_tracks(&soloed_tracks);
                         self.dirty = true;
                         let track_name = if insert_ordinal == 0 {
                             "Master".to_owned()
