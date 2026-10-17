@@ -358,12 +358,14 @@ are applied where the Mixer rows below describe. Full export surface:
   settings, applying supported directly assigned insert mute/solo/phase/swap
   state and Master flags. The File menu can also place this sample-backed
   pattern render as a new Audio Clip on the selected Playlist track at the
-  current transport or seek position. A mapped VST3 channel can render its
-  selected pattern notes to WAV, FLAC, Ogg Vorbis, or MP3 through the loaded
-  instrument, using the shared render depth, dither, bitrate, and channel-mode
-  settings; VST3 output buses must be mono or stereo. FL Studio renders selected
-  patterns to audio clips with configurable render settings; full-pattern VST3
-  rendering, all native render options, and complete Mixer routing/effects
+  current transport or seek position. The Piano roll Audio menu can render a
+  selected VST3 channel's pattern notes to WAV, FLAC, Ogg Vorbis, or MP3 through
+  the loaded instrument and either save the file or insert it as a new Audio
+  Clip on the selected Playlist track at the current transport or seek position.
+  It uses the shared render depth, dither, bitrate, and channel-mode settings;
+  VST3 output buses must be mono or stereo. FL Studio renders selected patterns
+  to audio clips with configurable render settings; full-pattern multi-channel
+  VST3 rendering, all native render options, and complete Mixer routing/effects
   remain incomplete ([Image-Line Patterns
   manual](https://www.image-line.com/fl-studio-learning-content/fl-studio-online-manual/html/menu_patterns.htm)).
 - `[obsolete]` Burn to CD-era options.
