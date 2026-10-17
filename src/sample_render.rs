@@ -4306,6 +4306,14 @@ fn stream_prepared_playlist_render_with_performance(
         cancelled,
         live_mixer_fader_targets: if performance.is_none() { meters } else { None },
     };
+    let performance_audio_mix_context = PreparedAudioClipMixContext {
+        clips: &render.audio.clips,
+        decoded_by_path: &render.audio.decoded_by_path,
+        sample_rate: options.sample_rate,
+        resampling_quality: options.resampling_quality,
+        cancelled,
+        live_mixer_fader_targets: meters,
+    };
     let mix_result = std::thread::scope(|scope| {
         let mut parallel_mixer = if worker_count > 1 {
             ParallelAudioClipMixer::new(scope, worker_clips, &audio_mix_context, meters.is_some())
@@ -4342,7 +4350,7 @@ fn stream_prepared_playlist_render_with_performance(
                     performance.update(
                         block_start..block_start.saturating_add(frame_count as u64),
                         &mut sampler_engine,
-                        &audio_mix_context,
+                        &performance_audio_mix_context,
                         block,
                         meter_buses.as_deref_mut(),
                         render.vst3_processor.as_deref_mut(),
@@ -10896,6 +10904,142 @@ mod tests {
         )
         .unwrap();
         assert_eq!(offline_mix, vec![2.25, 0.5625, 1.125, -2.25]);
+    }
+
+    #[test]
+    fn performance_audio_clip_smooths_live_fader_across_send_routes() {
+        let path = PathBuf::from("performance-audio.wav");
+        let decoded_by_path = HashMap::from([(
+            path.clone(),
+            DecodedAudio {
+                sample_rate: 1_000,
+                channels: vec![vec![1.0; 64], vec![1.0; 64]],
+            },
+        )]);
+        let cancelled = AtomicBool::new(false);
+        let meters = MixerTrackPeakMeters::default();
+        meters.set_live_mixer_insert_fader_raw(1, Some(10_000));
+        let no_arrangement_clips = [];
+        let audio_context = PreparedAudioClipMixContext {
+            clips: &no_arrangement_clips,
+            decoded_by_path: &decoded_by_path,
+            sample_rate: 1_000,
+            resampling_quality: ResamplingQuality::Linear,
+            cancelled: &cancelled,
+            live_mixer_fader_targets: Some(&meters),
+        };
+        let mixer_transform = MixerSourceRouteTransform::default().scaled(2.0);
+        let meter_transforms = vec![
+            (1, MixerSourceRouteTransform::default()),
+            (2, MixerSourceRouteTransform::default().scaled(0.5)),
+        ];
+        let clip = PreparedClip {
+            clip_index: 0,
+            playlist_track_id: Some(1),
+            channel_id: 1,
+            mixer_track: Some(1),
+            path,
+            start_frame: 0,
+            source_bounds: SampleBounds { start: 0, end: 64 },
+            pitch_ratio: 1.0,
+            duration_frames: 50,
+            gain: 1.0,
+            pan: 0.0,
+            pan_law: PanLaw::Circular,
+            mixer_transform,
+            live_mixer_fader: Some(PreparedClipLiveFader::new(
+                1,
+                1.0,
+                MixerSourceRouteTransform::default(),
+                meter_transforms.clone(),
+                1_000,
+            )),
+            mixer_meter_transforms: meter_transforms,
+        };
+        let (launches, receiver) = std::sync::mpsc::channel();
+        let mut runtime = PlaylistPerformanceRuntime {
+            performance_zone_end_tick: 0,
+            start_frame: 0,
+            sample_rate: 1_000,
+            tempo_map: PlaylistTempoMap::constant(96, 120.0)
+                .expect("constant tempo map should build"),
+            launches: receiver,
+            pending_commands: Vec::new(),
+            queued_by_track: BTreeMap::new(),
+            motion_by_track: HashMap::new(),
+            motion_clip_order_by_track: HashMap::new(),
+            motion_group_clip_by_index: HashMap::new(),
+            press_by_track: HashMap::new(),
+            position_sync_by_track: HashMap::new(),
+            ppq: 96,
+            initial_time_signature: None,
+            signature_changes: Vec::new(),
+            clips_by_index: HashMap::new(),
+            audio_clips_by_index: HashMap::from([(
+                0,
+                PerformanceAudioClip {
+                    track_id: 1,
+                    source_start_tick: 0,
+                    length_ticks: 384,
+                    source_duration_frames: 50,
+                    template: clip,
+                },
+            )]),
+            vst3_clips_by_index: HashMap::new(),
+            active_by_track: BTreeMap::new(),
+            active_audio_by_track: BTreeMap::new(),
+            active_vst3_by_track: BTreeMap::new(),
+            active_audio_playbacks: Vec::new(),
+        };
+        launches
+            .send(PlaylistPerformanceCommand::Launch(
+                PlaylistPerformanceLaunch {
+                    clip_index: 0,
+                    start_tick: 0,
+                    start_frame: 0,
+                    position_offset_ticks: 0,
+                },
+            ))
+            .expect("Performance Mode launch should queue");
+        drop(launches);
+        let sampler_sources = HashMap::new();
+        let sampler_notes = [];
+        let mut sampler_engine =
+            SamplerVoiceEngine::new(&sampler_sources, &sampler_notes, 16, 1, 1_000);
+        let mut initial_output = vec![0.0; 2];
+        let mut initial_meter_buses = vec![0.0; MIXER_TRACK_METER_COUNT * 2];
+        runtime
+            .update(
+                0..1,
+                &mut sampler_engine,
+                &audio_context,
+                &mut initial_output,
+                Some(&mut initial_meter_buses),
+                None,
+            )
+            .expect("initial Performance Mode audio block should mix");
+        assert_eq!(initial_output, vec![1.0, 1.0]);
+        assert_eq!(&initial_meter_buses[4..6], &[0.5, 0.5]);
+
+        meters.set_live_mixer_insert_fader_raw(1, Some(5_000));
+        let mut changed_output = vec![0.0; 40];
+        let mut changed_meter_buses = vec![0.0; MIXER_TRACK_METER_COUNT * changed_output.len()];
+        runtime
+            .update(
+                1..21,
+                &mut sampler_engine,
+                &audio_context,
+                &mut changed_output,
+                Some(&mut changed_meter_buses),
+                None,
+            )
+            .expect("updated Performance Mode audio block should mix");
+        let first_changed_gain = changed_output[0];
+        let final_changed_gain = changed_output[changed_output.len() - 2];
+        assert!(first_changed_gain < 1.0 && first_changed_gain > 0.5);
+        assert!(final_changed_gain < first_changed_gain && final_changed_gain > 0.5);
+        let send_meter_offset = 2 * changed_output.len() + changed_output.len() - 2;
+        assert!((changed_meter_buses[send_meter_offset] - final_changed_gain * 0.5).abs() < 1e-6);
     }
 
     #[test]
