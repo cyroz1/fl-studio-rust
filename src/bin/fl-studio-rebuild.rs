@@ -52,8 +52,9 @@ use flp_rebuild::sample_render::{
     write_input_recording_to_wav,
 };
 use flp_rebuild::vst3::{
-    MAX_REPORTED_TAIL_SECONDS, Vst3HostRuntime, Vst3PatternRenderOptions, Vst3PatternStreamHandle,
-    Vst3PlaylistLiveInputSender, Vst3PlaylistLiveInputSession, Vst3PlaylistStreamProcessor,
+    MAX_REPORTED_TAIL_SECONDS, Vst3HostRuntime, Vst3PatternChannelRenderRequest,
+    Vst3PatternRenderOptions, Vst3PatternStreamHandle, Vst3PlaylistLiveInputSender,
+    Vst3PlaylistLiveInputSession, Vst3PlaylistStreamProcessor,
 };
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, Arrangement, ArticulateOptions, AutomationChannel,
@@ -25359,11 +25360,21 @@ impl DawUi {
                         !note.is_muted() && sampler_channel_ids.contains(&note.channel_id)
                     })
                 });
+        let has_loaded_vst3_pattern_notes = self
+            .selected_pattern
+            .and_then(|pattern_id| patterns.iter().find(|pattern| pattern.id == pattern_id))
+            .is_some_and(|pattern| {
+                pattern.notes.iter().any(|note| {
+                    !note.is_muted() && self.channel_vst3_instances.contains_key(&note.channel_id)
+                })
+            });
         let mut add_note_requested = false;
         let mut open_midi_requested = false;
         let mut export_midi_requested = false;
         let mut render_requested = false;
         let mut render_insert_requested = false;
+        let mut render_all_vst3_requested = false;
+        let mut render_insert_all_vst3_requested = false;
         let mut preview_requested = false;
         let mut chord_preview_requested = false;
         let mut sampler_preview_requested = false;
@@ -27102,6 +27113,37 @@ impl DawUi {
                 }
                 if ui
                     .add_enabled(
+                        has_loaded_vst3_pattern_notes,
+                        egui::Button::new("Render loaded VST3 channels…"),
+                    )
+                    .on_hover_text(
+                        "Render and sum every loaded VST3 channel with notes in the selected Pattern",
+                    )
+                    .clicked()
+                {
+                    render_all_vst3_requested = true;
+                    ui.close();
+                }
+                let can_insert_all_vst3_pattern = has_loaded_vst3_pattern_notes
+                    && self.document.as_ref().is_some_and(|document| {
+                        project_has_audio_clip_template(document)
+                            && self.pattern_render_insert_placement(document).is_some()
+                    });
+                if ui
+                    .add_enabled(
+                        can_insert_all_vst3_pattern,
+                        egui::Button::new("Render and insert loaded VST3 channels…"),
+                    )
+                    .on_hover_text(
+                        "Sum loaded VST3 Pattern channels into one file and insert it as an Audio Clip",
+                    )
+                    .clicked()
+                {
+                    render_insert_all_vst3_requested = true;
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
                         has_loaded_instrument && self.selected_pattern.is_some(),
                         egui::Button::new("Preview VST3"),
                     )
@@ -27934,6 +27976,12 @@ impl DawUi {
         }
         if render_insert_requested {
             self.render_selected_pattern_channel(true);
+        }
+        if render_all_vst3_requested {
+            self.render_all_loaded_vst3_pattern_channels(false);
+        }
+        if render_insert_all_vst3_requested {
+            self.render_all_loaded_vst3_pattern_channels(true);
         }
         if discard_note_lengths_requested
             && let Some(pattern_id) = self.selected_pattern
@@ -29812,6 +29860,162 @@ impl DawUi {
                 }
             }
             Err(error) => self.status = format!("Could not render pattern channel: {error}"),
+        }
+    }
+
+    fn render_all_loaded_vst3_pattern_channels(&mut self, insert_into_playlist: bool) {
+        let Some(pattern_id) = self.selected_pattern else {
+            self.status = "Select a Pattern before rendering VST3 channels".to_owned();
+            return;
+        };
+        let Some(document) = self.document.clone() else {
+            self.status = "Open a project before rendering VST3 channels".to_owned();
+            return;
+        };
+        let notes = match document.patterns() {
+            Ok(patterns) => match patterns
+                .into_iter()
+                .find(|pattern| pattern.id == pattern_id)
+            {
+                Some(pattern) => pattern.notes,
+                None => {
+                    self.status = format!("Pattern {pattern_id} was not found");
+                    return;
+                }
+            },
+            Err(error) => {
+                self.status = format!("Could not decode Pattern notes: {error}");
+                return;
+            }
+        };
+        let instances = self.channel_vst3_instances.clone();
+        let channel_ids = notes
+            .iter()
+            .filter(|note| !note.is_muted() && instances.contains_key(&note.channel_id))
+            .map(|note| note.channel_id)
+            .collect::<BTreeSet<_>>();
+        if channel_ids.is_empty() {
+            self.status = "The selected Pattern has no notes on loaded VST3 channels".to_owned();
+            return;
+        }
+
+        let insert_placement = if insert_into_playlist {
+            if !project_has_audio_clip_template(&document) {
+                self.status =
+                    "Add an Audio Clip to the project before inserting the rendered Pattern"
+                        .to_owned();
+                return;
+            }
+            let Some(placement) = self.pattern_render_insert_placement(&document) else {
+                self.status = "Select a Playlist arrangement before inserting the rendered Pattern"
+                    .to_owned();
+                return;
+            };
+            Some(placement)
+        } else {
+            None
+        };
+
+        let ppq = document.header().ppq();
+        let tempo_bpm = document.metadata().tempo_bpm().unwrap_or(self.tempo_bpm);
+        let global_swing_mix_raw = document.metadata().global_swing_mix();
+        let channels =
+            channel_ids
+                .iter()
+                .filter_map(|channel_id| {
+                    let instance_id = instances.get(channel_id).copied()?;
+                    Some(Vst3PatternChannelRenderRequest {
+                        instance_id,
+                        notes: &notes,
+                        options: Vst3PatternRenderOptions {
+                            channel_id: *channel_id,
+                            ppq,
+                            tempo_bpm,
+                            tail_seconds: 2.0,
+                            global_swing_mix_raw,
+                            channel_swing_mix_raw: project_channel_swing_mix_raw(
+                                &document,
+                                *channel_id,
+                            ),
+                            pitch_offset_cents: project_channel_master_pitch_offset_cents(
+                                &document,
+                                *channel_id,
+                            ),
+                            note_pitch_offset_semitones:
+                                project_channel_vst3_note_pitch_offset_semitones(
+                                    &document,
+                                    *channel_id,
+                                ),
+                        },
+                    })
+                })
+                .collect::<Vec<_>>();
+        if channels.is_empty() {
+            self.status = "No loaded VST3 Pattern channels are available to render".to_owned();
+            return;
+        }
+
+        let selected_format = self.playlist_song_output_format;
+        let output_format = self.audio_render_output();
+        let dialog_title = if insert_into_playlist {
+            "Render loaded VST3 Pattern channels to Audio Clip"
+        } else {
+            "Render loaded VST3 Pattern channels"
+        };
+        let output_name = if insert_into_playlist {
+            format!("Pattern_{pattern_id}_VST3_Channels_Audio_Clip")
+        } else {
+            format!("Pattern_{pattern_id}_VST3_Channels")
+        };
+        let Some(path) = add_audio_render_file_filter(
+            rfd::FileDialog::new()
+                .set_title(dialog_title)
+                .set_file_name(format!("{output_name}.{}", selected_format.extension())),
+            selected_format,
+        )
+        .save_file() else {
+            return;
+        };
+        let encoding_options = AudioRenderEncodingOptions {
+            wav_sample_format: self.playlist_render_format,
+            wav_dither_mode: self.playlist_render_dither_mode,
+            wav_channel_mode: self.playlist_render_channel_mode,
+        };
+        let result = self
+            .vst3_host
+            .as_ref()
+            .ok_or_else(|| "VST3 host is not initialized".to_owned())
+            .and_then(|host| {
+                host.render_pattern_channels_to_file(
+                    &channels,
+                    &path,
+                    AudioFileRenderOptions {
+                        output_format,
+                        encoding: encoding_options,
+                    },
+                )
+            });
+        match result {
+            Ok(summary) => {
+                self.status = format!(
+                    "Rendered Pattern {pattern_id}: {} loaded VST3 channels, {} notes to {} ({:.2}s)",
+                    summary.channels_rendered,
+                    summary.notes_rendered,
+                    path.display(),
+                    summary.frames as f64 / f64::from(summary.sample_rate),
+                );
+                if let Some(placement) = insert_placement {
+                    if summary.notes_rendered == 0 {
+                        self.status = format!(
+                            "Pattern {pattern_id} produced no VST3 notes; left {} as a file",
+                            path.display()
+                        );
+                    } else {
+                        self.queue_rendered_pattern_audio_clip(pattern_id, &path, placement);
+                    }
+                }
+            }
+            Err(error) => self.status = format!("Could not render VST3 Pattern mix: {error}"),
         }
     }
 

@@ -80,6 +80,22 @@ pub struct Vst3RenderSummary {
     pub notes_rendered: usize,
 }
 
+/// One loaded VST3 instance and its Pattern notes for a summed offline render.
+pub struct Vst3PatternChannelRenderRequest<'a> {
+    pub instance_id: u64,
+    pub notes: &'a [PatternNote],
+    pub options: Vst3PatternRenderOptions,
+}
+
+/// Summary for one summed render of multiple loaded VST3 Pattern channels.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Vst3PatternMixRenderSummary {
+    pub frames: u64,
+    pub sample_rate: u32,
+    pub channels_rendered: usize,
+    pub notes_rendered: usize,
+}
+
 struct PreparedPatternRender {
     events: Vec<ScheduledMidiEvent>,
     parameter_automation: Vec<PreparedParameterAutomation>,
@@ -2013,6 +2029,78 @@ impl Vst3HostRuntime {
         ))
     }
 
+    /// Render several loaded VST3 channels from the same Pattern into one stereo audio file.
+    ///
+    /// Each request is rendered with its own channel timing and pitch options. The resulting
+    /// stereo buffers are summed, padded to the longest channel render, and encoded using the
+    /// shared audio output settings. Mixer routing and effects are not applied.
+    pub fn render_pattern_channels_to_file(
+        &self,
+        channels: &[Vst3PatternChannelRenderRequest<'_>],
+        path: impl AsRef<Path>,
+        file_options: AudioFileRenderOptions,
+    ) -> Result<Vst3PatternMixRenderSummary, String> {
+        if channels.is_empty() {
+            return Err("no loaded VST3 Pattern channels have notes to render".to_owned());
+        }
+
+        let mut mixed_stereo = Vec::new();
+        let mut mixed_frames = 0_u64;
+        let mut sample_rate = None;
+        let mut notes_rendered = 0usize;
+        let mut channels_rendered = 0usize;
+        for channel in channels {
+            let (stereo, summary) = self.render_pattern_channel_to_stereo_buffer(
+                channel.instance_id,
+                channel.notes,
+                channel.options,
+            )?;
+            if let Some(expected_rate) = sample_rate
+                && summary.sample_rate != expected_rate
+            {
+                return Err(format!(
+                    "VST3 Pattern channels use different render rates ({expected_rate} and {})",
+                    summary.sample_rate
+                ));
+            }
+            sample_rate.get_or_insert(summary.sample_rate);
+            mix_stereo_pattern_render_buffer(
+                &mut mixed_stereo,
+                &mut mixed_frames,
+                &stereo,
+                summary.frames,
+            )?;
+            notes_rendered = notes_rendered
+                .checked_add(summary.notes_rendered)
+                .ok_or_else(|| "rendered VST3 note count overflow".to_owned())?;
+            channels_rendered = channels_rendered
+                .checked_add(1)
+                .ok_or_else(|| "rendered VST3 channel count overflow".to_owned())?;
+        }
+
+        let sample_rate = sample_rate
+            .ok_or_else(|| "no loaded VST3 Pattern channels have notes to render".to_owned())?;
+        let summary = Vst3PatternMixRenderSummary {
+            frames: mixed_frames,
+            sample_rate,
+            channels_rendered,
+            notes_rendered,
+        };
+        render_stereo_audio_to_file(
+            path.as_ref(),
+            summary.frames,
+            summary.sample_rate,
+            file_options.encoding,
+            file_options.output_format,
+            |write_block| {
+                for block in mixed_stereo.chunks(8_192) {
+                    write_block(block)?;
+                }
+                Ok(summary)
+            },
+        )
+    }
+
     /// Start a low-latency stream for live MIDI audition through an already loaded instrument.
     pub fn start_live_midi_input_stream(
         &self,
@@ -3906,6 +3994,42 @@ fn append_vst_output_block_to_stereo(
     Ok(())
 }
 
+fn mix_stereo_pattern_render_buffer(
+    mix: &mut Vec<f32>,
+    mix_frames: &mut u64,
+    input: &[f32],
+    input_frames: u64,
+) -> Result<(), String> {
+    let input_samples = usize::try_from(input_frames)
+        .ok()
+        .and_then(|frames| frames.checked_mul(2))
+        .ok_or_else(|| "VST3 Pattern render frame count overflow".to_owned())?;
+    if input.len() != input_samples {
+        return Err("VST3 Pattern render buffer is not interleaved stereo".to_owned());
+    }
+
+    let output_frames = (*mix_frames).max(input_frames);
+    let output_samples = usize::try_from(output_frames)
+        .ok()
+        .and_then(|frames| frames.checked_mul(2))
+        .ok_or_else(|| "VST3 Pattern mix frame count overflow".to_owned())?;
+    output_samples
+        .checked_mul(std::mem::size_of::<f32>())
+        .filter(|bytes| *bytes <= MAX_STEREO_BUFFER_BYTES)
+        .ok_or_else(|| {
+            format!(
+                "VST3 Pattern mix exceeds the {} MiB in-memory render limit",
+                MAX_STEREO_BUFFER_BYTES / (1024 * 1024)
+            )
+        })?;
+    mix.resize(output_samples, 0.0);
+    for (mixed, sample) in mix.iter_mut().zip(input) {
+        *mixed = finite_sample(*mixed + finite_sample(*sample));
+    }
+    *mix_frames = output_frames;
+    Ok(())
+}
+
 fn scheduled_pattern_events(
     notes: &[PatternNote],
     channel_id: u16,
@@ -5149,6 +5273,28 @@ mod tests {
         assert!(append_vst_output_block_to_stereo(&mut stereo, &[0.0], 2).is_err());
         assert!(append_vst_output_block_to_stereo(&mut stereo, &[0.0; 6], 3).is_err());
         assert!(stereo.is_empty());
+    }
+
+    #[test]
+    fn pattern_render_mix_sums_stereo_buffers_and_pads_short_channels() {
+        let mut mixed = Vec::new();
+        let mut frames = 0;
+        mix_stereo_pattern_render_buffer(&mut mixed, &mut frames, &[0.2, 0.3], 1).unwrap();
+        mix_stereo_pattern_render_buffer(&mut mixed, &mut frames, &[0.4, -0.1, 0.5, 0.25], 2)
+            .unwrap();
+        assert_eq!(frames, 2);
+        assert_eq!(mixed, [0.6, 0.20000002, 0.5, 0.25]);
+    }
+
+    #[test]
+    fn pattern_render_mix_rejects_bad_shapes_and_sanitizes_non_finite_samples() {
+        let mut mixed = Vec::new();
+        let mut frames = 0;
+        assert!(mix_stereo_pattern_render_buffer(&mut mixed, &mut frames, &[1.0], 1).is_err());
+        mix_stereo_pattern_render_buffer(&mut mixed, &mut frames, &[f32::NAN, f32::INFINITY], 1)
+            .unwrap();
+        assert_eq!(frames, 1);
+        assert_eq!(mixed, [0.0, 0.0]);
     }
 
     #[test]
