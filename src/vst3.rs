@@ -48,6 +48,10 @@ const VST3_HOST_STATE_MAGIC: &[u8; 16] = b"VST3HOST_STATE\0\0";
 const VST3_HOST_STATE_VERSION: u32 = 1;
 const VST3_HOST_NO_CONTROLLER_STATE: u32 = u32::MAX;
 const MAX_VST3_STATE_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+// Native instrument root keys span 0..=127 around C5 (60), and enabled Master
+// pitch can add another twelve semitones in either direction.
+const MIN_VST3_NOTE_PITCH_OFFSET_SEMITONES: i16 = -79;
+const MAX_VST3_NOTE_PITCH_OFFSET_SEMITONES: i16 = 72;
 pub const MAX_REPORTED_TAIL_SECONDS: f64 = 60.0;
 const VST3_HOST_STATE_HEADER_SIZE: usize = 28;
 
@@ -211,7 +215,8 @@ pub struct Vst3PatternRenderOptions {
     pub channel_swing_mix_raw: u16,
     /// Effective continuous project Master pitch for this channel, in cents.
     pub pitch_offset_cents: i16,
-    /// Effective project Master pitch as a note transposition when Add to Key is enabled.
+    /// Effective project Master pitch and Native instrument root key as note transposition
+    /// when Add to Key is enabled.
     pub note_pitch_offset_semitones: i16,
 }
 
@@ -1845,8 +1850,10 @@ impl Vst3HostRuntime {
         if !(-1200..=1200).contains(&pitch_offset_cents) {
             return Err("VST3 pitch offset must be between -1200 and 1200 cents".to_owned());
         }
-        if !(-12..=12).contains(&note_pitch_offset_semitones) {
-            return Err("VST3 note pitch offset must be between -12 and 12 semitones".to_owned());
+        if !(MIN_VST3_NOTE_PITCH_OFFSET_SEMITONES..=MAX_VST3_NOTE_PITCH_OFFSET_SEMITONES)
+            .contains(&note_pitch_offset_semitones)
+        {
+            return Err("VST3 note pitch offset is outside the supported range".to_owned());
         }
         let plugin = self.plugin(id)?.clone();
         let (sample_rate, block_size, output_channels) = {
@@ -2101,7 +2108,7 @@ impl Vst3HostRuntime {
                 channel.master_pitch_render_offset_cents(project_master_pitch_cents)
             });
             let note_pitch_offset_semitones = channel.map_or(0, |channel| {
-                channel.master_pitch_note_offset_semitones(project_master_pitch_cents)
+                channel.native_instrument_note_pitch_offset_semitones(project_master_pitch_cents)
             });
             let (gain, pan) = channel_gain_pan(
                 channel.and_then(|channel| channel.volume()),
@@ -2385,7 +2392,7 @@ impl Vst3HostRuntime {
                 channel.master_pitch_render_offset_cents(project_master_pitch_cents)
             });
             let note_pitch_offset_semitones = channel.map_or(0, |channel| {
-                channel.master_pitch_note_offset_semitones(project_master_pitch_cents)
+                channel.native_instrument_note_pitch_offset_semitones(project_master_pitch_cents)
             });
             let (gain, pan) = channel_gain_pan(
                 channel.and_then(|channel| channel.volume()),
@@ -2586,8 +2593,10 @@ fn prepare_playlist_pattern_render(
             "VST3 Playlist supports mono or stereo output buses; the instrument has {output_channels} channels"
         ));
     }
-    if !(-12..=12).contains(&note_pitch_offset_semitones) {
-        return Err("VST3 note pitch offset must be between -12 and 12 semitones".to_owned());
+    if !(MIN_VST3_NOTE_PITCH_OFFSET_SEMITONES..=MAX_VST3_NOTE_PITCH_OFFSET_SEMITONES)
+        .contains(&note_pitch_offset_semitones)
+    {
+        return Err("VST3 note pitch offset is outside the supported range".to_owned());
     }
     let (mut events, note_count) =
         scheduled_playlist_midi_events_with_tempo_map(notes, tempo_map, sample_rate)?;
@@ -2724,8 +2733,10 @@ fn prepare_pattern_render_with_automation(
     if !(-1200..=1200).contains(&pitch_offset_cents) {
         return Err("VST3 pitch offset must be between -1200 and 1200 cents".to_owned());
     }
-    if !(-12..=12).contains(&note_pitch_offset_semitones) {
-        return Err("VST3 note pitch offset must be between -12 and 12 semitones".to_owned());
+    if !(MIN_VST3_NOTE_PITCH_OFFSET_SEMITONES..=MAX_VST3_NOTE_PITCH_OFFSET_SEMITONES)
+        .contains(&note_pitch_offset_semitones)
+    {
+        return Err("VST3 note pitch offset is outside the supported range".to_owned());
     }
     if ppq == 0 {
         return Err("project PPQ must be greater than zero".to_owned());
@@ -4893,6 +4904,34 @@ mod tests {
         assert_eq!(events[2].note_pan, 128);
         assert_eq!(events[2].note_id, events[3].note_id);
         assert_eq!(events[3].note_release, 21);
+    }
+
+    #[test]
+    fn playlist_note_transposition_applies_root_offset_to_note_on_and_off() {
+        let note = PlaylistMidiNote {
+            start_tick: 0,
+            stop_tick: 240,
+            key: 60,
+            velocity: 96,
+            midi_channel: 0,
+            fine_pitch_offset_cents: 0,
+            pan: 64,
+            release: 64,
+        };
+        let (mut events, note_count) =
+            scheduled_playlist_midi_events(&[note], 480, 120.0, 48_000.0).unwrap();
+
+        transpose_scheduled_note_events(&mut events, -4);
+
+        assert_eq!(note_count, 1);
+        assert!(matches!(
+            events[0].event,
+            MidiEvent::NoteOn { note: 56, .. }
+        ));
+        assert!(matches!(
+            events[1].event,
+            MidiEvent::NoteOff { note: 56, .. }
+        ));
     }
 
     #[test]

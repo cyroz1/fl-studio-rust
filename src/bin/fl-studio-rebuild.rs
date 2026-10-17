@@ -444,7 +444,7 @@ fn project_channel_master_pitch_offset_cents(document: &FlpDocument, channel_id:
         })
 }
 
-fn project_channel_master_pitch_note_offset_semitones(
+fn project_channel_vst3_note_pitch_offset_semitones(
     document: &FlpDocument,
     channel_id: u16,
 ) -> i16 {
@@ -454,7 +454,7 @@ fn project_channel_master_pitch_note_offset_semitones(
         .into_iter()
         .find(|channel| channel.id() == channel_id)
         .map_or(0, |channel| {
-            channel.master_pitch_note_offset_semitones(project_master_pitch_cents)
+            channel.native_instrument_note_pitch_offset_semitones(project_master_pitch_cents)
         })
 }
 const FL_GENRES: &[&str] = &[
@@ -22037,6 +22037,7 @@ impl DawUi {
                         }
                         let current_root_key = match channel.kind() {
                             Some(0) => Some(channel.sampler_root_key()),
+                            Some(2) => Some(channel.native_instrument_root_key()),
                             Some(3) => Some(channel.layer_root_key()),
                             _ => None,
                         };
@@ -22050,7 +22051,9 @@ impl DawUi {
                                         egui::DragValue::new(&mut root_key)
                                             .range(0..=127),
                                     )
-                                    .on_hover_text("Saved Sampler or Layer root MIDI key (0–127)")
+                                    .on_hover_text(
+                                        "Saved Sampler, Native instrument, or Layer root MIDI key (0–127)",
+                                    )
                                     .changed();
                                 if current_root_key.is_none() {
                                     ui.small("not saved");
@@ -28232,7 +28235,7 @@ impl DawUi {
         let channel_swing_mix_raw = project_channel_swing_mix_raw(document, channel_id);
         let pitch_offset_cents = project_channel_master_pitch_offset_cents(document, channel_id);
         let note_pitch_offset_semitones =
-            project_channel_master_pitch_note_offset_semitones(document, channel_id);
+            project_channel_vst3_note_pitch_offset_semitones(document, channel_id);
         let selected_format = self.playlist_song_output_format;
         let output_format = self.audio_render_output();
         let Some(path) = add_audio_render_file_filter(
@@ -28474,7 +28477,7 @@ impl DawUi {
         let tempo_bpm = document.metadata().tempo_bpm().unwrap_or(self.tempo_bpm);
         let pitch_offset_cents = project_channel_master_pitch_offset_cents(document, channel_id);
         let note_pitch_offset_semitones =
-            project_channel_master_pitch_note_offset_semitones(document, channel_id);
+            project_channel_vst3_note_pitch_offset_semitones(document, channel_id);
 
         if self.audio_engine.is_none() {
             match AudioEngine::start(&self.audio_settings) {
@@ -28692,7 +28695,7 @@ impl DawUi {
             .is_some_and(|channel| channel.kind() == Some(0));
         let pitch_offset_cents = project_channel_master_pitch_offset_cents(document, channel_id);
         let note_pitch_offset_semitones =
-            project_channel_master_pitch_note_offset_semitones(document, channel_id);
+            project_channel_vst3_note_pitch_offset_semitones(document, channel_id);
         let instance_id = self.channel_vst3_instances.get(&channel_id).copied();
         let sampler_project = if instance_id.is_none() && is_sampler {
             let Some(project_path) = self.sample_project_path() else {
@@ -28947,7 +28950,7 @@ impl DawUi {
         let channel_swing_mix_raw = project_channel_swing_mix_raw(document, channel_id);
         let pitch_offset_cents = project_channel_master_pitch_offset_cents(document, channel_id);
         let note_pitch_offset_semitones =
-            project_channel_master_pitch_note_offset_semitones(document, channel_id);
+            project_channel_vst3_note_pitch_offset_semitones(document, channel_id);
 
         if self.audio_engine.is_none() {
             match AudioEngine::start(&self.audio_settings) {
@@ -37607,7 +37610,7 @@ impl DawUi {
             let pitch_offset_cents =
                 project_channel_master_pitch_offset_cents(&document, target.channel_id);
             let note_pitch_offset_semitones =
-                project_channel_master_pitch_note_offset_semitones(&document, target.channel_id);
+                project_channel_vst3_note_pitch_offset_semitones(&document, target.channel_id);
             let result = self
                 .vst3_host
                 .as_ref()

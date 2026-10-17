@@ -1676,8 +1676,8 @@ fn render_pattern_vst3(
     let channel_swing_mix_raw = channel.swing_mix();
     let pitch_offset_cents =
         channel.master_pitch_render_offset_cents(document.metadata().master_pitch_cents());
-    let note_pitch_offset_semitones =
-        channel.master_pitch_note_offset_semitones(document.metadata().master_pitch_cents());
+    let note_pitch_offset_semitones = channel
+        .native_instrument_note_pitch_offset_semitones(document.metadata().master_pitch_cents());
     let mut host = Vst3HostRuntime::new(48_000.0, 512)?;
     let plugin = host.load(bundle_path, class_uid.as_deref())?;
     let output_extension = output_path
@@ -2291,7 +2291,7 @@ fn list_channels(path: &Path) -> Result<(), String> {
     println!("channels: {}", channels.len());
     for channel in channels {
         println!(
-            "id={} kind={} type={:?} enabled={} main_pitch={} add_to_key={} sampler_root_key={:?} layer_root_key={:?} keyboard_key_region={:?} color={:?} volume={:?} pan={:?} level_adjusts_raw={:?} swing_mix_raw={:?} layer_children={:?} layer_flags={:?} plugin={} name={} sample_path={:?} events={:?}",
+            "id={} kind={} type={:?} enabled={} main_pitch={} add_to_key={} sampler_root_key={:?} native_instrument_root_key={:?} layer_root_key={:?} keyboard_key_region={:?} color={:?} volume={:?} pan={:?} level_adjusts_raw={:?} swing_mix_raw={:?} layer_children={:?} layer_flags={:?} plugin={} name={} sample_path={:?} events={:?}",
             channel.id(),
             channel
                 .kind()
@@ -2303,6 +2303,7 @@ fn list_channels(path: &Path) -> Result<(), String> {
             channel.keyboard_main_pitch_enabled(),
             channel.keyboard_add_to_key_enabled(),
             channel.sampler_root_key(),
+            channel.native_instrument_root_key(),
             channel.layer_root_key(),
             channel.keyboard_key_region(),
             channel.color(),
