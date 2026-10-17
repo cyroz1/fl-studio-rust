@@ -5411,6 +5411,7 @@ fn prepare_audio_clip_render(
 
     let mut clips = Vec::with_capacity(candidate_clips.len());
     let mut output_frames = timeline_frames;
+    let mut live_fader_routes_by_track = HashMap::new();
     for (
         clip_index,
         clip,
@@ -5463,13 +5464,18 @@ fn prepare_audio_clip_render(
             .ok_or_else(|| "render timeline length overflow".to_owned())?;
         output_frames = output_frames.max(end_frame);
         let live_mixer_fader = (*mixer_track).and_then(|track| {
-            let (transform, volume_raw) =
-                mixer_route_audibility.direct_source_fader_transform_for_channel(Some(track))?;
-            let track = usize::try_from(track).ok()?;
+            let route_plan = live_fader_routes_by_track
+                .entry(track)
+                .or_insert_with(|| {
+                    mixer_route_audibility.source_fader_route_plan_for_channel(Some(track))
+                })
+                .clone()?;
+            let (track, volume_raw, route_plan) = route_plan;
             Some(PreparedClipLiveFader::new(
                 track,
                 volume_raw as f32 / 10_000.0,
-                transform,
+                route_plan.output_transform,
+                route_plan.insert_meter_transforms,
                 options.sample_rate,
             ))
         });
@@ -9143,6 +9149,7 @@ struct PreparedClip {
 struct PreparedClipLiveFader {
     track: usize,
     transform: MixerSourceRouteTransform,
+    meter_transforms: Vec<(usize, MixerSourceRouteTransform)>,
     current_gain_bits: Arc<AtomicU32>,
     started: Arc<AtomicBool>,
     smoothing_alpha: f32,
@@ -9153,11 +9160,13 @@ impl PreparedClipLiveFader {
         track: usize,
         saved_gain: f32,
         transform: MixerSourceRouteTransform,
+        meter_transforms: Vec<(usize, MixerSourceRouteTransform)>,
         sample_rate: u32,
     ) -> Self {
         Self {
             track,
             transform,
+            meter_transforms,
             current_gain_bits: Arc::new(AtomicU32::new(saved_gain.to_bits())),
             started: Arc::new(AtomicBool::new(false)),
             smoothing_alpha: crate::audio::output_gain_smoothing_alpha(sample_rate as f32),
@@ -9183,6 +9192,13 @@ impl PreparedClipLiveFader {
         frame[0] *= next_gain;
         frame[1] *= next_gain;
         Some(next_gain)
+    }
+
+    fn meter_transform(&self, track: usize) -> Option<MixerSourceRouteTransform> {
+        self.meter_transforms
+            .iter()
+            .find(|(meter_track, _)| *meter_track == track)
+            .map(|(_, transform)| *transform)
     }
 }
 
@@ -10089,9 +10105,9 @@ fn mix_clip_window_into_stereo_with_quality_and_meter(
                     right * clip.gain * right_pan_gain,
                 ];
                 if let (Some(fader), Some(gain)) = (clip.live_mixer_fader.as_ref(), live_fader_gain)
-                    && *track == fader.track
+                    && let Some(transform) = fader.meter_transform(*track)
                 {
-                    fader.transform.apply_frame(&mut meter_frame);
+                    transform.apply_frame(&mut meter_frame);
                     meter_frame[0] *= gain;
                     meter_frame[1] *= gain;
                 } else {
@@ -10746,8 +10762,13 @@ mod tests {
 
     #[test]
     fn live_playlist_audio_clip_fader_smooths_changes_from_its_current_gain() {
-        let fader =
-            PreparedClipLiveFader::new(1, 1.0, MixerSourceRouteTransform::default(), 48_000);
+        let fader = PreparedClipLiveFader::new(
+            1,
+            1.0,
+            MixerSourceRouteTransform::default(),
+            Vec::new(),
+            48_000,
+        );
         let target = AtomicI32::new(10_000);
 
         let mut frame = [1.0, 0.5];
@@ -10769,14 +10790,12 @@ mod tests {
     }
 
     #[test]
-    fn live_playlist_audio_clip_fader_replaces_the_saved_direct_route_gain() {
+    fn live_playlist_audio_clip_fader_scales_every_send_route() {
         let source = DecodedAudio {
             sample_rate: 4,
             channels: vec![vec![1.0, 0.5], vec![0.25, -1.0]],
         };
-        let saved_transform = MixerSourceRouteTransform::from_insert_transform(
-            MixerInsertSignalTransform::default().with_fader_volume_raw(Some(15_000)),
-        );
+        let saved_transform = MixerSourceRouteTransform::default().scaled(2.25);
         let clip = PreparedClip {
             clip_index: 0,
             playlist_track_id: None,
@@ -10794,10 +10813,17 @@ mod tests {
             live_mixer_fader: Some(PreparedClipLiveFader::new(
                 1,
                 1.5,
-                MixerSourceRouteTransform::default(),
+                MixerSourceRouteTransform::default().scaled(1.5),
+                vec![
+                    (1, MixerSourceRouteTransform::default()),
+                    (2, MixerSourceRouteTransform::default().scaled(0.5)),
+                ],
                 48_000,
             )),
-            mixer_meter_transforms: vec![(1, saved_transform)],
+            mixer_meter_transforms: vec![
+                (1, MixerSourceRouteTransform::default().scaled(1.5)),
+                (2, MixerSourceRouteTransform::default().scaled(0.75)),
+            ],
         };
         let meters = MixerTrackPeakMeters::default();
         meters.set_live_mixer_insert_fader_raw(1, Some(5_000));
@@ -10820,8 +10846,9 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(mix, vec![0.5, 0.125, 0.25, -0.5]);
-        assert_eq!(&meter_buses[4..8], mix.as_slice());
+        assert_eq!(mix, vec![0.75, 0.1875, 0.375, -0.75]);
+        assert_eq!(&meter_buses[4..8], &[0.5, 0.125, 0.25, -0.5]);
+        assert_eq!(&meter_buses[8..12], &[0.25, 0.0625, 0.125, -0.25]);
 
         let offline_meters = MixerTrackPeakMeters::default();
         let mut offline_mix = vec![0.0; 4];
@@ -10840,7 +10867,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(offline_mix, vec![1.5, 0.375, 0.75, -1.5]);
+        assert_eq!(offline_mix, vec![2.25, 0.5625, 1.125, -2.25]);
     }
 
     #[test]

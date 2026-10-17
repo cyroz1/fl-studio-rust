@@ -2418,6 +2418,26 @@ impl MixerRouteAudibility {
         ))
     }
 
+    /// Returns the route plan with the source insert fader removed and its saved fader value.
+    /// Unlike the direct-route helper, this preserves complete send graphs so a live source fader
+    /// can scale every supported output and insert meter path together.
+    pub(crate) fn source_fader_route_plan_for_channel(
+        &self,
+        route: Option<i8>,
+    ) -> Option<(usize, i32, MixerSourceRoutePlan)> {
+        let track = route.filter(|track| *track > 0 && self.known_tracks.contains(track))?;
+        let fader_volume_raw = *self.source_fader_volume_raw.get(&track)?;
+        let mut faderless_routes = self.clone();
+        let source_transform = faderless_routes.source_transforms.get_mut(&track)?;
+        *source_transform = source_transform.with_fader_volume_raw(None);
+        faderless_routes.source_fader_volume_raw.remove(&track);
+        Some((
+            track as usize,
+            fader_volume_raw,
+            faderless_routes.source_route_plan_for_channel(Some(track)),
+        ))
+    }
+
     /// Returns the pre-Master transform for all supported insert-to-insert send paths.
     /// The final Master transform remains applied once after sources are summed.
     pub(crate) fn source_route_transform_for_channel(
@@ -19646,6 +19666,71 @@ mod tests {
             .apply_frame(&mut solo_frame);
         assert_eq!(solo_frame, [0.25, 0.5]);
         assert!(!solo_routing.allows_channel(None));
+    }
+
+    #[test]
+    fn mixer_source_fader_route_plan_removes_the_source_fader_from_send_paths() {
+        let insert = |ordinal| MixerInsertSummary {
+            ordinal,
+            input_raw: -1,
+            output_raw: -1,
+            color_raw: 0,
+            icon_raw: None,
+            name: None,
+            flags: Some(1 << 3),
+            flags_event_index: None,
+            first_event_index: 0,
+            end_event_index: 0,
+        };
+        let send = |source_track: usize, destination_track: u8, level_raw| MixerSendSummary {
+            insert_ordinal: source_track,
+            route_parameter_id: 64 + destination_track,
+            value: level_raw,
+            enabled: Some(true),
+            routing_flag_location: None,
+            event_index: 0,
+            record_index: 0,
+        };
+        let fader = MixerParameterRecord {
+            event_index: 0,
+            record_index: 0,
+            prefix: [0; 4],
+            parameter_id: 192,
+            reserved: 0,
+            channel_data: 65 << 6,
+            value: 5_000,
+        };
+        let mut routing = MixerRouteAudibility::from_inserts_with_parameters(
+            [insert(0), insert(1), insert(2)],
+            &[fader],
+            None,
+        );
+        routing.add_send_summaries([send(1, 0, 12_800), send(1, 2, 6_400), send(2, 0, 12_800)]);
+
+        let mut saved_frame = [1.0, 0.0];
+        routing
+            .source_route_plan_for_channel(Some(1))
+            .output_transform
+            .apply_frame(&mut saved_frame);
+        assert_eq!(saved_frame, [0.75, 0.0]);
+
+        let (track, saved_gain_raw, faderless_plan) = routing
+            .source_fader_route_plan_for_channel(Some(1))
+            .expect("recognized source fader and complete send graph");
+        assert_eq!(track, 1);
+        assert_eq!(saved_gain_raw, 5_000);
+        let mut faderless_frame = [1.0, 0.0];
+        faderless_plan
+            .output_transform
+            .apply_frame(&mut faderless_frame);
+        assert_eq!(faderless_frame, [1.5, 0.0]);
+        assert_eq!(
+            faderless_plan.insert_meter_transforms,
+            vec![
+                (1, MixerSourceRouteTransform::default()),
+                (2, MixerSourceRouteTransform::default().scaled(0.5)),
+            ]
+        );
     }
 
     #[test]
