@@ -501,6 +501,13 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_channel_id_list(child_ids)?,
             )
         }
+        [command, input, output, channel_id] if command == "split-layer-children" => {
+            split_layer_children(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(channel_id, "Layer channel id")?,
+            )
+        }
         [command, input, output, channel_id, random, crossfade]
             if command == "set-layer-flags" =>
         {
@@ -1185,6 +1192,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild edit-channel-level-adjustments <input.flp> <output.flp> <channel-id> <event-index> <pan-raw|-> <volume-raw|-> <mod-x-raw|-> <mod-y-raw|->\n",
             "  flp-rebuild set-channel-swing <input.flp> <output.flp> <channel-id> <percent-0..100>\n",
             "  flp-rebuild set-layer-children <input.flp> <output.flp> <layer-channel-id> <child-ids-comma-separated|->\n",
+            "  flp-rebuild split-layer-children <input.flp> <output.flp> <layer-channel-id>\n",
             "  flp-rebuild set-layer-flags <input.flp> <output.flp> <layer-channel-id> <random:0|1|-> <crossfade:0|1|->\n",
             "  flp-rebuild edit-automation-point <input.flp> <output.flp> <channel-id> <point-index> <position-beats> <value> <tension>\n",
             "  flp-rebuild insert-automation-point <input.flp> <output.flp> <channel-id> <insertion-slot> <position-beats> <value> <tension>\n",
@@ -3036,6 +3044,23 @@ fn set_layer_children(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "set Layer channel {layer_channel_id} children to {child_channel_ids:?} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn split_layer_children(input: &Path, output: &Path, layer_channel_id: u16) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .split_layer_children_across_keyboard(layer_channel_id)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "split Layer channel {layer_channel_id} children across consecutive keys in {}",
         output.display()
     );
     Ok(())

@@ -732,6 +732,16 @@ impl ChannelSummary {
             .map(|note| note as u16)
     }
 
+    /// Saved root key for a Layer channel, when the raw value is a MIDI key number.
+    pub fn layer_root_key(&self) -> Option<u16> {
+        if self.kind != Some(ChannelType::Layer.raw()) {
+            return None;
+        }
+        self.sampler_root_note
+            .filter(|note| *note <= 127)
+            .map(|note| note as u16)
+    }
+
     /// Inclusive playable MIDI key range from the channel Parameters event.
     /// Missing or invalid ranges are treated as unrestricted.
     pub fn keyboard_key_region(&self) -> Option<(u16, u16)> {
@@ -13911,6 +13921,206 @@ impl FlpDocument {
         Ok(())
     }
 
+    /// Splits a Layer's Sampler children across consecutive single-key ranges.
+    ///
+    /// The first unique child is assigned the Layer root key, and each following
+    /// child is assigned the next MIDI key. Each Sampler's saved root key moves by
+    /// the same offset so the sample's original pitch is preserved. All child
+    /// parameters and root events are validated before any project data changes.
+    pub fn split_layer_children_across_keyboard(
+        &mut self,
+        layer_channel_id: u16,
+    ) -> Result<(), FlpError> {
+        self.require_unique_channel(layer_channel_id)?;
+        let channels = self.channels();
+        let layer = channels
+            .iter()
+            .find(|channel| channel.id() == layer_channel_id)
+            .expect("the unique Layer channel was checked above");
+        if layer.kind != Some(ChannelType::Layer.raw()) {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel is not a Layer channel",
+            ));
+        }
+
+        let layer_root_event_indices = layer
+            .event_range()
+            .filter(|index| self.events[*index].opcode == 0x87)
+            .collect::<Vec<_>>();
+        if layer_root_event_indices.len() != 1 {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected Layer must have one recognized root-key event",
+            ));
+        }
+        let layer_root_event = &self.events[layer_root_event_indices[0]];
+        if layer_root_event.encoding != PayloadEncoding::Dword
+            || layer_root_event.payload.len() != 4
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected Layer root-key event is not a dword",
+            ));
+        }
+        let layer_root_key = u32::from_le_bytes(
+            layer_root_event.payload[..4]
+                .try_into()
+                .expect("a dword event has four payload bytes"),
+        );
+        if layer_root_key > 127 {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected Layer root key is outside the MIDI key range",
+            ));
+        }
+
+        let mut child_ids = Vec::new();
+        let mut seen_child_ids = BTreeSet::new();
+        for child_id in layer.layer_child_ids().unwrap_or_default() {
+            if seen_child_ids.insert(*child_id) {
+                child_ids.push(*child_id);
+            }
+        }
+        if child_ids.is_empty() {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected Layer has no child channels to split",
+            ));
+        }
+
+        // (channel start, root event, updated root key, Parameters event,
+        //  kind event for insertion, assigned key)
+        let mut edits = Vec::with_capacity(child_ids.len());
+        for (child_offset, child_id) in child_ids.into_iter().enumerate() {
+            let mut matching_children = channels.iter().filter(|channel| channel.id() == child_id);
+            let Some(child) = matching_children.next() else {
+                return Err(FlpError::UnsupportedEdit(
+                    "a Layer child channel is missing from the project",
+                ));
+            };
+            if matching_children.next().is_some() {
+                return Err(FlpError::AmbiguousChannelId(child_id));
+            }
+            if child.kind != Some(ChannelType::Sampler.raw()) {
+                return Err(FlpError::UnsupportedEdit(
+                    "Split children currently supports Sampler children only",
+                ));
+            }
+
+            let root_events = child
+                .event_range()
+                .filter(|index| self.events[*index].opcode == 0x87)
+                .collect::<Vec<_>>();
+            if root_events.len() != 1 {
+                return Err(FlpError::UnsupportedEdit(
+                    "each Sampler child must have one recognized root-key event",
+                ));
+            }
+            let root_event = &self.events[root_events[0]];
+            if root_event.encoding != PayloadEncoding::Dword || root_event.payload.len() != 4 {
+                return Err(FlpError::UnsupportedEdit(
+                    "a Sampler child root-key event is not a dword",
+                ));
+            }
+            let old_root_key = u32::from_le_bytes(
+                root_event.payload[..4]
+                    .try_into()
+                    .expect("a dword event has four payload bytes"),
+            );
+            let offset = u32::try_from(child_offset).map_err(|_| {
+                FlpError::UnsupportedEdit("the Layer has too many children to split")
+            })?;
+            let assigned_key =
+                layer_root_key
+                    .checked_add(offset)
+                    .ok_or(FlpError::UnsupportedEdit(
+                        "the Layer child key range exceeds MIDI key 127",
+                    ))?;
+            let updated_root_key =
+                old_root_key
+                    .checked_add(offset)
+                    .ok_or(FlpError::UnsupportedEdit(
+                        "a Sampler child root key exceeds MIDI key 127",
+                    ))?;
+            if old_root_key > 127 || assigned_key > 127 || updated_root_key > 127 {
+                return Err(FlpError::UnsupportedEdit(
+                    "the split range or adjusted Sampler root key exceeds MIDI key 127",
+                ));
+            }
+
+            let c7_events = child
+                .event_range()
+                .filter(|index| self.events[*index].opcode == 0xC7)
+                .collect::<Vec<_>>();
+            let mut parameter_events = c7_events.iter().copied().filter(|index| {
+                matches!(self.events[*index].encoding, PayloadEncoding::Data { .. })
+                    && ascii_version(&self.events[*index].payload).is_none()
+            });
+            let parameters_index = parameter_events.next();
+            if parameter_events.next().is_some() {
+                return Err(FlpError::UnsupportedEdit(
+                    "a Sampler child has multiple Parameters (`0xC7`) events",
+                ));
+            }
+            if parameters_index.is_none() && !c7_events.is_empty() {
+                return Err(FlpError::UnsupportedEdit(
+                    "a Sampler child's `0xC7` event is not a recognized Parameters payload",
+                ));
+            }
+
+            let kind_index = if parameters_index.is_none() {
+                let mut kind_events = child
+                    .event_range()
+                    .filter(|index| self.events[*index].opcode == 0x15);
+                let Some(kind_index) = kind_events.next() else {
+                    return Err(FlpError::UnsupportedEdit(
+                        "a Sampler child has no recognized `0x15` kind event",
+                    ));
+                };
+                if kind_events.next().is_some()
+                    || self.events[kind_index].encoding != PayloadEncoding::Byte
+                    || self.events[kind_index].payload.as_slice() != [ChannelType::Sampler.raw()]
+                {
+                    return Err(FlpError::UnsupportedEdit(
+                        "a Sampler child's `0x15` kind event is ambiguous or malformed",
+                    ));
+                }
+                Some(kind_index)
+            } else {
+                None
+            };
+
+            edits.push((
+                child.event_range().start,
+                root_events[0],
+                updated_root_key,
+                parameters_index,
+                kind_index,
+                assigned_key,
+            ));
+        }
+
+        edits.sort_by_key(|edit| std::cmp::Reverse(edit.0));
+        let mut candidate = self.clone();
+        for (_, root_index, updated_root_key, parameters_index, kind_index, assigned_key) in edits {
+            candidate.events[root_index].replace_dword_payload(updated_root_key)?;
+            if let Some(parameters_index) = parameters_index {
+                let mut payload = candidate.events[parameters_index].payload.clone();
+                payload.resize(payload.len().max(76), 0);
+                payload[68..72].copy_from_slice(&assigned_key.to_le_bytes());
+                payload[72..76].copy_from_slice(&assigned_key.to_le_bytes());
+                candidate.events[parameters_index].replace_data_payload(payload)?;
+            } else {
+                let mut payload = vec![0; 76];
+                payload[68..72].copy_from_slice(&assigned_key.to_le_bytes());
+                payload[72..76].copy_from_slice(&assigned_key.to_le_bytes());
+                candidate.events.insert(
+                    kind_index.expect("missing Parameters requires a kind index") + 1,
+                    FlpEvent::new_data(0xC7, payload)?,
+                );
+            }
+        }
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
     /// Edits the observed Layer Random and Crossfade bits in an existing `0x90` flags dword.
     /// Every other bit in the raw field is retained.
     pub fn set_layer_flags(
@@ -18225,6 +18435,35 @@ mod tests {
         }
         event_stream.extend_from_slice(&[0x40, 1, 0, 0x15, 2]);
         event_stream.extend_from_slice(&[0x40, 2, 0, 0x15, 4, 0x62, 0, 0]);
+        flp_fixture(&event_stream, &[], &[])
+    }
+
+    fn append_split_sampler_channel(
+        event_stream: &mut Vec<u8>,
+        channel_id: u8,
+        root_key: u32,
+        low_key: u32,
+        high_key: u32,
+        marker: u8,
+    ) {
+        event_stream.extend_from_slice(&[0x40, channel_id, 0, 0x15, 0, 0x87]);
+        event_stream.extend_from_slice(&root_key.to_le_bytes());
+        let mut parameters = vec![marker; 80];
+        parameters[68..72].copy_from_slice(&low_key.to_le_bytes());
+        parameters[72..76].copy_from_slice(&high_key.to_le_bytes());
+        append_data_event(event_stream, 0xC7, &parameters);
+    }
+
+    fn layer_sampler_split_fixture(layer_root: u32, children: &[u16]) -> Vec<u8> {
+        let mut event_stream = vec![0x40, 0, 0, 0x15, 3, 0x87];
+        event_stream.extend_from_slice(&layer_root.to_le_bytes());
+        for child in children {
+            event_stream.push(0x5E);
+            event_stream.extend_from_slice(&child.to_le_bytes());
+        }
+        append_split_sampler_channel(&mut event_stream, 1, 72, 24, 96, 0xA1);
+        append_split_sampler_channel(&mut event_stream, 2, 48, 30, 90, 0xB2);
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
         flp_fixture(&event_stream, &[], &[])
     }
 
@@ -26549,6 +26788,121 @@ mod tests {
             reopened.channels()[0].layer_child_ids(),
             Some([2, 1, 2].as_slice())
         );
+    }
+
+    #[test]
+    fn splitting_layer_sampler_children_assigns_keys_and_preserves_pitch_and_payloads() {
+        let original = layer_sampler_split_fixture(60, &[2, 1, 2]);
+        let original_document = FlpDocument::parse(&original).expect("split fixture should parse");
+        let mut document = original_document.clone();
+        assert_eq!(document.channels()[0].layer_root_key(), Some(60));
+
+        document
+            .split_layer_children_across_keyboard(0)
+            .expect("Sampler children should split");
+
+        let channels = document.channels();
+        assert_eq!(channels[1].sampler_root_key(), Some(73));
+        assert_eq!(channels[1].keyboard_key_region(), Some((61, 61)));
+        assert_eq!(channels[2].sampler_root_key(), Some(48));
+        assert_eq!(channels[2].keyboard_key_region(), Some((60, 60)));
+
+        for (channel_id, expected_marker) in [(1, 0xA1), (2, 0xB2)] {
+            let original_channel = original_document
+                .channels()
+                .into_iter()
+                .find(|channel| channel.id() == channel_id)
+                .expect("original child should exist");
+            let edited_channel = channels
+                .iter()
+                .find(|channel| channel.id() == channel_id)
+                .expect("edited child should exist");
+            let original_parameters_index = original_channel
+                .event_range()
+                .find(|index| original_document.events()[*index].opcode() == 0xC7)
+                .expect("original Parameters event should exist");
+            let original_parameters =
+                original_document.events()[original_parameters_index].payload();
+            let edited_parameters = edited_channel
+                .event_range()
+                .filter(|index| document.events()[*index].opcode() == 0xC7)
+                .map(|index| document.events()[index].payload())
+                .next()
+                .expect("edited Parameters event should exist");
+            assert_eq!(&edited_parameters[..68], &original_parameters[..68]);
+            assert_eq!(&edited_parameters[76..], &original_parameters[76..]);
+            assert!(
+                original_parameters[..68]
+                    .iter()
+                    .all(|byte| *byte == expected_marker)
+            );
+        }
+
+        let encoded = document
+            .encode_lossless()
+            .expect("split project should encode");
+        let reopened = FlpDocument::parse(&encoded).expect("split project should reopen");
+        assert_eq!(reopened.channels(), document.channels());
+        assert_eq!(reopened.encode_lossless().unwrap(), encoded);
+    }
+
+    #[test]
+    fn splitting_layer_children_is_atomic_when_a_child_is_unsupported_or_out_of_range() {
+        let mut unsupported_stream = vec![0x40, 0, 0, 0x15, 3, 0x87];
+        unsupported_stream.extend_from_slice(&60_u32.to_le_bytes());
+        unsupported_stream.extend_from_slice(&[0x5E, 1, 0]);
+        unsupported_stream.extend_from_slice(&[0x40, 1, 0, 0x15, 2, 0x62, 0, 0]);
+        let unsupported_bytes = flp_fixture(&unsupported_stream, &[], &[]);
+        let mut unsupported =
+            FlpDocument::parse(&unsupported_bytes).expect("unsupported fixture should parse");
+        let unsupported_before = unsupported.clone();
+        assert!(matches!(
+            unsupported.split_layer_children_across_keyboard(0),
+            Err(FlpError::UnsupportedEdit(_))
+        ));
+        assert_eq!(unsupported, unsupported_before);
+
+        let out_of_range_bytes = layer_sampler_split_fixture(127, &[1, 2]);
+        let mut out_of_range =
+            FlpDocument::parse(&out_of_range_bytes).expect("boundary fixture should parse");
+        let out_of_range_before = out_of_range.clone();
+        assert!(matches!(
+            out_of_range.split_layer_children_across_keyboard(0),
+            Err(FlpError::UnsupportedEdit(_))
+        ));
+        assert_eq!(out_of_range, out_of_range_before);
+    }
+
+    #[test]
+    fn splitting_layer_children_inserts_parameters_when_sampler_has_no_key_range_event() {
+        let mut event_stream = vec![0x40, 0, 0, 0x15, 3, 0x87];
+        event_stream.extend_from_slice(&60_u32.to_le_bytes());
+        event_stream.extend_from_slice(&[0x5E, 1, 0, 0x40, 1, 0, 0x15, 0, 0x87]);
+        event_stream.extend_from_slice(&64_u32.to_le_bytes());
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        let input = flp_fixture(&event_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&input).expect("missing Parameters fixture parses");
+
+        document
+            .split_layer_children_across_keyboard(0)
+            .expect("split should create the missing Parameters event");
+
+        let child = document
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id() == 1)
+            .expect("Sampler child should exist");
+        assert_eq!(child.sampler_root_key(), Some(64));
+        assert_eq!(child.keyboard_key_region(), Some((60, 60)));
+        let parameters_event = child
+            .event_range()
+            .map(|index| &document.events()[index])
+            .find(|event| event.opcode() == 0xC7)
+            .expect("Parameters event should be inserted");
+        assert_eq!(parameters_event.payload().len(), 76);
+        let encoded = document.encode_lossless().expect("split should encode");
+        let reopened = FlpDocument::parse(&encoded).expect("split should reopen");
+        assert_eq!(reopened.channels(), document.channels());
     }
 
     #[test]

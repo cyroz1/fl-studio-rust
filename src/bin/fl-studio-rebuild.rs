@@ -21077,6 +21077,7 @@ impl DawUi {
         let mut channel_swing_edits = Vec::new();
         let mut layer_edits = Vec::new();
         let mut layer_flag_edits = Vec::new();
+        let mut layer_split_edits = Vec::new();
         let mut step_toggles = Vec::<(u16, Vec<usize>, u32, StepToggleOperation)>::new();
         let mut step_note_additions = Vec::<(u16, u32, u16)>::new();
         let mut mute_removed_steps_changed = false;
@@ -21981,6 +21982,22 @@ impl DawUi {
                                     ui.small("No recognized flags event");
                                 }
                             });
+                            let has_children = channel
+                                .layer_child_ids()
+                                .is_some_and(|children| !children.is_empty());
+                            let can_split = channel.layer_root_key().is_some() && has_children;
+                            if ui
+                                .add_enabled(
+                                    can_split,
+                                    egui::Button::new("Split children across keys"),
+                                )
+                                .clicked()
+                            {
+                                layer_split_edits.push(channel.id());
+                            }
+                            if !can_split {
+                                ui.small("Set a Layer root key and add children to split");
+                            }
                         }
                         }
                     });
@@ -22452,6 +22469,23 @@ impl DawUi {
                     }
                     Err(error) => {
                         self.status = format!("Could not update Layer children: {error}");
+                    }
+                }
+            }
+        }
+        if !layer_split_edits.is_empty()
+            && let Some(document) = self.document.as_mut()
+        {
+            for channel_id in layer_split_edits {
+                match document.split_layer_children_across_keyboard(channel_id) {
+                    Ok(()) => {
+                        self.dirty = true;
+                        self.status = format!(
+                            "Layer channel {channel_id} children split across consecutive keys"
+                        );
+                    }
+                    Err(error) => {
+                        self.status = format!("Could not split Layer children: {error}");
                     }
                 }
             }
