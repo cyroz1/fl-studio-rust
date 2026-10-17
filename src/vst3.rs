@@ -665,6 +665,7 @@ impl Vst3PlaylistStreamProcessor {
                         {
                             source.control.apply_meter_frame(
                                 controls,
+                                *track,
                                 *transform,
                                 &mut meter_frame,
                             );
@@ -4005,6 +4006,7 @@ mod tests {
                     pan_law_raw: Some(2),
                     output_transform: MixerSourceRouteTransform::default(),
                     insert_meter_transforms: Vec::new(),
+                    ..MixerLiveSourceRoutePlan::default()
                 },
                 48_000,
             ),
@@ -4052,6 +4054,7 @@ mod tests {
                     (1, MixerSourceRouteTransform::default()),
                     (2, MixerSourceRouteTransform::default().scaled(0.5)),
                 ],
+                ..MixerLiveSourceRoutePlan::default()
             },
             48_000,
         );
@@ -4074,6 +4077,7 @@ mod tests {
             let mut meter_frame = [1.0, -0.5];
             source.apply_meter_frame(
                 controls,
+                track,
                 source
                     .insert_meter_transforms()
                     .iter()
