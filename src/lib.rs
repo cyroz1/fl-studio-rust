@@ -2130,6 +2130,7 @@ pub(crate) struct MixerLiveSourceRoutePlan {
     pub(crate) source_transform: MixerSourceRouteTransform,
     pub(crate) saved_fader_gain: f32,
     pub(crate) saved_pan_raw: Option<i32>,
+    pub(crate) saved_stereo_separation_raw: Option<i32>,
     pub(crate) pan_law_raw: Option<u8>,
     pub(crate) output_transform: MixerSourceRouteTransform,
     pub(crate) insert_meter_transforms: Vec<(usize, MixerSourceRouteTransform)>,
@@ -2409,7 +2410,7 @@ impl MixerRouteAudibility {
     }
 
     /// Splits a source insert's static signal controls from the transforms on its routed paths.
-    /// The source fader and pan can then follow live targets before direct and send branches split.
+    /// The source fader, pan, and stereo separation can then follow live targets before routes split.
     pub(crate) fn live_source_route_plan_for_channel(
         &self,
         route: Option<i8>,
@@ -2417,15 +2418,19 @@ impl MixerRouteAudibility {
         let track = route.filter(|track| *track > 0 && self.known_tracks.contains(track))?;
         let source_transform = *self.source_transforms.get(&track)?;
         let saved_fader_raw = self.source_fader_volume_raw.get(&track).copied();
-        if saved_fader_raw.is_none() && source_transform.mixer_pan_raw.is_none() {
+        if saved_fader_raw.is_none()
+            && source_transform.mixer_pan_raw.is_none()
+            && source_transform.stereo_separation_raw.is_none()
+        {
             return None;
         }
 
-        let source_transform_without_fader_or_pan =
+        let source_transform_without_live_controls =
             MixerSourceRouteTransform::from_insert_transform(
                 source_transform
                     .with_fader_volume_raw(None)
-                    .with_mixer_pan_raw(None),
+                    .with_mixer_pan_raw(None)
+                    .with_stereo_separation_raw(None),
             );
         let mut downstream_routes = self.clone();
         downstream_routes
@@ -2435,9 +2440,10 @@ impl MixerRouteAudibility {
 
         Some(MixerLiveSourceRoutePlan {
             track: track as usize,
-            source_transform: source_transform_without_fader_or_pan,
+            source_transform: source_transform_without_live_controls,
             saved_fader_gain: saved_fader_raw.map_or(1.0, mixer_fader_gain),
             saved_pan_raw: source_transform.mixer_pan_raw,
+            saved_stereo_separation_raw: source_transform.stereo_separation_raw,
             pan_law_raw: source_transform.mixer_pan_law_raw,
             output_transform: route_plan.output_transform,
             insert_meter_transforms: route_plan.insert_meter_transforms,
@@ -2606,9 +2612,18 @@ fn candidate_mixer_stereo_separation(
 }
 
 fn apply_mixer_stereo_separation(frame: &mut [f32; 2], separation_raw: i32) {
+    apply_mixer_stereo_separation_raw_f32(frame, separation_raw as f32);
+}
+
+pub(crate) fn apply_mixer_stereo_separation_raw_f32(frame: &mut [f32; 2], separation_raw: f32) {
+    let separation_raw = if separation_raw.is_finite() {
+        separation_raw.clamp(-64.0, 64.0)
+    } else {
+        0.0
+    };
     let mid = (frame[0] + frame[1]) * 0.5;
     let side = (frame[0] - frame[1]) * 0.5;
-    let side_gain = 1.0 - separation_raw.clamp(-64, 64) as f32 / 64.0;
+    let side_gain = 1.0 - separation_raw / 64.0;
     frame[0] = mid + side * side_gain;
     frame[1] = mid - side * side_gain;
 }
@@ -19706,7 +19721,11 @@ mod tests {
             event_index: 0,
             record_index: 0,
         };
-        let parameters = [parameter(192, 5_000), parameter(193, -3_200)];
+        let parameters = [
+            parameter(192, 5_000),
+            parameter(193, -3_200),
+            parameter(194, 32),
+        ];
         let mut routing = MixerRouteAudibility::from_inserts_with_parameters(
             [insert(0), insert(1), insert(2)],
             &parameters,
@@ -19720,10 +19739,19 @@ mod tests {
         assert_eq!(plan.track, 1);
         assert_eq!(plan.saved_fader_gain, 0.5);
         assert_eq!(plan.saved_pan_raw, Some(-3_200));
+        assert_eq!(plan.saved_stereo_separation_raw, Some(32));
         assert_eq!(plan.pan_law_raw, Some(2));
+
+        let mut source_side = [1.0, -1.0];
+        plan.source_transform.apply_frame(&mut source_side);
+        assert_eq!(source_side, [1.0, -1.0]);
 
         let mut source_stage = [1.0, 1.0];
         plan.source_transform.apply_frame(&mut source_stage);
+        super::apply_mixer_stereo_separation(
+            &mut source_stage,
+            plan.saved_stereo_separation_raw.unwrap(),
+        );
         assert_eq!(source_stage, [1.0, 1.0]);
         super::apply_mixer_pan_raw_f32(&mut source_stage, -3_200.0, plan.pan_law_raw);
         source_stage[0] *= plan.saved_fader_gain;
