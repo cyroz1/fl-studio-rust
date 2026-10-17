@@ -2455,6 +2455,12 @@ pub(crate) struct MixerLiveInsertEnabledGain {
     pub(crate) saved_enabled: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct MixerLiveSoloState {
+    pub(crate) any_soloed: bool,
+    pub(crate) soloed: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct MixerLiveSendOutputPath {
     pub(crate) transform: MixerSourceRouteTransform,
@@ -2495,6 +2501,7 @@ pub(crate) struct MixerLiveSourceRoutePlan {
     pub(crate) saved_live_insert_enabled: Vec<bool>,
     pub(crate) live_send_output_paths: Option<Vec<MixerLiveSendOutputPath>>,
     pub(crate) live_send_meter_paths: Vec<MixerLiveSendMeterPath>,
+    pub(crate) live_solo: Option<MixerLiveSoloState>,
 }
 
 struct MixerLiveSourceRouteData {
@@ -2826,6 +2833,11 @@ impl MixerRouteAudibility {
         else {
             return self.allows_channel(route);
         };
+        if !self.complete_send_sources.contains(&source_track) {
+            // Keep direct-routed channels available so changing solo while playing can fade
+            // them in or out through the live source control.
+            return true;
+        }
         self.allows_channel_with_source_mute_override(route, Some(source_track), true)
     }
 
@@ -2929,6 +2941,7 @@ impl MixerRouteAudibility {
         route: Option<i8>,
     ) -> Option<MixerLiveSourceRoutePlan> {
         let track = route.filter(|track| *track > 0 && self.known_tracks.contains(track))?;
+        let live_direct_solo = !self.complete_send_sources.contains(&track);
         let source_transform = self
             .source_transforms
             .get(&track)
@@ -2947,6 +2960,7 @@ impl MixerRouteAudibility {
             && saved_signal_flags.is_none()
             && saved_enabled.is_none()
             && !has_live_send_controls
+            && !live_direct_solo
         {
             return None;
         }
@@ -2965,6 +2979,9 @@ impl MixerRouteAudibility {
             );
         let mut downstream_routes = self.clone();
         downstream_routes.disabled_tracks.remove(&track);
+        if live_direct_solo {
+            downstream_routes.soloed_insert_tracks.clear();
+        }
         downstream_routes
             .source_transforms
             .insert(track, MixerInsertSignalTransform::default());
@@ -2988,6 +3005,10 @@ impl MixerRouteAudibility {
             saved_live_insert_enabled: live_route_data.saved_target_insert_enabled,
             live_send_output_paths: live_route_data.output_paths,
             live_send_meter_paths: live_route_data.meter_paths,
+            live_solo: live_direct_solo.then_some(MixerLiveSoloState {
+                any_soloed: !self.soloed_insert_tracks.is_empty(),
+                soloed: self.soloed_insert_tracks.contains(&track),
+            }),
         })
     }
 
@@ -21171,6 +21192,41 @@ mod tests {
         let mut frame = [1.0, 0.25];
         plan.output_transform.apply_frame(&mut frame);
         assert_eq!(frame, [1.0, 0.25]);
+    }
+
+    #[test]
+    fn live_solo_keeps_direct_sources_available_for_runtime_smoothing() {
+        let insert = |ordinal, soloed| MixerInsertSummary {
+            ordinal,
+            input_raw: -1,
+            output_raw: -1,
+            color_raw: 0,
+            icon_raw: None,
+            name: None,
+            flags: Some((1 << 3) | if soloed { 1 << 12 } else { 0 }),
+            flags_event_index: None,
+            first_event_index: 0,
+            end_event_index: 0,
+        };
+        let routing = MixerRouteAudibility::from_inserts_with_parameters(
+            [insert(0, false), insert(1, true), insert(2, false)],
+            &[],
+            None,
+        );
+
+        assert!(!routing.allows_channel(Some(2)));
+        assert!(routing.allows_live_source_channel(Some(2)));
+        let plan = routing
+            .live_source_route_plan_for_channel(Some(2))
+            .expect("direct Mixer routes need live solo controls");
+        assert_eq!(
+            plan.live_solo,
+            Some(super::MixerLiveSoloState {
+                any_soloed: true,
+                soloed: false,
+            })
+        );
+        assert_eq!(plan.output_transform, MixerSourceRouteTransform::default());
     }
 
     #[test]

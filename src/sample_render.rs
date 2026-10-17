@@ -11634,6 +11634,48 @@ mod tests {
     }
 
     #[test]
+    fn direct_mixer_solo_changes_fade_supported_sources() {
+        let source_control = LiveMixerSourceControl::new(
+            MixerLiveSourceRoutePlan {
+                track: 1,
+                saved_fader_gain: 1.0,
+                live_solo: Some(crate::MixerLiveSoloState {
+                    any_soloed: true,
+                    soloed: true,
+                }),
+                ..MixerLiveSourceRoutePlan::default()
+            },
+            48_000,
+        );
+        let meters = MixerTrackPeakMeters::default();
+        meters.set_live_mixer_soloed_tracks(&[1]);
+        let targets = source_control.targets(&meters).unwrap();
+
+        let mut frame = [1.0, 0.25];
+        let controls = source_control.next_frame_controls(&targets);
+        source_control.apply_output_frame(controls, &mut frame);
+        assert_eq!(frame, [1.0, 0.25]);
+
+        meters.set_live_mixer_soloed_tracks(&[2]);
+        for _ in 0..100_000 {
+            let controls = source_control.next_frame_controls(&targets);
+            frame = [1.0, 0.25];
+            source_control.apply_output_frame(controls, &mut frame);
+        }
+        assert!(frame[0].abs() < 0.001);
+        assert!(frame[1].abs() < 0.001);
+
+        meters.set_live_mixer_soloed_tracks(&[]);
+        for _ in 0..100_000 {
+            let controls = source_control.next_frame_controls(&targets);
+            frame = [1.0, 0.25];
+            source_control.apply_output_frame(controls, &mut frame);
+        }
+        assert!((frame[0] - 1.0).abs() < 0.001);
+        assert!((frame[1] - 0.25).abs() < 0.001);
+    }
+
+    #[test]
     fn live_mixer_send_levels_and_flags_smooth_nested_output_and_insert_meters() {
         let source_control = LiveMixerSourceControl::new(
             MixerLiveSourceRoutePlan {
@@ -11707,6 +11749,7 @@ mod tests {
                         }],
                     },
                 ],
+                live_solo: None,
             },
             48_000,
         );
