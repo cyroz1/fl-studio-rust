@@ -361,7 +361,10 @@ are applied where the Mixer rows below describe. Full export surface:
   assigned insert mute/solo/phase/swap state and Master flags; a mapped VST3 channel can
   render its selected pattern notes to the selected WAV, FLAC, Ogg Vorbis, or
   MP3 format through the loaded instrument, using the shared render depth, dither,
-  bitrate, and channel-mode settings. VST3 output buses must be mono or stereo.
+  bitrate, and channel-mode settings. Either render can be inserted as an Audio
+  Clip on the selected Playlist track at the current transport or seek position,
+  subject to a saved project with an Audio Clip template. VST3 output buses must
+  be mono or stereo.
   FL Studio renders selected patterns to audio clips with configurable render
   settings; these exports are separate files and do not add an Audio Clip, apply
   all native render options, or include complete Mixer routing/effects ([Image-Line

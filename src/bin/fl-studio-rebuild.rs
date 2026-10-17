@@ -4421,6 +4421,16 @@ struct PendingSamplerPatternRender {
     worker: thread::JoinHandle<()>,
     output_path: PathBuf,
     pattern_id: u16,
+    insert_placement: Option<PendingPatternRenderPlacement>,
+}
+
+#[derive(Clone, Copy)]
+struct PendingPatternRenderPlacement {
+    arrangement_id: u16,
+    position_ticks: u32,
+    track_index: u16,
+    project_generation: u64,
+    project_fingerprint: [u8; 16],
 }
 
 struct PendingSamplerStream {
@@ -10990,7 +11000,22 @@ impl DawUi {
                         )
                         .clicked()
                     {
-                        self.render_selected_sampler_pattern_dialog();
+                        self.render_selected_sampler_pattern_dialog(false);
+                        ui.close();
+                    }
+                    let can_insert_sampler_pattern = can_render_sampler_pattern
+                        && self.document.as_ref().is_some_and(|document| {
+                            project_has_audio_clip_template(document)
+                                && self.pattern_render_insert_placement(document).is_some()
+                        });
+                    if ui
+                        .add_enabled(
+                            can_insert_sampler_pattern,
+                            egui::Button::new("Render and insert Sampler pattern…"),
+                        )
+                        .clicked()
+                    {
+                        self.render_selected_sampler_pattern_dialog(true);
                         ui.close();
                     }
                     if ui
@@ -25337,6 +25362,7 @@ impl DawUi {
         let mut open_midi_requested = false;
         let mut export_midi_requested = false;
         let mut render_requested = false;
+        let mut render_insert_requested = false;
         let mut preview_requested = false;
         let mut chord_preview_requested = false;
         let mut sampler_preview_requested = false;
@@ -27057,6 +27083,22 @@ impl DawUi {
                     render_requested = true;
                     ui.close();
                 }
+                let can_insert_vst3_pattern = has_loaded_instrument
+                    && self.selected_pattern.is_some()
+                    && self.document.as_ref().is_some_and(|document| {
+                        project_has_audio_clip_template(document)
+                            && self.pattern_render_insert_placement(document).is_some()
+                    });
+                if ui
+                    .add_enabled(
+                        can_insert_vst3_pattern,
+                        egui::Button::new("Render and insert as Audio Clip…"),
+                    )
+                    .clicked()
+                {
+                    render_insert_requested = true;
+                    ui.close();
+                }
                 if ui
                     .add_enabled(
                         has_loaded_instrument && self.selected_pattern.is_some(),
@@ -27887,7 +27929,10 @@ impl DawUi {
         });
 
         if render_requested {
-            self.render_selected_pattern_channel();
+            self.render_selected_pattern_channel(false);
+        }
+        if render_insert_requested {
+            self.render_selected_pattern_channel(true);
         }
         if discard_note_lengths_requested
             && let Some(pattern_id) = self.selected_pattern
@@ -29637,7 +29682,7 @@ impl DawUi {
         self.selected_note_editor(ui, &editor_pattern);
     }
 
-    fn render_selected_pattern_channel(&mut self) {
+    fn render_selected_pattern_channel(&mut self, insert_into_playlist: bool) {
         let (Some(pattern_id), Some(channel_id)) =
             (self.selected_pattern, self.selected_note_channel)
         else {
@@ -29647,9 +29692,25 @@ impl DawUi {
             self.status = "Load a VST3 instrument for this channel before rendering".to_owned();
             return;
         };
-        let Some(document) = self.document.as_ref() else {
+        let Some(document) = self.document.clone() else {
             self.status = "Open a project before rendering".to_owned();
             return;
+        };
+        let insert_placement = if insert_into_playlist {
+            if !project_has_audio_clip_template(&document) {
+                self.status =
+                    "Add an Audio Clip to the project before inserting the rendered Pattern"
+                        .to_owned();
+                return;
+            }
+            let Some(placement) = self.pattern_render_insert_placement(&document) else {
+                self.status = "Select a Playlist arrangement before inserting the rendered Pattern"
+                    .to_owned();
+                return;
+            };
+            Some(placement)
+        } else {
+            None
         };
         let notes = match document.patterns() {
             Ok(patterns) => match patterns
@@ -29670,19 +29731,31 @@ impl DawUi {
         let ppq = document.header().ppq();
         let tempo_bpm = document.metadata().tempo_bpm().unwrap_or(self.tempo_bpm);
         let global_swing_mix_raw = document.metadata().global_swing_mix();
-        let channel_swing_mix_raw = project_channel_swing_mix_raw(document, channel_id);
-        let pitch_offset_cents = project_channel_master_pitch_offset_cents(document, channel_id);
+        let channel_swing_mix_raw = project_channel_swing_mix_raw(&document, channel_id);
+        let pitch_offset_cents = project_channel_master_pitch_offset_cents(&document, channel_id);
         let note_pitch_offset_semitones =
             project_channel_master_pitch_note_offset_semitones(document, channel_id);
         let selected_format = self.playlist_song_output_format;
         let output_format = self.audio_render_output();
+        let dialog_title = if insert_into_playlist {
+            "Render VST3 pattern channel to Audio Clip"
+        } else {
+            "Render selected pattern channel"
+        };
+        let output_suffix = if insert_into_playlist {
+            "Audio_Clip"
+        } else {
+            ""
+        };
+        let output_name = if insert_into_playlist {
+            format!("Pattern_{pattern_id}_Channel_{channel_id}_{output_suffix}")
+        } else {
+            format!("Pattern_{pattern_id}_Channel_{channel_id}")
+        };
         let Some(path) = add_audio_render_file_filter(
             rfd::FileDialog::new()
-                .set_title("Render selected pattern channel")
-                .set_file_name(format!(
-                    "Pattern_{pattern_id}_Channel_{channel_id}.{}",
-                    selected_format.extension()
-                )),
+                .set_title(dialog_title)
+                .set_file_name(format!("{output_name}.{}", selected_format.extension())),
             selected_format,
         )
         .save_file() else {
@@ -29726,6 +29799,16 @@ impl DawUi {
                     path.display(),
                     summary.frames as f64 / f64::from(summary.sample_rate),
                 );
+                if let Some(placement) = insert_placement {
+                    if summary.notes_rendered == 0 {
+                        self.status = format!(
+                            "Pattern {pattern_id}, channel {channel_id} produced no notes; left {} as a file",
+                            path.display()
+                        );
+                    } else {
+                        self.queue_rendered_pattern_audio_clip(pattern_id, &path, placement);
+                    }
+                }
             }
             Err(error) => self.status = format!("Could not render pattern channel: {error}"),
         }
@@ -32689,7 +32772,37 @@ impl DawUi {
         }
     }
 
-    fn render_selected_sampler_pattern_dialog(&mut self) {
+    fn pattern_render_insert_placement(
+        &self,
+        document: &FlpDocument,
+    ) -> Option<PendingPatternRenderPlacement> {
+        let arrangements = document.arrangements().ok()?;
+        let arrangement_id = self
+            .selected_arrangement
+            .filter(|id| arrangements.iter().any(|arrangement| arrangement.id == *id))
+            .or_else(|| arrangements.first().map(|arrangement| arrangement.id))?;
+        let position_ticks = self
+            .current_playhead_tick()
+            .filter(|tick| tick.is_finite() && *tick >= 0.0)
+            .map(|tick| tick.round().min(f64::from(u32::MAX)) as u32)
+            .unwrap_or(self.playlist_seek_tick);
+        let track_index = self
+            .selected_playlist_track
+            .and_then(|track_id| track_id.checked_sub(1))
+            .and_then(|track| u16::try_from(track).ok())
+            .filter(|track| *track <= 499)
+            .unwrap_or(0);
+        let project_bytes = document.encode_lossless().ok()?;
+        Some(PendingPatternRenderPlacement {
+            arrangement_id,
+            position_ticks,
+            track_index,
+            project_generation: self.project_generation,
+            project_fingerprint: Md5::digest(&project_bytes).into(),
+        })
+    }
+
+    fn render_selected_sampler_pattern_dialog(&mut self, insert_into_playlist: bool) {
         let Some(pattern_id) = self.selected_pattern else {
             self.status = "Select a pattern before rendering Sampler channels".to_owned();
             return;
@@ -32701,6 +32814,22 @@ impl DawUi {
         let Some(document) = self.document.as_ref() else {
             self.status = "Open a project before rendering Sampler channels".to_owned();
             return;
+        };
+        let insert_placement = if insert_into_playlist {
+            if !project_has_audio_clip_template(document) {
+                self.status =
+                    "Add an Audio Clip to the project before inserting the rendered pattern"
+                        .to_owned();
+                return;
+            }
+            let Some(placement) = self.pattern_render_insert_placement(document) else {
+                self.status = "Select a Playlist arrangement before inserting the rendered pattern"
+                    .to_owned();
+                return;
+            };
+            Some(placement)
+        } else {
+            None
         };
         if self.pending_sampler_pattern_render.is_some() {
             self.status = "A Sampler pattern render is already running".to_owned();
@@ -32754,6 +32883,7 @@ impl DawUi {
                     worker,
                     output_path: output_path.clone(),
                     pattern_id,
+                    insert_placement,
                 });
                 self.status = format!(
                     "Rendering Sampler notes in pattern {pattern_id} to {}…",
@@ -32764,6 +32894,57 @@ impl DawUi {
                 self.status = format!("Could not start Sampler pattern render: {error}");
             }
         }
+    }
+
+    fn queue_rendered_pattern_audio_clip(
+        &mut self,
+        pattern_id: u16,
+        output_path: &Path,
+        placement: PendingPatternRenderPlacement,
+    ) {
+        let current_fingerprint = self
+            .document
+            .as_ref()
+            .and_then(|document| document.encode_lossless().ok())
+            .map(|bytes| <[u8; 16]>::from(Md5::digest(&bytes)));
+        if placement.project_generation != self.project_generation
+            || current_fingerprint != Some(placement.project_fingerprint)
+        {
+            self.status = format!(
+                "Rendered pattern {pattern_id}, but the active project changed; left {} as a file",
+                output_path.display()
+            );
+            return;
+        }
+        if !self
+            .document
+            .as_ref()
+            .is_some_and(project_has_audio_clip_template)
+        {
+            self.status = format!(
+                "Rendered pattern {pattern_id}, but the active project no longer has an Audio Clip template; left {} as a file",
+                output_path.display()
+            );
+            return;
+        }
+
+        self.pending_playlist_audio_drops
+            .push_back(PendingPlaylistAudioDrop {
+                path: output_path.to_path_buf(),
+                arrangement_id: placement.arrangement_id,
+                position_ticks: placement.position_ticks,
+                track_index: placement.track_index,
+                project_generation: placement.project_generation,
+            });
+        self.audio_waveforms.remove(output_path);
+        self.waveform_errors.remove(output_path);
+        self.waveform_loads.remove(output_path);
+        self.request_audio_waveform(output_path);
+        self.status = format!(
+            "Rendered pattern {pattern_id}; preparing its Audio Clip on Playlist track {} at tick {}…",
+            placement.track_index + 1,
+            placement.position_ticks,
+        );
     }
 
     fn poll_sampler_pattern_render(&mut self) {
@@ -32799,6 +32980,21 @@ impl DawUi {
                     summary.notes_skipped_unresolved_sample,
                     summary.voices_stolen,
                 );
+                if let Some(placement) = pending.insert_placement {
+                    if summary.notes_rendered == 0 {
+                        self.status = format!(
+                            "Pattern {} produced no supported sample notes; left {} as a file",
+                            pending.pattern_id,
+                            pending.output_path.display()
+                        );
+                    } else {
+                        self.queue_rendered_pattern_audio_clip(
+                            pending.pattern_id,
+                            &pending.output_path,
+                            placement,
+                        );
+                    }
+                }
             }
             Err(error) => {
                 self.status = format!("Could not render Sampler pattern: {error}");
