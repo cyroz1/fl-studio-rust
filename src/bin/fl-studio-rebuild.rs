@@ -4511,20 +4511,15 @@ struct MidiMixerControlMapping {
 enum MidiMixerControlTarget {
     Fader,
     Pan,
+    StereoSeparation,
 }
 
 impl MidiMixerControlTarget {
-    const fn mixer_parameter_kind(self) -> MixerParameterKind {
-        match self {
-            Self::Fader => MixerParameterKind::Volume,
-            Self::Pan => MixerParameterKind::Pan,
-        }
-    }
-
     const fn name(self) -> &'static str {
         match self {
             Self::Fader => "fader",
             Self::Pan => "pan",
+            Self::StereoSeparation => "stereo separation",
         }
     }
 
@@ -4532,6 +4527,7 @@ impl MidiMixerControlTarget {
         match value {
             "fader" => Some(Self::Fader),
             "pan" => Some(Self::Pan),
+            "stereo-separation" => Some(Self::StereoSeparation),
             _ => None,
         }
     }
@@ -4540,6 +4536,7 @@ impl MidiMixerControlTarget {
         match self {
             Self::Fader => "fader",
             Self::Pan => "pan",
+            Self::StereoSeparation => "stereo-separation",
         }
     }
 
@@ -4547,6 +4544,7 @@ impl MidiMixerControlTarget {
         match self {
             Self::Fader => midi_cc_to_mixer_fader_raw(cc),
             Self::Pan => midi_cc_to_mixer_pan_raw(cc),
+            Self::StereoSeparation => midi_cc_to_mixer_stereo_separation_raw(cc),
         }
     }
 
@@ -4554,6 +4552,7 @@ impl MidiMixerControlTarget {
         match self {
             Self::Fader => (0..=16_000).contains(&value),
             Self::Pan => (-6_400..=6_400).contains(&value),
+            Self::StereoSeparation => (-64..=64).contains(&value),
         }
     }
 }
@@ -4600,6 +4599,15 @@ fn midi_cc_to_mixer_pan_raw(value: u8) -> i32 {
         (value - 64) * 100
     } else {
         (value - 64) * 6_400 / 63
+    }
+}
+
+fn midi_cc_to_mixer_stereo_separation_raw(value: u8) -> i32 {
+    let value = i32::from(value.min(127));
+    if value <= 64 {
+        value - 64
+    } else {
+        (value - 64) * 64 / 63
     }
 }
 
@@ -35548,6 +35556,104 @@ impl DawUi {
                                                                 }
                                                             }
                                                             ui.small(separation_value.to_string());
+                                                            let learning = MidiMixerControlLearning {
+                                                                insert_ordinal: insert.ordinal(),
+                                                                target: MidiMixerControlTarget::StereoSeparation,
+                                                            };
+                                                            if self.midi_mixer_control_learning
+                                                                == Some(learning)
+                                                            {
+                                                                ui.small(
+                                                                    egui::RichText::new(
+                                                                        "Move a MIDI CC control…",
+                                                                    )
+                                                                    .color(ORANGE),
+                                                                );
+                                                                if ui
+                                                                    .small_button("Cancel learn")
+                                                                    .clicked()
+                                                                {
+                                                                    self.midi_mixer_control_learning =
+                                                                        None;
+                                                                }
+                                                            } else if ui
+                                                                .add_enabled(
+                                                                    self.midi_input_connection.is_some(),
+                                                                    egui::Button::new("Learn stereo CC"),
+                                                                )
+                                                                .on_hover_text(
+                                                                    "Connect a MIDI input, then move one CC control to map this Mixer stereo separation",
+                                                                )
+                                                                .clicked()
+                                                            {
+                                                                self.midi_output_gain_learning = false;
+                                                                self.midi_play_pause_learning = false;
+                                                                self.midi_mixer_control_learning =
+                                                                    Some(learning);
+                                                                self.status = format!(
+                                                                    "Move a MIDI CC control to map the {} stereo separation",
+                                                                    if insert.ordinal() == 0 {
+                                                                        "Master".to_owned()
+                                                                    } else {
+                                                                        format!("Insert {}", insert.ordinal())
+                                                                    }
+                                                                );
+                                                            }
+                                                            if let Some(mapping) = self
+                                                                .midi_mixer_control_mappings
+                                                                .iter()
+                                                                .find(|mapping| {
+                                                                    mapping.insert_ordinal
+                                                                        == insert.ordinal()
+                                                                        && mapping.target
+                                                                            == MidiMixerControlTarget::StereoSeparation
+                                                                })
+                                                            {
+                                                                let input_name = self
+                                                                    .midi_input_devices
+                                                                    .iter()
+                                                                    .find(|device| {
+                                                                        device.id
+                                                                            == mapping.input_device_id
+                                                                    })
+                                                                    .map(|device| device.name.as_str())
+                                                                    .unwrap_or(
+                                                                        mapping.input_device_id.as_str(),
+                                                                    );
+                                                                ui.small(format!(
+                                                                    "Stereo CC {} · Ch {}",
+                                                                    mapping.controller,
+                                                                    mapping.channel + 1
+                                                                ))
+                                                                .on_hover_text(format!(
+                                                                    "Mapped from {input_name}"
+                                                                ));
+                                                                if ui
+                                                                    .small_button("Clear stereo CC")
+                                                                    .clicked()
+                                                                {
+                                                                    self.midi_mixer_control_mappings
+                                                                        .retain(|mapping| {
+                                                                            mapping.insert_ordinal
+                                                                                != insert.ordinal()
+                                                                                || mapping.target
+                                                                                    != MidiMixerControlTarget::StereoSeparation
+                                                                        });
+                                                                    self.midi_mixer_control_learning =
+                                                                        None;
+                                                                    if let Err(error) =
+                                                                        save_midi_mixer_control_mappings(
+                                                                            &self.midi_mixer_control_mappings,
+                                                                        )
+                                                                    {
+                                                                        self.status = format!(
+                                                                            "Could not clear MIDI Mixer stereo mapping: {error}"
+                                                                        );
+                                                                    } else {
+                                                                        self.status = "Cleared MIDI Mixer stereo mapping".to_owned();
+                                                                    }
+                                                                }
+                                                            }
                                                         } else {
                                                             ui.small(format!("raw {separation_value}"));
                                                         }
@@ -37380,11 +37486,21 @@ impl DawUi {
             let parameters = document.mixer_parameter_records().map_err(|error| {
                 format!("Could not inspect Mixer {} records: {error}", target.name())
             })?;
-            let record = unique_candidate_mixer_parameter(
-                &parameters,
-                insert_ordinal,
-                target.mixer_parameter_kind(),
-            )
+            let record = match target {
+                MidiMixerControlTarget::Fader => unique_candidate_mixer_parameter(
+                    &parameters,
+                    insert_ordinal,
+                    MixerParameterKind::Volume,
+                ),
+                MidiMixerControlTarget::Pan => unique_candidate_mixer_parameter(
+                    &parameters,
+                    insert_ordinal,
+                    MixerParameterKind::Pan,
+                ),
+                MidiMixerControlTarget::StereoSeparation => {
+                    candidate_mixer_stereo_separation(&parameters, insert_ordinal)
+                }
+            }
             .filter(|record| target.supports_raw_value(record.value()))
             .ok_or_else(|| {
                 format!(
@@ -37442,6 +37558,12 @@ impl DawUi {
             (MidiMixerControlTarget::Pan, _) => self
                 .mixer_track_peak_meters
                 .set_live_mixer_insert_pan_raw(insert_ordinal, Some(raw_value)),
+            (MidiMixerControlTarget::StereoSeparation, 0) => self
+                .mixer_track_peak_meters
+                .set_live_master_stereo_separation_raw(Some(raw_value)),
+            (MidiMixerControlTarget::StereoSeparation, _) => self
+                .mixer_track_peak_meters
+                .set_live_mixer_insert_stereo_separation_raw(insert_ordinal, Some(raw_value)),
         }
         self.dirty = true;
         self.status = format!(
@@ -49498,16 +49620,16 @@ mod tests {
         detect_piano_roll_scale, encode_midi_device_id, encode_midi_device_selections,
         first_available_playlist_track, is_performance_clip_trigger_channel_event,
         midi_button_press_edge, midi_cc_to_mixer_fader_raw, midi_cc_to_mixer_pan_raw,
-        midi_controller_binding_for_device, midi_mixer_control_for_cc, next_piano_roll_note_group,
-        note_from_grid_position, parse_midi_control_change_mapping,
-        parse_midi_controller_templates, parse_midi_device_selections,
-        parse_midi_mixer_control_mappings, parse_window_layout_presets, pattern_loop_frame_at_tick,
-        pattern_loop_tick_at_frame, piano_roll_color_group_note_ids,
-        piano_roll_controller_stroke_points, piano_roll_controller_value_at,
-        piano_roll_controller_value_range, piano_roll_cross_pattern_ghost_notes,
-        piano_roll_discard_length_edit, piano_roll_duplicate_offset,
-        piano_roll_ghost_note_is_visible, piano_roll_key_at_y, piano_roll_note_group_members,
-        piano_roll_note_nudge_edit, piano_roll_odd_note_selection,
+        midi_cc_to_mixer_stereo_separation_raw, midi_controller_binding_for_device,
+        midi_mixer_control_for_cc, next_piano_roll_note_group, note_from_grid_position,
+        parse_midi_control_change_mapping, parse_midi_controller_templates,
+        parse_midi_device_selections, parse_midi_mixer_control_mappings,
+        parse_window_layout_presets, pattern_loop_frame_at_tick, pattern_loop_tick_at_frame,
+        piano_roll_color_group_note_ids, piano_roll_controller_stroke_points,
+        piano_roll_controller_value_at, piano_roll_controller_value_range,
+        piano_roll_cross_pattern_ghost_notes, piano_roll_discard_length_edit,
+        piano_roll_duplicate_offset, piano_roll_ghost_note_is_visible, piano_roll_key_at_y,
+        piano_roll_note_group_members, piano_roll_note_nudge_edit, piano_roll_odd_note_selection,
         piano_roll_overlap_note_selection, piano_roll_pitch_range_note_selection,
         piano_roll_random_note_selection, piano_roll_selection_time_range,
         piano_roll_shift_time_range, piano_roll_time_range_from_drag,
@@ -50725,6 +50847,13 @@ mod tests {
                 insert_ordinal: 1,
                 target: MidiMixerControlTarget::Fader,
             },
+            MidiMixerControlMapping {
+                input_device_id: "usb:surface".to_owned(),
+                channel: 0,
+                controller: 10,
+                insert_ordinal: 1,
+                target: MidiMixerControlTarget::StereoSeparation,
+            },
         ];
         let encoded = serialize_midi_mixer_control_mappings(&mappings);
         assert_eq!(parse_midi_mixer_control_mappings(&encoded), mappings);
@@ -50830,7 +50959,15 @@ mod tests {
             target: MidiMixerControlTarget::Pan,
         };
         upsert_midi_mixer_control_mapping(&mut mappings, pan.clone());
-        assert_eq!(mappings, vec![replacement, reassigned_control, pan]);
+        let stereo = MidiMixerControlMapping {
+            input_device_id: "surface".to_owned(),
+            channel: 0,
+            controller: 11,
+            insert_ordinal: 1,
+            target: MidiMixerControlTarget::StereoSeparation,
+        };
+        upsert_midi_mixer_control_mapping(&mut mappings, stereo.clone());
+        assert_eq!(mappings, vec![replacement, reassigned_control, pan, stereo]);
     }
 
     #[test]
@@ -50857,6 +50994,13 @@ mod tests {
                 insert_ordinal: 3,
                 target: MidiMixerControlTarget::Fader,
             },
+            MidiMixerControlMapping {
+                input_device_id: "surface-a".to_owned(),
+                channel: 0,
+                controller: 10,
+                insert_ordinal: 1,
+                target: MidiMixerControlTarget::StereoSeparation,
+            },
         ];
         assert_eq!(
             midi_mixer_control_for_cc(&mappings, "surface-a", 0, 7),
@@ -50874,6 +51018,10 @@ mod tests {
             midi_mixer_control_for_cc(&mappings, "surface-a", 0, 8),
             None
         );
+        assert_eq!(
+            midi_mixer_control_for_cc(&mappings, "surface-a", 0, 10),
+            Some((1, MidiMixerControlTarget::StereoSeparation))
+        );
     }
 
     #[test]
@@ -50884,6 +51032,16 @@ mod tests {
         assert_eq!(midi_cc_to_mixer_pan_raw(65), 101);
         assert_eq!(midi_cc_to_mixer_pan_raw(127), 6_400);
         assert_eq!(midi_cc_to_mixer_pan_raw(255), 6_400);
+    }
+
+    #[test]
+    fn midi_cc_stereo_separation_mapping_is_centered_and_clamped() {
+        assert_eq!(midi_cc_to_mixer_stereo_separation_raw(0), -64);
+        assert_eq!(midi_cc_to_mixer_stereo_separation_raw(63), -1);
+        assert_eq!(midi_cc_to_mixer_stereo_separation_raw(64), 0);
+        assert_eq!(midi_cc_to_mixer_stereo_separation_raw(65), 1);
+        assert_eq!(midi_cc_to_mixer_stereo_separation_raw(127), 64);
+        assert_eq!(midi_cc_to_mixer_stereo_separation_raw(255), 64);
     }
 
     #[test]
