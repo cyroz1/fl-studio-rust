@@ -36181,7 +36181,26 @@ impl DawUi {
                                 insert.polarity_reversed().unwrap_or(false);
                             let mut swap_left_right =
                                 insert.swap_left_right().unwrap_or(false);
+                            let mut effects_enabled = insert.effects_enabled().unwrap_or(false);
                             ui.horizontal(|ui| {
+                                if ui
+                                    .add_enabled(
+                                        flags_editable,
+                                        egui::Checkbox::new(&mut effects_enabled, "Effects on"),
+                                    )
+                                    .on_hover_text(
+                                        "Edit the saved effect-chain enable state; effect audio processing is not supported yet",
+                                    )
+                                    .changed()
+                                {
+                                    flag_edits.push((
+                                        insert.ordinal(),
+                                        MixerInsertEdit {
+                                            effects_enabled: Some(effects_enabled),
+                                            ..MixerInsertEdit::default()
+                                        },
+                                    ));
+                                }
                                 if ui
                                     .add_enabled(
                                         flags_editable,
