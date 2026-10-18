@@ -13696,6 +13696,104 @@ impl FlpDocument {
         Ok(())
     }
 
+    /// Imports one MIDI Control Change number from a track into an existing raw Pattern
+    /// controller stream. Source MIDI timing and tempo changes are preserved; CC values map
+    /// linearly from 0–127 to 0.0–1.0. `midi_channel` is zero-based, or `None` to include all
+    /// MIDI channels. No event realignment is applied so the imported points stay synchronized
+    /// with note data imported from the same MIDI file.
+    pub fn import_midi_control_changes(
+        &mut self,
+        midi: &midi::MidiFile,
+        track_index: usize,
+        pattern_id: u16,
+        target_stream: (u8, u8),
+        controller_number: u8,
+        midi_channel: Option<u8>,
+    ) -> Result<usize, FlpError> {
+        if controller_number > 127 {
+            return Err(FlpError::UnsupportedEdit(
+                "MIDI Control Change number must be from 0 through 127",
+            ));
+        }
+        if midi_channel.is_some_and(|channel| channel > 15) {
+            return Err(FlpError::UnsupportedEdit(
+                "MIDI channel must be from 0 through 15",
+            ));
+        }
+
+        let pattern = self
+            .patterns()?
+            .into_iter()
+            .find(|pattern| pattern.id == pattern_id)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested Pattern does not exist",
+            ))?;
+        if !pattern
+            .controllers
+            .iter()
+            .any(|point| (point.channel, point.flags) == target_stream)
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested raw Pattern controller stream does not exist",
+            ));
+        }
+        if self.header.ppq == 0 {
+            return Err(FlpError::UnsupportedEdit(
+                "MIDI import requires a non-zero project PPQ value",
+            ));
+        }
+        let project_tempo_milli_bpm = self.metadata.tempo_milli_bpm.unwrap_or(140_000);
+        if project_tempo_milli_bpm == 0 {
+            return Err(FlpError::UnsupportedEdit(
+                "MIDI import requires a positive project tempo",
+            ));
+        }
+        let track = midi
+            .tracks()
+            .get(track_index)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested MIDI track does not exist",
+            ))?;
+        let default_microseconds_per_quarter =
+            60_000_000_000.0 / f64::from(project_tempo_milli_bpm);
+        midi.elapsed_microseconds_at_tick(0, track_index, default_microseconds_per_quarter)
+            .map_err(|_| {
+                FlpError::UnsupportedEdit(
+                    "MIDI import requires a supported time division and valid tempo map",
+                )
+            })?;
+
+        let changes = track
+            .control_changes()
+            .into_iter()
+            .filter(|change| {
+                change.controller() == controller_number
+                    && midi_channel.is_none_or(|channel| change.channel() == channel)
+            })
+            .collect::<Vec<_>>();
+        let mut points = Vec::with_capacity(changes.len());
+        for change in &changes {
+            let elapsed_microseconds = midi
+                .elapsed_microseconds_at_tick(
+                    change.tick(),
+                    track_index,
+                    default_microseconds_per_quarter,
+                )
+                .map_err(|_| FlpError::UnsupportedEdit("could not convert MIDI event time"))?;
+            let position = scale_midi_microseconds_to_project_ticks(
+                elapsed_microseconds,
+                project_tempo_milli_bpm,
+                self.header.ppq,
+            )?;
+            points.push((position, f32::from(change.value()) / 127.0));
+        }
+
+        if !points.is_empty() {
+            self.draw_pattern_controller_points(pattern_id, target_stream, &points)?;
+        }
+        Ok(points.len())
+    }
+
     /// Imports the note events from one Standard MIDI File track into an existing FLP
     /// pattern and channel. Note times are converted through the MIDI tempo map or
     /// SMPTE clock, then expressed against the existing FLP tempo. MIDI CC 10 pan
@@ -27849,6 +27947,87 @@ mod tests {
         assert_eq!((note.position, note.length, note.key), (0, 96, 60));
         assert_eq!(note.velocity, 0);
         assert_eq!(note.release, 65);
+    }
+
+    #[test]
+    fn midi_control_changes_import_into_an_existing_raw_controller_stream() {
+        let first = pattern_controller_record(0, [0xA5, 0x5A], 3, 0x91, 0.25f32.to_bits());
+        let other_stream = pattern_controller_record(32, [0xD3, 0x4C], 7, 0x2A, 0.5f32.to_bits());
+        let mut controller_payload = first.to_vec();
+        controller_payload.extend_from_slice(&other_stream);
+        let mut controller_event = Vec::new();
+        append_data_event(&mut controller_event, 0xDF, &controller_payload);
+        let input = pattern_fixture(&[], &controller_event);
+        let mut document = FlpDocument::parse(&input).expect("project fixture should parse");
+        let midi = MidiFile::parse(&midi_fixture(
+            &[
+                0x00, 0xFF, 0x51, 0x03, 0x07, 0xA1, 0x20, // 120 BPM.
+                0x00, 0xB0, 74, 0, // CC 74, MIDI channel 1, tick 0.
+                0x81, 0x70, 0xB1, 74, 64, // CC 74, MIDI channel 2, tick 240.
+                0x81, 0x70, 0xB0, 74, 127, // CC 74, MIDI channel 1, tick 480.
+                0x00, 0xB0, 71, 100, // Different CC number, same tick.
+                0x00, 0xFF, 0x2F, 0x00,
+            ],
+            480,
+        ))
+        .expect("MIDI fixture should parse");
+
+        let imported = document
+            .import_midi_control_changes(&midi, 0, 7, (3, 0x91), 74, Some(0))
+            .expect("the selected CC should import");
+        assert_eq!(imported, 2);
+
+        let pattern = &document.patterns().unwrap()[0];
+        assert_eq!(pattern.controllers.len(), 3);
+        assert_eq!(pattern.controllers[0].position, 0);
+        assert_eq!(pattern.controllers[0].reserved, [0xA5, 0x5A]);
+        assert_eq!(pattern.controllers[0].value(), 0.0);
+        assert_eq!(pattern.controllers[1].encode(), other_stream);
+        assert_eq!(pattern.controllers[2].position, 112);
+        assert_eq!(pattern.controllers[2].reserved, [0xA5, 0x5A]);
+        assert_eq!(pattern.controllers[2].channel, 3);
+        assert_eq!(pattern.controllers[2].flags, 0x91);
+        assert_eq!(pattern.controllers[2].value(), 1.0);
+
+        let encoded = document
+            .encode_lossless()
+            .expect("the imported project should encode");
+        let round_trip = FlpDocument::parse(&encoded).expect("the imported project should parse");
+        assert_eq!(
+            round_trip.patterns().unwrap()[0].controllers,
+            pattern.controllers
+        );
+    }
+
+    #[test]
+    fn midi_control_change_import_rejects_invalid_targets_without_mutating() {
+        let record = pattern_controller_record(0, [0; 2], 3, 0x91, 0.5f32.to_bits());
+        let mut controller_event = Vec::new();
+        append_data_event(&mut controller_event, 0xDF, &record);
+        let input = pattern_fixture(&[], &controller_event);
+        let mut document = FlpDocument::parse(&input).expect("project fixture should parse");
+        let midi = MidiFile::parse(&midi_fixture(
+            &[0x00, 0xB0, 74, 127, 0x00, 0xFF, 0x2F, 0x00],
+            480,
+        ))
+        .expect("MIDI fixture should parse");
+
+        assert!(
+            document
+                .import_midi_control_changes(&midi, 0, 7, (3, 0x91), 128, None)
+                .is_err()
+        );
+        assert!(
+            document
+                .import_midi_control_changes(&midi, 0, 7, (3, 0x91), 74, Some(16))
+                .is_err()
+        );
+        assert!(
+            document
+                .import_midi_control_changes(&midi, 0, 7, (9, 0x91), 74, None)
+                .is_err()
+        );
+        assert_eq!(document.encode_lossless().unwrap(), input);
     }
 
     #[test]

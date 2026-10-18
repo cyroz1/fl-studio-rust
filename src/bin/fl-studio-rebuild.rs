@@ -3384,6 +3384,16 @@ struct PendingMidiImport {
     set_mixer_tracks_for_new_channels: bool,
 }
 
+struct PendingMidiCcImport {
+    path: PathBuf,
+    midi: MidiFile,
+    selected_track: usize,
+    controller_number: u8,
+    midi_channel: Option<u8>,
+    pattern_id: u16,
+    target_stream: (u8, u8),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BrowserTab {
     Files,
@@ -4052,6 +4062,7 @@ struct DawUi {
     claw_stretch_to_compensate: bool,
     piano_roll_slice_position_ticks: u32,
     pending_midi_import: Option<PendingMidiImport>,
+    pending_midi_cc_import: Option<PendingMidiCcImport>,
     midi_channel_mapping: MidiChannelMapping,
     selected_arrangement: Option<u16>,
     selected_clip: Option<usize>,
@@ -5099,6 +5110,7 @@ impl DawUi {
             claw_stretch_to_compensate: false,
             piano_roll_slice_position_ticks: 0,
             pending_midi_import: None,
+            pending_midi_cc_import: None,
             midi_channel_mapping: MidiChannelMapping::PreserveNoteChannels,
             selected_arrangement: None,
             selected_clip: None,
@@ -6239,6 +6251,7 @@ impl DawUi {
                 self.piano_roll_selection_drag = None;
                 self.active_note_drag = None;
                 self.pending_midi_import = None;
+                self.pending_midi_cc_import = None;
                 self.selected_plugin_state_channel = document
                     .channel_plugin_states()
                     .first()
@@ -34868,6 +34881,7 @@ impl DawUi {
         }
 
         let mut create_stream_requested = false;
+        let mut open_midi_cc_import_requested = false;
         ui.horizontal_wrapped(|ui| {
             ui.strong("Pattern controller data");
             piano_roll_event_target_selector(ui, &mut self.piano_roll_event_target);
@@ -34925,6 +34939,16 @@ impl DawUi {
                         }
                     });
             }
+            if ui
+                .add_enabled(
+                    self.piano_roll_controller_stream.is_some(),
+                    egui::Button::new("Import MIDI CC…"),
+                )
+                .on_hover_text("Import one MIDI Control Change number into the selected raw stream")
+                .clicked()
+            {
+                open_midi_cc_import_requested = true;
+            }
             if streams.is_empty() {
                 ui.separator();
                 ui.label("New raw stream");
@@ -34972,6 +34996,14 @@ impl DawUi {
             }
             return;
         }
+
+        let selected_stream = self.piano_roll_controller_stream;
+        self.draw_pending_midi_cc_import_ui(
+            ui,
+            pattern.id,
+            selected_stream,
+            open_midi_cc_import_requested,
+        );
 
         let size = Vec2::new(ui.available_width().max(1.0), 116.0);
         let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
@@ -35582,6 +35614,203 @@ impl DawUi {
                     Err(error) => {
                         self.status = format!("Could not add Pattern controller: {error}");
                     }
+                }
+            }
+        }
+    }
+
+    fn draw_pending_midi_cc_import_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        pattern_id: u16,
+        selected_stream: Option<(u8, u8)>,
+        open_requested: bool,
+    ) {
+        if open_requested
+            && let Some(target_stream) = selected_stream
+            && let Some(path) = rfd::FileDialog::new()
+                .set_title("Import MIDI controller automation")
+                .add_filter("MIDI files", &["mid", "midi"])
+                .pick_file()
+        {
+            match fs::read(&path) {
+                Ok(bytes) => match MidiFile::parse(&bytes) {
+                    Ok(midi) if !midi.tracks().is_empty() => {
+                        let controller_number = midi.tracks()[0]
+                            .control_changes()
+                            .first()
+                            .map_or(0, |change| change.controller());
+                        self.pending_midi_cc_import = Some(PendingMidiCcImport {
+                            path: path.clone(),
+                            midi,
+                            selected_track: 0,
+                            controller_number,
+                            midi_channel: None,
+                            pattern_id,
+                            target_stream,
+                        });
+                        self.status =
+                            format!("Loaded MIDI controller data from {}", path.display());
+                    }
+                    Ok(_) => self.status = "The MIDI file contains no tracks".to_owned(),
+                    Err(error) => {
+                        self.status = format!("Could not parse MIDI file: {error}");
+                    }
+                },
+                Err(error) => {
+                    self.status = format!("Could not read {}: {error}", path.display());
+                }
+            }
+        }
+
+        let mut import_request = None;
+        let mut cancel_requested = false;
+        if let Some(pending) = self.pending_midi_cc_import.as_mut() {
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    ui.strong("Import MIDI controller automation");
+                    ui.weak(pending.path.display().to_string());
+                });
+                ui.label(format!(
+                    "Destination: Pattern {} · raw stream channel {} · flags 0x{:02X}",
+                    pending.pattern_id, pending.target_stream.0, pending.target_stream.1
+                ));
+
+                let track_label = pending
+                    .midi
+                    .tracks()
+                    .get(pending.selected_track)
+                    .map(|track| {
+                        track
+                            .name()
+                            .filter(|name| !name.is_empty())
+                            .unwrap_or_else(|| format!("Track {}", pending.selected_track + 1))
+                    })
+                    .unwrap_or_else(|| "No track".to_owned());
+                egui::ComboBox::from_id_salt(("piano-roll-midi-cc-track", pending.pattern_id))
+                    .selected_text(track_label)
+                    .show_ui(ui, |ui| {
+                        for (index, track) in pending.midi.tracks().iter().enumerate() {
+                            let label = track
+                                .name()
+                                .filter(|name| !name.is_empty())
+                                .unwrap_or_else(|| format!("Track {}", index + 1));
+                            ui.selectable_value(&mut pending.selected_track, index, label);
+                        }
+                    });
+
+                let changes = pending
+                    .midi
+                    .tracks()
+                    .get(pending.selected_track)
+                    .map(|track| track.control_changes())
+                    .unwrap_or_default();
+                let controller_numbers = changes
+                    .iter()
+                    .map(|change| change.controller())
+                    .collect::<BTreeSet<_>>();
+                if let Some(first_controller) = controller_numbers.first().copied()
+                    && !controller_numbers.contains(&pending.controller_number)
+                {
+                    pending.controller_number = first_controller;
+                }
+                let selected_controller_text = if controller_numbers.is_empty() {
+                    "No CC events".to_owned()
+                } else {
+                    format!("CC {}", pending.controller_number)
+                };
+                egui::ComboBox::from_id_salt(("piano-roll-midi-cc-number", pending.pattern_id))
+                    .selected_text(selected_controller_text)
+                    .show_ui(ui, |ui| {
+                        for controller_number in &controller_numbers {
+                            ui.selectable_value(
+                                &mut pending.controller_number,
+                                *controller_number,
+                                format!("CC {controller_number}"),
+                            );
+                        }
+                    });
+
+                let channels = changes
+                    .iter()
+                    .filter(|change| change.controller() == pending.controller_number)
+                    .map(|change| change.channel())
+                    .collect::<BTreeSet<_>>();
+                if pending
+                    .midi_channel
+                    .is_some_and(|channel| !channels.contains(&channel))
+                {
+                    pending.midi_channel = None;
+                }
+                let channel_text = pending.midi_channel.map_or_else(
+                    || "All channels".to_owned(),
+                    |channel| format!("MIDI channel {}", channel + 1),
+                );
+                egui::ComboBox::from_id_salt(("piano-roll-midi-cc-channel", pending.pattern_id))
+                    .selected_text(channel_text)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut pending.midi_channel, None, "All channels");
+                        for channel in &channels {
+                            ui.selectable_value(
+                                &mut pending.midi_channel,
+                                Some(*channel),
+                                format!("MIDI channel {}", channel + 1),
+                            );
+                        }
+                    });
+                ui.weak("CC values map from 0–127 to 0.0–1.0. Source timing is preserved.");
+
+                if ui
+                    .add_enabled(
+                        !controller_numbers.is_empty(),
+                        egui::Button::new("Import selected CC"),
+                    )
+                    .clicked()
+                {
+                    import_request = Some((
+                        pending.midi.clone(),
+                        pending.selected_track,
+                        pending.pattern_id,
+                        pending.target_stream,
+                        pending.controller_number,
+                        pending.midi_channel,
+                    ));
+                }
+                cancel_requested = ui.button("Cancel").clicked();
+            });
+        }
+        if cancel_requested {
+            self.pending_midi_cc_import = None;
+        }
+        if let Some((midi, track_index, target_pattern, target_stream, cc, channel)) =
+            import_request
+        {
+            let result = self
+                .document
+                .as_mut()
+                .ok_or_else(|| "no project is open".to_owned())
+                .and_then(|document| {
+                    document
+                        .import_midi_control_changes(
+                            &midi,
+                            track_index,
+                            target_pattern,
+                            target_stream,
+                            cc,
+                            channel,
+                        )
+                        .map_err(|error| error.to_string())
+                });
+            match result {
+                Ok(imported) => {
+                    self.dirty |= imported > 0;
+                    self.status = format!(
+                        "Imported {imported} MIDI CC {cc} events into Pattern {target_pattern}"
+                    );
+                    self.pending_midi_cc_import = None;
+                }
+                Err(error) => {
+                    self.status = format!("Could not import MIDI controller automation: {error}");
                 }
             }
         }

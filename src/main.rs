@@ -2548,6 +2548,23 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_usize(marker_index, "time marker index")?,
             )
         }
+        [command, input, midi_path, output, track, pattern_id, stream_channel, stream_flags, controller_number, midi_channel]
+            if command == "import-midi-cc" =>
+        {
+            import_midi_control_changes(
+                Path::new(input),
+                Path::new(midi_path),
+                Path::new(output),
+                parse_usize(track, "MIDI track index")?,
+                parse_u16(pattern_id, "pattern id")?,
+                (
+                    parse_raw_byte(stream_channel, "raw controller channel")?,
+                    parse_raw_byte(stream_flags, "raw controller flags")?,
+                ),
+                parse_u8(controller_number, "MIDI Control Change number")?,
+                parse_midi_channel_filter(midi_channel)?,
+            )
+        }
         [command, input, midi_path, output, track, pattern_id, channel_id]
             if command == "import-midi" =>
         {
@@ -3192,6 +3209,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild create-playlist-pattern-clip <input.flp> <output.flp> <arrangement-id> <pattern-id> <position-ticks> <length-ticks> <track-index:zero-based>\n",
             "  flp-rebuild create-playlist-audio-clip <input.flp> <output.flp> <arrangement-id> <channel-id> <position-ticks> <length-ticks> <track-index:zero-based>\n",
             "  flp-rebuild import-midi <input.flp> <input.mid> <output.flp> <track> <pattern-id|new> <channel-id> [zero-velocity-note-ons:0|1] [realign-events:0|1] [midi-channels:all|none|1,2,...,16]\n",
+            "  flp-rebuild import-midi-cc <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <raw-channel> <raw-flags> <cc-0..127> <midi-channel-1..16|all>\n",
             "  flp-rebuild import-midi-all <input.flp> <input.mid> <output.flp> <pattern-id|new> <channel-ids-comma-separated> [zero-velocity-note-ons:0|1] [realign-events:0|1] [midi-channels:all|none|1,2,...,16]\n",
             "  flp-rebuild import-midi-named-patterns <input.flp> <input.mid> <output.flp> <channel-id> [zero-velocity-note-ons:0|1] [realign-events:0|1] [midi-channels:all|none|1,2,...,16]\n",
             "  flp-rebuild import-midi-selected <input.flp> <input.mid> <output.flp> <pattern-id|new> <track-numbers:all|1,2,...> <selected-track-channel-ids-comma-separated> [zero-velocity-note-ons:0|1 realign-events:0|1 midi-channels:all|none|1,2,...,16]\n",
@@ -3456,6 +3474,17 @@ fn parse_midi_channel_mask(value: &str) -> Result<u16, String> {
         mask |= 1u16 << u32::from(channel - 1);
     }
     Ok(mask)
+}
+
+fn parse_midi_channel_filter(value: &str) -> Result<Option<u8>, String> {
+    if value == "all" {
+        return Ok(None);
+    }
+    let channel = parse_u8(value, "MIDI channel number")?;
+    if !(1..=16).contains(&channel) {
+        return Err("MIDI channel number must be from 1 through 16, or 'all'".to_owned());
+    }
+    Ok(Some(channel - 1))
 }
 
 fn parse_midi_track_selection(value: &str, track_count: usize) -> Result<Vec<usize>, String> {
@@ -7412,6 +7441,49 @@ fn import_midi_track(
     Ok(())
 }
 
+fn import_midi_control_changes(
+    input: &Path,
+    midi_path: &Path,
+    output: &Path,
+    track_index: usize,
+    pattern_id: u16,
+    target_stream: (u8, u8),
+    controller_number: u8,
+    midi_channel: Option<u8>,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let midi_bytes = fs::read(midi_path)
+        .map_err(|error| format!("could not read {}: {error}", midi_path.display()))?;
+    let midi = MidiFile::parse(&midi_bytes)
+        .map_err(|error| format!("could not parse {}: {error}", midi_path.display()))?;
+    let imported = document
+        .import_midi_control_changes(
+            &midi,
+            track_index,
+            pattern_id,
+            target_stream,
+            controller_number,
+            midi_channel,
+        )
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    let source_channel = midi_channel.map_or_else(
+        || "all channels".to_owned(),
+        |channel| format!("MIDI channel {}", channel + 1),
+    );
+    println!(
+        "imported {imported} MIDI CC {controller_number} events from track {track_index} ({source_channel}) into pattern {pattern_id}, raw stream {} / 0x{:02X} in {}",
+        target_stream.0,
+        target_stream.1,
+        output.display()
+    );
+    Ok(())
+}
+
 fn import_midi_tracks(
     input: &Path,
     midi_path: &Path,
@@ -8736,10 +8808,11 @@ fn delete_time_marker(
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_clip_indices, parse_midi_channel_mask, parse_midi_import_options,
-        parse_midi_import_options_with_channels, parse_midi_import_options_with_mixer_tracks,
-        parse_midi_pattern_target, parse_midi_track_selection, parse_mixer_track, parse_raw_byte,
-        parse_rgb_hex, parse_scale_name,
+        parse_clip_indices, parse_midi_channel_filter, parse_midi_channel_mask,
+        parse_midi_import_options, parse_midi_import_options_with_channels,
+        parse_midi_import_options_with_mixer_tracks, parse_midi_pattern_target,
+        parse_midi_track_selection, parse_mixer_track, parse_raw_byte, parse_rgb_hex,
+        parse_scale_name,
     };
     use flp_rebuild::midi::MidiImportOptions;
 
@@ -8791,6 +8864,16 @@ mod tests {
         assert!(parse_midi_channel_mask("0").is_err());
         assert!(parse_midi_channel_mask("17").is_err());
         assert!(parse_midi_channel_mask("2,,3").is_err());
+    }
+
+    #[test]
+    fn parses_a_single_midi_channel_filter_or_all() {
+        assert_eq!(parse_midi_channel_filter("all"), Ok(None));
+        assert_eq!(parse_midi_channel_filter("1"), Ok(Some(0)));
+        assert_eq!(parse_midi_channel_filter("16"), Ok(Some(15)));
+        assert!(parse_midi_channel_filter("0").is_err());
+        assert!(parse_midi_channel_filter("17").is_err());
+        assert!(parse_midi_channel_filter("1,2").is_err());
     }
 
     #[test]

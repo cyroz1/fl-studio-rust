@@ -46,6 +46,37 @@ pub struct MidiNote {
     release_velocity: Option<u8>,
 }
 
+/// One MIDI Control Change message with its source channel, controller number, value, and tick.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MidiControlChange {
+    channel: u8,
+    controller: u8,
+    value: u8,
+    tick: u64,
+}
+
+impl MidiControlChange {
+    /// Zero-based MIDI channel in the range 0–15.
+    pub fn channel(self) -> u8 {
+        self.channel
+    }
+
+    /// Standard MIDI Control Change number in the range 0–127.
+    pub fn controller(self) -> u8 {
+        self.controller
+    }
+
+    /// Standard MIDI Control Change value in the range 0–127.
+    pub fn value(self) -> u8 {
+        self.value
+    }
+
+    /// Absolute position in the source track's MIDI ticks.
+    pub fn tick(self) -> u64 {
+        self.tick
+    }
+}
+
 /// Options for interpreting MIDI notes and aligning imported events.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MidiImportOptions {
@@ -1242,6 +1273,27 @@ impl MidiTrack {
             }
         }
         (note_on, note_off)
+    }
+
+    /// Returns valid MIDI Control Change messages in file order.
+    pub fn control_changes(&self) -> Vec<MidiControlChange> {
+        self.events
+            .iter()
+            .filter_map(|event| {
+                let MidiEventKind::ChannelVoice { status, data } = &event.kind else {
+                    return None;
+                };
+                if status & 0xF0 != 0xB0 || data.len() < 2 || data[0] > 127 || data[1] > 127 {
+                    return None;
+                }
+                Some(MidiControlChange {
+                    channel: status & 0x0F,
+                    controller: data[0],
+                    value: data[1],
+                    tick: event.absolute_tick,
+                })
+            })
+            .collect()
     }
 
     /// Pairs note-on and note-off messages in channel/key order. Notes without an
