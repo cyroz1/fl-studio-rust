@@ -3375,6 +3375,7 @@ struct PendingMidiImport {
     track_channel_ids: Vec<u16>,
     zero_velocity_note_ons_as_notes: bool,
     realign_events: bool,
+    midi_channel_mask: u16,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -11866,6 +11867,7 @@ impl DawUi {
                             track_channel_ids,
                             zero_velocity_note_ons_as_notes: false,
                             realign_events: false,
+                            midi_channel_mask: u16::MAX,
                         });
                         self.view = MainView::PianoRoll;
                         self.status = format!("Loaded MIDI file {}", path.display());
@@ -28081,6 +28083,7 @@ impl DawUi {
                             track_channel_ids,
                             zero_velocity_note_ons_as_notes: false,
                             realign_events: false,
+                            midi_channel_mask: u16::MAX,
                         });
                         self.status = format!("Loaded MIDI file {}", path.display());
                     }
@@ -28144,7 +28147,9 @@ impl DawUi {
                         });
                     if ui
                         .add_enabled(
-                            self.selected_pattern.is_some() && self.selected_note_channel.is_some(),
+                            self.selected_pattern.is_some()
+                                && self.selected_note_channel.is_some()
+                                && pending.midi_channel_mask != 0,
                             egui::Button::new("Import track"),
                         )
                         .clicked()
@@ -28160,6 +28165,7 @@ impl DawUi {
                                 zero_velocity_note_ons_as_notes:
                                     pending.zero_velocity_note_ons_as_notes,
                                 realign_events: pending.realign_events,
+                                midi_channel_mask: pending.midi_channel_mask,
                             },
                         ));
                     }
@@ -28174,6 +28180,7 @@ impl DawUi {
                     if ui
                         .add_enabled(
                             self.selected_pattern.is_some()
+                                && pending.midi_channel_mask != 0
                                 && mapping_is_valid
                                 && pending.midi.format() != 2,
                             egui::Button::new("Import all tracks"),
@@ -28189,12 +28196,14 @@ impl DawUi {
                                 zero_velocity_note_ons_as_notes:
                                     pending.zero_velocity_note_ons_as_notes,
                                 realign_events: pending.realign_events,
+                                midi_channel_mask: pending.midi_channel_mask,
                             },
                         ));
                     }
                     if ui
                         .add_enabled(
                             self.selected_pattern.is_some()
+                                && pending.midi_channel_mask != 0
                                 && selected_sampler_template.is_some()
                                 && pending.midi.format() != 2,
                             egui::Button::new("Create Sampler channels"),
@@ -28214,6 +28223,7 @@ impl DawUi {
                                 zero_velocity_note_ons_as_notes:
                                     pending.zero_velocity_note_ons_as_notes,
                                 realign_events: pending.realign_events,
+                                midi_channel_mask: pending.midi_channel_mask,
                             },
                         ));
                     }
@@ -28222,6 +28232,7 @@ impl DawUi {
                     && ui
                         .add_enabled(
                             self.selected_pattern.is_some()
+                                && pending.midi_channel_mask != 0
                                 && selected_sampler_template.is_some(),
                             egui::Button::new("Create separate patterns + Samplers"),
                         )
@@ -28238,6 +28249,7 @@ impl DawUi {
                             zero_velocity_note_ons_as_notes:
                                 pending.zero_velocity_note_ons_as_notes,
                             realign_events: pending.realign_events,
+                            midi_channel_mask: pending.midi_channel_mask,
                         },
                     ));
                 }
@@ -28254,6 +28266,26 @@ impl DawUi {
                 .on_hover_text(
                     "Remove leading empty time before the first imported note. Note and time-signature positions shift together, and tracks keep their relative timing.",
                 );
+            ui.collapsing("MIDI channels", |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("All").clicked() {
+                        pending.midi_channel_mask = u16::MAX;
+                    }
+                    if ui.button("None").clicked() {
+                        pending.midi_channel_mask = 0;
+                    }
+                    for channel in 0..16u32 {
+                        let bit = 1u16 << channel;
+                        let selected = pending.midi_channel_mask & bit != 0;
+                        if ui
+                            .selectable_label(selected, (channel + 1).to_string())
+                            .clicked()
+                        {
+                            pending.midi_channel_mask ^= bit;
+                        }
+                    }
+                });
+            });
             if pending.import_all_tracks {
                 ui.vertical(|ui| {
                     ui.small("Choose a destination Channel Rack channel for each MIDI track.");

@@ -26907,6 +26907,47 @@ mod tests {
     }
 
     #[test]
+    fn midi_import_channel_filter_also_controls_realign_origin() {
+        let project_bytes = pattern_fixture(&[], &[]);
+        let midi = MidiFile::parse(&midi_fixture(
+            &[
+                0x00, 0x90, 0x3C, 0x64, // Channel 1 starts at tick 0.
+                0x83, 0x60, 0x91, 0x43, 0x64, // Channel 2 starts at tick 480.
+                0x81, 0x70, 0x81, 0x43, 0x00, // Channel 2 note off at tick 720.
+                0x81, 0x70, 0x80, 0x3C, 0x00, // Channel 1 note off at tick 960.
+                0x00, 0xFF, 0x2F, 0x00,
+            ],
+            480,
+        ))
+        .expect("MIDI fixture should parse");
+        let mut document = FlpDocument::parse(&project_bytes).expect("project should parse");
+
+        assert_eq!(
+            document
+                .import_midi_track_with_options(
+                    &midi,
+                    0,
+                    7,
+                    0,
+                    MidiImportOptions {
+                        realign_events: true,
+                        midi_channel_mask: 1u16 << 1,
+                        ..MidiImportOptions::default()
+                    },
+                )
+                .expect("filtered MIDI import should succeed"),
+            1
+        );
+        let notes = &document.patterns().unwrap()[0].notes;
+        assert_eq!(notes.len(), 1);
+        assert_eq!(
+            (notes[0].position, notes[0].length, notes[0].key),
+            (0, 48, 67)
+        );
+        assert_eq!(notes[0].midi_channel, 1);
+    }
+
+    #[test]
     fn imports_all_midi_tracks_to_their_mapped_channels_atomically() {
         let midi = MidiFile::parse(&midi_tracks_fixture(
             &[

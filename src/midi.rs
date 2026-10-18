@@ -47,7 +47,7 @@ pub struct MidiNote {
 }
 
 /// Options for interpreting MIDI notes and aligning imported events.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MidiImportOptions {
     /// Treat MIDI Note On events with velocity zero as notes. By default, MIDI
     /// defines these events as Note Off messages.
@@ -55,6 +55,19 @@ pub struct MidiImportOptions {
     /// Remove leading empty time before the first imported note. Batch imports
     /// share one start across tracks; independent Format-2 sequences align separately.
     pub realign_events: bool,
+    /// Include these MIDI channels, with bit 0 representing MIDI channel 1.
+    /// The default mask includes all 16 channels.
+    pub midi_channel_mask: u16,
+}
+
+impl Default for MidiImportOptions {
+    fn default() -> Self {
+        Self {
+            zero_velocity_note_ons_as_notes: false,
+            realign_events: false,
+            midi_channel_mask: u16::MAX,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1236,7 +1249,7 @@ impl MidiTrack {
         self.notes_with_options(MidiImportOptions::default())
     }
 
-    /// Pairs note events using the supplied zero-velocity Note On option.
+    /// Pairs note events using the supplied velocity-zero and channel-selection options.
     /// `realign_events` is applied by document import methods because aligning
     /// several tracks requires a shared project-time origin.
     pub fn notes_with_options(&self, options: MidiImportOptions) -> Vec<MidiNote> {
@@ -1253,6 +1266,9 @@ impl MidiTrack {
             }
 
             let channel = status & 0x0F;
+            if options.midi_channel_mask & (1u16 << u32::from(channel)) == 0 {
+                continue;
+            }
             let key = data[0];
             match status & 0xF0 {
                 0xB0 => {
@@ -2135,6 +2151,30 @@ mod tests {
         assert_eq!(notes[0].start_tick(), 0);
         assert_eq!(notes[0].end_tick(), Some(96));
         assert_eq!(notes[0].release_velocity(), Some(33));
+    }
+
+    #[test]
+    fn midi_import_channel_mask_filters_note_channels() {
+        let input = midi_fixture(&[
+            0x00, 0x90, 0x3C, 0x64, // Channel 1, C4.
+            0x00, 0x91, 0x43, 0x50, // Channel 2, G4.
+            0x60, 0x80, 0x3C, 0x00, // Channel 1 note off at tick 96.
+            0x00, 0x81, 0x43, 0x00, // Channel 2 note off at tick 96.
+            0x00, 0xFF, 0x2F, 0x00,
+        ]);
+        let midi = MidiFile::parse(&input).expect("fixture should parse");
+        let track = &midi.tracks()[0];
+
+        assert_eq!(track.notes().len(), 2);
+
+        let notes = track.notes_with_options(MidiImportOptions {
+            midi_channel_mask: 1u16 << 1,
+            ..MidiImportOptions::default()
+        });
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].channel(), 1);
+        assert_eq!(notes[0].key(), 67);
+        assert_eq!(notes[0].end_tick(), Some(96));
     }
 
     #[test]
