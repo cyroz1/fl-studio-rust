@@ -139,7 +139,7 @@ flp-rebuild add-notes <input.flp> <output.flp> <pattern-id> <channel-id> <notes:
 flp-rebuild delete-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index>
 flp-rebuild delete-notes <input.flp> <output.flp> <pattern-id> <channel-id>
 flp-rebuild delete-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based>
-flp-rebuild import-midi <input.flp> <input.mid> <output.flp> <track> <pattern-id> <channel-id>
+flp-rebuild import-midi <input.flp> <input.mid> <output.flp> <track> <pattern-id|new> <channel-id>
 flp-rebuild create-playlist-pattern-clip <input.flp> <output.flp> <arrangement-id> <pattern-id> <position-ticks> <length-ticks> <track-index:zero-based>
 flp-rebuild create-playlist-audio-clip <input.flp> <output.flp> <arrangement-id> <channel-id> <position-ticks> <length-ticks> <track-index:zero-based>
 flp-rebuild edit-clip <input.flp> <output.flp> <arrangement-id> <clip-index> <position> <length>
@@ -154,6 +154,10 @@ flp-rebuild delete-time-marker <input.flp> <output.flp> <arrangement-id> <marker
 ```
 
 `add-notes` appends multiple notes to one channel in a pattern using comma-separated `position:length:key:velocity` tuples; each record gets the same neutral defaults as `add-note`. `delete-notes` removes every note from one pattern channel while preserving other channels. `delete-notes-selected` removes only the comma-separated zero-based channel-local indexes; `delete-note` remains available for one index.
+
+For MIDI import commands, use `new` as the Pattern target to create a Pattern in the current
+project. The project must contain an existing Pattern marker and a uniquely recognized
+Pattern note-event encoding; this does not create a separate FLP project.
 
 For source builds, run `python scripts/build_desktop_binaries.py --profile release` (or use `--profile debug` for a debug build) before launching the desktop shell. This builds the `vst3-host-helper` beside the app; VST3 loading, state calls, and audio processing run in that child process so plug-in crashes are reported to the app. Native VST3 editor windows across the process boundary are supported on macOS; editor hosting on Windows and Linux remains incomplete.
 
