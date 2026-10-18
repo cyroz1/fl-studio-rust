@@ -28164,15 +28164,10 @@ mod tests {
         let input = pattern_fixture(&[], &controller_event);
         let document = FlpDocument::parse(&input).expect("project fixture should parse");
 
-        let bytes = midi::MidiFile::encode_project_pattern_controller_stream(
-            &document,
-            7,
-            (3, 0x91),
-            74,
-            2,
-        )
-        .expect("the selected raw stream should export as MIDI CC");
-        let midi = midi::MidiFile::parse(&bytes).expect("exported MIDI should parse");
+        let bytes =
+            MidiFile::encode_project_pattern_controller_stream(&document, 7, (3, 0x91), 74, 2)
+                .expect("the selected raw stream should export as MIDI CC");
+        let midi = MidiFile::parse(&bytes).expect("exported MIDI should parse");
         assert_eq!(midi.tracks().len(), 2);
         let control_changes = midi.tracks()[1].control_changes();
         assert_eq!(
@@ -28194,7 +28189,7 @@ mod tests {
         let input = pattern_fixture(&[], &[]);
         let empty_document = FlpDocument::parse(&input).expect("project fixture should parse");
         assert!(
-            midi::MidiFile::encode_project_pattern_controller_stream(
+            MidiFile::encode_project_pattern_controller_stream(
                 &empty_document,
                 7,
                 (3, 0x91),
@@ -28210,34 +28205,16 @@ mod tests {
         let input = pattern_fixture(&[], &controller_event);
         let document = FlpDocument::parse(&input).expect("project fixture should parse");
         assert!(
-            midi::MidiFile::encode_project_pattern_controller_stream(
-                &document,
-                7,
-                (3, 0x91),
-                74,
-                0,
-            )
-            .is_err()
+            MidiFile::encode_project_pattern_controller_stream(&document, 7, (3, 0x91), 74, 0,)
+                .is_err()
         );
         assert!(
-            midi::MidiFile::encode_project_pattern_controller_stream(
-                &document,
-                7,
-                (3, 0x91),
-                128,
-                0,
-            )
-            .is_err()
+            MidiFile::encode_project_pattern_controller_stream(&document, 7, (3, 0x91), 128, 0,)
+                .is_err()
         );
         assert!(
-            midi::MidiFile::encode_project_pattern_controller_stream(
-                &document,
-                7,
-                (3, 0x91),
-                74,
-                16,
-            )
-            .is_err()
+            MidiFile::encode_project_pattern_controller_stream(&document, 7, (3, 0x91), 74, 16,)
+                .is_err()
         );
     }
 
