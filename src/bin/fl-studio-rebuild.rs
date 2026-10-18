@@ -4124,6 +4124,10 @@ struct DawUi {
     midi_live_layer_note_mapping: BTreeMap<(u8, u8), VecDeque<u8>>,
     midi_live_sampler_sustain_channels: BTreeSet<u8>,
     midi_output_gain_mapping: Option<MidiControlChangeMapping>,
+    midi_mixer_fader_mapping: Option<MidiMixerFaderMapping>,
+    midi_mixer_fader_learning: Option<usize>,
+    midi_mixer_fader_undo_snapshot: Option<Vec<u8>>,
+    midi_mixer_fader_undo_last_update: Option<Instant>,
     midi_controller_templates: Vec<MidiControllerTemplate>,
     midi_controller_template_index: Option<usize>,
     midi_controller_template_name: String,
@@ -4495,6 +4499,14 @@ struct MidiControlChangeMapping {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct MidiMixerFaderMapping {
+    input_device_id: String,
+    channel: u8,
+    controller: u8,
+    insert_ordinal: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct MidiControllerCcBinding {
     channel: u8,
     controller: u8,
@@ -4518,6 +4530,10 @@ fn midi_button_press_edge(value: u8, active: &mut bool) -> bool {
         *active = true;
         true
     }
+}
+
+fn midi_cc_to_mixer_fader_raw(value: u8) -> i32 {
+    i32::from(value.min(127)) * 16_000 / 127
 }
 
 impl ActiveMidiRecording {
@@ -4689,6 +4705,7 @@ impl DawUi {
             audio_settings.sample_rate = rate;
         }
         let midi_output_gain_mapping = load_midi_output_gain_mapping();
+        let midi_mixer_fader_mapping = load_midi_mixer_fader_mapping();
         let midi_play_pause_mapping = load_midi_play_pause_mapping();
         let midi_controller_templates = load_midi_controller_templates();
         let live_resampling_quality = load_live_resampling_quality();
@@ -5018,6 +5035,10 @@ impl DawUi {
             midi_live_layer_note_mapping: BTreeMap::new(),
             midi_live_sampler_sustain_channels: BTreeSet::new(),
             midi_output_gain_mapping,
+            midi_mixer_fader_mapping,
+            midi_mixer_fader_learning: None,
+            midi_mixer_fader_undo_snapshot: None,
+            midi_mixer_fader_undo_last_update: None,
             midi_controller_templates,
             midi_controller_template_index: None,
             midi_controller_template_name: String::new(),
@@ -5921,6 +5942,7 @@ impl DawUi {
     }
 
     fn open_project(&mut self, path: &Path) {
+        self.finish_midi_mixer_fader_undo_session();
         if self.audio_recording.is_some() {
             self.stop_audio_recording();
             self.status =
@@ -8016,6 +8038,7 @@ impl DawUi {
     }
 
     fn undo_document(&mut self) {
+        self.finish_midi_mixer_fader_undo_session();
         self.history_navigation_during_frame = true;
         let Some(snapshot) = self.undo_history.pop() else {
             self.status = "Nothing to undo".to_owned();
@@ -8049,6 +8072,7 @@ impl DawUi {
     }
 
     fn redo_document(&mut self) {
+        self.finish_midi_mixer_fader_undo_session();
         self.history_navigation_during_frame = true;
         let Some(snapshot) = self.redo_history.pop() else {
             self.status = "Nothing to redo".to_owned();
@@ -35219,6 +35243,96 @@ impl DawUi {
                                                         ui.small("LEVEL / PAN · NOT MAPPED")
                                                             .on_hover_text("No unique supported zero-scope volume and pan pair was found for this insert.");
                                                     }
+                                                    if track_controls.is_some() {
+                                                        ui.add_space(4.0);
+                                                        if self.midi_mixer_fader_learning
+                                                            == Some(insert.ordinal())
+                                                        {
+                                                            ui.small(
+                                                                egui::RichText::new(
+                                                                    "Move a MIDI CC control…",
+                                                                )
+                                                                .color(ORANGE),
+                                                            );
+                                                            if ui
+                                                                .small_button("Cancel learn")
+                                                                .clicked()
+                                                            {
+                                                                self.midi_mixer_fader_learning =
+                                                                    None;
+                                                            }
+                                                        } else if ui
+                                                            .add_enabled(
+                                                                self.midi_input_connection.is_some(),
+                                                                egui::Button::new("Learn MIDI CC"),
+                                                            )
+                                                            .on_hover_text(
+                                                                "Connect a MIDI input, then move one CC control to map this Mixer fader",
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            self.midi_output_gain_learning = false;
+                                                            self.midi_play_pause_learning = false;
+                                                            self.midi_mixer_fader_learning =
+                                                                Some(insert.ordinal());
+                                                            let track_name =
+                                                                if insert.ordinal() == 0 {
+                                                                    "Master".to_owned()
+                                                                } else {
+                                                                    format!(
+                                                                        "Insert {}",
+                                                                        insert.ordinal()
+                                                                    )
+                                                                };
+                                                            self.status = format!(
+                                                                "Move a MIDI CC control to map the {track_name} fader"
+                                                            );
+                                                        }
+                                                        if let Some(mapping) = self
+                                                            .midi_mixer_fader_mapping
+                                                            .as_ref()
+                                                            .filter(|mapping| {
+                                                                mapping.insert_ordinal
+                                                                    == insert.ordinal()
+                                                            })
+                                                        {
+                                                            let input_name = self
+                                                                .midi_input_devices
+                                                                .iter()
+                                                                .find(|device| {
+                                                                    device.id
+                                                                        == mapping.input_device_id
+                                                                })
+                                                                .map(|device| device.name.as_str())
+                                                                .unwrap_or(
+                                                                    mapping.input_device_id.as_str(),
+                                                                );
+                                                            ui.small(format!(
+                                                                "CC {} · Ch {}",
+                                                                mapping.controller,
+                                                                mapping.channel + 1
+                                                            ))
+                                                            .on_hover_text(format!(
+                                                                "Mapped from {input_name}"
+                                                            ));
+                                                            if ui.small_button("Clear CC").clicked() {
+                                                                self.midi_mixer_fader_mapping = None;
+                                                                self.midi_mixer_fader_learning =
+                                                                    None;
+                                                                if let Err(error) =
+                                                                    save_midi_mixer_fader_mapping(
+                                                                        None,
+                                                                    )
+                                                                {
+                                                                    self.status = format!(
+                                                                        "Could not clear MIDI Mixer fader mapping: {error}"
+                                                                    );
+                                                                } else {
+                                                                    self.status = "Cleared MIDI Mixer fader mapping".to_owned();
+                                                                }
+                                                            }
+                                                        }
+                                                    }
                                                     if let Some(record) = stereo_separation_record {
                                                         ui.add_space(5.0);
                                                         ui.small("STEREO · RAW");
@@ -35910,6 +36024,7 @@ impl DawUi {
                     self.stop_live_sampler_input_for_device_change();
                     self.stop_midi_input_thru();
                     self.midi_output_gain_learning = false;
+                    self.midi_mixer_fader_learning = None;
                     self.midi_play_pause_learning = false;
                     self.midi_play_pause_cc_active = false;
                     self.finish_active_midi_recording();
@@ -35965,6 +36080,7 @@ impl DawUi {
             return;
         };
         self.midi_output_gain_learning = false;
+        self.midi_mixer_fader_learning = None;
         self.midi_play_pause_learning = false;
         self.midi_play_pause_cc_active = false;
         self.release_all_midi_performance_clips();
@@ -36000,6 +36116,7 @@ impl DawUi {
         self.stop_live_sampler_input_for_device_change();
         self.stop_midi_input_thru();
         self.midi_output_gain_learning = false;
+        self.midi_mixer_fader_learning = None;
         self.midi_play_pause_learning = false;
         self.midi_play_pause_cc_active = false;
         let Some(connection) = self.midi_input_connection.take() else {
@@ -37073,6 +37190,110 @@ impl DawUi {
         self.status = format!("MIDI output gain · {gain:.2}×");
     }
 
+    fn apply_midi_mixer_fader_value(
+        &mut self,
+        insert_ordinal: usize,
+        value: u8,
+        history_snapshot_available: bool,
+    ) -> Result<bool, String> {
+        let raw_value = midi_cc_to_mixer_fader_raw(value);
+        let (event_index, record_index, old_value) = {
+            let document = self
+                .document
+                .as_ref()
+                .ok_or_else(|| "Open a project before mapping a Mixer fader".to_owned())?;
+            let parameters = document
+                .mixer_parameter_records()
+                .map_err(|error| format!("Could not inspect Mixer fader records: {error}"))?;
+            let record = unique_candidate_mixer_parameter(
+                &parameters,
+                insert_ordinal,
+                MixerParameterKind::Volume,
+            )
+            .filter(|record| (0..=16_000).contains(&record.value()))
+            .ok_or_else(|| {
+                format!(
+                    "The selected Mixer track {} has no unique supported fader record",
+                    if insert_ordinal == 0 {
+                        "Master".to_owned()
+                    } else {
+                        format!("Insert {insert_ordinal}")
+                    }
+                )
+            })?;
+            (record.event_index(), record.record_index(), record.value())
+        };
+        if raw_value == old_value {
+            return Ok(false);
+        }
+
+        let undo_snapshot =
+            if self.midi_mixer_fader_undo_snapshot.is_none() && !history_snapshot_available {
+                let snapshot = self
+                    .encode_history_snapshot()?
+                    .ok_or_else(|| "No open project is available for undo".to_owned())?;
+                if snapshot.len() > HISTORY_LIMIT_BYTES {
+                    return Err("Undo snapshot exceeds the 64 MiB history limit".to_owned());
+                }
+                Some(snapshot)
+            } else {
+                None
+            };
+
+        let document = self
+            .document
+            .as_mut()
+            .ok_or_else(|| "The project was closed while applying the Mixer fader".to_owned())?;
+        document
+            .set_mixer_parameter_record_value(event_index, record_index, raw_value)
+            .map_err(|error| format!("Could not update the Mixer fader: {error}"))?;
+        if let Some(snapshot) = undo_snapshot {
+            self.midi_mixer_fader_undo_snapshot = Some(snapshot);
+        }
+        self.midi_mixer_fader_undo_last_update = Some(Instant::now());
+        if insert_ordinal == 0 {
+            self.mixer_track_peak_meters
+                .set_live_master_fader_gain(raw_value as f32 / 10_000.0);
+        } else {
+            self.mixer_track_peak_meters
+                .set_live_mixer_insert_fader_raw(insert_ordinal, Some(raw_value));
+        }
+        self.dirty = true;
+        self.status = format!(
+            "MIDI Mixer fader · {} · raw {raw_value}",
+            if insert_ordinal == 0 {
+                "Master".to_owned()
+            } else {
+                format!("Insert {insert_ordinal}")
+            }
+        );
+        Ok(true)
+    }
+
+    fn finish_midi_mixer_fader_undo_session(&mut self) {
+        let Some(snapshot) = self.midi_mixer_fader_undo_snapshot.take() else {
+            self.midi_mixer_fader_undo_last_update = None;
+            return;
+        };
+        self.midi_mixer_fader_undo_last_update = None;
+        match self.encode_history_snapshot() {
+            Ok(Some(current)) if current != snapshot => self.remember_undo_snapshot(snapshot),
+            Ok(Some(_)) | Ok(None) => {}
+            Err(error) => {
+                self.status = format!("Could not finish MIDI Mixer fader undo step: {error}");
+            }
+        }
+    }
+
+    fn finish_idle_midi_mixer_fader_undo_session(&mut self) {
+        if self
+            .midi_mixer_fader_undo_last_update
+            .is_some_and(|last_update| last_update.elapsed() >= Duration::from_millis(300))
+        {
+            self.finish_midi_mixer_fader_undo_session();
+        }
+    }
+
     fn save_current_midi_controller_template(&mut self) {
         let name = self.midi_controller_template_name.trim().to_owned();
         if name.is_empty() || name.chars().count() > 64 {
@@ -37154,6 +37375,7 @@ impl DawUi {
         self.midi_output_gain_mapping = output_gain;
         self.midi_play_pause_mapping = play_pause;
         self.midi_output_gain_learning = false;
+        self.midi_mixer_fader_learning = None;
         self.midi_play_pause_learning = false;
         self.midi_play_pause_cc_active = false;
         self.midi_controller_template_index = Some(index);
@@ -37206,6 +37428,57 @@ impl DawUi {
         else {
             return;
         };
+
+        if let Some(insert_ordinal) = self.midi_mixer_fader_learning {
+            let Some(connection) = self.midi_input_connection.as_ref() else {
+                self.midi_mixer_fader_learning = None;
+                self.status = "Connect a MIDI input before learning a Mixer fader".to_owned();
+                return;
+            };
+            let mapping = MidiMixerFaderMapping {
+                input_device_id: connection.device_id.clone(),
+                channel,
+                controller,
+                insert_ordinal,
+            };
+            match self.apply_midi_mixer_fader_value(
+                insert_ordinal,
+                value,
+                history_snapshot_available,
+            ) {
+                Ok(_) => {
+                    self.midi_mixer_fader_mapping = Some(mapping);
+                    self.midi_mixer_fader_learning = None;
+                    self.status = save_midi_mixer_fader_mapping(
+                        self.midi_mixer_fader_mapping.as_ref(),
+                    )
+                    .err()
+                    .map_or_else(
+                        || {
+                            format!(
+                                "Learned MIDI CC {controller} · channel {} for {} fader",
+                                channel + 1,
+                                if insert_ordinal == 0 {
+                                    "Master".to_owned()
+                                } else {
+                                    format!("Insert {insert_ordinal}")
+                                }
+                            )
+                        },
+                        |error| {
+                            format!(
+                                "Using learned Mixer fader CC for this session; could not save it: {error}"
+                            )
+                        },
+                    );
+                }
+                Err(error) => {
+                    self.midi_mixer_fader_learning = None;
+                    self.status = format!("Could not learn the Mixer fader: {error}");
+                }
+            }
+            return;
+        }
 
         if self.midi_output_gain_learning {
             let Some(connection) = self.midi_input_connection.as_ref() else {
@@ -37274,6 +37547,22 @@ impl DawUi {
         if output_gain_matches {
             self.apply_midi_output_gain(value);
             self.status = format!("MIDI output gain · {:.2}×", self.audio_settings.output_gain);
+        }
+        let mixer_fader_insert = self
+            .midi_mixer_fader_mapping
+            .as_ref()
+            .zip(self.midi_input_connection.as_ref())
+            .and_then(|(mapping, connection)| {
+                (connection.device_id == mapping.input_device_id
+                    && mapping.channel == channel
+                    && mapping.controller == controller)
+                    .then_some(mapping.insert_ordinal)
+            });
+        if let Some(insert_ordinal) = mixer_fader_insert
+            && let Err(error) =
+                self.apply_midi_mixer_fader_value(insert_ordinal, value, history_snapshot_available)
+        {
+            self.status = format!("Could not apply MIDI Mixer fader: {error}");
         }
         let play_pause_matches = self
             .midi_play_pause_mapping
@@ -40207,6 +40496,7 @@ impl DawUi {
                 .on_hover_text("Connect a MIDI input, then move one CC control to map it")
                 .clicked()
             {
+                self.midi_mixer_fader_learning = None;
                 self.midi_play_pause_learning = false;
                 self.midi_play_pause_cc_active = false;
                 self.midi_output_gain_learning = true;
@@ -40258,6 +40548,7 @@ impl DawUi {
                 .clicked()
             {
                 self.midi_output_gain_learning = false;
+                self.midi_mixer_fader_learning = None;
                 self.midi_play_pause_learning = true;
                 self.midi_play_pause_cc_active = false;
                 self.status = "Press a MIDI CC button to map Play/Pause".to_owned();
@@ -41446,6 +41737,9 @@ impl eframe::App for DawUi {
                     )
                 })
         });
+        if edit_input_received {
+            self.finish_midi_mixer_fader_undo_session();
+        }
         let mut frame_snapshot = if !history_navigation
             && self.pending_history_snapshot.is_none()
             && edit_input_received
@@ -41463,6 +41757,7 @@ impl eframe::App for DawUi {
         self.history_snapshot_available_this_frame =
             frame_snapshot.is_some() || self.pending_history_snapshot.is_some();
         self.poll_midi_input(self.history_snapshot_available_this_frame);
+        self.finish_idle_midi_mixer_fader_undo_session();
         self.poll_live_layer_input();
         self.poll_live_sampler_input();
         self.poll_live_vst3_input();
@@ -43678,6 +43973,10 @@ fn midi_output_gain_mapping_file() -> Option<PathBuf> {
     midi_control_change_mapping_file("midi-output-gain-mapping.txt")
 }
 
+fn midi_mixer_fader_mapping_file() -> Option<PathBuf> {
+    midi_control_change_mapping_file("midi-mixer-fader-mapping.txt")
+}
+
 fn midi_play_pause_mapping_file() -> Option<PathBuf> {
     midi_control_change_mapping_file("midi-play-pause-mapping.txt")
 }
@@ -43695,6 +43994,11 @@ fn midi_control_change_mapping_file(filename: &str) -> Option<PathBuf> {
 fn load_midi_output_gain_mapping() -> Option<MidiControlChangeMapping> {
     let contents = fs::read_to_string(midi_output_gain_mapping_file()?).ok()?;
     parse_midi_control_change_mapping(&contents)
+}
+
+fn load_midi_mixer_fader_mapping() -> Option<MidiMixerFaderMapping> {
+    let contents = fs::read_to_string(midi_mixer_fader_mapping_file()?).ok()?;
+    parse_midi_mixer_fader_mapping(&contents)
 }
 
 fn load_midi_play_pause_mapping() -> Option<MidiControlChangeMapping> {
@@ -43815,6 +44119,18 @@ fn save_midi_output_gain_mapping(mapping: Option<&MidiControlChangeMapping>) -> 
     save_midi_control_change_mapping(midi_output_gain_mapping_file(), mapping)
 }
 
+fn save_midi_mixer_fader_mapping(mapping: Option<&MidiMixerFaderMapping>) -> Result<(), String> {
+    let path = midi_mixer_fader_mapping_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the MIDI Mixer fader mapping path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(&path, serialize_midi_mixer_fader_mapping(mapping))
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
 fn save_midi_play_pause_mapping(mapping: Option<&MidiControlChangeMapping>) -> Result<(), String> {
     save_midi_control_change_mapping(midi_play_pause_mapping_file(), mapping)
 }
@@ -43877,6 +44193,51 @@ fn parse_midi_control_change_mapping(contents: &str) -> Option<MidiControlChange
         channel,
         controller,
     })
+}
+
+fn parse_midi_mixer_fader_mapping(contents: &str) -> Option<MidiMixerFaderMapping> {
+    let mut input_device_id = None;
+    let mut channel = None;
+    let mut controller = None;
+    let mut insert_ordinal = None;
+    for line in contents.lines() {
+        if let Some(input) = line.strip_prefix("input=") {
+            input_device_id = decode_midi_device_id(input);
+        } else if let Some(value) = line.strip_prefix("channel=") {
+            channel = value.parse::<u8>().ok();
+        } else if let Some(value) = line.strip_prefix("controller=") {
+            controller = value.parse::<u8>().ok();
+        } else if let Some(value) = line.strip_prefix("insert=") {
+            insert_ordinal = value.parse::<usize>().ok();
+        }
+    }
+    let input_device_id = input_device_id?;
+    let channel = channel?;
+    let controller = controller?;
+    let insert_ordinal = insert_ordinal?;
+    (channel < 16 && controller < 128 && insert_ordinal < MIXER_TRACK_METER_COUNT).then_some(
+        MidiMixerFaderMapping {
+            input_device_id,
+            channel,
+            controller,
+            insert_ordinal,
+        },
+    )
+}
+
+fn serialize_midi_mixer_fader_mapping(mapping: Option<&MidiMixerFaderMapping>) -> String {
+    mapping.map_or_else(
+        || "input=\nchannel=\ncontroller=\ninsert=\n".to_owned(),
+        |mapping| {
+            format!(
+                "input={}\nchannel={}\ncontroller={}\ninsert={}\n",
+                encode_midi_device_id(&mapping.input_device_id),
+                mapping.channel,
+                mapping.controller,
+                mapping.insert_ordinal
+            )
+        },
+    )
 }
 
 fn serialize_midi_controller_templates(templates: &[MidiControllerTemplate]) -> String {
@@ -48822,21 +49183,22 @@ mod tests {
         ActivePlaylistClipDrag, Arrangement, ChannelDisplayFilter, DetachedWindowKind,
         DetachedWindowPlacement, DetachedWindowPlacements, DetectedPianoRollScale, FlpDocument,
         MainView, MidiControlChangeMapping, MidiControllerCcBinding, MidiControllerTemplate,
-        MidiDeviceSelections, MidiInputDevice, MidiInputEvent, MidiOutputDevice,
-        PIANO_ROLL_RULER_HEIGHT, Pattern, PatternController, PatternNote, PianoRollChordStamp,
-        PianoRollGrid, PianoRollScale, PianoRollSnap, PlaylistClip, PlaylistClipDragKind,
-        PlaylistTempoMap, PlaylistTrack, PluginCandidate, PluginFormat, TimeSelectionShift,
-        TouchGesture, TouchTapTracker, TouchZoomConfig, WINDOW_LAYOUT_PRESETS_HEADER,
-        WindowLayoutPreset, audio_recording_start_tick_with_offset,
+        MidiDeviceSelections, MidiInputDevice, MidiInputEvent, MidiMixerFaderMapping,
+        MidiOutputDevice, PIANO_ROLL_RULER_HEIGHT, Pattern, PatternController, PatternNote,
+        PianoRollChordStamp, PianoRollGrid, PianoRollScale, PianoRollSnap, PlaylistClip,
+        PlaylistClipDragKind, PlaylistTempoMap, PlaylistTrack, PluginCandidate, PluginFormat,
+        TimeSelectionShift, TouchGesture, TouchTapTracker, TouchZoomConfig,
+        WINDOW_LAYOUT_PRESETS_HEADER, WindowLayoutPreset, audio_recording_start_tick_with_offset,
         built_in_midi_controller_templates, candidate_live_mixer_send_key,
         candidate_matches_vst_identity, candidate_mixer_controls,
         candidate_mixer_stereo_separation, detect_chord_name, detect_piano_roll_channel_scale,
         detect_piano_roll_scale, encode_midi_device_id, encode_midi_device_selections,
         first_available_playlist_track, is_performance_clip_trigger_channel_event,
-        midi_button_press_edge, midi_controller_binding_for_device, next_piano_roll_note_group,
-        note_from_grid_position, parse_midi_control_change_mapping,
-        parse_midi_controller_templates, parse_midi_device_selections, parse_window_layout_presets,
-        pattern_loop_frame_at_tick, pattern_loop_tick_at_frame, piano_roll_color_group_note_ids,
+        midi_button_press_edge, midi_cc_to_mixer_fader_raw, midi_controller_binding_for_device,
+        next_piano_roll_note_group, note_from_grid_position, parse_midi_control_change_mapping,
+        parse_midi_controller_templates, parse_midi_device_selections,
+        parse_midi_mixer_fader_mapping, parse_window_layout_presets, pattern_loop_frame_at_tick,
+        pattern_loop_tick_at_frame, piano_roll_color_group_note_ids,
         piano_roll_controller_stroke_points, piano_roll_controller_value_at,
         piano_roll_controller_value_range, piano_roll_cross_pattern_ghost_notes,
         piano_roll_discard_length_edit, piano_roll_duplicate_offset,
@@ -48854,11 +49216,12 @@ mod tests {
         playlist_signature_at_tick, playlist_song_position_label, playlist_track_group_range,
         playlist_track_is_hidden, recolor_piano_roll_notes, recording_input_targets,
         sample_editor_selection_for_drag, serialize_midi_controller_templates,
-        serialize_window_layout_presets, should_auto_connect_midi_input,
-        should_auto_connect_midi_output, snap_note_tick, snap_piano_roll_key_to_scale,
-        snap_recorded_midi_notes_to_scale, toggle_piano_roll_note_group_selection,
-        touch_pan_zoom_scroll_offset, track_two_finger_tap, update_channel_rack_selection,
-        update_layer_child_selection, update_piano_roll_box_selection, zoom_to_fit,
+        serialize_midi_mixer_fader_mapping, serialize_window_layout_presets,
+        should_auto_connect_midi_input, should_auto_connect_midi_output, snap_note_tick,
+        snap_piano_roll_key_to_scale, snap_recorded_midi_notes_to_scale,
+        toggle_piano_roll_note_group_selection, touch_pan_zoom_scroll_offset, track_two_finger_tap,
+        update_channel_rack_selection, update_layer_child_selection,
+        update_piano_roll_box_selection, zoom_to_fit,
     };
 
     fn mixer_send_route_fixture() -> FlpDocument {
@@ -50039,6 +50402,40 @@ mod tests {
             mapping.controller
         );
         assert_eq!(parse_midi_control_change_mapping(&encoded), Some(mapping));
+    }
+
+    #[test]
+    fn midi_mixer_fader_mapping_round_trips_device_channel_controller_and_track() {
+        let mapping = MidiMixerFaderMapping {
+            input_device_id: "alsa:keyboard\t雪".to_owned(),
+            channel: 15,
+            controller: 74,
+            insert_ordinal: 23,
+        };
+        let encoded = serialize_midi_mixer_fader_mapping(Some(&mapping));
+        assert_eq!(parse_midi_mixer_fader_mapping(&encoded), Some(mapping));
+        assert!(
+            parse_midi_mixer_fader_mapping("input=706f7274\nchannel=16\ncontroller=7\ninsert=1\n")
+                .is_none()
+        );
+        assert!(
+            parse_midi_mixer_fader_mapping("input=706f7274\nchannel=0\ncontroller=128\ninsert=1\n")
+                .is_none()
+        );
+        assert!(
+            parse_midi_mixer_fader_mapping(
+                "input=706f7274\nchannel=0\ncontroller=7\ninsert=999999\n"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn midi_cc_values_map_to_the_supported_mixer_fader_range() {
+        assert_eq!(midi_cc_to_mixer_fader_raw(0), 0);
+        assert_eq!(midi_cc_to_mixer_fader_raw(64), 8_062);
+        assert_eq!(midi_cc_to_mixer_fader_raw(127), 16_000);
+        assert_eq!(midi_cc_to_mixer_fader_raw(255), 16_000);
     }
 
     #[test]
