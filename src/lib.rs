@@ -232,6 +232,13 @@ pub struct FlpDocument {
     trailing_bytes: Vec<u8>,
 }
 
+#[derive(Clone, Copy)]
+struct MidiTrackImportSettings {
+    import_time_signatures: bool,
+    options: midi::MidiImportOptions,
+    realign_origin_tick: Option<u64>,
+}
+
 /// The state-file variant identified by the FL Studio `FLhd` format field.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FstPresetKind {
@@ -13699,9 +13706,11 @@ impl FlpDocument {
             track_index,
             pattern_id,
             channel_id,
-            true,
-            options,
-            realign_origin_tick,
+            MidiTrackImportSettings {
+                import_time_signatures: true,
+                options,
+                realign_origin_tick,
+            },
         )?;
         *self = candidate;
         Ok(imported)
@@ -13765,9 +13774,11 @@ impl FlpDocument {
                 track_index,
                 pattern_id,
                 channel_id,
-                track_index == 0,
-                options,
-                realign_origin_tick,
+                MidiTrackImportSettings {
+                    import_time_signatures: track_index == 0,
+                    options,
+                    realign_origin_tick,
+                },
             )?;
             total_imported = total_imported
                 .checked_add(imported)
@@ -13893,10 +13904,13 @@ impl FlpDocument {
         track_index: usize,
         pattern_id: u16,
         channel_id: u16,
-        import_time_signatures: bool,
-        options: midi::MidiImportOptions,
-        realign_origin_tick: Option<u64>,
+        settings: MidiTrackImportSettings,
     ) -> Result<usize, FlpError> {
+        let MidiTrackImportSettings {
+            import_time_signatures,
+            options,
+            realign_origin_tick,
+        } = settings;
         self.require_unique_channel(channel_id)?;
         if !self
             .patterns()?
