@@ -15564,6 +15564,25 @@ impl FlpDocument {
         Ok(())
     }
 
+    /// Routes several channels to the same Mixer track as one atomic edit.
+    pub fn set_channel_mixer_tracks(
+        &mut self,
+        channel_ids: &[u16],
+        mixer_track: i8,
+    ) -> Result<(), FlpError> {
+        if mixer_track < -1 {
+            return Err(FlpError::UnsupportedEdit(
+                "Mixer track assignments must be Current (-1), Master (0), or insert 1 through 127",
+            ));
+        }
+        let mut candidate = self.clone();
+        for channel_id in channel_ids {
+            candidate.set_channel_mixer_track(*channel_id, mixer_track)?;
+        }
+        *self = candidate;
+        Ok(())
+    }
+
     /// Enables or disables this channel's response to project Master pitch.
     /// The flag is stored at byte 12 of the channel Parameters (`0xC7`) payload.
     /// Existing payload bytes are retained; a missing Parameters event is created only when
@@ -23378,6 +23397,27 @@ mod tests {
         let before = document.encode_lossless().expect("document should encode");
         assert!(document.set_channel_mixer_track(7, -2).is_err());
         assert_eq!(document.encode_lossless().unwrap(), before);
+    }
+
+    #[test]
+    fn batch_channel_mixer_routing_is_atomic() {
+        let input = flp_fixture(
+            &[0x40, 7, 0, 0x15, 0, 0x40, 8, 0, 0x15, 0, 0x62, 0, 0],
+            &[],
+            &[],
+        );
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+        document
+            .set_channel_mixer_tracks(&[7, 8], 4)
+            .expect("both channels should be routed together");
+        let channels = document.channels();
+        assert_eq!(channels[0].mixer_track(), Some(4));
+        assert_eq!(channels[1].mixer_track(), Some(4));
+
+        let mut rejected = FlpDocument::parse(&input).expect("fixture should parse");
+        let before = rejected.encode_lossless().expect("document should encode");
+        assert!(rejected.set_channel_mixer_tracks(&[7, 99], 4).is_err());
+        assert_eq!(rejected.encode_lossless().unwrap(), before);
     }
 
     #[test]

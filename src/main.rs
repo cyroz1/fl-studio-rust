@@ -668,6 +668,16 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_bool(enabled, "Add to Key setting")?,
             )
         }
+        [command, input, output, channel_id, mixer_track]
+            if command == "set-channel-mixer-track" =>
+        {
+            set_channel_mixer_track(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(channel_id, "channel id")?,
+                parse_mixer_track(mixer_track)?,
+            )
+        }
         [command, input, output, channel_id, volume, pan] if command == "set-channel-levels" => {
             set_channel_levels(
                 Path::new(input),
@@ -2902,6 +2912,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild set-channel-zipped <input.flp> <output.flp> <channel-id> <0|1>\n",
             "  flp-rebuild set-channel-main-pitch <input.flp> <output.flp> <channel-id> <0|1>\n",
             "  flp-rebuild set-channel-add-to-key <input.flp> <output.flp> <channel-id> <0|1>\n",
+            "  flp-rebuild set-channel-mixer-track <input.flp> <output.flp> <channel-id> <mixer-track:-1=Current|0=Master|1..127=insert>\n",
             "  flp-rebuild edit-channel-level-adjustments <input.flp> <output.flp> <channel-id> <event-index> <pan-raw|-> <volume-raw|-> <mod-x-raw|-> <mod-y-raw|->\n",
             "  flp-rebuild set-channel-swing <input.flp> <output.flp> <channel-id> <percent-0..100>\n",
             "  flp-rebuild set-layer-children <input.flp> <output.flp> <layer-channel-id> <child-ids-comma-separated|->\n",
@@ -3249,6 +3260,19 @@ fn parse_i16(value: &str, description: &str) -> Result<i16, String> {
     value
         .parse::<i16>()
         .map_err(|_| format!("{description} must be an integer from -32768 through 32767"))
+}
+
+fn parse_mixer_track(value: &str) -> Result<i8, String> {
+    let mixer_track = value.parse::<i8>().map_err(|_| {
+        "Mixer track must be -1 (Current), 0 (Master), or an insert from 1 through 127".to_owned()
+    })?;
+    if mixer_track < -1 {
+        return Err(
+            "Mixer track must be -1 (Current), 0 (Master), or an insert from 1 through 127"
+                .to_owned(),
+        );
+    }
+    Ok(mixer_track)
 }
 
 fn parse_u64(value: &str, description: &str) -> Result<u64, String> {
@@ -5620,6 +5644,28 @@ fn set_channel_add_to_key(
     println!(
         "{} Add to Key on channel {channel_id} in {}",
         if enabled { "enabled" } else { "disabled" },
+        output.display()
+    );
+    Ok(())
+}
+
+fn set_channel_mixer_track(
+    input: &Path,
+    output: &Path,
+    channel_id: u16,
+    mixer_track: i8,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .set_channel_mixer_track(channel_id, mixer_track)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "routed channel {channel_id} to Mixer track {mixer_track} in {}",
         output.display()
     );
     Ok(())
@@ -8055,7 +8101,7 @@ mod tests {
     use super::{
         parse_clip_indices, parse_midi_channel_mask, parse_midi_import_options,
         parse_midi_import_options_with_channels, parse_midi_import_options_with_mixer_tracks,
-        parse_raw_byte, parse_rgb_hex, parse_scale_name,
+        parse_mixer_track, parse_raw_byte, parse_rgb_hex, parse_scale_name,
     };
     use flp_rebuild::midi::MidiImportOptions;
 
@@ -8107,6 +8153,15 @@ mod tests {
         assert!(parse_midi_channel_mask("0").is_err());
         assert!(parse_midi_channel_mask("17").is_err());
         assert!(parse_midi_channel_mask("2,,3").is_err());
+    }
+
+    #[test]
+    fn parses_channel_mixer_track_assignments() {
+        assert_eq!(parse_mixer_track("-1"), Ok(-1));
+        assert_eq!(parse_mixer_track("0"), Ok(0));
+        assert_eq!(parse_mixer_track("127"), Ok(127));
+        assert!(parse_mixer_track("-2").is_err());
+        assert!(parse_mixer_track("128").is_err());
     }
 
     #[test]

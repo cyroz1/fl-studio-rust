@@ -21266,6 +21266,7 @@ impl DawUi {
         let mut channel_swing_edits = Vec::new();
         let mut layer_edits = Vec::new();
         let mut layer_flag_edits = Vec::new();
+        let mut channel_mixer_track_edits = Vec::<(Vec<u16>, i8)>::new();
         let mut step_toggles = Vec::<(u16, Vec<usize>, u32, StepToggleOperation)>::new();
         let mut step_note_additions = Vec::<(u16, u32, u16)>::new();
         let mut mute_removed_steps_changed = false;
@@ -21707,6 +21708,12 @@ impl DawUi {
                                 self.selected_graph_channel = Some(channel.id());
                                 self.selected_note_channel = Some(channel.id());
                             }
+                            let mixer_route_target_ids =
+                                if self.selected_rack_channels.contains(&channel.id()) {
+                                    self.selected_rack_channels.iter().copied().collect::<Vec<_>>()
+                                } else {
+                                    vec![channel.id()]
+                                };
                             channel_button.context_menu(|ui| {
                                 let channel_selected =
                                     self.selected_rack_channels.contains(&channel.id());
@@ -21740,6 +21747,52 @@ impl DawUi {
                                     self.selected_note_channel = Some(channel.id());
                                     ui.close();
                                 }
+                                ui.menu_button("Mixer track", |ui| {
+                                    if ui
+                                        .selectable_label(
+                                            channel.mixer_track() == Some(-1),
+                                            "Current (-1)",
+                                        )
+                                        .clicked()
+                                    {
+                                        channel_mixer_track_edits
+                                            .push((mixer_route_target_ids.clone(), -1));
+                                        ui.close();
+                                    }
+                                    if ui
+                                        .selectable_label(
+                                            channel.mixer_track() == Some(0),
+                                            "Master (0)",
+                                        )
+                                        .clicked()
+                                    {
+                                        channel_mixer_track_edits
+                                            .push((mixer_route_target_ids.clone(), 0));
+                                        ui.close();
+                                    }
+                                    for start in (1u8..=127).step_by(16) {
+                                        let end = start.saturating_add(15).min(127);
+                                        ui.menu_button(format!("Inserts {start}–{end}"), |ui| {
+                                            for track in start..=end {
+                                                let mixer_track = i8::try_from(track)
+                                                    .expect("positive Mixer tracks fit in i8");
+                                                if ui
+                                                    .selectable_label(
+                                                        channel.mixer_track() == Some(mixer_track),
+                                                        format!("Insert {track}"),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    channel_mixer_track_edits.push((
+                                                        mixer_route_target_ids.clone(),
+                                                        mixer_track,
+                                                    ));
+                                                    ui.close();
+                                                }
+                                            }
+                                        });
+                                    }
+                                });
                                 if matches!(channel.kind(), Some(0 | 2 | 4)) {
                                     let mut main_pitch_enabled =
                                         channel.keyboard_main_pitch_enabled();
@@ -22309,6 +22362,29 @@ impl DawUi {
                 }
                 Some(Err(error)) => {
                     self.status = format!("Could not change channel mute state: {error}");
+                }
+                None => {}
+            }
+        }
+        for (channel_ids, mixer_track) in channel_mixer_track_edits {
+            let result = self
+                .document
+                .as_mut()
+                .map(|document| document.set_channel_mixer_tracks(&channel_ids, mixer_track));
+            match result {
+                Some(Ok(())) => {
+                    self.stop_project_playback();
+                    self.dirty = true;
+                    let track_name = match mixer_track {
+                        -1 => "Current".to_owned(),
+                        0 => "Master".to_owned(),
+                        track => format!("Insert {track}"),
+                    };
+                    self.status =
+                        format!("Routed {} channel(s) to {track_name}", channel_ids.len());
+                }
+                Some(Err(error)) => {
+                    self.status = format!("Could not update Mixer track assignments: {error}");
                 }
                 None => {}
             }
