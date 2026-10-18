@@ -4125,7 +4125,7 @@ struct DawUi {
     midi_live_sampler_sustain_channels: BTreeSet<u8>,
     midi_output_gain_mapping: Option<MidiControlChangeMapping>,
     midi_mixer_control_mappings: Vec<MidiMixerControlMapping>,
-    midi_mixer_mute_cc_active: BTreeSet<(String, u8, u8)>,
+    midi_mixer_button_cc_active: BTreeSet<(String, u8, u8)>,
     midi_mixer_control_learning: Option<MidiMixerControlLearning>,
     midi_mixer_control_undo_snapshot: Option<Vec<u8>>,
     midi_mixer_control_undo_last_update: Option<Instant>,
@@ -4514,6 +4514,7 @@ enum MidiMixerControlTarget {
     Pan,
     StereoSeparation,
     Mute,
+    Solo,
 }
 
 impl MidiMixerControlTarget {
@@ -4523,6 +4524,7 @@ impl MidiMixerControlTarget {
             Self::Pan => "pan",
             Self::StereoSeparation => "stereo separation",
             Self::Mute => "mute",
+            Self::Solo => "solo",
         }
     }
 
@@ -4532,6 +4534,7 @@ impl MidiMixerControlTarget {
             "pan" => Some(Self::Pan),
             "stereo-separation" => Some(Self::StereoSeparation),
             "mute" => Some(Self::Mute),
+            "solo" => Some(Self::Solo),
             _ => None,
         }
     }
@@ -4542,6 +4545,7 @@ impl MidiMixerControlTarget {
             Self::Pan => "pan",
             Self::StereoSeparation => "stereo-separation",
             Self::Mute => "mute",
+            Self::Solo => "solo",
         }
     }
 
@@ -4550,7 +4554,7 @@ impl MidiMixerControlTarget {
             Self::Fader => midi_cc_to_mixer_fader_raw(cc),
             Self::Pan => midi_cc_to_mixer_pan_raw(cc),
             Self::StereoSeparation => midi_cc_to_mixer_stereo_separation_raw(cc),
-            Self::Mute => i32::from(cc >= 64),
+            Self::Mute | Self::Solo => i32::from(cc >= 64),
         }
     }
 
@@ -4559,8 +4563,12 @@ impl MidiMixerControlTarget {
             Self::Fader => (0..=16_000).contains(&value),
             Self::Pan => (-6_400..=6_400).contains(&value),
             Self::StereoSeparation => (-64..=64).contains(&value),
-            Self::Mute => (0..=1).contains(&value),
+            Self::Mute | Self::Solo => (0..=1).contains(&value),
         }
+    }
+
+    const fn is_toggle(self) -> bool {
+        matches!(self, Self::Mute | Self::Solo)
     }
 }
 
@@ -4596,7 +4604,7 @@ fn midi_button_press_edge(value: u8, active: &mut bool) -> bool {
     }
 }
 
-fn midi_mixer_mute_button_press_edge(
+fn midi_mixer_button_press_edge(
     active_mappings: &mut BTreeSet<(String, u8, u8)>,
     input_device_id: &str,
     channel: u8,
@@ -5136,7 +5144,7 @@ impl DawUi {
             midi_live_sampler_sustain_channels: BTreeSet::new(),
             midi_output_gain_mapping,
             midi_mixer_control_mappings,
-            midi_mixer_mute_cc_active: BTreeSet::new(),
+            midi_mixer_button_cc_active: BTreeSet::new(),
             midi_mixer_control_learning: None,
             midi_mixer_control_undo_snapshot: None,
             midi_mixer_control_undo_last_update: None,
@@ -35837,6 +35845,18 @@ impl DawUi {
                                         && mapping.target == MidiMixerControlTarget::Mute
                                 })
                                 .cloned();
+                            let solo_learning = MidiMixerControlLearning {
+                                insert_ordinal: insert.ordinal(),
+                                target: MidiMixerControlTarget::Solo,
+                            };
+                            let solo_mapping = self
+                                .midi_mixer_control_mappings
+                                .iter()
+                                .find(|mapping| {
+                                    mapping.insert_ordinal == insert.ordinal()
+                                        && mapping.target == MidiMixerControlTarget::Solo
+                                })
+                                .cloned();
                             ui.horizontal_wrapped(|ui| {
                                 if self.midi_mixer_control_learning == Some(mute_learning) {
                                     ui.small(
@@ -35858,7 +35878,7 @@ impl DawUi {
                                 {
                                     self.midi_output_gain_learning = false;
                                     self.midi_play_pause_learning = false;
-                                    self.midi_mixer_mute_cc_active.clear();
+                                    self.midi_mixer_button_cc_active.clear();
                                     self.midi_mixer_control_learning = Some(mute_learning);
                                     self.status = format!(
                                         "Press a MIDI CC button to map the {} mute toggle",
@@ -35887,7 +35907,7 @@ impl DawUi {
                                             mapping.insert_ordinal != insert.ordinal()
                                                 || mapping.target != MidiMixerControlTarget::Mute
                                         });
-                                        self.midi_mixer_mute_cc_active.remove(&(
+                                        self.midi_mixer_button_cc_active.remove(&(
                                             mapping.input_device_id.clone(),
                                             mapping.channel,
                                             mapping.controller,
@@ -35902,6 +35922,73 @@ impl DawUi {
                                         } else {
                                             self.status =
                                                 "Cleared MIDI Mixer mute mapping".to_owned();
+                                        }
+                                    }
+                                }
+                                if insert.ordinal() > 0 {
+                                    if self.midi_mixer_control_learning == Some(solo_learning) {
+                                        ui.small(
+                                            egui::RichText::new("Press a MIDI CC button…")
+                                                .color(ORANGE),
+                                        );
+                                        if ui.small_button("Cancel learn").clicked() {
+                                            self.midi_mixer_control_learning = None;
+                                        }
+                                    } else if ui
+                                        .add_enabled(
+                                            flags_editable
+                                                && self.midi_input_connection.is_some(),
+                                            egui::Button::new("Learn solo CC"),
+                                        )
+                                        .on_hover_text(
+                                            "Connect a MIDI input, then press a CC button to toggle this Mixer insert's solo state",
+                                        )
+                                        .clicked()
+                                    {
+                                        self.midi_output_gain_learning = false;
+                                        self.midi_play_pause_learning = false;
+                                        self.midi_mixer_button_cc_active.clear();
+                                        self.midi_mixer_control_learning = Some(solo_learning);
+                                        self.status = format!(
+                                            "Press a MIDI CC button to map Insert {} solo",
+                                            insert.ordinal()
+                                        );
+                                    }
+                                    if let Some(mapping) = &solo_mapping {
+                                        let input_name = self
+                                            .midi_input_devices
+                                            .iter()
+                                            .find(|device| device.id == mapping.input_device_id)
+                                            .map(|device| device.name.as_str())
+                                            .unwrap_or(mapping.input_device_id.as_str());
+                                        ui.small(format!(
+                                            "Solo CC {} · Ch {}",
+                                            mapping.controller,
+                                            mapping.channel + 1
+                                        ))
+                                        .on_hover_text(format!("Mapped from {input_name}"));
+                                        if ui.small_button("Clear solo CC").clicked() {
+                                            self.midi_mixer_control_mappings.retain(|mapping| {
+                                                mapping.insert_ordinal != insert.ordinal()
+                                                    || mapping.target
+                                                        != MidiMixerControlTarget::Solo
+                                            });
+                                            self.midi_mixer_button_cc_active.remove(&(
+                                                mapping.input_device_id.clone(),
+                                                mapping.channel,
+                                                mapping.controller,
+                                            ));
+                                            self.midi_mixer_control_learning = None;
+                                            if let Err(error) = save_midi_mixer_control_mappings(
+                                                &self.midi_mixer_control_mappings,
+                                            ) {
+                                                self.status = format!(
+                                                    "Could not clear MIDI Mixer solo mapping: {error}"
+                                                );
+                                            } else {
+                                                self.status =
+                                                    "Cleared MIDI Mixer solo mapping".to_owned();
+                                            }
                                         }
                                     }
                                 }
@@ -36414,7 +36501,7 @@ impl DawUi {
                     self.midi_mixer_control_learning = None;
                     self.midi_play_pause_learning = false;
                     self.midi_play_pause_cc_active = false;
-                    self.midi_mixer_mute_cc_active.clear();
+                    self.midi_mixer_button_cc_active.clear();
                     self.finish_active_midi_recording();
                     self.midi_input_connection = None;
                     self.status = "MIDI input disconnected; device list refreshed".to_owned();
@@ -36471,7 +36558,7 @@ impl DawUi {
         self.midi_mixer_control_learning = None;
         self.midi_play_pause_learning = false;
         self.midi_play_pause_cc_active = false;
-        self.midi_mixer_mute_cc_active.clear();
+        self.midi_mixer_button_cc_active.clear();
         self.release_all_midi_performance_clips();
         self.stop_live_sampler_input_for_device_change();
         self.stop_midi_input_thru();
@@ -36508,7 +36595,7 @@ impl DawUi {
         self.midi_mixer_control_learning = None;
         self.midi_play_pause_learning = false;
         self.midi_play_pause_cc_active = false;
-        self.midi_mixer_mute_cc_active.clear();
+        self.midi_mixer_button_cc_active.clear();
         let Some(connection) = self.midi_input_connection.take() else {
             return;
         };
@@ -37588,9 +37675,10 @@ impl DawUi {
         history_snapshot_available: bool,
     ) -> Result<bool, String> {
         let raw_value = target.raw_value(value);
-        if target == MidiMixerControlTarget::Mute {
-            return self.apply_midi_mixer_mute_state(
+        if target.is_toggle() {
+            return self.apply_midi_mixer_toggle_state(
                 insert_ordinal,
+                target,
                 raw_value != 0,
                 history_snapshot_available,
             );
@@ -37617,7 +37705,9 @@ impl DawUi {
                 MidiMixerControlTarget::StereoSeparation => {
                     candidate_mixer_stereo_separation(&parameters, insert_ordinal)
                 }
-                MidiMixerControlTarget::Mute => unreachable!("handled above"),
+                MidiMixerControlTarget::Mute | MidiMixerControlTarget::Solo => {
+                    unreachable!("handled above")
+                }
             }
             .filter(|record| target.supports_raw_value(record.value()))
             .ok_or_else(|| {
@@ -37682,7 +37772,9 @@ impl DawUi {
             (MidiMixerControlTarget::StereoSeparation, _) => self
                 .mixer_track_peak_meters
                 .set_live_mixer_insert_stereo_separation_raw(insert_ordinal, Some(raw_value)),
-            (MidiMixerControlTarget::Mute, _) => unreachable!("handled above"),
+            (MidiMixerControlTarget::Mute | MidiMixerControlTarget::Solo, _) => {
+                unreachable!("handled above")
+            }
         }
         self.dirty = true;
         self.status = format!(
@@ -37697,29 +37789,34 @@ impl DawUi {
         Ok(true)
     }
 
-    fn apply_midi_mixer_mute_button_cc(
+    fn apply_midi_mixer_toggle_button_cc(
         &mut self,
-        input_device_id: &str,
-        channel: u8,
-        controller: u8,
-        insert_ordinal: usize,
+        mapping: &MidiMixerControlMapping,
         value: u8,
         history_snapshot_available: bool,
     ) -> Result<bool, String> {
-        if !midi_mixer_mute_button_press_edge(
-            &mut self.midi_mixer_mute_cc_active,
-            input_device_id,
-            channel,
-            controller,
+        let target = mapping.target;
+        let insert_ordinal = mapping.insert_ordinal;
+        if !target.is_toggle() {
+            return Err(format!("Mixer {} is not a toggle control", target.name()));
+        }
+        if target == MidiMixerControlTarget::Solo && insert_ordinal == 0 {
+            return Err("Mixer Master does not support solo mapping".to_owned());
+        }
+        if !midi_mixer_button_press_edge(
+            &mut self.midi_mixer_button_cc_active,
+            &mapping.input_device_id,
+            mapping.channel,
+            mapping.controller,
             value,
         ) {
             return Ok(false);
         }
-        let enabled = {
+        let active = {
             let document = self
                 .document
                 .as_ref()
-                .ok_or_else(|| "Open a project before mapping Mixer mute".to_owned())?;
+                .ok_or_else(|| format!("Open a project before mapping Mixer {}", target.name()))?;
             let insert = document
                 .mixer_inserts()
                 .into_iter()
@@ -37736,39 +37833,58 @@ impl DawUi {
                 })?;
             if insert.flags().is_none() {
                 return Err(format!(
-                    "The selected Mixer track {} has no unique supported mute state",
+                    "The selected Mixer track {} has no unique supported {} state",
                     if insert_ordinal == 0 {
                         "Master".to_owned()
                     } else {
                         format!("Insert {insert_ordinal}")
-                    }
+                    },
+                    target.name()
                 ));
             }
-            insert.enabled().ok_or_else(|| {
+            match target {
+                MidiMixerControlTarget::Mute => insert.enabled(),
+                MidiMixerControlTarget::Solo => insert.soloed(),
+                _ => None,
+            }
+            .ok_or_else(|| {
                 format!(
-                    "The selected Mixer track {} has no supported mute state",
+                    "The selected Mixer track {} has no supported {} state",
                     if insert_ordinal == 0 {
                         "Master".to_owned()
                     } else {
                         format!("Insert {insert_ordinal}")
-                    }
+                    },
+                    target.name()
                 )
             })?
         };
-        self.apply_midi_mixer_mute_state(insert_ordinal, !enabled, history_snapshot_available)
+        self.apply_midi_mixer_toggle_state(
+            insert_ordinal,
+            target,
+            !active,
+            history_snapshot_available,
+        )
     }
 
-    fn apply_midi_mixer_mute_state(
+    fn apply_midi_mixer_toggle_state(
         &mut self,
         insert_ordinal: usize,
-        enabled: bool,
+        target: MidiMixerControlTarget,
+        active: bool,
         history_snapshot_available: bool,
     ) -> Result<bool, String> {
-        let old_enabled = {
+        if !target.is_toggle() {
+            return Err(format!("Mixer {} is not a toggle control", target.name()));
+        }
+        if target == MidiMixerControlTarget::Solo && insert_ordinal == 0 {
+            return Err("Mixer Master does not support solo mapping".to_owned());
+        }
+        let old_active = {
             let document = self
                 .document
                 .as_ref()
-                .ok_or_else(|| "Open a project before mapping Mixer mute".to_owned())?;
+                .ok_or_else(|| format!("Open a project before mapping Mixer {}", target.name()))?;
             let insert = document
                 .mixer_inserts()
                 .into_iter()
@@ -37785,26 +37901,33 @@ impl DawUi {
                 })?;
             if insert.flags().is_none() {
                 return Err(format!(
-                    "The selected Mixer track {} has no unique supported mute state",
+                    "The selected Mixer track {} has no unique supported {} state",
                     if insert_ordinal == 0 {
                         "Master".to_owned()
                     } else {
                         format!("Insert {insert_ordinal}")
-                    }
+                    },
+                    target.name()
                 ));
             }
-            insert.enabled().ok_or_else(|| {
+            match target {
+                MidiMixerControlTarget::Mute => insert.enabled(),
+                MidiMixerControlTarget::Solo => insert.soloed(),
+                _ => None,
+            }
+            .ok_or_else(|| {
                 format!(
-                    "The selected Mixer track {} has no supported mute state",
+                    "The selected Mixer track {} has no supported {} state",
                     if insert_ordinal == 0 {
                         "Master".to_owned()
                     } else {
                         format!("Insert {insert_ordinal}")
-                    }
+                    },
+                    target.name()
                 )
             })?
         };
-        if old_enabled == enabled {
+        if old_active == active {
             return Ok(false);
         }
         let undo_snapshot =
@@ -37820,44 +37943,79 @@ impl DawUi {
                 None
             };
         {
-            let document = self
-                .document
-                .as_mut()
-                .ok_or_else(|| "The project was closed while applying Mixer mute".to_owned())?;
-            document
-                .edit_mixer_insert_flags(
-                    insert_ordinal,
-                    MixerInsertEdit {
-                        enabled: Some(enabled),
-                        ..MixerInsertEdit::default()
-                    },
+            let document = self.document.as_mut().ok_or_else(|| {
+                format!(
+                    "The project was closed while applying Mixer {}",
+                    target.name()
                 )
-                .map_err(|error| format!("Could not update Mixer mute: {error}"))?;
+            })?;
+            let edit = match target {
+                MidiMixerControlTarget::Mute => MixerInsertEdit {
+                    enabled: Some(active),
+                    ..MixerInsertEdit::default()
+                },
+                MidiMixerControlTarget::Solo => MixerInsertEdit {
+                    soloed: Some(active),
+                    ..MixerInsertEdit::default()
+                },
+                _ => unreachable!("toggle target was checked above"),
+            };
+            document
+                .edit_mixer_insert_flags(insert_ordinal, edit)
+                .map_err(|error| format!("Could not update Mixer {}: {error}", target.name()))?;
         }
         if let Some(snapshot) = undo_snapshot {
             self.midi_mixer_control_undo_snapshot = Some(snapshot);
         }
         self.midi_mixer_control_undo_last_update = Some(Instant::now());
-        if insert_ordinal == 0 {
-            self.mixer_track_peak_meters
-                .set_live_master_enabled(Some(enabled));
-        } else {
-            let live_enabled = self.document.as_ref().and_then(|document| {
-                let inserts = document.mixer_inserts();
-                candidate_mixer_insert_enabled(&inserts, insert_ordinal)
-            });
-            self.mixer_track_peak_meters
-                .set_live_mixer_insert_enabled(insert_ordinal, live_enabled);
+        match target {
+            MidiMixerControlTarget::Mute if insert_ordinal == 0 => self
+                .mixer_track_peak_meters
+                .set_live_master_enabled(Some(active)),
+            MidiMixerControlTarget::Mute => {
+                let live_enabled = self.document.as_ref().and_then(|document| {
+                    let inserts = document.mixer_inserts();
+                    candidate_mixer_insert_enabled(&inserts, insert_ordinal)
+                });
+                self.mixer_track_peak_meters
+                    .set_live_mixer_insert_enabled(insert_ordinal, live_enabled);
+            }
+            MidiMixerControlTarget::Solo => {
+                let soloed_tracks = self
+                    .document
+                    .as_ref()
+                    .map(|document| {
+                        document
+                            .mixer_inserts()
+                            .into_iter()
+                            .filter(|insert| insert.ordinal() > 0 && insert.soloed() == Some(true))
+                            .map(|insert| insert.ordinal())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                self.mixer_track_peak_meters
+                    .set_live_mixer_soloed_tracks(&soloed_tracks);
+            }
+            _ => unreachable!("toggle target was checked above"),
         }
         self.dirty = true;
         self.status = format!(
-            "MIDI Mixer mute · {} · {}",
+            "MIDI Mixer {} · {} · {}",
+            target.name(),
             if insert_ordinal == 0 {
                 "Master".to_owned()
             } else {
                 format!("Insert {insert_ordinal}")
             },
-            if enabled { "unmuted" } else { "muted" }
+            match target {
+                MidiMixerControlTarget::Mute => {
+                    if active { "unmuted" } else { "muted" }
+                }
+                MidiMixerControlTarget::Solo => {
+                    if active { "soloed" } else { "unsoloed" }
+                }
+                _ => unreachable!("toggle target was checked above"),
+            }
         );
         Ok(true)
     }
@@ -37970,7 +38128,7 @@ impl DawUi {
         self.midi_mixer_control_learning = None;
         self.midi_play_pause_learning = false;
         self.midi_play_pause_cc_active = false;
-        self.midi_mixer_mute_cc_active.clear();
+        self.midi_mixer_button_cc_active.clear();
         self.midi_controller_template_index = Some(index);
         self.status = output_gain_error.or(play_pause_error).map_or_else(
             || format!("Applied {} to {device_name}", template.name),
@@ -38038,15 +38196,8 @@ impl DawUi {
                 insert_ordinal,
                 target,
             };
-            let apply_result = if target == MidiMixerControlTarget::Mute {
-                self.apply_midi_mixer_mute_button_cc(
-                    &input_device_id,
-                    channel,
-                    controller,
-                    insert_ordinal,
-                    value,
-                    history_snapshot_available,
-                )
+            let apply_result = if target.is_toggle() {
+                self.apply_midi_mixer_toggle_button_cc(&mapping, value, history_snapshot_available)
             } else {
                 self.apply_midi_mixer_control_value(
                     insert_ordinal,
@@ -38170,21 +38321,21 @@ impl DawUi {
                 channel,
                 controller,
             )
-            .map(|mapping| (connection.device_id.clone(), mapping))
+            .map(|(insert_ordinal, target)| MidiMixerControlMapping {
+                input_device_id: connection.device_id.clone(),
+                channel,
+                controller,
+                insert_ordinal,
+                target,
+            })
         });
-        if let Some((input_device_id, (insert_ordinal, target))) = mixer_control_mapping {
-            let apply_result = if target == MidiMixerControlTarget::Mute {
-                self.apply_midi_mixer_mute_button_cc(
-                    &input_device_id,
-                    channel,
-                    controller,
-                    insert_ordinal,
-                    value,
-                    history_snapshot_available,
-                )
+        if let Some(mapping) = mixer_control_mapping {
+            let target = mapping.target;
+            let apply_result = if target.is_toggle() {
+                self.apply_midi_mixer_toggle_button_cc(&mapping, value, history_snapshot_available)
             } else {
                 self.apply_midi_mixer_control_value(
-                    insert_ordinal,
+                    mapping.insert_ordinal,
                     target,
                     value,
                     history_snapshot_available,
@@ -44920,6 +45071,7 @@ fn valid_midi_mixer_control_mapping(mapping: &MidiMixerControlMapping) -> bool {
     mapping.channel < 16
         && mapping.controller < 128
         && mapping.insert_ordinal < MIXER_TRACK_METER_COUNT
+        && (mapping.target != MidiMixerControlTarget::Solo || mapping.insert_ordinal > 0)
 }
 
 fn upsert_midi_mixer_control_mapping(
@@ -49932,7 +50084,7 @@ mod tests {
         first_available_playlist_track, is_performance_clip_trigger_channel_event,
         midi_button_press_edge, midi_cc_to_mixer_fader_raw, midi_cc_to_mixer_pan_raw,
         midi_cc_to_mixer_stereo_separation_raw, midi_controller_binding_for_device,
-        midi_mixer_control_for_cc, midi_mixer_mute_button_press_edge, next_piano_roll_note_group,
+        midi_mixer_button_press_edge, midi_mixer_control_for_cc, next_piano_roll_note_group,
         note_from_grid_position, parse_midi_control_change_mapping,
         parse_midi_controller_templates, parse_midi_device_selections,
         parse_midi_mixer_control_mappings, parse_window_layout_presets, pattern_loop_frame_at_tick,
@@ -51173,6 +51325,13 @@ mod tests {
                 insert_ordinal: 1,
                 target: MidiMixerControlTarget::Mute,
             },
+            MidiMixerControlMapping {
+                input_device_id: "usb:surface".to_owned(),
+                channel: 0,
+                controller: 12,
+                insert_ordinal: 2,
+                target: MidiMixerControlTarget::Solo,
+            },
         ];
         let encoded = serialize_midi_mixer_control_mappings(&mappings);
         assert_eq!(parse_midi_mixer_control_mappings(&encoded), mappings);
@@ -51229,6 +51388,10 @@ mod tests {
                 "input=706f7274\nchannel=0\ncontroller=7\ninsert=999999\n"
             )
             .is_empty()
+        );
+        assert_eq!(
+            parse_midi_mixer_control_mappings("version=3\nmapping=706f7274\t0\t20\t0\tsolo\n"),
+            Vec::new()
         );
     }
 
@@ -51294,9 +51457,17 @@ mod tests {
             target: MidiMixerControlTarget::Mute,
         };
         upsert_midi_mixer_control_mapping(&mut mappings, mute.clone());
+        let solo = MidiMixerControlMapping {
+            input_device_id: "surface".to_owned(),
+            channel: 0,
+            controller: 13,
+            insert_ordinal: 1,
+            target: MidiMixerControlTarget::Solo,
+        };
+        upsert_midi_mixer_control_mapping(&mut mappings, solo.clone());
         assert_eq!(
             mappings,
-            vec![replacement, reassigned_control, pan, stereo, mute]
+            vec![replacement, reassigned_control, pan, stereo, mute, solo]
         );
     }
 
@@ -51338,6 +51509,13 @@ mod tests {
                 insert_ordinal: 2,
                 target: MidiMixerControlTarget::Mute,
             },
+            MidiMixerControlMapping {
+                input_device_id: "surface-a".to_owned(),
+                channel: 0,
+                controller: 12,
+                insert_ordinal: 2,
+                target: MidiMixerControlTarget::Solo,
+            },
         ];
         assert_eq!(
             midi_mixer_control_for_cc(&mappings, "surface-a", 0, 7),
@@ -51362,6 +51540,10 @@ mod tests {
         assert_eq!(
             midi_mixer_control_for_cc(&mappings, "surface-a", 0, 11),
             Some((2, MidiMixerControlTarget::Mute))
+        );
+        assert_eq!(
+            midi_mixer_control_for_cc(&mappings, "surface-a", 0, 12),
+            Some((2, MidiMixerControlTarget::Solo))
         );
     }
 
@@ -51555,44 +51737,44 @@ mod tests {
     }
 
     #[test]
-    fn midi_mixer_mute_cc_toggles_once_per_mapping_press() {
+    fn midi_mixer_toggle_cc_toggles_once_per_mapping_press() {
         let mut active_mappings = BTreeSet::new();
-        assert!(midi_mixer_mute_button_press_edge(
+        assert!(midi_mixer_button_press_edge(
             &mut active_mappings,
             "surface-a",
             0,
             12,
             127,
         ));
-        assert!(!midi_mixer_mute_button_press_edge(
+        assert!(!midi_mixer_button_press_edge(
             &mut active_mappings,
             "surface-a",
             0,
             12,
             96,
         ));
-        assert!(midi_mixer_mute_button_press_edge(
+        assert!(midi_mixer_button_press_edge(
             &mut active_mappings,
             "surface-a",
             0,
             13,
             127,
         ));
-        assert!(!midi_mixer_mute_button_press_edge(
+        assert!(!midi_mixer_button_press_edge(
             &mut active_mappings,
             "surface-b",
             0,
             12,
             0,
         ));
-        assert!(!midi_mixer_mute_button_press_edge(
+        assert!(!midi_mixer_button_press_edge(
             &mut active_mappings,
             "surface-a",
             0,
             12,
             0,
         ));
-        assert!(midi_mixer_mute_button_press_edge(
+        assert!(midi_mixer_button_press_edge(
             &mut active_mappings,
             "surface-a",
             0,
