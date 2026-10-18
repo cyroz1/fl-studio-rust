@@ -13696,20 +13696,14 @@ impl FlpDocument {
         Ok(())
     }
 
-    /// Imports one MIDI Control Change number from a track into an existing raw Pattern
-    /// controller stream. Source MIDI timing and tempo changes are preserved; CC values map
-    /// linearly from 0–127 to 0.0–1.0. `midi_channel` is zero-based, or `None` to include all
-    /// MIDI channels. No event realignment is applied so the imported points stay synchronized
-    /// with note data imported from the same MIDI file.
-    pub fn import_midi_control_changes(
-        &mut self,
+    fn midi_control_change_points(
+        &self,
         midi: &midi::MidiFile,
         track_index: usize,
         pattern_id: u16,
-        target_stream: (u8, u8),
         controller_number: u8,
         midi_channel: Option<u8>,
-    ) -> Result<usize, FlpError> {
+    ) -> Result<Vec<(u32, f32)>, FlpError> {
         if controller_number > 127 {
             return Err(FlpError::UnsupportedEdit(
                 "MIDI Control Change number must be from 0 through 127",
@@ -13720,21 +13714,13 @@ impl FlpDocument {
                 "MIDI channel must be from 0 through 15",
             ));
         }
-
-        let pattern = self
+        if !self
             .patterns()?
-            .into_iter()
-            .find(|pattern| pattern.id == pattern_id)
-            .ok_or(FlpError::UnsupportedEdit(
-                "the requested Pattern does not exist",
-            ))?;
-        if !pattern
-            .controllers
             .iter()
-            .any(|point| (point.channel, point.flags) == target_stream)
+            .any(|pattern| pattern.id == pattern_id)
         {
             return Err(FlpError::UnsupportedEdit(
-                "the requested raw Pattern controller stream does not exist",
+                "the requested Pattern does not exist",
             ));
         }
         if self.header.ppq == 0 {
@@ -13787,10 +13773,86 @@ impl FlpDocument {
             )?;
             points.push((position, f32::from(change.value()) / 127.0));
         }
+        Ok(points)
+    }
+
+    /// Imports one MIDI Control Change number from a track into an existing raw Pattern
+    /// controller stream. Source MIDI timing and tempo changes are preserved; CC values map
+    /// linearly from 0–127 to 0.0–1.0. `midi_channel` is zero-based, or `None` to include all
+    /// MIDI channels. No event realignment is applied so the imported points stay synchronized
+    /// with note data imported from the same MIDI file.
+    pub fn import_midi_control_changes(
+        &mut self,
+        midi: &midi::MidiFile,
+        track_index: usize,
+        pattern_id: u16,
+        target_stream: (u8, u8),
+        controller_number: u8,
+        midi_channel: Option<u8>,
+    ) -> Result<usize, FlpError> {
+        let pattern = self
+            .patterns()?
+            .into_iter()
+            .find(|pattern| pattern.id == pattern_id)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested Pattern does not exist",
+            ))?;
+        if !pattern
+            .controllers
+            .iter()
+            .any(|point| (point.channel, point.flags) == target_stream)
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested raw Pattern controller stream does not exist",
+            ));
+        }
+        let points = self.midi_control_change_points(
+            midi,
+            track_index,
+            pattern_id,
+            controller_number,
+            midi_channel,
+        )?;
 
         if !points.is_empty() {
             self.draw_pattern_controller_points(pattern_id, target_stream, &points)?;
         }
+        Ok(points.len())
+    }
+
+    /// Imports one MIDI Control Change number into a newly created raw Pattern controller
+    /// stream. The requested channel/flags bytes are stored verbatim, and the stream starts at
+    /// the first imported point. If no matching MIDI messages exist, no stream is created.
+    pub fn import_midi_control_changes_to_new_stream(
+        &mut self,
+        midi: &midi::MidiFile,
+        track_index: usize,
+        pattern_id: u16,
+        target_stream: (u8, u8),
+        controller_number: u8,
+        midi_channel: Option<u8>,
+    ) -> Result<usize, FlpError> {
+        let points = self.midi_control_change_points(
+            midi,
+            track_index,
+            pattern_id,
+            controller_number,
+            midi_channel,
+        )?;
+        let Some((first_position, first_value)) = points.first().copied() else {
+            return Ok(0);
+        };
+
+        let mut candidate = self.clone();
+        candidate.create_pattern_controller_stream(
+            pattern_id,
+            target_stream.0,
+            target_stream.1,
+            first_position,
+            first_value,
+        )?;
+        candidate.draw_pattern_controller_points(pattern_id, target_stream, &points)?;
+        *self = candidate;
         Ok(points.len())
     }
 
@@ -27996,6 +28058,94 @@ mod tests {
         assert_eq!(
             round_trip.patterns().unwrap()[0].controllers,
             pattern.controllers
+        );
+    }
+
+    #[test]
+    fn midi_control_changes_can_create_a_raw_controller_stream_atomically() {
+        let input = pattern_fixture(&[], &[]);
+        let mut document = FlpDocument::parse(&input).expect("project fixture should parse");
+        let midi = MidiFile::parse(&midi_fixture(
+            &[
+                0x00, 0xB0, 74, 64, // CC 74 at tick 0.
+                0x83, 0x60, 0xB0, 74, 127, // CC 74 at tick 480.
+                0x00, 0xFF, 0x2F, 0x00,
+            ],
+            480,
+        ))
+        .expect("MIDI fixture should parse");
+
+        let imported = document
+            .import_midi_control_changes_to_new_stream(&midi, 0, 7, (13, 0x7F), 74, Some(0))
+            .expect("the selected CC should create a raw stream");
+        assert_eq!(imported, 2);
+
+        let pattern = &document.patterns().unwrap()[0];
+        assert_eq!(pattern.controllers.len(), 2);
+        assert_eq!(pattern.controllers[0].position, 0);
+        assert_eq!(pattern.controllers[0].reserved, [0; 2]);
+        assert_eq!(pattern.controllers[0].channel, 13);
+        assert_eq!(pattern.controllers[0].flags, 0x7F);
+        assert!((pattern.controllers[0].value() - 64.0 / 127.0).abs() < f32::EPSILON);
+        assert_eq!(pattern.controllers[1].position, 96);
+        assert_eq!(pattern.controllers[1].channel, 13);
+        assert_eq!(pattern.controllers[1].flags, 0x7F);
+        assert_eq!(pattern.controllers[1].value(), 1.0);
+
+        let encoded = document
+            .encode_lossless()
+            .expect("the imported project should encode");
+        let round_trip = FlpDocument::parse(&encoded).expect("the imported project should parse");
+        assert_eq!(
+            round_trip.patterns().unwrap()[0].controllers,
+            pattern.controllers
+        );
+    }
+
+    #[test]
+    fn midi_control_change_new_stream_import_skips_empty_data_and_rejects_duplicates() {
+        let input = pattern_fixture(&[], &[]);
+        let mut document = FlpDocument::parse(&input).expect("project fixture should parse");
+        let no_matching_cc = MidiFile::parse(&midi_fixture(
+            &[0x00, 0xB0, 71, 127, 0x00, 0xFF, 0x2F, 0x00],
+            480,
+        ))
+        .expect("MIDI fixture should parse");
+        assert_eq!(
+            document
+                .import_midi_control_changes_to_new_stream(
+                    &no_matching_cc,
+                    0,
+                    7,
+                    (3, 0x91),
+                    74,
+                    None,
+                )
+                .expect("an unmatched CC should be a no-op"),
+            0
+        );
+        assert!(document.patterns().unwrap()[0].controllers.is_empty());
+        assert_eq!(document.encode_lossless().unwrap(), input);
+
+        let record = pattern_controller_record(0, [0; 2], 3, 0x91, 0.0f32.to_bits());
+        let mut controller_event = Vec::new();
+        append_data_event(&mut controller_event, 0xDF, &record);
+        let existing_stream_input = pattern_fixture(&[], &controller_event);
+        let mut existing_stream_document = FlpDocument::parse(&existing_stream_input)
+            .expect("project fixture with an existing stream should parse");
+        let matching_cc = MidiFile::parse(&midi_fixture(
+            &[0x00, 0xB0, 74, 127, 0x00, 0xFF, 0x2F, 0x00],
+            480,
+        ))
+        .expect("MIDI fixture should parse");
+        assert!(
+            existing_stream_document
+                .import_midi_control_changes_to_new_stream(&matching_cc, 0, 7, (3, 0x91), 74, None,)
+                .is_err()
+        );
+        assert_eq!(
+            existing_stream_document.encode_lossless().unwrap(),
+            existing_stream_input
         );
     }
 

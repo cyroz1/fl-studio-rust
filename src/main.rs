@@ -33,6 +33,7 @@ struct MidiControlChangeImport<'a> {
     target_stream: (u8, u8),
     controller_number: u8,
     midi_channel: Option<u8>,
+    new_stream: bool,
 }
 
 fn main() -> ExitCode {
@@ -2560,7 +2561,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             )
         }
         [command, input, midi_path, output, track, pattern_id, stream_channel, stream_flags, controller_number, midi_channel]
-            if command == "import-midi-cc" =>
+            if command == "import-midi-cc" || command == "import-midi-cc-new-stream" =>
         {
             import_midi_control_changes(
                 MidiControlChangeImport {
@@ -2575,6 +2576,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                     ),
                     controller_number: parse_u8(controller_number, "MIDI Control Change number")?,
                     midi_channel: parse_midi_channel_filter(midi_channel)?,
+                    new_stream: command == "import-midi-cc-new-stream",
                 },
             )
         }
@@ -3223,6 +3225,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild create-playlist-audio-clip <input.flp> <output.flp> <arrangement-id> <channel-id> <position-ticks> <length-ticks> <track-index:zero-based>\n",
             "  flp-rebuild import-midi <input.flp> <input.mid> <output.flp> <track> <pattern-id|new> <channel-id> [zero-velocity-note-ons:0|1] [realign-events:0|1] [midi-channels:all|none|1,2,...,16]\n",
             "  flp-rebuild import-midi-cc <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <raw-channel> <raw-flags> <cc-0..127> <midi-channel-1..16|all>\n",
+            "  flp-rebuild import-midi-cc-new-stream <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <raw-channel> <raw-flags> <cc-0..127> <midi-channel-1..16|all>\n",
             "  flp-rebuild import-midi-all <input.flp> <input.mid> <output.flp> <pattern-id|new> <channel-ids-comma-separated> [zero-velocity-note-ons:0|1] [realign-events:0|1] [midi-channels:all|none|1,2,...,16]\n",
             "  flp-rebuild import-midi-named-patterns <input.flp> <input.mid> <output.flp> <channel-id> [zero-velocity-note-ons:0|1] [realign-events:0|1] [midi-channels:all|none|1,2,...,16]\n",
             "  flp-rebuild import-midi-selected <input.flp> <input.mid> <output.flp> <pattern-id|new> <track-numbers:all|1,2,...> <selected-track-channel-ids-comma-separated> [zero-velocity-note-ons:0|1 realign-events:0|1 midi-channels:all|none|1,2,...,16]\n",
@@ -7464,14 +7467,15 @@ fn import_midi_control_changes(request: MidiControlChangeImport<'_>) -> Result<(
         target_stream,
         controller_number,
         midi_channel,
+        new_stream,
     } = request;
     let (_, mut document) = load_document(input)?;
     let midi_bytes = fs::read(midi_path)
         .map_err(|error| format!("could not read {}: {error}", midi_path.display()))?;
     let midi = MidiFile::parse(&midi_bytes)
         .map_err(|error| format!("could not parse {}: {error}", midi_path.display()))?;
-    let imported = document
-        .import_midi_control_changes(
+    let imported = if new_stream {
+        document.import_midi_control_changes_to_new_stream(
             &midi,
             track_index,
             pattern_id,
@@ -7479,7 +7483,17 @@ fn import_midi_control_changes(request: MidiControlChangeImport<'_>) -> Result<(
             controller_number,
             midi_channel,
         )
-        .map_err(|error| error.to_string())?;
+    } else {
+        document.import_midi_control_changes(
+            &midi,
+            track_index,
+            pattern_id,
+            target_stream,
+            controller_number,
+            midi_channel,
+        )
+    }
+    .map_err(|error| error.to_string())?;
     let bytes = document
         .encode_lossless()
         .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
@@ -7489,8 +7503,13 @@ fn import_midi_control_changes(request: MidiControlChangeImport<'_>) -> Result<(
         || "all channels".to_owned(),
         |channel| format!("MIDI channel {}", channel + 1),
     );
+    let stream_kind = if new_stream {
+        "new raw stream"
+    } else {
+        "raw stream"
+    };
     println!(
-        "imported {imported} MIDI CC {controller_number} events from track {track_index} ({source_channel}) into pattern {pattern_id}, raw stream {} / 0x{:02X} in {}",
+        "imported {imported} MIDI CC {controller_number} events from track {track_index} ({source_channel}) into pattern {pattern_id}, {stream_kind} {} / 0x{:02X} in {}",
         target_stream.0,
         target_stream.1,
         output.display()

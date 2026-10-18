@@ -3392,6 +3392,7 @@ struct PendingMidiCcImport {
     midi_channel: Option<u8>,
     pattern_id: u16,
     target_stream: (u8, u8),
+    new_stream: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -34882,6 +34883,7 @@ impl DawUi {
 
         let mut create_stream_requested = false;
         let mut open_midi_cc_import_requested = false;
+        let mut open_midi_cc_new_stream_requested = false;
         ui.horizontal_wrapped(|ui| {
             ui.strong("Pattern controller data");
             piano_roll_event_target_selector(ui, &mut self.piano_roll_event_target);
@@ -34949,6 +34951,9 @@ impl DawUi {
             {
                 open_midi_cc_import_requested = true;
             }
+            if ui.button("Import MIDI CC to new stream…").clicked() {
+                open_midi_cc_new_stream_requested = true;
+            }
             if streams.is_empty() {
                 ui.separator();
                 ui.label("New raw stream");
@@ -35002,7 +35007,9 @@ impl DawUi {
             ui,
             pattern.id,
             selected_stream,
+            &streams,
             open_midi_cc_import_requested,
+            open_midi_cc_new_stream_requested,
         );
 
         let size = Vec2::new(ui.available_width().max(1.0), 116.0);
@@ -35624,10 +35631,19 @@ impl DawUi {
         ui: &mut egui::Ui,
         pattern_id: u16,
         selected_stream: Option<(u8, u8)>,
-        open_requested: bool,
+        existing_streams: &BTreeSet<(u8, u8)>,
+        open_existing_requested: bool,
+        open_new_stream_requested: bool,
     ) {
-        if open_requested
-            && let Some(target_stream) = selected_stream
+        if (open_existing_requested || open_new_stream_requested)
+            && let Some(target_stream) = if open_new_stream_requested {
+                Some((
+                    self.piano_roll_controller_new_channel,
+                    self.piano_roll_controller_new_flags,
+                ))
+            } else {
+                selected_stream
+            }
             && let Some(path) = rfd::FileDialog::new()
                 .set_title("Import MIDI controller automation")
                 .add_filter("MIDI files", &["mid", "midi"])
@@ -35648,6 +35664,7 @@ impl DawUi {
                             midi_channel: None,
                             pattern_id,
                             target_stream,
+                            new_stream: open_new_stream_requested,
                         });
                         self.status =
                             format!("Loaded MIDI controller data from {}", path.display());
@@ -35671,10 +35688,30 @@ impl DawUi {
                     ui.strong("Import MIDI controller automation");
                     ui.weak(pending.path.display().to_string());
                 });
-                ui.label(format!(
-                    "Destination: Pattern {} · raw stream channel {} · flags 0x{:02X}",
-                    pending.pattern_id, pending.target_stream.0, pending.target_stream.1
-                ));
+                if pending.new_stream {
+                    ui.label(format!(
+                        "Destination: new raw stream in Pattern {}",
+                        pending.pattern_id
+                    ));
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::DragValue::new(&mut pending.target_stream.0)
+                                .range(0..=u8::MAX)
+                                .prefix("Channel "),
+                        );
+                        ui.add(
+                            egui::DragValue::new(&mut pending.target_stream.1)
+                                .range(0..=u8::MAX)
+                                .hexadecimal(2, false, true)
+                                .prefix("Flags 0x"),
+                        );
+                    });
+                } else {
+                    ui.label(format!(
+                        "Destination: Pattern {} · raw stream channel {} · flags 0x{:02X}",
+                        pending.pattern_id, pending.target_stream.0, pending.target_stream.1
+                    ));
+                }
 
                 let track_label = pending
                     .midi
@@ -35762,8 +35799,14 @@ impl DawUi {
 
                 if ui
                     .add_enabled(
-                        !controller_numbers.is_empty(),
-                        egui::Button::new("Import selected CC"),
+                        !controller_numbers.is_empty()
+                            && (!pending.new_stream
+                                || !existing_streams.contains(&pending.target_stream)),
+                        egui::Button::new(if pending.new_stream {
+                            "Import CC and create stream"
+                        } else {
+                            "Import selected CC"
+                        }),
                     )
                     .clicked()
                 {
@@ -35774,7 +35817,13 @@ impl DawUi {
                         pending.target_stream,
                         pending.controller_number,
                         pending.midi_channel,
+                        pending.new_stream,
                     ));
+                }
+                if pending.new_stream && existing_streams.contains(&pending.target_stream) {
+                    ui.weak(
+                        "Choose a channel/flags pair that is not already used by this Pattern.",
+                    );
                 }
                 cancel_requested = ui.button("Cancel").clicked();
             });
@@ -35782,7 +35831,7 @@ impl DawUi {
         if cancel_requested {
             self.pending_midi_cc_import = None;
         }
-        if let Some((midi, track_index, target_pattern, target_stream, cc, channel)) =
+        if let Some((midi, track_index, target_pattern, target_stream, cc, channel, new_stream)) =
             import_request
         {
             let result = self
@@ -35790,8 +35839,8 @@ impl DawUi {
                 .as_mut()
                 .ok_or_else(|| "no project is open".to_owned())
                 .and_then(|document| {
-                    document
-                        .import_midi_control_changes(
+                    let result = if new_stream {
+                        document.import_midi_control_changes_to_new_stream(
                             &midi,
                             track_index,
                             target_pattern,
@@ -35799,14 +35848,38 @@ impl DawUi {
                             cc,
                             channel,
                         )
-                        .map_err(|error| error.to_string())
+                    } else {
+                        document.import_midi_control_changes(
+                            &midi,
+                            track_index,
+                            target_pattern,
+                            target_stream,
+                            cc,
+                            channel,
+                        )
+                    };
+                    result.map_err(|error| error.to_string())
                 });
             match result {
                 Ok(imported) => {
                     self.dirty |= imported > 0;
-                    self.status = format!(
-                        "Imported {imported} MIDI CC {cc} events into Pattern {target_pattern}"
-                    );
+                    if new_stream && imported > 0 {
+                        self.piano_roll_controller_stream = Some(target_stream);
+                    }
+                    self.status = if new_stream && imported == 0 {
+                        format!(
+                            "No MIDI CC {cc} events matched in Pattern {target_pattern}; no raw stream was created"
+                        )
+                    } else {
+                        format!(
+                            "Imported {imported} MIDI CC {cc} events into Pattern {target_pattern}{}",
+                            if new_stream {
+                                " and created a raw stream"
+                            } else {
+                                ""
+                            }
+                        )
+                    };
                     self.pending_midi_cc_import = None;
                 }
                 Err(error) => {
