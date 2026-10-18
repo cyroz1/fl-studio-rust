@@ -3376,6 +3376,7 @@ struct PendingMidiImport {
     zero_velocity_note_ons_as_notes: bool,
     realign_events: bool,
     midi_channel_mask: u16,
+    set_mixer_tracks_for_new_channels: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -11868,6 +11869,7 @@ impl DawUi {
                             zero_velocity_note_ons_as_notes: false,
                             realign_events: false,
                             midi_channel_mask: u16::MAX,
+                            set_mixer_tracks_for_new_channels: false,
                         });
                         self.view = MainView::PianoRoll;
                         self.status = format!("Loaded MIDI file {}", path.display());
@@ -28084,6 +28086,7 @@ impl DawUi {
                             zero_velocity_note_ons_as_notes: false,
                             realign_events: false,
                             midi_channel_mask: u16::MAX,
+                            set_mixer_tracks_for_new_channels: false,
                         });
                         self.status = format!("Loaded MIDI file {}", path.display());
                     }
@@ -28166,6 +28169,8 @@ impl DawUi {
                                     pending.zero_velocity_note_ons_as_notes,
                                 realign_events: pending.realign_events,
                                 midi_channel_mask: pending.midi_channel_mask,
+                                set_mixer_tracks_for_new_channels:
+                                    pending.set_mixer_tracks_for_new_channels,
                             },
                         ));
                     }
@@ -28197,6 +28202,8 @@ impl DawUi {
                                     pending.zero_velocity_note_ons_as_notes,
                                 realign_events: pending.realign_events,
                                 midi_channel_mask: pending.midi_channel_mask,
+                                set_mixer_tracks_for_new_channels:
+                                    pending.set_mixer_tracks_for_new_channels,
                             },
                         ));
                     }
@@ -28224,6 +28231,8 @@ impl DawUi {
                                     pending.zero_velocity_note_ons_as_notes,
                                 realign_events: pending.realign_events,
                                 midi_channel_mask: pending.midi_channel_mask,
+                                set_mixer_tracks_for_new_channels:
+                                    pending.set_mixer_tracks_for_new_channels,
                             },
                         ));
                     }
@@ -28250,6 +28259,8 @@ impl DawUi {
                                 pending.zero_velocity_note_ons_as_notes,
                             realign_events: pending.realign_events,
                             midi_channel_mask: pending.midi_channel_mask,
+                            set_mixer_tracks_for_new_channels:
+                                pending.set_mixer_tracks_for_new_channels,
                         },
                     ));
                 }
@@ -28286,6 +28297,15 @@ impl DawUi {
                     }
                 });
             });
+            if pending.import_all_tracks || pending.midi.format() == 2 {
+                ui.checkbox(
+                    &mut pending.set_mixer_tracks_for_new_channels,
+                    "Set Mixer tracks for new channels",
+                )
+                .on_hover_text(
+                    "Route each newly created Sampler to the first available Mixer inserts, skipping inserts already assigned to existing channels.",
+                );
+            }
             if pending.import_all_tracks {
                 ui.vertical(|ui| {
                     ui.small("Choose a destination Channel Rack channel for each MIDI track.");

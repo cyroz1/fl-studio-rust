@@ -2568,6 +2568,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                     )?,
                     realign_events: false,
                     midi_channel_mask: u16::MAX,
+                    set_mixer_tracks_for_new_channels: false,
                 },
             )
         }
@@ -2637,6 +2638,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                     )?,
                     realign_events: false,
                     midi_channel_mask: u16::MAX,
+                    set_mixer_tracks_for_new_channels: false,
                 },
             )
         }
@@ -2704,6 +2706,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                     )?,
                     realign_events: false,
                     midi_channel_mask: u16::MAX,
+                    set_mixer_tracks_for_new_channels: false,
                 },
             )
         }
@@ -2735,6 +2738,23 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 )?,
             )
         }
+        [command, input, midi_path, output, pattern_id, template_channel_id, zero_velocity_note_ons, realign_events, midi_channels, set_mixer_tracks]
+            if command == "import-midi-sampler-tracks" =>
+        {
+            import_midi_sampler_tracks(
+                Path::new(input),
+                Path::new(midi_path),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(template_channel_id, "template channel id")?,
+                parse_midi_import_options_with_mixer_tracks(
+                    zero_velocity_note_ons,
+                    realign_events,
+                    midi_channels,
+                    set_mixer_tracks,
+                )?,
+            )
+        }
         [command, input, midi_path, output, template_channel_id]
             if command == "import-midi-format2" =>
         {
@@ -2761,6 +2781,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                     )?,
                     realign_events: false,
                     midi_channel_mask: u16::MAX,
+                    set_mixer_tracks_for_new_channels: false,
                 },
             )
         }
@@ -2787,6 +2808,22 @@ fn run(args: Vec<String>) -> Result<(), String> {
                     zero_velocity_note_ons,
                     realign_events,
                     midi_channels,
+                )?,
+            )
+        }
+        [command, input, midi_path, output, template_channel_id, zero_velocity_note_ons, realign_events, midi_channels, set_mixer_tracks]
+            if command == "import-midi-format2" =>
+        {
+            import_midi_format2(
+                Path::new(input),
+                Path::new(midi_path),
+                Path::new(output),
+                parse_u16(template_channel_id, "template channel id")?,
+                parse_midi_import_options_with_mixer_tracks(
+                    zero_velocity_note_ons,
+                    realign_events,
+                    midi_channels,
+                    set_mixer_tracks,
                 )?,
             )
         }
@@ -2925,8 +2962,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild create-playlist-audio-clip <input.flp> <output.flp> <arrangement-id> <channel-id> <position-ticks> <length-ticks> <track-index:zero-based>\n",
             "  flp-rebuild import-midi <input.flp> <input.mid> <output.flp> <track> <pattern-id> <channel-id> [zero-velocity-note-ons:0|1] [realign-events:0|1] [midi-channels:all|none|1,2,...,16]\n",
             "  flp-rebuild import-midi-all <input.flp> <input.mid> <output.flp> <pattern-id> <channel-ids-comma-separated> [zero-velocity-note-ons:0|1] [realign-events:0|1] [midi-channels:all|none|1,2,...,16]\n",
-            "  flp-rebuild import-midi-sampler-tracks <input.flp> <input.mid> <output.flp> <pattern-id> <template-channel-id> [zero-velocity-note-ons:0|1] [realign-events:0|1] [midi-channels:all|none|1,2,...,16]\n",
-            "  flp-rebuild import-midi-format2 <input.flp> <input.mid> <output.flp> <template-channel-id> [zero-velocity-note-ons:0|1] [realign-events:0|1] [midi-channels:all|none|1,2,...,16]\n",
+            "  flp-rebuild import-midi-sampler-tracks <input.flp> <input.mid> <output.flp> <pattern-id> <template-channel-id> [zero-velocity-note-ons:0|1] [realign-events:0|1] [midi-channels:all|none|1,2,...,16] [set-mixer-tracks:0|1]\n",
+            "  flp-rebuild import-midi-format2 <input.flp> <input.mid> <output.flp> <template-channel-id> [zero-velocity-note-ons:0|1] [realign-events:0|1] [midi-channels:all|none|1,2,...,16] [set-mixer-tracks:0|1]\n",
             "  flp-rebuild edit-clip <input.flp> <output.flp> <arrangement-id> <clip-index> <position> <length>\n",
             "  flp-rebuild delete-playlist-clip <input.flp> <output.flp> <arrangement-id> <clip-index>\n",
             "  flp-rebuild set-clip-muted <input.flp> <output.flp> <arrangement-id> <clip-index> <muted:0|1>\n",
@@ -3145,6 +3182,22 @@ fn parse_midi_import_options_with_channels(
 ) -> Result<MidiImportOptions, String> {
     let mut options = parse_midi_import_options(zero_velocity_note_ons, realign_events)?;
     options.midi_channel_mask = parse_midi_channel_mask(midi_channels)?;
+    Ok(options)
+}
+
+fn parse_midi_import_options_with_mixer_tracks(
+    zero_velocity_note_ons: &str,
+    realign_events: &str,
+    midi_channels: &str,
+    set_mixer_tracks: &str,
+) -> Result<MidiImportOptions, String> {
+    let mut options = parse_midi_import_options_with_channels(
+        zero_velocity_note_ons,
+        realign_events,
+        midi_channels,
+    )?;
+    options.set_mixer_tracks_for_new_channels =
+        parse_bool(set_mixer_tracks, "set Mixer tracks for new channels option")?;
     Ok(options)
 }
 
@@ -8001,7 +8054,8 @@ fn delete_time_marker(
 mod tests {
     use super::{
         parse_clip_indices, parse_midi_channel_mask, parse_midi_import_options,
-        parse_midi_import_options_with_channels, parse_raw_byte, parse_rgb_hex, parse_scale_name,
+        parse_midi_import_options_with_channels, parse_midi_import_options_with_mixer_tracks,
+        parse_raw_byte, parse_rgb_hex, parse_scale_name,
     };
     use flp_rebuild::midi::MidiImportOptions;
 
@@ -8013,6 +8067,7 @@ mod tests {
                 zero_velocity_note_ons_as_notes: true,
                 realign_events: false,
                 midi_channel_mask: u16::MAX,
+                set_mixer_tracks_for_new_channels: false,
             })
         );
         assert_eq!(
@@ -8021,6 +8076,7 @@ mod tests {
                 zero_velocity_note_ons_as_notes: false,
                 realign_events: true,
                 midi_channel_mask: u16::MAX,
+                set_mixer_tracks_for_new_channels: false,
             })
         );
         assert!(parse_midi_import_options("0", "2").is_err());
@@ -8030,8 +8086,17 @@ mod tests {
                 zero_velocity_note_ons_as_notes: false,
                 realign_events: true,
                 midi_channel_mask: (1u16 << 1) | (1u16 << 2),
+                set_mixer_tracks_for_new_channels: false,
             })
         );
+        assert_eq!(
+            parse_midi_import_options_with_mixer_tracks("0", "0", "all", "1"),
+            Ok(MidiImportOptions {
+                set_mixer_tracks_for_new_channels: true,
+                ..MidiImportOptions::default()
+            })
+        );
+        assert!(parse_midi_import_options_with_mixer_tracks("0", "0", "all", "2").is_err());
     }
 
     #[test]

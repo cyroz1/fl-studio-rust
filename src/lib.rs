@@ -13807,6 +13807,8 @@ impl FlpDocument {
     }
 
     /// Creates Sampler channels for MIDI tracks and imports them with explicit note options.
+    /// When `set_mixer_tracks_for_new_channels` is enabled, the new channels are assigned to
+    /// the lowest positive Mixer insert numbers that are not assigned to existing channels.
     pub fn import_midi_tracks_to_sampler_channels_with_options(
         &mut self,
         midi: &midi::MidiFile,
@@ -13825,13 +13827,23 @@ impl FlpDocument {
             ));
         }
 
+        let mixer_tracks = if options.set_mixer_tracks_for_new_channels {
+            Some(self.first_free_mixer_tracks(midi.tracks().len())?)
+        } else {
+            None
+        };
+
         let mut candidate = self.clone();
         let mut channel_ids = Vec::with_capacity(midi.tracks().len());
         for (track_index, track) in midi.tracks().iter().enumerate() {
-            channel_ids.push(candidate.duplicate_sampler_channel(
+            let channel_id = candidate.duplicate_sampler_channel(
                 template_channel_id,
                 &Self::midi_track_display_name(track, track_index),
-            )?);
+            )?;
+            if let Some(mixer_tracks) = &mixer_tracks {
+                candidate.set_channel_mixer_track(channel_id, mixer_tracks[track_index])?;
+            }
+            channel_ids.push(channel_id);
         }
 
         let imported =
@@ -13855,7 +13867,9 @@ impl FlpDocument {
         )
     }
 
-    /// Imports every Format-2 sequence using explicit note interpretation options.
+    /// Imports every Format-2 sequence using explicit note interpretation and routing options.
+    /// When `set_mixer_tracks_for_new_channels` is enabled, each new Sampler uses the lowest
+    /// positive Mixer insert number that is not assigned to an existing channel.
     pub fn import_midi_format2_tracks_to_sampler_patterns_with_options(
         &mut self,
         midi: &midi::MidiFile,
@@ -13873,6 +13887,12 @@ impl FlpDocument {
             ));
         }
 
+        let mixer_tracks = if options.set_mixer_tracks_for_new_channels {
+            Some(self.first_free_mixer_tracks(midi.tracks().len())?)
+        } else {
+            None
+        };
+
         let mut candidate = self.clone();
         let mut destinations = Vec::with_capacity(midi.tracks().len());
         let mut total_imported = 0usize;
@@ -13882,6 +13902,9 @@ impl FlpDocument {
             candidate.set_pattern_name(pattern_id, &track_name)?;
             let channel_id =
                 candidate.duplicate_sampler_channel(template_channel_id, &track_name)?;
+            if let Some(mixer_tracks) = &mixer_tracks {
+                candidate.set_channel_mixer_track(channel_id, mixer_tracks[track_index])?;
+            }
             let imported = candidate.import_midi_track_with_options(
                 midi,
                 track_index,
@@ -13896,6 +13919,25 @@ impl FlpDocument {
         }
         *self = candidate;
         Ok((total_imported, destinations))
+    }
+
+    fn first_free_mixer_tracks(&self, count: usize) -> Result<Vec<i8>, FlpError> {
+        let used_tracks = self
+            .channels()
+            .into_iter()
+            .filter_map(|channel| channel.mixer_track())
+            .filter(|track| *track > 0)
+            .collect::<HashSet<_>>();
+        let tracks = (1..=i8::MAX)
+            .filter(|track| !used_tracks.contains(track))
+            .take(count)
+            .collect::<Vec<_>>();
+        if tracks.len() != count {
+            return Err(FlpError::UnsupportedEdit(
+                "there are not enough unassigned Mixer inserts for the new MIDI channels",
+            ));
+        }
+        Ok(tracks)
     }
 
     fn import_midi_track_in_place(
@@ -15455,6 +15497,67 @@ impl FlpDocument {
             candidate
                 .events
                 .insert(kind_index + 1, FlpEvent::new_byte(0x00, u8::from(enabled)));
+        }
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    /// Routes a channel to the selected Mixer track using its signed-byte `0x16` event.
+    /// `-1` means Current, `0` means Master, and positive values select Mixer inserts.
+    /// If the channel has no assignment event, one is inserted after its recognized kind event.
+    pub fn set_channel_mixer_track(
+        &mut self,
+        channel_id: u16,
+        mixer_track: i8,
+    ) -> Result<(), FlpError> {
+        if mixer_track < -1 {
+            return Err(FlpError::UnsupportedEdit(
+                "Mixer track assignments must be Current (-1), Master (0), or insert 1 through 127",
+            ));
+        }
+        self.require_unique_channel(channel_id)?;
+        let channel = self
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id() == channel_id)
+            .expect("the unique channel was checked above");
+        let assignment_events = channel
+            .event_range()
+            .filter(|index| self.events[*index].opcode == 0x16)
+            .collect::<Vec<_>>();
+        if assignment_events.len() > 1 {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel has multiple 0x16 Mixer track assignments",
+            ));
+        }
+
+        let mut candidate = self.clone();
+        if let Some(event_index) = assignment_events.first().copied() {
+            candidate.events[event_index].replace_byte_payload(mixer_track as u8)?;
+        } else {
+            let mut kind_events = channel
+                .event_range()
+                .filter(|index| self.events[*index].opcode == 0x15);
+            let Some(kind_index) = kind_events.next() else {
+                return Err(FlpError::UnsupportedEdit(
+                    "the selected channel has no recognized 0x15 kind event",
+                ));
+            };
+            if kind_events.next().is_some() {
+                return Err(FlpError::UnsupportedEdit(
+                    "the selected channel has multiple 0x15 kind events",
+                ));
+            }
+            let kind_event = &candidate.events[kind_index];
+            if kind_event.encoding != PayloadEncoding::Byte || kind_event.payload.len() != 1 {
+                return Err(FlpError::UnsupportedEdit(
+                    "the selected channel's 0x15 kind event is not a one-byte event",
+                ));
+            }
+            candidate
+                .events
+                .insert(kind_index + 1, FlpEvent::new_byte(0x16, mixer_track as u8));
         }
         candidate.refresh_event_offsets()?;
         *self = candidate;
@@ -23219,6 +23322,65 @@ mod tests {
     }
 
     #[test]
+    fn sets_channel_mixer_track_by_updating_or_inserting_its_event_losslessly() {
+        let tail = [0xA5, 0x5A];
+        for has_assignment_event in [false, true] {
+            let mut event_stream = vec![0x40, 7, 0, 0x15, 0];
+            if has_assignment_event {
+                event_stream.extend_from_slice(&[0x16, 3]);
+            }
+            event_stream.extend_from_slice(&[0x48, 0x34, 0x12, 0x62, 0, 0]);
+            let input = flp_fixture(&event_stream, &[], &tail);
+            let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+            let mut expected_events = document
+                .events()
+                .iter()
+                .map(|event| event.wire_bytes.clone())
+                .collect::<Vec<_>>();
+
+            if has_assignment_event {
+                let assignment_index = document
+                    .events()
+                    .iter()
+                    .position(|event| event.opcode() == 0x16)
+                    .expect("fixture should have an assignment event");
+                expected_events[assignment_index] = vec![0x16, 0xFF];
+            } else {
+                let kind_index = document
+                    .events()
+                    .iter()
+                    .position(|event| event.opcode() == 0x15)
+                    .expect("fixture should have a channel kind event");
+                expected_events.insert(kind_index + 1, vec![0x16, 0xFF]);
+            }
+
+            document
+                .set_channel_mixer_track(7, -1)
+                .expect("channel should route to Current");
+
+            assert_eq!(document.channels()[0].mixer_track(), Some(-1));
+            assert_eq!(
+                document
+                    .events()
+                    .iter()
+                    .map(|event| event.wire_bytes.clone())
+                    .collect::<Vec<_>>(),
+                expected_events
+            );
+            let encoded = document.encode_lossless().expect("document should encode");
+            assert!(encoded.ends_with(&tail));
+            let round_trip = FlpDocument::parse(&encoded).expect("updated project should parse");
+            assert_eq!(round_trip.channels()[0].mixer_track(), Some(-1));
+        }
+
+        let input = flp_fixture(&[0x40, 7, 0, 0x15, 0, 0x62, 0, 0], &[], &tail);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+        let before = document.encode_lossless().expect("document should encode");
+        assert!(document.set_channel_mixer_track(7, -2).is_err());
+        assert_eq!(document.encode_lossless().unwrap(), before);
+    }
+
+    #[test]
     fn reads_and_sets_channel_swing_mix_losslessly() {
         let tail = [0xDE, 0xAD];
         for (kind, initial_mix, requested_mix, expected_mix, inserted) in [
@@ -27179,6 +27341,95 @@ mod tests {
     }
 
     #[test]
+    fn midi_track_sampler_creation_can_route_to_first_free_mixer_inserts() {
+        let midi = MidiFile::parse(&midi_tracks_fixture(
+            &[
+                &[
+                    0x00, 0x90, 0x3C, 0x64, // First track: C4.
+                    0x60, 0x80, 0x3C, 0x00, 0x00, 0xFF, 0x2F, 0x00,
+                ],
+                &[
+                    0x00, 0x90, 0x43, 0x50, // Second track: G4.
+                    0x60, 0x80, 0x43, 0x00, 0x00, 0xFF, 0x2F, 0x00,
+                ],
+            ],
+            1,
+            480,
+        ))
+        .expect("two-track MIDI fixture should parse");
+        let mut stream = vec![
+            0x40, 0, 0, // Sampler template, ID 0.
+            0x15, 0, // Kind-0 Sampler.
+            0x16, 1, // Template already routes to insert 1.
+            0x00, 1,
+        ];
+        let sample_path = "/samples/template.wav"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .chain([0, 0])
+            .collect::<Vec<_>>();
+        append_data_event(&mut stream, 0xC4, &sample_path);
+        let template_name = "Template"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .chain([0, 0])
+            .collect::<Vec<_>>();
+        append_data_event(&mut stream, 0xCB, &template_name);
+        stream.extend_from_slice(&[
+            0x40, 1, 0, // Existing channel, ID 1.
+            0x15, 2, // Native instrument channel.
+            0x16, 3, // Insert 3 is also already assigned.
+            0x62, 0, 0, // End of Channel Rack data.
+            0x41, 7, 0, 0xD0, 0, // Empty Pattern 7.
+        ]);
+        let original = flp_fixture(&stream, &[], &[]);
+        let mut document = FlpDocument::parse(&original).expect("project should parse");
+
+        let (imported, channel_ids) = document
+            .import_midi_tracks_to_sampler_channels_with_options(
+                &midi,
+                7,
+                0,
+                MidiImportOptions {
+                    set_mixer_tracks_for_new_channels: true,
+                    ..MidiImportOptions::default()
+                },
+            )
+            .expect("new Samplers should route to the first free inserts");
+
+        assert_eq!(imported, 2);
+        let channels = document.channels();
+        let assignments = channel_ids
+            .iter()
+            .map(|channel_id| {
+                channels
+                    .iter()
+                    .find(|channel| channel.id() == *channel_id)
+                    .expect("created Sampler should exist")
+                    .mixer_track()
+                    .expect("created Sampler should have a Mixer assignment")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(assignments, [2, 4]);
+        assert_eq!(
+            channels
+                .iter()
+                .find(|channel| channel.id() == 0)
+                .expect("template should remain")
+                .mixer_track(),
+            Some(1)
+        );
+        assert_eq!(
+            channels
+                .iter()
+                .find(|channel| channel.id() == 1)
+                .expect("existing channel should remain")
+                .mixer_track(),
+            Some(3)
+        );
+    }
+
+    #[test]
     fn imports_format_two_midi_tracks_into_separate_sampler_patterns() {
         let midi = MidiFile::parse(&midi_tracks_fixture(
             &[
@@ -27258,6 +27509,32 @@ mod tests {
             assert_eq!(channel.display_name(), Some(expected_name));
             assert_eq!(channel.sample_path(), Some("/samples/template.wav"));
         }
+
+        let mut routed_document =
+            FlpDocument::parse(&original).expect("project should parse for routed import");
+        let (_, routed_destinations) = routed_document
+            .import_midi_format2_tracks_to_sampler_patterns_with_options(
+                &midi,
+                0,
+                MidiImportOptions {
+                    set_mixer_tracks_for_new_channels: true,
+                    ..MidiImportOptions::default()
+                },
+            )
+            .expect("Format-2 Samplers should route to free inserts");
+        let routed_channels = routed_document.channels();
+        let routed_tracks = routed_destinations
+            .iter()
+            .map(|(_, channel_id)| {
+                routed_channels
+                    .iter()
+                    .find(|channel| channel.id() == *channel_id)
+                    .expect("routed Format-2 Sampler should exist")
+                    .mixer_track()
+                    .expect("routed Format-2 Sampler should have an assignment")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(routed_tracks, [1, 2]);
 
         let mut non_sampler_stream = stream;
         let kind_event = non_sampler_stream

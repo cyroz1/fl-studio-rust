@@ -58,6 +58,9 @@ pub struct MidiImportOptions {
     /// Include these MIDI channels, with bit 0 representing MIDI channel 1.
     /// The default mask includes all 16 channels.
     pub midi_channel_mask: u16,
+    /// Assign newly created MIDI-track Sampler channels to the first unassigned Mixer inserts.
+    /// This option has no effect when MIDI notes are imported into existing channels.
+    pub set_mixer_tracks_for_new_channels: bool,
 }
 
 impl Default for MidiImportOptions {
@@ -66,6 +69,7 @@ impl Default for MidiImportOptions {
             zero_velocity_note_ons_as_notes: false,
             realign_events: false,
             midi_channel_mask: u16::MAX,
+            set_mixer_tracks_for_new_channels: false,
         }
     }
 }
