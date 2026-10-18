@@ -2848,6 +2848,66 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 )?,
             )
         }
+        [command, input, midi_path, output, pattern_id, template_channel_id, track_numbers]
+            if command == "import-midi-template-tracks" =>
+        {
+            import_midi_template_tracks(
+                Path::new(input),
+                Path::new(midi_path),
+                Path::new(output),
+                parse_midi_pattern_target(pattern_id)?,
+                parse_u16(template_channel_id, "template channel id")?,
+                track_numbers,
+                MidiImportOptions::default(),
+            )
+        }
+        [command, input, midi_path, output, pattern_id, template_channel_id, track_numbers, zero_velocity_note_ons, realign_events, midi_channels, set_mixer_tracks]
+            if command == "import-midi-template-tracks" =>
+        {
+            import_midi_template_tracks(
+                Path::new(input),
+                Path::new(midi_path),
+                Path::new(output),
+                parse_midi_pattern_target(pattern_id)?,
+                parse_u16(template_channel_id, "template channel id")?,
+                track_numbers,
+                parse_midi_import_options_with_mixer_tracks(
+                    zero_velocity_note_ons,
+                    realign_events,
+                    midi_channels,
+                    set_mixer_tracks,
+                )?,
+            )
+        }
+        [command, input, midi_path, output, template_channel_id, track_numbers]
+            if command == "import-midi-template-format2" =>
+        {
+            import_midi_template_format2_tracks(
+                Path::new(input),
+                Path::new(midi_path),
+                Path::new(output),
+                parse_u16(template_channel_id, "template channel id")?,
+                track_numbers,
+                MidiImportOptions::default(),
+            )
+        }
+        [command, input, midi_path, output, template_channel_id, track_numbers, zero_velocity_note_ons, realign_events, midi_channels, set_mixer_tracks]
+            if command == "import-midi-template-format2" =>
+        {
+            import_midi_template_format2_tracks(
+                Path::new(input),
+                Path::new(midi_path),
+                Path::new(output),
+                parse_u16(template_channel_id, "template channel id")?,
+                track_numbers,
+                parse_midi_import_options_with_mixer_tracks(
+                    zero_velocity_note_ons,
+                    realign_events,
+                    midi_channels,
+                    set_mixer_tracks,
+                )?,
+            )
+        }
         [command, input, midi_path, output, pattern_id, template_channel_id]
             if command == "import-midi-sampler-tracks" =>
         {
@@ -3138,6 +3198,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild import-midi-sampler-tracks-selected <input.flp> <input.mid> <output.flp> <pattern-id|new> <template-channel-id> <track-numbers:all|1,2,...> [zero-velocity-note-ons:0|1 realign-events:0|1 midi-channels:all|none|1,2,...,16 set-mixer-tracks:0|1]\n",
             "  flp-rebuild import-midi-format2-selected <input.flp> <input.mid> <output.flp> <template-channel-id> <track-numbers:all|1,2,...> [zero-velocity-note-ons:0|1 realign-events:0|1 midi-channels:all|none|1,2,...,16 set-mixer-tracks:0|1]\n",
             "  flp-rebuild import-midi-new-project <template.flp> <input.mid> <output.flp> <template-channel-id> <track-numbers:all|1,2,...> [zero-velocity-note-ons:0|1 realign-events:0|1 midi-channels:all|none|1,2,...,16 set-mixer-tracks:0|1]\n",
+            "  flp-rebuild import-midi-template-tracks <input.flp> <input.mid> <output.flp> <pattern-id|new> <template-channel-id> <track-numbers:all|1,2,...> [zero-velocity-note-ons:0|1 realign-events:0|1 midi-channels:all|none|1,2,...,16 set-mixer-tracks:0|1]\n",
+            "  flp-rebuild import-midi-template-format2 <input.flp> <input.mid> <output.flp> <template-channel-id> <track-numbers:all|1,2,...> [zero-velocity-note-ons:0|1 realign-events:0|1 midi-channels:all|none|1,2,...,16 set-mixer-tracks:0|1]\n",
             "  flp-rebuild import-midi-sampler-tracks <input.flp> <input.mid> <output.flp> <pattern-id|new> <template-channel-id> [zero-velocity-note-ons:0|1] [realign-events:0|1] [midi-channels:all|none|1,2,...,16] [set-mixer-tracks:0|1]\n",
             "  flp-rebuild import-midi-format2 <input.flp> <input.mid> <output.flp> <template-channel-id> [zero-velocity-note-ons:0|1] [realign-events:0|1] [midi-channels:all|none|1,2,...,16] [set-mixer-tracks:0|1]\n",
             "  flp-rebuild edit-clip <input.flp> <output.flp> <arrangement-id> <clip-index> <position> <length>\n",
@@ -7622,6 +7684,108 @@ fn import_midi_sampler_tracks(
         .join(",");
     println!(
         "created Sampler channels {channel_ids} and imported {imported} MIDI notes into pattern {pattern_id} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn import_midi_template_tracks(
+    input: &Path,
+    midi_path: &Path,
+    output: &Path,
+    pattern_id: Option<u16>,
+    template_channel_id: u16,
+    track_numbers: &str,
+    options: MidiImportOptions,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let midi_bytes = fs::read(midi_path)
+        .map_err(|error| format!("could not read {}: {error}", midi_path.display()))?;
+    let midi = MidiFile::parse(&midi_bytes)
+        .map_err(|error| format!("could not parse {}: {error}", midi_path.display()))?;
+    let track_indices = parse_midi_track_selection(track_numbers, midi.tracks().len())?;
+    let (pattern_id, imported, channel_ids) = if let Some(pattern_id) = pattern_id {
+        let (imported, channel_ids) = document
+            .import_midi_selected_tracks_to_template_channels_with_options(
+                &midi,
+                pattern_id,
+                template_channel_id,
+                &track_indices,
+                options,
+            )
+            .map_err(|error| error.to_string())?;
+        (pattern_id, imported, channel_ids)
+    } else {
+        document
+            .import_midi_selected_tracks_to_template_channels_in_new_pattern_with_options(
+                &midi,
+                template_channel_id,
+                &track_indices,
+                options,
+            )
+            .map_err(|error| error.to_string())?
+    };
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    let channel_ids = channel_ids
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    println!(
+        "created template channels {channel_ids} from MIDI tracks {} and imported {imported} notes into pattern {pattern_id} in {}",
+        track_indices
+            .iter()
+            .map(|index| (index + 1).to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+        output.display()
+    );
+    Ok(())
+}
+
+fn import_midi_template_format2_tracks(
+    input: &Path,
+    midi_path: &Path,
+    output: &Path,
+    template_channel_id: u16,
+    track_numbers: &str,
+    options: MidiImportOptions,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let midi_bytes = fs::read(midi_path)
+        .map_err(|error| format!("could not read {}: {error}", midi_path.display()))?;
+    let midi = MidiFile::parse(&midi_bytes)
+        .map_err(|error| format!("could not parse {}: {error}", midi_path.display()))?;
+    let track_indices = parse_midi_track_selection(track_numbers, midi.tracks().len())?;
+    let (imported, destinations) = document
+        .import_midi_selected_format2_tracks_to_template_patterns_with_options(
+            &midi,
+            template_channel_id,
+            &track_indices,
+            options,
+        )
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    let destinations = destinations
+        .iter()
+        .map(|(pattern_id, channel_id)| format!("{pattern_id}:{channel_id}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    println!(
+        "imported {imported} Format-2 notes from tracks {} into template-channel Pattern:channel pairs {destinations} in {}",
+        track_indices
+            .iter()
+            .map(|index| (index + 1).to_string())
+            .collect::<Vec<_>>()
+            .join(","),
         output.display()
     );
     Ok(())

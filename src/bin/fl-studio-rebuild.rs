@@ -7426,14 +7426,15 @@ impl DawUi {
                     template_path.display()
                 )
             })?;
-            let template_channel_id = template
-                .channels()
-                .into_iter()
+            let channels = template.channels();
+            let template_channel_id = channels
+                .iter()
                 .find(|channel| channel.kind() == Some(0))
+                .or_else(|| channels.iter().find(|channel| channel.kind() == Some(2)))
                 .map(|channel| channel.id())
                 .ok_or_else(|| {
                     format!(
-                        "Project template {} has no Sampler channel to copy",
+                        "Project template {} has no Sampler or Native instrument channel to copy",
                         template_path.display()
                     )
                 })?;
@@ -28520,17 +28521,25 @@ impl DawUi {
         let mut import_midi_request = None;
         let mut import_all_midi_request = None;
         let mut import_named_midi_patterns_request = None;
-        let mut create_sampler_midi_request = None;
-        let mut create_format2_midi_request = None;
+        let mut create_template_midi_request = None;
+        let mut create_format2_template_midi_request = None;
         let mut new_project_midi_request = None;
         let mut choose_project_template = false;
         let mut clear_midi_import = false;
-        let selected_sampler_template = self.selected_note_channel.filter(|channel_id| {
-            available_midi_channels
-                .iter()
-                .any(|channel| channel.id() == *channel_id && channel.kind() == Some(0))
-        });
         if let Some(pending) = &mut self.pending_midi_import {
+            let selected_midi_template = self.selected_note_channel.and_then(|channel_id| {
+                available_midi_channels
+                    .iter()
+                    .find(|channel| {
+                        channel.id() == channel_id && matches!(channel.kind(), Some(0 | 2))
+                    })
+                    .map(|channel| (channel_id, channel.kind().unwrap_or_default()))
+            });
+            let template_type_name = match selected_midi_template.map(|(_, kind)| kind) {
+                Some(0) => "Sampler",
+                Some(2) => "Native",
+                _ => "instrument",
+            };
             ui.horizontal(|ui| {
                 ui.small(pending.path.file_name().map_or_else(
                     || "MIDI".to_owned(),
@@ -28706,20 +28715,20 @@ impl DawUi {
                                     && self.document.is_some()
                                     && pending.midi_channel_mask != 0
                                     && !selected_track_indices.is_empty()
-                                    && selected_sampler_template.is_some(),
+                                    && selected_midi_template.is_some(),
                                 egui::Button::new(if pending.create_new_pattern {
-                                    "Create Samplers in new Pattern"
+                                    format!("Create {template_type_name} channels in new Pattern")
                                 } else {
-                                    "Create Sampler channels"
+                                    format!("Create {template_type_name} channels")
                                 }),
                             )
                             .on_hover_text(
-                                "Copy the selected Sampler's sample and settings for each selected MIDI track, then import those tracks into their new channels.",
+                                "Copy the selected Sampler or Native instrument channel state for each selected MIDI track, then import those tracks into the new channels.",
                             )
                             .clicked()
-                        && let Some(template_channel_id) = selected_sampler_template
+                        && let Some((template_channel_id, _)) = selected_midi_template
                     {
-                        create_sampler_midi_request = Some((
+                        create_template_midi_request = Some((
                             pending.midi.clone(),
                             selected_track_indices.clone(),
                             target_pattern_id,
@@ -28737,7 +28746,7 @@ impl DawUi {
                             egui::Button::new("Create new project from selected sequences"),
                         )
                         .on_hover_text(
-                            "Create one Pattern and cloned Sampler channel for each selected Format-2 sequence.",
+                            "Create one Pattern and cloned channel from the project template for each selected Format-2 sequence.",
                         )
                         .clicked()
                         && let Some(template_path) = pending.project_template_path.clone()
@@ -28754,16 +28763,16 @@ impl DawUi {
                         self.selected_pattern.is_some()
                             && pending.midi_channel_mask != 0
                             && !selected_track_indices.is_empty()
-                            && selected_sampler_template.is_some(),
-                        egui::Button::new("Create separate patterns + Samplers"),
+                            && selected_midi_template.is_some(),
+                        egui::Button::new(format!("Create separate patterns + {template_type_name} channels")),
                     )
                     .on_hover_text(
-                        "Create one new Pattern and named Sampler channel for each selected independent Format-2 sequence.",
+                        "Create one new Pattern and named channel from the selected Sampler or Native template for each selected independent Format-2 sequence.",
                     )
                     .clicked()
-                    && let Some(template_channel_id) = selected_sampler_template
+                    && let Some((template_channel_id, _)) = selected_midi_template
                 {
-                    create_format2_midi_request = Some((
+                    create_format2_template_midi_request = Some((
                         pending.midi.clone(),
                         selected_track_indices,
                         template_channel_id,
@@ -29120,7 +29129,7 @@ impl DawUi {
             }
         }
         if let Some((midi, track_indices, target_pattern_id, template_channel_id, options)) =
-            create_sampler_midi_request
+            create_template_midi_request
         {
             let selected_track_index = track_indices
                 .iter()
@@ -29134,7 +29143,7 @@ impl DawUi {
             if let Some(document) = &mut self.document {
                 let result = if let Some(pattern_id) = target_pattern_id {
                     document
-                        .import_midi_selected_tracks_to_sampler_channels_with_options(
+                        .import_midi_selected_tracks_to_template_channels_with_options(
                             &midi,
                             pattern_id,
                             template_channel_id,
@@ -29144,7 +29153,7 @@ impl DawUi {
                         .map(|(imported, channel_ids)| (pattern_id, imported, channel_ids))
                 } else {
                     document
-                        .import_midi_selected_tracks_to_sampler_channels_in_new_pattern_with_options(
+                        .import_midi_selected_tracks_to_template_channels_in_new_pattern_with_options(
                             &midi,
                             template_channel_id,
                             &track_indices,
@@ -29172,12 +29181,12 @@ impl DawUi {
                         self.dirty = true;
                         self.status = if target_pattern_id.is_none() {
                             format!(
-                                "Created {} Sampler channels from selected MIDI tracks and imported {imported} notes into new pattern {pattern_id}",
+                                "Created {} MIDI template channels from selected MIDI tracks and imported {imported} notes into new pattern {pattern_id}",
                                 channel_ids.len()
                             )
                         } else {
                             format!(
-                                "Created {} Sampler channels from selected MIDI tracks and imported {imported} notes into pattern {pattern_id}",
+                                "Created {} MIDI template channels from selected MIDI tracks and imported {imported} notes into pattern {pattern_id}",
                                 channel_ids.len()
                             )
                         };
@@ -29187,7 +29196,7 @@ impl DawUi {
             }
         }
         if let Some((midi, track_indices, template_channel_id, options)) =
-            create_format2_midi_request
+            create_format2_template_midi_request
         {
             let selected_track_index = track_indices
                 .iter()
@@ -29198,12 +29207,13 @@ impl DawUi {
                 })
                 .unwrap_or(0);
             if let Some(document) = &mut self.document {
-                match document.import_midi_selected_format2_tracks_to_sampler_patterns_with_options(
-                    &midi,
-                    template_channel_id,
-                    &track_indices,
-                    options,
-                ) {
+                match document
+                    .import_midi_selected_format2_tracks_to_template_patterns_with_options(
+                        &midi,
+                        template_channel_id,
+                        &track_indices,
+                        options,
+                    ) {
                     Ok((imported, destinations)) => {
                         self.stop_project_playback();
                         if let Some((pattern_id, channel_id)) =
@@ -29221,7 +29231,7 @@ impl DawUi {
                         }
                         self.dirty = true;
                         self.status = format!(
-                            "Imported {imported} notes from {} selected Format-2 tracks into separate Patterns with Sampler channels",
+                            "Imported {imported} notes from {} selected Format-2 tracks into separate Patterns with cloned instrument channels",
                             destinations.len()
                         );
                     }

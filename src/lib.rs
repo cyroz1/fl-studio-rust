@@ -13987,6 +13987,24 @@ impl FlpDocument {
         )
     }
 
+    /// Creates one named Sampler or Native instrument channel per format-0/1 MIDI track
+    /// using the supplied channel as a template, then imports each selected track into the
+    /// existing Pattern. Channel state is copied verbatim except for its unique ID and name.
+    /// The operation is atomic and rejects Format-2 files and invalid track selections.
+    pub fn import_midi_tracks_to_template_channels(
+        &mut self,
+        midi: &midi::MidiFile,
+        pattern_id: u16,
+        template_channel_id: u16,
+    ) -> Result<(usize, Vec<u16>), FlpError> {
+        self.import_midi_tracks_to_template_channels_with_options(
+            midi,
+            pattern_id,
+            template_channel_id,
+            midi::MidiImportOptions::default(),
+        )
+    }
+
     /// Imports every MIDI track into a separately named Pattern using the supplied options.
     ///
     /// If any track fails, the source document remains unchanged. Format-2 tracks are also
@@ -14059,6 +14077,98 @@ impl FlpDocument {
         self.events.insert(marker_index + 2, name_event);
         self.refresh_event_offsets()?;
         Ok(())
+    }
+
+    /// Creates channels from a Sampler or Native instrument template for every format-0/1
+    /// track and imports the notes with the requested interpretation and routing options.
+    pub fn import_midi_tracks_to_template_channels_with_options(
+        &mut self,
+        midi: &midi::MidiFile,
+        pattern_id: u16,
+        template_channel_id: u16,
+        options: midi::MidiImportOptions,
+    ) -> Result<(usize, Vec<u16>), FlpError> {
+        let track_indices = (0..midi.tracks().len()).collect::<Vec<_>>();
+        self.import_midi_selected_tracks_to_template_channels_with_options(
+            midi,
+            pattern_id,
+            template_channel_id,
+            &track_indices,
+            options,
+        )
+    }
+
+    /// Creates channels from a Sampler or Native instrument template for selected format-0/1
+    /// tracks and imports them into an existing Pattern.
+    pub fn import_midi_selected_tracks_to_template_channels(
+        &mut self,
+        midi: &midi::MidiFile,
+        pattern_id: u16,
+        template_channel_id: u16,
+        track_indices: &[usize],
+    ) -> Result<(usize, Vec<u16>), FlpError> {
+        self.import_midi_selected_tracks_to_template_channels_with_options(
+            midi,
+            pattern_id,
+            template_channel_id,
+            track_indices,
+            midi::MidiImportOptions::default(),
+        )
+    }
+
+    /// Creates channels from a Sampler or Native instrument template for selected format-0/1
+    /// tracks and imports them with the requested note interpretation and routing options.
+    /// When Mixer routing is enabled, channels use the lowest free positive insert numbers.
+    pub fn import_midi_selected_tracks_to_template_channels_with_options(
+        &mut self,
+        midi: &midi::MidiFile,
+        pattern_id: u16,
+        template_channel_id: u16,
+        track_indices: &[usize],
+        options: midi::MidiImportOptions,
+    ) -> Result<(usize, Vec<u16>), FlpError> {
+        if midi.format() == 2 {
+            return Err(FlpError::UnsupportedEdit(
+                "Format-2 MIDI tracks are independent sequences; import them one at a time",
+            ));
+        }
+        if midi.tracks().is_empty() {
+            return Err(FlpError::UnsupportedEdit(
+                "the MIDI file contains no tracks to import",
+            ));
+        }
+        Self::validate_midi_track_selection(midi, track_indices)?;
+        self.midi_template_channel_kind(template_channel_id)?;
+
+        let mixer_tracks = if options.set_mixer_tracks_for_new_channels {
+            Some(self.first_free_mixer_tracks(track_indices.len())?)
+        } else {
+            None
+        };
+
+        let mut candidate = self.clone();
+        let mut channel_ids = Vec::with_capacity(track_indices.len());
+        for (selection_index, track_index) in track_indices.iter().copied().enumerate() {
+            let track = &midi.tracks()[track_index];
+            let channel_id = candidate.duplicate_midi_template_channel(
+                template_channel_id,
+                &Self::midi_track_display_name(track, track_index),
+            )?;
+            if let Some(mixer_tracks) = &mixer_tracks {
+                candidate.set_channel_mixer_track(channel_id, mixer_tracks[selection_index])?;
+            }
+            channel_ids.push(channel_id);
+        }
+
+        let imported = candidate.import_midi_selected_tracks_with_options(
+            midi,
+            pattern_id,
+            track_indices,
+            &channel_ids,
+            options,
+        )?;
+        *self = candidate;
+        Ok((imported, channel_ids))
     }
 
     /// Creates one named Sampler channel per format-0/1 MIDI track by copying the selected
@@ -14154,6 +14264,81 @@ impl FlpDocument {
         Ok((imported, channel_ids))
     }
 
+    /// Creates a new Pattern and clones one Sampler or Native instrument template channel for
+    /// each selected format-0/1 MIDI track. Pattern and channel edits commit atomically.
+    pub fn import_midi_selected_tracks_to_template_channels_in_new_pattern(
+        &mut self,
+        midi: &midi::MidiFile,
+        template_channel_id: u16,
+        track_indices: &[usize],
+    ) -> Result<(u16, usize, Vec<u16>), FlpError> {
+        self.import_midi_selected_tracks_to_template_channels_in_new_pattern_with_options(
+            midi,
+            template_channel_id,
+            track_indices,
+            midi::MidiImportOptions::default(),
+        )
+    }
+
+    /// Creates a new Pattern and clones one Sampler or Native instrument template channel for
+    /// every format-0/1 MIDI track.
+    pub fn import_midi_tracks_to_template_channels_in_new_pattern(
+        &mut self,
+        midi: &midi::MidiFile,
+        template_channel_id: u16,
+    ) -> Result<(u16, usize, Vec<u16>), FlpError> {
+        self.import_midi_tracks_to_template_channels_in_new_pattern_with_options(
+            midi,
+            template_channel_id,
+            midi::MidiImportOptions::default(),
+        )
+    }
+
+    /// Creates a new Pattern and clones one Sampler or Native instrument template channel for
+    /// every format-0/1 MIDI track, using the requested note and routing options.
+    pub fn import_midi_tracks_to_template_channels_in_new_pattern_with_options(
+        &mut self,
+        midi: &midi::MidiFile,
+        template_channel_id: u16,
+        options: midi::MidiImportOptions,
+    ) -> Result<(u16, usize, Vec<u16>), FlpError> {
+        let track_indices = (0..midi.tracks().len()).collect::<Vec<_>>();
+        self.import_midi_selected_tracks_to_template_channels_in_new_pattern_with_options(
+            midi,
+            template_channel_id,
+            &track_indices,
+            options,
+        )
+    }
+
+    /// Creates a new Pattern and clones one Sampler or Native instrument template channel for
+    /// each selected format-0/1 track. The complete edit is atomic.
+    pub fn import_midi_selected_tracks_to_template_channels_in_new_pattern_with_options(
+        &mut self,
+        midi: &midi::MidiFile,
+        template_channel_id: u16,
+        track_indices: &[usize],
+        options: midi::MidiImportOptions,
+    ) -> Result<(u16, usize, Vec<u16>), FlpError> {
+        if midi.format() == 2 {
+            return Err(FlpError::UnsupportedEdit(
+                "Format-2 MIDI tracks are independent sequences; import them into separate Patterns",
+            ));
+        }
+        let mut candidate = self.clone();
+        let pattern_id = candidate.create_pattern()?;
+        let (imported, channel_ids) = candidate
+            .import_midi_selected_tracks_to_template_channels_with_options(
+                midi,
+                pattern_id,
+                template_channel_id,
+                track_indices,
+                options,
+            )?;
+        *self = candidate;
+        Ok((pattern_id, imported, channel_ids))
+    }
+
     /// Creates one new Pattern, clones a named Sampler for each selected format-0/1 MIDI
     /// track, and imports those tracks into the new Pattern. Pattern creation, channel creation,
     /// Mixer assignment, and note import commit as one atomic edit.
@@ -14228,8 +14413,9 @@ impl FlpDocument {
 
     /// Builds a separate project from `template` and imports the selected MIDI tracks into it.
     /// Format-0/1 tracks share one new Pattern; Format-2 sequences each get their own Pattern.
-    /// Each selected track receives a cloned Sampler channel. The source template is never
-    /// modified, and the returned project is available only after the full import succeeds.
+    /// Each selected track receives a clone of a kind-0 Sampler or kind-2 Native instrument
+    /// template channel. The source template is never modified, and the returned project is
+    /// available only after the full import succeeds.
     pub fn new_project_from_midi_selected_tracks(
         template: &FlpDocument,
         midi: &midi::MidiFile,
@@ -14264,7 +14450,7 @@ impl FlpDocument {
         let mut project = template.clone();
         if midi.format() == 2 {
             let (imported, destinations) = project
-                .import_midi_selected_format2_tracks_to_sampler_patterns_with_options(
+                .import_midi_selected_format2_tracks_to_template_patterns_with_options(
                     midi,
                     template_channel_id,
                     track_indices,
@@ -14277,7 +14463,7 @@ impl FlpDocument {
             });
         }
         let (pattern_id, imported, channel_ids) = project
-            .import_midi_selected_tracks_to_sampler_channels_in_new_pattern_with_options(
+            .import_midi_selected_tracks_to_template_channels_in_new_pattern_with_options(
                 midi,
                 template_channel_id,
                 track_indices,
@@ -14292,6 +14478,94 @@ impl FlpDocument {
             imported_notes: imported,
             destinations,
         })
+    }
+
+    /// Imports each independent Format-2 sequence into a separate Pattern and cloned channel
+    /// based on a Sampler or Native instrument template.
+    pub fn import_midi_format2_tracks_to_template_patterns(
+        &mut self,
+        midi: &midi::MidiFile,
+        template_channel_id: u16,
+    ) -> Result<(usize, Vec<(u16, u16)>), FlpError> {
+        self.import_midi_format2_tracks_to_template_patterns_with_options(
+            midi,
+            template_channel_id,
+            midi::MidiImportOptions::default(),
+        )
+    }
+
+    /// Imports every independent Format-2 sequence into a separate Pattern and cloned channel,
+    /// applying the requested note interpretation and routing options.
+    pub fn import_midi_format2_tracks_to_template_patterns_with_options(
+        &mut self,
+        midi: &midi::MidiFile,
+        template_channel_id: u16,
+        options: midi::MidiImportOptions,
+    ) -> Result<(usize, Vec<(u16, u16)>), FlpError> {
+        let track_indices = (0..midi.tracks().len()).collect::<Vec<_>>();
+        self.import_midi_selected_format2_tracks_to_template_patterns_with_options(
+            midi,
+            template_channel_id,
+            &track_indices,
+            options,
+        )
+    }
+
+    /// Imports selected independent Format-2 sequences into separate Patterns and cloned
+    /// Sampler or Native instrument channels. The complete operation is atomic.
+    pub fn import_midi_selected_format2_tracks_to_template_patterns_with_options(
+        &mut self,
+        midi: &midi::MidiFile,
+        template_channel_id: u16,
+        track_indices: &[usize],
+        options: midi::MidiImportOptions,
+    ) -> Result<(usize, Vec<(u16, u16)>), FlpError> {
+        if midi.format() != 2 {
+            return Err(FlpError::UnsupportedEdit(
+                "separate Pattern import requires a Format-2 MIDI file",
+            ));
+        }
+        if midi.tracks().is_empty() {
+            return Err(FlpError::UnsupportedEdit(
+                "the MIDI file contains no tracks to import",
+            ));
+        }
+        Self::validate_midi_track_selection(midi, track_indices)?;
+        self.midi_template_channel_kind(template_channel_id)?;
+
+        let mixer_tracks = if options.set_mixer_tracks_for_new_channels {
+            Some(self.first_free_mixer_tracks(track_indices.len())?)
+        } else {
+            None
+        };
+
+        let mut candidate = self.clone();
+        let mut destinations = Vec::with_capacity(track_indices.len());
+        let mut total_imported = 0usize;
+        for (selection_index, track_index) in track_indices.iter().copied().enumerate() {
+            let track = &midi.tracks()[track_index];
+            let track_name = Self::midi_track_display_name(track, track_index);
+            let pattern_id = candidate.create_pattern()?;
+            candidate.set_pattern_name(pattern_id, &track_name)?;
+            let channel_id =
+                candidate.duplicate_midi_template_channel(template_channel_id, &track_name)?;
+            if let Some(mixer_tracks) = &mixer_tracks {
+                candidate.set_channel_mixer_track(channel_id, mixer_tracks[selection_index])?;
+            }
+            let imported = candidate.import_midi_track_with_options(
+                midi,
+                track_index,
+                pattern_id,
+                channel_id,
+                options,
+            )?;
+            total_imported = total_imported
+                .checked_add(imported)
+                .ok_or(FlpError::LengthOverflow)?;
+            destinations.push((pattern_id, channel_id));
+        }
+        *self = candidate;
+        Ok((total_imported, destinations))
     }
 
     /// Imports every independent sequence in a Format-2 MIDI file into its own new Pattern and
@@ -16647,12 +16921,62 @@ impl FlpDocument {
 
     /// Adds a Sampler channel by copying one existing kind-0 Sampler channel.
     /// The clone retains its sample and channel settings byte-for-byte, receives a unique
-    /// channel ID, and uses the supplied display name. Other channel types are rejected because
-    /// their state may contain references or plug-in instance data that cannot be cloned safely.
+    /// channel ID, and uses the supplied display name.
     pub fn duplicate_sampler_channel(
         &mut self,
         source_channel_id: u16,
         display_name: &str,
+    ) -> Result<u16, FlpError> {
+        self.duplicate_channel_with_kind(source_channel_id, display_name, 0)
+    }
+
+    /// Adds a Native instrument channel by copying one existing kind-2 channel.
+    /// Opaque plug-in and channel-state events are copied byte-for-byte; the clone receives a
+    /// unique channel ID and the supplied display name.
+    pub fn duplicate_native_channel(
+        &mut self,
+        source_channel_id: u16,
+        display_name: &str,
+    ) -> Result<u16, FlpError> {
+        self.duplicate_channel_with_kind(source_channel_id, display_name, 2)
+    }
+
+    /// Duplicates a Sampler or Native instrument channel as a MIDI track template.
+    /// Other channel kinds are rejected because their state may contain relationships that
+    /// cannot be copied safely.
+    pub fn duplicate_midi_template_channel(
+        &mut self,
+        source_channel_id: u16,
+        display_name: &str,
+    ) -> Result<u16, FlpError> {
+        let kind = self.midi_template_channel_kind(source_channel_id)?;
+        self.duplicate_channel_with_kind(source_channel_id, display_name, kind)
+    }
+
+    fn midi_template_channel_kind(&self, source_channel_id: u16) -> Result<u8, FlpError> {
+        let channels = self.channels();
+        let mut matching = channels
+            .iter()
+            .filter(|channel| channel.id() == source_channel_id);
+        let Some(source) = matching.next() else {
+            return Err(FlpError::ChannelNotFound(source_channel_id));
+        };
+        if matching.next().is_some() {
+            return Err(FlpError::AmbiguousChannelId(source_channel_id));
+        }
+        match source.kind() {
+            Some(kind @ (0 | 2)) => Ok(kind),
+            _ => Err(FlpError::UnsupportedEdit(
+                "MIDI track templates must be kind-0 Sampler or kind-2 Native instrument channels",
+            )),
+        }
+    }
+
+    fn duplicate_channel_with_kind(
+        &mut self,
+        source_channel_id: u16,
+        display_name: &str,
+        channel_kind: u8,
     ) -> Result<u16, FlpError> {
         if display_name.contains('\0') {
             return Err(FlpError::UnsupportedEdit(
@@ -16670,9 +16994,9 @@ impl FlpDocument {
         if matching.next().is_some() {
             return Err(FlpError::AmbiguousChannelId(source_channel_id));
         }
-        if source.kind() != Some(0) {
+        if source.kind() != Some(channel_kind) {
             return Err(FlpError::UnsupportedEdit(
-                "only a kind-0 Sampler channel can be duplicated safely",
+                "the source channel does not match the requested template type",
             ));
         }
 
@@ -16682,7 +17006,7 @@ impl FlpDocument {
             .any(|index| matches!(self.events[index].opcode, 0x41 | 0x63))
         {
             return Err(FlpError::UnsupportedEdit(
-                "the Sampler channel range includes pattern or arrangement data",
+                "the channel range includes pattern or arrangement data",
             ));
         }
         let marker_indices = source_range
@@ -16695,7 +17019,7 @@ impl FlpDocument {
             .collect::<Vec<_>>();
         if marker_indices.len() != 1 {
             return Err(FlpError::UnsupportedEdit(
-                "the Sampler channel has no unique recognized ID marker",
+                "the channel has no unique recognized ID marker",
             ));
         }
         let name_events = source_range
@@ -16707,7 +17031,7 @@ impl FlpDocument {
             .collect::<Vec<_>>();
         if name_events.len() != 1 {
             return Err(FlpError::UnsupportedEdit(
-                "the Sampler channel has no unique recognized display-name event",
+                "the channel has no unique recognized display-name event",
             ));
         }
         if !project_string_is_utf16(
@@ -16715,7 +17039,7 @@ impl FlpDocument {
             self.project_version.as_deref(),
         ) {
             return Err(FlpError::UnsupportedEdit(
-                "the Sampler channel display name is not verified UTF-16LE",
+                "the channel display name is not verified UTF-16LE",
             ));
         }
 
@@ -28104,6 +28428,155 @@ mod tests {
                 .is_err()
         );
         assert_eq!(rejected_non_sampler.encode_lossless().unwrap(), non_sampler);
+    }
+
+    #[test]
+    fn midi_track_creation_clones_native_template_state_for_selected_tracks() {
+        let midi = MidiFile::parse(&midi_tracks_fixture(
+            &[
+                &[
+                    0x00, 0xFF, 0x03, 0x05, b'P', b'i', b'a', b'n', b'o', 0x00, 0x90, 0x3C, 0x64,
+                    0x60, 0x80, 0x3C, 0x00, 0x00, 0xFF, 0x2F, 0x00,
+                ],
+                &[
+                    0x00, 0xFF, 0x03, 0x04, b'B', b'a', b's', b's', 0x00, 0x90, 0x43, 0x50, 0x60,
+                    0x80, 0x43, 0x00, 0x00, 0xFF, 0x2F, 0x00,
+                ],
+            ],
+            1,
+            480,
+        ))
+        .expect("named format-1 MIDI fixture should parse");
+        let utf16 = |value: &str| {
+            value
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .chain([0, 0])
+                .collect::<Vec<_>>()
+        };
+        let mut project_events = Vec::new();
+        append_data_event(&mut project_events, 0xC7, b"26.0.0\0");
+        project_events.extend_from_slice(&[0x40, 0, 0, 0x15, 2, 0x00, 1]);
+        append_data_event(&mut project_events, 0xD4, &[0xA1, 0xA2, 0xA3]);
+        append_data_event(&mut project_events, 0xD5, &[0xB1, 0xC2, 0xD3, 0xE4, 0xF5]);
+        append_data_event(&mut project_events, 0xCB, &utf16("Native Template"));
+        project_events.extend_from_slice(&[0x62, 0, 0, 0x41, 7, 0, 0xD0, 0]);
+        let original = flp_fixture(&project_events, &[], &[]);
+        let template_document =
+            FlpDocument::parse(&original).expect("Native template project should parse");
+        let source_channel = template_document
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id() == 0)
+            .expect("Native template channel should be recognized");
+        assert_eq!(source_channel.kind(), Some(2));
+        let source_state = template_document.events()[source_channel.event_range()]
+            .iter()
+            .filter(|event| matches!(event.opcode, 0xD4 | 0xD5))
+            .map(|event| event.wire_bytes().to_vec())
+            .collect::<Vec<_>>();
+
+        let mut document = template_document.clone();
+        let (imported, channel_ids) = document
+            .import_midi_selected_tracks_to_template_channels_with_options(
+                &midi,
+                7,
+                0,
+                &[0, 1],
+                MidiImportOptions::default(),
+            )
+            .expect("both selected tracks should clone the Native channel");
+        assert_eq!(imported, 2);
+        assert_eq!(channel_ids.len(), 2);
+        let channels = document.channels();
+        for (channel_id, expected_name) in channel_ids.iter().zip(["Piano", "Bass"]) {
+            let channel = channels
+                .iter()
+                .find(|channel| channel.id() == *channel_id)
+                .expect("new Native channel should be recognized");
+            assert_eq!(channel.kind(), Some(2));
+            assert_eq!(channel.display_name(), Some(expected_name));
+            let state = document.events()[channel.event_range()]
+                .iter()
+                .filter(|event| matches!(event.opcode, 0xD4 | 0xD5))
+                .map(|event| event.wire_bytes().to_vec())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                state, source_state,
+                "opaque plug-in state must be preserved"
+            );
+        }
+        let notes = document
+            .patterns()
+            .unwrap()
+            .into_iter()
+            .find(|pattern| pattern.id == 7)
+            .expect("import target Pattern should remain present")
+            .notes;
+        assert_eq!(notes.len(), 2);
+        assert_eq!((notes[0].channel_id, notes[0].key), (channel_ids[0], 60));
+        assert_eq!((notes[1].channel_id, notes[1].key), (channel_ids[1], 67));
+
+        let new_project =
+            FlpDocument::new_project_from_midi_selected_tracks(&template_document, &midi, 0, &[1])
+                .expect("Native template should support separate-project import");
+        let project_channel_id = new_project.destinations[0].1;
+        let project_channel = new_project
+            .project
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id() == project_channel_id)
+            .expect("new-project Native channel should exist");
+        assert_eq!(project_channel.kind(), Some(2));
+        assert_eq!(new_project.imported_notes, 1);
+        assert_eq!(
+            new_project.project.events()[project_channel.event_range()]
+                .iter()
+                .filter(|event| matches!(event.opcode, 0xD4 | 0xD5))
+                .map(|event| event.wire_bytes().to_vec())
+                .collect::<Vec<_>>(),
+            source_state
+        );
+        assert_eq!(template_document.encode_lossless().unwrap(), original);
+
+        let format_two = MidiFile::parse(&midi_tracks_fixture(
+            &[
+                &[
+                    0x00, 0x90, 0x3C, 0x64, 0x60, 0x80, 0x3C, 0x00, 0x00, 0xFF, 0x2F, 0x00,
+                ],
+                &[
+                    0x00, 0x90, 0x43, 0x50, 0x60, 0x80, 0x43, 0x00, 0x00, 0xFF, 0x2F, 0x00,
+                ],
+            ],
+            2,
+            480,
+        ))
+        .expect("Format-2 MIDI fixture should parse");
+        let mut format_two_document = template_document.clone();
+        let (format_two_imported, destinations) = format_two_document
+            .import_midi_selected_format2_tracks_to_template_patterns_with_options(
+                &format_two,
+                0,
+                &[1],
+                MidiImportOptions::default(),
+            )
+            .expect("selected Format-2 sequence should clone the Native template");
+        assert_eq!(format_two_imported, 1);
+        assert_eq!(destinations.len(), 1);
+        let format_two_channel = format_two_document
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id() == destinations[0].1)
+            .expect("Format-2 Native channel should exist");
+        assert_eq!(format_two_channel.kind(), Some(2));
+        assert_eq!(
+            format_two_document.events()[format_two_channel.event_range()]
+                .iter()
+                .filter(|event| matches!(event.opcode, 0xD4 | 0xD5))
+                .map(|event| event.wire_bytes().to_vec())
+                .collect::<Vec<_>>(),
+            source_state
+        );
     }
 
     #[test]
