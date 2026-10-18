@@ -7447,12 +7447,12 @@ impl DawUi {
             .map_err(|error| error.to_string())
         })();
         match result {
-            Ok((document, imported, destinations)) => {
+            Ok(import_result) => {
                 self.pending_project_change = Some(PendingProjectChange::NewProject {
-                    document: Box::new(document),
+                    document: Box::new(import_result.project),
                     template_path,
-                    imported,
-                    destinations,
+                    imported: import_result.imported_notes,
+                    destinations: import_result.destinations,
                 });
                 if self.dirty {
                     self.recovery_prompt = None;

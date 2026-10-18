@@ -232,8 +232,12 @@ pub struct FlpDocument {
     trailing_bytes: Vec<u8>,
 }
 
-/// Result of importing MIDI into a new FL Studio project.
-pub type MidiNewProjectImportResult = (FlpDocument, usize, Vec<(u16, u16)>);
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NewProjectMidiImport {
+    pub project: FlpDocument,
+    pub imported_notes: usize,
+    pub destinations: Vec<(u16, u16)>,
+}
 
 #[derive(Clone, Copy)]
 struct MidiTrackImportSettings {
@@ -14129,7 +14133,7 @@ impl FlpDocument {
         midi: &midi::MidiFile,
         template_channel_id: u16,
         track_indices: &[usize],
-    ) -> Result<MidiNewProjectImportResult, FlpError> {
+    ) -> Result<NewProjectMidiImport, FlpError> {
         Self::new_project_from_midi_selected_tracks_with_options(
             template,
             midi,
@@ -14149,7 +14153,7 @@ impl FlpDocument {
         template_channel_id: u16,
         track_indices: &[usize],
         options: midi::MidiImportOptions,
-    ) -> Result<MidiNewProjectImportResult, FlpError> {
+    ) -> Result<NewProjectMidiImport, FlpError> {
         if template.header().format() != 0 {
             return Err(FlpError::UnsupportedEdit(
                 "new MIDI project imports require a full FL Studio project template",
@@ -14164,7 +14168,11 @@ impl FlpDocument {
                     track_indices,
                     options,
                 )?;
-            return Ok((project, imported, destinations));
+            return Ok(NewProjectMidiImport {
+                project,
+                imported_notes: imported,
+                destinations,
+            });
         }
         let (pattern_id, imported, channel_ids) = project
             .import_midi_selected_tracks_to_sampler_channels_in_new_pattern_with_options(
@@ -14177,7 +14185,11 @@ impl FlpDocument {
             .into_iter()
             .map(|channel_id| (pattern_id, channel_id))
             .collect();
-        Ok((project, imported, destinations))
+        Ok(NewProjectMidiImport {
+            project,
+            imported_notes: imported,
+            destinations,
+        })
     }
 
     /// Imports every independent sequence in a Format-2 MIDI file into its own new Pattern and
@@ -27870,15 +27882,15 @@ mod tests {
 
         let template_document =
             FlpDocument::parse(&original).expect("project fixture should parse");
-        let (new_project, project_imported, destinations) =
+        let project_import =
             FlpDocument::new_project_from_midi_selected_tracks(&template_document, &midi, 0, &[1])
                 .expect("selected MIDI track should create a separate project");
-        assert_eq!(project_imported, 1);
-        assert_eq!(destinations.len(), 1);
-        assert_eq!(destinations[0].0, 8);
+        assert_eq!(project_import.imported_notes, 1);
+        assert_eq!(project_import.destinations.len(), 1);
+        assert_eq!(project_import.destinations[0].0, 8);
         assert_eq!(
-            new_project.patterns().unwrap()[1].notes[0].channel_id,
-            destinations[0].1
+            project_import.project.patterns().unwrap()[1].notes[0].channel_id,
+            project_import.destinations[0].1
         );
         assert_eq!(template_document.encode_lossless().unwrap(), original);
 
@@ -28121,18 +28133,17 @@ mod tests {
 
         let template_document =
             FlpDocument::parse(&original).expect("project should parse for new-project import");
-        let (new_project, project_imported, project_destinations) =
-            FlpDocument::new_project_from_midi_selected_tracks(
-                &template_document,
-                &midi,
-                0,
-                &[0, 1],
-            )
-            .expect("Format-2 sequences should import into a separate project");
-        assert_eq!(project_imported, 2);
-        assert_eq!(project_destinations.len(), 2);
+        let project_import = FlpDocument::new_project_from_midi_selected_tracks(
+            &template_document,
+            &midi,
+            0,
+            &[0, 1],
+        )
+        .expect("Format-2 sequences should import into a separate project");
+        assert_eq!(project_import.imported_notes, 2);
+        assert_eq!(project_import.destinations.len(), 2);
         assert_eq!(
-            new_project.patterns().unwrap().len(),
+            project_import.project.patterns().unwrap().len(),
             template_document.patterns().unwrap().len() + 2
         );
         assert_eq!(template_document.encode_lossless().unwrap(), original);

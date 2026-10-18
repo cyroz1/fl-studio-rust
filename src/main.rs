@@ -7577,28 +7577,30 @@ fn import_midi_into_new_project(
     let midi = MidiFile::parse(&midi_bytes)
         .map_err(|error| format!("could not parse {}: {error}", midi_path.display()))?;
     let track_indices = parse_midi_track_selection(track_numbers, midi.tracks().len())?;
-    let (document, imported, destinations) =
-        FlpDocument::new_project_from_midi_selected_tracks_with_options(
-            &template,
-            &midi,
-            template_channel_id,
-            &track_indices,
-            options,
-        )
-        .map_err(|error| error.to_string())?;
-    let bytes = document
+    let import_result = FlpDocument::new_project_from_midi_selected_tracks_with_options(
+        &template,
+        &midi,
+        template_channel_id,
+        &track_indices,
+        options,
+    )
+    .map_err(|error| error.to_string())?;
+    let bytes = import_result
+        .project
         .encode_lossless()
         .map_err(|error| format!("could not encode new project: {error}"))?;
     fs::write(output, bytes)
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
-    let destinations = destinations
+    let destinations = import_result
+        .destinations
         .iter()
         .map(|(pattern_id, channel_id)| format!("{pattern_id}:{channel_id}"))
         .collect::<Vec<_>>()
         .join(",");
     println!(
-        "created new project from {} with {imported} MIDI notes in Pattern:channel pairs {destinations} at {}",
+        "created new project from {} with {} MIDI notes in Pattern:channel pairs {destinations} at {}",
         template_path.display(),
+        import_result.imported_notes,
         output.display()
     );
     Ok(())
