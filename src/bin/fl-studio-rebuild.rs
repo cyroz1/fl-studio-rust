@@ -3397,10 +3397,16 @@ struct PendingMidiCcImport {
 
 struct PendingMidiCcExport {
     path: PathBuf,
-    pattern_id: u16,
+    target: PendingMidiCcExportTarget,
     target_stream: (u8, u8),
     controller_number: u8,
     midi_channel: u8,
+}
+
+#[derive(Clone, Copy)]
+enum PendingMidiCcExportTarget {
+    Pattern(u16),
+    Song(u16),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -34895,6 +34901,7 @@ impl DawUi {
         let mut open_midi_cc_import_requested = false;
         let mut open_midi_cc_new_stream_requested = false;
         let mut open_midi_cc_export_requested = false;
+        let mut open_midi_song_cc_export_requested = false;
         ui.horizontal_wrapped(|ui| {
             ui.strong("Pattern controller data");
             piano_roll_event_target_selector(ui, &mut self.piano_roll_event_target);
@@ -34975,6 +34982,16 @@ impl DawUi {
             {
                 open_midi_cc_export_requested = true;
             }
+            if ui
+                .add_enabled(
+                    self.piano_roll_controller_stream.is_some(),
+                    egui::Button::new("Export song MIDI CC…"),
+                )
+                .on_hover_text("Export this raw stream at every matching Playlist Pattern Clip")
+                .clicked()
+            {
+                open_midi_song_cc_export_requested = true;
+            }
             if streams.is_empty() {
                 ui.separator();
                 ui.label("New raw stream");
@@ -35037,6 +35054,7 @@ impl DawUi {
             pattern.id,
             selected_stream,
             open_midi_cc_export_requested,
+            open_midi_song_cc_export_requested,
         );
 
         let size = Vec2::new(ui.available_width().max(1.0), 116.0);
@@ -35922,6 +35940,7 @@ impl DawUi {
         pattern_id: u16,
         selected_stream: Option<(u8, u8)>,
         open_requested: bool,
+        open_song_requested: bool,
     ) {
         if open_requested
             && let Some(target_stream) = selected_stream
@@ -35933,7 +35952,37 @@ impl DawUi {
         {
             self.pending_midi_cc_export = Some(PendingMidiCcExport {
                 path,
-                pattern_id,
+                target: PendingMidiCcExportTarget::Pattern(pattern_id),
+                target_stream,
+                controller_number: 1,
+                midi_channel: 1,
+            });
+        }
+        let song_arrangement_id = if open_song_requested {
+            self.document.as_ref().and_then(|document| {
+                let arrangements = document.arrangements().ok()?;
+                self.selected_arrangement
+                    .filter(|id| arrangements.iter().any(|arrangement| arrangement.id == *id))
+                    .or_else(|| arrangements.first().map(|arrangement| arrangement.id))
+            })
+        } else {
+            None
+        };
+        if open_song_requested && song_arrangement_id.is_none() {
+            self.status = "This project has no Playlist arrangement to export".to_owned();
+        }
+        if open_song_requested
+            && let Some(target_stream) = selected_stream
+            && let Some(arrangement_id) = song_arrangement_id
+            && let Some(path) = rfd::FileDialog::new()
+                .set_title("Export arrangement controller as MIDI CC")
+                .set_file_name("song_controller.mid")
+                .add_filter("MIDI files", &["mid", "midi"])
+                .save_file()
+        {
+            self.pending_midi_cc_export = Some(PendingMidiCcExport {
+                path,
+                target: PendingMidiCcExportTarget::Song(arrangement_id),
                 target_stream,
                 controller_number: 1,
                 midi_channel: 1,
@@ -35943,14 +35992,34 @@ impl DawUi {
         let mut export_request = None;
         let mut cancel_requested = false;
         if let Some(pending) = self.pending_midi_cc_export.as_mut() {
+            let source_label = match pending.target {
+                PendingMidiCcExportTarget::Pattern(pattern_id) => {
+                    format!("Source: Pattern {pattern_id}")
+                }
+                PendingMidiCcExportTarget::Song(arrangement_id) => {
+                    format!("Source: Playlist arrangement {arrangement_id}")
+                }
+            };
+            let export_button_label = match pending.target {
+                PendingMidiCcExportTarget::Pattern(_) => "Export selected stream",
+                PendingMidiCcExportTarget::Song(_) => "Export stream across song",
+            };
+            let help_text = match pending.target {
+                PendingMidiCcExportTarget::Pattern(_) => {
+                    "Raw values map to MIDI 0–127; Pattern ticks and project PPQ are preserved."
+                }
+                PendingMidiCcExportTarget::Song(_) => {
+                    "Points follow matching Playlist Pattern Clips; the song tempo map and markers are preserved."
+                }
+            };
             ui.group(|ui| {
                 ui.horizontal(|ui| {
                     ui.strong("Export raw controller stream as MIDI CC");
                     ui.weak(pending.path.display().to_string());
                 });
                 ui.label(format!(
-                    "Source: Pattern {} · raw stream channel {} · flags 0x{:02X}",
-                    pending.pattern_id, pending.target_stream.0, pending.target_stream.1
+                    "{source_label} · raw stream channel {} · flags 0x{:02X}",
+                    pending.target_stream.0, pending.target_stream.1
                 ));
                 ui.horizontal(|ui| {
                     ui.add(
@@ -35964,13 +36033,11 @@ impl DawUi {
                             .prefix("MIDI channel "),
                     );
                 });
-                ui.weak(
-                    "Raw values clamp to 0.0–1.0 and map to MIDI 0–127; Pattern timing and project PPQ are preserved.",
-                );
-                if ui.button("Export selected stream").clicked() {
+                ui.weak(help_text);
+                if ui.button(export_button_label).clicked() {
                     export_request = Some((
                         pending.path.clone(),
-                        pending.pattern_id,
+                        pending.target,
                         pending.target_stream,
                         pending.controller_number,
                         pending.midi_channel - 1,
@@ -35982,20 +36049,33 @@ impl DawUi {
         if cancel_requested {
             self.pending_midi_cc_export = None;
         }
-        if let Some((path, target_pattern, target_stream, cc, channel)) = export_request {
+        if let Some((path, target, target_stream, cc, channel)) = export_request {
             let result = self
                 .document
                 .as_ref()
                 .ok_or_else(|| "no project is open".to_owned())
                 .and_then(|document| {
-                    MidiFile::encode_project_pattern_controller_stream(
-                        document,
-                        target_pattern,
-                        target_stream,
-                        cc,
-                        channel,
-                    )
-                    .map_err(|error| error.to_string())
+                    let encoded = match target {
+                        PendingMidiCcExportTarget::Pattern(pattern_id) => {
+                            MidiFile::encode_project_pattern_controller_stream(
+                                document,
+                                pattern_id,
+                                target_stream,
+                                cc,
+                                channel,
+                            )
+                        }
+                        PendingMidiCcExportTarget::Song(arrangement_id) => {
+                            MidiFile::encode_project_song_controller_stream(
+                                document,
+                                arrangement_id,
+                                target_stream,
+                                cc,
+                                channel,
+                            )
+                        }
+                    };
+                    encoded.map_err(|error| error.to_string())
                 })
                 .and_then(|bytes| {
                     fs::write(&path, &bytes)
@@ -36004,8 +36084,16 @@ impl DawUi {
                 });
             match result {
                 Ok(byte_count) => {
+                    let scope = match target {
+                        PendingMidiCcExportTarget::Pattern(pattern_id) => {
+                            format!("Pattern {pattern_id}")
+                        }
+                        PendingMidiCcExportTarget::Song(arrangement_id) => {
+                            format!("arrangement {arrangement_id}")
+                        }
+                    };
                     self.status = format!(
-                        "Exported Pattern {target_pattern} raw stream {} / 0x{:02X} as MIDI CC {cc} on channel {} to {} ({byte_count} bytes)",
+                        "Exported {scope} raw stream {} / 0x{:02X} as MIDI CC {cc} on channel {} to {} ({byte_count} bytes)",
                         target_stream.0,
                         target_stream.1,
                         channel + 1,

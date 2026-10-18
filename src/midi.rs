@@ -658,6 +658,208 @@ impl MidiFile {
         Ok(output)
     }
 
+    /// Exports one raw Pattern controller stream across every matching Pattern Clip in an
+    /// arrangement as a MIDI Control Change track. The raw stream bytes do not identify a
+    /// MIDI controller or channel, so both mappings are explicit. Pattern-relative points
+    /// follow each clip's repeat length and are clipped at the Playlist clip boundary. If a
+    /// Pattern has no saved or note-inferred length, its clip span is used for one pass.
+    pub fn encode_project_song_controller_stream(
+        document: &FlpDocument,
+        arrangement_id: u16,
+        raw_stream: (u8, u8),
+        midi_controller: u8,
+        midi_channel: u8,
+    ) -> Result<Vec<u8>, MidiError> {
+        if midi_controller > 127 {
+            return Err(MidiError::InvalidExport(
+                "MIDI Control Change number must be from 0 through 127",
+            ));
+        }
+        if midi_channel > 15 {
+            return Err(MidiError::InvalidExport(
+                "MIDI channel must be from 0 through 15",
+            ));
+        }
+
+        let arrangements = document
+            .arrangements()
+            .map_err(|error| MidiError::Project(error.to_string()))?;
+        let arrangement = arrangements
+            .iter()
+            .find(|arrangement| arrangement.id == arrangement_id)
+            .ok_or(MidiError::InvalidExport(
+                "the requested Playlist arrangement does not exist",
+            ))?;
+        let patterns = document
+            .patterns()
+            .map_err(|error| MidiError::Project(error.to_string()))?;
+        let patterns_by_id: BTreeMap<_, _> = patterns
+            .iter()
+            .map(|pattern| (pattern.id, pattern))
+            .collect();
+        let mut controller_events = Vec::new();
+        let mut song_end_tick = 0u64;
+        let mut exported_point_count = 0usize;
+        let ppq = document.header().ppq();
+
+        for clip in &arrangement.clips {
+            if clip.is_muted() || clip.track_index.is_none() || clip.length_ticks == 0 {
+                continue;
+            }
+            let clip_start = u64::from(clip.position_ticks);
+            let clip_length = u64::from(clip.length_ticks);
+            let clip_end = clip_start
+                .checked_add(clip_length)
+                .ok_or(MidiError::LengthOverflow)?;
+            song_end_tick = song_end_tick.max(clip_end);
+
+            let PlaylistClipTarget::Pattern { id } = clip.target() else {
+                continue;
+            };
+            let Some(pattern) = patterns_by_id.get(&id).copied() else {
+                continue;
+            };
+            if clip
+                .scale
+                .is_some_and(|scale| !scale.is_finite() || (scale - 1.0).abs() > 1e-9)
+            {
+                return Err(MidiError::InvalidExport(
+                    "scaled Playlist Pattern Clips cannot be exported yet",
+                ));
+            }
+
+            let controller_points = pattern
+                .controllers
+                .iter()
+                .filter(|point| (point.channel, point.flags) == raw_stream)
+                .collect::<Vec<_>>();
+            if controller_points.is_empty() {
+                continue;
+            }
+            if controller_points
+                .iter()
+                .any(|point| !point.value().is_finite())
+            {
+                return Err(MidiError::InvalidExport(
+                    "raw Pattern controller values must be finite",
+                ));
+            }
+
+            let inferred_note_length = pattern
+                .notes
+                .iter()
+                .filter(|note| note.length > 0)
+                .map(|note| u64::from(note.position) + u64::from(note.length))
+                .max()
+                .unwrap_or(0);
+            let loop_length = pattern
+                .length_ticks
+                .map(u64::from)
+                .filter(|length| *length > 0)
+                .unwrap_or_else(|| {
+                    inferred_pattern_loop_length(
+                        inferred_note_length,
+                        clip_length,
+                        ppq,
+                        document.metadata().time_signature(),
+                    )
+                });
+            if loop_length == 0 {
+                continue;
+            }
+            let controller_points = controller_points
+                .into_iter()
+                .filter(|point| u64::from(point.position) < loop_length)
+                .collect::<Vec<_>>();
+            if controller_points.is_empty() {
+                continue;
+            }
+
+            let repetitions = clip_length.div_ceil(loop_length);
+            for repetition in 0..repetitions {
+                let repeat_start = repetition
+                    .checked_mul(loop_length)
+                    .ok_or(MidiError::LengthOverflow)?;
+                for point in &controller_points {
+                    let point_position = u64::from(point.position);
+                    let relative_tick = repeat_start
+                        .checked_add(point_position)
+                        .ok_or(MidiError::LengthOverflow)?;
+                    if relative_tick >= clip_length {
+                        continue;
+                    }
+                    exported_point_count = exported_point_count.saturating_add(1);
+                    if exported_point_count > MAX_EXPORTED_CONTROLLER_POINTS {
+                        return Err(MidiError::InvalidExport(
+                            "the arrangement expands to more than one million controller points",
+                        ));
+                    }
+                    controller_events.push(TimedMidiBytes {
+                        tick: clip_start
+                            .checked_add(relative_tick)
+                            .ok_or(MidiError::LengthOverflow)?,
+                        order: 4,
+                        bytes: vec![
+                            0xB0 | midi_channel,
+                            midi_controller,
+                            (point.value().clamp(0.0, 1.0) * 127.0).round() as u8,
+                        ],
+                    });
+                }
+            }
+        }
+
+        if controller_events.is_empty() {
+            return Err(MidiError::InvalidExport(
+                "the requested raw Pattern controller stream has no points in the arrangement",
+            ));
+        }
+
+        // Reuse the regular song exporter for its conductor, tempo automation, markers, and
+        // note tracks, then append a dedicated CC track so those existing mappings stay intact.
+        let mut output = Self::encode_project_song(
+            document,
+            arrangement_id,
+            MidiChannelMapping::PreserveNoteChannels,
+        )?;
+        let existing_track_count = u16::from_be_bytes([output[10], output[11]]);
+        let new_track_count = existing_track_count
+            .checked_add(1)
+            .ok_or(MidiError::LengthOverflow)?;
+        controller_events.push(TimedMidiBytes {
+            tick: 0,
+            order: 0,
+            bytes: meta_event_bytes(
+                0x03,
+                format!(
+                    "Arrangement {arrangement_id} raw controller {} / 0x{:02X} as CC {midi_controller} channel {}",
+                    raw_stream.0,
+                    raw_stream.1,
+                    midi_channel + 1
+                )
+                .as_bytes(),
+            )?,
+        });
+        controller_events.sort_by_key(|event| (event.tick, event.order));
+        let mut controller_track = Vec::new();
+        let mut previous_tick = 0u64;
+        for event in controller_events {
+            write_delta(
+                &mut controller_track,
+                event.tick.saturating_sub(previous_tick),
+            )?;
+            controller_track.extend_from_slice(&event.bytes);
+            previous_tick = event.tick;
+        }
+        write_end_of_track(
+            &mut controller_track,
+            song_end_tick.saturating_sub(previous_tick),
+        )?;
+        append_track_chunk(&mut output, controller_track)?;
+        output[10..12].copy_from_slice(&new_track_count.to_be_bytes());
+        Ok(output)
+    }
+
     /// Exports pattern clips in one FL Studio arrangement to a format-1 MIDI file.
     /// Audio clips and non-pattern clip targets are omitted.
     pub fn encode_project_song(

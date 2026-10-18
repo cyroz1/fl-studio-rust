@@ -29313,6 +29313,95 @@ mod tests {
     }
 
     #[test]
+    fn exports_selected_raw_controller_stream_across_repeated_song_clips() {
+        let mut note = note_record(0, 3, 48, 60, 100);
+        note[18] = 32;
+        let mut event_stream = vec![0x40, 0, 0, 0x41, 7, 0, 0xD0, 24];
+        event_stream.extend_from_slice(&note);
+        for record in [
+            pattern_controller_record(0, [0; 2], 3, 0x91, 0.0f32.to_bits()),
+            pattern_controller_record(24, [0; 2], 3, 0x91, 0.5f32.to_bits()),
+            pattern_controller_record(12, [0; 2], 9, 0x01, 1.0f32.to_bits()),
+        ] {
+            append_data_event(&mut event_stream, 0xDF, &record);
+        }
+        event_stream.extend_from_slice(&[0x63, 0, 0]);
+
+        let mut clips = Vec::new();
+        for (position, length) in [(100u32, 100u32), (300, 40)] {
+            let mut clip = [0u8; 80];
+            clip[..4].copy_from_slice(&position.to_le_bytes());
+            clip[6..8].copy_from_slice(&7u16.to_le_bytes());
+            clip[8..12].copy_from_slice(&length.to_le_bytes());
+            clip[64..72].copy_from_slice(&1.0f64.to_le_bytes());
+            clips.extend_from_slice(&clip);
+        }
+        append_data_event(&mut event_stream, 0xE9, &clips);
+        let document = FlpDocument::parse(&flp_fixture(&event_stream, &[], &[]))
+            .expect("arrangement fixture should parse");
+
+        let bytes = MidiFile::encode_project_song_controller_stream(&document, 0, (3, 0x91), 74, 2)
+            .expect("the selected raw stream should export across the arrangement");
+        let midi = MidiFile::parse(&bytes).expect("exported MIDI should parse");
+        assert_eq!(midi.division(), 96);
+        assert_eq!(midi.tracks().len(), 3);
+        let controller_track = midi.tracks().last().unwrap();
+        assert_eq!(controller_track.end_tick(), 340);
+        assert_eq!(
+            controller_track
+                .control_changes()
+                .iter()
+                .map(|change| (
+                    change.tick(),
+                    change.channel(),
+                    change.controller(),
+                    change.value()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (100, 2, 74, 0),
+                (124, 2, 74, 64),
+                (148, 2, 74, 0),
+                (172, 2, 74, 64),
+                (196, 2, 74, 0),
+                (300, 2, 74, 0),
+                (324, 2, 74, 64),
+            ]
+        );
+    }
+
+    #[test]
+    fn song_controller_export_rejects_missing_streams_and_invalid_mappings() {
+        let mut event_stream = vec![0x40, 0, 0, 0x41, 7, 0, 0xD0, 24];
+        event_stream.extend_from_slice(&note_record(0, 3, 48, 60, 100));
+        event_stream.extend_from_slice(&[0x63, 0, 0]);
+        let mut clip = [0u8; 80];
+        clip[6..8].copy_from_slice(&7u16.to_le_bytes());
+        clip[8..12].copy_from_slice(&100u32.to_le_bytes());
+        clip[64..72].copy_from_slice(&1.0f64.to_le_bytes());
+        append_data_event(&mut event_stream, 0xE9, &clip);
+        let document = FlpDocument::parse(&flp_fixture(&event_stream, &[], &[]))
+            .expect("arrangement fixture should parse");
+
+        assert!(
+            MidiFile::encode_project_song_controller_stream(&document, 0, (3, 0x91), 74, 0,)
+                .is_err()
+        );
+        assert!(
+            MidiFile::encode_project_song_controller_stream(&document, 0, (3, 0x91), 128, 0,)
+                .is_err()
+        );
+        assert!(
+            MidiFile::encode_project_song_controller_stream(&document, 0, (3, 0x91), 74, 16,)
+                .is_err()
+        );
+        assert!(
+            MidiFile::encode_project_song_controller_stream(&document, 9, (3, 0x91), 74, 0,)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn inferred_pattern_repeat_length_rounds_up_to_the_project_measure() {
         let note = note_record(0, 3, 1_501, 60, 100);
         let mut event_stream = vec![0x40, 0, 0, 0x41, 7, 0, 0xD0, 24];
