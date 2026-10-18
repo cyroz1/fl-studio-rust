@@ -22,7 +22,7 @@ use flp_rebuild::media::{
     decode_audio_preview, decode_audio_preview_from_position, decode_audio_waveform,
     summarize_audio_waveform, write_audio_range_to_wav_with_processing,
 };
-use flp_rebuild::midi::{MidiChannelMapping, MidiFile};
+use flp_rebuild::midi::{MidiChannelMapping, MidiFile, MidiImportOptions};
 use flp_rebuild::plugins::{PluginCandidate, PluginFormat, scan_installed_plugins};
 use flp_rebuild::project_package::{ProjectPackageWorkspace, copy_unique_sample_file};
 use flp_rebuild::sample_render::{
@@ -3373,6 +3373,7 @@ struct PendingMidiImport {
     selected_track: usize,
     import_all_tracks: bool,
     track_channel_ids: Vec<u16>,
+    zero_velocity_note_ons_as_notes: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -11862,6 +11863,7 @@ impl DawUi {
                             selected_track: 0,
                             import_all_tracks: false,
                             track_channel_ids,
+                            zero_velocity_note_ons_as_notes: false,
                         });
                         self.view = MainView::PianoRoll;
                         self.status = format!("Loaded MIDI file {}", path.display());
@@ -28075,6 +28077,7 @@ impl DawUi {
                             selected_track: 0,
                             import_all_tracks: false,
                             track_channel_ids,
+                            zero_velocity_note_ons_as_notes: false,
                         });
                         self.status = format!("Loaded MIDI file {}", path.display());
                     }
@@ -28150,6 +28153,10 @@ impl DawUi {
                             pending.selected_track,
                             pattern_id,
                             channel_id,
+                            MidiImportOptions {
+                                zero_velocity_note_ons_as_notes:
+                                    pending.zero_velocity_note_ons_as_notes,
+                            },
                         ));
                     }
                 } else {
@@ -28174,6 +28181,10 @@ impl DawUi {
                             pending.midi.clone(),
                             pending.track_channel_ids.clone(),
                             pattern_id,
+                            MidiImportOptions {
+                                zero_velocity_note_ons_as_notes:
+                                    pending.zero_velocity_note_ons_as_notes,
+                            },
                         ));
                     }
                     if ui
@@ -28194,6 +28205,10 @@ impl DawUi {
                             pending.midi.clone(),
                             pattern_id,
                             template_channel_id,
+                            MidiImportOptions {
+                                zero_velocity_note_ons_as_notes:
+                                    pending.zero_velocity_note_ons_as_notes,
+                            },
                         ));
                     }
                 }
@@ -28210,11 +28225,24 @@ impl DawUi {
                         .clicked()
                     && let Some(template_channel_id) = selected_sampler_template
                 {
-                    create_format2_midi_request =
-                        Some((pending.midi.clone(), template_channel_id));
+                    create_format2_midi_request = Some((
+                        pending.midi.clone(),
+                        template_channel_id,
+                        MidiImportOptions {
+                            zero_velocity_note_ons_as_notes:
+                                pending.zero_velocity_note_ons_as_notes,
+                        },
+                    ));
                 }
                 clear_midi_import = ui.button("Clear").clicked();
             });
+            ui.checkbox(
+                &mut pending.zero_velocity_note_ons_as_notes,
+                "Import zero-velocity Note On messages as notes",
+            )
+            .on_hover_text(
+                "By default, MIDI treats Note On with velocity 0 as Note Off. Enable this to import those messages as notes with velocity 0.",
+            );
             if pending.import_all_tracks {
                 ui.vertical(|ui| {
                     ui.small("Choose a destination Channel Rack channel for each MIDI track.");
@@ -28266,7 +28294,7 @@ impl DawUi {
         if clear_midi_import {
             self.pending_midi_import = None;
         }
-        if let Some((midi, track_index, pattern_id, channel_id)) = import_midi_request {
+        if let Some((midi, track_index, pattern_id, channel_id, options)) = import_midi_request {
             let first_note_index = patterns
                 .iter()
                 .find(|pattern| pattern.id == pattern_id)
@@ -28279,7 +28307,13 @@ impl DawUi {
                 })
                 .unwrap_or(0);
             if let Some(document) = &mut self.document {
-                match document.import_midi_track(&midi, track_index, pattern_id, channel_id) {
+                match document.import_midi_track_with_options(
+                    &midi,
+                    track_index,
+                    pattern_id,
+                    channel_id,
+                    options,
+                ) {
                     Ok(imported) => {
                         if imported > 0 {
                             self.selected_note = Some((pattern_id, channel_id, first_note_index));
@@ -28298,12 +28332,12 @@ impl DawUi {
                 }
             }
         }
-        if let Some((midi, channel_ids, pattern_id)) = import_all_midi_request {
+        if let Some((midi, channel_ids, pattern_id, options)) = import_all_midi_request {
             let channel_id = midi
                 .tracks()
                 .iter()
                 .enumerate()
-                .find(|(_, track)| !track.notes().is_empty())
+                .find(|(_, track)| !track.notes_with_options(options).is_empty())
                 .and_then(|(track_index, _)| channel_ids.get(track_index).copied())
                 .or_else(|| channel_ids.first().copied())
                 .unwrap_or_default();
@@ -28319,7 +28353,12 @@ impl DawUi {
                 })
                 .unwrap_or(0);
             if let Some(document) = &mut self.document {
-                match document.import_midi_tracks(&midi, pattern_id, &channel_ids) {
+                match document.import_midi_tracks_with_options(
+                    &midi,
+                    pattern_id,
+                    &channel_ids,
+                    options,
+                ) {
                     Ok(imported) => {
                         self.stop_project_playback();
                         self.selected_note_channel = Some(channel_id);
@@ -28342,18 +28381,20 @@ impl DawUi {
                 }
             }
         }
-        if let Some((midi, pattern_id, template_channel_id)) = create_sampler_midi_request {
+        if let Some((midi, pattern_id, template_channel_id, options)) = create_sampler_midi_request
+        {
             let selected_track_index = midi
                 .tracks()
                 .iter()
-                .position(|track| !track.notes().is_empty())
+                .position(|track| !track.notes_with_options(options).is_empty())
                 .unwrap_or(0);
             let first_note_index = 0;
             if let Some(document) = &mut self.document {
-                match document.import_midi_tracks_to_sampler_channels(
+                match document.import_midi_tracks_to_sampler_channels_with_options(
                     &midi,
                     pattern_id,
                     template_channel_id,
+                    options,
                 ) {
                     Ok((imported, channel_ids)) => {
                         self.stop_project_playback();
@@ -28381,16 +28422,18 @@ impl DawUi {
                 }
             }
         }
-        if let Some((midi, template_channel_id)) = create_format2_midi_request {
+        if let Some((midi, template_channel_id, options)) = create_format2_midi_request {
             let selected_track_index = midi
                 .tracks()
                 .iter()
-                .position(|track| !track.notes().is_empty())
+                .position(|track| !track.notes_with_options(options).is_empty())
                 .unwrap_or(0);
             if let Some(document) = &mut self.document {
-                match document
-                    .import_midi_format2_tracks_to_sampler_patterns(&midi, template_channel_id)
-                {
+                match document.import_midi_format2_tracks_to_sampler_patterns_with_options(
+                    &midi,
+                    template_channel_id,
+                    options,
+                ) {
                     Ok((imported, destinations)) => {
                         self.stop_project_playback();
                         if let Some((pattern_id, channel_id)) =

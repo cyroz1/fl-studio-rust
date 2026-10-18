@@ -13656,6 +13656,24 @@ impl FlpDocument {
         pattern_id: u16,
         channel_id: u16,
     ) -> Result<usize, FlpError> {
+        self.import_midi_track_with_options(
+            midi,
+            track_index,
+            pattern_id,
+            channel_id,
+            midi::MidiImportOptions::default(),
+        )
+    }
+
+    /// Imports one MIDI track using explicit note interpretation options.
+    pub fn import_midi_track_with_options(
+        &mut self,
+        midi: &midi::MidiFile,
+        track_index: usize,
+        pattern_id: u16,
+        channel_id: u16,
+        options: midi::MidiImportOptions,
+    ) -> Result<usize, FlpError> {
         let mut candidate = self.clone();
         let imported = candidate.import_midi_track_in_place(
             midi,
@@ -13663,6 +13681,7 @@ impl FlpDocument {
             pattern_id,
             channel_id,
             true,
+            options,
         )?;
         *self = candidate;
         Ok(imported)
@@ -13678,6 +13697,22 @@ impl FlpDocument {
         midi: &midi::MidiFile,
         pattern_id: u16,
         channel_ids: &[u16],
+    ) -> Result<usize, FlpError> {
+        self.import_midi_tracks_with_options(
+            midi,
+            pattern_id,
+            channel_ids,
+            midi::MidiImportOptions::default(),
+        )
+    }
+
+    /// Imports every MIDI track using the same note interpretation options.
+    pub fn import_midi_tracks_with_options(
+        &mut self,
+        midi: &midi::MidiFile,
+        pattern_id: u16,
+        channel_ids: &[u16],
+        options: midi::MidiImportOptions,
     ) -> Result<usize, FlpError> {
         if midi.format() == 2 {
             return Err(FlpError::UnsupportedEdit(
@@ -13704,6 +13739,7 @@ impl FlpDocument {
                 pattern_id,
                 channel_id,
                 track_index == 0,
+                options,
             )?;
             total_imported = total_imported
                 .checked_add(imported)
@@ -13722,6 +13758,22 @@ impl FlpDocument {
         midi: &midi::MidiFile,
         pattern_id: u16,
         template_channel_id: u16,
+    ) -> Result<(usize, Vec<u16>), FlpError> {
+        self.import_midi_tracks_to_sampler_channels_with_options(
+            midi,
+            pattern_id,
+            template_channel_id,
+            midi::MidiImportOptions::default(),
+        )
+    }
+
+    /// Creates Sampler channels for MIDI tracks and imports them with explicit note options.
+    pub fn import_midi_tracks_to_sampler_channels_with_options(
+        &mut self,
+        midi: &midi::MidiFile,
+        pattern_id: u16,
+        template_channel_id: u16,
+        options: midi::MidiImportOptions,
     ) -> Result<(usize, Vec<u16>), FlpError> {
         if midi.format() == 2 {
             return Err(FlpError::UnsupportedEdit(
@@ -13743,7 +13795,8 @@ impl FlpDocument {
             )?);
         }
 
-        let imported = candidate.import_midi_tracks(midi, pattern_id, &channel_ids)?;
+        let imported =
+            candidate.import_midi_tracks_with_options(midi, pattern_id, &channel_ids, options)?;
         *self = candidate;
         Ok((imported, channel_ids))
     }
@@ -13755,6 +13808,20 @@ impl FlpDocument {
         &mut self,
         midi: &midi::MidiFile,
         template_channel_id: u16,
+    ) -> Result<(usize, Vec<(u16, u16)>), FlpError> {
+        self.import_midi_format2_tracks_to_sampler_patterns_with_options(
+            midi,
+            template_channel_id,
+            midi::MidiImportOptions::default(),
+        )
+    }
+
+    /// Imports every Format-2 sequence using explicit note interpretation options.
+    pub fn import_midi_format2_tracks_to_sampler_patterns_with_options(
+        &mut self,
+        midi: &midi::MidiFile,
+        template_channel_id: u16,
+        options: midi::MidiImportOptions,
     ) -> Result<(usize, Vec<(u16, u16)>), FlpError> {
         if midi.format() != 2 {
             return Err(FlpError::UnsupportedEdit(
@@ -13776,8 +13843,13 @@ impl FlpDocument {
             candidate.set_pattern_name(pattern_id, &track_name)?;
             let channel_id =
                 candidate.duplicate_sampler_channel(template_channel_id, &track_name)?;
-            let imported =
-                candidate.import_midi_track(midi, track_index, pattern_id, channel_id)?;
+            let imported = candidate.import_midi_track_with_options(
+                midi,
+                track_index,
+                pattern_id,
+                channel_id,
+                options,
+            )?;
             total_imported = total_imported
                 .checked_add(imported)
                 .ok_or(FlpError::LengthOverflow)?;
@@ -13794,6 +13866,7 @@ impl FlpDocument {
         pattern_id: u16,
         channel_id: u16,
         import_time_signatures: bool,
+        options: midi::MidiImportOptions,
     ) -> Result<usize, FlpError> {
         self.require_unique_channel(channel_id)?;
         if !self
@@ -13830,7 +13903,7 @@ impl FlpDocument {
                     "MIDI import requires a supported time division and valid tempo map",
                 )
             })?;
-        let midi_notes = track.notes();
+        let midi_notes = track.notes_with_options(options);
 
         let mut imported = Vec::with_capacity(midi_notes.len());
         for midi_note in &midi_notes {
@@ -26653,6 +26726,50 @@ mod tests {
 
         let reparsed = FlpDocument::parse(&document.encode_lossless().unwrap()).unwrap();
         assert_eq!(reparsed.patterns().unwrap()[0].notes.len(), 3);
+    }
+
+    #[test]
+    fn midi_import_can_treat_zero_velocity_note_ons_as_notes() {
+        let project_bytes = pattern_fixture(&[], &[]);
+        let midi_bytes = midi_fixture(
+            &[
+                0x00, 0x90, 0x3C, 0x00, // Zero-velocity Note On at tick 0.
+                0x83, 0x60, 0x80, 0x3C, 0x40, // Note Off at tick 480.
+                0x00, 0xFF, 0x2F, 0x00,
+            ],
+            480,
+        );
+        let midi = MidiFile::parse(&midi_bytes).expect("MIDI fixture should parse");
+
+        let mut default_document =
+            FlpDocument::parse(&project_bytes).expect("project should parse");
+        assert_eq!(
+            default_document
+                .import_midi_track(&midi, 0, 7, 0)
+                .expect("default MIDI import should succeed"),
+            0
+        );
+
+        let mut opted_in_document =
+            FlpDocument::parse(&project_bytes).expect("project should parse");
+        assert_eq!(
+            opted_in_document
+                .import_midi_track_with_options(
+                    &midi,
+                    0,
+                    7,
+                    0,
+                    midi::MidiImportOptions {
+                        zero_velocity_note_ons_as_notes: true,
+                    },
+                )
+                .expect("option-aware MIDI import should succeed"),
+            1
+        );
+        let note = &opted_in_document.patterns().unwrap()[0].notes[0];
+        assert_eq!((note.position, note.length, note.key), (0, 96, 60));
+        assert_eq!(note.velocity, 0);
+        assert_eq!(note.release, 65);
     }
 
     #[test]

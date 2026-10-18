@@ -46,6 +46,14 @@ pub struct MidiNote {
     release_velocity: Option<u8>,
 }
 
+/// Options that change how note events are interpreted during MIDI import.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MidiImportOptions {
+    /// Treat MIDI Note On events with velocity zero as notes. By default, MIDI
+    /// defines these events as Note Off messages.
+    pub zero_velocity_note_ons_as_notes: bool,
+}
+
 #[derive(Clone, Copy)]
 struct MidiChannelNoteState {
     pan: u8,
@@ -1222,6 +1230,11 @@ impl MidiTrack {
     /// each note starts. Missing CC values use MIDI center 64; a track without
     /// RPN 0 pitch sensitivity assumes a two-semitone range.
     pub fn notes(&self) -> Vec<MidiNote> {
+        self.notes_with_options(MidiImportOptions::default())
+    }
+
+    /// Pairs note events using the supplied MIDI import options.
+    pub fn notes_with_options(&self, options: MidiImportOptions) -> Vec<MidiNote> {
         let mut notes = Vec::new();
         let mut active: BTreeMap<(u8, u8), VecDeque<usize>> = BTreeMap::new();
         let mut channel_state = BTreeMap::<u8, MidiChannelNoteState>::new();
@@ -1258,7 +1271,7 @@ impl MidiTrack {
                     let state = channel_state.entry(channel).or_default();
                     state.pitch_bend_value = u16::from(data[0]) | (u16::from(data[1]) << 7);
                 }
-                0x90 if data[1] != 0 => {
+                0x90 if data[1] != 0 || options.zero_velocity_note_ons_as_notes => {
                     let state = channel_state.get(&channel).copied().unwrap_or_default();
                     let note_index = notes.len();
                     notes.push(MidiNote {
@@ -2054,7 +2067,9 @@ fn read_u32_be(bytes: &[u8], offset: usize, context: &'static str) -> Result<u32
 
 #[cfg(test)]
 mod tests {
-    use super::{MidiChannelMapping, MidiError, MidiExportNote, MidiExportTrack, MidiFile};
+    use super::{
+        MidiChannelMapping, MidiError, MidiExportNote, MidiExportTrack, MidiFile, MidiImportOptions,
+    };
 
     fn midi_fixture(track: &[u8]) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -2091,6 +2106,29 @@ mod tests {
         assert_eq!(notes[0].end_tick(), Some(240));
         assert_eq!(notes[0].duration_ticks(), Some(240));
         assert_eq!(midi.encode_lossless(), input);
+    }
+
+    #[test]
+    fn zero_velocity_note_on_is_an_off_by_default_and_an_on_when_requested() {
+        let input = midi_fixture(&[
+            0x00, 0x90, 0x3C, 0x00, // Velocity-zero Note On at tick 0.
+            0x60, 0x80, 0x3C, 0x21, // Note Off at tick 96.
+            0x00, 0xFF, 0x2F, 0x00,
+        ]);
+        let midi = MidiFile::parse(&input).expect("fixture should parse");
+        let track = &midi.tracks()[0];
+
+        assert!(track.notes().is_empty());
+
+        let notes = track.notes_with_options(MidiImportOptions {
+            zero_velocity_note_ons_as_notes: true,
+        });
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].key(), 60);
+        assert_eq!(notes[0].velocity(), 0);
+        assert_eq!(notes[0].start_tick(), 0);
+        assert_eq!(notes[0].end_tick(), Some(96));
+        assert_eq!(notes[0].release_velocity(), Some(33));
     }
 
     #[test]
