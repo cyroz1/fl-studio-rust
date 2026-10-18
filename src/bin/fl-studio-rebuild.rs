@@ -21411,6 +21411,7 @@ impl DawUi {
         let mut rename_group_dialog = None;
         let mut delete_group = None;
         let mut save_channel_preset = None;
+        let mut duplicate_channel_request = None;
         let mut channel_enabled_edits = Vec::new();
         let mut channel_main_pitch_edits = Vec::new();
         let mut channel_add_to_key_edits = Vec::new();
@@ -21945,6 +21946,32 @@ impl DawUi {
                                     self.rack_selection_anchor = Some(channel.id());
                                     self.selected_graph_channel = Some(channel.id());
                                     self.selected_note_channel = Some(channel.id());
+                                    ui.close();
+                                }
+                                if ui
+                                    .add_enabled(
+                                        matches!(channel.kind(), Some(0 | 2)),
+                                        egui::Button::new("Duplicate channel"),
+                                    )
+                                    .on_hover_text(
+                                        "Duplicate this Sampler or Native instrument, preserving its channel and plug-in state.",
+                                    )
+                                    .clicked()
+                                {
+                                    let base_name = format!(
+                                        "{} Copy",
+                                        channel.display_name().unwrap_or("Channel")
+                                    );
+                                    let mut duplicate_name = base_name.clone();
+                                    let mut suffix = 2u32;
+                                    while channels.iter().any(|candidate| {
+                                        candidate.display_name() == Some(duplicate_name.as_str())
+                                    }) {
+                                        duplicate_name = format!("{base_name} {suffix}");
+                                        suffix = suffix.saturating_add(1);
+                                    }
+                                    duplicate_channel_request =
+                                        Some((channel.id(), duplicate_name));
                                     ui.close();
                                 }
                                 ui.menu_button("Mixer track", |ui| {
@@ -22545,6 +22572,32 @@ impl DawUi {
         }
         if let Some(path) = new_sampler_sample {
             self.create_browser_sampler_channel(&path);
+        }
+        if let Some((source_channel_id, display_name)) = duplicate_channel_request {
+            let result = self
+                .document
+                .as_mut()
+                .map(|document| document.duplicate_channel(source_channel_id, &display_name));
+            match result {
+                Some(Ok(new_channel_id)) => {
+                    self.stop_project_playback();
+                    self.selected_rack_channels.clear();
+                    self.selected_rack_channels.insert(new_channel_id);
+                    self.rack_selection_anchor = Some(new_channel_id);
+                    self.selected_graph_channel = Some(new_channel_id);
+                    self.selected_note_channel = Some(new_channel_id);
+                    self.selected_note = None;
+                    self.selected_piano_notes.clear();
+                    self.dirty = true;
+                    self.status = format!(
+                        "Duplicated channel {source_channel_id} as channel {new_channel_id} ({display_name})"
+                    );
+                }
+                Some(Err(error)) => {
+                    self.status = format!("Could not duplicate channel: {error}");
+                }
+                None => {}
+            }
         }
         for (channel_id, enabled) in channel_enabled_edits {
             let result = self

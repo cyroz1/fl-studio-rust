@@ -17101,9 +17101,18 @@ impl FlpDocument {
         self.duplicate_channel_with_kind(source_channel_id, display_name, 2)
     }
 
-    /// Duplicates a Sampler or Native instrument channel as a MIDI track template.
+    /// Duplicates a kind-0 Sampler or kind-2 Native instrument channel.
     /// Other channel kinds are rejected because their state may contain relationships that
     /// cannot be copied safely.
+    pub fn duplicate_channel(
+        &mut self,
+        source_channel_id: u16,
+        display_name: &str,
+    ) -> Result<u16, FlpError> {
+        self.duplicate_midi_template_channel(source_channel_id, display_name)
+    }
+
+    /// Duplicates a Sampler or Native instrument channel as a MIDI track template.
     pub fn duplicate_midi_template_channel(
         &mut self,
         source_channel_id: u16,
@@ -17127,7 +17136,7 @@ impl FlpDocument {
         match source.kind() {
             Some(kind @ (0 | 2)) => Ok(kind),
             _ => Err(FlpError::UnsupportedEdit(
-                "MIDI track templates must be kind-0 Sampler or kind-2 Native instrument channels",
+                "only kind-0 Sampler or kind-2 Native instrument channels can be duplicated safely",
             )),
         }
     }
@@ -28873,6 +28882,26 @@ mod tests {
             .filter(|event| matches!(event.opcode, 0xD4 | 0xD5))
             .map(|event| event.wire_bytes().to_vec())
             .collect::<Vec<_>>();
+        let mut direct_duplicate = template_document.clone();
+        let direct_duplicate_id = direct_duplicate
+            .duplicate_channel(0, "Native Copy")
+            .expect("a Native instrument channel should duplicate directly");
+        let direct_duplicate_channel = direct_duplicate
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id() == direct_duplicate_id)
+            .expect("directly duplicated Native channel should exist");
+        assert_eq!(direct_duplicate_channel.kind(), Some(2));
+        assert_eq!(direct_duplicate_channel.display_name(), Some("Native Copy"));
+        assert_eq!(
+            direct_duplicate.events()[direct_duplicate_channel.event_range()]
+                .iter()
+                .filter(|event| matches!(event.opcode, 0xD4 | 0xD5))
+                .map(|event| event.wire_bytes().to_vec())
+                .collect::<Vec<_>>(),
+            source_state,
+            "direct channel duplication must preserve plug-in wrapper and state bytes"
+        );
 
         let mut document = template_document.clone();
         let (imported, channel_ids) = document

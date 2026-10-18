@@ -531,6 +531,14 @@ fn run(args: Vec<String>) -> Result<(), String> {
             }
             write_global_swing(Path::new(input), Path::new(output), percent as u8)
         }
+        [command, input, output, channel_id, name] if command == "duplicate-channel" => {
+            duplicate_channel(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(channel_id, "channel id")?,
+                name,
+            )
+        }
         [command, input, output, channel_id, name] if command == "rename-channel" => {
             let channel_id = channel_id
                 .parse::<u16>()
@@ -3137,6 +3145,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild render-pattern-vst3 <project.flp> <pattern-id> <channel-id> <plugin.vst3> <output.{wav|flac|ogg|mp3}> [tail-seconds]\n",
             "  flp-rebuild channels <file.flp>\n",
             "  flp-rebuild channel-groups <file.flp>\n",
+            "  flp-rebuild duplicate-channel <input.flp> <output.flp> <channel-id> <name>\n",
             "  flp-rebuild mixer <file.flp>\n",
             "  flp-rebuild set-mixer-parameter-record-value <input.flp> <output.flp> <event-index> <record-index> <signed-value>\n",
             "  flp-rebuild rename-mixer-insert <input.flp> <output.flp> <insert-ordinal> <name>\n",
@@ -5565,6 +5574,28 @@ fn write_global_swing(input: &Path, output: &Path, percent: u8) -> Result<(), St
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "set global swing mix to {percent}% (raw {raw}) in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn duplicate_channel(
+    input: &Path,
+    output: &Path,
+    channel_id: u16,
+    name: &str,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let new_channel_id = document
+        .duplicate_channel(channel_id, name)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "duplicated channel {channel_id} as channel {new_channel_id} named {name:?} in {}",
         output.display()
     );
     Ok(())
