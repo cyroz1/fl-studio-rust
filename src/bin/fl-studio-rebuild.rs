@@ -4124,7 +4124,7 @@ struct DawUi {
     midi_live_layer_note_mapping: BTreeMap<(u8, u8), VecDeque<u8>>,
     midi_live_sampler_sustain_channels: BTreeSet<u8>,
     midi_output_gain_mapping: Option<MidiControlChangeMapping>,
-    midi_mixer_fader_mapping: Option<MidiMixerFaderMapping>,
+    midi_mixer_fader_mappings: Vec<MidiMixerFaderMapping>,
     midi_mixer_fader_learning: Option<usize>,
     midi_mixer_fader_undo_snapshot: Option<Vec<u8>>,
     midi_mixer_fader_undo_last_update: Option<Instant>,
@@ -4705,7 +4705,7 @@ impl DawUi {
             audio_settings.sample_rate = rate;
         }
         let midi_output_gain_mapping = load_midi_output_gain_mapping();
-        let midi_mixer_fader_mapping = load_midi_mixer_fader_mapping();
+        let midi_mixer_fader_mappings = load_midi_mixer_fader_mappings();
         let midi_play_pause_mapping = load_midi_play_pause_mapping();
         let midi_controller_templates = load_midi_controller_templates();
         let live_resampling_quality = load_live_resampling_quality();
@@ -5035,7 +5035,7 @@ impl DawUi {
             midi_live_layer_note_mapping: BTreeMap::new(),
             midi_live_sampler_sustain_channels: BTreeSet::new(),
             midi_output_gain_mapping,
-            midi_mixer_fader_mapping,
+            midi_mixer_fader_mappings,
             midi_mixer_fader_learning: None,
             midi_mixer_fader_undo_snapshot: None,
             midi_mixer_fader_undo_last_update: None,
@@ -35289,9 +35289,9 @@ impl DawUi {
                                                             );
                                                         }
                                                         if let Some(mapping) = self
-                                                            .midi_mixer_fader_mapping
-                                                            .as_ref()
-                                                            .filter(|mapping| {
+                                                            .midi_mixer_fader_mappings
+                                                            .iter()
+                                                            .find(|mapping| {
                                                                 mapping.insert_ordinal
                                                                     == insert.ordinal()
                                                             })
@@ -35316,12 +35316,16 @@ impl DawUi {
                                                                 "Mapped from {input_name}"
                                                             ));
                                                             if ui.small_button("Clear CC").clicked() {
-                                                                self.midi_mixer_fader_mapping = None;
+                                                                self.midi_mixer_fader_mappings
+                                                                    .retain(|mapping| {
+                                                                        mapping.insert_ordinal
+                                                                            != insert.ordinal()
+                                                                    });
                                                                 self.midi_mixer_fader_learning =
                                                                     None;
                                                                 if let Err(error) =
-                                                                    save_midi_mixer_fader_mapping(
-                                                                        None,
+                                                                    save_midi_mixer_fader_mappings(
+                                                                        &self.midi_mixer_fader_mappings,
                                                                     )
                                                                 {
                                                                     self.status = format!(
@@ -37447,10 +37451,10 @@ impl DawUi {
                 history_snapshot_available,
             ) {
                 Ok(_) => {
-                    self.midi_mixer_fader_mapping = Some(mapping);
+                    upsert_midi_mixer_fader_mapping(&mut self.midi_mixer_fader_mappings, mapping);
                     self.midi_mixer_fader_learning = None;
-                    self.status = save_midi_mixer_fader_mapping(
-                        self.midi_mixer_fader_mapping.as_ref(),
+                    self.status = save_midi_mixer_fader_mappings(
+                        &self.midi_mixer_fader_mappings,
                     )
                     .err()
                     .map_or_else(
@@ -37548,16 +37552,14 @@ impl DawUi {
             self.apply_midi_output_gain(value);
             self.status = format!("MIDI output gain · {:.2}×", self.audio_settings.output_gain);
         }
-        let mixer_fader_insert = self
-            .midi_mixer_fader_mapping
-            .as_ref()
-            .zip(self.midi_input_connection.as_ref())
-            .and_then(|(mapping, connection)| {
-                (connection.device_id == mapping.input_device_id
-                    && mapping.channel == channel
-                    && mapping.controller == controller)
-                    .then_some(mapping.insert_ordinal)
-            });
+        let mixer_fader_insert = self.midi_input_connection.as_ref().and_then(|connection| {
+            midi_mixer_fader_insert_for_control(
+                &self.midi_mixer_fader_mappings,
+                &connection.device_id,
+                channel,
+                controller,
+            )
+        });
         if let Some(insert_ordinal) = mixer_fader_insert
             && let Err(error) =
                 self.apply_midi_mixer_fader_value(insert_ordinal, value, history_snapshot_available)
@@ -43996,9 +43998,11 @@ fn load_midi_output_gain_mapping() -> Option<MidiControlChangeMapping> {
     parse_midi_control_change_mapping(&contents)
 }
 
-fn load_midi_mixer_fader_mapping() -> Option<MidiMixerFaderMapping> {
-    let contents = fs::read_to_string(midi_mixer_fader_mapping_file()?).ok()?;
-    parse_midi_mixer_fader_mapping(&contents)
+fn load_midi_mixer_fader_mappings() -> Vec<MidiMixerFaderMapping> {
+    midi_mixer_fader_mapping_file()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .map(|contents| parse_midi_mixer_fader_mappings(&contents))
+        .unwrap_or_default()
 }
 
 fn load_midi_play_pause_mapping() -> Option<MidiControlChangeMapping> {
@@ -44119,7 +44123,7 @@ fn save_midi_output_gain_mapping(mapping: Option<&MidiControlChangeMapping>) -> 
     save_midi_control_change_mapping(midi_output_gain_mapping_file(), mapping)
 }
 
-fn save_midi_mixer_fader_mapping(mapping: Option<&MidiMixerFaderMapping>) -> Result<(), String> {
+fn save_midi_mixer_fader_mappings(mappings: &[MidiMixerFaderMapping]) -> Result<(), String> {
     let path = midi_mixer_fader_mapping_file()
         .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
     let parent = path
@@ -44127,7 +44131,7 @@ fn save_midi_mixer_fader_mapping(mapping: Option<&MidiMixerFaderMapping>) -> Res
         .ok_or_else(|| "the MIDI Mixer fader mapping path has no parent folder".to_owned())?;
     fs::create_dir_all(parent)
         .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
-    fs::write(&path, serialize_midi_mixer_fader_mapping(mapping))
+    fs::write(&path, serialize_midi_mixer_fader_mappings(mappings))
         .map_err(|error| format!("could not write {}: {error}", path.display()))
 }
 
@@ -44195,7 +44199,51 @@ fn parse_midi_control_change_mapping(contents: &str) -> Option<MidiControlChange
     })
 }
 
-fn parse_midi_mixer_fader_mapping(contents: &str) -> Option<MidiMixerFaderMapping> {
+fn parse_midi_mixer_fader_mappings(contents: &str) -> Vec<MidiMixerFaderMapping> {
+    let mut mappings = Vec::new();
+    let mut found_versioned_mapping = false;
+    for line in contents.lines() {
+        let Some(encoded) = line.strip_prefix("mapping=") else {
+            continue;
+        };
+        found_versioned_mapping = true;
+        let mut fields = encoded.split('\t');
+        let Some(input_device_id) = fields.next().and_then(decode_midi_device_id) else {
+            continue;
+        };
+        let Some(channel) = fields.next().and_then(|field| field.parse::<u8>().ok()) else {
+            continue;
+        };
+        let Some(controller) = fields.next().and_then(|field| field.parse::<u8>().ok()) else {
+            continue;
+        };
+        let Some(insert_ordinal) = fields.next().and_then(|field| field.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        if fields.next().is_some() {
+            continue;
+        }
+        let mapping = MidiMixerFaderMapping {
+            input_device_id,
+            channel,
+            controller,
+            insert_ordinal,
+        };
+        if valid_midi_mixer_fader_mapping(&mapping) {
+            upsert_midi_mixer_fader_mapping(&mut mappings, mapping);
+        }
+    }
+    if found_versioned_mapping {
+        mappings
+    } else {
+        parse_legacy_midi_mixer_fader_mapping(contents)
+            .into_iter()
+            .collect()
+    }
+}
+
+fn parse_legacy_midi_mixer_fader_mapping(contents: &str) -> Option<MidiMixerFaderMapping> {
     let mut input_device_id = None;
     let mut channel = None;
     let mut controller = None;
@@ -44215,29 +44263,71 @@ fn parse_midi_mixer_fader_mapping(contents: &str) -> Option<MidiMixerFaderMappin
     let channel = channel?;
     let controller = controller?;
     let insert_ordinal = insert_ordinal?;
-    (channel < 16 && controller < 128 && insert_ordinal < MIXER_TRACK_METER_COUNT).then_some(
-        MidiMixerFaderMapping {
-            input_device_id,
-            channel,
-            controller,
-            insert_ordinal,
-        },
-    )
+    let mapping = MidiMixerFaderMapping {
+        input_device_id,
+        channel,
+        controller,
+        insert_ordinal,
+    };
+    valid_midi_mixer_fader_mapping(&mapping).then_some(mapping)
 }
 
-fn serialize_midi_mixer_fader_mapping(mapping: Option<&MidiMixerFaderMapping>) -> String {
-    mapping.map_or_else(
-        || "input=\nchannel=\ncontroller=\ninsert=\n".to_owned(),
-        |mapping| {
-            format!(
-                "input={}\nchannel={}\ncontroller={}\ninsert={}\n",
-                encode_midi_device_id(&mapping.input_device_id),
-                mapping.channel,
-                mapping.controller,
-                mapping.insert_ordinal
-            )
-        },
-    )
+fn valid_midi_mixer_fader_mapping(mapping: &MidiMixerFaderMapping) -> bool {
+    mapping.channel < 16
+        && mapping.controller < 128
+        && mapping.insert_ordinal < MIXER_TRACK_METER_COUNT
+}
+
+fn upsert_midi_mixer_fader_mapping(
+    mappings: &mut Vec<MidiMixerFaderMapping>,
+    mapping: MidiMixerFaderMapping,
+) {
+    mappings.retain(|existing| {
+        existing.insert_ordinal != mapping.insert_ordinal
+            && !(existing.input_device_id == mapping.input_device_id
+                && existing.channel == mapping.channel
+                && existing.controller == mapping.controller)
+    });
+    mappings.push(mapping);
+}
+
+fn midi_mixer_fader_insert_for_control(
+    mappings: &[MidiMixerFaderMapping],
+    input_device_id: &str,
+    channel: u8,
+    controller: u8,
+) -> Option<usize> {
+    mappings
+        .iter()
+        .find(|mapping| {
+            mapping.input_device_id == input_device_id
+                && mapping.channel == channel
+                && mapping.controller == controller
+        })
+        .map(|mapping| mapping.insert_ordinal)
+}
+
+fn serialize_midi_mixer_fader_mappings(mappings: &[MidiMixerFaderMapping]) -> String {
+    let mut contents = String::from("version=2\n");
+    let mut normalized = Vec::new();
+    for mapping in mappings
+        .iter()
+        .filter(|mapping| valid_midi_mixer_fader_mapping(mapping))
+    {
+        upsert_midi_mixer_fader_mapping(&mut normalized, mapping.clone());
+    }
+    for mapping in normalized {
+        contents.push_str("mapping=");
+        contents.push_str(&encode_midi_device_id(&mapping.input_device_id));
+        contents.push('\t');
+        contents.push_str(&mapping.channel.to_string());
+        contents.push('\t');
+        contents.push_str(&mapping.controller.to_string());
+        contents.push('\t');
+        contents.push_str(&mapping.insert_ordinal.to_string());
+        contents.push('\n');
+    }
+    contents
 }
 
 fn serialize_midi_controller_templates(templates: &[MidiControllerTemplate]) -> String {
@@ -49195,10 +49285,10 @@ mod tests {
         detect_piano_roll_scale, encode_midi_device_id, encode_midi_device_selections,
         first_available_playlist_track, is_performance_clip_trigger_channel_event,
         midi_button_press_edge, midi_cc_to_mixer_fader_raw, midi_controller_binding_for_device,
-        next_piano_roll_note_group, note_from_grid_position, parse_midi_control_change_mapping,
-        parse_midi_controller_templates, parse_midi_device_selections,
-        parse_midi_mixer_fader_mapping, parse_window_layout_presets, pattern_loop_frame_at_tick,
-        pattern_loop_tick_at_frame, piano_roll_color_group_note_ids,
+        midi_mixer_fader_insert_for_control, next_piano_roll_note_group, note_from_grid_position,
+        parse_midi_control_change_mapping, parse_midi_controller_templates,
+        parse_midi_device_selections, parse_midi_mixer_fader_mappings, parse_window_layout_presets,
+        pattern_loop_frame_at_tick, pattern_loop_tick_at_frame, piano_roll_color_group_note_ids,
         piano_roll_controller_stroke_points, piano_roll_controller_value_at,
         piano_roll_controller_value_range, piano_roll_cross_pattern_ghost_notes,
         piano_roll_discard_length_edit, piano_roll_duplicate_offset,
@@ -49216,12 +49306,12 @@ mod tests {
         playlist_signature_at_tick, playlist_song_position_label, playlist_track_group_range,
         playlist_track_is_hidden, recolor_piano_roll_notes, recording_input_targets,
         sample_editor_selection_for_drag, serialize_midi_controller_templates,
-        serialize_midi_mixer_fader_mapping, serialize_window_layout_presets,
+        serialize_midi_mixer_fader_mappings, serialize_window_layout_presets,
         should_auto_connect_midi_input, should_auto_connect_midi_output, snap_note_tick,
         snap_piano_roll_key_to_scale, snap_recorded_midi_notes_to_scale,
         toggle_piano_roll_note_group_selection, touch_pan_zoom_scroll_offset, track_two_finger_tap,
         update_channel_rack_selection, update_layer_child_selection,
-        update_piano_roll_box_selection, zoom_to_fit,
+        update_piano_roll_box_selection, upsert_midi_mixer_fader_mapping, zoom_to_fit,
     };
 
     fn mixer_send_route_fixture() -> FlpDocument {
@@ -50405,28 +50495,129 @@ mod tests {
     }
 
     #[test]
-    fn midi_mixer_fader_mapping_round_trips_device_channel_controller_and_track() {
-        let mapping = MidiMixerFaderMapping {
+    fn midi_mixer_fader_mappings_round_trip_multiple_devices_and_tracks() {
+        let mappings = vec![
+            MidiMixerFaderMapping {
+                input_device_id: "alsa:keyboard\t雪".to_owned(),
+                channel: 15,
+                controller: 74,
+                insert_ordinal: 23,
+            },
+            MidiMixerFaderMapping {
+                input_device_id: "usb:surface".to_owned(),
+                channel: 0,
+                controller: 7,
+                insert_ordinal: 1,
+            },
+        ];
+        let encoded = serialize_midi_mixer_fader_mappings(&mappings);
+        assert_eq!(parse_midi_mixer_fader_mappings(&encoded), mappings);
+    }
+
+    #[test]
+    fn midi_mixer_fader_mapping_loader_keeps_legacy_single_mapping_files() {
+        let legacy = MidiMixerFaderMapping {
             input_device_id: "alsa:keyboard\t雪".to_owned(),
             channel: 15,
             controller: 74,
             insert_ordinal: 23,
         };
-        let encoded = serialize_midi_mixer_fader_mapping(Some(&mapping));
-        assert_eq!(parse_midi_mixer_fader_mapping(&encoded), Some(mapping));
+        let encoded = format!(
+            "input={}\nchannel={}\ncontroller={}\ninsert={}\n",
+            encode_midi_device_id(&legacy.input_device_id),
+            legacy.channel,
+            legacy.controller,
+            legacy.insert_ordinal
+        );
+        assert_eq!(parse_midi_mixer_fader_mappings(&encoded), vec![legacy]);
         assert!(
-            parse_midi_mixer_fader_mapping("input=706f7274\nchannel=16\ncontroller=7\ninsert=1\n")
-                .is_none()
+            parse_midi_mixer_fader_mappings("input=706f7274\nchannel=16\ncontroller=7\ninsert=1\n")
+                .is_empty()
         );
         assert!(
-            parse_midi_mixer_fader_mapping("input=706f7274\nchannel=0\ncontroller=128\ninsert=1\n")
-                .is_none()
+            parse_midi_mixer_fader_mappings(
+                "input=706f7274\nchannel=0\ncontroller=128\ninsert=1\n"
+            )
+            .is_empty()
         );
         assert!(
-            parse_midi_mixer_fader_mapping(
+            parse_midi_mixer_fader_mappings(
                 "input=706f7274\nchannel=0\ncontroller=7\ninsert=999999\n"
             )
-            .is_none()
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn midi_mixer_fader_mapping_reassignment_is_one_to_one_and_preserves_other_strips() {
+        let first = MidiMixerFaderMapping {
+            input_device_id: "surface".to_owned(),
+            channel: 0,
+            controller: 7,
+            insert_ordinal: 1,
+        };
+        let second = MidiMixerFaderMapping {
+            input_device_id: "surface".to_owned(),
+            channel: 0,
+            controller: 8,
+            insert_ordinal: 2,
+        };
+        let replacement = MidiMixerFaderMapping {
+            input_device_id: "surface".to_owned(),
+            channel: 0,
+            controller: 9,
+            insert_ordinal: 1,
+        };
+        let reassigned_control = MidiMixerFaderMapping {
+            input_device_id: "surface".to_owned(),
+            channel: 0,
+            controller: 8,
+            insert_ordinal: 3,
+        };
+        let mut mappings = vec![first, second.clone()];
+        upsert_midi_mixer_fader_mapping(&mut mappings, replacement.clone());
+        assert_eq!(mappings, vec![second, replacement.clone()]);
+        upsert_midi_mixer_fader_mapping(&mut mappings, reassigned_control.clone());
+        assert_eq!(mappings, vec![replacement, reassigned_control]);
+    }
+
+    #[test]
+    fn midi_mixer_fader_control_matches_device_channel_and_controller() {
+        let mappings = vec![
+            MidiMixerFaderMapping {
+                input_device_id: "surface-a".to_owned(),
+                channel: 0,
+                controller: 7,
+                insert_ordinal: 1,
+            },
+            MidiMixerFaderMapping {
+                input_device_id: "surface-b".to_owned(),
+                channel: 0,
+                controller: 7,
+                insert_ordinal: 2,
+            },
+            MidiMixerFaderMapping {
+                input_device_id: "surface-a".to_owned(),
+                channel: 1,
+                controller: 7,
+                insert_ordinal: 3,
+            },
+        ];
+        assert_eq!(
+            midi_mixer_fader_insert_for_control(&mappings, "surface-a", 0, 7),
+            Some(1)
+        );
+        assert_eq!(
+            midi_mixer_fader_insert_for_control(&mappings, "surface-b", 0, 7),
+            Some(2)
+        );
+        assert_eq!(
+            midi_mixer_fader_insert_for_control(&mappings, "surface-a", 1, 7),
+            Some(3)
+        );
+        assert_eq!(
+            midi_mixer_fader_insert_for_control(&mappings, "surface-a", 0, 8),
+            None
         );
     }
 
