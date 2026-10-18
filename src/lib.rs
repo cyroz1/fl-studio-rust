@@ -13644,6 +13644,19 @@ impl FlpDocument {
         }
     }
 
+    fn midi_realign_origin_tick(
+        midi: &midi::MidiFile,
+        track_indices: impl IntoIterator<Item = usize>,
+        options: midi::MidiImportOptions,
+    ) -> Option<u64> {
+        track_indices
+            .into_iter()
+            .filter_map(|track_index| midi.tracks().get(track_index))
+            .flat_map(|track| track.notes_with_options(options))
+            .map(|note| note.start_tick())
+            .min()
+    }
+
     /// Imports the note events from one Standard MIDI File track into an existing FLP
     /// pattern and channel. Note times are converted through the MIDI tempo map or
     /// SMPTE clock, then expressed against the existing FLP tempo. MIDI CC 10 pan
@@ -13665,7 +13678,8 @@ impl FlpDocument {
         )
     }
 
-    /// Imports one MIDI track using explicit note interpretation options.
+    /// Imports one MIDI track using explicit note interpretation options. When
+    /// `realign_events` is enabled, its earliest imported note starts at tick zero.
     pub fn import_midi_track_with_options(
         &mut self,
         midi: &midi::MidiFile,
@@ -13674,6 +13688,11 @@ impl FlpDocument {
         channel_id: u16,
         options: midi::MidiImportOptions,
     ) -> Result<usize, FlpError> {
+        let realign_origin_tick = if options.realign_events {
+            Self::midi_realign_origin_tick(midi, [track_index], options)
+        } else {
+            None
+        };
         let mut candidate = self.clone();
         let imported = candidate.import_midi_track_in_place(
             midi,
@@ -13682,6 +13701,7 @@ impl FlpDocument {
             channel_id,
             true,
             options,
+            realign_origin_tick,
         )?;
         *self = candidate;
         Ok(imported)
@@ -13706,7 +13726,9 @@ impl FlpDocument {
         )
     }
 
-    /// Imports every MIDI track using the same note interpretation options.
+    /// Imports every MIDI track using the same note interpretation options. When
+    /// `realign_events` is enabled, the earliest note across all tracks starts at
+    /// tick zero, preserving their timing relative to one another.
     pub fn import_midi_tracks_with_options(
         &mut self,
         midi: &midi::MidiFile,
@@ -13730,6 +13752,11 @@ impl FlpDocument {
             ));
         }
 
+        let realign_origin_tick = if options.realign_events {
+            Self::midi_realign_origin_tick(midi, 0..midi.tracks().len(), options)
+        } else {
+            None
+        };
         let mut candidate = self.clone();
         let mut total_imported = 0usize;
         for (track_index, channel_id) in channel_ids.iter().copied().enumerate() {
@@ -13740,6 +13767,7 @@ impl FlpDocument {
                 channel_id,
                 track_index == 0,
                 options,
+                realign_origin_tick,
             )?;
             total_imported = total_imported
                 .checked_add(imported)
@@ -13867,6 +13895,7 @@ impl FlpDocument {
         channel_id: u16,
         import_time_signatures: bool,
         options: midi::MidiImportOptions,
+        realign_origin_tick: Option<u64>,
     ) -> Result<usize, FlpError> {
         self.require_unique_channel(channel_id)?;
         if !self
@@ -13903,22 +13932,43 @@ impl FlpDocument {
                     "MIDI import requires a supported time division and valid tempo map",
                 )
             })?;
+        let realign_offset_ticks = if let Some(origin_tick) = realign_origin_tick {
+            let origin_microseconds = midi
+                .elapsed_microseconds_at_tick(
+                    origin_tick,
+                    track_index,
+                    default_microseconds_per_quarter,
+                )
+                .map_err(|_| {
+                    FlpError::UnsupportedEdit("could not convert MIDI realignment start time")
+                })?;
+            Some(scale_midi_microseconds_to_project_ticks(
+                origin_microseconds,
+                project_tempo_milli_bpm,
+                self.header.ppq,
+            )?)
+        } else {
+            None
+        };
         let midi_notes = track.notes_with_options(options);
 
         let mut imported = Vec::with_capacity(midi_notes.len());
         for midi_note in &midi_notes {
-            let start_microseconds = midi
+            let absolute_start_microseconds = midi
                 .elapsed_microseconds_at_tick(
                     midi_note.start_tick(),
                     track_index,
                     default_microseconds_per_quarter,
                 )
                 .map_err(|_| FlpError::UnsupportedEdit("could not convert MIDI note start time"))?;
-            let position = scale_midi_microseconds_to_project_ticks(
-                start_microseconds,
+            let absolute_position = scale_midi_microseconds_to_project_ticks(
+                absolute_start_microseconds,
                 project_tempo_milli_bpm,
                 self.header.ppq,
             )?;
+            let position = realign_offset_ticks.map_or(absolute_position, |offset| {
+                absolute_position.saturating_sub(offset)
+            });
 
             let end_microseconds = if let Some(end_tick) = midi_note.end_tick() {
                 midi.elapsed_microseconds_at_tick(
@@ -13948,13 +13998,16 @@ impl FlpDocument {
                     FlpError::UnsupportedEdit("could not convert MIDI fallback note end time")
                 })?
             } else {
-                start_microseconds + default_microseconds_per_quarter
+                absolute_start_microseconds + default_microseconds_per_quarter
             };
-            let end_position = scale_midi_microseconds_to_project_ticks(
+            let absolute_end_position = scale_midi_microseconds_to_project_ticks(
                 end_microseconds,
                 project_tempo_milli_bpm,
                 self.header.ppq,
             )?;
+            let end_position = realign_offset_ticks.map_or(absolute_end_position, |offset| {
+                absolute_end_position.saturating_sub(offset)
+            });
             let length = end_position.saturating_sub(position).max(1);
             imported.push(PatternNote {
                 position,
@@ -14029,11 +14082,14 @@ impl FlpDocument {
                 .map_err(|_| {
                     FlpError::UnsupportedEdit("could not convert MIDI time-signature position")
                 })?;
-            let position = scale_midi_microseconds_to_project_ticks(
+            let absolute_position = scale_midi_microseconds_to_project_ticks(
                 elapsed_microseconds,
                 project_tempo_milli_bpm,
                 self.header.ppq,
             )?;
+            let position = realign_offset_ticks.map_or(absolute_position, |offset| {
+                absolute_position.saturating_sub(offset)
+            });
             imported_signatures.push((position, numerator, denominator));
         }
 
@@ -26761,6 +26817,7 @@ mod tests {
                     0,
                     MidiImportOptions {
                         zero_velocity_note_ons_as_notes: true,
+                        ..MidiImportOptions::default()
                     },
                 )
                 .expect("option-aware MIDI import should succeed"),
@@ -26770,6 +26827,69 @@ mod tests {
         assert_eq!((note.position, note.length, note.key), (0, 96, 60));
         assert_eq!(note.velocity, 0);
         assert_eq!(note.release, 65);
+    }
+
+    #[test]
+    fn midi_import_realigns_all_tracks_from_the_earliest_note() {
+        let project_bytes = pattern_fixture(&[], &[]);
+        let midi = MidiFile::parse(&midi_tracks_fixture(
+            &[
+                &[
+                    0x85, 0x50, 0xFF, 0x58, 0x04, 0x04, 0x02, 0x18, 0x08, // 4/4 at tick 720.
+                    0x81, 0x70, 0x90, 0x3C, 0x64, // C4 at tick 960.
+                    0x83, 0x60, 0x80, 0x3C, 0x40, // Note off at tick 1440.
+                    0x00, 0xFF, 0x2F, 0x00,
+                ],
+                &[
+                    0x83, 0x60, 0x90, 0x43, 0x64, // G4 at tick 480.
+                    0x81, 0x70, 0x80, 0x43, 0x40, // Note off at tick 720.
+                    0x00, 0xFF, 0x2F, 0x00,
+                ],
+            ],
+            1,
+            480,
+        ))
+        .expect("MIDI fixture should parse");
+
+        let mut default_document =
+            FlpDocument::parse(&project_bytes).expect("project should parse");
+        default_document
+            .import_midi_tracks_with_options(&midi, 7, &[0, 0], MidiImportOptions::default())
+            .expect("default MIDI import should succeed");
+        let default_pattern = &default_document.patterns().unwrap()[0];
+        assert_eq!(
+            default_pattern
+                .notes
+                .iter()
+                .map(|note| note.position)
+                .collect::<Vec<_>>(),
+            [192, 96]
+        );
+        assert_eq!(default_pattern.time_markers[0].position_ticks(), 144);
+
+        let mut realigned_document =
+            FlpDocument::parse(&project_bytes).expect("project should parse");
+        realigned_document
+            .import_midi_tracks_with_options(
+                &midi,
+                7,
+                &[0, 0],
+                MidiImportOptions {
+                    realign_events: true,
+                    ..MidiImportOptions::default()
+                },
+            )
+            .expect("realigned MIDI import should succeed");
+        let realigned_pattern = &realigned_document.patterns().unwrap()[0];
+        assert_eq!(
+            realigned_pattern
+                .notes
+                .iter()
+                .map(|note| note.position)
+                .collect::<Vec<_>>(),
+            [96, 0]
+        );
+        assert_eq!(realigned_pattern.time_markers[0].position_ticks(), 48);
     }
 
     #[test]

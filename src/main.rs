@@ -2566,7 +2566,21 @@ fn run(args: Vec<String>) -> Result<(), String> {
                         zero_velocity_note_ons,
                         "zero-velocity Note On option",
                     )?,
+                    realign_events: false,
                 },
+            )
+        }
+        [command, input, midi_path, output, track, pattern_id, channel_id, zero_velocity_note_ons, realign_events]
+            if command == "import-midi" =>
+        {
+            import_midi_track(
+                Path::new(input),
+                Path::new(midi_path),
+                Path::new(output),
+                parse_usize(track, "MIDI track number")?,
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                parse_midi_import_options(zero_velocity_note_ons, realign_events)?,
             )
         }
         [command, input, midi_path, output, pattern_id, channel_ids]
@@ -2603,7 +2617,24 @@ fn run(args: Vec<String>) -> Result<(), String> {
                         zero_velocity_note_ons,
                         "zero-velocity Note On option",
                     )?,
+                    realign_events: false,
                 },
+            )
+        }
+        [command, input, midi_path, output, pattern_id, channel_ids, zero_velocity_note_ons, realign_events]
+            if command == "import-midi-all" =>
+        {
+            let channel_ids = channel_ids
+                .split(',')
+                .map(|channel_id| parse_u16(channel_id, "channel id"))
+                .collect::<Result<Vec<_>, _>>()?;
+            import_midi_tracks(
+                Path::new(input),
+                Path::new(midi_path),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                &channel_ids,
+                parse_midi_import_options(zero_velocity_note_ons, realign_events)?,
             )
         }
         [command, input, midi_path, output, pattern_id, template_channel_id]
@@ -2632,7 +2663,20 @@ fn run(args: Vec<String>) -> Result<(), String> {
                         zero_velocity_note_ons,
                         "zero-velocity Note On option",
                     )?,
+                    realign_events: false,
                 },
+            )
+        }
+        [command, input, midi_path, output, pattern_id, template_channel_id, zero_velocity_note_ons, realign_events]
+            if command == "import-midi-sampler-tracks" =>
+        {
+            import_midi_sampler_tracks(
+                Path::new(input),
+                Path::new(midi_path),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(template_channel_id, "template channel id")?,
+                parse_midi_import_options(zero_velocity_note_ons, realign_events)?,
             )
         }
         [command, input, midi_path, output, template_channel_id]
@@ -2659,7 +2703,19 @@ fn run(args: Vec<String>) -> Result<(), String> {
                         zero_velocity_note_ons,
                         "zero-velocity Note On option",
                     )?,
+                    realign_events: false,
                 },
+            )
+        }
+        [command, input, midi_path, output, template_channel_id, zero_velocity_note_ons, realign_events]
+            if command == "import-midi-format2" =>
+        {
+            import_midi_format2(
+                Path::new(input),
+                Path::new(midi_path),
+                Path::new(output),
+                parse_u16(template_channel_id, "template channel id")?,
+                parse_midi_import_options(zero_velocity_note_ons, realign_events)?,
             )
         }
         _ => Err(concat!(
@@ -2795,10 +2851,10 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild delete-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based>\n",
             "  flp-rebuild create-playlist-pattern-clip <input.flp> <output.flp> <arrangement-id> <pattern-id> <position-ticks> <length-ticks> <track-index:zero-based>\n",
             "  flp-rebuild create-playlist-audio-clip <input.flp> <output.flp> <arrangement-id> <channel-id> <position-ticks> <length-ticks> <track-index:zero-based>\n",
-            "  flp-rebuild import-midi <input.flp> <input.mid> <output.flp> <track> <pattern-id> <channel-id> [zero-velocity-note-ons:0|1]\n",
-            "  flp-rebuild import-midi-all <input.flp> <input.mid> <output.flp> <pattern-id> <channel-ids-comma-separated> [zero-velocity-note-ons:0|1]\n",
-            "  flp-rebuild import-midi-sampler-tracks <input.flp> <input.mid> <output.flp> <pattern-id> <template-channel-id> [zero-velocity-note-ons:0|1]\n",
-            "  flp-rebuild import-midi-format2 <input.flp> <input.mid> <output.flp> <template-channel-id> [zero-velocity-note-ons:0|1]\n",
+            "  flp-rebuild import-midi <input.flp> <input.mid> <output.flp> <track> <pattern-id> <channel-id> [zero-velocity-note-ons:0|1] [realign-events:0|1]\n",
+            "  flp-rebuild import-midi-all <input.flp> <input.mid> <output.flp> <pattern-id> <channel-ids-comma-separated> [zero-velocity-note-ons:0|1] [realign-events:0|1]\n",
+            "  flp-rebuild import-midi-sampler-tracks <input.flp> <input.mid> <output.flp> <pattern-id> <template-channel-id> [zero-velocity-note-ons:0|1] [realign-events:0|1]\n",
+            "  flp-rebuild import-midi-format2 <input.flp> <input.mid> <output.flp> <template-channel-id> [zero-velocity-note-ons:0|1] [realign-events:0|1]\n",
             "  flp-rebuild edit-clip <input.flp> <output.flp> <arrangement-id> <clip-index> <position> <length>\n",
             "  flp-rebuild delete-playlist-clip <input.flp> <output.flp> <arrangement-id> <clip-index>\n",
             "  flp-rebuild set-clip-muted <input.flp> <output.flp> <arrangement-id> <clip-index> <muted:0|1>\n",
@@ -2994,6 +3050,19 @@ fn parse_midi_channel_mapping(value: &str) -> Result<MidiChannelMapping, String>
         "channels" => Ok(MidiChannelMapping::AssignProjectChannels),
         _ => Err("MIDI channel mapping must be 'stored' or 'channels'".to_owned()),
     }
+}
+
+fn parse_midi_import_options(
+    zero_velocity_note_ons: &str,
+    realign_events: &str,
+) -> Result<MidiImportOptions, String> {
+    Ok(MidiImportOptions {
+        zero_velocity_note_ons_as_notes: parse_bool(
+            zero_velocity_note_ons,
+            "zero-velocity Note On option",
+        )?,
+        realign_events: parse_bool(realign_events, "realign events option")?,
+    })
 }
 
 fn parse_u8(value: &str, description: &str) -> Result<u8, String> {
@@ -7828,7 +7897,30 @@ fn delete_time_marker(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_clip_indices, parse_raw_byte, parse_rgb_hex, parse_scale_name};
+    use super::{
+        parse_clip_indices, parse_midi_import_options, parse_raw_byte, parse_rgb_hex,
+        parse_scale_name,
+    };
+    use flp_rebuild::midi::MidiImportOptions;
+
+    #[test]
+    fn parses_midi_import_options() {
+        assert_eq!(
+            parse_midi_import_options("1", "0"),
+            Ok(MidiImportOptions {
+                zero_velocity_note_ons_as_notes: true,
+                realign_events: false,
+            })
+        );
+        assert_eq!(
+            parse_midi_import_options("0", "1"),
+            Ok(MidiImportOptions {
+                zero_velocity_note_ons_as_notes: false,
+                realign_events: true,
+            })
+        );
+        assert!(parse_midi_import_options("0", "2").is_err());
+    }
 
     #[test]
     fn parses_channel_rgb_in_hex_form_with_optional_prefix() {

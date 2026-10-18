@@ -46,12 +46,15 @@ pub struct MidiNote {
     release_velocity: Option<u8>,
 }
 
-/// Options that change how note events are interpreted during MIDI import.
+/// Options for interpreting MIDI notes and aligning imported events.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct MidiImportOptions {
     /// Treat MIDI Note On events with velocity zero as notes. By default, MIDI
     /// defines these events as Note Off messages.
     pub zero_velocity_note_ons_as_notes: bool,
+    /// Remove leading empty time before the first imported note. Batch imports
+    /// share one start across tracks; independent Format-2 sequences align separately.
+    pub realign_events: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1233,7 +1236,9 @@ impl MidiTrack {
         self.notes_with_options(MidiImportOptions::default())
     }
 
-    /// Pairs note events using the supplied MIDI import options.
+    /// Pairs note events using the supplied zero-velocity Note On option.
+    /// `realign_events` is applied by document import methods because aligning
+    /// several tracks requires a shared project-time origin.
     pub fn notes_with_options(&self, options: MidiImportOptions) -> Vec<MidiNote> {
         let mut notes = Vec::new();
         let mut active: BTreeMap<(u8, u8), VecDeque<usize>> = BTreeMap::new();
@@ -2122,6 +2127,7 @@ mod tests {
 
         let notes = track.notes_with_options(MidiImportOptions {
             zero_velocity_note_ons_as_notes: true,
+            ..MidiImportOptions::default()
         });
         assert_eq!(notes.len(), 1);
         assert_eq!(notes[0].key(), 60);

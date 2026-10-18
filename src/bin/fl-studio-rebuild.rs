@@ -3374,6 +3374,7 @@ struct PendingMidiImport {
     import_all_tracks: bool,
     track_channel_ids: Vec<u16>,
     zero_velocity_note_ons_as_notes: bool,
+    realign_events: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -11864,6 +11865,7 @@ impl DawUi {
                             import_all_tracks: false,
                             track_channel_ids,
                             zero_velocity_note_ons_as_notes: false,
+                            realign_events: false,
                         });
                         self.view = MainView::PianoRoll;
                         self.status = format!("Loaded MIDI file {}", path.display());
@@ -28078,6 +28080,7 @@ impl DawUi {
                             import_all_tracks: false,
                             track_channel_ids,
                             zero_velocity_note_ons_as_notes: false,
+                            realign_events: false,
                         });
                         self.status = format!("Loaded MIDI file {}", path.display());
                     }
@@ -28156,6 +28159,7 @@ impl DawUi {
                             MidiImportOptions {
                                 zero_velocity_note_ons_as_notes:
                                     pending.zero_velocity_note_ons_as_notes,
+                                realign_events: pending.realign_events,
                             },
                         ));
                     }
@@ -28184,6 +28188,7 @@ impl DawUi {
                             MidiImportOptions {
                                 zero_velocity_note_ons_as_notes:
                                     pending.zero_velocity_note_ons_as_notes,
+                                realign_events: pending.realign_events,
                             },
                         ));
                     }
@@ -28208,6 +28213,7 @@ impl DawUi {
                             MidiImportOptions {
                                 zero_velocity_note_ons_as_notes:
                                     pending.zero_velocity_note_ons_as_notes,
+                                realign_events: pending.realign_events,
                             },
                         ));
                     }
@@ -28231,6 +28237,7 @@ impl DawUi {
                         MidiImportOptions {
                             zero_velocity_note_ons_as_notes:
                                 pending.zero_velocity_note_ons_as_notes,
+                            realign_events: pending.realign_events,
                         },
                     ));
                 }
@@ -28243,6 +28250,10 @@ impl DawUi {
             .on_hover_text(
                 "By default, MIDI treats Note On with velocity 0 as Note Off. Enable this to import those messages as notes with velocity 0.",
             );
+            ui.checkbox(&mut pending.realign_events, "Realign events")
+                .on_hover_text(
+                    "Remove leading empty time before the first imported note. Note and time-signature positions shift together, and tracks keep their relative timing.",
+                );
             if pending.import_all_tracks {
                 ui.vertical(|ui| {
                     ui.small("Choose a destination Channel Rack channel for each MIDI track.");
