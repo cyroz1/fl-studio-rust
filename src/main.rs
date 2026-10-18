@@ -24,6 +24,17 @@ use flp_rebuild::{
     ScaleLevelsOptions, StrumOptions, TimeMarkerEdit,
 };
 
+struct MidiControlChangeImport<'a> {
+    input: &'a Path,
+    midi_path: &'a Path,
+    output: &'a Path,
+    track_index: usize,
+    pattern_id: u16,
+    target_stream: (u8, u8),
+    controller_number: u8,
+    midi_channel: Option<u8>,
+}
+
 fn main() -> ExitCode {
     match run(env::args().skip(1).collect()) {
         Ok(()) => ExitCode::SUCCESS,
@@ -2552,17 +2563,19 @@ fn run(args: Vec<String>) -> Result<(), String> {
             if command == "import-midi-cc" =>
         {
             import_midi_control_changes(
-                Path::new(input),
-                Path::new(midi_path),
-                Path::new(output),
-                parse_usize(track, "MIDI track index")?,
-                parse_u16(pattern_id, "pattern id")?,
-                (
+                MidiControlChangeImport {
+                    input: Path::new(input),
+                    midi_path: Path::new(midi_path),
+                    output: Path::new(output),
+                    track_index: parse_usize(track, "MIDI track index")?,
+                    pattern_id: parse_u16(pattern_id, "pattern id")?,
+                    target_stream: (
                     parse_raw_byte(stream_channel, "raw controller channel")?,
                     parse_raw_byte(stream_flags, "raw controller flags")?,
-                ),
-                parse_u8(controller_number, "MIDI Control Change number")?,
-                parse_midi_channel_filter(midi_channel)?,
+                    ),
+                    controller_number: parse_u8(controller_number, "MIDI Control Change number")?,
+                    midi_channel: parse_midi_channel_filter(midi_channel)?,
+                },
             )
         }
         [command, input, midi_path, output, track, pattern_id, channel_id]
@@ -7441,16 +7454,17 @@ fn import_midi_track(
     Ok(())
 }
 
-fn import_midi_control_changes(
-    input: &Path,
-    midi_path: &Path,
-    output: &Path,
-    track_index: usize,
-    pattern_id: u16,
-    target_stream: (u8, u8),
-    controller_number: u8,
-    midi_channel: Option<u8>,
-) -> Result<(), String> {
+fn import_midi_control_changes(request: MidiControlChangeImport<'_>) -> Result<(), String> {
+    let MidiControlChangeImport {
+        input,
+        midi_path,
+        output,
+        track_index,
+        pattern_id,
+        target_stream,
+        controller_number,
+        midi_channel,
+    } = request;
     let (_, mut document) = load_document(input)?;
     let midi_bytes = fs::read(midi_path)
         .map_err(|error| format!("could not read {}: {error}", midi_path.display()))?;
