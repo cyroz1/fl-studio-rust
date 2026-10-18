@@ -4516,6 +4516,7 @@ enum MidiMixerControlTarget {
     Mute,
     Solo,
     PhaseInvert,
+    SwapLeftRight,
 }
 
 impl MidiMixerControlTarget {
@@ -4527,6 +4528,7 @@ impl MidiMixerControlTarget {
             Self::Mute => "mute",
             Self::Solo => "solo",
             Self::PhaseInvert => "phase invert",
+            Self::SwapLeftRight => "left/right swap",
         }
     }
 
@@ -4538,6 +4540,7 @@ impl MidiMixerControlTarget {
             "mute" => Some(Self::Mute),
             "solo" => Some(Self::Solo),
             "phase-invert" => Some(Self::PhaseInvert),
+            "swap-left-right" => Some(Self::SwapLeftRight),
             _ => None,
         }
     }
@@ -4550,6 +4553,7 @@ impl MidiMixerControlTarget {
             Self::Mute => "mute",
             Self::Solo => "solo",
             Self::PhaseInvert => "phase-invert",
+            Self::SwapLeftRight => "swap-left-right",
         }
     }
 
@@ -4558,7 +4562,9 @@ impl MidiMixerControlTarget {
             Self::Fader => midi_cc_to_mixer_fader_raw(cc),
             Self::Pan => midi_cc_to_mixer_pan_raw(cc),
             Self::StereoSeparation => midi_cc_to_mixer_stereo_separation_raw(cc),
-            Self::Mute | Self::Solo | Self::PhaseInvert => i32::from(cc >= 64),
+            Self::Mute | Self::Solo | Self::PhaseInvert | Self::SwapLeftRight => {
+                i32::from(cc >= 64)
+            }
         }
     }
 
@@ -4567,12 +4573,17 @@ impl MidiMixerControlTarget {
             Self::Fader => (0..=16_000).contains(&value),
             Self::Pan => (-6_400..=6_400).contains(&value),
             Self::StereoSeparation => (-64..=64).contains(&value),
-            Self::Mute | Self::Solo | Self::PhaseInvert => (0..=1).contains(&value),
+            Self::Mute | Self::Solo | Self::PhaseInvert | Self::SwapLeftRight => {
+                (0..=1).contains(&value)
+            }
         }
     }
 
     const fn is_toggle(self) -> bool {
-        matches!(self, Self::Mute | Self::Solo | Self::PhaseInvert)
+        matches!(
+            self,
+            Self::Mute | Self::Solo | Self::PhaseInvert | Self::SwapLeftRight
+        )
     }
 }
 
@@ -35874,6 +35885,19 @@ impl DawUi {
                                             == MidiMixerControlTarget::PhaseInvert
                                 })
                                 .cloned();
+                            let swap_left_right_learning = MidiMixerControlLearning {
+                                insert_ordinal: insert.ordinal(),
+                                target: MidiMixerControlTarget::SwapLeftRight,
+                            };
+                            let swap_left_right_mapping = self
+                                .midi_mixer_control_mappings
+                                .iter()
+                                .find(|mapping| {
+                                    mapping.insert_ordinal == insert.ordinal()
+                                        && mapping.target
+                                            == MidiMixerControlTarget::SwapLeftRight
+                                })
+                                .cloned();
                             ui.horizontal_wrapped(|ui| {
                                 if self.midi_mixer_control_learning == Some(mute_learning) {
                                     ui.small(
@@ -36010,6 +36034,78 @@ impl DawUi {
                                         } else {
                                             self.status =
                                                 "Cleared MIDI Mixer phase mapping".to_owned();
+                                        }
+                                    }
+                                }
+                                if self.midi_mixer_control_learning
+                                    == Some(swap_left_right_learning)
+                                {
+                                    ui.small(
+                                        egui::RichText::new("Press a MIDI CC button…")
+                                            .color(ORANGE),
+                                    );
+                                    if ui.small_button("Cancel learn").clicked() {
+                                        self.midi_mixer_control_learning = None;
+                                    }
+                                } else if ui
+                                    .add_enabled(
+                                        flags_editable && self.midi_input_connection.is_some(),
+                                        egui::Button::new("Learn Swap L/R CC"),
+                                    )
+                                    .on_hover_text(
+                                        "Connect a MIDI input, then press a CC button to toggle this Mixer track's left/right swap",
+                                    )
+                                    .clicked()
+                                {
+                                    self.midi_output_gain_learning = false;
+                                    self.midi_play_pause_learning = false;
+                                    self.midi_mixer_button_cc_active.clear();
+                                    self.midi_mixer_control_learning =
+                                        Some(swap_left_right_learning);
+                                    self.status = format!(
+                                        "Press a MIDI CC button to map {} left/right swap",
+                                        if insert.ordinal() == 0 {
+                                            "Master".to_owned()
+                                        } else {
+                                            format!("Insert {}", insert.ordinal())
+                                        }
+                                    );
+                                }
+                                if let Some(mapping) = &swap_left_right_mapping {
+                                    let input_name = self
+                                        .midi_input_devices
+                                        .iter()
+                                        .find(|device| device.id == mapping.input_device_id)
+                                        .map(|device| device.name.as_str())
+                                        .unwrap_or(mapping.input_device_id.as_str());
+                                    ui.small(format!(
+                                        "Swap L/R CC {} · Ch {}",
+                                        mapping.controller,
+                                        mapping.channel + 1
+                                    ))
+                                    .on_hover_text(format!("Mapped from {input_name}"));
+                                    if ui.small_button("Clear Swap L/R CC").clicked() {
+                                        self.midi_mixer_control_mappings.retain(|mapping| {
+                                            mapping.insert_ordinal != insert.ordinal()
+                                                || mapping.target
+                                                    != MidiMixerControlTarget::SwapLeftRight
+                                        });
+                                        self.midi_mixer_button_cc_active.remove(&(
+                                            mapping.input_device_id.clone(),
+                                            mapping.channel,
+                                            mapping.controller,
+                                        ));
+                                        self.midi_mixer_control_learning = None;
+                                        if let Err(error) = save_midi_mixer_control_mappings(
+                                            &self.midi_mixer_control_mappings,
+                                        ) {
+                                            self.status = format!(
+                                                "Could not clear MIDI Mixer left/right swap mapping: {error}"
+                                            );
+                                        } else {
+                                            self.status =
+                                                "Cleared MIDI Mixer left/right swap mapping"
+                                                    .to_owned();
                                         }
                                     }
                                 }
@@ -37795,7 +37891,8 @@ impl DawUi {
                 }
                 MidiMixerControlTarget::Mute
                 | MidiMixerControlTarget::Solo
-                | MidiMixerControlTarget::PhaseInvert => {
+                | MidiMixerControlTarget::PhaseInvert
+                | MidiMixerControlTarget::SwapLeftRight => {
                     unreachable!("handled above")
                 }
             }
@@ -37865,7 +37962,8 @@ impl DawUi {
             (
                 MidiMixerControlTarget::Mute
                 | MidiMixerControlTarget::Solo
-                | MidiMixerControlTarget::PhaseInvert,
+                | MidiMixerControlTarget::PhaseInvert
+                | MidiMixerControlTarget::SwapLeftRight,
                 _,
             ) => {
                 unreachable!("handled above")
@@ -37941,6 +38039,7 @@ impl DawUi {
                 MidiMixerControlTarget::Mute => insert.enabled(),
                 MidiMixerControlTarget::Solo => insert.soloed(),
                 MidiMixerControlTarget::PhaseInvert => insert.polarity_reversed(),
+                MidiMixerControlTarget::SwapLeftRight => insert.swap_left_right(),
                 _ => None,
             }
             .ok_or_else(|| {
@@ -38010,6 +38109,7 @@ impl DawUi {
                 MidiMixerControlTarget::Mute => insert.enabled(),
                 MidiMixerControlTarget::Solo => insert.soloed(),
                 MidiMixerControlTarget::PhaseInvert => insert.polarity_reversed(),
+                MidiMixerControlTarget::SwapLeftRight => insert.swap_left_right(),
                 _ => None,
             }
             .ok_or_else(|| {
@@ -38059,6 +38159,10 @@ impl DawUi {
                     polarity_reversed: Some(active),
                     ..MixerInsertEdit::default()
                 },
+                MidiMixerControlTarget::SwapLeftRight => MixerInsertEdit {
+                    swap_left_right: Some(active),
+                    ..MixerInsertEdit::default()
+                },
                 _ => unreachable!("toggle target was checked above"),
             };
             document
@@ -38097,7 +38201,9 @@ impl DawUi {
                 self.mixer_track_peak_meters
                     .set_live_mixer_soloed_tracks(&soloed_tracks);
             }
-            MidiMixerControlTarget::PhaseInvert if insert_ordinal == 0 => {
+            MidiMixerControlTarget::PhaseInvert | MidiMixerControlTarget::SwapLeftRight
+                if insert_ordinal == 0 =>
+            {
                 let live_flags = self
                     .document
                     .as_ref()
@@ -38105,7 +38211,7 @@ impl DawUi {
                 self.mixer_track_peak_meters
                     .set_live_master_signal_flags(live_flags);
             }
-            MidiMixerControlTarget::PhaseInvert => {
+            MidiMixerControlTarget::PhaseInvert | MidiMixerControlTarget::SwapLeftRight => {
                 let live_flags = self.document.as_ref().and_then(|document| {
                     let inserts = document.mixer_inserts();
                     candidate_mixer_insert_signal_flags(&inserts, insert_ordinal)
@@ -38133,6 +38239,9 @@ impl DawUi {
                 }
                 MidiMixerControlTarget::PhaseInvert => {
                     if active { "reversed" } else { "normal" }
+                }
+                MidiMixerControlTarget::SwapLeftRight => {
+                    if active { "swapped" } else { "normal" }
                 }
                 _ => unreachable!("toggle target was checked above"),
             }
@@ -51459,6 +51568,13 @@ mod tests {
                 insert_ordinal: 0,
                 target: MidiMixerControlTarget::PhaseInvert,
             },
+            MidiMixerControlMapping {
+                input_device_id: "usb:surface".to_owned(),
+                channel: 0,
+                controller: 14,
+                insert_ordinal: 0,
+                target: MidiMixerControlTarget::SwapLeftRight,
+            },
         ];
         let encoded = serialize_midi_mixer_control_mappings(&mappings);
         assert_eq!(parse_midi_mixer_control_mappings(&encoded), mappings);
@@ -51600,6 +51716,14 @@ mod tests {
             target: MidiMixerControlTarget::PhaseInvert,
         };
         upsert_midi_mixer_control_mapping(&mut mappings, phase_invert.clone());
+        let swap_left_right = MidiMixerControlMapping {
+            input_device_id: "surface".to_owned(),
+            channel: 0,
+            controller: 15,
+            insert_ordinal: 1,
+            target: MidiMixerControlTarget::SwapLeftRight,
+        };
+        upsert_midi_mixer_control_mapping(&mut mappings, swap_left_right.clone());
         assert_eq!(
             mappings,
             vec![
@@ -51609,7 +51733,8 @@ mod tests {
                 stereo,
                 mute,
                 solo,
-                phase_invert
+                phase_invert,
+                swap_left_right,
             ]
         );
     }
@@ -51666,6 +51791,13 @@ mod tests {
                 insert_ordinal: 0,
                 target: MidiMixerControlTarget::PhaseInvert,
             },
+            MidiMixerControlMapping {
+                input_device_id: "surface-a".to_owned(),
+                channel: 0,
+                controller: 14,
+                insert_ordinal: 0,
+                target: MidiMixerControlTarget::SwapLeftRight,
+            },
         ];
         assert_eq!(
             midi_mixer_control_for_cc(&mappings, "surface-a", 0, 7),
@@ -51698,6 +51830,31 @@ mod tests {
         assert_eq!(
             midi_mixer_control_for_cc(&mappings, "surface-a", 0, 13),
             Some((0, MidiMixerControlTarget::PhaseInvert))
+        );
+        assert_eq!(
+            midi_mixer_control_for_cc(&mappings, "surface-a", 0, 14),
+            Some((0, MidiMixerControlTarget::SwapLeftRight))
+        );
+    }
+
+    #[test]
+    fn midi_mixer_toggle_targets_use_cc_press_threshold() {
+        for target in [
+            MidiMixerControlTarget::Mute,
+            MidiMixerControlTarget::Solo,
+            MidiMixerControlTarget::PhaseInvert,
+            MidiMixerControlTarget::SwapLeftRight,
+        ] {
+            assert!(target.is_toggle());
+            assert_eq!(target.raw_value(63), 0);
+            assert_eq!(target.raw_value(64), 1);
+            assert!(target.supports_raw_value(0));
+            assert!(target.supports_raw_value(1));
+            assert!(!target.supports_raw_value(2));
+        }
+        assert_eq!(
+            MidiMixerControlTarget::from_setting("swap-left-right"),
+            Some(MidiMixerControlTarget::SwapLeftRight)
         );
     }
 
