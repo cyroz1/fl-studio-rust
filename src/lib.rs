@@ -29336,6 +29336,7 @@ mod tests {
             clip[64..72].copy_from_slice(&1.0f64.to_le_bytes());
             clips.extend_from_slice(&clip);
         }
+        append_data_event(&mut event_stream, 0xC7, b"25.0.0\0");
         append_data_event(&mut event_stream, 0xE9, &clips);
         let document = FlpDocument::parse(&flp_fixture(&event_stream, &[], &[]))
             .expect("arrangement fixture should parse");
