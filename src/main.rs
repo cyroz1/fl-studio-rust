@@ -2786,6 +2786,35 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 )?,
             )
         }
+        [command, template_path, midi_path, output, template_channel_id, track_numbers]
+            if command == "import-midi-new-project" =>
+        {
+            import_midi_into_new_project(
+                Path::new(template_path),
+                Path::new(midi_path),
+                Path::new(output),
+                parse_u16(template_channel_id, "template channel id")?,
+                track_numbers,
+                MidiImportOptions::default(),
+            )
+        }
+        [command, template_path, midi_path, output, template_channel_id, track_numbers, zero_velocity_note_ons, realign_events, midi_channels, set_mixer_tracks]
+            if command == "import-midi-new-project" =>
+        {
+            import_midi_into_new_project(
+                Path::new(template_path),
+                Path::new(midi_path),
+                Path::new(output),
+                parse_u16(template_channel_id, "template channel id")?,
+                track_numbers,
+                parse_midi_import_options_with_mixer_tracks(
+                    zero_velocity_note_ons,
+                    realign_events,
+                    midi_channels,
+                    set_mixer_tracks,
+                )?,
+            )
+        }
         [command, input, midi_path, output, pattern_id, template_channel_id]
             if command == "import-midi-sampler-tracks" =>
         {
@@ -3074,6 +3103,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild import-midi-selected <input.flp> <input.mid> <output.flp> <pattern-id|new> <track-numbers:all|1,2,...> <selected-track-channel-ids-comma-separated> [zero-velocity-note-ons:0|1 realign-events:0|1 midi-channels:all|none|1,2,...,16]\n",
             "  flp-rebuild import-midi-sampler-tracks-selected <input.flp> <input.mid> <output.flp> <pattern-id|new> <template-channel-id> <track-numbers:all|1,2,...> [zero-velocity-note-ons:0|1 realign-events:0|1 midi-channels:all|none|1,2,...,16 set-mixer-tracks:0|1]\n",
             "  flp-rebuild import-midi-format2-selected <input.flp> <input.mid> <output.flp> <template-channel-id> <track-numbers:all|1,2,...> [zero-velocity-note-ons:0|1 realign-events:0|1 midi-channels:all|none|1,2,...,16 set-mixer-tracks:0|1]\n",
+            "  flp-rebuild import-midi-new-project <template.flp> <input.mid> <output.flp> <template-channel-id> <track-numbers:all|1,2,...> [zero-velocity-note-ons:0|1 realign-events:0|1 midi-channels:all|none|1,2,...,16 set-mixer-tracks:0|1]\n",
             "  flp-rebuild import-midi-sampler-tracks <input.flp> <input.mid> <output.flp> <pattern-id|new> <template-channel-id> [zero-velocity-note-ons:0|1] [realign-events:0|1] [midi-channels:all|none|1,2,...,16] [set-mixer-tracks:0|1]\n",
             "  flp-rebuild import-midi-format2 <input.flp> <input.mid> <output.flp> <template-channel-id> [zero-velocity-note-ons:0|1] [realign-events:0|1] [midi-channels:all|none|1,2,...,16] [set-mixer-tracks:0|1]\n",
             "  flp-rebuild edit-clip <input.flp> <output.flp> <arrangement-id> <clip-index> <position> <length>\n",
@@ -7521,6 +7551,54 @@ fn import_midi_sampler_tracks(
         .join(",");
     println!(
         "created Sampler channels {channel_ids} and imported {imported} MIDI notes into pattern {pattern_id} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn import_midi_into_new_project(
+    template_path: &Path,
+    midi_path: &Path,
+    output: &Path,
+    template_channel_id: u16,
+    track_numbers: &str,
+    options: MidiImportOptions,
+) -> Result<(), String> {
+    let template_bytes = fs::read(template_path)
+        .map_err(|error| format!("could not read {}: {error}", template_path.display()))?;
+    let template = FlpDocument::parse(&template_bytes).map_err(|error| {
+        format!(
+            "could not parse project template {}: {error}",
+            template_path.display()
+        )
+    })?;
+    let midi_bytes = fs::read(midi_path)
+        .map_err(|error| format!("could not read {}: {error}", midi_path.display()))?;
+    let midi = MidiFile::parse(&midi_bytes)
+        .map_err(|error| format!("could not parse {}: {error}", midi_path.display()))?;
+    let track_indices = parse_midi_track_selection(track_numbers, midi.tracks().len())?;
+    let (document, imported, destinations) =
+        FlpDocument::new_project_from_midi_selected_tracks_with_options(
+            &template,
+            &midi,
+            template_channel_id,
+            &track_indices,
+            options,
+        )
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode new project: {error}"))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    let destinations = destinations
+        .iter()
+        .map(|(pattern_id, channel_id)| format!("{pattern_id}:{channel_id}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    println!(
+        "created new project from {} with {imported} MIDI notes in Pattern:channel pairs {destinations} at {}",
+        template_path.display(),
         output.display()
     );
     Ok(())

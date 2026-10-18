@@ -14117,6 +14117,66 @@ impl FlpDocument {
         Ok((pattern_id, imported, channel_ids))
     }
 
+    /// Builds a separate project from `template` and imports the selected MIDI tracks into it.
+    /// Format-0/1 tracks share one new Pattern; Format-2 sequences each get their own Pattern.
+    /// Each selected track receives a cloned Sampler channel. The source template is never
+    /// modified, and the returned project is available only after the full import succeeds.
+    pub fn new_project_from_midi_selected_tracks(
+        template: &FlpDocument,
+        midi: &midi::MidiFile,
+        template_channel_id: u16,
+        track_indices: &[usize],
+    ) -> Result<(FlpDocument, usize, Vec<(u16, u16)>), FlpError> {
+        Self::new_project_from_midi_selected_tracks_with_options(
+            template,
+            midi,
+            template_channel_id,
+            track_indices,
+            midi::MidiImportOptions::default(),
+        )
+    }
+
+    /// Builds a separate project from `template` and imports selected MIDI tracks using the
+    /// requested note and routing options. Format-0/1 tracks share one new Pattern; Format-2
+    /// sequences each get their own Pattern. The source template remains unchanged on success
+    /// or failure.
+    pub fn new_project_from_midi_selected_tracks_with_options(
+        template: &FlpDocument,
+        midi: &midi::MidiFile,
+        template_channel_id: u16,
+        track_indices: &[usize],
+        options: midi::MidiImportOptions,
+    ) -> Result<(FlpDocument, usize, Vec<(u16, u16)>), FlpError> {
+        if template.header().format() != 0 {
+            return Err(FlpError::UnsupportedEdit(
+                "new MIDI project imports require a full FL Studio project template",
+            ));
+        }
+        let mut project = template.clone();
+        if midi.format() == 2 {
+            let (imported, destinations) = project
+                .import_midi_selected_format2_tracks_to_sampler_patterns_with_options(
+                    midi,
+                    template_channel_id,
+                    track_indices,
+                    options,
+                )?;
+            return Ok((project, imported, destinations));
+        }
+        let (pattern_id, imported, channel_ids) = project
+            .import_midi_selected_tracks_to_sampler_channels_in_new_pattern_with_options(
+                midi,
+                template_channel_id,
+                track_indices,
+                options,
+            )?;
+        let destinations = channel_ids
+            .into_iter()
+            .map(|channel_id| (pattern_id, channel_id))
+            .collect();
+        Ok((project, imported, destinations))
+    }
+
     /// Imports every independent sequence in a Format-2 MIDI file into its own new Pattern and
     /// named Sampler channel. Each Sampler copies the selected kind-0 template, and the complete
     /// operation rolls back if a Pattern cannot be created or any track fails to import.
@@ -27805,6 +27865,20 @@ mod tests {
             Some("Bass")
         );
 
+        let template_document =
+            FlpDocument::parse(&original).expect("project fixture should parse");
+        let (new_project, project_imported, destinations) =
+            FlpDocument::new_project_from_midi_selected_tracks(&template_document, &midi, 0, &[1])
+                .expect("selected MIDI track should create a separate project");
+        assert_eq!(project_imported, 1);
+        assert_eq!(destinations.len(), 1);
+        assert_eq!(destinations[0].0, 8);
+        assert_eq!(
+            new_project.patterns().unwrap()[1].notes[0].channel_id,
+            destinations[0].1
+        );
+        assert_eq!(template_document.encode_lossless().unwrap(), original);
+
         let mut rejected = FlpDocument::parse(&original).expect("project fixture should parse");
         assert!(
             rejected
@@ -28041,6 +28115,24 @@ mod tests {
         assert_eq!(selected_pattern.notes.len(), 1);
         assert_eq!(selected_pattern.notes[0].key, 67);
         assert_eq!(selected_document.channels().len(), 2);
+
+        let template_document =
+            FlpDocument::parse(&original).expect("project should parse for new-project import");
+        let (new_project, project_imported, project_destinations) =
+            FlpDocument::new_project_from_midi_selected_tracks(
+                &template_document,
+                &midi,
+                0,
+                &[0, 1],
+            )
+            .expect("Format-2 sequences should import into a separate project");
+        assert_eq!(project_imported, 2);
+        assert_eq!(project_destinations.len(), 2);
+        assert_eq!(
+            new_project.patterns().unwrap().len(),
+            template_document.patterns().unwrap().len() + 2
+        );
+        assert_eq!(template_document.encode_lossless().unwrap(), original);
 
         let mut routed_document =
             FlpDocument::parse(&original).expect("project should parse for routed import");

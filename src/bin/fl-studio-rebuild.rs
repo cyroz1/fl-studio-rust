@@ -20,7 +20,8 @@ use flp_rebuild::audio::{
 use flp_rebuild::media::{
     AudioWaveform, DecodedAudio, SamplePathResolver, WaveformPeak, decode_audio_file,
     decode_audio_preview, decode_audio_preview_from_position, decode_audio_waveform,
-    summarize_audio_waveform, write_audio_range_to_wav_with_processing,
+    find_empty_project_template, summarize_audio_waveform,
+    write_audio_range_to_wav_with_processing,
 };
 use flp_rebuild::midi::{MidiChannelMapping, MidiFile, MidiImportOptions};
 use flp_rebuild::plugins::{PluginCandidate, PluginFormat, scan_installed_plugins};
@@ -3375,6 +3376,8 @@ struct PendingMidiImport {
     selected_midi_tracks: Vec<bool>,
     track_channel_ids: Vec<u16>,
     create_new_pattern: bool,
+    start_new_project: bool,
+    project_template_path: Option<PathBuf>,
     zero_velocity_note_ons_as_notes: bool,
     realign_events: bool,
     midi_channel_mask: u16,
@@ -3727,6 +3730,12 @@ struct RecoveryPrompt {
 #[derive(Clone)]
 enum PendingProjectChange {
     Open(PathBuf),
+    NewProject {
+        document: FlpDocument,
+        template_path: PathBuf,
+        imported: usize,
+        destinations: Vec<(u16, u16)>,
+    },
     Exit,
 }
 
@@ -3823,6 +3832,7 @@ type MidiPerformanceHoldMap = BTreeMap<(u8, u8), Vec<MidiHeldPerformanceClip>>;
 struct DawUi {
     document: Option<FlpDocument>,
     current_path: Option<PathBuf>,
+    new_project_template_path: Option<PathBuf>,
     package_workspace: Option<ProjectPackageWorkspace>,
     view: MainView,
     ui_scale: f32,
@@ -4869,6 +4879,7 @@ impl DawUi {
         let mut app = Self {
             document: None,
             current_path: None,
+            new_project_template_path: None,
             package_workspace: None,
             view: MainView::Playlist,
             ui_scale,
@@ -6247,6 +6258,7 @@ impl DawUi {
                     arrangements.first().map(|arrangement| arrangement.id)
                 });
                 self.current_path = Some(target_path.to_path_buf());
+                self.new_project_template_path = None;
                 self.package_workspace = package_workspace;
                 self.document = Some(document);
                 self.refresh_audio_waveform_paths();
@@ -6315,6 +6327,7 @@ impl DawUi {
             .as_ref()
             .map(|workspace| workspace.sample_project_path().to_path_buf())
             .or_else(|| self.current_path.clone())
+            .or_else(|| self.new_project_template_path.clone())
     }
 
     fn make_audio_clip_unique_as_sample(
@@ -7306,6 +7319,13 @@ impl DawUi {
                     path.display()
                 ),
             ),
+            PendingProjectChange::NewProject { template_path, .. } => (
+                "Save changes before starting a new project?",
+                format!(
+                    "Save changes to the current project before starting a MIDI project from {}?",
+                    template_path.display()
+                ),
+            ),
             PendingProjectChange::Exit => (
                 "Save changes before closing?",
                 "Save changes to the current project before closing FL Studio Rebuild?".to_owned(),
@@ -7370,11 +7390,151 @@ impl DawUi {
             PendingProjectChange::Open(path) => {
                 self.load_project_from(&path, &path, true);
             }
+            PendingProjectChange::NewProject {
+                document,
+                template_path,
+                imported,
+                destinations,
+            } => {
+                self.install_midi_project(context, document, template_path, imported, destinations)
+            }
             PendingProjectChange::Exit => {
                 self.close_approved = true;
                 context.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
+    }
+
+    fn request_midi_new_project(
+        &mut self,
+        context: &egui::Context,
+        template_path: PathBuf,
+        midi: MidiFile,
+        track_indices: Vec<usize>,
+        options: MidiImportOptions,
+    ) {
+        let result = (|| {
+            let bytes = fs::read(&template_path).map_err(|error| {
+                format!(
+                    "Could not read project template {}: {error}",
+                    template_path.display()
+                )
+            })?;
+            let template = FlpDocument::parse(&bytes).map_err(|error| {
+                format!(
+                    "Could not parse project template {}: {error}",
+                    template_path.display()
+                )
+            })?;
+            let template_channel_id = template
+                .channels()
+                .into_iter()
+                .find(|channel| channel.kind() == Some(0))
+                .map(|channel| channel.id())
+                .ok_or_else(|| {
+                    format!(
+                        "Project template {} has no Sampler channel to copy",
+                        template_path.display()
+                    )
+                })?;
+            FlpDocument::new_project_from_midi_selected_tracks_with_options(
+                &template,
+                &midi,
+                template_channel_id,
+                &track_indices,
+                options,
+            )
+            .map_err(|error| error.to_string())
+        })();
+        match result {
+            Ok((document, imported, destinations)) => {
+                self.pending_project_change = Some(PendingProjectChange::NewProject {
+                    document,
+                    template_path,
+                    imported,
+                    destinations,
+                });
+                if self.dirty {
+                    self.recovery_prompt = None;
+                } else {
+                    self.perform_pending_project_change(context);
+                }
+            }
+            Err(error) => self.status = error,
+        }
+    }
+
+    fn install_midi_project(
+        &mut self,
+        _context: &egui::Context,
+        document: FlpDocument,
+        template_path: PathBuf,
+        imported: usize,
+        destinations: Vec<(u16, u16)>,
+    ) {
+        let bytes = match document.encode_lossless() {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.status = format!("Could not encode new MIDI project: {error}");
+                return;
+            }
+        };
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        let temporary_path = std::env::temp_dir().join(format!(
+            "fl-studio-midi-project-{}-{nonce}.flp",
+            std::process::id()
+        ));
+        if let Err(error) = fs::write(&temporary_path, bytes) {
+            self.status = format!("Could not stage the new MIDI project: {error}");
+            return;
+        }
+        let temporary_recent_path =
+            fs::canonicalize(&temporary_path).unwrap_or_else(|_| temporary_path.clone());
+        let loaded = self.load_project_from(&temporary_path, &temporary_path, false);
+        let _ = fs::remove_file(&temporary_path);
+        if !loaded {
+            self.browser_recent_projects
+                .retain(|path| path != &temporary_recent_path);
+            return;
+        }
+
+        self.browser_recent_projects
+            .retain(|path| path != &temporary_recent_path);
+        let _ = save_recent_projects(&self.browser_recent_projects);
+        self.current_path = None;
+        self.package_workspace = None;
+        self.new_project_template_path = Some(template_path);
+        self.saved_project_hash = None;
+        self.dirty = true;
+        self.autosave_deadline = None;
+        self.last_autosave_path = None;
+        self.selected_pattern = destinations.first().map(|(pattern_id, _)| *pattern_id);
+        self.selected_note_channel = destinations.first().map(|(_, channel_id)| *channel_id);
+        if let Some(channel_id) = self.selected_note_channel {
+            self.selected_graph_channel = Some(channel_id);
+            self.selected_rack_channels.clear();
+            self.selected_rack_channels.insert(channel_id);
+            self.rack_selection_anchor = Some(channel_id);
+        }
+        self.selected_note = destinations
+            .first()
+            .filter(|_| imported > 0)
+            .map(|(pattern_id, channel_id)| (*pattern_id, *channel_id, 0));
+        self.selected_piano_notes.clear();
+        if let Some(note) = self.selected_note {
+            self.selected_piano_notes.insert(note);
+        }
+        self.view = MainView::PianoRoll;
+        self.refresh_audio_waveform_paths();
+        self.status = format!(
+            "Started a new project from {} and imported {imported} MIDI notes",
+            self.new_project_template_path.as_deref().map_or_else(
+                || "the Empty template".to_owned(),
+                |path| path.display().to_string()
+            )
+        );
     }
 
     fn recover_from_backup(&mut self, prompt: &RecoveryPrompt) {
@@ -8439,6 +8599,7 @@ impl DawUi {
                 saved_bytes.hash(&mut hasher);
                 let saved_hash = hasher.finish();
                 self.current_path = Some(path.to_path_buf());
+                self.new_project_template_path = None;
                 if let Some(workspace) = package_workspace_after_save {
                     self.package_workspace = Some(workspace);
                 }
@@ -11863,6 +12024,7 @@ impl DawUi {
                         let track_channel_ids =
                             self.default_midi_import_channels(midi.tracks().len());
                         let selected_midi_tracks = vec![true; midi.tracks().len()];
+                        let start_new_project = self.document.is_none();
                         self.pending_midi_import = Some(PendingMidiImport {
                             path: path.clone(),
                             midi,
@@ -11871,6 +12033,8 @@ impl DawUi {
                             selected_midi_tracks,
                             track_channel_ids,
                             create_new_pattern: false,
+                            start_new_project,
+                            project_template_path: find_empty_project_template(),
                             zero_velocity_note_ons_as_notes: false,
                             realign_events: false,
                             midi_channel_mask: u16::MAX,
@@ -24504,9 +24668,167 @@ impl DawUi {
         }
     }
 
+    fn piano_roll_midi_new_project_without_open_project(&mut self, ui: &mut egui::Ui) -> bool {
+        if self.pending_midi_import.is_none() {
+            return false;
+        }
+        let mut request = None;
+        let mut choose_template = false;
+        let mut clear_import = false;
+        ui.heading("Import MIDI into a new project");
+        ui.label("Choose an Empty.flp template, then select the MIDI tracks to import.");
+        if let Some(pending) = self.pending_midi_import.as_mut() {
+            pending.start_new_project = true;
+            ui.label(format!("MIDI file: {}", pending.path.display()));
+            ui.horizontal(|ui| {
+                ui.label("Project template:");
+                if let Some(path) = pending.project_template_path.as_deref() {
+                    ui.label(path.display().to_string());
+                } else {
+                    ui.weak("Choose an FL Studio project template");
+                }
+                if ui.button("Choose…").clicked() {
+                    choose_template = true;
+                }
+            });
+            if pending.midi.format() != 2 {
+                ui.checkbox(&mut pending.import_all_tracks, "Import multiple tracks");
+            } else {
+                pending.import_all_tracks = true;
+                ui.weak("Format-2 tracks are independent sequences and create separate Patterns.");
+            }
+            if pending.import_all_tracks {
+                ui.horizontal(|ui| {
+                    if ui.button("All tracks").clicked() {
+                        pending.selected_midi_tracks.fill(true);
+                    }
+                    if ui.button("No tracks").clicked() {
+                        pending.selected_midi_tracks.fill(false);
+                    }
+                });
+                for (index, track) in pending.midi.tracks().iter().enumerate() {
+                    let label = track
+                        .name()
+                        .filter(|name| !name.is_empty())
+                        .unwrap_or_else(|| format!("Track {}", index + 1));
+                    if let Some(selected) = pending.selected_midi_tracks.get_mut(index) {
+                        ui.checkbox(selected, label);
+                    }
+                }
+            } else {
+                let selected_label = pending
+                    .midi
+                    .tracks()
+                    .get(pending.selected_track)
+                    .map(|track| {
+                        track
+                            .name()
+                            .filter(|name| !name.is_empty())
+                            .unwrap_or_else(|| format!("Track {}", pending.selected_track + 1))
+                    })
+                    .unwrap_or_else(|| "No track".to_owned());
+                egui::ComboBox::from_id_salt("midi-new-project-track-picker")
+                    .selected_text(selected_label)
+                    .show_ui(ui, |ui| {
+                        for (index, track) in pending.midi.tracks().iter().enumerate() {
+                            let label = track
+                                .name()
+                                .filter(|name| !name.is_empty())
+                                .unwrap_or_else(|| format!("Track {}", index + 1));
+                            ui.selectable_value(&mut pending.selected_track, index, label);
+                        }
+                    });
+            }
+            ui.checkbox(
+                &mut pending.zero_velocity_note_ons_as_notes,
+                "Import zero-velocity Note On messages as notes",
+            );
+            ui.checkbox(&mut pending.realign_events, "Realign events");
+            ui.checkbox(
+                &mut pending.set_mixer_tracks_for_new_channels,
+                "Set Mixer tracks for new channels",
+            );
+            ui.collapsing("MIDI channels", |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("All").clicked() {
+                        pending.midi_channel_mask = u16::MAX;
+                    }
+                    if ui.button("None").clicked() {
+                        pending.midi_channel_mask = 0;
+                    }
+                    for channel in 0..16u32 {
+                        let bit = 1u16 << channel;
+                        let selected = pending.midi_channel_mask & bit != 0;
+                        if ui
+                            .selectable_label(selected, (channel + 1).to_string())
+                            .clicked()
+                        {
+                            pending.midi_channel_mask ^= bit;
+                        }
+                    }
+                });
+            });
+            let track_indices = if pending.import_all_tracks {
+                pending
+                    .selected_midi_tracks
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, selected)| selected.then_some(index))
+                    .collect::<Vec<_>>()
+            } else {
+                vec![pending.selected_track]
+            };
+            let ready = pending.project_template_path.is_some()
+                && !track_indices.is_empty()
+                && pending.midi_channel_mask != 0;
+            if ui
+                .add_enabled(
+                    ready,
+                    egui::Button::new("Start new project and import MIDI"),
+                )
+                .clicked()
+            {
+                request = pending.project_template_path.clone().map(|template_path| {
+                    (
+                        template_path,
+                        pending.midi.clone(),
+                        track_indices,
+                        MidiImportOptions {
+                            zero_velocity_note_ons_as_notes: pending
+                                .zero_velocity_note_ons_as_notes,
+                            realign_events: pending.realign_events,
+                            midi_channel_mask: pending.midi_channel_mask,
+                            set_mixer_tracks_for_new_channels: pending
+                                .set_mixer_tracks_for_new_channels,
+                        },
+                    )
+                });
+            }
+            clear_import = ui.button("Clear MIDI import").clicked();
+        }
+        if choose_template
+            && let Some(path) = rfd::FileDialog::new()
+                .set_title("Choose FL Studio project template")
+                .add_filter("FL Studio project", &["flp"])
+                .pick_file()
+            && let Some(pending) = self.pending_midi_import.as_mut()
+        {
+            pending.project_template_path = Some(path);
+        }
+        if clear_import {
+            self.pending_midi_import = None;
+        }
+        if let Some((template_path, midi, track_indices, options)) = request {
+            self.request_midi_new_project(ui.ctx(), template_path, midi, track_indices, options);
+        }
+        true
+    }
+
     fn piano_roll(&mut self, ui: &mut egui::Ui) {
         let Some(document) = self.document.as_ref() else {
-            empty_view(ui, "Open a project to see its Piano roll");
+            if !self.piano_roll_midi_new_project_without_open_project(ui) {
+                empty_view(ui, "Open a project to see its Piano roll");
+            }
             return;
         };
         let mut patterns = document.patterns().unwrap_or_default();
@@ -28159,6 +28481,7 @@ impl DawUi {
                         let track_channel_ids =
                             self.default_midi_import_channels(midi.tracks().len());
                         let selected_midi_tracks = vec![true; midi.tracks().len()];
+                        let start_new_project = self.document.is_none();
                         self.pending_midi_import = Some(PendingMidiImport {
                             path: path.clone(),
                             midi,
@@ -28167,6 +28490,8 @@ impl DawUi {
                             selected_midi_tracks,
                             track_channel_ids,
                             create_new_pattern: false,
+                            start_new_project,
+                            project_template_path: find_empty_project_template(),
                             zero_velocity_note_ons_as_notes: false,
                             realign_events: false,
                             midi_channel_mask: u16::MAX,
@@ -28196,108 +28521,166 @@ impl DawUi {
         let mut import_all_midi_request = None;
         let mut create_sampler_midi_request = None;
         let mut create_format2_midi_request = None;
+        let mut new_project_midi_request = None;
+        let mut choose_project_template = false;
         let mut clear_midi_import = false;
         if let Some(pending) = &mut self.pending_midi_import {
             ui.horizontal(|ui| {
                 let selected_sampler_template = self.selected_note_channel.filter(|channel_id| {
-                    available_midi_channels.iter().any(|channel| {
-                        channel.id() == *channel_id && channel.kind() == Some(0)
-                    })
+                    available_midi_channels
+                        .iter()
+                        .any(|channel| channel.id() == *channel_id && channel.kind() == Some(0))
                 });
                 ui.small(pending.path.file_name().map_or_else(
                     || "MIDI".to_owned(),
                     |name| name.to_string_lossy().into_owned(),
                 ));
-                ui.checkbox(&mut pending.import_all_tracks, "Route all tracks");
-                if !pending.import_all_tracks {
-                    let target_pattern_id = if pending.create_new_pattern {
-                        None
+                ui.checkbox(&mut pending.start_new_project, "Start new project");
+                ui.checkbox(
+                    &mut pending.import_all_tracks,
+                    if pending.start_new_project {
+                        "Select multiple tracks"
                     } else {
-                        self.selected_pattern
-                    };
-                    let selected_track_label = pending
-                        .midi
-                        .tracks()
-                        .get(pending.selected_track)
-                        .map(|track| {
-                            track
+                        "Route all tracks"
+                    },
+                );
+            });
+            if pending.start_new_project {
+                ui.horizontal(|ui| {
+                    ui.label("Project template:");
+                    if let Some(path) = pending.project_template_path.as_deref() {
+                        ui.label(path.display().to_string());
+                    } else {
+                        ui.weak("Choose an FL Studio project template");
+                    }
+                    if ui.button("Choose…").clicked() {
+                        choose_project_template = true;
+                    }
+                });
+            }
+            let options = MidiImportOptions {
+                zero_velocity_note_ons_as_notes: pending.zero_velocity_note_ons_as_notes,
+                realign_events: pending.realign_events,
+                midi_channel_mask: pending.midi_channel_mask,
+                set_mixer_tracks_for_new_channels: pending.set_mixer_tracks_for_new_channels,
+            };
+            if !pending.import_all_tracks && pending.midi.format() != 2 {
+                let target_pattern_id = if pending.create_new_pattern {
+                    None
+                } else {
+                    self.selected_pattern
+                };
+                let selected_track_label = pending
+                    .midi
+                    .tracks()
+                    .get(pending.selected_track)
+                    .map(|track| {
+                        track
+                            .name()
+                            .filter(|name| !name.is_empty())
+                            .unwrap_or_else(|| format!("Track {}", pending.selected_track + 1))
+                    })
+                    .unwrap_or_else(|| "No track".to_owned());
+                egui::ComboBox::from_id_salt("midi-import-track-picker")
+                    .selected_text(selected_track_label)
+                    .show_ui(ui, |ui| {
+                        for (index, track) in pending.midi.tracks().iter().enumerate() {
+                            let label = track
                                 .name()
                                 .filter(|name| !name.is_empty())
-                                .unwrap_or_else(|| format!("Track {}", pending.selected_track + 1))
-                        })
-                        .unwrap_or_else(|| "No track".to_owned());
-                    egui::ComboBox::from_id_salt("midi-import-track-picker")
-                        .selected_text(selected_track_label)
-                        .show_ui(ui, |ui| {
-                            for (index, track) in pending.midi.tracks().iter().enumerate() {
-                                let label = track
-                                    .name()
-                                    .filter(|name| !name.is_empty())
-                                    .unwrap_or_else(|| format!("Track {}", index + 1));
-                                ui.selectable_value(&mut pending.selected_track, index, label);
-                            }
-                        });
+                                .unwrap_or_else(|| format!("Track {}", index + 1));
+                            ui.selectable_value(&mut pending.selected_track, index, label);
+                        }
+                    });
+                if pending.start_new_project {
+                    let ready =
+                        pending.project_template_path.is_some() && pending.midi_channel_mask != 0;
                     if ui
-                        .add_enabled(
-                            (pending.create_new_pattern || target_pattern_id.is_some())
-                                && self.document.is_some()
-                                && self.selected_note_channel.is_some()
-                                && pending.midi_channel_mask != 0,
-                            egui::Button::new(if pending.create_new_pattern {
-                                "Import into new Pattern"
-                            } else {
-                                "Import track"
-                            }),
-                        )
+                        .add_enabled(ready, egui::Button::new("Import track into new project"))
                         .clicked()
-                        && let Some(channel_id) = self.selected_note_channel
-                        && (pending.create_new_pattern || target_pattern_id.is_some())
+                        && let Some(template_path) = pending.project_template_path.clone()
                     {
-                        import_midi_request = Some((
+                        new_project_midi_request = Some((
+                            template_path,
                             pending.midi.clone(),
-                            pending.selected_track,
-                            target_pattern_id,
-                            channel_id,
-                            MidiImportOptions {
-                                zero_velocity_note_ons_as_notes:
-                                    pending.zero_velocity_note_ons_as_notes,
-                                realign_events: pending.realign_events,
-                                midi_channel_mask: pending.midi_channel_mask,
-                                set_mixer_tracks_for_new_channels:
-                                    pending.set_mixer_tracks_for_new_channels,
-                            },
+                            vec![pending.selected_track],
+                            options,
                         ));
                     }
+                } else if ui
+                    .add_enabled(
+                        (pending.create_new_pattern || target_pattern_id.is_some())
+                            && self.document.is_some()
+                            && self.selected_note_channel.is_some()
+                            && pending.midi_channel_mask != 0,
+                        egui::Button::new(if pending.create_new_pattern {
+                            "Import into new Pattern"
+                        } else {
+                            "Import track"
+                        }),
+                    )
+                    .clicked()
+                    && let Some(channel_id) = self.selected_note_channel
+                    && (pending.create_new_pattern || target_pattern_id.is_some())
+                {
+                    import_midi_request = Some((
+                        pending.midi.clone(),
+                        pending.selected_track,
+                        target_pattern_id,
+                        channel_id,
+                        options,
+                    ));
+                }
+            }
+            if pending.import_all_tracks || pending.midi.format() == 2 {
+                let selected_track_indices = pending
+                    .selected_midi_tracks
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, selected)| selected.then_some(index))
+                    .collect::<Vec<_>>();
+                let selected_channel_ids = selected_track_indices
+                    .iter()
+                    .filter_map(|index| pending.track_channel_ids.get(*index).copied())
+                    .collect::<Vec<_>>();
+                let mapping_is_valid = !selected_track_indices.is_empty()
+                    && selected_channel_ids.len() == selected_track_indices.len()
+                    && selected_channel_ids.iter().all(|channel_id| {
+                        available_midi_channels
+                            .iter()
+                            .any(|channel| channel.id() == *channel_id)
+                    });
+                let target_pattern_id = if pending.create_new_pattern {
+                    None
                 } else {
-                    let selected_track_indices = pending
-                        .selected_midi_tracks
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(index, selected)| selected.then_some(index))
-                        .collect::<Vec<_>>();
-                    let selected_channel_ids = selected_track_indices
-                        .iter()
-                        .filter_map(|index| pending.track_channel_ids.get(*index).copied())
-                        .collect::<Vec<_>>();
-                    let mapping_is_valid = !selected_track_indices.is_empty()
-                        && selected_channel_ids.len() == selected_track_indices.len()
-                        && selected_channel_ids.iter().all(|channel_id| {
-                            available_midi_channels
-                                .iter()
-                                .any(|channel| channel.id() == *channel_id)
-                        });
-                    let target_pattern_id = if pending.create_new_pattern {
-                        None
-                    } else {
-                        self.selected_pattern
-                    };
-                    if ui
+                    self.selected_pattern
+                };
+                if pending.midi.format() != 2 {
+                    if pending.start_new_project {
+                        let ready = pending.project_template_path.is_some()
+                            && !selected_track_indices.is_empty()
+                            && pending.midi_channel_mask != 0;
+                        if ui
+                            .add_enabled(
+                                ready,
+                                egui::Button::new("Import selected tracks into new project"),
+                            )
+                            .clicked()
+                            && let Some(template_path) = pending.project_template_path.clone()
+                        {
+                            new_project_midi_request = Some((
+                                template_path,
+                                pending.midi.clone(),
+                                selected_track_indices.clone(),
+                                options,
+                            ));
+                        }
+                    } else if ui
                         .add_enabled(
                             (pending.create_new_pattern || target_pattern_id.is_some())
                                 && self.document.is_some()
                                 && pending.midi_channel_mask != 0
-                                && mapping_is_valid
-                                && pending.midi.format() != 2,
+                                && mapping_is_valid,
                             egui::Button::new(if pending.create_new_pattern {
                                 "Import selected tracks into new Pattern"
                             } else {
@@ -28309,97 +28692,85 @@ impl DawUi {
                     {
                         import_all_midi_request = Some((
                             pending.midi.clone(),
-                            selected_track_indices,
+                            selected_track_indices.clone(),
                             selected_channel_ids,
                             target_pattern_id,
-                            MidiImportOptions {
-                                zero_velocity_note_ons_as_notes:
-                                    pending.zero_velocity_note_ons_as_notes,
-                                realign_events: pending.realign_events,
-                                midi_channel_mask: pending.midi_channel_mask,
-                                set_mixer_tracks_for_new_channels:
-                                    pending.set_mixer_tracks_for_new_channels,
-                            },
+                            options,
                         ));
                     }
-                    if ui
-                        .add_enabled(
-                            (pending.create_new_pattern || target_pattern_id.is_some())
-                                && self.document.is_some()
-                                && pending.midi_channel_mask != 0
-                                && pending.selected_midi_tracks.iter().any(|selected| *selected)
-                                && selected_sampler_template.is_some()
-                                && pending.midi.format() != 2,
-                            egui::Button::new(if pending.create_new_pattern {
-                                "Create Samplers in new Pattern"
-                            } else {
-                                "Create Sampler channels"
-                            }),
-                        )
-                        .on_hover_text(
-                            "Copy the selected Sampler's sample and settings for each selected MIDI track, then import those tracks into their new channels.",
-                        )
-                        .clicked()
+                    if !pending.start_new_project
+                        && ui
+                            .add_enabled(
+                                (pending.create_new_pattern || target_pattern_id.is_some())
+                                    && self.document.is_some()
+                                    && pending.midi_channel_mask != 0
+                                    && !selected_track_indices.is_empty()
+                                    && selected_sampler_template.is_some(),
+                                egui::Button::new(if pending.create_new_pattern {
+                                    "Create Samplers in new Pattern"
+                                } else {
+                                    "Create Sampler channels"
+                                }),
+                            )
+                            .on_hover_text(
+                                "Copy the selected Sampler's sample and settings for each selected MIDI track, then import those tracks into their new channels.",
+                            )
+                            .clicked()
                         && let Some(template_channel_id) = selected_sampler_template
-                        && (pending.create_new_pattern || target_pattern_id.is_some())
                     {
                         create_sampler_midi_request = Some((
                             pending.midi.clone(),
-                            pending
-                                .selected_midi_tracks
-                                .iter()
-                                .enumerate()
-                                .filter_map(|(index, selected)| selected.then_some(index))
-                                .collect::<Vec<_>>(),
+                            selected_track_indices.clone(),
                             target_pattern_id,
                             template_channel_id,
-                            MidiImportOptions {
-                                zero_velocity_note_ons_as_notes:
-                                    pending.zero_velocity_note_ons_as_notes,
-                                realign_events: pending.realign_events,
-                                midi_channel_mask: pending.midi_channel_mask,
-                                set_mixer_tracks_for_new_channels:
-                                    pending.set_mixer_tracks_for_new_channels,
-                            },
+                            options,
                         ));
                     }
-                }
-                if pending.midi.format() == 2
-                    && ui
+                } else if pending.start_new_project {
+                    let ready = pending.project_template_path.is_some()
+                        && !selected_track_indices.is_empty()
+                        && pending.midi_channel_mask != 0;
+                    if ui
                         .add_enabled(
-                            self.selected_pattern.is_some()
-                                && pending.midi_channel_mask != 0
-                                && pending.selected_midi_tracks.iter().any(|selected| *selected)
-                                && selected_sampler_template.is_some(),
-                            egui::Button::new("Create separate patterns + Samplers"),
+                            ready,
+                            egui::Button::new("Create new project from selected sequences"),
                         )
                         .on_hover_text(
-                            "Create one new Pattern and named Sampler channel for each selected independent Format-2 sequence.",
+                            "Create one Pattern and cloned Sampler channel for each selected Format-2 sequence.",
                         )
                         .clicked()
+                        && let Some(template_path) = pending.project_template_path.clone()
+                    {
+                        new_project_midi_request = Some((
+                            template_path,
+                            pending.midi.clone(),
+                            selected_track_indices,
+                            options,
+                        ));
+                    }
+                } else if ui
+                    .add_enabled(
+                        self.selected_pattern.is_some()
+                            && pending.midi_channel_mask != 0
+                            && !selected_track_indices.is_empty()
+                            && selected_sampler_template.is_some(),
+                        egui::Button::new("Create separate patterns + Samplers"),
+                    )
+                    .on_hover_text(
+                        "Create one new Pattern and named Sampler channel for each selected independent Format-2 sequence.",
+                    )
+                    .clicked()
                     && let Some(template_channel_id) = selected_sampler_template
                 {
                     create_format2_midi_request = Some((
                         pending.midi.clone(),
-                        pending
-                            .selected_midi_tracks
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(index, selected)| selected.then_some(index))
-                            .collect::<Vec<_>>(),
+                        selected_track_indices,
                         template_channel_id,
-                        MidiImportOptions {
-                            zero_velocity_note_ons_as_notes:
-                                pending.zero_velocity_note_ons_as_notes,
-                            realign_events: pending.realign_events,
-                            midi_channel_mask: pending.midi_channel_mask,
-                            set_mixer_tracks_for_new_channels:
-                                pending.set_mixer_tracks_for_new_channels,
-                        },
+                        options,
                     ));
                 }
-                clear_midi_import = ui.button("Clear").clicked();
-            });
+            }
+            clear_midi_import = ui.button("Clear").clicked();
             ui.checkbox(
                 &mut pending.zero_velocity_note_ons_as_notes,
                 "Import zero-velocity Note On messages as notes",
@@ -28411,7 +28782,7 @@ impl DawUi {
                 .on_hover_text(
                     "Remove leading empty time before the first imported note. Note and time-signature positions shift together, and tracks keep their relative timing.",
                 );
-            if pending.midi.format() != 2 {
+            if pending.midi.format() != 2 && !pending.start_new_project {
                 ui.checkbox(&mut pending.create_new_pattern, "Create a new Pattern")
                     .on_hover_text(
                         "Create a Pattern in this project for the imported MIDI notes. The project must contain an existing Pattern marker and a recognized Pattern note-event template.",
@@ -28458,7 +28829,8 @@ impl DawUi {
                     }
                 });
             }
-            if pending.import_all_tracks || pending.midi.format() == 2 {
+            if pending.start_new_project || pending.import_all_tracks || pending.midi.format() == 2
+            {
                 ui.checkbox(
                     &mut pending.set_mixer_tracks_for_new_channels,
                     "Set Mixer tracks for new channels",
@@ -28467,14 +28839,11 @@ impl DawUi {
                     "Route each newly created Sampler to the first available Mixer inserts, skipping inserts already assigned to existing channels.",
                 );
             }
-            if pending.import_all_tracks {
+            if pending.import_all_tracks && !pending.start_new_project {
                 ui.vertical(|ui| {
-                    ui.small("Choose a destination Channel Rack channel for each selected MIDI track.");
-                    if pending.midi.format() == 2 {
-                        ui.weak(
-                            "Format-2 tracks are independent sequences; each selected track gets a separate Pattern and Sampler.",
-                        );
-                    }
+                    ui.small(
+                        "Choose a destination Channel Rack channel for each selected MIDI track.",
+                    );
                     for (track_index, track) in pending.midi.tracks().iter().enumerate() {
                         if !pending
                             .selected_midi_tracks
@@ -28523,8 +28892,20 @@ impl DawUi {
                 });
             }
         }
+        if choose_project_template
+            && let Some(path) = rfd::FileDialog::new()
+                .set_title("Choose FL Studio project template")
+                .add_filter("FL Studio project", &["flp"])
+                .pick_file()
+            && let Some(pending) = self.pending_midi_import.as_mut()
+        {
+            pending.project_template_path = Some(path);
+        }
         if clear_midi_import {
             self.pending_midi_import = None;
+        }
+        if let Some((template_path, midi, track_indices, options)) = new_project_midi_request {
+            self.request_midi_new_project(ui.ctx(), template_path, midi, track_indices, options);
         }
         if let Some((midi, track_index, target_pattern_id, channel_id, options)) =
             import_midi_request

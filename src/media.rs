@@ -1214,6 +1214,33 @@ pub struct SamplePathResolver {
     factory_roots: Vec<PathBuf>,
 }
 
+/// Finds the installed FL Studio Empty.flp template used for MIDI imports that start a project.
+/// Set `FL_STUDIO_EMPTY_PROJECT` to override automatic installation discovery.
+pub fn find_empty_project_template() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("FL_STUDIO_EMPTY_PROJECT").map(PathBuf::from)
+        && path.is_file()
+    {
+        return Some(path);
+    }
+    find_empty_project_template_in_roots(&discover_factory_roots())
+}
+
+fn find_empty_project_template_in_roots(roots: &[PathBuf]) -> Option<PathBuf> {
+    for root in roots {
+        for candidate in [
+            root.join("Data/Templates/Empty/Empty.flp"),
+            root.join("Templates/Empty/Empty.flp"),
+            root.join("Resources/FL/Data/Templates/Empty/Empty.flp"),
+            root.join("Contents/Resources/FL/Data/Templates/Empty/Empty.flp"),
+        ] {
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
 impl SamplePathResolver {
     pub fn new(project_file: impl AsRef<Path>) -> Self {
         Self {
@@ -1726,6 +1753,29 @@ mod tests {
             .resolve(r"%FLStudioFactoryData%\Data\Patches\voice.wav")
             .unwrap();
         assert_eq!(resolved, asset);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn finds_empty_project_template_in_installation_and_data_roots() {
+        let root = fixture_root();
+        let installation_template = root.join("Data/Templates/Empty/Empty.flp");
+        std::fs::create_dir_all(installation_template.parent().unwrap()).unwrap();
+        std::fs::write(&installation_template, b"template").unwrap();
+        assert_eq!(
+            find_empty_project_template_in_roots(std::slice::from_ref(&root)),
+            Some(installation_template.clone())
+        );
+
+        let data_root = root.join("Data");
+        let data_template = data_root.join("Templates/Empty/Empty.flp");
+        std::fs::create_dir_all(data_template.parent().unwrap()).unwrap();
+        std::fs::write(&data_template, b"data template").unwrap();
+        assert_eq!(
+            find_empty_project_template_in_roots(std::slice::from_ref(&data_root)),
+            Some(data_template)
+        );
 
         std::fs::remove_dir_all(root).unwrap();
     }
