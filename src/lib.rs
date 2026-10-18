@@ -17628,8 +17628,8 @@ mod tests {
         PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit,
         RandomizerOptions, RiffMachineOptions, RiffMachineQuantizeMode, ScaleLevelsOptions,
         TimeMarkerEdit, apply_mixer_pan, apply_mixer_stereo_separation, midi::MidiChannelMapping,
-        midi::MidiEventKind, midi::MidiFile, note_pitch_in_scale, parse_vst_plugin_state_metadata,
-        riff_machine_groove_note_timing,
+        midi::MidiEventKind, midi::MidiFile, midi::MidiImportOptions, note_pitch_in_scale,
+        parse_vst_plugin_state_metadata, riff_machine_groove_note_timing,
     };
 
     fn articulate_options(
@@ -26759,7 +26759,7 @@ mod tests {
                     0,
                     7,
                     0,
-                    midi::MidiImportOptions {
+                    MidiImportOptions {
                         zero_velocity_note_ons_as_notes: true,
                     },
                 )
