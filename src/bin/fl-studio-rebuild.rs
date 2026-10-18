@@ -3395,6 +3395,14 @@ struct PendingMidiCcImport {
     new_stream: bool,
 }
 
+struct PendingMidiCcExport {
+    path: PathBuf,
+    pattern_id: u16,
+    target_stream: (u8, u8),
+    controller_number: u8,
+    midi_channel: u8,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BrowserTab {
     Files,
@@ -4064,6 +4072,7 @@ struct DawUi {
     piano_roll_slice_position_ticks: u32,
     pending_midi_import: Option<PendingMidiImport>,
     pending_midi_cc_import: Option<PendingMidiCcImport>,
+    pending_midi_cc_export: Option<PendingMidiCcExport>,
     midi_channel_mapping: MidiChannelMapping,
     selected_arrangement: Option<u16>,
     selected_clip: Option<usize>,
@@ -5112,6 +5121,7 @@ impl DawUi {
             piano_roll_slice_position_ticks: 0,
             pending_midi_import: None,
             pending_midi_cc_import: None,
+            pending_midi_cc_export: None,
             midi_channel_mapping: MidiChannelMapping::PreserveNoteChannels,
             selected_arrangement: None,
             selected_clip: None,
@@ -34884,6 +34894,7 @@ impl DawUi {
         let mut create_stream_requested = false;
         let mut open_midi_cc_import_requested = false;
         let mut open_midi_cc_new_stream_requested = false;
+        let mut open_midi_cc_export_requested = false;
         ui.horizontal_wrapped(|ui| {
             ui.strong("Pattern controller data");
             piano_roll_event_target_selector(ui, &mut self.piano_roll_event_target);
@@ -34954,6 +34965,16 @@ impl DawUi {
             if ui.button("Import MIDI CC to new stream…").clicked() {
                 open_midi_cc_new_stream_requested = true;
             }
+            if ui
+                .add_enabled(
+                    self.piano_roll_controller_stream.is_some(),
+                    egui::Button::new("Export MIDI CC…"),
+                )
+                .on_hover_text("Export one selected raw stream as a MIDI Control Change track")
+                .clicked()
+            {
+                open_midi_cc_export_requested = true;
+            }
             if streams.is_empty() {
                 ui.separator();
                 ui.label("New raw stream");
@@ -35010,6 +35031,12 @@ impl DawUi {
             &streams,
             open_midi_cc_import_requested,
             open_midi_cc_new_stream_requested,
+        );
+        self.draw_pending_midi_cc_export_ui(
+            ui,
+            pattern.id,
+            selected_stream,
+            open_midi_cc_export_requested,
         );
 
         let size = Vec2::new(ui.available_width().max(1.0), 116.0);
@@ -35884,6 +35911,110 @@ impl DawUi {
                 }
                 Err(error) => {
                     self.status = format!("Could not import MIDI controller automation: {error}");
+                }
+            }
+        }
+    }
+
+    fn draw_pending_midi_cc_export_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        pattern_id: u16,
+        selected_stream: Option<(u8, u8)>,
+        open_requested: bool,
+    ) {
+        if open_requested
+            && let Some(target_stream) = selected_stream
+            && let Some(path) = rfd::FileDialog::new()
+                .set_title("Export Pattern controller as MIDI CC")
+                .set_file_name("controller.mid")
+                .add_filter("MIDI files", &["mid", "midi"])
+                .save_file()
+        {
+            self.pending_midi_cc_export = Some(PendingMidiCcExport {
+                path,
+                pattern_id,
+                target_stream,
+                controller_number: 1,
+                midi_channel: 1,
+            });
+        }
+
+        let mut export_request = None;
+        let mut cancel_requested = false;
+        if let Some(pending) = self.pending_midi_cc_export.as_mut() {
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    ui.strong("Export raw controller stream as MIDI CC");
+                    ui.weak(pending.path.display().to_string());
+                });
+                ui.label(format!(
+                    "Source: Pattern {} · raw stream channel {} · flags 0x{:02X}",
+                    pending.pattern_id, pending.target_stream.0, pending.target_stream.1
+                ));
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::DragValue::new(&mut pending.controller_number)
+                            .range(0..=127)
+                            .prefix("CC "),
+                    );
+                    ui.add(
+                        egui::DragValue::new(&mut pending.midi_channel)
+                            .range(1..=16)
+                            .prefix("MIDI channel "),
+                    );
+                });
+                ui.weak(
+                    "Raw values clamp to 0.0–1.0 and map to MIDI 0–127; Pattern timing and project PPQ are preserved.",
+                );
+                if ui.button("Export selected stream").clicked() {
+                    export_request = Some((
+                        pending.path.clone(),
+                        pending.pattern_id,
+                        pending.target_stream,
+                        pending.controller_number,
+                        pending.midi_channel - 1,
+                    ));
+                }
+                cancel_requested = ui.button("Cancel").clicked();
+            });
+        }
+        if cancel_requested {
+            self.pending_midi_cc_export = None;
+        }
+        if let Some((path, target_pattern, target_stream, cc, channel)) = export_request {
+            let result = self
+                .document
+                .as_ref()
+                .ok_or_else(|| "no project is open".to_owned())
+                .and_then(|document| {
+                    MidiFile::encode_project_pattern_controller_stream(
+                        document,
+                        target_pattern,
+                        target_stream,
+                        cc,
+                        channel,
+                    )
+                    .map_err(|error| error.to_string())
+                })
+                .and_then(|bytes| {
+                    fs::write(&path, &bytes)
+                        .map(|()| bytes.len())
+                        .map_err(|error| format!("could not write {}: {error}", path.display()))
+                });
+            match result {
+                Ok(byte_count) => {
+                    self.status = format!(
+                        "Exported Pattern {target_pattern} raw stream {} / 0x{:02X} as MIDI CC {cc} on channel {} to {} ({byte_count} bytes)",
+                        target_stream.0,
+                        target_stream.1,
+                        channel + 1,
+                        path.display()
+                    );
+                    self.pending_midi_cc_export = None;
+                }
+                Err(error) => {
+                    self.status = format!("Could not export MIDI controller automation: {error}");
                 }
             }
         }

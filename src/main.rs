@@ -297,6 +297,21 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_midi_channel_mapping(mapping)?,
             )
         }
+        [command, project, output, pattern_id, raw_channel, raw_flags, controller, midi_channel]
+            if command == "export-midi-cc" =>
+        {
+            export_midi_controller_stream(
+                Path::new(project),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                (
+                    parse_u8(raw_channel, "raw controller stream channel")?,
+                    parse_u8(raw_flags, "raw controller stream flags")?,
+                ),
+                parse_u8(controller, "MIDI Control Change number")?,
+                parse_midi_channel_number(midi_channel)?,
+            )
+        }
         [command, project, output, arrangement_id] if command == "export-midi-song" => {
             export_midi_song(
                 Path::new(project),
@@ -3098,6 +3113,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild global-swing <file.flp>\n",
             "  flp-rebuild midi-info <file.mid>\n",
             "  flp-rebuild export-midi-pattern <project.flp> <output.mid> <pattern-id> [stored|channels]\n",
+            "  flp-rebuild export-midi-cc <project.flp> <output.mid> <pattern-id> <raw-channel> <raw-flags> <cc-0..127> <midi-channel-1..16>\n",
             "  flp-rebuild export-midi-song <project.flp> <output.mid> <arrangement-id> [stored|channels]\n",
             "  flp-rebuild midi-events <file.mid> <track> [start] [count]\n",
             "  flp-rebuild scan <directory>\n",
@@ -3430,6 +3446,15 @@ fn parse_midi_channel_mapping(value: &str) -> Result<MidiChannelMapping, String>
         "stored" => Ok(MidiChannelMapping::PreserveNoteChannels),
         "channels" => Ok(MidiChannelMapping::AssignProjectChannels),
         _ => Err("MIDI channel mapping must be 'stored' or 'channels'".to_owned()),
+    }
+}
+
+fn parse_midi_channel_number(value: &str) -> Result<u8, String> {
+    let channel = parse_u8(value, "MIDI channel")?;
+    if (1..=16).contains(&channel) {
+        Ok(channel - 1)
+    } else {
+        Err("MIDI channel must be from 1 through 16".to_owned())
     }
 }
 
@@ -4452,6 +4477,36 @@ fn export_midi_pattern(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "exported pattern {pattern_id} as {} ({} bytes)",
+        output.display(),
+        bytes.len()
+    );
+    Ok(())
+}
+
+fn export_midi_controller_stream(
+    project: &Path,
+    output: &Path,
+    pattern_id: u16,
+    raw_stream: (u8, u8),
+    midi_controller: u8,
+    midi_channel: u8,
+) -> Result<(), String> {
+    let (_, document) = load_document(project)?;
+    let bytes = MidiFile::encode_project_pattern_controller_stream(
+        &document,
+        pattern_id,
+        raw_stream,
+        midi_controller,
+        midi_channel,
+    )
+    .map_err(|error| error.to_string())?;
+    fs::write(output, &bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "exported Pattern {pattern_id} raw controller stream {} / 0x{:02X} as MIDI CC {midi_controller} on channel {} to {} ({} bytes)",
+        raw_stream.0,
+        raw_stream.1,
+        midi_channel + 1,
         output.display(),
         bytes.len()
     );
@@ -8842,10 +8897,10 @@ fn delete_time_marker(
 mod tests {
     use super::{
         parse_clip_indices, parse_midi_channel_filter, parse_midi_channel_mask,
-        parse_midi_import_options, parse_midi_import_options_with_channels,
-        parse_midi_import_options_with_mixer_tracks, parse_midi_pattern_target,
-        parse_midi_track_selection, parse_mixer_track, parse_raw_byte, parse_rgb_hex,
-        parse_scale_name,
+        parse_midi_channel_number, parse_midi_import_options,
+        parse_midi_import_options_with_channels, parse_midi_import_options_with_mixer_tracks,
+        parse_midi_pattern_target, parse_midi_track_selection, parse_mixer_track, parse_raw_byte,
+        parse_rgb_hex, parse_scale_name,
     };
     use flp_rebuild::midi::MidiImportOptions;
 
@@ -8907,6 +8962,14 @@ mod tests {
         assert!(parse_midi_channel_filter("0").is_err());
         assert!(parse_midi_channel_filter("17").is_err());
         assert!(parse_midi_channel_filter("1,2").is_err());
+    }
+
+    #[test]
+    fn parses_required_one_based_midi_channels() {
+        assert_eq!(parse_midi_channel_number("1"), Ok(0));
+        assert_eq!(parse_midi_channel_number("16"), Ok(15));
+        assert!(parse_midi_channel_number("0").is_err());
+        assert!(parse_midi_channel_number("17").is_err());
     }
 
     #[test]

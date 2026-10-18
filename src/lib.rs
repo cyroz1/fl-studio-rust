@@ -28150,6 +28150,98 @@ mod tests {
     }
 
     #[test]
+    fn midi_export_maps_one_raw_controller_stream_to_selected_cc_and_channel() {
+        let mut controller_event = Vec::new();
+        let records = [
+            pattern_controller_record(0, [0; 2], 3, 0x91, 0.0f32.to_bits()),
+            pattern_controller_record(48, [0; 2], 8, 0x11, 0.75f32.to_bits()),
+            pattern_controller_record(96, [0; 2], 3, 0x91, 0.5f32.to_bits()),
+            pattern_controller_record(192, [0; 2], 3, 0x91, 1.0f32.to_bits()),
+        ];
+        for record in records {
+            append_data_event(&mut controller_event, 0xDF, &record);
+        }
+        let input = pattern_fixture(&[], &controller_event);
+        let document = FlpDocument::parse(&input).expect("project fixture should parse");
+
+        let bytes = midi::MidiFile::encode_project_pattern_controller_stream(
+            &document,
+            7,
+            (3, 0x91),
+            74,
+            2,
+        )
+        .expect("the selected raw stream should export as MIDI CC");
+        let midi = midi::MidiFile::parse(&bytes).expect("exported MIDI should parse");
+        assert_eq!(midi.tracks().len(), 2);
+        let control_changes = midi.tracks()[1].control_changes();
+        assert_eq!(
+            control_changes
+                .iter()
+                .map(|change| (
+                    change.tick(),
+                    change.channel(),
+                    change.controller(),
+                    change.value()
+                ))
+                .collect::<Vec<_>>(),
+            vec![(0, 2, 74, 0), (96, 2, 74, 64), (192, 2, 74, 127)]
+        );
+    }
+
+    #[test]
+    fn midi_controller_export_rejects_missing_streams_and_non_finite_points() {
+        let input = pattern_fixture(&[], &[]);
+        let empty_document = FlpDocument::parse(&input).expect("project fixture should parse");
+        assert!(
+            midi::MidiFile::encode_project_pattern_controller_stream(
+                &empty_document,
+                7,
+                (3, 0x91),
+                74,
+                0,
+            )
+            .is_err()
+        );
+
+        let record = pattern_controller_record(0, [0; 2], 3, 0x91, f32::NAN.to_bits());
+        let mut controller_event = Vec::new();
+        append_data_event(&mut controller_event, 0xDF, &record);
+        let input = pattern_fixture(&[], &controller_event);
+        let document = FlpDocument::parse(&input).expect("project fixture should parse");
+        assert!(
+            midi::MidiFile::encode_project_pattern_controller_stream(
+                &document,
+                7,
+                (3, 0x91),
+                74,
+                0,
+            )
+            .is_err()
+        );
+        assert!(
+            midi::MidiFile::encode_project_pattern_controller_stream(
+                &document,
+                7,
+                (3, 0x91),
+                128,
+                0,
+            )
+            .is_err()
+        );
+        assert!(
+            midi::MidiFile::encode_project_pattern_controller_stream(
+                &document,
+                7,
+                (3, 0x91),
+                74,
+                16,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn midi_control_change_import_rejects_invalid_targets_without_mutating() {
         let record = pattern_controller_record(0, [0; 2], 3, 0x91, 0.5f32.to_bits());
         let mut controller_event = Vec::new();

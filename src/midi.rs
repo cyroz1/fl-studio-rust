@@ -7,6 +7,7 @@ const MTHD: &[u8; 4] = b"MThd";
 const MTRK: &[u8; 4] = b"MTrk";
 const MAX_VLQ: u64 = 0x0FFF_FFFF;
 const MAX_EXPORTED_NOTES: usize = 1_000_000;
+const MAX_EXPORTED_CONTROLLER_POINTS: usize = 1_000_000;
 const MAX_EXPORTED_TEMPO_EVENTS: usize = 1_000_000;
 const MAX_EXPORTED_MARKERS: usize = 1_000_000;
 
@@ -512,6 +513,149 @@ impl MidiFile {
             ));
         }
         Self::encode_project_export_tracks(document, &tracks, channel_mapping)
+    }
+
+    /// Exports one raw Pattern controller stream as a MIDI Control Change track.
+    /// The raw stream bytes do not identify a MIDI controller or channel, so both
+    /// mappings are explicit. Controller values are clamped to 0.0–1.0 and mapped
+    /// linearly to MIDI's 0–127 range; Pattern ticks use the project's PPQ.
+    pub fn encode_project_pattern_controller_stream(
+        document: &FlpDocument,
+        pattern_id: u16,
+        raw_stream: (u8, u8),
+        midi_controller: u8,
+        midi_channel: u8,
+    ) -> Result<Vec<u8>, MidiError> {
+        if midi_controller > 127 {
+            return Err(MidiError::InvalidExport(
+                "MIDI Control Change number must be from 0 through 127",
+            ));
+        }
+        if midi_channel > 15 {
+            return Err(MidiError::InvalidExport(
+                "MIDI channel must be from 0 through 15",
+            ));
+        }
+        let ppq = document.header().ppq();
+        if ppq == 0 || ppq & 0x8000 != 0 {
+            return Err(MidiError::InvalidExport(
+                "project PPQ must be in the range 1..=32767",
+            ));
+        }
+        let patterns = document
+            .patterns()
+            .map_err(|error| MidiError::Project(error.to_string()))?;
+        let pattern = patterns
+            .iter()
+            .find(|pattern| pattern.id == pattern_id)
+            .ok_or(MidiError::InvalidExport(
+                "the requested pattern does not exist",
+            ))?;
+        let controller_points = pattern
+            .controllers
+            .iter()
+            .filter(|point| (point.channel, point.flags) == raw_stream)
+            .collect::<Vec<_>>();
+        if controller_points.is_empty() {
+            return Err(MidiError::InvalidExport(
+                "the requested raw Pattern controller stream does not exist",
+            ));
+        }
+        if controller_points.len() > MAX_EXPORTED_CONTROLLER_POINTS {
+            return Err(MidiError::InvalidExport(
+                "the raw Pattern controller stream has more than one million points",
+            ));
+        }
+        if controller_points
+            .iter()
+            .any(|point| !point.value().is_finite())
+        {
+            return Err(MidiError::InvalidExport(
+                "raw Pattern controller values must be finite",
+            ));
+        }
+
+        let tempo_bpm = document.metadata().tempo_bpm().unwrap_or(140.0);
+        let tempo = midi_tempo_microseconds_per_quarter(tempo_bpm)?.to_be_bytes();
+        let time_signature = document.metadata().time_signature();
+        if let Some((numerator, denominator)) = time_signature
+            && (numerator == 0 || denominator == 0 || !denominator.is_power_of_two())
+        {
+            return Err(MidiError::InvalidExport(
+                "time signature must have a positive numerator and power-of-two denominator",
+            ));
+        }
+
+        let mut output = Vec::new();
+        output.extend_from_slice(MTHD);
+        output.extend_from_slice(&6u32.to_be_bytes());
+        output.extend_from_slice(&1u16.to_be_bytes());
+        output.extend_from_slice(&2u16.to_be_bytes());
+        output.extend_from_slice(&ppq.to_be_bytes());
+
+        let mut conductor_events = vec![TimedMidiBytes {
+            tick: 0,
+            order: 0,
+            bytes: meta_event_bytes(0x03, b"Tempo and meter")?,
+        }];
+        conductor_events.push(TimedMidiBytes {
+            tick: 0,
+            order: 1,
+            bytes: meta_event_bytes(0x51, &tempo[1..])?,
+        });
+        if let Some((numerator, denominator)) = time_signature {
+            let signature = midi_time_signature_bytes(numerator, denominator)?;
+            conductor_events.push(TimedMidiBytes {
+                tick: 0,
+                order: 2,
+                bytes: meta_event_bytes(0x58, &signature)?,
+            });
+        }
+        conductor_events.sort_by_key(|event| (event.tick, event.order));
+        let mut conductor = Vec::new();
+        let mut previous_tick = 0;
+        for event in conductor_events {
+            write_delta(&mut conductor, event.tick.saturating_sub(previous_tick))?;
+            conductor.extend_from_slice(&event.bytes);
+            previous_tick = event.tick;
+        }
+        write_end_of_track(&mut conductor, 0)?;
+        append_track_chunk(&mut output, conductor)?;
+
+        let mut controller_events = vec![TimedMidiBytes {
+            tick: 0,
+            order: 0,
+            bytes: meta_event_bytes(
+                0x03,
+                format!(
+                    "Pattern {pattern_id} controller {} / 0x{:02X}",
+                    raw_stream.0, raw_stream.1
+                )
+                .as_bytes(),
+            )?,
+        }];
+        for point in controller_points {
+            let value = (point.value().clamp(0.0, 1.0) * 127.0).round() as u8;
+            controller_events.push(TimedMidiBytes {
+                tick: u64::from(point.position),
+                order: 4,
+                bytes: vec![0xB0 | midi_channel, midi_controller, value],
+            });
+        }
+        controller_events.sort_by_key(|event| (event.tick, event.order));
+        let mut controller_track = Vec::new();
+        let mut previous_tick = 0;
+        for event in controller_events {
+            write_delta(
+                &mut controller_track,
+                event.tick.saturating_sub(previous_tick),
+            )?;
+            controller_track.extend_from_slice(&event.bytes);
+            previous_tick = event.tick;
+        }
+        write_end_of_track(&mut controller_track, 0)?;
+        append_track_chunk(&mut output, controller_track)?;
+        Ok(output)
     }
 
     /// Exports pattern clips in one FL Studio arrangement to a format-1 MIDI file.
