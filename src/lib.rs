@@ -13664,6 +13664,31 @@ impl FlpDocument {
             .min()
     }
 
+    fn validate_midi_track_selection(
+        midi: &midi::MidiFile,
+        track_indices: &[usize],
+    ) -> Result<(), FlpError> {
+        if track_indices.is_empty() {
+            return Err(FlpError::UnsupportedEdit(
+                "select at least one MIDI track to import",
+            ));
+        }
+        let mut selected = HashSet::with_capacity(track_indices.len());
+        for track_index in track_indices {
+            if *track_index >= midi.tracks().len() {
+                return Err(FlpError::UnsupportedEdit(
+                    "a selected MIDI track does not exist",
+                ));
+            }
+            if !selected.insert(*track_index) {
+                return Err(FlpError::UnsupportedEdit(
+                    "a MIDI track cannot be selected more than once",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Imports the note events from one Standard MIDI File track into an existing FLP
     /// pattern and channel. Note times are converted through the MIDI tempo map or
     /// SMPTE clock, then expressed against the existing FLP tempo. MIDI CC 10 pan
@@ -13745,6 +13770,29 @@ impl FlpDocument {
         channel_ids: &[u16],
         options: midi::MidiImportOptions,
     ) -> Result<usize, FlpError> {
+        let track_indices = (0..midi.tracks().len()).collect::<Vec<_>>();
+        self.import_midi_selected_tracks_with_options(
+            midi,
+            pattern_id,
+            &track_indices,
+            channel_ids,
+            options,
+        )
+    }
+
+    /// Imports the selected Standard MIDI File tracks into one existing Pattern. Each selected
+    /// source track maps to the destination Channel Rack channel at the same position in
+    /// `channel_ids`. When realignment is enabled, the earliest note across only the selected
+    /// tracks starts at tick zero. Format-2 files remain separate sequences and are rejected.
+    /// The operation is atomic, so a bad track or destination leaves the project unchanged.
+    pub fn import_midi_selected_tracks_with_options(
+        &mut self,
+        midi: &midi::MidiFile,
+        pattern_id: u16,
+        track_indices: &[usize],
+        channel_ids: &[u16],
+        options: midi::MidiImportOptions,
+    ) -> Result<usize, FlpError> {
         if midi.format() == 2 {
             return Err(FlpError::UnsupportedEdit(
                 "Format-2 MIDI tracks are independent sequences; import them one at a time",
@@ -13755,27 +13803,33 @@ impl FlpDocument {
                 "the MIDI file contains no tracks to import",
             ));
         }
-        if channel_ids.len() != midi.tracks().len() {
+        Self::validate_midi_track_selection(midi, track_indices)?;
+        if channel_ids.len() != track_indices.len() {
             return Err(FlpError::UnsupportedEdit(
-                "provide one destination channel for every MIDI track",
+                "provide one destination channel for every selected MIDI track",
             ));
         }
 
         let realign_origin_tick = if options.realign_events {
-            Self::midi_realign_origin_tick(midi, 0..midi.tracks().len(), options)
+            Self::midi_realign_origin_tick(midi, track_indices.iter().copied(), options)
         } else {
             None
         };
         let mut candidate = self.clone();
         let mut total_imported = 0usize;
-        for (track_index, channel_id) in channel_ids.iter().copied().enumerate() {
+        for (mapping_index, (track_index, channel_id)) in track_indices
+            .iter()
+            .copied()
+            .zip(channel_ids.iter().copied())
+            .enumerate()
+        {
             let imported = candidate.import_midi_track_in_place(
                 midi,
                 track_index,
                 pattern_id,
                 channel_id,
                 MidiTrackImportSettings {
-                    import_time_signatures: track_index == 0,
+                    import_time_signatures: mapping_index == 0,
                     options,
                     realign_origin_tick,
                 },
@@ -13816,6 +13870,28 @@ impl FlpDocument {
         template_channel_id: u16,
         options: midi::MidiImportOptions,
     ) -> Result<(usize, Vec<u16>), FlpError> {
+        let track_indices = (0..midi.tracks().len()).collect::<Vec<_>>();
+        self.import_midi_selected_tracks_to_sampler_channels_with_options(
+            midi,
+            pattern_id,
+            template_channel_id,
+            &track_indices,
+            options,
+        )
+    }
+
+    /// Creates a named Sampler only for each selected format-0/1 MIDI track, then imports its
+    /// notes into that channel in `pattern_id`. When realignment is enabled, the selected tracks
+    /// share one origin. The operation is atomic and rejects empty, repeated, or out-of-range
+    /// track selections.
+    pub fn import_midi_selected_tracks_to_sampler_channels_with_options(
+        &mut self,
+        midi: &midi::MidiFile,
+        pattern_id: u16,
+        template_channel_id: u16,
+        track_indices: &[usize],
+        options: midi::MidiImportOptions,
+    ) -> Result<(usize, Vec<u16>), FlpError> {
         if midi.format() == 2 {
             return Err(FlpError::UnsupportedEdit(
                 "Format-2 MIDI tracks are independent sequences; import them one at a time",
@@ -13826,28 +13902,35 @@ impl FlpDocument {
                 "the MIDI file contains no tracks to import",
             ));
         }
+        Self::validate_midi_track_selection(midi, track_indices)?;
 
         let mixer_tracks = if options.set_mixer_tracks_for_new_channels {
-            Some(self.first_free_mixer_tracks(midi.tracks().len())?)
+            Some(self.first_free_mixer_tracks(track_indices.len())?)
         } else {
             None
         };
 
         let mut candidate = self.clone();
-        let mut channel_ids = Vec::with_capacity(midi.tracks().len());
-        for (track_index, track) in midi.tracks().iter().enumerate() {
+        let mut channel_ids = Vec::with_capacity(track_indices.len());
+        for (selection_index, track_index) in track_indices.iter().copied().enumerate() {
+            let track = &midi.tracks()[track_index];
             let channel_id = candidate.duplicate_sampler_channel(
                 template_channel_id,
                 &Self::midi_track_display_name(track, track_index),
             )?;
             if let Some(mixer_tracks) = &mixer_tracks {
-                candidate.set_channel_mixer_track(channel_id, mixer_tracks[track_index])?;
+                candidate.set_channel_mixer_track(channel_id, mixer_tracks[selection_index])?;
             }
             channel_ids.push(channel_id);
         }
 
-        let imported =
-            candidate.import_midi_tracks_with_options(midi, pattern_id, &channel_ids, options)?;
+        let imported = candidate.import_midi_selected_tracks_with_options(
+            midi,
+            pattern_id,
+            track_indices,
+            &channel_ids,
+            options,
+        )?;
         *self = candidate;
         Ok((imported, channel_ids))
     }
@@ -13876,6 +13959,25 @@ impl FlpDocument {
         template_channel_id: u16,
         options: midi::MidiImportOptions,
     ) -> Result<(usize, Vec<(u16, u16)>), FlpError> {
+        let track_indices = (0..midi.tracks().len()).collect::<Vec<_>>();
+        self.import_midi_selected_format2_tracks_to_sampler_patterns_with_options(
+            midi,
+            template_channel_id,
+            &track_indices,
+            options,
+        )
+    }
+
+    /// Imports selected independent Format-2 sequences into separate named Patterns and Sampler
+    /// channels. Each new Sampler copies the selected kind-0 template. The complete operation
+    /// rolls back if a track or channel cannot be imported.
+    pub fn import_midi_selected_format2_tracks_to_sampler_patterns_with_options(
+        &mut self,
+        midi: &midi::MidiFile,
+        template_channel_id: u16,
+        track_indices: &[usize],
+        options: midi::MidiImportOptions,
+    ) -> Result<(usize, Vec<(u16, u16)>), FlpError> {
         if midi.format() != 2 {
             return Err(FlpError::UnsupportedEdit(
                 "separate Pattern import requires a Format-2 MIDI file",
@@ -13886,24 +13988,26 @@ impl FlpDocument {
                 "the MIDI file contains no tracks to import",
             ));
         }
+        Self::validate_midi_track_selection(midi, track_indices)?;
 
         let mixer_tracks = if options.set_mixer_tracks_for_new_channels {
-            Some(self.first_free_mixer_tracks(midi.tracks().len())?)
+            Some(self.first_free_mixer_tracks(track_indices.len())?)
         } else {
             None
         };
 
         let mut candidate = self.clone();
-        let mut destinations = Vec::with_capacity(midi.tracks().len());
+        let mut destinations = Vec::with_capacity(track_indices.len());
         let mut total_imported = 0usize;
-        for (track_index, track) in midi.tracks().iter().enumerate() {
+        for (selection_index, track_index) in track_indices.iter().copied().enumerate() {
+            let track = &midi.tracks()[track_index];
             let track_name = Self::midi_track_display_name(track, track_index);
             let pattern_id = candidate.create_pattern()?;
             candidate.set_pattern_name(pattern_id, &track_name)?;
             let channel_id =
                 candidate.duplicate_sampler_channel(template_channel_id, &track_name)?;
             if let Some(mixer_tracks) = &mixer_tracks {
-                candidate.set_channel_mixer_track(channel_id, mixer_tracks[track_index])?;
+                candidate.set_channel_mixer_track(channel_id, mixer_tracks[selection_index])?;
             }
             let imported = candidate.import_midi_track_with_options(
                 midi,
@@ -27208,6 +27312,84 @@ mod tests {
     }
 
     #[test]
+    fn imports_only_selected_midi_tracks_and_realigns_within_the_selection() {
+        let midi = MidiFile::parse(&midi_tracks_fixture(
+            &[
+                &[
+                    0x00, 0x90, 0x3C, 0x64, // Unselected Track 1 starts at tick zero.
+                    0x83, 0x60, 0x80, 0x3C, 0x00, 0x00, 0xFF, 0x2F, 0x00,
+                ],
+                &[
+                    0x81, 0x70, 0x90, 0x3E, 0x64, // Selected Track 2 starts at tick 240.
+                    0x83, 0x60, 0x80, 0x3E, 0x00, 0x00, 0xFF, 0x2F, 0x00,
+                ],
+                &[
+                    0x83, 0x60, 0x90, 0x43, 0x64, // Selected Track 3 starts at tick 480.
+                    0x83, 0x60, 0x80, 0x43, 0x00, 0x00, 0xFF, 0x2F, 0x00,
+                ],
+            ],
+            1,
+            480,
+        ))
+        .expect("three-track MIDI fixture should parse");
+        let mut project_events = vec![
+            0x40, 0, 0, 0x15, 0, // Destination channel 0.
+            0x40, 1, 0, 0x15, 0, // Destination channel 1.
+            0x41, 7, 0, 0xD0, 0, // Existing empty Pattern 7.
+        ];
+        project_events.extend_from_slice(&[0x63, 0, 0, 0xFF, 0x02, 0xAA, 0xBB]);
+        let original = flp_fixture(&project_events, &[], &[]);
+        let mut document = FlpDocument::parse(&original).expect("project fixture should parse");
+
+        assert_eq!(
+            document
+                .import_midi_selected_tracks_with_options(
+                    &midi,
+                    7,
+                    &[1, 2],
+                    &[1, 0],
+                    MidiImportOptions {
+                        realign_events: true,
+                        ..MidiImportOptions::default()
+                    },
+                )
+                .expect("selected MIDI tracks should import"),
+            2
+        );
+        let notes = &document.patterns().unwrap()[0].notes;
+        assert_eq!(notes.len(), 2, "the unselected track must be omitted");
+        assert_eq!(
+            (notes[0].channel_id, notes[0].key, notes[0].position),
+            (1, 62, 0)
+        );
+        assert_eq!(
+            (notes[1].channel_id, notes[1].key, notes[1].position),
+            (0, 67, 48),
+            "realignment must use the earliest selected note, not an earlier unselected track"
+        );
+        assert_eq!(
+            document.events().last().unwrap().wire_bytes(),
+            &[0xFF, 0x02, 0xAA, 0xBB]
+        );
+
+        for invalid_selection in [&[][..], &[1, 1][..], &[3][..]] {
+            let mut rejected = FlpDocument::parse(&original).expect("project fixture should parse");
+            assert!(
+                rejected
+                    .import_midi_selected_tracks_with_options(
+                        &midi,
+                        7,
+                        invalid_selection,
+                        &[0; 2][..invalid_selection.len()],
+                        MidiImportOptions::default(),
+                    )
+                    .is_err()
+            );
+            assert_eq!(rejected.encode_lossless().unwrap(), original);
+        }
+    }
+
+    #[test]
     fn all_track_midi_import_rejects_incomplete_maps_and_format_two_files() {
         let one_track = MidiFile::parse(&midi_fixture(
             &[
@@ -27335,6 +27517,33 @@ mod tests {
         assert_eq!(notes.len(), 2);
         assert_eq!((notes[0].channel_id, notes[0].key), (channel_ids[0], 60));
         assert_eq!((notes[1].channel_id, notes[1].key), (channel_ids[1], 67));
+
+        let mut selected_document =
+            FlpDocument::parse(&original).expect("project fixture should parse");
+        let (selected_imported, selected_channel_ids) = selected_document
+            .import_midi_selected_tracks_to_sampler_channels_with_options(
+                &midi,
+                7,
+                0,
+                &[1],
+                MidiImportOptions::default(),
+            )
+            .expect("selected MIDI track should get one cloned Sampler");
+        assert_eq!(selected_imported, 1);
+        assert_eq!(selected_channel_ids.len(), 1);
+        assert_eq!(
+            selected_document
+                .channels()
+                .iter()
+                .find(|channel| channel.id() == selected_channel_ids[0])
+                .and_then(ChannelSummary::display_name),
+            Some("Bass")
+        );
+        assert_eq!(
+            selected_document.patterns().unwrap()[0].notes[0].key,
+            67,
+            "unselected MIDI tracks must not produce notes or channels"
+        );
 
         let mut rejected = FlpDocument::parse(&original).expect("project fixture should parse");
         assert!(
@@ -27549,6 +27758,29 @@ mod tests {
             assert_eq!(channel.display_name(), Some(expected_name));
             assert_eq!(channel.sample_path(), Some("/samples/template.wav"));
         }
+
+        let mut selected_document =
+            FlpDocument::parse(&original).expect("project should parse for selected import");
+        let (selected_imported, selected_destinations) = selected_document
+            .import_midi_selected_format2_tracks_to_sampler_patterns_with_options(
+                &midi,
+                0,
+                &[1],
+                MidiImportOptions::default(),
+            )
+            .expect("the selected independent sequence should import");
+        assert_eq!(selected_imported, 1);
+        assert_eq!(selected_destinations.len(), 1);
+        let selected_pattern = selected_document
+            .patterns()
+            .unwrap()
+            .into_iter()
+            .find(|pattern| pattern.id == selected_destinations[0].0)
+            .expect("only the selected sequence Pattern should be added");
+        assert_eq!(selected_pattern.name.as_deref(), Some("Bass"));
+        assert_eq!(selected_pattern.notes.len(), 1);
+        assert_eq!(selected_pattern.notes[0].key, 67);
+        assert_eq!(selected_document.channels().len(), 2);
 
         let mut routed_document =
             FlpDocument::parse(&original).expect("project should parse for routed import");

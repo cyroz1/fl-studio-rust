@@ -3372,6 +3372,7 @@ struct PendingMidiImport {
     midi: MidiFile,
     selected_track: usize,
     import_all_tracks: bool,
+    selected_midi_tracks: Vec<bool>,
     track_channel_ids: Vec<u16>,
     zero_velocity_note_ons_as_notes: bool,
     realign_events: bool,
@@ -11860,11 +11861,13 @@ impl DawUi {
                     Ok(midi) if !midi.tracks().is_empty() => {
                         let track_channel_ids =
                             self.default_midi_import_channels(midi.tracks().len());
+                        let selected_midi_tracks = vec![true; midi.tracks().len()];
                         self.pending_midi_import = Some(PendingMidiImport {
                             path: path.clone(),
                             midi,
                             selected_track: 0,
                             import_all_tracks: false,
+                            selected_midi_tracks,
                             track_channel_ids,
                             zero_velocity_note_ons_as_notes: false,
                             realign_events: false,
@@ -28153,11 +28156,13 @@ impl DawUi {
                     Ok(midi) if !midi.tracks().is_empty() => {
                         let track_channel_ids =
                             self.default_midi_import_channels(midi.tracks().len());
+                        let selected_midi_tracks = vec![true; midi.tracks().len()];
                         self.pending_midi_import = Some(PendingMidiImport {
                             path: path.clone(),
                             midi,
                             selected_track: 0,
                             import_all_tracks: false,
+                            selected_midi_tracks,
                             track_channel_ids,
                             zero_velocity_note_ons_as_notes: false,
                             realign_events: false,
@@ -28251,9 +28256,19 @@ impl DawUi {
                         ));
                     }
                 } else {
-                    let mapping_is_valid = pending.track_channel_ids.len()
-                        == pending.midi.tracks().len()
-                        && pending.track_channel_ids.iter().all(|channel_id| {
+                    let selected_track_indices = pending
+                        .selected_midi_tracks
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, selected)| selected.then_some(index))
+                        .collect::<Vec<_>>();
+                    let selected_channel_ids = selected_track_indices
+                        .iter()
+                        .filter_map(|index| pending.track_channel_ids.get(*index).copied())
+                        .collect::<Vec<_>>();
+                    let mapping_is_valid = !selected_track_indices.is_empty()
+                        && selected_channel_ids.len() == selected_track_indices.len()
+                        && selected_channel_ids.iter().all(|channel_id| {
                             available_midi_channels
                                 .iter()
                                 .any(|channel| channel.id() == *channel_id)
@@ -28264,14 +28279,15 @@ impl DawUi {
                                 && pending.midi_channel_mask != 0
                                 && mapping_is_valid
                                 && pending.midi.format() != 2,
-                            egui::Button::new("Import all tracks"),
+                            egui::Button::new("Import selected tracks"),
                         )
                         .clicked()
                         && let Some(pattern_id) = self.selected_pattern
                     {
                         import_all_midi_request = Some((
                             pending.midi.clone(),
-                            pending.track_channel_ids.clone(),
+                            selected_track_indices,
+                            selected_channel_ids,
                             pattern_id,
                             MidiImportOptions {
                                 zero_velocity_note_ons_as_notes:
@@ -28287,12 +28303,13 @@ impl DawUi {
                         .add_enabled(
                             self.selected_pattern.is_some()
                                 && pending.midi_channel_mask != 0
+                                && pending.selected_midi_tracks.iter().any(|selected| *selected)
                                 && selected_sampler_template.is_some()
                                 && pending.midi.format() != 2,
                             egui::Button::new("Create Sampler channels"),
                         )
                         .on_hover_text(
-                            "Copy the selected Sampler's sample and settings once per MIDI track, then import each track into its new channel.",
+                            "Copy the selected Sampler's sample and settings for each selected MIDI track, then import those tracks into their new channels.",
                         )
                         .clicked()
                         && let (Some(pattern_id), Some(template_channel_id)) =
@@ -28300,6 +28317,12 @@ impl DawUi {
                     {
                         create_sampler_midi_request = Some((
                             pending.midi.clone(),
+                            pending
+                                .selected_midi_tracks
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(index, selected)| selected.then_some(index))
+                                .collect::<Vec<_>>(),
                             pattern_id,
                             template_channel_id,
                             MidiImportOptions {
@@ -28318,17 +28341,24 @@ impl DawUi {
                         .add_enabled(
                             self.selected_pattern.is_some()
                                 && pending.midi_channel_mask != 0
+                                && pending.selected_midi_tracks.iter().any(|selected| *selected)
                                 && selected_sampler_template.is_some(),
                             egui::Button::new("Create separate patterns + Samplers"),
                         )
                         .on_hover_text(
-                            "Create one new Pattern and named Sampler channel for each independent Format-2 sequence.",
+                            "Create one new Pattern and named Sampler channel for each selected independent Format-2 sequence.",
                         )
                         .clicked()
                     && let Some(template_channel_id) = selected_sampler_template
                 {
                     create_format2_midi_request = Some((
                         pending.midi.clone(),
+                        pending
+                            .selected_midi_tracks
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(index, selected)| selected.then_some(index))
+                            .collect::<Vec<_>>(),
                         template_channel_id,
                         MidiImportOptions {
                             zero_velocity_note_ons_as_notes:
@@ -28374,6 +28404,27 @@ impl DawUi {
                 });
             });
             if pending.import_all_tracks || pending.midi.format() == 2 {
+                ui.collapsing("MIDI tracks to import", |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.button("All").clicked() {
+                            pending.selected_midi_tracks.fill(true);
+                        }
+                        if ui.button("None").clicked() {
+                            pending.selected_midi_tracks.fill(false);
+                        }
+                    });
+                    for (track_index, track) in pending.midi.tracks().iter().enumerate() {
+                        let track_name = track
+                            .name()
+                            .filter(|name| !name.is_empty())
+                            .unwrap_or_else(|| format!("Track {}", track_index + 1));
+                        if let Some(selected) = pending.selected_midi_tracks.get_mut(track_index) {
+                            ui.checkbox(selected, track_name);
+                        }
+                    }
+                });
+            }
+            if pending.import_all_tracks || pending.midi.format() == 2 {
                 ui.checkbox(
                     &mut pending.set_mixer_tracks_for_new_channels,
                     "Set Mixer tracks for new channels",
@@ -28384,13 +28435,21 @@ impl DawUi {
             }
             if pending.import_all_tracks {
                 ui.vertical(|ui| {
-                    ui.small("Choose a destination Channel Rack channel for each MIDI track.");
+                    ui.small("Choose a destination Channel Rack channel for each selected MIDI track.");
                     if pending.midi.format() == 2 {
                         ui.weak(
-                            "Format-2 tracks are independent sequences; create a separate Pattern for each or import one track at a time.",
+                            "Format-2 tracks are independent sequences; each selected track gets a separate Pattern and Sampler.",
                         );
                     }
                     for (track_index, track) in pending.midi.tracks().iter().enumerate() {
+                        if !pending
+                            .selected_midi_tracks
+                            .get(track_index)
+                            .copied()
+                            .unwrap_or(false)
+                        {
+                            continue;
+                        }
                         let track_name = track
                             .name()
                             .filter(|name| !name.is_empty())
@@ -28471,13 +28530,20 @@ impl DawUi {
                 }
             }
         }
-        if let Some((midi, channel_ids, pattern_id, options)) = import_all_midi_request {
-            let channel_id = midi
-                .tracks()
+        if let Some((midi, track_indices, channel_ids, pattern_id, options)) =
+            import_all_midi_request
+        {
+            let selected_mapping_index = track_indices
                 .iter()
-                .enumerate()
-                .find(|(_, track)| !track.notes_with_options(options).is_empty())
-                .and_then(|(track_index, _)| channel_ids.get(track_index).copied())
+                .position(|track_index| {
+                    !midi.tracks()[*track_index]
+                        .notes_with_options(options)
+                        .is_empty()
+                })
+                .unwrap_or(0);
+            let channel_id = channel_ids
+                .get(selected_mapping_index)
+                .copied()
                 .or_else(|| channel_ids.first().copied())
                 .unwrap_or_default();
             let first_note_index = patterns
@@ -28492,9 +28558,10 @@ impl DawUi {
                 })
                 .unwrap_or(0);
             if let Some(document) = &mut self.document {
-                match document.import_midi_tracks_with_options(
+                match document.import_midi_selected_tracks_with_options(
                     &midi,
                     pattern_id,
+                    &track_indices,
                     &channel_ids,
                     options,
                 ) {
@@ -28512,27 +28579,32 @@ impl DawUi {
                         }
                         self.dirty = true;
                         self.status = format!(
-                            "Imported {imported} MIDI notes from {} tracks into pattern {pattern_id}",
-                            midi.tracks().len()
+                            "Imported {imported} MIDI notes from {} selected tracks into pattern {pattern_id}",
+                            track_indices.len()
                         );
                     }
                     Err(error) => self.status = error.to_string(),
                 }
             }
         }
-        if let Some((midi, pattern_id, template_channel_id, options)) = create_sampler_midi_request
+        if let Some((midi, track_indices, pattern_id, template_channel_id, options)) =
+            create_sampler_midi_request
         {
-            let selected_track_index = midi
-                .tracks()
+            let selected_track_index = track_indices
                 .iter()
-                .position(|track| !track.notes_with_options(options).is_empty())
+                .position(|track_index| {
+                    !midi.tracks()[*track_index]
+                        .notes_with_options(options)
+                        .is_empty()
+                })
                 .unwrap_or(0);
             let first_note_index = 0;
             if let Some(document) = &mut self.document {
-                match document.import_midi_tracks_to_sampler_channels_with_options(
+                match document.import_midi_selected_tracks_to_sampler_channels_with_options(
                     &midi,
                     pattern_id,
                     template_channel_id,
+                    &track_indices,
                     options,
                 ) {
                     Ok((imported, channel_ids)) => {
@@ -28553,7 +28625,7 @@ impl DawUi {
                         }
                         self.dirty = true;
                         self.status = format!(
-                            "Created {} Sampler channels and imported {imported} MIDI notes into pattern {pattern_id}",
+                            "Created {} Sampler channels from selected MIDI tracks and imported {imported} notes into pattern {pattern_id}",
                             channel_ids.len()
                         );
                     }
@@ -28561,16 +28633,22 @@ impl DawUi {
                 }
             }
         }
-        if let Some((midi, template_channel_id, options)) = create_format2_midi_request {
-            let selected_track_index = midi
-                .tracks()
+        if let Some((midi, track_indices, template_channel_id, options)) =
+            create_format2_midi_request
+        {
+            let selected_track_index = track_indices
                 .iter()
-                .position(|track| !track.notes_with_options(options).is_empty())
+                .position(|track_index| {
+                    !midi.tracks()[*track_index]
+                        .notes_with_options(options)
+                        .is_empty()
+                })
                 .unwrap_or(0);
             if let Some(document) = &mut self.document {
-                match document.import_midi_format2_tracks_to_sampler_patterns_with_options(
+                match document.import_midi_selected_format2_tracks_to_sampler_patterns_with_options(
                     &midi,
                     template_channel_id,
+                    &track_indices,
                     options,
                 ) {
                     Ok((imported, destinations)) => {
@@ -28590,7 +28668,7 @@ impl DawUi {
                         }
                         self.dirty = true;
                         self.status = format!(
-                            "Imported {imported} Format-2 MIDI notes into {} separate Patterns with Sampler channels",
+                            "Imported {imported} notes from {} selected Format-2 tracks into separate Patterns with Sampler channels",
                             destinations.len()
                         );
                     }
