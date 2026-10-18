@@ -4517,6 +4517,7 @@ enum MidiMixerControlTarget {
     Solo,
     PhaseInvert,
     SwapLeftRight,
+    EffectsEnabled,
 }
 
 impl MidiMixerControlTarget {
@@ -4529,6 +4530,7 @@ impl MidiMixerControlTarget {
             Self::Solo => "solo",
             Self::PhaseInvert => "phase invert",
             Self::SwapLeftRight => "left/right swap",
+            Self::EffectsEnabled => "effects enabled",
         }
     }
 
@@ -4541,6 +4543,7 @@ impl MidiMixerControlTarget {
             "solo" => Some(Self::Solo),
             "phase-invert" => Some(Self::PhaseInvert),
             "swap-left-right" => Some(Self::SwapLeftRight),
+            "effects-enabled" => Some(Self::EffectsEnabled),
             _ => None,
         }
     }
@@ -4554,6 +4557,7 @@ impl MidiMixerControlTarget {
             Self::Solo => "solo",
             Self::PhaseInvert => "phase-invert",
             Self::SwapLeftRight => "swap-left-right",
+            Self::EffectsEnabled => "effects-enabled",
         }
     }
 
@@ -4562,9 +4566,11 @@ impl MidiMixerControlTarget {
             Self::Fader => midi_cc_to_mixer_fader_raw(cc),
             Self::Pan => midi_cc_to_mixer_pan_raw(cc),
             Self::StereoSeparation => midi_cc_to_mixer_stereo_separation_raw(cc),
-            Self::Mute | Self::Solo | Self::PhaseInvert | Self::SwapLeftRight => {
-                i32::from(cc >= 64)
-            }
+            Self::Mute
+            | Self::Solo
+            | Self::PhaseInvert
+            | Self::SwapLeftRight
+            | Self::EffectsEnabled => i32::from(cc >= 64),
         }
     }
 
@@ -4573,16 +4579,22 @@ impl MidiMixerControlTarget {
             Self::Fader => (0..=16_000).contains(&value),
             Self::Pan => (-6_400..=6_400).contains(&value),
             Self::StereoSeparation => (-64..=64).contains(&value),
-            Self::Mute | Self::Solo | Self::PhaseInvert | Self::SwapLeftRight => {
-                (0..=1).contains(&value)
-            }
+            Self::Mute
+            | Self::Solo
+            | Self::PhaseInvert
+            | Self::SwapLeftRight
+            | Self::EffectsEnabled => (0..=1).contains(&value),
         }
     }
 
     const fn is_toggle(self) -> bool {
         matches!(
             self,
-            Self::Mute | Self::Solo | Self::PhaseInvert | Self::SwapLeftRight
+            Self::Mute
+                | Self::Solo
+                | Self::PhaseInvert
+                | Self::SwapLeftRight
+                | Self::EffectsEnabled
         )
     }
 }
@@ -35898,6 +35910,19 @@ impl DawUi {
                                             == MidiMixerControlTarget::SwapLeftRight
                                 })
                                 .cloned();
+                            let effects_enabled_learning = MidiMixerControlLearning {
+                                insert_ordinal: insert.ordinal(),
+                                target: MidiMixerControlTarget::EffectsEnabled,
+                            };
+                            let effects_enabled_mapping = self
+                                .midi_mixer_control_mappings
+                                .iter()
+                                .find(|mapping| {
+                                    mapping.insert_ordinal == insert.ordinal()
+                                        && mapping.target
+                                            == MidiMixerControlTarget::EffectsEnabled
+                                })
+                                .cloned();
                             ui.horizontal_wrapped(|ui| {
                                 if self.midi_mixer_control_learning == Some(mute_learning) {
                                     ui.small(
@@ -36106,6 +36131,77 @@ impl DawUi {
                                             self.status =
                                                 "Cleared MIDI Mixer left/right swap mapping"
                                                     .to_owned();
+                                        }
+                                    }
+                                }
+                                if self.midi_mixer_control_learning
+                                    == Some(effects_enabled_learning)
+                                {
+                                    ui.small(
+                                        egui::RichText::new("Press a MIDI CC button…")
+                                            .color(ORANGE),
+                                    );
+                                    if ui.small_button("Cancel learn").clicked() {
+                                        self.midi_mixer_control_learning = None;
+                                    }
+                                } else if ui
+                                    .add_enabled(
+                                        flags_editable && self.midi_input_connection.is_some(),
+                                        egui::Button::new("Learn Effects CC"),
+                                    )
+                                    .on_hover_text(
+                                        "Learn a CC to toggle this saved effect-chain enable state; effects are not processed yet",
+                                    )
+                                    .clicked()
+                                {
+                                    self.midi_output_gain_learning = false;
+                                    self.midi_play_pause_learning = false;
+                                    self.midi_mixer_button_cc_active.clear();
+                                    self.midi_mixer_control_learning =
+                                        Some(effects_enabled_learning);
+                                    self.status = format!(
+                                        "Press a MIDI CC button to map {} effects enabled",
+                                        if insert.ordinal() == 0 {
+                                            "Master".to_owned()
+                                        } else {
+                                            format!("Insert {}", insert.ordinal())
+                                        }
+                                    );
+                                }
+                                if let Some(mapping) = &effects_enabled_mapping {
+                                    let input_name = self
+                                        .midi_input_devices
+                                        .iter()
+                                        .find(|device| device.id == mapping.input_device_id)
+                                        .map(|device| device.name.as_str())
+                                        .unwrap_or(mapping.input_device_id.as_str());
+                                    ui.small(format!(
+                                        "Effects CC {} · Ch {}",
+                                        mapping.controller,
+                                        mapping.channel + 1
+                                    ))
+                                    .on_hover_text(format!("Mapped from {input_name}"));
+                                    if ui.small_button("Clear Effects CC").clicked() {
+                                        self.midi_mixer_control_mappings.retain(|mapping| {
+                                            mapping.insert_ordinal != insert.ordinal()
+                                                || mapping.target
+                                                    != MidiMixerControlTarget::EffectsEnabled
+                                        });
+                                        self.midi_mixer_button_cc_active.remove(&(
+                                            mapping.input_device_id.clone(),
+                                            mapping.channel,
+                                            mapping.controller,
+                                        ));
+                                        self.midi_mixer_control_learning = None;
+                                        if let Err(error) = save_midi_mixer_control_mappings(
+                                            &self.midi_mixer_control_mappings,
+                                        ) {
+                                            self.status = format!(
+                                                "Could not clear MIDI Mixer effects mapping: {error}"
+                                            );
+                                        } else {
+                                            self.status =
+                                                "Cleared MIDI Mixer effects mapping".to_owned();
                                         }
                                     }
                                 }
@@ -37911,7 +38007,8 @@ impl DawUi {
                 MidiMixerControlTarget::Mute
                 | MidiMixerControlTarget::Solo
                 | MidiMixerControlTarget::PhaseInvert
-                | MidiMixerControlTarget::SwapLeftRight => {
+                | MidiMixerControlTarget::SwapLeftRight
+                | MidiMixerControlTarget::EffectsEnabled => {
                     unreachable!("handled above")
                 }
             }
@@ -37982,7 +38079,8 @@ impl DawUi {
                 MidiMixerControlTarget::Mute
                 | MidiMixerControlTarget::Solo
                 | MidiMixerControlTarget::PhaseInvert
-                | MidiMixerControlTarget::SwapLeftRight,
+                | MidiMixerControlTarget::SwapLeftRight
+                | MidiMixerControlTarget::EffectsEnabled,
                 _,
             ) => {
                 unreachable!("handled above")
@@ -38059,6 +38157,7 @@ impl DawUi {
                 MidiMixerControlTarget::Solo => insert.soloed(),
                 MidiMixerControlTarget::PhaseInvert => insert.polarity_reversed(),
                 MidiMixerControlTarget::SwapLeftRight => insert.swap_left_right(),
+                MidiMixerControlTarget::EffectsEnabled => insert.effects_enabled(),
                 _ => None,
             }
             .ok_or_else(|| {
@@ -38129,6 +38228,7 @@ impl DawUi {
                 MidiMixerControlTarget::Solo => insert.soloed(),
                 MidiMixerControlTarget::PhaseInvert => insert.polarity_reversed(),
                 MidiMixerControlTarget::SwapLeftRight => insert.swap_left_right(),
+                MidiMixerControlTarget::EffectsEnabled => insert.effects_enabled(),
                 _ => None,
             }
             .ok_or_else(|| {
@@ -38180,6 +38280,10 @@ impl DawUi {
                 },
                 MidiMixerControlTarget::SwapLeftRight => MixerInsertEdit {
                     swap_left_right: Some(active),
+                    ..MixerInsertEdit::default()
+                },
+                MidiMixerControlTarget::EffectsEnabled => MixerInsertEdit {
+                    effects_enabled: Some(active),
                     ..MixerInsertEdit::default()
                 },
                 _ => unreachable!("toggle target was checked above"),
@@ -38238,6 +38342,7 @@ impl DawUi {
                 self.mixer_track_peak_meters
                     .set_live_mixer_insert_signal_flags(insert_ordinal, live_flags);
             }
+            MidiMixerControlTarget::EffectsEnabled => {}
             _ => unreachable!("toggle target was checked above"),
         }
         self.dirty = true;
@@ -38261,6 +38366,9 @@ impl DawUi {
                 }
                 MidiMixerControlTarget::SwapLeftRight => {
                     if active { "swapped" } else { "normal" }
+                }
+                MidiMixerControlTarget::EffectsEnabled => {
+                    if active { "enabled" } else { "disabled" }
                 }
                 _ => unreachable!("toggle target was checked above"),
             }
@@ -51594,6 +51702,13 @@ mod tests {
                 insert_ordinal: 0,
                 target: MidiMixerControlTarget::SwapLeftRight,
             },
+            MidiMixerControlMapping {
+                input_device_id: "usb:surface".to_owned(),
+                channel: 0,
+                controller: 15,
+                insert_ordinal: 0,
+                target: MidiMixerControlTarget::EffectsEnabled,
+            },
         ];
         let encoded = serialize_midi_mixer_control_mappings(&mappings);
         assert_eq!(parse_midi_mixer_control_mappings(&encoded), mappings);
@@ -51743,6 +51858,14 @@ mod tests {
             target: MidiMixerControlTarget::SwapLeftRight,
         };
         upsert_midi_mixer_control_mapping(&mut mappings, swap_left_right.clone());
+        let effects_enabled = MidiMixerControlMapping {
+            input_device_id: "surface".to_owned(),
+            channel: 0,
+            controller: 16,
+            insert_ordinal: 1,
+            target: MidiMixerControlTarget::EffectsEnabled,
+        };
+        upsert_midi_mixer_control_mapping(&mut mappings, effects_enabled.clone());
         assert_eq!(
             mappings,
             vec![
@@ -51754,6 +51877,7 @@ mod tests {
                 solo,
                 phase_invert,
                 swap_left_right,
+                effects_enabled,
             ]
         );
     }
@@ -51817,6 +51941,13 @@ mod tests {
                 insert_ordinal: 0,
                 target: MidiMixerControlTarget::SwapLeftRight,
             },
+            MidiMixerControlMapping {
+                input_device_id: "surface-a".to_owned(),
+                channel: 0,
+                controller: 15,
+                insert_ordinal: 0,
+                target: MidiMixerControlTarget::EffectsEnabled,
+            },
         ];
         assert_eq!(
             midi_mixer_control_for_cc(&mappings, "surface-a", 0, 7),
@@ -51854,6 +51985,10 @@ mod tests {
             midi_mixer_control_for_cc(&mappings, "surface-a", 0, 14),
             Some((0, MidiMixerControlTarget::SwapLeftRight))
         );
+        assert_eq!(
+            midi_mixer_control_for_cc(&mappings, "surface-a", 0, 15),
+            Some((0, MidiMixerControlTarget::EffectsEnabled))
+        );
     }
 
     #[test]
@@ -51863,6 +51998,7 @@ mod tests {
             MidiMixerControlTarget::Solo,
             MidiMixerControlTarget::PhaseInvert,
             MidiMixerControlTarget::SwapLeftRight,
+            MidiMixerControlTarget::EffectsEnabled,
         ] {
             assert!(target.is_toggle());
             assert_eq!(target.raw_value(63), 0);
@@ -51874,6 +52010,10 @@ mod tests {
         assert_eq!(
             MidiMixerControlTarget::from_setting("swap-left-right"),
             Some(MidiMixerControlTarget::SwapLeftRight)
+        );
+        assert_eq!(
+            MidiMixerControlTarget::from_setting("effects-enabled"),
+            Some(MidiMixerControlTarget::EffectsEnabled)
         );
     }
 
