@@ -10,7 +10,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap_probe::{
     ClapInspectionResponse, ClapInspectionState, ClapInstanceInspectionResponse,
-    ClapInstanceInspectionState,
+    ClapInstanceInspectionState, ClapNotePreviewRequest, ClapNotePreviewResponse,
+    ClapNotePreviewState,
 };
 use eframe::egui::{self, Align2, Color32, FontId, Id, PointerButton, Sense, Stroke, Vec2};
 use flp_rebuild::audio::{
@@ -654,6 +655,15 @@ fn matching_vst3_candidate<'a>(
         .find(|candidate| candidate_matches_vst_metadata(candidate, metadata))
 }
 
+fn clap_descriptor_supports_note_preview(features: &[String]) -> bool {
+    features.iter().any(|feature| {
+        matches!(
+            feature.to_ascii_lowercase().as_str(),
+            "instrument" | "synthesizer" | "sampler" | "drum" | "drum-machine"
+        )
+    })
+}
+
 fn main() -> eframe::Result {
     let args = std::env::args_os().collect::<Vec<_>>();
     if args
@@ -679,6 +689,34 @@ fn main() -> eframe::Result {
             std::process::exit(2);
         };
         std::process::exit(clap_probe::run_instance_child(&path, plugin_id));
+    }
+    if args
+        .get(1)
+        .is_some_and(|argument| argument == std::ffi::OsStr::new(clap_probe::NOTE_PREVIEW_FLAG))
+    {
+        let Some(path) = args.get(2).map(PathBuf::from) else {
+            eprintln!(
+                "CLAP note preview needs a bundle or library path, plug-in ID, and sample rate"
+            );
+            std::process::exit(2);
+        };
+        let Some(plugin_id) = args.get(3).and_then(|value| value.to_str()) else {
+            eprintln!("CLAP note preview needs a UTF-8 plug-in ID");
+            std::process::exit(2);
+        };
+        let Some(sample_rate) = args.get(4).and_then(|value| value.to_str()) else {
+            eprintln!("CLAP note preview needs a sample rate");
+            std::process::exit(2);
+        };
+        let Ok(sample_rate) = sample_rate.parse::<u32>() else {
+            eprintln!("CLAP note preview sample rate must be an integer");
+            std::process::exit(2);
+        };
+        std::process::exit(clap_probe::run_note_preview_child(
+            &path,
+            plugin_id,
+            sample_rate,
+        ));
     }
     let initial_project = args.get(1).map(PathBuf::from);
     let ui_scale = load_ui_scale();
@@ -4134,6 +4172,9 @@ struct DawUi {
     clap_instance_inspection_sender: Sender<(PathBuf, String)>,
     clap_instance_inspection_receiver: Receiver<ClapInstanceInspectionResponse>,
     clap_instance_inspection_states: BTreeMap<(PathBuf, String), ClapInstanceInspectionState>,
+    clap_note_preview_sender: Sender<ClapNotePreviewRequest>,
+    clap_note_preview_receiver: Receiver<ClapNotePreviewResponse>,
+    clap_note_preview_states: BTreeMap<(PathBuf, String), ClapNotePreviewState>,
     vst3_host: Option<Vst3HostRuntime>,
     channel_vst3_instances: BTreeMap<u16, u64>,
     audio_catalog: AudioDeviceCatalog,
@@ -4850,6 +4891,8 @@ impl DawUi {
             clap_probe::start_worker(creation.egui_ctx.clone());
         let (clap_instance_inspection_sender, clap_instance_inspection_receiver) =
             clap_probe::start_instance_worker(creation.egui_ctx.clone());
+        let (clap_note_preview_sender, clap_note_preview_receiver) =
+            clap_probe::start_note_preview_worker(creation.egui_ctx.clone());
         let audio_catalog = enumerate_devices();
         let (midi_message_sender, midi_message_receiver) =
             mpsc::sync_channel(midi_input::MIDI_INPUT_QUEUE_CAPACITY);
@@ -5183,6 +5226,9 @@ impl DawUi {
             clap_instance_inspection_sender,
             clap_instance_inspection_receiver,
             clap_instance_inspection_states: BTreeMap::new(),
+            clap_note_preview_sender,
+            clap_note_preview_receiver,
+            clap_note_preview_states: BTreeMap::new(),
             vst3_host: None,
             channel_vst3_instances: BTreeMap::new(),
             audio_catalog,
@@ -13157,12 +13203,138 @@ impl DawUi {
         }
     }
 
+    fn request_clap_note_preview(
+        &mut self,
+        path: PathBuf,
+        plugin_id: String,
+        plugin_name: String,
+        ctx: &egui::Context,
+    ) {
+        if self
+            .clap_note_preview_states
+            .values()
+            .any(|state| matches!(state, ClapNotePreviewState::Rendering))
+        {
+            return;
+        }
+        if self.audio_engine.is_none() {
+            match AudioEngine::start(&self.audio_settings) {
+                Ok(engine) => self.audio_engine = Some(engine),
+                Err(error) => {
+                    self.clap_note_preview_states.insert(
+                        (path, plugin_id),
+                        ClapNotePreviewState::Failed(error.clone()),
+                    );
+                    self.status = format!("Could not start CLAP preview audio: {error}");
+                    return;
+                }
+            }
+        }
+        let Some(engine) = self.audio_engine.as_ref() else {
+            return;
+        };
+        if !engine.output_active() {
+            let error = "Enable an output device before previewing a CLAP instrument".to_owned();
+            self.clap_note_preview_states.insert(
+                (path, plugin_id),
+                ClapNotePreviewState::Failed(error.clone()),
+            );
+            self.status = error;
+            return;
+        }
+
+        let sample_rate = engine.sample_rate();
+        self.browser_preview_queued = None;
+        self.browser_preview_cancelled = self.browser_preview_pending.is_some();
+        self.browser_preview_path = None;
+        self.browser_preview_error = None;
+        engine.stop_browser_preview();
+        engine.set_browser_preview_looping(false);
+
+        let key = (path.clone(), plugin_id.clone());
+        self.clap_note_preview_states
+            .insert(key.clone(), ClapNotePreviewState::Rendering);
+        if self
+            .clap_note_preview_sender
+            .send((path, plugin_id, plugin_name.clone(), sample_rate))
+            .is_err()
+        {
+            let error = "CLAP note preview worker is unavailable".to_owned();
+            self.clap_note_preview_states
+                .insert(key, ClapNotePreviewState::Failed(error.clone()));
+            self.status = error;
+        } else {
+            self.status = format!("Rendering C4 preview for {plugin_name}");
+            ctx.request_repaint_after(Duration::from_millis(40));
+        }
+    }
+
+    fn poll_clap_note_preview(&mut self, ctx: &egui::Context) {
+        while let Ok((path, plugin_id, plugin_name, result)) =
+            self.clap_note_preview_receiver.try_recv()
+        {
+            let key = (path, plugin_id);
+            if !matches!(
+                self.clap_note_preview_states.get(&key),
+                Some(ClapNotePreviewState::Rendering)
+            ) {
+                continue;
+            }
+
+            let result = result.and_then(|samples| {
+                let engine = self
+                    .audio_engine
+                    .as_ref()
+                    .ok_or_else(|| "Audio output is not available".to_owned())?;
+                if !engine.output_active() {
+                    return Err(
+                        "Enable an output device before previewing a CLAP instrument".into(),
+                    );
+                }
+                engine.set_browser_preview_gain(self.browser_preview_volume);
+                engine.set_browser_preview_looping(false);
+                engine.set_browser_preview(samples)
+            });
+            match result {
+                Ok(()) => {
+                    self.browser_preview_path = None;
+                    self.browser_preview_error = None;
+                    self.clap_note_preview_states
+                        .insert(key, ClapNotePreviewState::Ready);
+                    self.status = format!("Previewing {plugin_name} at C4");
+                }
+                Err(error) => {
+                    self.clap_note_preview_states
+                        .insert(key, ClapNotePreviewState::Failed(error.clone()));
+                    self.status = format!("Could not preview {plugin_name}: {error}");
+                }
+            }
+        }
+
+        if self
+            .clap_note_preview_states
+            .values()
+            .any(|state| matches!(state, ClapNotePreviewState::Rendering))
+        {
+            ctx.request_repaint_after(Duration::from_millis(40));
+        }
+    }
+
+    fn cancel_clap_note_previews(&mut self) {
+        for state in self.clap_note_preview_states.values_mut() {
+            if matches!(state, ClapNotePreviewState::Rendering) {
+                *state = ClapNotePreviewState::Cancelled;
+            }
+        }
+    }
+
     fn request_browser_preview(
         &mut self,
         path: PathBuf,
         full_sample: bool,
         start_fraction: Option<f64>,
     ) {
+        self.cancel_clap_note_previews();
         self.browser_preview_error = None;
         self.browser_preview_path = None;
         let start_fraction = start_fraction
@@ -43380,9 +43552,14 @@ impl DawUi {
         let mut restore_request = None;
         let mut inspect_clap_path = None;
         let mut inspect_clap_instance = None;
+        let mut preview_clap_note = None;
         let mut open_id = None;
         let mut close_id = None;
         let mut parameter_edits = Vec::new();
+        let clap_note_preview_busy = self
+            .clap_note_preview_states
+            .values()
+            .any(|state| matches!(state, ClapNotePreviewState::Rendering));
 
         while let Ok((path, result)) = self.clap_inspection_receiver.try_recv() {
             let state = match result {
@@ -43635,7 +43812,7 @@ impl DawUi {
             ui.heading(format!("Detected CLAP plug-ins ({})", clap_candidates.len()));
             ui.label(
                 egui::RichText::new(
-                    "Descriptor scans and selected plug-in initialization run in helper processes. Audio hosting is not available yet.",
+                "Descriptor scans, inspection, and one-shot C4 instrument previews run in helper processes. Persistent CLAP instances and project playback are not available yet.",
                 )
                 .color(MUTED),
             );
@@ -43729,6 +43906,48 @@ impl DawUi {
                                     }
                                     let instance_key =
                                         (candidate.path.clone(), descriptor.id.clone());
+                                    if clap_descriptor_supports_note_preview(&descriptor.features) {
+                                        let preview_state =
+                                            self.clap_note_preview_states.get(&instance_key);
+                                        ui.horizontal(|ui| {
+                                            let button_label = if matches!(
+                                                preview_state,
+                                                Some(ClapNotePreviewState::Rendering)
+                                            ) {
+                                                "Rendering C4 preview…"
+                                            } else {
+                                                "Preview C4"
+                                            };
+                                            if ui
+                                                .add_enabled(
+                                                    !clap_note_preview_busy,
+                                                    egui::Button::new(button_label),
+                                                )
+                                                .clicked()
+                                            {
+                                                preview_clap_note = Some((
+                                                    candidate.path.clone(),
+                                                    descriptor.id.clone(),
+                                                    descriptor.name.clone(),
+                                                ));
+                                            }
+                                            match preview_state {
+                                                Some(ClapNotePreviewState::Rendering) => {
+                                                    ui.spinner();
+                                                }
+                                                Some(ClapNotePreviewState::Ready) => {
+                                                    ui.small("Rendered and sent to audio output");
+                                                }
+                                                Some(ClapNotePreviewState::Cancelled) => {
+                                                    ui.small("Preview cancelled");
+                                                }
+                                                Some(ClapNotePreviewState::Failed(error)) => {
+                                                    ui.colored_label(ORANGE, error);
+                                                }
+                                                None => {}
+                                            }
+                                        });
+                                    }
                                     match self.clap_instance_inspection_states.get(&instance_key) {
                                         Some(ClapInstanceInspectionState::Inspected(info)) => {
                                             ui.small(format!(
@@ -43909,6 +44128,10 @@ impl DawUi {
             } else {
                 ui.ctx().request_repaint();
             }
+        }
+
+        if let Some((path, plugin_id, plugin_name)) = preview_clap_note {
+            self.request_clap_note_preview(path, plugin_id, plugin_name, ui.ctx());
         }
 
         if let Some((path, channel_id, class_uid)) = restore_request {
@@ -44366,6 +44589,7 @@ impl eframe::App for DawUi {
         self.poll_vst3_stream();
         self.poll_sampler_stream();
         self.poll_browser_preview(ui.ctx());
+        self.poll_clap_note_preview(ui.ctx());
         self.poll_sample_editor_recording(ui.ctx());
         self.poll_sample_editor(ui.ctx());
         self.sample_editor_window(ui.ctx());

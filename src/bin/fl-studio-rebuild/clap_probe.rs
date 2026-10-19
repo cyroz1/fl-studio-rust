@@ -6,17 +6,28 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use clack_extensions::audio_ports::{AudioPortInfoBuffer, PluginAudioPorts};
-use clack_extensions::note_ports::{NotePortInfoBuffer, PluginNotePorts};
+use clack_extensions::audio_ports::{AudioPortFlags, AudioPortInfoBuffer, PluginAudioPorts};
+use clack_extensions::note_ports::{NoteDialect, NotePortInfoBuffer, PluginNotePorts};
 use clack_extensions::params::{ParamInfoBuffer, PluginParams};
-use clack_host::prelude::{HostInfo, PluginEntry, PluginInstance};
+use clack_host::events::event_types::{MidiEvent, NoteOffEvent, NoteOnEvent};
+use clack_host::prelude::{
+    AudioPortBuffer, AudioPortBufferType, AudioPorts, EventBuffer, HostInfo, InputAudioBuffers,
+    InputChannel, PluginAudioConfiguration, PluginEntry, PluginInstance, ProcessStatus,
+};
 
 pub const PROBE_FLAG: &str = "--clap-probe";
 pub const INSTANCE_PROBE_FLAG: &str = "--clap-instance-probe";
+pub const NOTE_PREVIEW_FLAG: &str = "--clap-note-preview";
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_PROBE_OUTPUT_BYTES: usize = 1024 * 1024;
+const MAX_NOTE_PREVIEW_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_INSTANCE_METADATA_ITEMS: u32 = 512;
+const MAX_NOTE_PREVIEW_AUDIO_PORTS: u32 = 16;
+const MAX_NOTE_PREVIEW_TOTAL_CHANNELS: u32 = 64;
+const NOTE_PREVIEW_BLOCK_FRAMES: u32 = 512;
+const NOTE_PREVIEW_DURATION_MILLISECONDS: u32 = 1500;
+const NOTE_PREVIEW_NOTE_MILLISECONDS: u32 = 500;
 const PROBE_HEADER: &str = "FL_STUDIO_REBUILD_CLAP_PROBE_V1";
 const INSTANCE_PROBE_HEADER: &str = "FL_STUDIO_REBUILD_CLAP_INSTANCE_V1";
 
@@ -87,8 +98,18 @@ pub enum ClapInstanceInspectionState {
     Failed(String),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ClapNotePreviewState {
+    Rendering,
+    Ready,
+    Cancelled,
+    Failed(String),
+}
+
 pub type ClapInspectionResponse = (PathBuf, Result<Vec<ClapPluginDescriptor>, String>);
 pub type ClapInstanceInspectionResponse = (PathBuf, String, Result<ClapInstanceInfo, String>);
+pub type ClapNotePreviewRequest = (PathBuf, String, String, u32);
+pub type ClapNotePreviewResponse = (PathBuf, String, String, Result<Vec<f32>, String>);
 
 pub fn start_worker(
     egui_context: eframe::egui::Context,
@@ -141,6 +162,36 @@ pub fn start_instance_worker(
     (request_sender, response_receiver)
 }
 
+pub fn start_note_preview_worker(
+    egui_context: eframe::egui::Context,
+) -> (
+    Sender<ClapNotePreviewRequest>,
+    Receiver<ClapNotePreviewResponse>,
+) {
+    let (request_sender, request_receiver) = mpsc::channel::<ClapNotePreviewRequest>();
+    let (response_sender, response_receiver) = mpsc::channel::<ClapNotePreviewResponse>();
+
+    thread::Builder::new()
+        .name("clap-note-preview".to_owned())
+        .spawn(move || {
+            while let Ok((path, plugin_id, plugin_name, sample_rate)) = request_receiver.recv() {
+                let response = (
+                    path.clone(),
+                    plugin_id.clone(),
+                    plugin_name,
+                    note_preview_in_subprocess(&path, &plugin_id, sample_rate),
+                );
+                if response_sender.send(response).is_err() {
+                    break;
+                }
+                egui_context.request_repaint();
+            }
+        })
+        .expect("CLAP note preview worker should start");
+
+    (request_sender, response_receiver)
+}
+
 /// Loads one CLAP entry in a child process so a crashing plug-in cannot terminate the DAW.
 pub fn inspect_in_subprocess(path: &Path) -> Result<Vec<ClapPluginDescriptor>, String> {
     let arguments = [OsString::from(PROBE_FLAG), path.as_os_str().to_owned()];
@@ -161,7 +212,44 @@ pub fn inspect_instance_in_subprocess(
         .and_then(|output| parse_instance_probe_output(&output))
 }
 
+pub fn note_preview_in_subprocess(
+    path: &Path,
+    plugin_id: &str,
+    sample_rate: u32,
+) -> Result<Vec<f32>, String> {
+    let arguments = [
+        OsString::from(NOTE_PREVIEW_FLAG),
+        path.as_os_str().to_owned(),
+        OsString::from(plugin_id),
+        OsString::from(sample_rate.to_string()),
+    ];
+    let output = run_limited_subprocess(&arguments, "note preview", MAX_NOTE_PREVIEW_OUTPUT_BYTES)?;
+    if output.is_empty() || !output.len().is_multiple_of(8) {
+        return Err("CLAP note preview returned incomplete stereo audio".to_owned());
+    }
+
+    Ok(output
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|sample| {
+            let sample = f32::from_le_bytes(*sample);
+            if sample.is_finite() { sample } else { 0.0 }
+        })
+        .collect())
+}
+
 fn run_probe_subprocess(arguments: &[OsString], description: &str) -> Result<String, String> {
+    let output = run_limited_subprocess(arguments, description, MAX_PROBE_OUTPUT_BYTES)?;
+    String::from_utf8(output)
+        .map_err(|error| format!("could not read CLAP {description} output: {error}"))
+}
+
+fn run_limited_subprocess(
+    arguments: &[OsString],
+    description: &str,
+    max_output_bytes: usize,
+) -> Result<Vec<u8>, String> {
     let executable = std::env::current_exe()
         .map_err(|error| format!("could not locate the application executable: {error}"))?;
     let mut child = Command::new(executable)
@@ -175,10 +263,10 @@ fn run_probe_subprocess(arguments: &[OsString], description: &str) -> Result<Str
         .take()
         .ok_or_else(|| format!("CLAP {description} did not provide output"))?;
     let reader = thread::spawn(move || {
-        let mut output = String::new();
+        let mut output = Vec::new();
         let result = stdout
-            .take((MAX_PROBE_OUTPUT_BYTES + 1) as u64)
-            .read_to_string(&mut output);
+            .take((max_output_bytes + 1) as u64)
+            .read_to_end(&mut output);
         result.map(|_| output)
     });
 
@@ -192,8 +280,8 @@ fn run_probe_subprocess(arguments: &[OsString], description: &str) -> Result<Str
                     .map_err(|error| {
                         format!("could not read CLAP {description} output: {error}")
                     })?;
-                if output.len() > MAX_PROBE_OUTPUT_BYTES {
-                    return Err(format!("CLAP {description} output exceeded 1 MiB"));
+                if output.len() > max_output_bytes {
+                    return Err(format!("CLAP {description} output exceeded its size limit"));
                 }
                 if !status.success() {
                     return Err(format!("CLAP {description} exited with {status}"));
@@ -285,6 +373,329 @@ pub fn run_instance_child(path: &Path, plugin_id: &str) -> i32 {
             eprintln!("{error}");
             1
         }
+    }
+}
+
+/// Entry point used only by the short-lived note-preview child process.
+pub fn run_note_preview_child(path: &Path, plugin_id: &str, sample_rate: u32) -> i32 {
+    match render_note_preview(path, plugin_id, sample_rate) {
+        Ok(samples) => {
+            let mut bytes = Vec::with_capacity(samples.len() * std::mem::size_of::<f32>());
+            for sample in samples {
+                bytes.extend_from_slice(&sample.to_le_bytes());
+            }
+            if std::io::stdout().lock().write_all(&bytes).is_ok() {
+                0
+            } else {
+                1
+            }
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            1
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PreviewNoteDialect {
+    Clap,
+    Midi,
+}
+
+fn render_note_preview(path: &Path, plugin_id: &str, sample_rate: u32) -> Result<Vec<f32>, String> {
+    if !(8_000..=192_000).contains(&sample_rate) {
+        return Err(format!(
+            "unsupported CLAP preview sample rate: {sample_rate}"
+        ));
+    }
+
+    let entry = unsafe { PluginEntry::load(path) }
+        .map_err(|error| format!("could not load CLAP entry: {error}"))?;
+    let plugin_id = CString::new(plugin_id)
+        .map_err(|_| "CLAP plug-in ID contains an invalid null byte".to_owned())?;
+    let host_info = HostInfo::new(
+        "FL Studio Rebuild",
+        "fl-studio-rust contributors",
+        "https://github.com/cyroz1/fl-studio-rust",
+        env!("CARGO_PKG_VERSION"),
+    )
+    .map_err(|error| format!("could not describe the host to the CLAP plug-in: {error}"))?;
+    let mut instance = PluginInstance::<()>::new(|_| (), |_| (), &entry, &plugin_id, &host_info)
+        .map_err(|error| format!("could not initialize CLAP plug-in instance: {error}"))?;
+
+    let (input_port_channels, output_port_channels, main_output_index, note_port_index, dialect) = {
+        let plugin = instance.plugin_handle();
+        let audio_ports = plugin
+            .get_extension::<PluginAudioPorts>()
+            .ok_or_else(|| "CLAP instrument does not expose audio ports".to_owned())?;
+        let note_ports = plugin
+            .get_extension::<PluginNotePorts>()
+            .ok_or_else(|| "CLAP instrument does not expose note input ports".to_owned())?;
+        let input_port_channels = read_preview_audio_port_channels(&audio_ports, &plugin, true)?;
+        let (output_port_channels, main_output_index) =
+            read_preview_audio_outputs(&audio_ports, &plugin)?;
+        let (note_port_index, dialect) = find_preview_note_input(&note_ports, &plugin)?;
+        (
+            input_port_channels,
+            output_port_channels,
+            main_output_index,
+            note_port_index,
+            dialect,
+        )
+    };
+
+    let main_output_channels = output_port_channels[main_output_index];
+    if !(1..=2).contains(&main_output_channels) {
+        return Err(format!(
+            "CLAP preview needs a mono or stereo main output; plug-in reports {main_output_channels} channels"
+        ));
+    }
+
+    let audio_configuration = PluginAudioConfiguration {
+        sample_rate: f64::from(sample_rate),
+        min_frames_count: 1,
+        max_frames_count: NOTE_PREVIEW_BLOCK_FRAMES,
+    };
+    let stopped_processor = instance
+        .activate(|_, _| (), audio_configuration)
+        .map_err(|error| format!("could not activate CLAP instrument: {error}"))?;
+    let mut audio_processor = match stopped_processor.start_processing() {
+        Ok(processor) => processor,
+        Err(error) => {
+            let stopped_processor = error.into_stopped_processor();
+            instance.deactivate(stopped_processor);
+            return Err("CLAP instrument could not start audio processing".to_owned());
+        }
+    };
+
+    let total_frames = sample_rate * NOTE_PREVIEW_DURATION_MILLISECONDS / 1000;
+    let note_off_frame = sample_rate * NOTE_PREVIEW_NOTE_MILLISECONDS / 1000;
+    let mut samples = Vec::with_capacity(total_frames as usize * 2);
+    let mut input_audio_ports = AudioPorts::with_capacity(
+        input_port_channels.iter().sum::<u32>() as usize,
+        input_port_channels.len(),
+    );
+    let mut output_audio_ports = AudioPorts::with_capacity(
+        output_port_channels.iter().sum::<u32>() as usize,
+        output_port_channels.len(),
+    );
+    let mut frame_offset = 0;
+    let mut render_error = None;
+
+    while frame_offset < total_frames {
+        let frame_count = (total_frames - frame_offset).min(NOTE_PREVIEW_BLOCK_FRAMES);
+        let frame_end = frame_offset + frame_count;
+        let mut input_event_buffer = EventBuffer::with_capacity(2);
+        let pckn = clack_host::prelude::Pckn::new(note_port_index, 0u16, 60u16, 0u32);
+        if frame_offset == 0 {
+            match dialect {
+                PreviewNoteDialect::Clap => {
+                    input_event_buffer.push(&NoteOnEvent::new(0, pckn, 0.8));
+                }
+                PreviewNoteDialect::Midi => {
+                    input_event_buffer.push(&MidiEvent::new(0, note_port_index, [0x90, 60, 100]));
+                }
+            }
+        }
+        if (frame_offset..frame_end).contains(&note_off_frame) {
+            let event_time = note_off_frame - frame_offset;
+            match dialect {
+                PreviewNoteDialect::Clap => {
+                    input_event_buffer.push(&NoteOffEvent::new(event_time, pckn, 0.0));
+                }
+                PreviewNoteDialect::Midi => {
+                    input_event_buffer.push(&MidiEvent::new(
+                        event_time,
+                        note_port_index,
+                        [0x80, 60, 0],
+                    ));
+                }
+            }
+        }
+        input_event_buffer.sort();
+        let mut output_event_buffer = EventBuffer::with_capacity(16);
+        let mut input_audio_storage = input_port_channels
+            .iter()
+            .map(|channel_count| {
+                (0..*channel_count)
+                    .map(|_| vec![0.0f32; frame_count as usize])
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let mut output_audio_storage = output_port_channels
+            .iter()
+            .map(|channel_count| {
+                (0..*channel_count)
+                    .map(|_| vec![0.0f32; frame_count as usize])
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        let process_result: Result<(), String> = {
+            let input_audio = if input_audio_storage.is_empty() {
+                InputAudioBuffers::empty()
+            } else {
+                input_audio_ports.with_input_buffers(input_audio_storage.iter_mut().map(
+                    |channels| AudioPortBuffer {
+                        latency: 0,
+                        channels: AudioPortBufferType::f32_input_only(
+                            channels.iter_mut().map(InputChannel::constant),
+                        ),
+                    },
+                ))
+            };
+            let mut output_audio =
+                output_audio_ports.with_output_buffers(output_audio_storage.iter_mut().map(
+                    |channels| AudioPortBuffer {
+                        latency: 0,
+                        channels: AudioPortBufferType::f32_output_only(
+                            channels.iter_mut().map(Vec::as_mut_slice),
+                        ),
+                    },
+                ));
+            let input_events = input_event_buffer.as_input();
+            let mut output_events = output_event_buffer.as_output();
+            audio_processor
+                .process(
+                    &input_audio,
+                    &mut output_audio,
+                    &input_events,
+                    &mut output_events,
+                    Some(u64::from(frame_offset)),
+                    None,
+                )
+                .map(|_: ProcessStatus| ())
+                .map_err(|error| format!("CLAP instrument failed while rendering audio: {error}"))
+        };
+
+        if let Err(error) = process_result {
+            render_error = Some(error);
+            break;
+        }
+
+        let main_output = &output_audio_storage[main_output_index];
+        let left_channel = &main_output[0];
+        let right_channel = if main_output_channels == 1 {
+            left_channel
+        } else {
+            &main_output[1]
+        };
+        for (&left, &right) in left_channel
+            .iter()
+            .zip(right_channel.iter())
+            .take(frame_count as usize)
+        {
+            samples.push(if left.is_finite() { left } else { 0.0 });
+            samples.push(if right.is_finite() { right } else { 0.0 });
+        }
+        frame_offset = frame_end;
+    }
+
+    let stopped_processor = audio_processor.stop_processing();
+    instance.deactivate(stopped_processor);
+    if let Some(error) = render_error {
+        return Err(error);
+    }
+    Ok(samples)
+}
+
+fn read_preview_audio_port_channels(
+    ports: &PluginAudioPorts,
+    plugin: &clack_host::plugin::PluginMainThreadHandle<'_>,
+    is_input: bool,
+) -> Result<Vec<u32>, String> {
+    let count = ports.count(plugin, is_input);
+    if count > MAX_NOTE_PREVIEW_AUDIO_PORTS {
+        return Err("CLAP instrument has too many audio ports for preview".to_owned());
+    }
+    let mut total_channels = 0u32;
+    let mut channels = Vec::with_capacity(count as usize);
+    let mut buffer = AudioPortInfoBuffer::new();
+    for index in 0..count {
+        let port = ports
+            .get(plugin, index, is_input, &mut buffer)
+            .ok_or_else(|| {
+                "CLAP instrument returned incomplete audio port information".to_owned()
+            })?;
+        if port.channel_count == 0 {
+            return Err("CLAP instrument reports an audio port with no channels".to_owned());
+        }
+        total_channels = total_channels
+            .checked_add(port.channel_count)
+            .ok_or_else(|| "CLAP instrument audio channel count overflowed".to_owned())?;
+        if total_channels > MAX_NOTE_PREVIEW_TOTAL_CHANNELS {
+            return Err("CLAP instrument has too many audio channels for preview".to_owned());
+        }
+        channels.push(port.channel_count);
+    }
+    Ok(channels)
+}
+
+fn read_preview_audio_outputs(
+    ports: &PluginAudioPorts,
+    plugin: &clack_host::plugin::PluginMainThreadHandle<'_>,
+) -> Result<(Vec<u32>, usize), String> {
+    let channels = read_preview_audio_port_channels(ports, plugin, false)?;
+    if channels.is_empty() {
+        return Err("CLAP instrument has no audio output ports".to_owned());
+    }
+    let mut main_output_index = None;
+    let mut buffer = AudioPortInfoBuffer::new();
+    for index in 0..channels.len() as u32 {
+        let port = ports
+            .get(plugin, index, false, &mut buffer)
+            .ok_or_else(|| {
+                "CLAP instrument returned incomplete audio output information".to_owned()
+            })?;
+        if port.flags.contains(AudioPortFlags::IS_MAIN)
+            && main_output_index.replace(index as usize).is_some()
+        {
+            return Err("CLAP instrument reports multiple main audio outputs".to_owned());
+        }
+    }
+    let main_output_index = main_output_index
+        .ok_or_else(|| "CLAP instrument does not identify a main audio output".to_owned())?;
+    Ok((channels, main_output_index))
+}
+
+fn find_preview_note_input(
+    ports: &PluginNotePorts,
+    plugin: &clack_host::plugin::PluginMainThreadHandle<'_>,
+) -> Result<(u16, PreviewNoteDialect), String> {
+    let count = ports.count(plugin, true).min(MAX_INSTANCE_METADATA_ITEMS);
+    let mut info_buffer = NotePortInfoBuffer::new();
+    for index in 0..count {
+        let Some(port) = ports.get(plugin, index, true, &mut info_buffer) else {
+            continue;
+        };
+        let dialect = port
+            .preferred_dialect
+            .and_then(preview_note_dialect)
+            .or_else(|| {
+                port.supported_dialects
+                    .supports(NoteDialect::Clap)
+                    .then_some(PreviewNoteDialect::Clap)
+            })
+            .or_else(|| {
+                (port.supported_dialects.supports(NoteDialect::Midi)
+                    || port.supported_dialects.supports(NoteDialect::MidiMpe))
+                .then_some(PreviewNoteDialect::Midi)
+            });
+        if let Some(dialect) = dialect {
+            let port_index = u16::try_from(index)
+                .map_err(|_| "CLAP instrument note input port index is too large".to_owned())?;
+            return Ok((port_index, dialect));
+        }
+    }
+    Err("CLAP instrument has no note input port supporting CLAP or MIDI events".to_owned())
+}
+
+fn preview_note_dialect(dialect: NoteDialect) -> Option<PreviewNoteDialect> {
+    match dialect {
+        NoteDialect::Clap => Some(PreviewNoteDialect::Clap),
+        NoteDialect::Midi | NoteDialect::MidiMpe => Some(PreviewNoteDialect::Midi),
+        NoteDialect::Midi2 => None,
     }
 }
 
