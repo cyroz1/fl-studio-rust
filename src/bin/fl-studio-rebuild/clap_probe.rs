@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use clack_extensions::audio_ports::{AudioPortFlags, AudioPortInfoBuffer, PluginAudioPorts};
 use clack_extensions::note_ports::{NoteDialect, NotePortInfoBuffer, PluginNotePorts};
 use clack_extensions::params::{ParamInfoBuffer, PluginParams};
-use clack_host::events::event_types::{MidiEvent, NoteOffEvent, NoteOnEvent};
+use clack_host::events::event_types::{Midi2Event, MidiEvent, NoteOffEvent, NoteOnEvent};
 use clack_host::prelude::{
     AudioPortBuffer, AudioPortBufferType, AudioPorts, EventBuffer, HostInfo, InputAudioBuffers,
     InputChannel, PluginAudioConfiguration, PluginEntry, PluginInstance, ProcessStatus,
@@ -28,6 +28,7 @@ const MAX_NOTE_PREVIEW_TOTAL_CHANNELS: u32 = 64;
 const NOTE_PREVIEW_BLOCK_FRAMES: u32 = 512;
 const NOTE_PREVIEW_DURATION_MILLISECONDS: u32 = 1500;
 const NOTE_PREVIEW_NOTE_MILLISECONDS: u32 = 500;
+const MIDI2_PREVIEW_NOTE_VELOCITY: u16 = 52_428;
 const PROBE_HEADER: &str = "FL_STUDIO_REBUILD_CLAP_PROBE_V1";
 const INSTANCE_PROBE_HEADER: &str = "FL_STUDIO_REBUILD_CLAP_INSTANCE_V1";
 
@@ -401,6 +402,7 @@ pub fn run_note_preview_child(path: &Path, plugin_id: &str, sample_rate: u32) ->
 enum PreviewNoteDialect {
     Clap,
     Midi,
+    Midi2,
 }
 
 fn render_note_preview(path: &Path, plugin_id: &str, sample_rate: u32) -> Result<Vec<f32>, String> {
@@ -496,6 +498,15 @@ fn render_note_preview(path: &Path, plugin_id: &str, sample_rate: u32) -> Result
                 PreviewNoteDialect::Midi => {
                     input_event_buffer.push(&MidiEvent::new(0, note_port_index, [0x90, 60, 100]));
                 }
+                PreviewNoteDialect::Midi2 => {
+                    input_event_buffer.push(&midi2_preview_note_event(
+                        0,
+                        note_port_index,
+                        60,
+                        MIDI2_PREVIEW_NOTE_VELOCITY,
+                        true,
+                    ));
+                }
             }
         }
         if (frame_offset..frame_end).contains(&note_off_frame) {
@@ -509,6 +520,15 @@ fn render_note_preview(path: &Path, plugin_id: &str, sample_rate: u32) -> Result
                         event_time,
                         note_port_index,
                         [0x80, 60, 0],
+                    ));
+                }
+                PreviewNoteDialect::Midi2 => {
+                    input_event_buffer.push(&midi2_preview_note_event(
+                        event_time,
+                        note_port_index,
+                        60,
+                        0,
+                        false,
                     ));
                 }
             }
@@ -681,6 +701,11 @@ fn find_preview_note_input(
                 (port.supported_dialects.supports(NoteDialect::Midi)
                     || port.supported_dialects.supports(NoteDialect::MidiMpe))
                 .then_some(PreviewNoteDialect::Midi)
+            })
+            .or_else(|| {
+                port.supported_dialects
+                    .supports(NoteDialect::Midi2)
+                    .then_some(PreviewNoteDialect::Midi2)
             });
         if let Some(dialect) = dialect {
             let port_index = u16::try_from(index)
@@ -688,15 +713,30 @@ fn find_preview_note_input(
             return Ok((port_index, dialect));
         }
     }
-    Err("CLAP instrument has no note input port supporting CLAP or MIDI events".to_owned())
+    Err(
+        "CLAP instrument has no note input port supporting CLAP, MIDI 1.0, or MIDI 2.0 events"
+            .to_owned(),
+    )
 }
 
 fn preview_note_dialect(dialect: NoteDialect) -> Option<PreviewNoteDialect> {
     match dialect {
         NoteDialect::Clap => Some(PreviewNoteDialect::Clap),
         NoteDialect::Midi | NoteDialect::MidiMpe => Some(PreviewNoteDialect::Midi),
-        NoteDialect::Midi2 => None,
+        NoteDialect::Midi2 => Some(PreviewNoteDialect::Midi2),
     }
+}
+
+fn midi2_preview_note_event(
+    time: u32,
+    port_index: u16,
+    key: u8,
+    velocity: u16,
+    note_on: bool,
+) -> Midi2Event {
+    let status = if note_on { 0x9_u32 } else { 0x8_u32 };
+    let header = 0x4000_0000 | (status << 20) | (u32::from(key) << 8);
+    Midi2Event::new(time, port_index, [header, u32::from(velocity) << 16, 0, 0])
 }
 
 fn inspect_plugin_instance(path: &Path, plugin_id: &str) -> Result<ClapInstanceInfo, String> {
