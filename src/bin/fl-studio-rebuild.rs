@@ -55,10 +55,10 @@ use flp_rebuild::vst3::{
 };
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, Arrangement, ArticulateOptions, AutomationChannel,
-    AutomationPoint, AutomationPointEdit, ChannelGroupSummary, ChannelNoteRouter, ChannelSortOrder,
-    ChannelSummary, ChannelType, ClawMachineOptions, FlamOptions, FlpDocument, FlpError, FstPreset,
-    FstPresetKind, HumanizerOptions, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit,
-    MixerInsertSummary, MixerParameterKind, MixerParameterRecord, PATTERN_NOTE_DEFAULT_FLAGS,
+    AutomationPoint, AutomationPointEdit, ChannelGroupSummary, ChannelSortOrder, ChannelSummary,
+    ChannelType, ClawMachineOptions, FlamOptions, FlpDocument, FlpError, FstPreset, FstPresetKind,
+    HumanizerOptions, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerInsertSummary,
+    MixerParameterKind, MixerParameterRecord, PATTERN_NOTE_DEFAULT_FLAGS,
     PATTERN_NOTE_DEFAULT_RELEASE, PATTERN_NOTE_SLIDE_FLAG, Pattern, PatternController,
     PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation, PayloadEncoding,
     PlaylistClip, PlaylistClipEdit, PlaylistClipSelectionClipboard, PlaylistClipTarget,
@@ -372,10 +372,10 @@ fn candidate_mixer_insert_signal_flags(
     inserts: &[MixerInsertSummary],
     insert_ordinal: usize,
 ) -> Option<(bool, bool)> {
-    inserts
+    let insert = inserts
         .iter()
-        .find(|insert| insert.ordinal() == insert_ordinal)
-        .and_then(|insert| Some((insert.polarity_reversed()?, insert.swap_left_right()?)))
+        .find(|insert| insert.ordinal() == insert_ordinal)?;
+    Some((insert.polarity_reversed()?, insert.swap_left_right()?))
 }
 
 fn candidate_mixer_stereo_separation(
@@ -9357,7 +9357,6 @@ impl DawUi {
 
     fn initialize_live_mixer_insert_fader_targets(&self, document: &FlpDocument) {
         let parameters = document.mixer_parameter_records().unwrap_or_default();
-        let inserts = document.mixer_inserts();
         for track in 1..=i8::MAX as usize {
             let volume_raw =
                 unique_candidate_mixer_parameter(&parameters, track, MixerParameterKind::Volume)
@@ -9472,6 +9471,7 @@ impl DawUi {
             .set_live_master_signal_flags(candidate_mixer_master_signal_flags(document));
 
         let parameters = document.mixer_parameter_records().unwrap_or_default();
+        let inserts = document.mixer_inserts();
         for track in 1..=i8::MAX as usize {
             let live_fader_raw =
                 unique_candidate_mixer_parameter(&parameters, track, MixerParameterKind::Volume)
