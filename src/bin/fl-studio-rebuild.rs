@@ -55,17 +55,18 @@ use flp_rebuild::vst3::{
 };
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, Arrangement, ArticulateOptions, AutomationChannel,
-    AutomationPoint, AutomationPointEdit, ChannelGroupSummary, ChannelSortOrder, ChannelSummary,
-    ChannelType, ClawMachineOptions, FlamOptions, FlpDocument, FlpError, FstPreset, FstPresetKind,
-    HumanizerOptions, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerParameterKind,
-    MixerParameterRecord, PATTERN_NOTE_DEFAULT_FLAGS, PATTERN_NOTE_DEFAULT_RELEASE,
-    PATTERN_NOTE_SLIDE_FLAG, Pattern, PatternController, PatternControllerEdit, PatternNote,
-    PatternNoteEdit, PatternNoteRotation, PayloadEncoding, PlaylistClip, PlaylistClipEdit,
-    PlaylistClipSelectionClipboard, PlaylistClipTarget, PlaylistTrack, PlaylistTrackEdit,
-    PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit,
-    ProjectSettingsEdit, QuantizeNoteMode, QuantizeNoteOptions, RandomNoteChordMap,
-    RandomNoteGeneratorOptions, RandomizerOptions, RiffMachineOptions, RiffMachineQuantizeMode,
-    ScaleLevelsOptions, StrumOptions, TimeMarker, TimeMarkerEdit, VstPluginStateMetadata,
+    AutomationPoint, AutomationPointEdit, ChannelGroupSummary, ChannelNoteRouter, ChannelSortOrder,
+    ChannelSummary, ChannelType, ClawMachineOptions, FlamOptions, FlpDocument, FlpError, FstPreset,
+    FstPresetKind, HumanizerOptions, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit,
+    MixerInsertSummary, MixerParameterKind, MixerParameterRecord, PATTERN_NOTE_DEFAULT_FLAGS,
+    PATTERN_NOTE_DEFAULT_RELEASE, PATTERN_NOTE_SLIDE_FLAG, Pattern, PatternController,
+    PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation, PayloadEncoding,
+    PlaylistClip, PlaylistClipEdit, PlaylistClipSelectionClipboard, PlaylistClipTarget,
+    PlaylistTrack, PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync,
+    ProjectInfoEdit, ProjectSettingsEdit, QuantizeNoteMode, QuantizeNoteOptions,
+    RandomNoteChordMap, RandomNoteGeneratorOptions, RandomizerOptions, RiffMachineOptions,
+    RiffMachineQuantizeMode, ScaleLevelsOptions, StrumOptions, TimeMarker, TimeMarkerEdit,
+    VstPluginStateMetadata,
 };
 use md5::{Digest, Md5};
 use vst3_host::midi::{MidiChannel as Vst3MidiChannel, MidiEvent as Vst3MidiEvent};
@@ -364,11 +365,17 @@ fn candidate_mixer_master_enabled(document: &FlpDocument) -> Option<bool> {
 }
 
 fn candidate_mixer_master_signal_flags(document: &FlpDocument) -> Option<(bool, bool)> {
-    document
-        .mixer_inserts()
-        .into_iter()
-        .find(|insert| insert.ordinal() == 0)
-        .and_then(|master| Some((master.polarity_reversed()?, master.swap_left_right()?)))
+    candidate_mixer_insert_signal_flags(&document.mixer_inserts(), 0)
+}
+
+fn candidate_mixer_insert_signal_flags(
+    inserts: &[MixerInsertSummary],
+    insert_ordinal: usize,
+) -> Option<(bool, bool)> {
+    inserts
+        .iter()
+        .find(|insert| insert.ordinal() == insert_ordinal)
+        .and_then(|insert| Some((insert.polarity_reversed()?, insert.swap_left_right()?)))
 }
 
 fn candidate_mixer_stereo_separation(
@@ -9350,6 +9357,7 @@ impl DawUi {
 
     fn initialize_live_mixer_insert_fader_targets(&self, document: &FlpDocument) {
         let parameters = document.mixer_parameter_records().unwrap_or_default();
+        let inserts = document.mixer_inserts();
         for track in 1..=i8::MAX as usize {
             let volume_raw =
                 unique_candidate_mixer_parameter(&parameters, track, MixerParameterKind::Volume)
@@ -9481,6 +9489,11 @@ impl DawUi {
                 .set_live_mixer_insert_pan_raw(track, live_pan_raw);
             self.mixer_track_peak_meters
                 .set_live_mixer_insert_stereo_separation_raw(track, live_stereo_separation_raw);
+            self.mixer_track_peak_meters
+                .set_live_mixer_insert_signal_flags(
+                    track,
+                    candidate_mixer_insert_signal_flags(&inserts, track),
+                );
         }
     }
 
@@ -35640,6 +35653,13 @@ impl DawUi {
                             self.mixer_track_peak_meters.set_live_master_signal_flags(
                                 candidate_mixer_master_signal_flags(document),
                             );
+                        } else {
+                            let inserts = document.mixer_inserts();
+                            self.mixer_track_peak_meters
+                                .set_live_mixer_insert_signal_flags(
+                                    insert_ordinal,
+                                    candidate_mixer_insert_signal_flags(&inserts, insert_ordinal),
+                                );
                         }
                         self.dirty = true;
                         let track_name = if insert_ordinal == 0 {

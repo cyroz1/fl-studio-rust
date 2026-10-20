@@ -4397,12 +4397,7 @@ impl MixerMasterOutput {
 }
 
 fn apply_master_signal_transform(frame: &mut [f32; 2], polarity_mix: f32, swap_mix: f32) {
-    let left = frame[0];
-    let right = frame[1];
-    let polarity_gain = 1.0 - 2.0 * polarity_mix.clamp(0.0, 1.0);
-    let swap_mix = swap_mix.clamp(0.0, 1.0);
-    frame[0] = (left * (1.0 - swap_mix) + right * swap_mix) * polarity_gain;
-    frame[1] = (right * (1.0 - swap_mix) + left * swap_mix) * polarity_gain;
+    crate::apply_mixer_signal_flags_f32(frame, polarity_mix, swap_mix);
 }
 
 fn stream_prepared_playlist_render(
@@ -10955,6 +10950,7 @@ mod tests {
                 saved_fader_gain,
                 saved_pan_raw,
                 saved_stereo_separation_raw,
+                saved_signal_flags: None,
                 pan_law_raw: Some(2),
                 output_transform,
                 insert_meter_transforms,
@@ -11357,6 +11353,103 @@ mod tests {
         source_control.apply_meter_frame(controls, meter_transforms[1].1, &mut send_meter);
         assert!(send_meter[0].abs() < 0.0005);
         assert!(send_meter[1].abs() < 0.0005);
+    }
+
+    #[test]
+    fn live_mixer_source_signal_flags_smooth_direct_and_send_routes() {
+        let meter_transforms = vec![
+            (1, MixerSourceRouteTransform::default()),
+            (2, MixerSourceRouteTransform::default().scaled(0.5)),
+        ];
+        let source_control = LiveMixerSourceControl::new(
+            MixerLiveSourceRoutePlan {
+                track: 1,
+                source_transform: MixerSourceRouteTransform::default(),
+                saved_fader_gain: 1.0,
+                saved_pan_raw: None,
+                saved_stereo_separation_raw: None,
+                saved_signal_flags: Some((false, false)),
+                pan_law_raw: Some(2),
+                output_transform: MixerSourceRouteTransform::default(),
+                insert_meter_transforms: meter_transforms.clone(),
+            },
+            48_000,
+        );
+        let meters = MixerTrackPeakMeters::default();
+        meters.set_live_mixer_insert_signal_flags(1, Some((false, false)));
+        let targets = source_control.targets(&meters).unwrap();
+
+        let mut frame = [1.0, 0.25];
+        let controls = source_control.next_frame_controls(&targets);
+        source_control.apply_output_frame(controls, &mut frame);
+        assert_eq!(frame, [1.0, 0.25]);
+
+        meters.set_live_mixer_insert_signal_flags(1, Some((true, true)));
+        let controls = source_control.next_frame_controls(&targets);
+        frame = [1.0, 0.25];
+        source_control.apply_output_frame(controls, &mut frame);
+        assert!(frame[0] < 1.0 && frame[0] > -0.25);
+        assert!(frame[1] > 0.25 && frame[1] < 0.26);
+
+        let mut direct_meter = [1.0, 0.25];
+        source_control.apply_meter_frame(controls, meter_transforms[0].1, &mut direct_meter);
+        assert_eq!(direct_meter, frame);
+        let mut send_meter = [1.0, 0.25];
+        source_control.apply_meter_frame(controls, meter_transforms[1].1, &mut send_meter);
+        assert!((send_meter[0] - frame[0] * 0.5).abs() < 1e-6);
+        assert!((send_meter[1] - frame[1] * 0.5).abs() < 1e-6);
+
+        for _ in 0..100_000 {
+            let controls = source_control.next_frame_controls(&targets);
+            frame = [1.0, 0.25];
+            source_control.apply_output_frame(controls, &mut frame);
+        }
+        assert!((frame[0] + 0.25).abs() < 0.001);
+        assert!((frame[1] + 1.0).abs() < 0.001);
+
+        let controls = source_control.next_frame_controls(&targets);
+        let mut send_meter = [1.0, 0.25];
+        source_control.apply_meter_frame(controls, meter_transforms[1].1, &mut send_meter);
+        assert!((send_meter[0] + 0.125).abs() < 0.0005);
+        assert!((send_meter[1] + 0.5).abs() < 0.0005);
+    }
+
+    #[test]
+    fn cloned_live_mixer_signal_flag_smoothers_advance_independently() {
+        let source_control = LiveMixerSourceControl::new(
+            MixerLiveSourceRoutePlan {
+                track: 1,
+                source_transform: MixerSourceRouteTransform::default(),
+                saved_fader_gain: 1.0,
+                saved_pan_raw: None,
+                saved_stereo_separation_raw: None,
+                saved_signal_flags: Some((false, false)),
+                pan_law_raw: Some(2),
+                output_transform: MixerSourceRouteTransform::default(),
+                insert_meter_transforms: Vec::new(),
+            },
+            48_000,
+        );
+        let meters = MixerTrackPeakMeters::default();
+        meters.set_live_mixer_insert_signal_flags(1, Some((false, false)));
+        let targets = source_control.targets(&meters).unwrap();
+        let controls = source_control.next_frame_controls(&targets);
+        let mut frame = [1.0, 0.25];
+        source_control.apply_output_frame(controls, &mut frame);
+        let cloned_control = source_control.clone();
+        let cloned_targets = cloned_control.targets(&meters).unwrap();
+
+        meters.set_live_mixer_insert_signal_flags(1, Some((true, true)));
+        for _ in 0..1_000 {
+            let controls = source_control.next_frame_controls(&targets);
+            frame = [1.0, 0.25];
+            source_control.apply_output_frame(controls, &mut frame);
+        }
+        let controls = cloned_control.next_frame_controls(&cloned_targets);
+        let mut cloned_frame = [1.0, 0.25];
+        cloned_control.apply_output_frame(controls, &mut cloned_frame);
+        assert!(frame[0] < cloned_frame[0]);
+        assert!(frame[1] < cloned_frame[1]);
     }
 
     #[test]
@@ -12499,6 +12592,7 @@ mod tests {
                     saved_fader_gain: 1.5,
                     saved_pan_raw: None,
                     saved_stereo_separation_raw: None,
+                    saved_signal_flags: None,
                     pan_law_raw: Some(2),
                     output_transform: MixerSourceRouteTransform::default().scaled(1.5),
                     insert_meter_transforms: vec![
