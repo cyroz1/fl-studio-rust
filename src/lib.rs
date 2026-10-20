@@ -2402,6 +2402,7 @@ pub(crate) struct MixerRouteAudibility {
     disabled_tracks: HashSet<i8>,
     soloed_insert_tracks: HashSet<i8>,
     source_transforms: HashMap<i8, MixerInsertSignalTransform>,
+    source_fader_volume_raw: HashMap<i8, i32>,
     send_routes_by_source: HashMap<i8, Vec<MixerSendRouteEdge>>,
     complete_send_sources: HashSet<i8>,
     master_fader_raw: Option<i32>,
@@ -2626,6 +2627,11 @@ impl MixerRouteAudibility {
                 routing.master_stereo_separation_raw = stereo_separation_raw;
                 continue;
             }
+            if let Some(fader_volume_raw) = fader_volume_raw {
+                routing
+                    .source_fader_volume_raw
+                    .insert(track, fader_volume_raw);
+            }
             if insert.enabled() == Some(false) {
                 routing.disabled_tracks.insert(track);
             }
@@ -2702,6 +2708,27 @@ impl MixerRouteAudibility {
             .filter(|track| *track > 0 && self.known_tracks.contains(track))
             .and_then(|track| self.source_transforms.get(&track).copied())
             .unwrap_or_default()
+    }
+
+    /// Returns the direct-route transform without the source insert fader and the saved fader
+    /// value. This lets live Sampler playback apply that fader as a smoothed gain while retaining
+    /// the other recognized insert controls. Send-routed tracks are left on their static route.
+    pub(crate) fn direct_source_fader_transform_for_channel(
+        &self,
+        route: Option<i8>,
+    ) -> Option<(MixerSourceRouteTransform, i32)> {
+        let track = route.filter(|track| *track > 0 && self.known_tracks.contains(track))?;
+        if self.complete_send_sources.contains(&track) {
+            return None;
+        }
+        let fader_volume_raw = *self.source_fader_volume_raw.get(&track)?;
+        let transform = self
+            .transform_for_channel(Some(track))
+            .with_fader_volume_raw(None);
+        Some((
+            MixerSourceRouteTransform::from_insert_transform(transform),
+            fader_volume_raw,
+        ))
     }
 
     /// Returns the pre-Master transform for all supported insert-to-insert send paths.
@@ -20522,6 +20549,13 @@ mod tests {
 
         assert_eq!(routing.master_fader_raw(), Some(2_500));
         assert_eq!(routing.master_pan_raw(), Some(3_200));
+        let (live_transform, saved_volume_raw) = routing
+            .direct_source_fader_transform_for_channel(Some(1))
+            .expect("the direct insert fader should expose a live transform");
+        assert_eq!(saved_volume_raw, 5_000);
+        let mut live_frame = [1.0, 2.0];
+        live_transform.apply_frame(&mut live_frame);
+        assert_eq!(live_frame, [2.0, 1.0]);
         let mut insert_frame = [1.0, 2.0];
         routing
             .transform_for_channel(Some(1))
@@ -20532,6 +20566,22 @@ mod tests {
             .transform_for_channel(Some(2))
             .apply_frame(&mut unmatched_frame);
         assert_eq!(unmatched_frame, [1.0, 2.0]);
+
+        let mut send_routing = routing.clone();
+        send_routing.add_send_summaries([MixerSendSummary {
+            insert_ordinal: 1,
+            route_parameter_id: 64,
+            value: 12_800,
+            enabled: Some(true),
+            routing_flag_location: None,
+            event_index: 0,
+            record_index: 0,
+        }]);
+        assert!(
+            send_routing
+                .direct_source_fader_transform_for_channel(Some(1))
+                .is_none()
+        );
 
         for invalid in [
             vec![parameter(1, 0, 192, 5_000), parameter(1, 0, 192, 6_000)],
