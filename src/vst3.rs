@@ -19,7 +19,7 @@ use crate::sample_render::{
     render_stereo_audio_to_file, schedule_playlist_pattern_notes, swing_note_start_tick,
 };
 use crate::{
-    ChannelNoteRouter, ChannelPluginState, FlpDocument, MixerRouteAudibility,
+    ChannelNoteRouter, ChannelPluginState, FlpDocument, MixerRouteAudibility, MixerSourceRoutePlan,
     MixerSourceRouteTransform,
 };
 use vst3_host::audio::AudioBuffers;
@@ -284,20 +284,26 @@ struct PlaylistPluginStream {
 struct PlaylistLiveMixerFader {
     track: usize,
     transform: MixerSourceRouteTransform,
+    meter_transforms: HashMap<usize, MixerSourceRouteTransform>,
     target_raw: Option<Arc<AtomicI32>>,
     current_gain: f32,
     smoothing_alpha: f32,
 }
 
 impl PlaylistLiveMixerFader {
-    fn new(track: usize, saved_gain: f32, transform: MixerSourceRouteTransform) -> Self {
+    fn new(track: usize, saved_gain: f32, route_plan: MixerSourceRoutePlan) -> Self {
         Self {
             track,
-            transform,
+            transform: route_plan.output_transform,
+            meter_transforms: route_plan.insert_meter_transforms.into_iter().collect(),
             target_raw: None,
             current_gain: saved_gain,
             smoothing_alpha: 0.0,
         }
+    }
+
+    fn meter_transform(&self, track: usize) -> Option<MixerSourceRouteTransform> {
+        self.meter_transforms.get(&track).copied()
     }
 
     fn attach_target(&mut self, meters: &MixerTrackPeakMeters, sample_rate: u32) {
@@ -843,12 +849,11 @@ impl Vst3PlaylistStreamProcessor {
                     frame[0] * stream.gain * stream.left_pan_gain,
                     frame[1] * stream.gain * stream.right_pan_gain,
                 ];
-                let live_fader = stream.live_mixer_fader.as_mut().and_then(|fader| {
-                    fader
-                        .apply(&mut routed_frame)
-                        .map(|gain| (gain, fader.track, fader.transform))
-                });
-                if live_fader.is_none() {
+                let live_fader_gain = stream
+                    .live_mixer_fader
+                    .as_mut()
+                    .and_then(|fader| fader.apply(&mut routed_frame));
+                if live_fader_gain.is_none() {
                     stream.mixer_transform.apply_frame(&mut routed_frame);
                 }
                 output[frame_index * 2] += routed_frame[0];
@@ -856,10 +861,16 @@ impl Vst3PlaylistStreamProcessor {
                 if let Some(meter_buses) = meter_buses.as_deref_mut() {
                     for (track, transform) in &stream.mixer_meter_transforms {
                         let mut meter_frame = source_frame;
-                        if let Some((gain, fader_track, fader_transform)) = live_fader
-                            && *track == fader_track
+                        let live_transform = live_fader_gain.and_then(|_| {
+                            stream
+                                .live_mixer_fader
+                                .as_ref()
+                                .and_then(|fader| fader.meter_transform(*track))
+                        });
+                        if let (Some(gain), Some(live_transform)) =
+                            (live_fader_gain, live_transform)
                         {
-                            fader_transform.apply_frame(&mut meter_frame);
+                            live_transform.apply_frame(&mut meter_frame);
                             meter_frame[0] *= gain;
                             meter_frame[1] *= gain;
                         } else {
@@ -2312,14 +2323,12 @@ impl Vst3HostRuntime {
                 })
                 .unwrap_or_default();
             let live_mixer_fader = channel.and_then(|channel| {
-                let mixer_track = channel.mixer_track()?;
-                let (transform, volume_raw) = mixer_route_audibility
-                    .direct_source_fader_transform_for_channel(Some(mixer_track))?;
-                let track = usize::try_from(mixer_track).ok()?;
+                let (track, volume_raw, route_plan) = mixer_route_audibility
+                    .source_fader_route_plan_for_channel(channel.mixer_track())?;
                 Some(PlaylistLiveMixerFader::new(
                     track,
                     volume_raw as f32 / 10_000.0,
-                    transform,
+                    route_plan,
                 ))
             });
             let (render, latency_frames, loop_frames) = {
@@ -2598,14 +2607,12 @@ impl Vst3HostRuntime {
                 })
                 .unwrap_or_default();
             let live_mixer_fader = channel.and_then(|channel| {
-                let mixer_track = channel.mixer_track()?;
-                let (transform, volume_raw) = mixer_route_audibility
-                    .direct_source_fader_transform_for_channel(Some(mixer_track))?;
-                let track = usize::try_from(mixer_track).ok()?;
+                let (track, volume_raw, route_plan) = mixer_route_audibility
+                    .source_fader_route_plan_for_channel(channel.mixer_track())?;
                 Some(PlaylistLiveMixerFader::new(
                     track,
                     volume_raw as f32 / 10_000.0,
-                    transform,
+                    route_plan,
                 ))
             });
             let mixer_transform = route_plan.output_transform;
@@ -4199,7 +4206,14 @@ mod tests {
     #[test]
     fn playlist_live_mixer_fader_smooths_from_its_saved_gain() {
         let meters = MixerTrackPeakMeters::default();
-        let mut fader = PlaylistLiveMixerFader::new(1, 1.0, MixerSourceRouteTransform::default());
+        let mut fader = PlaylistLiveMixerFader::new(
+            1,
+            1.0,
+            MixerSourceRoutePlan {
+                output_transform: MixerSourceRouteTransform::default(),
+                insert_meter_transforms: Vec::new(),
+            },
+        );
         let mut frame = [1.0, -0.5];
         assert_eq!(fader.apply(&mut frame), None);
 
@@ -4220,6 +4234,45 @@ mod tests {
             final_gain = fader.apply(&mut frame).expect("valid live target");
         }
         assert!((final_gain - 0.25).abs() < 0.0001);
+    }
+
+    #[test]
+    fn playlist_live_mixer_fader_scales_every_send_meter_route() {
+        let meters = MixerTrackPeakMeters::default();
+        let mut fader = PlaylistLiveMixerFader::new(
+            1,
+            1.0,
+            MixerSourceRoutePlan {
+                output_transform: MixerSourceRouteTransform::default(),
+                insert_meter_transforms: vec![
+                    (1, MixerSourceRouteTransform::default()),
+                    (2, MixerSourceRouteTransform::default()),
+                ],
+            },
+        );
+        meters.set_live_mixer_insert_fader_raw(1, Some(2_500));
+        fader.attach_target(&meters, 48_000);
+
+        let mut output_frame = [1.0, -0.5];
+        let gain = fader
+            .apply(&mut output_frame)
+            .expect("the live source fader target should be valid");
+        assert!(gain < 1.0 && gain > 0.25);
+        assert!((output_frame[0] - gain).abs() < f32::EPSILON);
+        assert!((output_frame[1] + gain * 0.5).abs() < f32::EPSILON);
+
+        for track in [1, 2] {
+            let mut meter_frame = [1.0, -0.5];
+            fader
+                .meter_transform(track)
+                .expect("every send destination has its own meter transform")
+                .apply_frame(&mut meter_frame);
+            meter_frame[0] *= gain;
+            meter_frame[1] *= gain;
+            assert!((meter_frame[0] - gain).abs() < f32::EPSILON);
+            assert!((meter_frame[1] + gain * 0.5).abs() < f32::EPSILON);
+        }
+        assert!(fader.meter_transform(3).is_none());
     }
 
     #[test]
