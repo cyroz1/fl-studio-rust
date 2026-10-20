@@ -31,7 +31,7 @@ use crate::audio::{
 use crate::media::{DecodedAudio, SamplePathResolver, decode_audio_file, wav_sampler_metadata};
 use crate::vst3::{PlaylistMidiNote, Vst3PlaylistStreamProcessor};
 use crate::{
-    Arrangement, ChannelNoteRouter, ChannelSummary, ChannelType, FlpDocument,
+    Arrangement, ChannelNoteRouter, ChannelSummary, FlpDocument,
     MixerInsertSignalTransform, MixerLiveSourceRoutePlan, MixerRouteAudibility,
     MixerSourceRoutePlan, MixerSourceRouteTransform, Pattern, PatternNote, PlaylistClip,
     PlaylistClipTarget, PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync,
