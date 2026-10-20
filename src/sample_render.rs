@@ -4483,16 +4483,7 @@ fn stream_prepared_playlist_render_with_performance(
     };
     let mix_result = std::thread::scope(|scope| {
         let mut parallel_mixer = if worker_count > 1 {
-            ParallelAudioClipMixer::new(
-                scope,
-                worker_clips,
-                audio_mix_context.decoded_by_path,
-                options.sample_rate,
-                options.resampling_quality,
-                cancelled,
-                audio_mix_context.live_mixer_fader_targets,
-                meters.is_some(),
-            )
+            ParallelAudioClipMixer::new(scope, worker_clips, &audio_mix_context, meters.is_some())
         } else {
             None
         };
@@ -9939,11 +9930,7 @@ impl<'scope> ParallelAudioClipMixer<'scope> {
     fn new<'env>(
         scope: &'scope std::thread::Scope<'scope, 'env>,
         worker_clips: Vec<Vec<&'scope PreparedClip>>,
-        decoded_by_path: &'scope HashMap<PathBuf, DecodedAudio>,
-        sample_rate: u32,
-        resampling_quality: ResamplingQuality,
-        cancelled: &'scope AtomicBool,
-        live_mixer_fader_targets: Option<&'scope MixerTrackPeakMeters>,
+        audio_context: &'scope PreparedAudioClipMixContext<'scope>,
         include_meters: bool,
     ) -> Option<Self> {
         let worker_count = worker_clips.len();
@@ -9984,11 +9971,11 @@ impl<'scope> ParallelAudioClipMixer<'scope> {
                         worker_index,
                         worker_count,
                         clips,
-                        decoded_by_path,
-                        sample_rate,
-                        resampling_quality,
-                        cancelled,
-                        live_mixer_fader_targets,
+                        decoded_by_path: audio_context.decoded_by_path,
+                        sample_rate: audio_context.sample_rate,
+                        resampling_quality: audio_context.resampling_quality,
+                        cancelled: audio_context.cancelled,
+                        live_mixer_fader_targets: audio_context.live_mixer_fader_targets,
                         control: worker_control,
                         scratch: worker_scratch,
                     });
@@ -12537,17 +12524,9 @@ mod tests {
         let mut parallel_meters = vec![0.0; MIXER_TRACK_METER_COUNT * 16];
         std::thread::scope(|scope| {
             let worker_clips = audio_clip_groups_for_workers(&track_groups, 2);
-            let mut mixer = ParallelAudioClipMixer::new(
-                scope,
-                worker_clips,
-                &decoded_by_path,
-                8,
-                ResamplingQuality::Linear,
-                &cancelled,
-                None,
-                true,
-            )
-            .expect("two source mixer tracks should start two workers");
+            let mut mixer =
+                ParallelAudioClipMixer::new(scope, worker_clips, &audio_mix_context, true)
+                    .expect("two source mixer tracks should start two workers");
             mix_prepared_audio_clip_block(
                 &audio_mix_context,
                 0,
