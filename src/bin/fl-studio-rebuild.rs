@@ -9291,36 +9291,9 @@ impl DawUi {
         };
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
-        let live_master_fader_gain = self
-            .document
-            .as_ref()
-            .map_or(1.0, candidate_mixer_master_fader_gain);
-        self.mixer_track_peak_meters
-            .set_live_master_fader_gain(live_master_fader_gain);
-        let live_master_pan_raw = self
-            .document
-            .as_ref()
-            .and_then(candidate_mixer_master_pan_raw);
-        self.mixer_track_peak_meters
-            .set_live_master_pan_raw(live_master_pan_raw);
-        let live_master_stereo_separation_raw = self
-            .document
-            .as_ref()
-            .and_then(candidate_mixer_master_stereo_separation_raw);
-        self.mixer_track_peak_meters
-            .set_live_master_stereo_separation_raw(live_master_stereo_separation_raw);
-        let live_master_enabled = self
-            .document
-            .as_ref()
-            .and_then(candidate_mixer_master_enabled);
-        self.mixer_track_peak_meters
-            .set_live_master_enabled(live_master_enabled);
-        let live_master_signal_flags = self
-            .document
-            .as_ref()
-            .and_then(candidate_mixer_master_signal_flags);
-        self.mixer_track_peak_meters
-            .set_live_master_signal_flags(live_master_signal_flags);
+        if let Some(document) = self.document.as_ref() {
+            self.initialize_live_master_mixer_targets(document);
+        }
         let worker_mixer_meters = Arc::clone(&self.mixer_track_peak_meters);
         worker_mixer_meters.clear();
         self.mixer_insert_peak_holds.fill(0.0);
@@ -9471,6 +9444,22 @@ impl DawUi {
         } else {
             explicit_length.max(last_note_end)
         })
+    }
+
+    fn initialize_live_master_mixer_targets(&self, document: &FlpDocument) {
+        let live_master_fader_gain = candidate_mixer_master_fader_gain(document);
+        self.mixer_track_peak_meters
+            .set_live_master_fader_gain(live_master_fader_gain);
+        self.mixer_track_peak_meters
+            .set_live_master_pan_raw(candidate_mixer_master_pan_raw(document));
+        self.mixer_track_peak_meters
+            .set_live_master_stereo_separation_raw(candidate_mixer_master_stereo_separation_raw(
+                document,
+            ));
+        self.mixer_track_peak_meters
+            .set_live_master_enabled(candidate_mixer_master_enabled(document));
+        self.mixer_track_peak_meters
+            .set_live_master_signal_flags(candidate_mixer_master_signal_flags(document));
     }
 
     fn start_performance_mode_playback(&mut self) {
@@ -9675,6 +9664,7 @@ impl DawUi {
         };
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
+        self.initialize_live_master_mixer_targets(document);
         let worker_mixer_meters = Arc::clone(&self.mixer_track_peak_meters);
         worker_mixer_meters.clear();
         self.mixer_insert_peak_holds.fill(0.0);

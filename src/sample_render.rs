@@ -2140,13 +2140,17 @@ pub fn stream_playlist_performance_with_vst3_to_device(
         mixer_insert_peaks: None,
     };
     let mut frames_to_skip = performance.start_frame;
+    let mut master_output = MixerMasterOutput::from_document(&static_document);
+    if let Some(meters) = performance.meters.as_deref() {
+        master_output = master_output.with_live_master_targets(meters, options.sample_rate);
+    }
     stream_prepared_playlist_render_with_performance(
         PreparedPlaylistBlockMix {
             audio: &audio,
             sampler: &sampler,
             options,
             frames: u64::MAX,
-            master_output: MixerMasterOutput::from_document(&static_document),
+            master_output,
             vst3_processor: vst3_processor.as_mut(),
         },
         Some(runtime),
@@ -4156,6 +4160,17 @@ impl MixerMasterOutput {
             mixer_pan_law_raw: document.metadata().pan_law_raw(),
             ..Self::default()
         }
+    }
+
+    fn with_live_master_targets(self, meters: &MixerTrackPeakMeters, sample_rate: u32) -> Self {
+        self.with_live_fader_gain_target(meters.live_master_fader_gain(), sample_rate)
+            .with_live_pan_raw_target(meters.live_master_pan_raw(), sample_rate)
+            .with_live_stereo_separation_target(
+                meters.live_master_stereo_separation_raw(),
+                sample_rate,
+            )
+            .with_live_enabled_target(meters.live_master_enabled(), sample_rate)
+            .with_live_signal_flags_target(meters.live_master_signal_flags(), sample_rate)
     }
 
     fn with_live_fader_gain_target(
@@ -11191,6 +11206,28 @@ mod tests {
         }
         assert!(frame[0] < 0.001);
         assert_eq!(frame[1], frame[0] * 0.5);
+    }
+
+    #[test]
+    fn performance_stream_smooths_live_master_fader_changes() {
+        let meters = MixerTrackPeakMeters::default();
+        let output = MixerMasterOutput::default().with_live_master_targets(&meters, 48_000);
+
+        let mut frame = [1.0, 1.0];
+        output.apply(&mut frame);
+        assert_eq!(frame, [1.0, 1.0]);
+
+        meters.set_live_master_fader_gain(0.25);
+        frame = [1.0, 1.0];
+        output.apply(&mut frame);
+        assert!(frame[0] < 1.0 && frame[0] > 0.99);
+        assert_eq!(frame[0], frame[1]);
+
+        for _ in 0..100_000 {
+            frame = [1.0, 1.0];
+            output.apply(&mut frame);
+        }
+        assert!((frame[0] - 0.25).abs() < 0.001);
     }
 
     #[test]
