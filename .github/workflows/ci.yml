@@ -43,9 +43,9 @@ jobs:
       - name: Run tests
         run: cargo test --all-targets
 
-      - name: Prepare macOS signing and notarization
-        id: macos-signing
+      - name: Check macOS signing credentials
         if: runner.os == 'macOS'
+        id: macos-signing-status
         shell: bash
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -71,20 +71,31 @@ jobs:
           done
 
           if [[ "$present" -eq 0 ]]; then
-            echo "configured=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::Skipping the signed macOS installer because Developer ID signing and notarization secrets are not configured; CI will still build and inspect an unsigned app bundle."
+            echo "::error::macOS signing credentials are required to publish a Gatekeeper-ready installer. Configure all six secrets listed in docs/macos-ci-packaging.md."
             {
-              echo "### macOS installer skipped"
+              echo "### macOS installer unavailable"
               echo
-              echo "The macOS tests have passed. CI will build and inspect the unsigned app bundle, then upload it as a short-lived GUI preview artifact for local testing. The preview is not a distributable installer; configure signing and notarization credentials to publish a verified disk image. See [macOS CI packaging](docs/macos-ci-packaging.md)."
+              echo "This matrix job requires all six Apple signing and notarization secrets listed in [macOS CI packaging](docs/macos-ci-packaging.md). It will not report success without producing and verifying a Gatekeeper-ready installer."
             } >> "$GITHUB_STEP_SUMMARY"
-            exit 0
+            exit 1
           fi
-
           if [[ "$present" -ne "${#secret_names[@]}" ]]; then
             echo "::error::macOS signing configuration is incomplete. Configure all six secrets listed in docs/macos-ci-packaging.md."
             exit 1
           fi
+          echo "available=true" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare macOS signing and notarization
+        if: runner.os == 'macOS' && steps.macos-signing-status.outputs.available == 'true'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
+        run: |
+          set -euo pipefail
 
           python3 - <<'PY'
           import json
@@ -98,18 +109,103 @@ jobs:
           Path("Packager.signed.toml").write_text(config, encoding="utf-8")
           PY
 
-          api_key_path="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
+          keychain_path="$RUNNER_TEMP/fl-studio-signing.keychain-db"
+          keychain_password="$(openssl rand -hex 24)"
+          certificate_path="$RUNNER_TEMP/fl-studio-signing.p12"
           umask 077
+          python3 - "$certificate_path" <<'PY'
+          import base64
+          import os
+          import sys
+          from pathlib import Path
+
+          encoded = os.environ["APPLE_CERTIFICATE"].replace("\n", "").replace("\r", "")
+          Path(sys.argv[1]).write_bytes(base64.b64decode(encoded, validate=True))
+          PY
+
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          security import "$certificate_path" -k "$keychain_path" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$keychain_password" "$keychain_path"
+          security list-keychains -d user -s "$keychain_path" \
+            $(security list-keychains -d user | tr -d '"')
+          if ! security find-identity -v -p codesigning "$keychain_path" \
+            | grep -F -- "\"$APPLE_SIGNING_IDENTITY\""; then
+            echo "::error::The Developer ID signing identity was not imported into the temporary keychain."
+            exit 1
+          fi
+
+          api_key_path="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
           printf '%s' "$APPLE_API_KEY_CONTENT" > "$api_key_path"
+          echo "APPLE_SIGNING_KEYCHAIN=$keychain_path" >> "$GITHUB_ENV"
+          echo "APPLE_SIGNING_CERTIFICATE_PATH=$certificate_path" >> "$GITHUB_ENV"
           echo "APPLE_API_KEY_PATH=$api_key_path" >> "$GITHUB_ENV"
-          echo "configured=true" >> "$GITHUB_OUTPUT"
 
       - name: Install Cargo Packager
-        run: cargo install cargo-packager --locked
+        run: cargo install cargo-packager --version 0.11.8 --locked --force
 
       - name: Build desktop installers (Linux and Windows)
         if: runner.os != 'macOS'
         run: cargo packager --release
+
+      - name: Install Linux package
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          shopt -s nullglob
+          packages=(dist/*.deb)
+          if (( ${#packages[@]} != 1 )); then
+            echo "::error::Expected exactly one Linux .deb installer; found ${#packages[@]}."
+            printf '%s\n' "${packages[@]}"
+            exit 1
+          fi
+          sudo apt-get install --yes "./${packages[0]}"
+          test -x /usr/bin/fl-studio-rebuild
+          test -x /usr/bin/vst3-host-helper
+
+      - name: Install and launch Windows setup
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installers = @(Get-ChildItem -Path dist -Filter '*-setup.exe' -File)
+          if ($installers.Count -ne 1) {
+            throw "Expected exactly one Windows setup installer; found $($installers.Count)."
+          }
+
+          $installPath = Join-Path $env:LOCALAPPDATA 'FL Studio Rebuild'
+          $installerProcess = Start-Process -FilePath $installers[0].FullName -ArgumentList '/S' -Wait -PassThru
+          if ($installerProcess.ExitCode -ne 0) {
+            throw "Windows setup exited with code $($installerProcess.ExitCode)."
+          }
+
+          $appPath = Join-Path $installPath 'fl-studio-rebuild.exe'
+          $helperPath = Join-Path $installPath 'vst3-host-helper.exe'
+          if (-not (Test-Path -LiteralPath $appPath -PathType Leaf)) {
+            throw "Installed app executable is missing: $appPath"
+          }
+          if (-not (Test-Path -LiteralPath $helperPath -PathType Leaf)) {
+            throw "Installed VST3 helper is missing: $helperPath"
+          }
+
+          $env:APPDATA = Join-Path $env:RUNNER_TEMP 'fl-studio-ui-config'
+          New-Item -ItemType Directory -Path $env:APPDATA -Force | Out-Null
+          $app = Start-Process -FilePath $appPath -WorkingDirectory $installPath -PassThru
+          try {
+            Start-Sleep -Seconds 5
+            $app.Refresh()
+            if ($app.HasExited) {
+              throw "Installed app exited with code $($app.ExitCode)."
+            }
+            Write-Host 'Installed app remained running after launch.'
+          } finally {
+            if (-not $app.HasExited) {
+              Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue
+            }
+          }
 
       - name: Capture desktop UI on a virtual display
         if: runner.os == 'Linux'
@@ -1109,17 +1205,50 @@ jobs:
           xvfb-run --auto-servernum --server-args="-screen 0 1600x900x24 +extension GLX" \
             bash "$RUNNER_TEMP/capture-ui.sh"
 
-      - name: Upload Linux GUI preview
-        if: always() && runner.os == 'Linux'
-        uses: actions/upload-artifact@v4
-        with:
-          name: linux-gui-preview
-          path: dist/gui-preview/*.png
-          if-no-files-found: error
-          retention-days: 14
+      - name: Launch Linux AppImage on a virtual display
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          appimages=(dist/*.AppImage)
+          if (( ${#appimages[@]} != 1 )); then
+            echo "::error::Expected exactly one Linux AppImage; found ${#appimages[@]}."
+            printf '%s\n' "${appimages[@]}"
+            exit 1
+          fi
+          appimage="${appimages[0]}"
+          chmod +x "$appimage"
+          mkdir -p "$RUNNER_TEMP/appimage-config" "$RUNNER_TEMP/appimage-data"
+          export XDG_CONFIG_HOME="$RUNNER_TEMP/appimage-config"
+          export XDG_DATA_HOME="$RUNNER_TEMP/appimage-data"
+          appimage_log="$RUNNER_TEMP/appimage-launch.log"
+          xvfb-run --auto-servernum --server-args="-screen 0 1600x900x24 +extension GLX" \
+            bash -euo pipefail -c '
+              appimage="$1"
+              log="$2"
+              "$appimage" --appimage-extract-and-run > "$log" 2>&1 &
+              app_pid=$!
+              cleanup() {
+                kill "$app_pid" 2>/dev/null || true
+                wait "$app_pid" 2>/dev/null || true
+              }
+              trap cleanup EXIT
+              sleep 8
+              if ! kill -0 "$app_pid" 2>/dev/null; then
+                set +e
+                wait "$app_pid"
+                app_status=$?
+                set -e
+                echo "::error::The Linux AppImage exited during launch with status $app_status."
+                cat "$log"
+                exit 1
+              fi
+              echo "Linux AppImage remained running after launch."
+            ' _ "$appimage" "$appimage_log"
 
       - name: Build signed and notarized macOS installer
-        if: runner.os == 'macOS' && steps.macos-signing.outputs.configured == 'true'
+        if: runner.os == 'macOS' && steps.macos-signing-status.outputs.available == 'true'
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -1127,136 +1256,120 @@ jobs:
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
         run: cargo packager --release --config Packager.signed.toml
 
-      - name: Build unsigned macOS app for CI verification
-        if: runner.os == 'macOS' && steps.macos-signing.outputs.configured == 'false'
+      - name: Sign, notarize, and verify macOS disk image
+        if: runner.os == 'macOS' && steps.macos-signing-status.outputs.available == 'true'
         shell: bash
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
         run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          source = Path("Packager.toml").read_text(encoding="utf-8")
-          default_formats = 'formats = ["default"]'
-          if source.count(default_formats) != 1:
-              raise SystemExit("Packager.toml must declare exactly one default formats line")
-          smoke_config = source.replace(default_formats, 'formats = ["app"]', 1)
-          Path("Packager.macos-smoke.toml").write_text(smoke_config, encoding="utf-8")
-          PY
-          cargo packager --release --config Packager.macos-smoke.toml
-
-      - name: Verify unsigned macOS app bundle metadata
-        if: runner.os == 'macOS' && steps.macos-signing.outputs.configured == 'false'
-        shell: bash
-        run: |
-          app_path="$(find dist -maxdepth 1 -type d -name '*.app' -print -quit)"
-          if [[ -z "$app_path" ]]; then
-            echo "::error::Cargo Packager did not produce a macOS app bundle."
+          shopt -s nullglob
+          app_bundles=(dist/*.app)
+          disk_images=(dist/*.dmg)
+          if (( ${#app_bundles[@]} != 1 )); then
+            echo "::error::Expected exactly one macOS app bundle; found ${#app_bundles[@]}."
+            printf '%s\n' "${app_bundles[@]}"
             exit 1
           fi
-          python3 - "$app_path" <<'PY'
-          import plistlib
-          import sys
-          from pathlib import Path
+          if (( ${#disk_images[@]} != 1 )); then
+            echo "::error::Expected exactly one macOS disk image; found ${#disk_images[@]}."
+            printf '%s\n' "${disk_images[@]}"
+            exit 1
+          fi
+          disk_image="${disk_images[0]}"
 
-          app = Path(sys.argv[1])
-          with (app / "Contents" / "Info.plist").open("rb") as plist_file:
-              info = plistlib.load(plist_file)
-
-          executable = info.get("CFBundleExecutable")
-          if not executable or not (app / "Contents" / "MacOS" / executable).is_file():
-              raise SystemExit("macOS app bundle is missing its declared executable")
-
-          extensions = {
-              extension.lower()
-              for document_type in info.get("CFBundleDocumentTypes", [])
-              for extension in document_type.get("CFBundleTypeExtensions", [])
-              if isinstance(extension, str)
+          mount_path="$RUNNER_TEMP/fl-studio-installer"
+          cleanup() {
+            hdiutil detach "$mount_path" -quiet 2>/dev/null || true
           }
-          if "flp" not in extensions:
-              raise SystemExit("macOS app bundle is missing its .flp file association")
-          print("Unsigned macOS app bundle and .flp association are valid")
-          PY
+          trap cleanup EXIT
 
-      - name: Prepare unsigned macOS GUI preview
-        if: runner.os == 'macOS' && steps.macos-signing.outputs.configured == 'false'
-        shell: bash
-        run: |
-          app_path="$(find dist -maxdepth 1 -type d -name '*.app' -print -quit)"
-          if [[ -z "$app_path" ]]; then
-            echo "::error::Cargo Packager did not produce a macOS app bundle."
-            exit 1
-          fi
-          preview_dir="dist/macos-unsigned-preview"
-          mkdir -p "$preview_dir"
-          app_name="$(basename "$app_path")"
-          app_executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app_path/Contents/Info.plist")"
-          app_binary_path="$app_name/Contents/MacOS/$app_executable"
-          app_archive="$preview_dir/$app_name.tar.gz"
-          tar -czpf "$app_archive" -C "$(dirname "$app_path")" "$app_name"
-          python3 - "$app_archive" "$app_binary_path" <<'PY'
+          codesign --force --timestamp --keychain "$APPLE_SIGNING_KEYCHAIN" \
+            --sign "$APPLE_SIGNING_IDENTITY" "$disk_image"
+          xcrun notarytool submit "$disk_image" \
+            --key-id "$APPLE_API_KEY" \
+            --issuer "$APPLE_API_ISSUER" \
+            --key "$APPLE_API_KEY_PATH" \
+            --wait --output-format json > "$RUNNER_TEMP/fl-studio-dmg-notarization.json"
+          python3 - "$RUNNER_TEMP/fl-studio-dmg-notarization.json" <<'PY'
+          import json
           import sys
-          import tarfile
+          from pathlib import Path
 
-          archive_path, binary_path = sys.argv[1:]
-          with tarfile.open(archive_path, "r:gz") as archive:
-              binary = archive.getmember(binary_path)
-              if not binary.isfile() or binary.mode & 0o111 == 0:
-                  raise SystemExit("macOS preview archive did not preserve the app executable bit")
-          print("Unsigned macOS preview archive preserves the app executable bit")
+          result = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if result.get("status") != "Accepted":
+              raise SystemExit(f"Disk image notarization was not accepted: {result.get('status')!r}")
           PY
-          cat > "$preview_dir/README-FIRST.txt" <<'EOF'
-          This is an unsigned macOS CI preview. Extract this Actions artifact, then unpack
-          the app archive before opening it. Gatekeeper can label an unsigned, quarantined
-          app “damaged” because it has no Developer ID signature and notarization.
+          xcrun stapler staple "$disk_image"
+          xcrun stapler validate "$disk_image"
+          spctl --assess --type open --context context:primary-signature --verbose=4 "$disk_image"
 
-          To open the app, open Terminal, change to this folder, then run:
-
-              tar -xzf "FL Studio Rebuild.app.tar.gz"
-              xattr -dr com.apple.quarantine "FL Studio Rebuild.app"
-              open "FL Studio Rebuild.app"
-
-          A signed and notarized disk image is produced only when the repository's Apple
-          Developer ID and notarization secrets are configured.
-          EOF
-
-      - name: Verify macOS signature and notarization
-        if: runner.os == 'macOS' && steps.macos-signing.outputs.configured == 'true'
-        shell: bash
-        run: |
-          app_path="$(find dist -maxdepth 1 -type d -name '*.app' -print -quit)"
+          mkdir -p "$mount_path"
+          hdiutil attach -readonly -nobrowse -mountpoint "$mount_path" "$disk_image"
+          app_path="$(find "$mount_path" -maxdepth 2 -type d -name '*.app' -print -quit)"
           if [[ -z "$app_path" ]]; then
-            echo "::error::Cargo Packager did not produce a macOS app bundle."
+            echo "::error::The macOS installer does not contain an app bundle."
             exit 1
           fi
           codesign --verify --deep --strict --verbose=2 "$app_path"
           xcrun stapler validate "$app_path"
           spctl --assess --type execute --verbose=4 "$app_path"
 
-      - name: Launch and capture native macOS GUI
-        if: runner.os == 'macOS'
+      - name: Verify macOS signature and notarization
+        if: runner.os == 'macOS' && steps.macos-signing-status.outputs.available == 'true'
         shell: bash
         run: |
-          app_path="$(find dist -maxdepth 1 -type d -name '*.app' -print -quit)"
-          if [[ -z "$app_path" ]]; then
-            echo "::error::Cargo Packager did not produce a macOS app bundle."
+          shopt -s nullglob
+          app_bundles=(dist/*.app)
+          if (( ${#app_bundles[@]} != 1 )); then
+            echo "::error::Expected exactly one signed macOS app bundle; found ${#app_bundles[@]}."
+            printf '%s\n' "${app_bundles[@]}"
             exit 1
           fi
-          app_path="$(cd "$(dirname "$app_path")" && pwd)/$(basename "$app_path")"
-          app_executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app_path/Contents/Info.plist")"
-          app_binary="$app_path/Contents/MacOS/$app_executable"
-          if [[ ! -x "$app_binary" ]]; then
-            echo "::error::The macOS app bundle executable is missing or not executable."
+          app_path="${app_bundles[0]}"
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+          xcrun stapler validate "$app_path"
+          spctl --assess --type execute --verbose=4 "$app_path"
+
+      - name: Install and launch macOS app from disk image
+        if: runner.os == 'macOS' && steps.macos-signing-status.outputs.available == 'true'
+        shell: bash
+        run: |
+          shopt -s nullglob
+          disk_images=(dist/*.dmg)
+          if (( ${#disk_images[@]} != 1 )); then
+            echo "::error::Expected exactly one macOS disk image; found ${#disk_images[@]}."
+            printf '%s\n' "${disk_images[@]}"
             exit 1
           fi
 
-          preview_dir="dist/macos-gui-preview"
-          mkdir -p "$preview_dir"
-          app_pid=""
+          mount_path="$RUNNER_TEMP/fl-studio-smoke-mount"
+          install_dir="$RUNNER_TEMP/Applications"
+          mkdir -p "$mount_path" "$install_dir"
+          hdiutil attach -readonly -nobrowse -mountpoint "$mount_path" "${disk_images[0]}"
           cleanup() {
-            if [[ -n "$app_pid" ]]; then
+            hdiutil detach "$mount_path" -quiet 2>/dev/null || true
+            if [[ -n "${app_pid:-}" ]]; then
               kill "$app_pid" 2>/dev/null || true
             fi
           }
           trap cleanup EXIT
+
+          source_app="$(find "$mount_path" -maxdepth 2 -type d -name '*.app' -print -quit)"
+          if [[ -z "$source_app" ]]; then
+            echo "::error::The macOS disk image does not contain an app bundle."
+            exit 1
+          fi
+          app_path="$install_dir/$(basename "$source_app")"
+          ditto "$source_app" "$app_path"
+          app_executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app_path/Contents/Info.plist")"
+          app_binary="$app_path/Contents/MacOS/$app_executable"
+          if [[ ! -x "$app_binary" ]]; then
+            echo "::error::The installed macOS app executable is missing or not executable."
+            exit 1
+          fi
+
           open -a "$app_path"
           for attempt in $(seq 1 30); do
             app_pid="$(pgrep -f "$app_binary" | head -n 1 || true)"
@@ -1266,54 +1379,74 @@ jobs:
             sleep 1
           done
           if [[ -z "$app_pid" ]]; then
-            echo "::error::The packaged macOS app did not stay running after launch."
+            echo "::error::The installed macOS app did not stay running after launch."
             exit 1
           fi
           sleep 3
-          if screencapture -x "$preview_dir/startup.png" && [[ -s "$preview_dir/startup.png" ]]; then
-            echo "Captured the native macOS startup window."
-          else
-            echo "::warning::The macOS app launched, but the runner could not capture its screen."
-            rm -f "$preview_dir/startup.png"
-          fi
+          echo "Installed macOS app remained running after launch."
 
-      - name: Upload Linux and Windows installers
-        if: runner.os != 'macOS'
+      - name: Stage exactly one platform installer
+        if: runner.os != 'macOS' || steps.macos-signing-status.outputs.available == 'true'
+        shell: bash
+        run: |
+          shopt -s nullglob
+          case "$RUNNER_OS" in
+            Linux) installers=(dist/*.AppImage) ;;
+            Windows) installers=(dist/*-setup.exe) ;;
+            macOS) installers=(dist/*.dmg) ;;
+            *)
+              echo "::error::Unsupported installer platform: $RUNNER_OS"
+              exit 1
+              ;;
+          esac
+          if (( ${#installers[@]} != 1 )); then
+            echo "::error::Expected exactly one $RUNNER_OS installer in dist; found ${#installers[@]}."
+            printf '%s\n' "${installers[@]}"
+            exit 1
+          fi
+          mkdir -p dist/ci-installer
+          cp "${installers[0]}" dist/ci-installer/
+          staged_installers=(dist/ci-installer/*)
+          if (( ${#staged_installers[@]} != 1 )); then
+            echo "::error::Expected exactly one staged installer; found ${#staged_installers[@]}."
+            printf '%s\n' "${staged_installers[@]}"
+            exit 1
+          fi
+          echo "Staged installer: ${staged_installers[0]}"
+
+      - name: Upload Linux AppImage installer
+        if: runner.os == 'Linux'
         uses: actions/upload-artifact@v4
         with:
           name: installers-${{ matrix.os }}
-          path: dist/*
+          path: dist/ci-installer/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Windows setup installer
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: installers-${{ matrix.os }}
+          path: dist/ci-installer/*
           if-no-files-found: error
           retention-days: 14
 
       - name: Upload signed macOS disk image
-        if: runner.os == 'macOS' && steps.macos-signing.outputs.configured == 'true'
+        if: runner.os == 'macOS' && steps.macos-signing-status.outputs.available == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: installers-${{ matrix.os }}
-          path: dist/*.dmg
+          path: dist/ci-installer/*
           if-no-files-found: error
-          retention-days: 14
-
-      - name: Upload unsigned macOS GUI preview
-        if: runner.os == 'macOS' && steps.macos-signing.outputs.configured == 'false'
-        uses: actions/upload-artifact@v4
-        with:
-          name: macos-unsigned-gui-preview
-          path: dist/macos-unsigned-preview
-          if-no-files-found: error
-          retention-days: 14
-
-      - name: Upload native macOS screenshot
-        if: runner.os == 'macOS'
-        uses: actions/upload-artifact@v4
-        with:
-          name: macos-native-gui-preview
-          path: dist/macos-gui-preview/startup.png
-          if-no-files-found: warn
           retention-days: 14
 
       - name: Remove temporary macOS signing files
         if: always() && runner.os == 'macOS'
         shell: bash
-        run: rm -f Packager.signed.toml Packager.macos-smoke.toml "${APPLE_API_KEY_PATH:-}"
+        run: |
+          keychain_path="${APPLE_SIGNING_KEYCHAIN:-$RUNNER_TEMP/fl-studio-signing.keychain-db}"
+          security delete-keychain "$keychain_path" 2>/dev/null || true
+          rm -f Packager.signed.toml \
+            "${APPLE_SIGNING_CERTIFICATE_PATH:-$RUNNER_TEMP/fl-studio-signing.p12}" \
+            "${APPLE_API_KEY_PATH:-}"
