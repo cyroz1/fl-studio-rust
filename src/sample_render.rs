@@ -542,6 +542,13 @@ pub struct SamplerPatternRenderOptions {
 }
 
 /// Timing and prepared plug-in stream for live Pattern-mode playback.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SamplerPatternLoopPlayback {
+    pub loop_length_ticks: u64,
+    pub start_tick: u64,
+}
+
+/// Timing and prepared plug-in stream for live Pattern-mode playback.
 pub struct Vst3PatternLoopPlayback {
     pub loop_length_ticks: u64,
     pub start_tick: u64,
@@ -4118,7 +4125,7 @@ struct PreparedPlaylistBlockMix<'a> {
     vst3_processor: Option<&'a mut Vst3PlaylistStreamProcessor>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct MixerMasterOutput {
     enabled: Option<bool>,
     polarity_reversed: Option<bool>,
@@ -4744,6 +4751,33 @@ pub fn stream_sampler_pattern_loop_from_tick_to_device(
             vst3_processor: None,
             allow_empty_sampler: false,
         },
+        None,
+        writer,
+        cancelled,
+    )
+}
+
+/// Stream a looping Sampler Pattern with live Master Mixer control smoothing.
+pub fn stream_sampler_pattern_loop_from_tick_to_device_with_live_master_controls(
+    document: &FlpDocument,
+    project_path: impl AsRef<Path>,
+    options: SamplerPatternRenderOptions,
+    playback: SamplerPatternLoopPlayback,
+    meters: &crate::audio::MixerTrackPeakMeters,
+    writer: &StreamingAudioWriter,
+    cancelled: &AtomicBool,
+) -> Result<SamplerPatternRenderSummary, String> {
+    stream_sampler_pattern_loop_from_tick_with_vst3_to_device(
+        document,
+        project_path,
+        options,
+        PatternLoopStreamConfig {
+            loop_length_ticks: playback.loop_length_ticks,
+            start_tick: playback.start_tick,
+            vst3_processor: None,
+            allow_empty_sampler: false,
+        },
+        Some(meters),
         writer,
         cancelled,
     )
@@ -4768,6 +4802,33 @@ pub fn stream_pattern_loop_with_vst3_from_tick_to_device(
             vst3_processor: Some(playback.processor),
             allow_empty_sampler: true,
         },
+        None,
+        writer,
+        cancelled,
+    )
+}
+
+/// Stream a Sampler and VST3 Pattern loop with live Master Mixer control smoothing.
+pub fn stream_pattern_loop_with_vst3_from_tick_to_device_with_live_master_controls(
+    document: &FlpDocument,
+    project_path: impl AsRef<Path>,
+    options: SamplerPatternRenderOptions,
+    playback: Vst3PatternLoopPlayback,
+    meters: &crate::audio::MixerTrackPeakMeters,
+    writer: &StreamingAudioWriter,
+    cancelled: &AtomicBool,
+) -> Result<SamplerPatternRenderSummary, String> {
+    stream_sampler_pattern_loop_from_tick_with_vst3_to_device(
+        document,
+        project_path,
+        options,
+        PatternLoopStreamConfig {
+            loop_length_ticks: playback.loop_length_ticks,
+            start_tick: playback.start_tick,
+            vst3_processor: Some(playback.processor),
+            allow_empty_sampler: true,
+        },
+        Some(meters),
         writer,
         cancelled,
     )
@@ -4785,6 +4846,7 @@ fn stream_sampler_pattern_loop_from_tick_with_vst3_to_device(
     project_path: impl AsRef<Path>,
     options: SamplerPatternRenderOptions,
     mut playback: PatternLoopStreamConfig,
+    live_master_meters: Option<&crate::audio::MixerTrackPeakMeters>,
     writer: &StreamingAudioWriter,
     cancelled: &AtomicBool,
 ) -> Result<SamplerPatternRenderSummary, String> {
@@ -4813,6 +4875,10 @@ fn stream_sampler_pattern_loop_from_tick_with_vst3_to_device(
     } else {
         prepare_sampler_pattern(document, project_path.as_ref(), options, Some(cancelled))?
     };
+    let mut master_output = render.master_output.clone();
+    if let Some(meters) = live_master_meters {
+        master_output = master_output.with_live_master_targets(meters, options.sample_rate);
+    }
     if render.summary.notes_rendered == 0
         && playback
             .vst3_processor
@@ -4910,7 +4976,7 @@ fn stream_sampler_pattern_loop_from_tick_with_vst3_to_device(
             if let Some(processor) = playback.vst3_processor.as_mut() {
                 processor.mix_next_block(&mut block)?;
             }
-            render.master_output.apply(&mut block);
+            master_output.apply(&mut block);
             writer.write_stereo_samples(&block)?;
             block_start = block_start.saturating_add(frame_count as u64);
         }
@@ -11210,6 +11276,28 @@ mod tests {
 
     #[test]
     fn performance_stream_smooths_live_master_fader_changes() {
+        let meters = MixerTrackPeakMeters::default();
+        let output = MixerMasterOutput::default().with_live_master_targets(&meters, 48_000);
+
+        let mut frame = [1.0, 1.0];
+        output.apply(&mut frame);
+        assert_eq!(frame, [1.0, 1.0]);
+
+        meters.set_live_master_fader_gain(0.25);
+        frame = [1.0, 1.0];
+        output.apply(&mut frame);
+        assert!(frame[0] < 1.0 && frame[0] > 0.99);
+        assert_eq!(frame[0], frame[1]);
+
+        for _ in 0..100_000 {
+            frame = [1.0, 1.0];
+            output.apply(&mut frame);
+        }
+        assert!((frame[0] - 0.25).abs() < 0.001);
+    }
+
+    #[test]
+    fn pattern_stream_smooths_live_master_fader_changes() {
         let meters = MixerTrackPeakMeters::default();
         let output = MixerMasterOutput::default().with_live_master_targets(&meters, 48_000);
 
