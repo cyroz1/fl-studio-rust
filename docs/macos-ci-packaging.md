@@ -1,8 +1,8 @@
 # macOS CI packaging
 
-The macOS artifact is a Developer ID signed, notarized, and stapled DMG. CI imports the Developer ID certificate into a temporary keychain, builds and verifies the app bundle, signs and notarizes the disk image, checks Gatekeeper acceptance, then installs and launches the app from the DMG. CI uploads only the verified DMG. Without all six Apple signing and notarization secrets, the macOS matrix job fails with setup instructions instead of publishing an unsigned app that Gatekeeper may label “damaged.”
+With all six Apple signing and notarization secrets, CI imports the Developer ID certificate into a temporary keychain, builds and verifies the app bundle, signs and notarizes the disk image, checks Gatekeeper acceptance, then installs and launches the app from the DMG. CI uploads only the verified DMG. Without signing secrets, CI builds, checks, and smoke-tests an unsigned `.app` bundle, then skips the macOS artifact so users cannot download an app Gatekeeper may label “damaged.” A partial set of signing secrets fails the job so an incomplete package is not mistaken for a verified installer.
 
-The Linux runner installs the Debian package and launches the AppImage; Windows installs and launches its setup executable. CI uploads exactly one installer per platform: the Linux AppImage, the Windows setup executable, or the signed macOS DMG. Screenshots, additional package formats, and unsigned macOS previews are not uploaded as CI artifacts.
+The Linux runner installs the Debian package and launches the AppImage; Windows installs and launches its setup executable. CI uploads exactly one installer for each platform it can package safely: the Linux AppImage, the Windows setup executable, or the signed macOS DMG. Screenshots, additional package formats, and unsigned macOS previews are not uploaded as CI artifacts.
 
 Apple requires Developer ID signing for software distributed outside the Mac App Store; see [Apple's Gatekeeper signing guidance](https://developer.apple.com/developer-id/). Add these repository Actions secrets under Settings → Secrets and variables → Actions:
 
