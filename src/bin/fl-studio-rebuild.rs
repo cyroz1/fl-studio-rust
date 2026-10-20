@@ -9210,6 +9210,9 @@ impl DawUi {
                 return;
             }
         };
+        self.initialize_live_mixer_insert_fader_targets(
+            self.document.as_ref().expect("project was checked above"),
+        );
         let options = PlaylistRenderOptions {
             arrangement_id: self.selected_arrangement.unwrap_or(0),
             sample_rate,
@@ -9367,6 +9370,18 @@ impl DawUi {
                 self.stop_project_playback();
                 self.status = format!("Could not start audio streaming: {error}");
             }
+        }
+    }
+
+    fn initialize_live_mixer_insert_fader_targets(&self, document: &FlpDocument) {
+        let parameters = document.mixer_parameter_records().unwrap_or_default();
+        for track in 1..=i8::MAX as usize {
+            let volume_raw =
+                unique_candidate_mixer_parameter(&parameters, track, MixerParameterKind::Volume)
+                    .map(MixerParameterRecord::value)
+                    .filter(|value| (0..=16_000).contains(value));
+            self.mixer_track_peak_meters
+                .set_live_mixer_insert_fader_raw(track, volume_raw);
         }
     }
 
@@ -9599,6 +9614,7 @@ impl DawUi {
                 return;
             }
         };
+        self.initialize_live_mixer_insert_fader_targets(document);
         let static_document = match playlist_performance_static_document_with_vst3(
             document,
             arrangement_id,
@@ -29162,18 +29178,7 @@ impl DawUi {
                 return;
             }
         };
-        let mixer_parameters = document.mixer_parameter_records().unwrap_or_default();
-        for track in 1..=i8::MAX as usize {
-            let live_fader_raw = unique_candidate_mixer_parameter(
-                &mixer_parameters,
-                track,
-                MixerParameterKind::Volume,
-            )
-            .map(MixerParameterRecord::value)
-            .filter(|value| (0..=16_000).contains(value));
-            self.mixer_track_peak_meters
-                .set_live_mixer_insert_fader_raw(track, live_fader_raw);
-        }
+        self.initialize_live_mixer_insert_fader_targets(document);
         if self.audio_engine.is_none() {
             match AudioEngine::start(&self.audio_settings) {
                 Ok(engine) => self.audio_engine = Some(engine),
