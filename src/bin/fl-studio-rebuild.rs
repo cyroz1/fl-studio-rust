@@ -44,9 +44,8 @@ use flp_rebuild::sample_render::{
     stream_pattern_loop_with_vst3_from_tick_to_device,
     stream_playlist_performance_with_vst3_to_device,
     stream_playlist_with_vst3_to_device_with_monitor, stream_sampler_midi_input_to_device,
-    stream_sampler_pattern_loop_from_tick_to_device, stream_sampler_pattern_loop_to_device,
-    stream_sampler_pattern_to_device, stream_vst3_midi_input_to_device,
-    write_input_recording_to_wav,
+    stream_sampler_pattern_loop_from_tick_to_device, stream_sampler_pattern_to_device,
+    stream_vst3_midi_input_to_device, write_input_recording_to_wav,
 };
 use flp_rebuild::vst3::{
     MAX_REPORTED_TAIL_SECONDS, Vst3HostRuntime, Vst3LiveInputStreamHandle,
