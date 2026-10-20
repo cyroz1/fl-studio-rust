@@ -906,46 +906,85 @@ impl ChannelNoteRouter {
         note_seed: u64,
         key: u16,
     ) -> Vec<u16> {
-        let Some(source) = self.channels_by_id.get(&source_channel_id) else {
-            return Vec::new();
+        let mut targets = Vec::new();
+        let mut seen_targets = HashSet::new();
+        self.route_channel(
+            source_channel_id,
+            note_seed,
+            key,
+            &mut HashSet::new(),
+            &mut seen_targets,
+            &mut targets,
+        );
+        targets
+    }
+
+    fn route_channel(
+        &self,
+        channel_id: u16,
+        note_seed: u64,
+        key: u16,
+        active_layers: &mut HashSet<u16>,
+        seen_targets: &mut HashSet<u16>,
+        targets: &mut Vec<u16>,
+    ) {
+        let Some(channel) = self.channels_by_id.get(&channel_id) else {
+            return;
         };
-        if source.enabled == Some(false) {
-            return Vec::new();
+        if channel.enabled == Some(false) || !channel_accepts_key(channel, key) {
+            return;
         }
-        if !channel_accepts_key(source, key) {
-            return Vec::new();
+        if channel.channel_type() != Some(ChannelType::Layer) {
+            if seen_targets.insert(channel_id) {
+                targets.push(channel_id);
+            }
+            return;
         }
-        if source.channel_type() != Some(ChannelType::Layer) {
-            return vec![source_channel_id];
+        if !active_layers.insert(channel_id) {
+            return;
         }
 
-        let mut seen = HashSet::new();
-        let children = source
+        let mut seen_children = HashSet::new();
+        let children = channel
             .layer_children
             .iter()
             .copied()
-            .filter(|child_id| seen.insert(*child_id))
+            .filter(|child_id| seen_children.insert(*child_id))
             .filter(|child_id| {
                 self.channels_by_id.get(child_id).is_some_and(|child| {
                     child.enabled != Some(false)
-                        && child.channel_type() != Some(ChannelType::Layer)
+                        && (child.channel_type() != Some(ChannelType::Layer)
+                            || !active_layers.contains(child_id))
                         && channel_accepts_key(child, key)
                 })
             })
             .collect::<Vec<_>>();
-
-        if children.is_empty() {
-            return children;
+        if channel.layer_random_enabled() == Some(true) && !children.is_empty() {
+            let mut random = note_seed ^ (u64::from(channel_id) << 32) ^ 0x9E37_79B9_7F4A_7C15;
+            random = (random ^ (random >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            random = (random ^ (random >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            random ^= random >> 31;
+            self.route_channel(
+                children[(random as usize) % children.len()],
+                note_seed,
+                key,
+                active_layers,
+                seen_targets,
+                targets,
+            );
+        } else {
+            for child_id in children {
+                self.route_channel(
+                    child_id,
+                    note_seed,
+                    key,
+                    active_layers,
+                    seen_targets,
+                    targets,
+                );
+            }
         }
-        if source.layer_random_enabled() != Some(true) {
-            return children;
-        }
-
-        let mut random = note_seed ^ (u64::from(source_channel_id) << 32) ^ 0x9E37_79B9_7F4A_7C15;
-        random = (random ^ (random >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        random = (random ^ (random >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        random ^= random >> 31;
-        vec![children[(random as usize) % children.len()]]
+        active_layers.remove(&channel_id);
     }
 }
 
@@ -1160,6 +1199,28 @@ pub enum PatternNoteRotation {
     Right,
 }
 
+/// Timing and velocity settings for the Piano roll Strum operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StrumOptions {
+    pub spread_ticks: u32,
+    pub descending: bool,
+    /// Positive values lower successive note velocities; negative values raise them.
+    pub velocity_amount: i16,
+    /// Curves the velocity change from gradual to accelerated/decelerated.
+    pub velocity_tension_percent: i16,
+}
+
+impl Default for StrumOptions {
+    fn default() -> Self {
+        Self {
+            spread_ticks: 120,
+            descending: false,
+            velocity_amount: 0,
+            velocity_tension_percent: 0,
+        }
+    }
+}
+
 /// Pitch range, wrap mode, and optional scale settings for the Piano roll Limit operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LimitNoteOptions<'a> {
@@ -1187,6 +1248,40 @@ pub enum RiffMachineQuantizeMode {
     LeaveEnd,
     QuantizeDuration,
     QuantizeEnd,
+}
+
+/// Note-duration behavior for Piano roll quantization.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QuantizeNoteMode {
+    LeaveDuration,
+    LeaveEnd,
+    QuantizeDuration,
+    QuantizeEnd,
+}
+
+/// Settings for Piano roll quantization of note starts and durations.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct QuantizeNoteOptions {
+    pub grid_ticks: u32,
+    pub start_strength: f64,
+    /// Snap only features within this fraction of half a grid step.
+    pub sensitivity: f64,
+    pub duration_strength: f64,
+    pub swing: f64,
+    pub mode: QuantizeNoteMode,
+}
+
+impl Default for QuantizeNoteOptions {
+    fn default() -> Self {
+        Self {
+            grid_ticks: 24,
+            start_strength: 1.0,
+            sensitivity: 1.0,
+            duration_strength: 0.0,
+            swing: 0.0,
+            mode: QuantizeNoteMode::LeaveDuration,
+        }
+    }
 }
 
 /// Settings for a seeded, scale-based Riff Machine pass over an existing note progression.
@@ -1336,15 +1431,228 @@ fn riff_machine_groove_note_timing(
     Ok((start, length.max(1)))
 }
 
-/// Parameters for seeded note velocity, pan, and pitch randomization.
+/// Parameters for seeded note-level and pitch randomization.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RandomizerOptions {
     pub seed: u64,
     pub velocity_amount_percent: i16,
     pub pan_amount_percent: i16,
+    pub release_amount_percent: i16,
+    pub mod_x_amount_percent: i16,
+    pub mod_y_amount_percent: i16,
     pub pitch_range_semitones: u8,
     pub bipolar: bool,
     pub reset_levels: bool,
+}
+
+/// Chord tones used to constrain seeded random note generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RandomNoteChordMap {
+    Major,
+    Minor,
+    Diminished,
+    Augmented,
+    Suspended2,
+    Suspended4,
+    Power,
+    Dominant7,
+    Major7,
+    Minor7,
+    Major6,
+    Minor6,
+    Add9,
+    MinorAdd9,
+    Diminished7,
+    HalfDiminished7,
+    MinorMajor7,
+    Dominant7Flat5,
+    Dominant7Sharp5,
+    Dominant7Flat9,
+    Dominant7Sharp9,
+    Dominant9,
+    Major9,
+    Minor9,
+    Dominant11,
+    Minor11,
+    Dominant13,
+    Major7Add13,
+}
+
+impl RandomNoteChordMap {
+    pub const ALL: [Self; 28] = [
+        Self::Major,
+        Self::Minor,
+        Self::Diminished,
+        Self::Augmented,
+        Self::Suspended2,
+        Self::Suspended4,
+        Self::Power,
+        Self::Dominant7,
+        Self::Major7,
+        Self::Minor7,
+        Self::Major6,
+        Self::Minor6,
+        Self::Add9,
+        Self::MinorAdd9,
+        Self::Diminished7,
+        Self::HalfDiminished7,
+        Self::MinorMajor7,
+        Self::Dominant7Flat5,
+        Self::Dominant7Sharp5,
+        Self::Dominant7Flat9,
+        Self::Dominant7Sharp9,
+        Self::Dominant9,
+        Self::Major9,
+        Self::Minor9,
+        Self::Dominant11,
+        Self::Minor11,
+        Self::Dominant13,
+        Self::Major7Add13,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Major => "Major",
+            Self::Minor => "Minor",
+            Self::Diminished => "Diminished",
+            Self::Augmented => "Augmented",
+            Self::Suspended2 => "Suspended 2",
+            Self::Suspended4 => "Suspended 4",
+            Self::Power => "Power fifth",
+            Self::Dominant7 => "Dominant 7",
+            Self::Major7 => "Major 7",
+            Self::Minor7 => "Minor 7",
+            Self::Major6 => "Major 6",
+            Self::Minor6 => "Minor 6",
+            Self::Add9 => "Add 9",
+            Self::MinorAdd9 => "Minor add 9",
+            Self::Diminished7 => "Diminished 7",
+            Self::HalfDiminished7 => "Half-diminished 7",
+            Self::MinorMajor7 => "Minor-major 7",
+            Self::Dominant7Flat5 => "Dominant 7 flat 5",
+            Self::Dominant7Sharp5 => "Dominant 7 sharp 5",
+            Self::Dominant7Flat9 => "Dominant 7 flat 9",
+            Self::Dominant7Sharp9 => "Dominant 7 sharp 9",
+            Self::Dominant9 => "Dominant 9",
+            Self::Major9 => "Major 9",
+            Self::Minor9 => "Minor 9",
+            Self::Dominant11 => "Dominant 11",
+            Self::Minor11 => "Minor 11",
+            Self::Dominant13 => "Dominant 13",
+            Self::Major7Add13 => "Major 7 add 13",
+        }
+    }
+
+    pub fn cli_name(self) -> &'static str {
+        match self {
+            Self::Major => "major",
+            Self::Minor => "minor",
+            Self::Diminished => "diminished",
+            Self::Augmented => "augmented",
+            Self::Suspended2 => "sus2",
+            Self::Suspended4 => "sus4",
+            Self::Power => "power",
+            Self::Dominant7 => "dominant7",
+            Self::Major7 => "major7",
+            Self::Minor7 => "minor7",
+            Self::Major6 => "major6",
+            Self::Minor6 => "minor6",
+            Self::Add9 => "add9",
+            Self::MinorAdd9 => "minor-add9",
+            Self::Diminished7 => "diminished7",
+            Self::HalfDiminished7 => "half-diminished7",
+            Self::MinorMajor7 => "minor-major7",
+            Self::Dominant7Flat5 => "dominant7-flat5",
+            Self::Dominant7Sharp5 => "dominant7-sharp5",
+            Self::Dominant7Flat9 => "dominant7-flat9",
+            Self::Dominant7Sharp9 => "dominant7-sharp9",
+            Self::Dominant9 => "dominant9",
+            Self::Major9 => "major9",
+            Self::Minor9 => "minor9",
+            Self::Dominant11 => "dominant11",
+            Self::Minor11 => "minor11",
+            Self::Dominant13 => "dominant13",
+            Self::Major7Add13 => "major7-add13",
+        }
+    }
+
+    pub fn intervals(self) -> &'static [u8] {
+        match self {
+            Self::Major => &[0, 4, 7],
+            Self::Minor => &[0, 3, 7],
+            Self::Diminished => &[0, 3, 6],
+            Self::Augmented => &[0, 4, 8],
+            Self::Suspended2 => &[0, 2, 7],
+            Self::Suspended4 => &[0, 5, 7],
+            Self::Power => &[0, 7, 12],
+            Self::Dominant7 => &[0, 4, 7, 10],
+            Self::Major7 => &[0, 4, 7, 11],
+            Self::Minor7 => &[0, 3, 7, 10],
+            Self::Major6 => &[0, 4, 7, 9],
+            Self::Minor6 => &[0, 3, 7, 9],
+            Self::Add9 => &[0, 4, 7, 14],
+            Self::MinorAdd9 => &[0, 3, 7, 14],
+            Self::Diminished7 => &[0, 3, 6, 9],
+            Self::HalfDiminished7 => &[0, 3, 6, 10],
+            Self::MinorMajor7 => &[0, 3, 7, 11],
+            Self::Dominant7Flat5 => &[0, 4, 6, 10],
+            Self::Dominant7Sharp5 => &[0, 4, 8, 10],
+            Self::Dominant7Flat9 => &[0, 4, 7, 10, 13],
+            Self::Dominant7Sharp9 => &[0, 4, 7, 10, 15],
+            Self::Dominant9 => &[0, 4, 7, 10, 14],
+            Self::Major9 => &[0, 4, 7, 11, 14],
+            Self::Minor9 => &[0, 3, 7, 10, 14],
+            Self::Dominant11 => &[0, 4, 7, 10, 14, 17],
+            Self::Minor11 => &[0, 3, 7, 10, 14, 17],
+            Self::Dominant13 => &[0, 4, 7, 10, 14, 17, 21],
+            Self::Major7Add13 => &[0, 4, 7, 11, 21],
+        }
+    }
+}
+
+/// Parameters for generating seeded notes on a bounded Piano roll grid range.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RandomNoteGeneratorOptions {
+    pub seed: u64,
+    pub start_tick: u32,
+    /// Exclusive end of the generated range.
+    pub end_tick: u32,
+    pub step_ticks: u32,
+    pub note_length_ticks: u32,
+    pub density_percent: u8,
+    /// Number of distinct pitches to generate at each occupied grid position.
+    pub notes_per_step: u8,
+    /// Maximum seeded note-length variation, from -100% (shorter) to +100% (longer).
+    pub length_variation_percent: i16,
+    /// Merge touching or overlapping generated notes that have the same pitch.
+    pub merge_repeated_notes: bool,
+    /// Base octave for an octave-bounded pitch pool. Set with `range_octaves`.
+    pub base_octave: Option<u8>,
+    /// Number of octaves above the base octave included in the pitch pool.
+    pub range_octaves: Option<u8>,
+    /// Optional chord map. Its pitch classes are combined with any selected scale.
+    pub chord_map: Option<RandomNoteChordMap>,
+    /// Chord-map root pitch class, 0 = C through 11 = B.
+    pub chord_root: u8,
+    pub minimum_key: u16,
+    pub maximum_key: u16,
+}
+
+/// Timing and note-level variation for a seeded Humanize pass.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HumanizerOptions {
+    /// Maximum symmetric timing offset, in project ticks.
+    pub timing_range_ticks: u32,
+    /// Symmetric variation as a percentage of the full velocity range.
+    pub velocity_variation_percent: u8,
+    /// Symmetric variation as a percentage of the full pan range.
+    pub pan_variation_percent: u8,
+    /// Symmetric variation as a percentage of the full release range.
+    pub release_variation_percent: u8,
+    /// Symmetric variation as a percentage of the full Mod X range.
+    pub mod_x_variation_percent: u8,
+    /// Symmetric variation as a percentage of the full Mod Y range.
+    pub mod_y_variation_percent: u8,
 }
 
 /// Parameters for adding and optionally grouping Flam strokes.
@@ -9098,8 +9406,26 @@ impl FlpDocument {
         swing: f64,
     ) -> Result<usize, FlpError> {
         self.quantize_pattern_notes_in_scope(
-            pattern_id, channel_id, None, grid_ticks, strength, swing,
+            pattern_id,
+            channel_id,
+            None,
+            QuantizeNoteOptions {
+                grid_ticks,
+                start_strength: strength,
+                swing,
+                ..QuantizeNoteOptions::default()
+            },
         )
+    }
+
+    /// Quantizes a channel's note starts and optional durations with the supplied settings.
+    pub fn quantize_pattern_notes_with_options(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        options: QuantizeNoteOptions,
+    ) -> Result<usize, FlpError> {
+        self.quantize_pattern_notes_in_scope(pattern_id, channel_id, None, options)
     }
 
     /// Moves only the supplied channel-note indices toward the closest grid points.
@@ -9117,10 +9443,24 @@ impl FlpDocument {
             pattern_id,
             channel_id,
             Some(note_indices),
-            grid_ticks,
-            strength,
-            swing,
+            QuantizeNoteOptions {
+                grid_ticks,
+                start_strength: strength,
+                swing,
+                ..QuantizeNoteOptions::default()
+            },
         )
+    }
+
+    /// Quantizes only the supplied channel notes with the supplied start and duration settings.
+    pub fn quantize_pattern_note_selection_with_options(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: &[usize],
+        options: QuantizeNoteOptions,
+    ) -> Result<usize, FlpError> {
+        self.quantize_pattern_notes_in_scope(pattern_id, channel_id, Some(note_indices), options)
     }
 
     fn quantize_pattern_notes_in_scope(
@@ -9128,21 +9468,31 @@ impl FlpDocument {
         pattern_id: u16,
         channel_id: u16,
         note_indices: Option<&[usize]>,
-        grid_ticks: u32,
-        strength: f64,
-        swing: f64,
+        options: QuantizeNoteOptions,
     ) -> Result<usize, FlpError> {
-        if grid_ticks == 0 {
+        if options.grid_ticks == 0 {
             return Err(FlpError::UnsupportedEdit(
                 "quantize grid must be greater than zero ticks",
             ));
         }
-        if !strength.is_finite() || !(0.0..=1.0).contains(&strength) {
+        if !options.start_strength.is_finite() || !(0.0..=1.0).contains(&options.start_strength) {
             return Err(FlpError::UnsupportedEdit(
-                "quantize strength must be between 0 and 1",
+                "quantize start strength must be between 0 and 1",
             ));
         }
-        if !swing.is_finite() || !(0.0..=1.0).contains(&swing) {
+        if !options.sensitivity.is_finite() || !(0.0..=1.0).contains(&options.sensitivity) {
+            return Err(FlpError::UnsupportedEdit(
+                "quantize sensitivity must be between 0 and 1",
+            ));
+        }
+        if !options.duration_strength.is_finite()
+            || !(0.0..=1.0).contains(&options.duration_strength)
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "quantize duration strength must be between 0 and 1",
+            ));
+        }
+        if !options.swing.is_finite() || !(0.0..=1.0).contains(&options.swing) {
             return Err(FlpError::UnsupportedEdit(
                 "quantize swing must be between 0 and 1",
             ));
@@ -9154,7 +9504,7 @@ impl FlpDocument {
             .ok_or(FlpError::UnsupportedEdit(
                 "the requested pattern does not exist",
             ))?;
-        let grid = u64::from(grid_ticks);
+        let grid = u64::from(options.grid_ticks);
         let selected_indices =
             note_indices.map(|indices| indices.iter().copied().collect::<HashSet<_>>());
         let edits = pattern
@@ -9168,21 +9518,59 @@ impl FlpDocument {
                     .is_none_or(|indices| indices.contains(note_index))
             })
             .filter_map(|(note_index, note)| {
-                let position = u64::from(note.position);
-                let grid_index = position.saturating_add(grid / 2) / grid;
-                let straight_target = grid_index.saturating_mul(grid);
-                let swing_offset = if grid_index % 2 == 1 {
-                    (grid as f64 * 0.5 * swing).round() as u64
-                } else {
-                    0
+                let original_start = u64::from(note.position);
+                let original_length = u64::from(note.length);
+                let original_end = original_start.saturating_add(original_length);
+                let target_for = |tick: u64| {
+                    let grid_index = tick.saturating_add(grid / 2) / grid;
+                    let straight_target = grid_index.saturating_mul(grid);
+                    let sensitivity_limit = grid as f64 * 0.5 * options.sensitivity;
+                    if tick.abs_diff(straight_target) as f64 > sensitivity_limit {
+                        return tick;
+                    }
+                    let swing_offset = if grid_index % 2 == 1 {
+                        (grid as f64 * 0.5 * options.swing).round() as u64
+                    } else {
+                        0
+                    };
+                    straight_target.saturating_add(swing_offset)
                 };
-                let target = straight_target
-                    .saturating_add(swing_offset)
-                    .min(u64::from(u32::MAX)) as f64;
-                let next_position = (position as f64 + (target - position as f64) * strength)
-                    .round()
-                    .clamp(0.0, f64::from(u32::MAX)) as u32;
-                (next_position != note.position).then_some((note_index, next_position))
+                let mix = |original: u64, target: u64, strength: f64| {
+                    (original as f64 + (target as f64 - original as f64) * strength)
+                        .round()
+                        .clamp(0.0, f64::from(u32::MAX)) as u64
+                };
+
+                let target_start = target_for(original_start);
+                let mut next_start = mix(original_start, target_start, options.start_strength);
+                let target_end = target_for(original_end);
+                let next_length = if original_length == 0 {
+                    original_length
+                } else {
+                    match options.mode {
+                        QuantizeNoteMode::LeaveDuration => original_length,
+                        QuantizeNoteMode::LeaveEnd => {
+                            next_start = next_start.min(original_end.saturating_sub(1));
+                            original_end.saturating_sub(next_start)
+                        }
+                        QuantizeNoteMode::QuantizeDuration => {
+                            let target_length = target_end.saturating_sub(target_start).max(1);
+                            mix(original_length, target_length, options.duration_strength).max(1)
+                        }
+                        QuantizeNoteMode::QuantizeEnd => {
+                            let next_end = mix(original_end, target_end, options.duration_strength);
+                            next_start = next_start.min(next_end.saturating_sub(1));
+                            next_end.saturating_sub(next_start).max(1)
+                        }
+                    }
+                };
+                let next_start = next_start.min(u64::from(u32::MAX)) as u32;
+                let next_length = next_length.min(u64::from(u32::MAX)) as u32;
+                (next_start != note.position || next_length != note.length).then_some((
+                    note_index,
+                    next_start,
+                    next_length,
+                ))
             })
             .collect::<Vec<_>>();
         if edits.is_empty() {
@@ -9190,13 +9578,14 @@ impl FlpDocument {
         }
 
         let mut updated = self.clone();
-        for (note_index, position) in &edits {
+        for (note_index, position, length) in &edits {
             updated.edit_pattern_note(
                 pattern_id,
                 channel_id,
                 *note_index,
                 PatternNoteEdit {
                     position: Some(*position),
+                    length: Some(*length),
                     ..PatternNoteEdit::default()
                 },
             )?;
@@ -9629,8 +10018,29 @@ impl FlpDocument {
         signature_changes.sort_by_key(|(position, _, _)| *position);
         let initial_signature = self.metadata.time_signature();
         let ppq = self.header.ppq.max(1);
-        let selected_indices =
-            note_indices.map(|indices| indices.iter().copied().collect::<HashSet<_>>());
+        let selected_indices = note_indices.map(|indices| {
+            let mut selected = indices.iter().copied().collect::<HashSet<_>>();
+            let selected_groups = pattern
+                .notes
+                .iter()
+                .filter(|note| note.channel_id == channel_id)
+                .enumerate()
+                .filter(|(note_index, note)| selected.contains(note_index) && note.group != 0)
+                .map(|(_, note)| note.group)
+                .collect::<HashSet<_>>();
+            if !selected_groups.is_empty() {
+                selected.extend(
+                    pattern
+                        .notes
+                        .iter()
+                        .filter(|note| note.channel_id == channel_id)
+                        .enumerate()
+                        .filter(|(_, note)| selected_groups.contains(&note.group))
+                        .map(|(note_index, _)| note_index),
+                );
+            }
+            selected
+        });
         let mut edits = Vec::new();
         for (note_index, note) in pattern
             .notes
@@ -9961,7 +10371,26 @@ impl FlpDocument {
         spread_ticks: u32,
         descending: bool,
     ) -> Result<usize, FlpError> {
-        self.strum_pattern_notes_in_scope(pattern_id, channel_id, None, spread_ticks, descending)
+        self.strum_pattern_notes_in_scope(
+            pattern_id,
+            channel_id,
+            None,
+            StrumOptions {
+                spread_ticks,
+                descending,
+                ..StrumOptions::default()
+            },
+        )
+    }
+
+    /// Strums channel chords with configurable start-time and velocity shaping.
+    pub fn strum_pattern_notes_with_options(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        options: StrumOptions,
+    ) -> Result<usize, FlpError> {
+        self.strum_pattern_notes_in_scope(pattern_id, channel_id, None, options)
     }
 
     /// Staggers simultaneous notes only within the supplied channel-local selection.
@@ -9977,9 +10406,23 @@ impl FlpDocument {
             pattern_id,
             channel_id,
             Some(note_indices),
-            spread_ticks,
-            descending,
+            StrumOptions {
+                spread_ticks,
+                descending,
+                ..StrumOptions::default()
+            },
         )
+    }
+
+    /// Strums only the supplied channel-local notes with configurable velocity shaping.
+    pub fn strum_pattern_note_selection_with_options(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: &[usize],
+        options: StrumOptions,
+    ) -> Result<usize, FlpError> {
+        self.strum_pattern_notes_in_scope(pattern_id, channel_id, Some(note_indices), options)
     }
 
     fn strum_pattern_notes_in_scope(
@@ -9987,9 +10430,18 @@ impl FlpDocument {
         pattern_id: u16,
         channel_id: u16,
         note_indices: Option<&[usize]>,
-        spread_ticks: u32,
-        descending: bool,
+        options: StrumOptions,
     ) -> Result<usize, FlpError> {
+        if !(-127..=127).contains(&options.velocity_amount) {
+            return Err(FlpError::UnsupportedEdit(
+                "strum velocity amount must be between -127 and 127",
+            ));
+        }
+        if !(-100..=100).contains(&options.velocity_tension_percent) {
+            return Err(FlpError::UnsupportedEdit(
+                "strum velocity tension must be between -100 and 100 percent",
+            ));
+        }
         let patterns = self.patterns()?;
         let pattern = patterns
             .iter()
@@ -9997,7 +10449,7 @@ impl FlpDocument {
             .ok_or(FlpError::UnsupportedEdit(
                 "the requested pattern does not exist",
             ))?;
-        let mut onset_groups = std::collections::BTreeMap::<u32, Vec<(usize, u16)>>::new();
+        let mut onset_groups = std::collections::BTreeMap::<u32, Vec<(usize, u16, u8)>>::new();
         let selected_indices =
             note_indices.map(|indices| indices.iter().copied().collect::<HashSet<_>>());
         for (note_index, note) in pattern
@@ -10009,28 +10461,51 @@ impl FlpDocument {
             if !note_index_in_scope(note_index, selected_indices.as_ref()) {
                 continue;
             }
-            onset_groups
-                .entry(note.position)
-                .or_default()
-                .push((note_index, note.key));
+            onset_groups.entry(note.position).or_default().push((
+                note_index,
+                note.key,
+                note.velocity,
+            ));
         }
 
         let mut edits = Vec::new();
         for (onset, mut group) in onset_groups {
-            if group.len() < 2 || spread_ticks == 0 {
+            if group.len() < 2 || (options.spread_ticks == 0 && options.velocity_amount == 0) {
                 continue;
             }
-            group.sort_by_key(|(note_index, key)| {
-                (if descending { u16::MAX - *key } else { *key }, *note_index)
+            group.sort_by_key(|(note_index, key, _)| {
+                (
+                    if options.descending {
+                        u16::MAX - *key
+                    } else {
+                        *key
+                    },
+                    *note_index,
+                )
             });
             let steps = u64::try_from(group.len() - 1).map_err(|_| FlpError::LengthOverflow)?;
-            for (rank, (note_index, _)) in group.into_iter().enumerate() {
+            let tension = f64::from(options.velocity_tension_percent) / 100.0;
+            let exponent = if tension >= 0.0 {
+                1.0 + 3.0 * tension
+            } else {
+                1.0 / (1.0 + 3.0 * tension.abs())
+            };
+            for (rank, (note_index, _, original_velocity)) in group.into_iter().enumerate() {
                 let rank = u64::try_from(rank).map_err(|_| FlpError::LengthOverflow)?;
-                let offset = u64::from(spread_ticks) * rank / steps;
+                let offset = u64::from(options.spread_ticks) * rank / steps;
                 let position = u64::from(onset) + offset;
                 let position = u32::try_from(position).map_err(|_| FlpError::LengthOverflow)?;
-                if position != onset {
-                    edits.push((note_index, position));
+                let progress = (rank as f64 / steps as f64).powf(exponent);
+                let velocity_delta = -f64::from(options.velocity_amount) * progress;
+                let velocity = if velocity_delta == 0.0 {
+                    original_velocity
+                } else {
+                    (f64::from(original_velocity) + velocity_delta)
+                        .round()
+                        .clamp(0.0, 127.0) as u8
+                };
+                if position != onset || velocity != original_velocity {
+                    edits.push((note_index, position, velocity));
                 }
             }
         }
@@ -10039,13 +10514,14 @@ impl FlpDocument {
         }
 
         let mut updated = self.clone();
-        for (note_index, position) in &edits {
+        for (note_index, position, velocity) in &edits {
             updated.edit_pattern_note(
                 pattern_id,
                 channel_id,
                 *note_index,
                 PatternNoteEdit {
                     position: Some(*position),
+                    velocity: Some(*velocity),
                     ..PatternNoteEdit::default()
                 },
             )?;
@@ -10871,6 +11347,253 @@ impl FlpDocument {
         Ok(stroke_count)
     }
 
+    /// Generates seeded notes on a grid inside the requested tick range.
+    /// The end tick is exclusive; new notes use FL Studio's observed neutral defaults.
+    pub fn generate_random_pattern_notes(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        options: RandomNoteGeneratorOptions,
+    ) -> Result<usize, FlpError> {
+        self.generate_random_pattern_notes_in_scale(pattern_id, channel_id, options, None)
+    }
+
+    /// Generates seeded notes on a grid while limiting pitches to the supplied scale.
+    pub fn generate_random_pattern_notes_with_scale(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        options: RandomNoteGeneratorOptions,
+        scale_root: u8,
+        scale_intervals: &[u8],
+    ) -> Result<usize, FlpError> {
+        self.generate_random_pattern_notes_in_scale(
+            pattern_id,
+            channel_id,
+            options,
+            Some((scale_root, scale_intervals)),
+        )
+    }
+
+    fn generate_random_pattern_notes_in_scale(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        options: RandomNoteGeneratorOptions,
+        scale: Option<(u8, &[u8])>,
+    ) -> Result<usize, FlpError> {
+        if options.start_tick >= options.end_tick {
+            return Err(FlpError::UnsupportedEdit(
+                "random note generation requires a non-empty tick range",
+            ));
+        }
+        if options.step_ticks == 0 || options.note_length_ticks == 0 {
+            return Err(FlpError::UnsupportedEdit(
+                "random note generation step and note length must be greater than zero ticks",
+            ));
+        }
+        if options.density_percent > 100 {
+            return Err(FlpError::UnsupportedEdit(
+                "random note generation density must be between 0 and 100 percent",
+            ));
+        }
+        if !(1..=16).contains(&options.notes_per_step) {
+            return Err(FlpError::UnsupportedEdit(
+                "random note generation stack must be between 1 and 16 notes per step",
+            ));
+        }
+        if !(-100..=100).contains(&options.length_variation_percent) {
+            return Err(FlpError::UnsupportedEdit(
+                "random note length variation must be between -100 and 100 percent",
+            ));
+        }
+        if options.minimum_key > options.maximum_key || options.maximum_key > 127 {
+            return Err(FlpError::UnsupportedEdit(
+                "random note generation key range must be ordered and remain within keys 0 through 127",
+            ));
+        }
+        let (minimum_key, maximum_key) = match (options.base_octave, options.range_octaves) {
+            (None, None) => (options.minimum_key, options.maximum_key),
+            (Some(base_octave), Some(range_octaves)) => {
+                if base_octave > 10 {
+                    return Err(FlpError::UnsupportedEdit(
+                        "random note generation base octave must be between 0 and 10",
+                    ));
+                }
+                if !(1..=11).contains(&range_octaves) {
+                    return Err(FlpError::UnsupportedEdit(
+                        "random note generation octave range must be between 1 and 11",
+                    ));
+                }
+                let octave_start = u16::from(base_octave) * 12;
+                let octave_end =
+                    (u32::from(octave_start) + u32::from(range_octaves) * 12).min(127) as u16;
+                (
+                    options.minimum_key.max(octave_start),
+                    options.maximum_key.min(octave_end),
+                )
+            }
+            _ => {
+                return Err(FlpError::UnsupportedEdit(
+                    "random note generation base octave and octave range must be set together",
+                ));
+            }
+        };
+        if minimum_key > maximum_key {
+            return Err(FlpError::UnsupportedEdit(
+                "random note generation octave range does not overlap the selected key bounds",
+            ));
+        }
+        if options.chord_map.is_some() && options.chord_root > 11 {
+            return Err(FlpError::UnsupportedEdit(
+                "random note generation chord root must be between 0 and 11",
+            ));
+        }
+        if let Some((scale_root, scale_intervals)) = scale
+            && (scale_root > 11
+                || scale_intervals.is_empty()
+                || scale_intervals.first() != Some(&0)
+                || scale_intervals.iter().any(|interval| *interval > 11)
+                || scale_intervals.windows(2).any(|pair| pair[0] >= pair[1]))
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "random note generation scale intervals must be unique, ordered pitch classes starting at zero",
+            ));
+        }
+
+        self.require_unique_channel(channel_id)?;
+        let pattern = self
+            .patterns()?
+            .into_iter()
+            .find(|pattern| pattern.id == pattern_id)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested pattern does not exist",
+            ))?;
+        let grid_positions = u64::from(options.end_tick - options.start_tick)
+            .div_ceil(u64::from(options.step_ticks));
+        let note_opportunities = grid_positions * u64::from(options.notes_per_step);
+        if note_opportunities > MAX_MERGED_PATTERN_NOTES as u64 {
+            return Err(FlpError::UnsupportedEdit(
+                "random note generation is limited to two million grid-note positions",
+            ));
+        }
+
+        let pitches = (minimum_key..=maximum_key)
+            .filter(|key| {
+                scale.is_none_or(|(root, intervals)| {
+                    note_pitch_in_scale(i32::from(*key), root, intervals)
+                }) && options.chord_map.is_none_or(|chord_map| {
+                    chord_map.intervals().iter().any(|interval| {
+                        (u16::from(options.chord_root) + u16::from(*interval)) % 12 == *key % 12
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        if pitches.is_empty() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested key range contains no notes from the selected scale",
+            ));
+        }
+        if pitches.len() < usize::from(options.notes_per_step) {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested key range does not contain enough distinct pitches for the selected stack",
+            ));
+        }
+
+        let mut state = if options.seed == 0 {
+            0x9e37_79b9_7f4a_7c15
+        } else {
+            options.seed
+        };
+        let mut length_state = state ^ 0xd1b5_4a32_d192_ed03;
+        let available_notes = MAX_MERGED_PATTERN_NOTES.saturating_sub(pattern.notes.len());
+        let initial_capacity = usize::try_from(note_opportunities.min(available_notes as u64))
+            .map_err(|_| FlpError::LengthOverflow)?
+            .min(65_536);
+        let mut additions = Vec::with_capacity(initial_capacity);
+        let mut position = u64::from(options.start_tick);
+        let end_tick = u64::from(options.end_tick);
+        while position < end_tick {
+            let selected = options.density_percent == 100
+                || (options.density_percent > 0
+                    && next_randomizer_value(&mut state) % 100
+                        < u64::from(options.density_percent));
+            if selected {
+                let remaining_ticks = end_tick - position;
+                let mut selected_pitches = Vec::with_capacity(usize::from(options.notes_per_step));
+                while selected_pitches.len() < usize::from(options.notes_per_step) {
+                    let pitch_index =
+                        (next_randomizer_value(&mut state) % pitches.len() as u64) as usize;
+                    let pitch = pitches[pitch_index];
+                    if !selected_pitches.contains(&pitch) {
+                        selected_pitches.push(pitch);
+                    }
+                }
+                let base_length = u64::from(options.note_length_ticks);
+                let variation_percent = u64::from(options.length_variation_percent.unsigned_abs());
+                let maximum_variation = base_length.saturating_mul(variation_percent).div_ceil(100);
+                let variation = if maximum_variation == 0 {
+                    0
+                } else {
+                    next_randomizer_value(&mut length_state) % (maximum_variation + 1)
+                };
+                let varied_length = if options.length_variation_percent < 0 {
+                    base_length.saturating_sub(variation).max(1)
+                } else {
+                    base_length.saturating_add(variation)
+                };
+                let length = varied_length.min(remaining_ticks);
+                for key in selected_pitches {
+                    if additions.len() >= available_notes {
+                        return Err(FlpError::UnsupportedEdit(
+                            "random note generation would exceed two million notes in this pattern",
+                        ));
+                    }
+                    additions.push(PatternNote {
+                        position: u32::try_from(position).map_err(|_| FlpError::LengthOverflow)?,
+                        length: u32::try_from(length).map_err(|_| FlpError::LengthOverflow)?,
+                        key,
+                        channel_id,
+                        ..PatternNote::default()
+                    });
+                }
+            }
+            position = position.saturating_add(u64::from(options.step_ticks));
+        }
+
+        let additions = if options.merge_repeated_notes {
+            additions.sort_by_key(|note| (note.key, note.position));
+            let mut merged: Vec<PatternNote> = Vec::with_capacity(additions.len());
+            for note in additions {
+                if let Some(previous) = merged.last_mut() {
+                    let previous_end = u64::from(previous.position) + u64::from(previous.length);
+                    if previous.key == note.key && u64::from(note.position) <= previous_end {
+                        let note_end = u64::from(note.position) + u64::from(note.length);
+                        previous.length = u32::try_from(
+                            previous_end.max(note_end) - u64::from(previous.position),
+                        )
+                        .map_err(|_| FlpError::LengthOverflow)?;
+                        continue;
+                    }
+                }
+                merged.push(note);
+            }
+            merged.sort_by_key(|note| (note.position, note.key));
+            merged
+        } else {
+            additions
+        };
+
+        if additions.is_empty() {
+            return Ok(0);
+        }
+        let created = additions.len();
+        let mut updated = self.clone();
+        updated.add_pattern_notes(pattern_id, &additions)?;
+        *self = updated;
+        Ok(created)
+    }
+
     /// Randomizes channel note velocity, pan, and pitch from a repeatable seed.
     /// Negative level amounts favor lower values; bipolar mode applies offsets in either direction.
     pub fn randomize_pattern_notes(
@@ -10949,15 +11672,21 @@ impl FlpDocument {
             seed,
             velocity_amount_percent,
             pan_amount_percent,
+            release_amount_percent,
+            mod_x_amount_percent,
+            mod_y_amount_percent,
             pitch_range_semitones,
             bipolar,
             reset_levels,
         } = options;
         if !(-100..=100).contains(&velocity_amount_percent)
             || !(-100..=100).contains(&pan_amount_percent)
+            || !(-100..=100).contains(&release_amount_percent)
+            || !(-100..=100).contains(&mod_x_amount_percent)
+            || !(-100..=100).contains(&mod_y_amount_percent)
         {
             return Err(FlpError::UnsupportedEdit(
-                "randomizer velocity and pan amounts must be between -100 and 100",
+                "randomizer level amounts must be between -100 and 100",
             ));
         }
         if pitch_range_semitones > 24 {
@@ -11009,9 +11738,27 @@ impl FlpDocument {
             } else {
                 i32::from(note.pan)
             };
+            let release_base = if reset_levels {
+                64
+            } else {
+                i32::from(note.release)
+            };
+            let mod_x_base = if reset_levels {
+                128
+            } else {
+                i32::from(note.mod_x)
+            };
+            let mod_y_base = if reset_levels {
+                128
+            } else {
+                i32::from(note.mod_y)
+            };
             let velocity_range =
                 (127 * i32::from(velocity_amount_percent.unsigned_abs()) + 50) / 100;
             let pan_range = (127 * i32::from(pan_amount_percent.unsigned_abs()) + 50) / 100;
+            let release_range = (128 * i32::from(release_amount_percent.unsigned_abs()) + 50) / 100;
+            let mod_x_range = (255 * i32::from(mod_x_amount_percent.unsigned_abs()) + 50) / 100;
+            let mod_y_range = (255 * i32::from(mod_y_amount_percent.unsigned_abs()) + 50) / 100;
             let velocity_offset = randomizer_offset(
                 &mut state,
                 velocity_range,
@@ -11024,6 +11771,51 @@ impl FlpDocument {
                 pan_amount_percent.is_negative(),
                 bipolar,
             );
+            // Keep the established velocity, pan, and pitch random stream order stable.
+            let (key, pitch_changed) = match scale {
+                Some((scale_root, scale_intervals)) if pitch_range_semitones > 0 => (
+                    randomizer_pitch_in_scale(
+                        &mut state,
+                        note.key,
+                        pitch_range_semitones,
+                        bipolar,
+                        scale_root,
+                        scale_intervals,
+                    ),
+                    true,
+                ),
+                _ if pitch_range_semitones > 0 => {
+                    let pitch_offset = randomizer_offset(
+                        &mut state,
+                        i32::from(pitch_range_semitones),
+                        false,
+                        bipolar,
+                    );
+                    (
+                        (i32::from(note.key) + pitch_offset).clamp(0, i32::from(u16::MAX)) as u16,
+                        true,
+                    )
+                }
+                _ => (note.key, false),
+            };
+            let release_offset = randomizer_offset(
+                &mut state,
+                release_range,
+                release_amount_percent.is_negative(),
+                bipolar,
+            );
+            let mod_x_offset = randomizer_offset(
+                &mut state,
+                mod_x_range,
+                mod_x_amount_percent.is_negative(),
+                bipolar,
+            );
+            let mod_y_offset = randomizer_offset(
+                &mut state,
+                mod_y_range,
+                mod_y_amount_percent.is_negative(),
+                bipolar,
+            );
             let velocity = if !reset_levels && velocity_amount_percent == 0 {
                 note.velocity
             } else {
@@ -11034,30 +11826,17 @@ impl FlpDocument {
             } else {
                 (pan_base + pan_offset).clamp(0, 127) as u8
             };
-            let key = match scale {
-                Some((scale_root, scale_intervals)) if pitch_range_semitones > 0 => {
-                    randomizer_pitch_in_scale(
-                        &mut state,
-                        note.key,
-                        pitch_range_semitones,
-                        bipolar,
-                        scale_root,
-                        scale_intervals,
-                    )
-                }
-                _ if pitch_range_semitones > 0 => {
-                    let pitch_offset = randomizer_offset(
-                        &mut state,
-                        i32::from(pitch_range_semitones),
-                        false,
-                        bipolar,
-                    );
-                    (i32::from(note.key) + pitch_offset).clamp(0, i32::from(u16::MAX)) as u16
-                }
-                _ => note.key,
-            };
-            if velocity != note.velocity || pan != note.pan || key != note.key {
-                edits.push((note_index, velocity, pan, key));
+            let release = (release_base + release_offset).clamp(0, 128) as u8;
+            let mod_x = (mod_x_base + mod_x_offset).clamp(0, 255) as u8;
+            let mod_y = (mod_y_base + mod_y_offset).clamp(0, 255) as u8;
+            if velocity != note.velocity
+                || pan != note.pan
+                || (pitch_changed && key != note.key)
+                || release != note.release
+                || mod_x != note.mod_x
+                || mod_y != note.mod_y
+            {
+                edits.push((note_index, velocity, pan, key, release, mod_x, mod_y));
             }
         }
         if edits.is_empty() {
@@ -11065,7 +11844,7 @@ impl FlpDocument {
         }
 
         let mut updated = self.clone();
-        for (note_index, velocity, pan, key) in &edits {
+        for (note_index, velocity, pan, key, release, mod_x, mod_y) in &edits {
             updated.edit_pattern_note(
                 pattern_id,
                 channel_id,
@@ -11074,6 +11853,9 @@ impl FlpDocument {
                     velocity: Some(*velocity),
                     pan: Some(*pan),
                     key: Some(*key),
+                    release: Some(*release),
+                    mod_x: Some(*mod_x),
+                    mod_y: Some(*mod_y),
                     ..PatternNoteEdit::default()
                 },
             )?;
@@ -11221,14 +12003,27 @@ impl FlpDocument {
         timing_range_ticks: u32,
         velocity_variation_percent: u8,
     ) -> Result<usize, FlpError> {
-        self.humanize_pattern_notes_in_scope(
+        self.humanize_pattern_notes_with_options(
             pattern_id,
             channel_id,
-            None,
             seed,
-            timing_range_ticks,
-            velocity_variation_percent,
+            HumanizerOptions {
+                timing_range_ticks,
+                velocity_variation_percent,
+                ..HumanizerOptions::default()
+            },
         )
+    }
+
+    /// Adds seeded timing variation and note-level variation to channel notes.
+    pub fn humanize_pattern_notes_with_options(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        seed: u64,
+        options: HumanizerOptions,
+    ) -> Result<usize, FlpError> {
+        self.humanize_pattern_notes_in_scope(pattern_id, channel_id, None, seed, options)
     }
 
     /// Adds timing and velocity variation only to selected notes.
@@ -11241,13 +12036,34 @@ impl FlpDocument {
         timing_range_ticks: u32,
         velocity_variation_percent: u8,
     ) -> Result<usize, FlpError> {
+        self.humanize_pattern_note_selection_with_options(
+            pattern_id,
+            channel_id,
+            note_indices,
+            seed,
+            HumanizerOptions {
+                timing_range_ticks,
+                velocity_variation_percent,
+                ..HumanizerOptions::default()
+            },
+        )
+    }
+
+    /// Adds timing and note-level variation only to selected notes.
+    pub fn humanize_pattern_note_selection_with_options(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: &[usize],
+        seed: u64,
+        options: HumanizerOptions,
+    ) -> Result<usize, FlpError> {
         self.humanize_pattern_notes_in_scope(
             pattern_id,
             channel_id,
             Some(note_indices),
             seed,
-            timing_range_ticks,
-            velocity_variation_percent,
+            options,
         )
     }
 
@@ -11257,15 +12073,19 @@ impl FlpDocument {
         channel_id: u16,
         note_indices: Option<&[usize]>,
         seed: u64,
-        timing_range_ticks: u32,
-        velocity_variation_percent: u8,
+        options: HumanizerOptions,
     ) -> Result<usize, FlpError> {
-        if velocity_variation_percent > 100 {
+        if options.velocity_variation_percent > 100
+            || options.pan_variation_percent > 100
+            || options.release_variation_percent > 100
+            || options.mod_x_variation_percent > 100
+            || options.mod_y_variation_percent > 100
+        {
             return Err(FlpError::UnsupportedEdit(
-                "humanize velocity variation must be between 0 and 100 percent",
+                "humanize level variations must be between 0 and 100 percent",
             ));
         }
-        if timing_range_ticks > i32::MAX as u32 {
+        if options.timing_range_ticks > i32::MAX as u32 {
             return Err(FlpError::UnsupportedEdit(
                 "humanize timing range must fit a signed 32-bit tick offset",
             ));
@@ -11282,7 +12102,11 @@ impl FlpDocument {
         } else {
             seed
         };
-        let velocity_range = (127 * i32::from(velocity_variation_percent) + 50) / 100;
+        let velocity_range = (127 * i32::from(options.velocity_variation_percent) + 50) / 100;
+        let pan_range = (127 * i32::from(options.pan_variation_percent) + 50) / 100;
+        let release_range = (128 * i32::from(options.release_variation_percent) + 50) / 100;
+        let mod_x_range = (255 * i32::from(options.mod_x_variation_percent) + 50) / 100;
+        let mod_y_range = (255 * i32::from(options.mod_y_variation_percent) + 50) / 100;
         let selected_indices =
             note_indices.map(|indices| indices.iter().copied().collect::<HashSet<_>>());
         let mut edits = Vec::new();
@@ -11295,20 +12119,50 @@ impl FlpDocument {
         {
             let timing_offset = randomizer_offset(
                 &mut state,
-                i32::try_from(timing_range_ticks).map_err(|_| FlpError::LengthOverflow)?,
+                i32::try_from(options.timing_range_ticks).map_err(|_| FlpError::LengthOverflow)?,
                 false,
                 true,
             );
             let position = (i64::from(note.position) + i64::from(timing_offset))
                 .clamp(0, i64::from(u32::MAX)) as u32;
             let velocity_offset = randomizer_offset(&mut state, velocity_range, false, true);
-            let velocity = if velocity_variation_percent == 0 {
+            let velocity = if options.velocity_variation_percent == 0 {
                 note.velocity
             } else {
                 (i32::from(note.velocity) + velocity_offset).clamp(0, 127) as u8
             };
-            if position != note.position || velocity != note.velocity {
-                edits.push((note_index, position, velocity));
+            let pan_offset = randomizer_offset(&mut state, pan_range, false, true);
+            let pan = if options.pan_variation_percent == 0 {
+                note.pan
+            } else {
+                (i32::from(note.pan) + pan_offset).clamp(0, 127) as u8
+            };
+            let release_offset = randomizer_offset(&mut state, release_range, false, true);
+            let release = if options.release_variation_percent == 0 {
+                note.release
+            } else {
+                (i32::from(note.release) + release_offset).clamp(0, 128) as u8
+            };
+            let mod_x_offset = randomizer_offset(&mut state, mod_x_range, false, true);
+            let mod_x = if options.mod_x_variation_percent == 0 {
+                note.mod_x
+            } else {
+                (i32::from(note.mod_x) + mod_x_offset).clamp(0, 255) as u8
+            };
+            let mod_y_offset = randomizer_offset(&mut state, mod_y_range, false, true);
+            let mod_y = if options.mod_y_variation_percent == 0 {
+                note.mod_y
+            } else {
+                (i32::from(note.mod_y) + mod_y_offset).clamp(0, 255) as u8
+            };
+            if position != note.position
+                || velocity != note.velocity
+                || pan != note.pan
+                || release != note.release
+                || mod_x != note.mod_x
+                || mod_y != note.mod_y
+            {
+                edits.push((note_index, position, velocity, pan, release, mod_x, mod_y));
             }
         }
         if edits.is_empty() {
@@ -11316,7 +12170,7 @@ impl FlpDocument {
         }
 
         let mut updated = self.clone();
-        for (note_index, position, velocity) in &edits {
+        for (note_index, position, velocity, pan, release, mod_x, mod_y) in &edits {
             updated.edit_pattern_note(
                 pattern_id,
                 channel_id,
@@ -11324,6 +12178,10 @@ impl FlpDocument {
                 PatternNoteEdit {
                     position: Some(*position),
                     velocity: Some(*velocity),
+                    pan: Some(*pan),
+                    release: Some(*release),
+                    mod_x: Some(*mod_x),
+                    mod_y: Some(*mod_y),
                     ..PatternNoteEdit::default()
                 },
             )?;
@@ -22649,6 +23507,9 @@ mod tests {
             seed: 41,
             velocity_amount_percent: 0,
             pan_amount_percent: 0,
+            release_amount_percent: 0,
+            mod_x_amount_percent: 0,
+            mod_y_amount_percent: 0,
             pitch_range_semitones: 5,
             bipolar: true,
             reset_levels: false,

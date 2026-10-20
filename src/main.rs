@@ -14,10 +14,14 @@ use flp_rebuild::sample_render::{
 };
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions};
 use flp_rebuild::{
-    ArpeggioDirection, ArpeggioOptions, AutomationPointEdit, ChannelLevelAdjustmentsEdit,
-    FlpDocument, FstPreset, PatternControllerEdit, PatternNote, PatternNoteEdit, PlaylistClipEdit,
+    ArpeggioDirection, ArpeggioOptions, ArticulateOptions, AutomationPointEdit,
+    ChannelLevelAdjustmentsEdit, ChannelSortOrder, ClawMachineOptions, FlamOptions, FlpDocument,
+    FstPreset, HumanizerOptions, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit,
+    PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation, PlaylistClipEdit,
     PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit,
-    ProjectSettingsEdit, RandomizerOptions, TimeMarkerEdit,
+    ProjectSettingsEdit, QuantizeNoteMode, QuantizeNoteOptions, RandomNoteChordMap,
+    RandomNoteGeneratorOptions, RandomizerOptions, RiffMachineOptions, RiffMachineQuantizeMode,
+    ScaleLevelsOptions, StrumOptions, TimeMarkerEdit,
 };
 
 fn main() -> ExitCode {
@@ -40,6 +44,9 @@ fn run(args: Vec<String>) -> Result<(), String> {
         }
         [command, path] if command == "global-swing" => show_global_swing(Path::new(path)),
         [command, path] if command == "channels" => list_channels(Path::new(path)),
+        [command, path] if command == "channel-groups" => {
+            list_channel_groups(Path::new(path))
+        }
         [command, path] if command == "mixer" => list_mixer(Path::new(path)),
         [command, path] if command == "automation" => list_automation(Path::new(path)),
         [command, path] if command == "time-markers" => list_time_markers(Path::new(path)),
@@ -165,6 +172,53 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_f32(value, "controller value")?,
             )
         }
+        [command, input, output, pattern_id, channel, flags, points]
+            if command == "draw-pattern-controller-points" =>
+        {
+            let points = parse_pattern_controller_points(points)?;
+            draw_pattern_controller_points(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                (
+                    parse_u8(channel, "controller channel")?,
+                    parse_u8(flags, "controller flags")?,
+                ),
+                &points,
+            )
+        }
+        [command, input, output, pattern_id, channel, flags, start_tick, end_tick]
+            if command == "linearize-pattern-controllers" =>
+        {
+            edit_pattern_controller_range(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                (
+                    parse_u8(channel, "controller channel")?,
+                    parse_u8(flags, "controller flags")?,
+                ),
+                parse_u32(start_tick, "controller range start")?,
+                parse_u32(end_tick, "controller range end")?,
+                PatternControllerRangeOperation::Linear,
+            )
+        }
+        [command, input, output, pattern_id, channel, flags, start_tick, end_tick]
+            if command == "spline-pattern-controllers" =>
+        {
+            edit_pattern_controller_range(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                (
+                    parse_u8(channel, "controller channel")?,
+                    parse_u8(flags, "controller flags")?,
+                ),
+                parse_u32(start_tick, "controller range start")?,
+                parse_u32(end_tick, "controller range end")?,
+                PatternControllerRangeOperation::Spline,
+            )
+        }
         [command, input, output, pattern_id, controller_index]
             if command == "delete-pattern-controller" =>
         {
@@ -173,6 +227,22 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 Path::new(output),
                 parse_u16(pattern_id, "pattern id")?,
                 parse_usize(controller_index, "Pattern controller index")?,
+            )
+        }
+        [command, input, output, pattern_id, channel, flags, start_tick, end_tick]
+            if command == "delete-pattern-controller-range" =>
+        {
+            edit_pattern_controller_range(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                (
+                    parse_u8(channel, "controller channel")?,
+                    parse_u8(flags, "controller flags")?,
+                ),
+                parse_u32(start_tick, "controller range start")?,
+                parse_u32(end_tick, "controller range end")?,
+                PatternControllerRangeOperation::Delete,
             )
         }
         [command, path] if command == "playlist" => list_playlist(Path::new(path), 0, 16),
@@ -275,6 +345,13 @@ fn run(args: Vec<String>) -> Result<(), String> {
         }
         [command, input, output] if command == "create-pattern" => {
             create_pattern(Path::new(input), Path::new(output))
+        }
+        [command, input, output, pattern_id] if command == "duplicate-pattern" => {
+            duplicate_pattern(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+            )
         }
         [command, input, output, cents] if command == "set-project-master-pitch" => {
             write_project_settings(
@@ -390,12 +467,85 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 .map_err(|_| "channel id must be an integer from 0 through 65535".to_owned())?;
             rename_channel(Path::new(input), Path::new(output), channel_id, name)
         }
+        [command, input, output, sample_path, name] if command == "create-sampler-channel" => {
+            create_sample_channel(Path::new(input), Path::new(output), sample_path, name, false)
+        }
+        [command, input, output, sample_path, name] if command == "create-audio-channel" => {
+            create_sample_channel(Path::new(input), Path::new(output), sample_path, name, true)
+        }
+        [command, input, output, name] if command == "create-channel-group" => {
+            create_channel_group(Path::new(input), Path::new(output), name)
+        }
+        [command, input, output, channel_ids, name] if command == "group-channels" => {
+            group_channels(
+                Path::new(input),
+                Path::new(output),
+                &parse_channel_id_list(channel_ids)?,
+                name,
+            )
+        }
+        [command, input, output, group_index, name] if command == "rename-channel-group" => {
+            rename_channel_group(
+                Path::new(input),
+                Path::new(output),
+                parse_channel_group_index(group_index)?,
+                name,
+            )
+        }
+        [command, input, output, group_index] if command == "delete-channel-group" => {
+            delete_channel_group(
+                Path::new(input),
+                Path::new(output),
+                parse_channel_group_index(group_index)?,
+            )
+        }
         [command, input, output, channel_id, color] if command == "set-channel-color" => {
             set_channel_color(
                 Path::new(input),
                 Path::new(output),
                 parse_u16(channel_id, "channel id")?,
                 parse_rgb_hex(color)?,
+            )
+        }
+        [command, input, output, channel_id, target_index] if command == "move-channel" => {
+            move_channel(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(channel_id, "channel id")?,
+                parse_usize(target_index, "target Channel Rack index")?,
+            )
+        }
+        [command, input, output, channel_ids] if command == "reorder-channels" => {
+            reorder_channels(
+                Path::new(input),
+                Path::new(output),
+                &parse_channel_id_list(channel_ids)?,
+            )
+        }
+        [command, input, output, order] if command == "sort-channels" => {
+            sort_channels(
+                Path::new(input),
+                Path::new(output),
+                parse_channel_sort_order(order)?,
+            )
+        }
+        [command, input, output, channel_ids, color] if command == "set-channel-colors" => {
+            set_channel_colors(
+                Path::new(input),
+                Path::new(output),
+                &parse_channel_id_list(channel_ids)?,
+                parse_rgb_hex(color)?,
+            )
+        }
+        [command, input, output, channel_ids, start_color, end_color]
+            if command == "set-channel-color-gradient" =>
+        {
+            set_channel_color_gradient(
+                Path::new(input),
+                Path::new(output),
+                &parse_channel_id_list(channel_ids)?,
+                parse_rgb_hex(start_color)?,
+                parse_rgb_hex(end_color)?,
             )
         }
         [command, input, output, channel_id, enabled]
@@ -406,6 +556,78 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 Path::new(output),
                 parse_u16(channel_id, "channel id")?,
                 parse_bool(enabled, "Enable main pitch setting")?,
+            )
+        }
+        [command, input, output, channel_id, enabled] if command == "set-channel-enabled" => {
+            set_channel_enabled(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(channel_id, "channel id")?,
+                parse_bool(enabled, "channel enabled setting")?,
+            )
+        }
+        [command, input, output, channel_id, sample_path]
+            if command == "set-channel-sample-path" =>
+        {
+            set_channel_sample_path(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(channel_id, "channel id")?,
+                sample_path,
+            )
+        }
+        [command, input, output, event_index, record_index, value]
+            if command == "set-mixer-parameter-record-value" =>
+        {
+            let value = value
+                .parse::<i32>()
+                .map_err(|_| "Mixer parameter value must be a signed 32-bit integer".to_owned())?;
+            set_mixer_parameter_record_value(
+                Path::new(input),
+                Path::new(output),
+                parse_usize(event_index, "Mixer event index")?,
+                parse_usize(record_index, "Mixer record index")?,
+                value,
+            )
+        }
+        [command, input, output, insert_ordinal, name]
+            if command == "rename-mixer-insert" =>
+        {
+            rename_mixer_insert(
+                Path::new(input),
+                Path::new(output),
+                parse_usize(insert_ordinal, "Mixer insert ordinal")?,
+                name,
+            )
+        }
+        [command, input, output, insert_ordinal, field, enabled]
+            if command == "set-mixer-insert-flag" =>
+        {
+            set_mixer_insert_flag(
+                Path::new(input),
+                Path::new(output),
+                parse_usize(insert_ordinal, "Mixer insert ordinal")?,
+                field,
+                parse_bool(enabled, "Mixer insert flag")?,
+            )
+        }
+        [command, input, output, event_index, routing_flag_index, enabled]
+            if command == "set-mixer-routing-flag" =>
+        {
+            set_mixer_routing_flag(
+                Path::new(input),
+                Path::new(output),
+                parse_usize(event_index, "Mixer routing event index")?,
+                parse_usize(routing_flag_index, "Mixer routing flag byte index")?,
+                parse_bool(enabled, "Mixer routing flag")?,
+            )
+        }
+        [command, input, output, channel_id, zipped] if command == "set-channel-zipped" => {
+            set_channel_zipped(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(channel_id, "channel id")?,
+                parse_bool(zipped, "channel zipped setting")?,
             )
         }
         [command, input, output, channel_id, enabled]
@@ -513,6 +735,17 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_usize(point_index, "automation point index")?,
             )
         }
+        [command, input, output, channel_id, first_point_index, last_point_index]
+            if command == "interpolate-automation-points" =>
+        {
+            interpolate_automation_points(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(channel_id, "channel id")?,
+                parse_usize(first_point_index, "first automation point index")?,
+                parse_usize(last_point_index, "last automation point index")?,
+            )
+        }
         [command, input, output, pattern_id, channel_id, note_index, position, length, key, velocity]
             if command == "edit-note" =>
         {
@@ -553,6 +786,46 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 },
             )
         }
+        [command, input, output, pattern_id, channel_id, grid_ticks, strength, swing,
+            sensitivity, duration_strength, mode]
+            if command == "quantize-notes" =>
+        {
+            quantize_notes_with_options(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                QuantizeNoteOptions {
+                    grid_ticks: parse_u32(grid_ticks, "quantize grid ticks")?,
+                    start_strength: parse_f64(strength, "quantize start strength")?,
+                    swing: parse_f64(swing, "quantize swing")?,
+                    sensitivity: parse_f64(sensitivity, "quantize sensitivity")?,
+                    duration_strength: parse_f64(duration_strength, "quantize duration strength")?,
+                    mode: parse_quantize_note_mode(mode)?,
+                },
+            )
+        }
+        [command, input, output, pattern_id, channel_id, note_indices, grid_ticks, strength, swing,
+            sensitivity, duration_strength, mode]
+            if command == "quantize-notes-selected" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            quantize_notes_with_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Some(&note_indices),
+                QuantizeNoteOptions {
+                    grid_ticks: parse_u32(grid_ticks, "quantize grid ticks")?,
+                    start_strength: parse_f64(strength, "quantize start strength")?,
+                    swing: parse_f64(swing, "quantize swing")?,
+                    sensitivity: parse_f64(sensitivity, "quantize sensitivity")?,
+                    duration_strength: parse_f64(duration_strength, "quantize duration strength")?,
+                    mode: parse_quantize_note_mode(mode)?,
+                },
+            )
+        }
         [command, input, output, pattern_id, channel_id, grid_ticks, strength, swing]
             if command == "quantize-notes" =>
         {
@@ -564,6 +837,63 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u32(grid_ticks, "quantize grid ticks")?,
                 parse_f64(strength, "quantize strength")?,
                 parse_f64(swing, "quantize swing")?,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, note_indices, grid_ticks, strength, swing]
+            if command == "quantize-notes-selected" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            quantize_notes_with_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Some(&note_indices),
+                QuantizeNoteOptions {
+                    grid_ticks: parse_u32(grid_ticks, "quantize grid ticks")?,
+                    start_strength: parse_f64(strength, "quantize strength")?,
+                    swing: parse_f64(swing, "quantize swing")?,
+                    ..QuantizeNoteOptions::default()
+                },
+            )
+        }
+        [command, input, output, pattern_id, channel_id, snap_ticks, direction]
+            if command == "rotate-notes" =>
+        {
+            rotate_notes_with_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                None,
+                parse_u32(snap_ticks, "note rotation snap ticks")?,
+                parse_note_rotation(direction)?,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, note_indices, snap_ticks, direction]
+            if command == "rotate-notes-selected" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            rotate_notes_with_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Some(&note_indices),
+                parse_u32(snap_ticks, "note rotation snap ticks")?,
+                parse_note_rotation(direction)?,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, note_indices]
+            if command == "legato-notes-selected" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            legato_notes_with_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Some(&note_indices),
             )
         }
         [command, input, output, pattern_id, channel_id] if command == "legato-notes" => {
@@ -585,6 +915,44 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u8(divisions, "note chop divisions")?,
             )
         }
+        [command, input, output, pattern_id, channel_id, note_indices, divisions]
+            if command == "chop-notes-selected" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            chop_notes_with_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Some(&note_indices),
+                parse_u8(divisions, "note chop divisions")?,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, snap_ticks]
+            if command == "quick-chop-notes" =>
+        {
+            quick_chop_notes_with_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                None,
+                parse_u32(snap_ticks, "quick chop snap ticks")?,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, note_indices, snap_ticks]
+            if command == "quick-chop-notes-selected" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            quick_chop_notes_with_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Some(&note_indices),
+                parse_u32(snap_ticks, "quick chop snap ticks")?,
+            )
+        }
         [command, input, output, pattern_id, channel_id] if command == "glue-notes" => {
             glue_notes(
                 Path::new(input),
@@ -593,12 +961,61 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u16(channel_id, "channel id")?,
             )
         }
+        [command, input, output, pattern_id, channel_id, note_indices]
+            if command == "glue-notes-selected" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            glue_notes_with_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Some(&note_indices),
+            )
+        }
         [command, input, output, pattern_id, channel_id] if command == "flip-notes" => {
             flip_notes(
                 Path::new(input),
                 Path::new(output),
                 parse_u16(pattern_id, "pattern id")?,
                 parse_u16(channel_id, "channel id")?,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, note_indices]
+            if command == "flip-notes-selected" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            flip_notes_with_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Some(&note_indices),
+            )
+        }
+        [command, input, output, pattern_id, channel_id, spread_ticks, direction,
+            velocity_amount, velocity_tension]
+            if command == "strum-notes" =>
+        {
+            let descending = match direction.as_str() {
+                "up" => false,
+                "down" => true,
+                _ => return Err("strum direction must be 'up' or 'down'".to_owned()),
+            };
+            strum_notes_with_options(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                StrumOptions {
+                    spread_ticks: parse_u32(spread_ticks, "strum spread")?,
+                    descending,
+                    velocity_amount: parse_i16(velocity_amount, "strum velocity amount")?,
+                    velocity_tension_percent: parse_i16(
+                        velocity_tension,
+                        "strum velocity tension",
+                    )?,
+                },
             )
         }
         [command, input, output, pattern_id, channel_id, spread_ticks, direction]
@@ -616,6 +1033,45 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u16(channel_id, "channel id")?,
                 parse_u32(spread_ticks, "strum spread")?,
                 descending,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, note_indices, spread_ticks, direction,
+            velocity_amount, velocity_tension]
+            if command == "strum-notes-selected" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            strum_notes_with_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Some(&note_indices),
+                StrumOptions {
+                    spread_ticks: parse_u32(spread_ticks, "strum spread")?,
+                    descending: parse_strum_direction(direction)?,
+                    velocity_amount: parse_i16(velocity_amount, "strum velocity amount")?,
+                    velocity_tension_percent: parse_i16(
+                        velocity_tension,
+                        "strum velocity tension",
+                    )?,
+                },
+            )
+        }
+        [command, input, output, pattern_id, channel_id, note_indices, spread_ticks, direction]
+            if command == "strum-notes-selected" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            strum_notes_with_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Some(&note_indices),
+                StrumOptions {
+                    spread_ticks: parse_u32(spread_ticks, "strum spread")?,
+                    descending: parse_strum_direction(direction)?,
+                    ..StrumOptions::default()
+                },
             )
         }
         [command, input, output, pattern_id, channel_id, stroke_ticks, velocity, placement]
@@ -636,6 +1092,452 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 before,
             )
         }
+        [command, input, output, pattern_id, channel_id, stroke_ticks, velocity, placement,
+            group_notes]
+            if command == "flam-notes" =>
+        {
+            let before = parse_flam_placement(placement)?;
+            flam_notes_with_options(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                None,
+                FlamOptions {
+                    stroke_ticks: parse_u32(stroke_ticks, "flam stroke time")?,
+                    velocity: parse_u8(velocity, "flam velocity")?,
+                    before,
+                    group_notes: parse_bool(group_notes, "group notes")?,
+                },
+            )
+        }
+        [command, input, output, pattern_id, channel_id, note_indices, stroke_ticks, velocity,
+            placement]
+            if command == "flam-notes-selected" =>
+        {
+            let before = parse_flam_placement(placement)?;
+            let note_indices = parse_note_indices(note_indices)?;
+            flam_notes_with_options(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Some(&note_indices),
+                FlamOptions {
+                    stroke_ticks: parse_u32(stroke_ticks, "flam stroke time")?,
+                    velocity: parse_u8(velocity, "flam velocity")?,
+                    before,
+                    group_notes: false,
+                },
+            )
+        }
+        [command, input, output, pattern_id, channel_id, note_indices, stroke_ticks, velocity,
+            placement, group_notes]
+            if command == "flam-notes-selected" =>
+        {
+            let before = parse_flam_placement(placement)?;
+            let note_indices = parse_note_indices(note_indices)?;
+            flam_notes_with_options(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Some(&note_indices),
+                FlamOptions {
+                    stroke_ticks: parse_u32(stroke_ticks, "flam stroke time")?,
+                    velocity: parse_u8(velocity, "flam velocity")?,
+                    before,
+                    group_notes: parse_bool(group_notes, "group notes")?,
+                },
+            )
+        }
+        [command, input, output, pattern_id, channel_id, start_tick, end_tick, step_ticks,
+            note_length_ticks, density, minimum_key, maximum_key, seed, stack, length_variation,
+            merge_same_notes, base_octave, range_octaves, chord_map_name, chord_root]
+            if command == "generate-random-notes" =>
+        {
+            generate_random_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                RandomNoteGeneratorOptions {
+                    seed: parse_u64(seed, "random note generator seed")?,
+                    start_tick: parse_u32(start_tick, "generation start tick")?,
+                    end_tick: parse_u32(end_tick, "generation end tick")?,
+                    step_ticks: parse_u32(step_ticks, "generation step")?,
+                    note_length_ticks: parse_u32(note_length_ticks, "generated note length")?,
+                    density_percent: parse_u8(density, "generation density")?,
+                    notes_per_step: parse_u8(stack, "note stack")?,
+                    length_variation_percent: parse_i16(
+                        length_variation,
+                        "note length variation",
+                    )?,
+                    merge_repeated_notes: parse_bool(merge_same_notes, "merge same notes")?,
+                    base_octave: Some(parse_u8(base_octave, "base octave")?),
+                    range_octaves: Some(parse_u8(range_octaves, "octave range")?),
+                    chord_map: Some(parse_random_note_chord_map(chord_map_name)?),
+                    chord_root: parse_u8(chord_root, "chord-map root")?,
+                    minimum_key: u16::from(parse_u8(minimum_key, "minimum key")?),
+                    maximum_key: u16::from(parse_u8(maximum_key, "maximum key")?),
+                },
+                None,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, start_tick, end_tick, step_ticks,
+            note_length_ticks, density, minimum_key, maximum_key, seed, scale_name, scale_root,
+            stack, length_variation, merge_same_notes, base_octave, range_octaves, chord_map_name,
+            chord_root]
+            if command == "generate-random-notes-scale" =>
+        {
+            let scale_intervals = parse_scale_name(scale_name)?;
+            generate_random_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                RandomNoteGeneratorOptions {
+                    seed: parse_u64(seed, "random note generator seed")?,
+                    start_tick: parse_u32(start_tick, "generation start tick")?,
+                    end_tick: parse_u32(end_tick, "generation end tick")?,
+                    step_ticks: parse_u32(step_ticks, "generation step")?,
+                    note_length_ticks: parse_u32(note_length_ticks, "generated note length")?,
+                    density_percent: parse_u8(density, "generation density")?,
+                    notes_per_step: parse_u8(stack, "note stack")?,
+                    length_variation_percent: parse_i16(
+                        length_variation,
+                        "note length variation",
+                    )?,
+                    merge_repeated_notes: parse_bool(merge_same_notes, "merge same notes")?,
+                    base_octave: Some(parse_u8(base_octave, "base octave")?),
+                    range_octaves: Some(parse_u8(range_octaves, "octave range")?),
+                    chord_map: Some(parse_random_note_chord_map(chord_map_name)?),
+                    chord_root: parse_u8(chord_root, "chord-map root")?,
+                    minimum_key: u16::from(parse_u8(minimum_key, "minimum key")?),
+                    maximum_key: u16::from(parse_u8(maximum_key, "maximum key")?),
+                },
+                Some((parse_u8(scale_root, "scale root")?, scale_intervals)),
+            )
+        }
+        [command, input, output, pattern_id, channel_id, start_tick, end_tick, step_ticks,
+            note_length_ticks, density, minimum_key, maximum_key, seed, stack, length_variation,
+            merge_same_notes, base_octave, range_octaves]
+            if command == "generate-random-notes" =>
+        {
+            generate_random_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                RandomNoteGeneratorOptions {
+                    seed: parse_u64(seed, "random note generator seed")?,
+                    start_tick: parse_u32(start_tick, "generation start tick")?,
+                    end_tick: parse_u32(end_tick, "generation end tick")?,
+                    step_ticks: parse_u32(step_ticks, "generation step")?,
+                    note_length_ticks: parse_u32(note_length_ticks, "generated note length")?,
+                    density_percent: parse_u8(density, "generation density")?,
+                    notes_per_step: parse_u8(stack, "note stack")?,
+                    length_variation_percent: parse_i16(
+                        length_variation,
+                        "note length variation",
+                    )?,
+                    merge_repeated_notes: parse_bool(merge_same_notes, "merge same notes")?,
+                    base_octave: Some(parse_u8(base_octave, "base octave")?),
+                    range_octaves: Some(parse_u8(range_octaves, "octave range")?),
+                    chord_map: None,
+                    chord_root: 0,
+                    minimum_key: u16::from(parse_u8(minimum_key, "minimum key")?),
+                    maximum_key: u16::from(parse_u8(maximum_key, "maximum key")?),
+                },
+                None,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, start_tick, end_tick, step_ticks,
+            note_length_ticks, density, minimum_key, maximum_key, seed, scale_name, scale_root,
+            stack, length_variation, merge_same_notes, base_octave, range_octaves]
+            if command == "generate-random-notes-scale" =>
+        {
+            let scale_intervals = parse_scale_name(scale_name)?;
+            generate_random_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                RandomNoteGeneratorOptions {
+                    seed: parse_u64(seed, "random note generator seed")?,
+                    start_tick: parse_u32(start_tick, "generation start tick")?,
+                    end_tick: parse_u32(end_tick, "generation end tick")?,
+                    step_ticks: parse_u32(step_ticks, "generation step")?,
+                    note_length_ticks: parse_u32(note_length_ticks, "generated note length")?,
+                    density_percent: parse_u8(density, "generation density")?,
+                    notes_per_step: parse_u8(stack, "note stack")?,
+                    length_variation_percent: parse_i16(
+                        length_variation,
+                        "note length variation",
+                    )?,
+                    merge_repeated_notes: parse_bool(merge_same_notes, "merge same notes")?,
+                    base_octave: Some(parse_u8(base_octave, "base octave")?),
+                    range_octaves: Some(parse_u8(range_octaves, "octave range")?),
+                    chord_map: None,
+                    chord_root: 0,
+                    minimum_key: u16::from(parse_u8(minimum_key, "minimum key")?),
+                    maximum_key: u16::from(parse_u8(maximum_key, "maximum key")?),
+                },
+                Some((parse_u8(scale_root, "scale root")?, scale_intervals)),
+            )
+        }
+        [command, input, output, pattern_id, channel_id, start_tick, end_tick, step_ticks,
+            note_length_ticks, density, minimum_key, maximum_key, seed, stack, length_variation,
+            merge_same_notes]
+            if command == "generate-random-notes" =>
+        {
+            generate_random_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                RandomNoteGeneratorOptions {
+                    seed: parse_u64(seed, "random note generator seed")?,
+                    start_tick: parse_u32(start_tick, "generation start tick")?,
+                    end_tick: parse_u32(end_tick, "generation end tick")?,
+                    step_ticks: parse_u32(step_ticks, "generation step")?,
+                    note_length_ticks: parse_u32(note_length_ticks, "generated note length")?,
+                    density_percent: parse_u8(density, "generation density")?,
+                    notes_per_step: parse_u8(stack, "note stack")?,
+                    length_variation_percent: parse_i16(
+                        length_variation,
+                        "note length variation",
+                    )?,
+                    merge_repeated_notes: parse_bool(merge_same_notes, "merge same notes")?,
+                    base_octave: None,
+                    range_octaves: None,
+                    chord_map: None,
+                    chord_root: 0,
+                    minimum_key: u16::from(parse_u8(minimum_key, "minimum key")?),
+                    maximum_key: u16::from(parse_u8(maximum_key, "maximum key")?),
+                },
+                None,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, start_tick, end_tick, step_ticks,
+            note_length_ticks, density, minimum_key, maximum_key, seed, scale_name, scale_root,
+            stack, length_variation, merge_same_notes]
+            if command == "generate-random-notes-scale" =>
+        {
+            let scale_intervals = parse_scale_name(scale_name)?;
+            generate_random_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                RandomNoteGeneratorOptions {
+                    seed: parse_u64(seed, "random note generator seed")?,
+                    start_tick: parse_u32(start_tick, "generation start tick")?,
+                    end_tick: parse_u32(end_tick, "generation end tick")?,
+                    step_ticks: parse_u32(step_ticks, "generation step")?,
+                    note_length_ticks: parse_u32(note_length_ticks, "generated note length")?,
+                    density_percent: parse_u8(density, "generation density")?,
+                    notes_per_step: parse_u8(stack, "note stack")?,
+                    length_variation_percent: parse_i16(
+                        length_variation,
+                        "note length variation",
+                    )?,
+                    merge_repeated_notes: parse_bool(merge_same_notes, "merge same notes")?,
+                    base_octave: None,
+                    range_octaves: None,
+                    chord_map: None,
+                    chord_root: 0,
+                    minimum_key: u16::from(parse_u8(minimum_key, "minimum key")?),
+                    maximum_key: u16::from(parse_u8(maximum_key, "maximum key")?),
+                },
+                Some((parse_u8(scale_root, "scale root")?, scale_intervals)),
+            )
+        }
+        [command, input, output, pattern_id, channel_id, start_tick, end_tick, step_ticks,
+            note_length_ticks, density, minimum_key, maximum_key, seed, stack, length_variation]
+            if command == "generate-random-notes" =>
+        {
+            generate_random_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                RandomNoteGeneratorOptions {
+                    seed: parse_u64(seed, "random note generator seed")?,
+                    start_tick: parse_u32(start_tick, "generation start tick")?,
+                    end_tick: parse_u32(end_tick, "generation end tick")?,
+                    step_ticks: parse_u32(step_ticks, "generation step")?,
+                    note_length_ticks: parse_u32(note_length_ticks, "generated note length")?,
+                    density_percent: parse_u8(density, "generation density")?,
+                    notes_per_step: parse_u8(stack, "note stack")?,
+                    length_variation_percent: parse_i16(
+                        length_variation,
+                        "note length variation",
+                    )?,
+                    merge_repeated_notes: false,
+                    base_octave: None,
+                    range_octaves: None,
+                    chord_map: None,
+                    chord_root: 0,
+                    minimum_key: u16::from(parse_u8(minimum_key, "minimum key")?),
+                    maximum_key: u16::from(parse_u8(maximum_key, "maximum key")?),
+                },
+                None,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, start_tick, end_tick, step_ticks,
+            note_length_ticks, density, minimum_key, maximum_key, seed, scale_name, scale_root,
+            stack, length_variation]
+            if command == "generate-random-notes-scale" =>
+        {
+            let scale_intervals = parse_scale_name(scale_name)?;
+            generate_random_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                RandomNoteGeneratorOptions {
+                    seed: parse_u64(seed, "random note generator seed")?,
+                    start_tick: parse_u32(start_tick, "generation start tick")?,
+                    end_tick: parse_u32(end_tick, "generation end tick")?,
+                    step_ticks: parse_u32(step_ticks, "generation step")?,
+                    note_length_ticks: parse_u32(note_length_ticks, "generated note length")?,
+                    density_percent: parse_u8(density, "generation density")?,
+                    notes_per_step: parse_u8(stack, "note stack")?,
+                    length_variation_percent: parse_i16(
+                        length_variation,
+                        "note length variation",
+                    )?,
+                    merge_repeated_notes: false,
+                    base_octave: None,
+                    range_octaves: None,
+                    chord_map: None,
+                    chord_root: 0,
+                    minimum_key: u16::from(parse_u8(minimum_key, "minimum key")?),
+                    maximum_key: u16::from(parse_u8(maximum_key, "maximum key")?),
+                },
+                Some((parse_u8(scale_root, "scale root")?, scale_intervals)),
+            )
+        }
+        [command, input, output, pattern_id, channel_id, start_tick, end_tick, step_ticks,
+            note_length_ticks, density, minimum_key, maximum_key, seed, stack]
+            if command == "generate-random-notes" =>
+        {
+            generate_random_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                RandomNoteGeneratorOptions {
+                    seed: parse_u64(seed, "random note generator seed")?,
+                    start_tick: parse_u32(start_tick, "generation start tick")?,
+                    end_tick: parse_u32(end_tick, "generation end tick")?,
+                    step_ticks: parse_u32(step_ticks, "generation step")?,
+                    note_length_ticks: parse_u32(note_length_ticks, "generated note length")?,
+                    density_percent: parse_u8(density, "generation density")?,
+                    notes_per_step: parse_u8(stack, "note stack")?,
+                    length_variation_percent: 0,
+                    merge_repeated_notes: false,
+                    base_octave: None,
+                    range_octaves: None,
+                    chord_map: None,
+                    chord_root: 0,
+                    minimum_key: u16::from(parse_u8(minimum_key, "minimum key")?),
+                    maximum_key: u16::from(parse_u8(maximum_key, "maximum key")?),
+                },
+                None,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, start_tick, end_tick, step_ticks,
+            note_length_ticks, density, minimum_key, maximum_key, seed, scale_name, scale_root,
+            stack]
+            if command == "generate-random-notes-scale" =>
+        {
+            let scale_intervals = parse_scale_name(scale_name)?;
+            generate_random_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                RandomNoteGeneratorOptions {
+                    seed: parse_u64(seed, "random note generator seed")?,
+                    start_tick: parse_u32(start_tick, "generation start tick")?,
+                    end_tick: parse_u32(end_tick, "generation end tick")?,
+                    step_ticks: parse_u32(step_ticks, "generation step")?,
+                    note_length_ticks: parse_u32(note_length_ticks, "generated note length")?,
+                    density_percent: parse_u8(density, "generation density")?,
+                    notes_per_step: parse_u8(stack, "note stack")?,
+                    length_variation_percent: 0,
+                    merge_repeated_notes: false,
+                    base_octave: None,
+                    range_octaves: None,
+                    chord_map: None,
+                    chord_root: 0,
+                    minimum_key: u16::from(parse_u8(minimum_key, "minimum key")?),
+                    maximum_key: u16::from(parse_u8(maximum_key, "maximum key")?),
+                },
+                Some((parse_u8(scale_root, "scale root")?, scale_intervals)),
+            )
+        }
+        [command, input, output, pattern_id, channel_id, start_tick, end_tick, step_ticks,
+            note_length_ticks, density, minimum_key, maximum_key, seed]
+            if command == "generate-random-notes" =>
+        {
+            generate_random_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                RandomNoteGeneratorOptions {
+                    seed: parse_u64(seed, "random note generator seed")?,
+                    start_tick: parse_u32(start_tick, "generation start tick")?,
+                    end_tick: parse_u32(end_tick, "generation end tick")?,
+                    step_ticks: parse_u32(step_ticks, "generation step")?,
+                    note_length_ticks: parse_u32(note_length_ticks, "generated note length")?,
+                    density_percent: parse_u8(density, "generation density")?,
+                    notes_per_step: 1,
+                    length_variation_percent: 0,
+                    merge_repeated_notes: false,
+                    base_octave: None,
+                    range_octaves: None,
+                    chord_map: None,
+                    chord_root: 0,
+                    minimum_key: u16::from(parse_u8(minimum_key, "minimum key")?),
+                    maximum_key: u16::from(parse_u8(maximum_key, "maximum key")?),
+                },
+                None,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, start_tick, end_tick, step_ticks,
+            note_length_ticks, density, minimum_key, maximum_key, seed, scale_name, scale_root]
+            if command == "generate-random-notes-scale" =>
+        {
+            let scale_intervals = parse_scale_name(scale_name)?;
+            generate_random_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                RandomNoteGeneratorOptions {
+                    seed: parse_u64(seed, "random note generator seed")?,
+                    start_tick: parse_u32(start_tick, "generation start tick")?,
+                    end_tick: parse_u32(end_tick, "generation end tick")?,
+                    step_ticks: parse_u32(step_ticks, "generation step")?,
+                    note_length_ticks: parse_u32(note_length_ticks, "generated note length")?,
+                    density_percent: parse_u8(density, "generation density")?,
+                    notes_per_step: 1,
+                    length_variation_percent: 0,
+                    merge_repeated_notes: false,
+                    base_octave: None,
+                    range_octaves: None,
+                    chord_map: None,
+                    chord_root: 0,
+                    minimum_key: u16::from(parse_u8(minimum_key, "minimum key")?),
+                    maximum_key: u16::from(parse_u8(maximum_key, "maximum key")?),
+                },
+                Some((parse_u8(scale_root, "scale root")?, scale_intervals)),
+            )
+        }
         [command, input, output, pattern_id, channel_id, seed, velocity_amount, pan_amount,
             pitch_range, bipolar, reset_levels]
             if command == "randomize-notes" =>
@@ -649,6 +1551,31 @@ fn run(args: Vec<String>) -> Result<(), String> {
                     seed: parse_u64(seed, "randomizer seed")?,
                     velocity_amount_percent: parse_i16(velocity_amount, "velocity amount")?,
                     pan_amount_percent: parse_i16(pan_amount, "pan amount")?,
+                    release_amount_percent: 0,
+                    mod_x_amount_percent: 0,
+                    mod_y_amount_percent: 0,
+                    pitch_range_semitones: parse_u8(pitch_range, "pitch range")?,
+                    bipolar: parse_bool(bipolar, "bipolar")?,
+                    reset_levels: parse_bool(reset_levels, "reset levels")?,
+                },
+            )
+        }
+        [command, input, output, pattern_id, channel_id, seed, velocity_amount, pan_amount,
+            pitch_range, bipolar, reset_levels, release_amount, mod_x_amount, mod_y_amount]
+            if command == "randomize-notes" =>
+        {
+            randomize_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                RandomizerOptions {
+                    seed: parse_u64(seed, "randomizer seed")?,
+                    velocity_amount_percent: parse_i16(velocity_amount, "velocity amount")?,
+                    pan_amount_percent: parse_i16(pan_amount, "pan amount")?,
+                    release_amount_percent: parse_i16(release_amount, "release amount")?,
+                    mod_x_amount_percent: parse_i16(mod_x_amount, "Mod X amount")?,
+                    mod_y_amount_percent: parse_i16(mod_y_amount, "Mod Y amount")?,
                     pitch_range_semitones: parse_u8(pitch_range, "pitch range")?,
                     bipolar: parse_bool(bipolar, "bipolar")?,
                     reset_levels: parse_bool(reset_levels, "reset levels")?,
@@ -669,12 +1596,145 @@ fn run(args: Vec<String>) -> Result<(), String> {
                     seed: parse_u64(seed, "randomizer seed")?,
                     velocity_amount_percent: parse_i16(velocity_amount, "velocity amount")?,
                     pan_amount_percent: parse_i16(pan_amount, "pan amount")?,
+                    release_amount_percent: 0,
+                    mod_x_amount_percent: 0,
+                    mod_y_amount_percent: 0,
                     pitch_range_semitones: parse_u8(pitch_range, "pitch range")?,
                     bipolar: parse_bool(bipolar, "bipolar")?,
                     reset_levels: parse_bool(reset_levels, "reset levels")?,
                 },
                 parse_u8(scale_root, "scale root")?,
                 scale_intervals,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, seed, velocity_amount, pan_amount,
+            pitch_range, bipolar, reset_levels, scale_name, scale_root, release_amount,
+            mod_x_amount, mod_y_amount]
+            if command == "randomize-notes-scale" =>
+        {
+            let scale_intervals = parse_scale_name(scale_name)?;
+            randomize_notes_with_scale(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                RandomizerOptions {
+                    seed: parse_u64(seed, "randomizer seed")?,
+                    velocity_amount_percent: parse_i16(velocity_amount, "velocity amount")?,
+                    pan_amount_percent: parse_i16(pan_amount, "pan amount")?,
+                    release_amount_percent: parse_i16(release_amount, "release amount")?,
+                    mod_x_amount_percent: parse_i16(mod_x_amount, "Mod X amount")?,
+                    mod_y_amount_percent: parse_i16(mod_y_amount, "Mod Y amount")?,
+                    pitch_range_semitones: parse_u8(pitch_range, "pitch range")?,
+                    bipolar: parse_bool(bipolar, "bipolar")?,
+                    reset_levels: parse_bool(reset_levels, "reset levels")?,
+                },
+                parse_u8(scale_root, "scale root")?,
+                scale_intervals,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, note_indices, seed, velocity_amount,
+            pan_amount, pitch_range, bipolar, reset_levels]
+            if command == "randomize-notes-selected" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            randomize_notes_selection(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                &note_indices,
+                RandomizerOptions {
+                    seed: parse_u64(seed, "randomizer seed")?,
+                    velocity_amount_percent: parse_i16(velocity_amount, "velocity amount")?,
+                    pan_amount_percent: parse_i16(pan_amount, "pan amount")?,
+                    release_amount_percent: 0,
+                    mod_x_amount_percent: 0,
+                    mod_y_amount_percent: 0,
+                    pitch_range_semitones: parse_u8(pitch_range, "pitch range")?,
+                    bipolar: parse_bool(bipolar, "bipolar")?,
+                    reset_levels: parse_bool(reset_levels, "reset levels")?,
+                },
+                None,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, note_indices, seed, velocity_amount,
+            pan_amount, pitch_range, bipolar, reset_levels, release_amount, mod_x_amount,
+            mod_y_amount]
+            if command == "randomize-notes-selected" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            randomize_notes_selection(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                &note_indices,
+                RandomizerOptions {
+                    seed: parse_u64(seed, "randomizer seed")?,
+                    velocity_amount_percent: parse_i16(velocity_amount, "velocity amount")?,
+                    pan_amount_percent: parse_i16(pan_amount, "pan amount")?,
+                    release_amount_percent: parse_i16(release_amount, "release amount")?,
+                    mod_x_amount_percent: parse_i16(mod_x_amount, "Mod X amount")?,
+                    mod_y_amount_percent: parse_i16(mod_y_amount, "Mod Y amount")?,
+                    pitch_range_semitones: parse_u8(pitch_range, "pitch range")?,
+                    bipolar: parse_bool(bipolar, "bipolar")?,
+                    reset_levels: parse_bool(reset_levels, "reset levels")?,
+                },
+                None,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, note_indices, seed, velocity_amount,
+            pan_amount, pitch_range, bipolar, reset_levels, scale_name, scale_root]
+            if command == "randomize-notes-selected-scale" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            let scale_intervals = parse_scale_name(scale_name)?;
+            randomize_notes_selection(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                &note_indices,
+                RandomizerOptions {
+                    seed: parse_u64(seed, "randomizer seed")?,
+                    velocity_amount_percent: parse_i16(velocity_amount, "velocity amount")?,
+                    pan_amount_percent: parse_i16(pan_amount, "pan amount")?,
+                    release_amount_percent: 0,
+                    mod_x_amount_percent: 0,
+                    mod_y_amount_percent: 0,
+                    pitch_range_semitones: parse_u8(pitch_range, "pitch range")?,
+                    bipolar: parse_bool(bipolar, "bipolar")?,
+                    reset_levels: parse_bool(reset_levels, "reset levels")?,
+                },
+                Some((parse_u8(scale_root, "scale root")?, scale_intervals)),
+            )
+        }
+        [command, input, output, pattern_id, channel_id, note_indices, seed, velocity_amount,
+            pan_amount, pitch_range, bipolar, reset_levels, scale_name, scale_root, release_amount,
+            mod_x_amount, mod_y_amount]
+            if command == "randomize-notes-selected-scale" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            let scale_intervals = parse_scale_name(scale_name)?;
+            randomize_notes_selection(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                &note_indices,
+                RandomizerOptions {
+                    seed: parse_u64(seed, "randomizer seed")?,
+                    velocity_amount_percent: parse_i16(velocity_amount, "velocity amount")?,
+                    pan_amount_percent: parse_i16(pan_amount, "pan amount")?,
+                    release_amount_percent: parse_i16(release_amount, "release amount")?,
+                    mod_x_amount_percent: parse_i16(mod_x_amount, "Mod X amount")?,
+                    mod_y_amount_percent: parse_i16(mod_y_amount, "Mod Y amount")?,
+                    pitch_range_semitones: parse_u8(pitch_range, "pitch range")?,
+                    bipolar: parse_bool(bipolar, "bipolar")?,
+                    reset_levels: parse_bool(reset_levels, "reset levels")?,
+                },
+                Some((parse_u8(scale_root, "scale root")?, scale_intervals)),
             )
         }
         [command, input, output, pattern_id, channel_id, seed, timing_range, velocity_variation]
@@ -686,8 +1746,85 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u16(pattern_id, "pattern id")?,
                 parse_u16(channel_id, "channel id")?,
                 parse_u64(seed, "humanize seed")?,
-                parse_u32(timing_range, "timing range")?,
-                parse_u8(velocity_variation, "velocity variation")?,
+                HumanizerOptions {
+                    timing_range_ticks: parse_u32(timing_range, "timing range")?,
+                    velocity_variation_percent: parse_u8(
+                        velocity_variation,
+                        "velocity variation",
+                    )?,
+                    ..HumanizerOptions::default()
+                },
+            )
+        }
+        [command, input, output, pattern_id, channel_id, seed, timing_range, velocity_variation,
+            pan_variation, release_variation, mod_x_variation, mod_y_variation]
+            if command == "humanize-notes" =>
+        {
+            humanize_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                parse_u64(seed, "humanize seed")?,
+                HumanizerOptions {
+                    timing_range_ticks: parse_u32(timing_range, "timing range")?,
+                    velocity_variation_percent: parse_u8(
+                        velocity_variation,
+                        "velocity variation",
+                    )?,
+                    pan_variation_percent: parse_u8(pan_variation, "pan variation")?,
+                    release_variation_percent: parse_u8(release_variation, "release variation")?,
+                    mod_x_variation_percent: parse_u8(mod_x_variation, "Mod X variation")?,
+                    mod_y_variation_percent: parse_u8(mod_y_variation, "Mod Y variation")?,
+                },
+            )
+        }
+        [command, input, output, pattern_id, channel_id, note_indices, seed, timing_range,
+            velocity_variation]
+            if command == "humanize-notes-selected" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            humanize_notes_with_options(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Some(&note_indices),
+                parse_u64(seed, "humanize seed")?,
+                HumanizerOptions {
+                    timing_range_ticks: parse_u32(timing_range, "timing range")?,
+                    velocity_variation_percent: parse_u8(
+                        velocity_variation,
+                        "velocity variation",
+                    )?,
+                    ..HumanizerOptions::default()
+                },
+            )
+        }
+        [command, input, output, pattern_id, channel_id, note_indices, seed, timing_range,
+            velocity_variation, pan_variation, release_variation, mod_x_variation,
+            mod_y_variation]
+            if command == "humanize-notes-selected" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            humanize_notes_with_options(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Some(&note_indices),
+                parse_u64(seed, "humanize seed")?,
+                HumanizerOptions {
+                    timing_range_ticks: parse_u32(timing_range, "timing range")?,
+                    velocity_variation_percent: parse_u8(
+                        velocity_variation,
+                        "velocity variation",
+                    )?,
+                    pan_variation_percent: parse_u8(pan_variation, "pan variation")?,
+                    release_variation_percent: parse_u8(release_variation, "release variation")?,
+                    mod_x_variation_percent: parse_u8(mod_x_variation, "Mod X variation")?,
+                    mod_y_variation_percent: parse_u8(mod_y_variation, "Mod Y variation")?,
+                },
             )
         }
         [command, input, output, pattern_id, channel_id, minimum_key, maximum_key]
@@ -700,6 +1837,67 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u16(channel_id, "channel id")?,
                 parse_u16(minimum_key, "minimum key")?,
                 parse_u16(maximum_key, "maximum key")?,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, minimum_key, maximum_key, wrap_to_bottom,
+            scale_name, scale_root, snap_direction]
+            if command == "limit-notes" =>
+        {
+            limit_notes_with_options(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                None,
+                parse_limit_note_options(
+                    minimum_key,
+                    maximum_key,
+                    wrap_to_bottom,
+                    scale_name,
+                    scale_root,
+                    snap_direction,
+                )?,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, note_indices, minimum_key, maximum_key]
+            if command == "limit-notes-selected" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            limit_notes_with_options(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Some(&note_indices),
+                LimitNoteOptions {
+                    minimum_key: parse_u16(minimum_key, "minimum key")?,
+                    maximum_key: parse_u16(maximum_key, "maximum key")?,
+                    wrap_to_bottom: false,
+                    scale_root: None,
+                    scale_intervals: None,
+                    snap_direction: LimitSnapDirection::Up,
+                },
+            )
+        }
+        [command, input, output, pattern_id, channel_id, note_indices, minimum_key, maximum_key,
+            wrap_to_bottom, scale_name, scale_root, snap_direction]
+            if command == "limit-notes-selected" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            limit_notes_with_options(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Some(&note_indices),
+                parse_limit_note_options(
+                    minimum_key,
+                    maximum_key,
+                    wrap_to_bottom,
+                    scale_name,
+                    scale_root,
+                    snap_direction,
+                )?,
             )
         }
         [command, input, output, pattern_id, channel_id, step_ticks, range_octaves, gate, direction]
@@ -719,6 +1917,50 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 },
             )
         }
+        [command, input, output, pattern_id, channel_id, note_indices, step_ticks, range_octaves,
+            gate, direction]
+            if command == "arp-notes-selected" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            arpeggiate_notes_with_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Some(&note_indices),
+                ArpeggioOptions {
+                    step_ticks: parse_u32(step_ticks, "arpeggiator step")?,
+                    range_octaves: parse_u8(range_octaves, "arpeggiator range")?,
+                    gate_percent: parse_u8(gate, "arpeggiator gate")?,
+                    direction: parse_arpeggio_direction(direction)?,
+                },
+            )
+        }
+        [command, input, output, pattern_id, channel_id, options @ ..]
+            if command == "riff-machine-notes" =>
+        {
+            riff_machine_notes_with_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                None,
+                parse_riff_machine_options(options)?,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, note_indices, options @ ..]
+            if command == "riff-machine-notes-selected" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            riff_machine_notes_with_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Some(&note_indices),
+                parse_riff_machine_options(options)?,
+            )
+        }
         [command, input, output, pattern_id, channel_id, position_ticks]
             if command == "slice-notes" =>
         {
@@ -728,6 +1970,158 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u16(pattern_id, "pattern id")?,
                 parse_u16(channel_id, "channel id")?,
                 parse_u32(position_ticks, "slice position")?,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, note_indices, position_ticks]
+            if command == "slice-notes-selected" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            slice_notes_with_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Some(&note_indices),
+                parse_u32(position_ticks, "slice position")?,
+            )
+        }
+        [command, input, output, pattern_id, note_cuts]
+            if command == "slice-notes-at-positions" =>
+        {
+            let note_cuts = parse_note_cuts(note_cuts)?;
+            slice_notes_at_positions(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                &note_cuts,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, center, tension, multiplier, offset]
+            if command == "scale-levels-notes" =>
+        {
+            scale_levels_notes_with_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                None,
+                ScaleLevelsOptions {
+                    center_percent: parse_i16(center, "Scale Levels center")?,
+                    tension_percent: parse_i16(tension, "Scale Levels tension")?,
+                    multiplier_percent: parse_u16(multiplier, "Scale Levels multiplier")?,
+                    offset_percent: parse_i16(offset, "Scale Levels offset")?,
+                },
+            )
+        }
+        [command, input, output, pattern_id, channel_id, note_indices, center, tension,
+            multiplier, offset]
+            if command == "scale-levels-notes-selected" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            scale_levels_notes_with_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Some(&note_indices),
+                ScaleLevelsOptions {
+                    center_percent: parse_i16(center, "Scale Levels center")?,
+                    tension_percent: parse_i16(tension, "Scale Levels tension")?,
+                    multiplier_percent: parse_u16(multiplier, "Scale Levels multiplier")?,
+                    offset_percent: parse_i16(offset, "Scale Levels offset")?,
+                },
+            )
+        }
+        [command, input, output, pattern_id, channel_id, multiplier, variation, seed,
+            use_original_lengths, chop_chords]
+            if command == "articulate-notes" =>
+        {
+            articulate_notes_with_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                None,
+                ArticulateOptions {
+                    multiplier_percent: parse_u8(multiplier, "Articulate multiplier")?,
+                    variation_percent: parse_u8(variation, "Articulate variation")?,
+                    seed: parse_u64(seed, "Articulate seed")?,
+                    use_original_lengths: parse_bool(use_original_lengths, "use original lengths")?,
+                    chop_chords: parse_bool(chop_chords, "chop chords")?,
+                },
+                false,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, note_indices, multiplier, variation,
+            seed, use_original_lengths, chop_chords, only_with_selection]
+            if command == "articulate-notes-selected" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            articulate_notes_with_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Some(&note_indices),
+                ArticulateOptions {
+                    multiplier_percent: parse_u8(multiplier, "Articulate multiplier")?,
+                    variation_percent: parse_u8(variation, "Articulate variation")?,
+                    seed: parse_u64(seed, "Articulate seed")?,
+                    use_original_lengths: parse_bool(use_original_lengths, "use original lengths")?,
+                    chop_chords: parse_bool(chop_chords, "chop chords")?,
+                },
+                parse_bool(only_with_selection, "only with selection")?,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, period_ticks, trash_every,
+            time_distortion, remove_short_notes, stretch_to_compensate]
+            if command == "claw-notes" =>
+        {
+            claw_notes_with_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                None,
+                ClawMachineOptions {
+                    period_ticks: parse_u32(period_ticks, "Claw Machine period")?,
+                    trash_every: parse_u8(trash_every, "Claw Machine Trash every")?,
+                    time_distortion_percent: parse_i16(
+                        time_distortion,
+                        "Claw Machine time distortion",
+                    )?,
+                    remove_short_notes: parse_bool(remove_short_notes, "remove short notes")?,
+                    stretch_to_compensate: parse_bool(
+                        stretch_to_compensate,
+                        "stretch to compensate",
+                    )?,
+                },
+            )
+        }
+        [command, input, output, pattern_id, channel_id, note_indices, period_ticks,
+            trash_every, time_distortion, remove_short_notes, stretch_to_compensate]
+            if command == "claw-notes-selected" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            claw_notes_with_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Some(&note_indices),
+                ClawMachineOptions {
+                    period_ticks: parse_u32(period_ticks, "Claw Machine period")?,
+                    trash_every: parse_u8(trash_every, "Claw Machine Trash every")?,
+                    time_distortion_percent: parse_i16(
+                        time_distortion,
+                        "Claw Machine time distortion",
+                    )?,
+                    remove_short_notes: parse_bool(remove_short_notes, "remove short notes")?,
+                    stretch_to_compensate: parse_bool(
+                        stretch_to_compensate,
+                        "stretch to compensate",
+                    )?,
+                },
             )
         }
         [command, input, output, pattern_id, channel_id, position, length, key, velocity]
@@ -747,6 +2141,18 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 },
             )
         }
+        [command, input, output, pattern_id, channel_id, note_specs]
+            if command == "add-notes" =>
+        {
+            let channel_id = parse_u16(channel_id, "channel id")?;
+            let notes = parse_note_specs(channel_id, note_specs)?;
+            add_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                &notes,
+            )
+        }
         [command, input, output, pattern_id, channel_id, note_index] if command == "delete-note" => {
             delete_note(
                 Path::new(input),
@@ -754,6 +2160,53 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u16(pattern_id, "pattern id")?,
                 parse_u16(channel_id, "channel id")?,
                 parse_usize(note_index, "channel note index")?,
+            )
+        }
+        [command, input, output, pattern_id, channel_id] if command == "delete-notes" => {
+            delete_notes_with_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                None,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, note_indices]
+            if command == "delete-notes-selected" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            delete_notes_with_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Some(&note_indices),
+            )
+        }
+        [command, input, output, arrangement_id, pattern_id, position, length, track_index]
+            if command == "create-playlist-pattern-clip" =>
+        {
+            create_playlist_pattern_clip(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(arrangement_id, "arrangement id")?,
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u32(position, "clip position")?,
+                parse_u32(length, "clip length")?,
+                parse_u16(track_index, "zero-based Playlist track index")?,
+            )
+        }
+        [command, input, output, arrangement_id, channel_id, position, length, track_index]
+            if command == "create-playlist-audio-clip" =>
+        {
+            create_playlist_audio_clip(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(arrangement_id, "arrangement id")?,
+                parse_u16(channel_id, "Audio Clip channel id")?,
+                parse_u32(position, "clip position")?,
+                parse_u32(length, "clip length")?,
+                parse_u16(track_index, "zero-based Playlist track index")?,
             )
         }
         [command, input, output, arrangement_id, clip_index, position, length]
@@ -766,6 +2219,16 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_usize(clip_index, "clip index")?,
                 parse_u32(position, "clip position")?,
                 parse_u32(length, "clip length")?,
+            )
+        }
+        [command, input, output, arrangement_id, clip_index]
+            if command == "delete-playlist-clip" =>
+        {
+            delete_playlist_clip(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(arrangement_id, "arrangement id")?,
+                parse_usize(clip_index, "clip index")?,
             )
         }
         [command, input, output, arrangement_id, clip_index, muted]
@@ -1074,7 +2537,12 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild plugin-scan\n",
             "  flp-rebuild render-pattern-vst3 <project.flp> <pattern-id> <channel-id> <plugin.vst3> <output.{wav|flac|ogg|mp3}> [tail-seconds]\n",
             "  flp-rebuild channels <file.flp>\n",
+            "  flp-rebuild channel-groups <file.flp>\n",
             "  flp-rebuild mixer <file.flp>\n",
+            "  flp-rebuild set-mixer-parameter-record-value <input.flp> <output.flp> <event-index> <record-index> <signed-value>\n",
+            "  flp-rebuild rename-mixer-insert <input.flp> <output.flp> <insert-ordinal> <name>\n",
+            "  flp-rebuild set-mixer-insert-flag <input.flp> <output.flp> <insert-ordinal> <enabled|soloed|polarity-reversed|swap-left-right|effects-enabled> <0|1>\n",
+            "  flp-rebuild set-mixer-routing-flag <input.flp> <output.flp> <event-index> <flag-byte-index> <0|1>\n",
             "  flp-rebuild automation <file.flp>\n",
             "  flp-rebuild time-markers <file.flp>\n",
             "  flp-rebuild sample-paths <file.flp>\n",
@@ -1088,6 +2556,10 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild edit-pattern-controller <input.flp> <output.flp> <pattern-id> <controller-index> <position-ticks|-> <value|->\n",
             "  flp-rebuild duplicate-pattern-controller <input.flp> <output.flp> <pattern-id> <template-index> <position-ticks> <value>\n",
             "  flp-rebuild delete-pattern-controller <input.flp> <output.flp> <pattern-id> <controller-index>\n",
+            "  flp-rebuild draw-pattern-controller-points <input.flp> <output.flp> <pattern-id> <channel:0..255> <flags:0..255> <points:tick:value,...>\n",
+            "  flp-rebuild linearize-pattern-controllers <input.flp> <output.flp> <pattern-id> <channel:0..255> <flags:0..255> <start-tick> <end-tick>\n",
+            "  flp-rebuild spline-pattern-controllers <input.flp> <output.flp> <pattern-id> <channel:0..255> <flags:0..255> <start-tick> <end-tick>\n",
+            "  flp-rebuild delete-pattern-controller-range <input.flp> <output.flp> <pattern-id> <channel:0..255> <flags:0..255> <start-tick> <end-tick>\n",
             "  flp-rebuild playlist <file.flp> [start] [count]\n",
             "  flp-rebuild notes <file.flp> <pattern-id> [start] [count]\n",
             "  flp-rebuild events <file.flp> [start] [count]\n",
@@ -1095,6 +2567,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild roundtrip <input.flp> <output.flp>\n",
             "  flp-rebuild set-tempo <input.flp> <output.flp> <bpm>\n",
             "  flp-rebuild create-pattern <input.flp> <output.flp>\n",
+            "  flp-rebuild duplicate-pattern <input.flp> <output.flp> <pattern-id>\n",
             "  flp-rebuild set-project-info <input.flp> <output.flp> <title|-> <author|-> <genre|-> <comments|-> <web-link|->\n",
             "  flp-rebuild set-project-settings <input.flp> <output.flp> <play-truncated:0|1|-> <fast-declick:0|1|-> [pan-law-raw|-]\n",
             "  flp-rebuild set-project-master-pitch <input.flp> <output.flp> <cents:-1200..1200>\n",
@@ -1103,8 +2576,22 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild delete-pattern-time-signature <input.flp> <output.flp> <pattern-id> <position-ticks>\n",
             "  flp-rebuild set-global-swing <input.flp> <output.flp> <percent-0..100>\n",
             "  flp-rebuild rename-channel <input.flp> <output.flp> <channel-id> <name>\n",
+            "  flp-rebuild create-sampler-channel <input.flp> <output.flp> <sample-path> <name>\n",
+            "  flp-rebuild create-audio-channel <input.flp> <output.flp> <sample-path> <name>\n",
+            "  flp-rebuild create-channel-group <input.flp> <output.flp> <name>\n",
+            "  flp-rebuild group-channels <input.flp> <output.flp> <channel-ids:comma-separated> <name>\n",
+            "  flp-rebuild rename-channel-group <input.flp> <output.flp> <group-index> <name>\n",
+            "  flp-rebuild delete-channel-group <input.flp> <output.flp> <group-index>\n",
             "  flp-rebuild set-channel-color <input.flp> <output.flp> <channel-id> <RRGGBB>\n",
+            "  flp-rebuild move-channel <input.flp> <output.flp> <channel-id> <target-index:zero-based>\n",
+            "  flp-rebuild reorder-channels <input.flp> <output.flp> <complete-channel-id-order:comma-separated>\n",
+            "  flp-rebuild sort-channels <input.flp> <output.flp> <color|mixer-track|name|type>\n",
+            "  flp-rebuild set-channel-colors <input.flp> <output.flp> <channel-ids:comma-separated> <RRGGBB>\n",
+            "  flp-rebuild set-channel-color-gradient <input.flp> <output.flp> <channel-ids:comma-separated-in-order> <start-RRGGBB> <end-RRGGBB>\n",
             "  flp-rebuild set-channel-levels <input.flp> <output.flp> <channel-id> <volume-0..12800> <pan-0..12800>\n",
+            "  flp-rebuild set-channel-enabled <input.flp> <output.flp> <channel-id> <0|1>\n",
+            "  flp-rebuild set-channel-sample-path <input.flp> <output.flp> <channel-id> <sample-path>\n",
+            "  flp-rebuild set-channel-zipped <input.flp> <output.flp> <channel-id> <0|1>\n",
             "  flp-rebuild set-channel-main-pitch <input.flp> <output.flp> <channel-id> <0|1>\n",
             "  flp-rebuild set-channel-add-to-key <input.flp> <output.flp> <channel-id> <0|1>\n",
             "  flp-rebuild edit-channel-level-adjustments <input.flp> <output.flp> <channel-id> <event-index> <pan-raw|-> <volume-raw|-> <mod-x-raw|-> <mod-y-raw|->\n",
@@ -1114,25 +2601,60 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild edit-automation-point <input.flp> <output.flp> <channel-id> <point-index> <position-beats> <value> <tension>\n",
             "  flp-rebuild insert-automation-point <input.flp> <output.flp> <channel-id> <insertion-slot> <position-beats> <value> <tension>\n",
             "  flp-rebuild delete-automation-point <input.flp> <output.flp> <channel-id> <point-index>\n",
+            "  flp-rebuild interpolate-automation-points <input.flp> <output.flp> <channel-id> <first-point-index> <last-point-index>\n",
             "  flp-rebuild edit-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index> <position> <length> <key> <velocity>\n",
             "  flp-rebuild edit-note-properties <input.flp> <output.flp> <pattern-id> <channel-id> <note-index> <flags-raw|-> <group-raw|-> <fine-pitch|-> <release|-> <midi-channel-raw|-> <pan|-> <mod-x|-> <mod-y|->\n",
-            "  flp-rebuild quantize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <grid-ticks> <strength-0..1> <swing-0..1>\n",
+            "  flp-rebuild quantize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <grid-ticks> <start-strength-0..1> <swing-0..1> [sensitivity-0..1 duration-strength-0..1 leave-duration|leave-end|quantize-duration|quantize-end]\n",
+            "  flp-rebuild quantize-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <grid-ticks> <start-strength-0..1> <swing-0..1> [sensitivity-0..1 duration-strength-0..1 leave-duration|leave-end|quantize-duration|quantize-end]\n",
+            "  flp-rebuild rotate-notes <input.flp> <output.flp> <pattern-id> <channel-id> <snap-ticks> <left|right>\n",
+            "  flp-rebuild rotate-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <snap-ticks> <left|right>\n",
             "  flp-rebuild legato-notes <input.flp> <output.flp> <pattern-id> <channel-id>\n",
+            "  flp-rebuild legato-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based>\n",
             "  flp-rebuild chop-notes <input.flp> <output.flp> <pattern-id> <channel-id> <divisions-2..64>\n",
+            "  flp-rebuild chop-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <divisions-2..64>\n",
+            "  flp-rebuild quick-chop-notes <input.flp> <output.flp> <pattern-id> <channel-id> <snap-ticks>\n",
+            "  flp-rebuild quick-chop-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <snap-ticks>\n",
             "  flp-rebuild glue-notes <input.flp> <output.flp> <pattern-id> <channel-id>\n",
+            "  flp-rebuild glue-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based>\n",
             "  flp-rebuild flip-notes <input.flp> <output.flp> <pattern-id> <channel-id>\n",
-            "  flp-rebuild strum-notes <input.flp> <output.flp> <pattern-id> <channel-id> <spread-ticks> <up|down>\n",
-            "  flp-rebuild flam-notes <input.flp> <output.flp> <pattern-id> <channel-id> <stroke-ticks> <velocity-0..127> <before|after>\n",
-            "  flp-rebuild randomize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <velocity-amount:-100..100> <pan-amount:-100..100> <pitch-range:0..24> <bipolar:0|1> <reset:0|1>\n",
-            "  flp-rebuild randomize-notes-scale <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <velocity-amount:-100..100> <pan-amount:-100..100> <pitch-range:0..24> <bipolar:0|1> <reset:0|1> <scale-name> <scale-root:0..11>\n",
-            "  flp-rebuild humanize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <timing-range-ticks> <velocity-variation-0..100>\n",
-            "  flp-rebuild limit-notes <input.flp> <output.flp> <pattern-id> <channel-id> <minimum-key-0..127> <maximum-key-0..127>\n",
+            "  flp-rebuild flip-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based>\n",
+            "  flp-rebuild strum-notes <input.flp> <output.flp> <pattern-id> <channel-id> <spread-ticks> <up|down> [velocity-amount:-127..127 velocity-tension:-100..100]\n",
+            "  flp-rebuild strum-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <spread-ticks> <up|down> [velocity-amount:-127..127 velocity-tension:-100..100]\n",
+            "  flp-rebuild flam-notes <input.flp> <output.flp> <pattern-id> <channel-id> <stroke-ticks> <velocity-0..127> <before|after> [group-notes:0|1]\n",
+            "  flp-rebuild flam-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <stroke-ticks> <velocity-0..127> <before|after> [group-notes:0|1]\n",
+            "  flp-rebuild generate-random-notes <input.flp> <output.flp> <pattern-id> <channel-id> <start-ticks> <end-ticks-exclusive> <step-ticks> <note-length-ticks> <density-0..100> <minimum-key-0..127> <maximum-key-0..127> <seed> [stack-1..16 [length-variation:-100..100 [merge-same-notes:0|1 [base-octave-0..10 range-octaves-1..11 [chord-map-name chord-root-0..11]]]]]\n",
+            "  flp-rebuild generate-random-notes-scale <input.flp> <output.flp> <pattern-id> <channel-id> <start-ticks> <end-ticks-exclusive> <step-ticks> <note-length-ticks> <density-0..100> <minimum-key-0..127> <maximum-key-0..127> <seed> <scale-name> <scale-root-0..11> [stack-1..16 [length-variation:-100..100 [merge-same-notes:0|1 [base-octave-0..10 range-octaves-1..11 [chord-map-name chord-root-0..11]]]]]\n",
+            "  flp-rebuild randomize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <velocity:-100..100> <pan:-100..100> <pitch-range:0..24> <bipolar:0|1> <reset:0|1> [release:-100..100 mod-x:-100..100 mod-y:-100..100]\n",
+            "  flp-rebuild randomize-notes-scale <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <velocity:-100..100> <pan:-100..100> <pitch-range:0..24> <bipolar:0|1> <reset:0|1> <scale-name> <scale-root:0..11> [release:-100..100 mod-x:-100..100 mod-y:-100..100]\n",
+            "  flp-rebuild randomize-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <seed> <velocity:-100..100> <pan:-100..100> <pitch-range:0..24> <bipolar:0|1> <reset:0|1> [release:-100..100 mod-x:-100..100 mod-y:-100..100]\n",
+            "  flp-rebuild randomize-notes-selected-scale <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <seed> <velocity:-100..100> <pan:-100..100> <pitch-range:0..24> <bipolar:0|1> <reset:0|1> <scale-name> <scale-root:0..11> [release:-100..100 mod-x:-100..100 mod-y:-100..100]\n",
+            "  flp-rebuild humanize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <timing-range-ticks> <velocity-variation-0..100> [pan-variation-0..100 release-variation-0..100 mod-x-variation-0..100 mod-y-variation-0..100]\n",
+            "  flp-rebuild humanize-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <seed> <timing-range-ticks> <velocity-variation-0..100> [pan-variation-0..100 release-variation-0..100 mod-x-variation-0..100 mod-y-variation-0..100]\n",
+            "  flp-rebuild limit-notes <input.flp> <output.flp> <pattern-id> <channel-id> <minimum-key-0..127> <maximum-key-0..127> [wrap-to-bottom:0|1 scale-name|none scale-root:0..11|-> snap-direction:up|down|alternate]\n",
+            "  flp-rebuild limit-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <minimum-key-0..127> <maximum-key-0..127> [wrap-to-bottom:0|1 scale-name|none scale-root:0..11|-> snap-direction:up|down|alternate]\n",
             "  flp-rebuild arp-notes <input.flp> <output.flp> <pattern-id> <channel-id> <step-ticks> <range-octaves-1..4> <gate-1..100> <up|down|up-down>\n",
+            "  flp-rebuild arp-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <step-ticks> <range-octaves-1..4> <gate-1..100> <up|down|up-down>\n",
+            "  flp-rebuild riff-machine-notes <input.flp> <output.flp> <pattern-id> <channel-id> [--option=value ...]\n",
+            "  flp-rebuild riff-machine-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> [--option=value ...]\n",
             "  flp-rebuild slice-notes <input.flp> <output.flp> <pattern-id> <channel-id> <position-ticks>\n",
+            "  flp-rebuild slice-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <position-ticks>\n",
+            "  flp-rebuild slice-notes-at-positions <input.flp> <output.flp> <pattern-id> <cuts:channel-id:note-index:tick,...>\n",
+            "  flp-rebuild scale-levels-notes <input.flp> <output.flp> <pattern-id> <channel-id> <center:-100..100> <tension:-100..100> <multiplier:0..200> <offset:-100..100>\n",
+            "  flp-rebuild scale-levels-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <center:-100..100> <tension:-100..100> <multiplier:0..200> <offset:-100..100>\n",
+            "  flp-rebuild articulate-notes <input.flp> <output.flp> <pattern-id> <channel-id> <multiplier:10..100> <variation:0..100> <seed> <use-original-lengths:0|1> <chop-chords:0|1>\n",
+            "  flp-rebuild articulate-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <multiplier:10..100> <variation:0..100> <seed> <use-original-lengths:0|1> <chop-chords:0|1> <only-with-selection:0|1>\n",
+            "  flp-rebuild claw-notes <input.flp> <output.flp> <pattern-id> <channel-id> <period-ticks:16+> <trash-every:2..16> <time-distortion:-100..100> <remove-short-notes:0|1> <stretch-to-compensate:0|1>\n",
+            "  flp-rebuild claw-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <period-ticks:16+> <trash-every:2..16> <time-distortion:-100..100> <remove-short-notes:0|1> <stretch-to-compensate:0|1>\n",
             "  flp-rebuild add-note <input.flp> <output.flp> <pattern-id> <channel-id> <position> <length> <key> <velocity>\n",
+            "  flp-rebuild add-notes <input.flp> <output.flp> <pattern-id> <channel-id> <notes:position:length:key:velocity,...>\n",
             "  flp-rebuild delete-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index>\n",
+            "  flp-rebuild delete-notes <input.flp> <output.flp> <pattern-id> <channel-id>\n",
+            "  flp-rebuild delete-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based>\n",
+            "  flp-rebuild create-playlist-pattern-clip <input.flp> <output.flp> <arrangement-id> <pattern-id> <position-ticks> <length-ticks> <track-index:zero-based>\n",
+            "  flp-rebuild create-playlist-audio-clip <input.flp> <output.flp> <arrangement-id> <channel-id> <position-ticks> <length-ticks> <track-index:zero-based>\n",
             "  flp-rebuild import-midi <input.flp> <input.mid> <output.flp> <track> <pattern-id> <channel-id>\n",
             "  flp-rebuild edit-clip <input.flp> <output.flp> <arrangement-id> <clip-index> <position> <length>\n",
+            "  flp-rebuild delete-playlist-clip <input.flp> <output.flp> <arrangement-id> <clip-index>\n",
             "  flp-rebuild set-clip-muted <input.flp> <output.flp> <arrangement-id> <clip-index> <muted:0|1>\n",
             "  flp-rebuild edit-playlist-track <input.flp> <output.flp> <track-id> <enabled:0|1|-> <grouped:0|1|->\n",
             "  flp-rebuild set-playlist-track-press <input.flp> <output.flp> <arrangement-id> <track-id> <retrigger|hold-stop|hold-motion|latch>\n",
@@ -1179,6 +2701,147 @@ fn parse_clip_indices(value: &str) -> Result<Vec<usize>, String> {
     Ok(indices)
 }
 
+fn parse_note_indices(value: &str) -> Result<Vec<usize>, String> {
+    let indices = value
+        .split(',')
+        .map(|part| {
+            let part = part.trim();
+            if part.is_empty() {
+                return Err("note indexes must be comma-separated non-negative integers".to_owned());
+            }
+            parse_usize(part, "note index")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if indices.is_empty() {
+        return Err("at least one channel-local note index is required".to_owned());
+    }
+    Ok(indices)
+}
+
+fn parse_note_specs(channel_id: u16, value: &str) -> Result<Vec<PatternNote>, String> {
+    let mut notes = Vec::new();
+    for note in value.split(',') {
+        let mut fields = note.split(':');
+        let position = fields.next().unwrap_or_default();
+        let length = fields.next().unwrap_or_default();
+        let key = fields.next().unwrap_or_default();
+        let velocity = fields.next().unwrap_or_default();
+        if position.is_empty()
+            || length.is_empty()
+            || key.is_empty()
+            || velocity.is_empty()
+            || fields.next().is_some()
+        {
+            return Err(
+                "notes must be comma-separated position:length:key:velocity tuples".to_owned(),
+            );
+        }
+        notes.push(PatternNote {
+            channel_id,
+            position: parse_u32(position, "note position")?,
+            length: parse_u32(length, "note length")?,
+            key: parse_u16(key, "note key")?,
+            velocity: parse_u8(velocity, "note velocity")?,
+            ..PatternNote::default()
+        });
+    }
+    Ok(notes)
+}
+
+fn parse_pattern_controller_points(value: &str) -> Result<Vec<(u32, f32)>, String> {
+    let mut points = Vec::new();
+    for point in value.split(',') {
+        let mut fields = point.split(':');
+        let position = fields.next().unwrap_or_default();
+        let value = fields.next().unwrap_or_default();
+        if position.is_empty() || value.is_empty() || fields.next().is_some() {
+            return Err("controller points must be comma-separated tick:value pairs".to_owned());
+        }
+        points.push((
+            parse_u32(position, "controller position")?,
+            parse_f32(value, "controller value")?,
+        ));
+    }
+    Ok(points)
+}
+
+fn parse_note_cuts(value: &str) -> Result<Vec<(u16, usize, u32)>, String> {
+    let mut cuts = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for cut in value.split(',') {
+        let mut fields = cut.split(':');
+        let channel_id = fields.next().unwrap_or_default();
+        let note_index = fields.next().unwrap_or_default();
+        let position_ticks = fields.next().unwrap_or_default();
+        if channel_id.is_empty()
+            || note_index.is_empty()
+            || position_ticks.is_empty()
+            || fields.next().is_some()
+        {
+            return Err(
+                "note cuts must be comma-separated channel-id:note-index:tick triples".to_owned(),
+            );
+        }
+        let channel_id = parse_u16(channel_id, "note cut channel id")?;
+        let note_index = parse_usize(note_index, "note cut channel-local index")?;
+        let position_ticks = parse_u32(position_ticks, "note cut position")?;
+        if !seen.insert((channel_id, note_index)) {
+            return Err(format!(
+                "note cut for channel {channel_id}, note {note_index} was supplied more than once"
+            ));
+        }
+        cuts.push((channel_id, note_index, position_ticks));
+    }
+    Ok(cuts)
+}
+
+fn parse_flam_placement(value: &str) -> Result<bool, String> {
+    match value {
+        "before" => Ok(true),
+        "after" => Ok(false),
+        _ => Err("flam placement must be 'before' or 'after'".to_owned()),
+    }
+}
+
+fn parse_limit_note_options(
+    minimum_key: &str,
+    maximum_key: &str,
+    wrap_to_bottom: &str,
+    scale_name: &str,
+    scale_root: &str,
+    snap_direction: &str,
+) -> Result<LimitNoteOptions<'static>, String> {
+    let (scale_root, scale_intervals) = if scale_name == "none" {
+        if scale_root != "-" {
+            return Err("scale root must be '-' when scale name is 'none'".to_owned());
+        }
+        (None, None)
+    } else {
+        if scale_root == "-" {
+            return Err("a scale root is required when a scale name is provided".to_owned());
+        }
+        let root = parse_u8(scale_root, "scale root")?;
+        if root > 11 {
+            return Err("scale root must be between 0 and 11".to_owned());
+        }
+        (Some(root), Some(parse_scale_name(scale_name)?))
+    };
+    let snap_direction = match snap_direction {
+        "up" => LimitSnapDirection::Up,
+        "down" => LimitSnapDirection::Down,
+        "alternate" => LimitSnapDirection::Alternate,
+        _ => return Err("limit snap direction must be 'up', 'down', or 'alternate'".to_owned()),
+    };
+    Ok(LimitNoteOptions {
+        minimum_key: parse_u16(minimum_key, "minimum key")?,
+        maximum_key: parse_u16(maximum_key, "maximum key")?,
+        wrap_to_bottom: parse_bool(wrap_to_bottom, "wrap to bottom")?,
+        scale_root,
+        scale_intervals,
+        snap_direction,
+    })
+}
+
 fn parse_midi_channel_mapping(value: &str) -> Result<MidiChannelMapping, String> {
     match value {
         "stored" => Ok(MidiChannelMapping::PreserveNoteChannels),
@@ -1217,6 +2880,13 @@ fn parse_bool(value: &str, description: &str) -> Result<bool, String> {
         "1" | "true" => Ok(true),
         _ => Err(format!("{description} must be 0 or 1")),
     }
+}
+
+fn parse_random_note_chord_map(value: &str) -> Result<RandomNoteChordMap, String> {
+    RandomNoteChordMap::ALL
+        .into_iter()
+        .find(|chord_map| chord_map.cli_name() == value)
+        .ok_or_else(|| format!("unknown random note chord map: {value}"))
 }
 
 fn parse_scale_name(value: &str) -> Result<&'static [u8], String> {
@@ -1303,6 +2973,145 @@ fn parse_arpeggio_direction(value: &str) -> Result<ArpeggioDirection, String> {
     }
 }
 
+fn parse_riff_machine_quantize_mode(value: &str) -> Result<RiffMachineQuantizeMode, String> {
+    match value {
+        "leave-duration" => Ok(RiffMachineQuantizeMode::LeaveDuration),
+        "leave-end" => Ok(RiffMachineQuantizeMode::LeaveEnd),
+        "quantize-duration" => Ok(RiffMachineQuantizeMode::QuantizeDuration),
+        "quantize-end" => Ok(RiffMachineQuantizeMode::QuantizeEnd),
+        _ => Err("Riff Machine Groove mode must be leave-duration, leave-end, quantize-duration, or quantize-end".to_owned()),
+    }
+}
+
+fn parse_riff_machine_options(values: &[String]) -> Result<RiffMachineOptions<'static>, String> {
+    let mut options = RiffMachineOptions::default();
+    let mut seen = std::collections::HashSet::new();
+    for argument in values {
+        let option = argument.strip_prefix("--").ok_or_else(|| {
+            format!("Riff Machine options must use --name=value syntax: {argument}")
+        })?;
+        let (name, value) = option.split_once('=').ok_or_else(|| {
+            format!("Riff Machine option must use --name=value syntax: {argument}")
+        })?;
+        if name.is_empty() || value.is_empty() {
+            return Err(format!(
+                "Riff Machine option needs a name and value: {argument}"
+            ));
+        }
+        if !seen.insert(name) {
+            return Err(format!(
+                "Riff Machine option was supplied more than once: --{name}"
+            ));
+        }
+        match name {
+            "scale" => options.scale_intervals = parse_scale_name(value)?,
+            "root" => {
+                options.scale_root = parse_u8(value, "Riff Machine scale root")?;
+                if options.scale_root > 11 {
+                    return Err("Riff Machine scale root must be between 0 and 11".to_owned());
+                }
+            }
+            "min-key" => options.minimum_key = parse_u16(value, "Riff Machine minimum key")?,
+            "max-key" => options.maximum_key = parse_u16(value, "Riff Machine maximum key")?,
+            "wrap-to-bottom" => {
+                options.wrap_to_bottom = parse_bool(value, "Riff Machine wrap to bottom")?
+            }
+            "snap-direction" => {
+                options.snap_direction = match value {
+                    "up" => LimitSnapDirection::Up,
+                    "down" => LimitSnapDirection::Down,
+                    "alternate" => LimitSnapDirection::Alternate,
+                    _ => {
+                        return Err(
+                            "Riff Machine snap direction must be up, down, or alternate".to_owned()
+                        );
+                    }
+                }
+            }
+            "step-ticks" => options.step_ticks = parse_u32(value, "Riff Machine step")?,
+            "range-octaves" => {
+                options.range_octaves = parse_u8(value, "Riff Machine octave range")?
+            }
+            "gate-percent" => options.gate_percent = parse_u8(value, "Riff Machine gate")?,
+            "direction" => options.direction = parse_arpeggio_direction(value)?,
+            "mirror-horizontal" => {
+                options.mirror_horizontal = parse_bool(value, "horizontal mirror")?
+            }
+            "preserve-start-times" => {
+                options.preserve_start_times = parse_bool(value, "preserve start times")?
+            }
+            "mirror-vertical" => options.mirror_vertical = parse_bool(value, "vertical mirror")?,
+            "groove-snap-ticks" => {
+                options.groove_snap_ticks = if value == "none" {
+                    None
+                } else {
+                    Some(parse_u32(value, "Riff Machine Groove snap ticks")?)
+                }
+            }
+            "groove-start-percent" => {
+                options.groove_start_percent = parse_u8(value, "Groove start percentage")?
+            }
+            "groove-sensitivity-percent" => {
+                options.groove_sensitivity_percent =
+                    parse_u8(value, "Groove sensitivity percentage")?
+            }
+            "groove-duration-percent" => {
+                options.groove_duration_percent = parse_u8(value, "Groove duration percentage")?
+            }
+            "groove-mode" => {
+                options.groove_quantize_mode = parse_riff_machine_quantize_mode(value)?
+            }
+            "pan-variation-percent" => {
+                options.pan_variation_percent = parse_u8(value, "pan variation")?
+            }
+            "length-multiplier-percent" => {
+                options.length_multiplier_percent = parse_u8(value, "length multiplier")?
+            }
+            "velocity-variation-percent" => {
+                options.velocity_variation_percent = parse_u8(value, "velocity variation")?
+            }
+            "release-variation-percent" => {
+                options.release_variation_percent = parse_u8(value, "release variation")?
+            }
+            "mod-x-variation-percent" => {
+                options.mod_x_variation_percent = parse_u8(value, "Mod X variation")?
+            }
+            "mod-y-variation-percent" => {
+                options.mod_y_variation_percent = parse_u8(value, "Mod Y variation")?
+            }
+            "pitch-variation-semitones" => {
+                options.pitch_variation_semitones = parse_u8(value, "pitch variation")?
+            }
+            "reset-levels" => options.reset_levels = parse_bool(value, "reset levels")?,
+            "bipolar-levels" => options.bipolar_levels = parse_bool(value, "bipolar levels")?,
+            "seed" => options.seed = parse_u64(value, "Riff Machine seed")?,
+            _ => return Err(format!("unknown Riff Machine option: --{name}")),
+        }
+    }
+    Ok(options)
+}
+
+fn parse_note_rotation(value: &str) -> Result<PatternNoteRotation, String> {
+    match value {
+        "left" => Ok(PatternNoteRotation::Left),
+        "right" => Ok(PatternNoteRotation::Right),
+        _ => Err("note rotation direction must be 'left' or 'right'".to_owned()),
+    }
+}
+
+fn parse_quantize_note_mode(value: &str) -> Result<QuantizeNoteMode, String> {
+    match value {
+        "leave-duration" => Ok(QuantizeNoteMode::LeaveDuration),
+        "leave-end" => Ok(QuantizeNoteMode::LeaveEnd),
+        "quantize-duration" => Ok(QuantizeNoteMode::QuantizeDuration),
+        "quantize-end" => Ok(QuantizeNoteMode::QuantizeEnd),
+        _ => Err(
+            "quantize mode must be leave-duration, leave-end, quantize-duration, or quantize-end"
+                .to_owned(),
+        ),
+    }
+}
+
 fn parse_channel_id_list(value: &str) -> Result<Vec<u16>, String> {
     if value == "-" {
         return Ok(Vec::new());
@@ -1311,11 +3120,27 @@ fn parse_channel_id_list(value: &str) -> Result<Vec<u16>, String> {
         .split(',')
         .map(|child_id| {
             if child_id.is_empty() {
-                return Err("child channel IDs must be comma-separated integers".to_owned());
+                return Err("channel IDs must be comma-separated integers".to_owned());
             }
-            parse_u16(child_id, "child channel id")
+            parse_u16(child_id, "channel id")
         })
         .collect()
+}
+
+fn parse_channel_group_index(value: &str) -> Result<i32, String> {
+    let index = parse_usize(value, "Channel Rack group index")?;
+    i32::try_from(index)
+        .map_err(|_| "Channel Rack group index must fit within a signed 32-bit integer".to_owned())
+}
+
+fn parse_channel_sort_order(value: &str) -> Result<ChannelSortOrder, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "color" => Ok(ChannelSortOrder::Color),
+        "mixer-track" => Ok(ChannelSortOrder::MixerTrack),
+        "name" => Ok(ChannelSortOrder::Name),
+        "type" => Ok(ChannelSortOrder::Type),
+        _ => Err("channel sort order must be color, mixer-track, name, or type".to_owned()),
+    }
 }
 
 fn project_info_argument(value: &str) -> Option<String> {
@@ -2161,7 +3986,7 @@ fn list_channels(path: &Path) -> Result<(), String> {
     println!("channels: {}", channels.len());
     for channel in channels {
         println!(
-            "id={} kind={} type={:?} enabled={} main_pitch={} add_to_key={} color={:?} volume={:?} pan={:?} level_adjusts_raw={:?} swing_mix_raw={:?} layer_children={:?} layer_flags={:?} plugin={} name={} sample_path={:?} events={:?}",
+            "id={} kind={} type={:?} enabled={} zipped={} main_pitch={} add_to_key={} color={:?} volume={:?} pan={:?} level_adjusts_raw={:?} swing_mix_raw={:?} layer_children={:?} layer_flags={:?} plugin={} name={} sample_path={:?} events={:?}",
             channel.id(),
             channel
                 .kind()
@@ -2170,6 +3995,7 @@ fn list_channels(path: &Path) -> Result<(), String> {
             channel
                 .enabled()
                 .map_or_else(|| "unknown".to_owned(), |enabled| enabled.to_string()),
+            channel.zipped(),
             channel.keyboard_main_pitch_enabled(),
             channel.keyboard_add_to_key_enabled(),
             channel.color(),
@@ -2188,6 +4014,124 @@ fn list_channels(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn list_channel_groups(path: &Path) -> Result<(), String> {
+    let (_, document) = load_document(path)?;
+    let groups = document.channel_groups();
+    let channels = document.channels();
+    println!("channel groups: {}", groups.len());
+    for group in &groups {
+        let channel_ids = channels
+            .iter()
+            .filter(|channel| channel.group_number() == Some(group.index()))
+            .map(|channel| channel.id().to_string())
+            .collect::<Vec<_>>();
+        println!(
+            "index={} name={:?} channel_ids={}",
+            group.index(),
+            group.name().unwrap_or("(undecoded)"),
+            if channel_ids.is_empty() {
+                "-".to_owned()
+            } else {
+                channel_ids.join(",")
+            }
+        );
+    }
+    let unassigned = channels
+        .iter()
+        .filter(|channel| channel.group_number().is_none())
+        .map(|channel| channel.id().to_string())
+        .collect::<Vec<_>>();
+    println!(
+        "unassigned_channel_ids={}",
+        if unassigned.is_empty() {
+            "-".to_owned()
+        } else {
+            unassigned.join(",")
+        }
+    );
+    let unresolved = channels
+        .iter()
+        .filter_map(|channel| {
+            let index = channel.group_number()?;
+            (!groups.iter().any(|group| group.index() == index))
+                .then(|| format!("{}:{index}", channel.id()))
+        })
+        .collect::<Vec<_>>();
+    if !unresolved.is_empty() {
+        println!(
+            "unresolved_channel_group_assignments={}",
+            unresolved.join(",")
+        );
+    }
+    Ok(())
+}
+
+fn edit_channel_groups(
+    input: &Path,
+    output: &Path,
+    edit: impl FnOnce(&mut FlpDocument) -> Result<String, String>,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let description = edit(&mut document)?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!("{description} in {}", output.display());
+    Ok(())
+}
+
+fn create_channel_group(input: &Path, output: &Path, name: &str) -> Result<(), String> {
+    edit_channel_groups(input, output, |document| {
+        let index = document
+            .add_channel_group(name)
+            .map_err(|error| error.to_string())?;
+        Ok(format!("created Channel Rack group {index} named {name:?}"))
+    })
+}
+
+fn group_channels(
+    input: &Path,
+    output: &Path,
+    channel_ids: &[u16],
+    name: &str,
+) -> Result<(), String> {
+    edit_channel_groups(input, output, |document| {
+        let index = document
+            .group_channels(channel_ids, name)
+            .map_err(|error| error.to_string())?;
+        Ok(format!(
+            "assigned channel IDs {channel_ids:?} to Channel Rack group {index} named {name:?}"
+        ))
+    })
+}
+
+fn rename_channel_group(
+    input: &Path,
+    output: &Path,
+    group_index: i32,
+    name: &str,
+) -> Result<(), String> {
+    edit_channel_groups(input, output, |document| {
+        document
+            .rename_channel_group(group_index, name)
+            .map_err(|error| error.to_string())?;
+        Ok(format!(
+            "renamed Channel Rack group {group_index} to {name:?}"
+        ))
+    })
+}
+
+fn delete_channel_group(input: &Path, output: &Path, group_index: i32) -> Result<(), String> {
+    edit_channel_groups(input, output, |document| {
+        document
+            .delete_channel_group(group_index)
+            .map_err(|error| error.to_string())?;
+        Ok(format!("deleted Channel Rack group {group_index}"))
+    })
+}
+
 fn list_mixer(path: &Path) -> Result<(), String> {
     let (_, document) = load_document(path)?;
     let inserts = document.mixer_inserts();
@@ -2195,6 +4139,9 @@ fn list_mixer(path: &Path) -> Result<(), String> {
     let parameters = document
         .mixer_parameter_records()
         .map_err(|error| format!("could not decode Mixer parameter records: {error}"))?;
+    let sends = document
+        .mixer_send_summaries()
+        .map_err(|error| format!("could not decode Mixer sends: {error}"))?;
     println!("recognized insert records: {}", inserts.len());
     for insert in inserts {
         println!(
@@ -2233,6 +4180,37 @@ fn list_mixer(path: &Path) -> Result<(), String> {
         count_kind(flp_rebuild::MixerParameterKind::StereoSeparation),
         count_kind(flp_rebuild::MixerParameterKind::RouteVolume),
     );
+    for record in &parameters {
+        println!(
+            "0xE1 event={} record={} id=0x{:02X} kind={:?} target={} slot={} scope_raw={} value={}",
+            record.event_index(),
+            record.record_index(),
+            record.parameter_id(),
+            record.kind(),
+            record.target_index(),
+            record.slot_index(),
+            record.target_scope_raw(),
+            record.value()
+        );
+    }
+    println!("Mixer sends: {}", sends.len());
+    for send in sends {
+        let (parameter_event, parameter_record) = send.parameter_location();
+        let routing_flag = send
+            .routing_flag_location()
+            .map(|(event, byte)| format!("{event}:{byte}"))
+            .unwrap_or_else(|| "-".to_owned());
+        println!(
+            "source_insert={} route_id=0x{:02X} parameter_event={} parameter_record={} value={} enabled={:?} routing_flag_event_byte={}",
+            send.insert_ordinal(),
+            send.route_parameter_id(),
+            parameter_event,
+            parameter_record,
+            send.value(),
+            send.enabled(),
+            routing_flag
+        );
+    }
     Ok(())
 }
 
@@ -2763,6 +4741,33 @@ fn rename_channel(input: &Path, output: &Path, channel_id: u16, name: &str) -> R
     Ok(())
 }
 
+fn create_sample_channel(
+    input: &Path,
+    output: &Path,
+    sample_path: &str,
+    name: &str,
+    audio_clip: bool,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let channel_id = if audio_clip {
+        document.create_audio_channel(sample_path, name)
+    } else {
+        document.create_sampler_channel(sample_path, name)
+    }
+    .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    let channel_type = if audio_clip { "Audio Clip" } else { "Sampler" };
+    println!(
+        "created {channel_type} channel {channel_id} named {name:?} with sample {sample_path:?} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
 fn set_channel_color(
     input: &Path,
     output: &Path,
@@ -2783,6 +4788,269 @@ fn set_channel_color(
         rgb[0],
         rgb[1],
         rgb[2],
+        output.display()
+    );
+    Ok(())
+}
+
+fn set_channel_colors(
+    input: &Path,
+    output: &Path,
+    channel_ids: &[u16],
+    rgb: [u8; 3],
+) -> Result<(), String> {
+    edit_channel_colors(
+        input,
+        output,
+        format!(
+            "set color #{:02X}{:02X}{:02X} on channels {channel_ids:?}",
+            rgb[0], rgb[1], rgb[2]
+        ),
+        |document| {
+            document
+                .set_channel_colors(channel_ids, rgb)
+                .map_err(|error| error.to_string())
+        },
+    )
+}
+
+fn set_channel_color_gradient(
+    input: &Path,
+    output: &Path,
+    channel_ids: &[u16],
+    start_rgb: [u8; 3],
+    end_rgb: [u8; 3],
+) -> Result<(), String> {
+    edit_channel_colors(
+        input,
+        output,
+        format!(
+            "applied color gradient #{:02X}{:02X}{:02X}..#{:02X}{:02X}{:02X} to channels {channel_ids:?}",
+            start_rgb[0], start_rgb[1], start_rgb[2], end_rgb[0], end_rgb[1], end_rgb[2]
+        ),
+        |document| {
+            document
+                .set_channel_color_gradient(channel_ids, start_rgb, end_rgb)
+                .map_err(|error| error.to_string())
+        },
+    )
+}
+
+fn edit_channel_colors(
+    input: &Path,
+    output: &Path,
+    description: String,
+    edit: impl FnOnce(&mut FlpDocument) -> Result<(), String>,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    edit(&mut document)?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!("{description} in {}", output.display());
+    Ok(())
+}
+
+fn move_channel(
+    input: &Path,
+    output: &Path,
+    channel_id: u16,
+    target_index: usize,
+) -> Result<(), String> {
+    edit_channel_order(
+        input,
+        output,
+        format!("moved channel {channel_id} to Channel Rack index {target_index}"),
+        |document| {
+            document
+                .move_channel(channel_id, target_index)
+                .map_err(|error| error.to_string())
+        },
+    )
+}
+
+fn reorder_channels(input: &Path, output: &Path, channel_ids: &[u16]) -> Result<(), String> {
+    edit_channel_order(
+        input,
+        output,
+        format!("reordered Channel Rack channels as {channel_ids:?}"),
+        |document| {
+            document
+                .reorder_channels(channel_ids)
+                .map_err(|error| error.to_string())
+        },
+    )
+}
+
+fn sort_channels(input: &Path, output: &Path, order: ChannelSortOrder) -> Result<(), String> {
+    edit_channel_order(
+        input,
+        output,
+        format!("sorted Channel Rack channels by {order:?}"),
+        |document| {
+            document
+                .sort_channels(order)
+                .map_err(|error| error.to_string())
+        },
+    )
+}
+
+fn edit_channel_order(
+    input: &Path,
+    output: &Path,
+    description: String,
+    edit: impl FnOnce(&mut FlpDocument) -> Result<(), String>,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    edit(&mut document)?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!("{description} in {}", output.display());
+    Ok(())
+}
+
+fn set_mixer_parameter_record_value(
+    input: &Path,
+    output: &Path,
+    event_index: usize,
+    record_index: usize,
+    value: i32,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .set_mixer_parameter_record_value(event_index, record_index, value)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "set Mixer 0xE1 event {event_index} record {record_index} value to {value} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn rename_mixer_insert(
+    input: &Path,
+    output: &Path,
+    insert_ordinal: usize,
+    name: &str,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .set_mixer_insert_name(insert_ordinal, name)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "renamed Mixer insert {insert_ordinal} to {name:?} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn set_mixer_insert_flag(
+    input: &Path,
+    output: &Path,
+    insert_ordinal: usize,
+    field: &str,
+    enabled: bool,
+) -> Result<(), String> {
+    let edit = match field {
+        "enabled" => MixerInsertEdit {
+            enabled: Some(enabled),
+            ..MixerInsertEdit::default()
+        },
+        "soloed" => MixerInsertEdit {
+            soloed: Some(enabled),
+            ..MixerInsertEdit::default()
+        },
+        "polarity-reversed" => MixerInsertEdit {
+            polarity_reversed: Some(enabled),
+            ..MixerInsertEdit::default()
+        },
+        "swap-left-right" => MixerInsertEdit {
+            swap_left_right: Some(enabled),
+            ..MixerInsertEdit::default()
+        },
+        "effects-enabled" => MixerInsertEdit {
+            effects_enabled: Some(enabled),
+            ..MixerInsertEdit::default()
+        },
+        _ => {
+            return Err(format!(
+                "unknown Mixer insert flag {field:?}; expected enabled, soloed, polarity-reversed, swap-left-right, or effects-enabled"
+            ));
+        }
+    };
+    let (_, mut document) = load_document(input)?;
+    document
+        .edit_mixer_insert_flags(insert_ordinal, edit)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "set Mixer insert {insert_ordinal} flag {field} to {} in {}",
+        u8::from(enabled),
+        output.display()
+    );
+    Ok(())
+}
+
+fn set_mixer_routing_flag(
+    input: &Path,
+    output: &Path,
+    event_index: usize,
+    routing_flag_index: usize,
+    enabled: bool,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .set_mixer_routing_flag(event_index, routing_flag_index, enabled)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "set Mixer routing event {event_index} flag byte {routing_flag_index} to {} in {}",
+        u8::from(enabled),
+        output.display()
+    );
+    Ok(())
+}
+
+fn set_channel_sample_path(
+    input: &Path,
+    output: &Path,
+    channel_id: u16,
+    sample_path: &str,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .set_channel_sample_path(channel_id, sample_path)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "set channel {channel_id} sample path to {sample_path:?} in {}",
         output.display()
     );
     Ok(())
@@ -2875,6 +5143,52 @@ fn set_channel_main_pitch(
     println!(
         "{} main pitch on channel {channel_id} in {}",
         if enabled { "enabled" } else { "disabled" },
+        output.display()
+    );
+    Ok(())
+}
+
+fn set_channel_enabled(
+    input: &Path,
+    output: &Path,
+    channel_id: u16,
+    enabled: bool,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .set_channel_enabled(channel_id, enabled)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "{} channel {channel_id} in {}",
+        if enabled { "enabled" } else { "disabled" },
+        output.display()
+    );
+    Ok(())
+}
+
+fn set_channel_zipped(
+    input: &Path,
+    output: &Path,
+    channel_id: u16,
+    zipped: bool,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .set_channel_zipped(channel_id, zipped)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "{} channel {channel_id} in {}",
+        if zipped { "zipped" } else { "unzipped" },
         output.display()
     );
     Ok(())
@@ -3028,6 +5342,29 @@ fn delete_automation_point(
     Ok(())
 }
 
+fn interpolate_automation_points(
+    input: &Path,
+    output: &Path,
+    channel_id: u16,
+    first_point_index: usize,
+    last_point_index: usize,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let interpolated_count = document
+        .interpolate_automation_points(channel_id, first_point_index, last_point_index)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "interpolated {interpolated_count} automation points between indices {first_point_index} and {last_point_index} in channel {channel_id} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
 fn edit_note(
     input: &Path,
     output: &Path,
@@ -3099,6 +5436,82 @@ fn duplicate_pattern_controller(
     Ok(())
 }
 
+fn draw_pattern_controller_points(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    stream: (u8, u8),
+    points: &[(u32, f32)],
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let added = document
+        .draw_pattern_controller_points(pattern_id, stream, points)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "drew {} controller points in pattern {pattern_id}, channel {}, flags {} (added {added}) to {}",
+        points.len(),
+        stream.0,
+        stream.1,
+        output.display()
+    );
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum PatternControllerRangeOperation {
+    Linear,
+    Spline,
+    Delete,
+}
+
+fn edit_pattern_controller_range(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    stream: (u8, u8),
+    start_tick: u32,
+    end_tick: u32,
+    operation: PatternControllerRangeOperation,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let changed = match operation {
+        PatternControllerRangeOperation::Linear => {
+            document.linearize_pattern_controller_range(pattern_id, stream, start_tick, end_tick)
+        }
+        PatternControllerRangeOperation::Spline => {
+            document.spline_pattern_controller_range(pattern_id, stream, start_tick, end_tick)
+        }
+        PatternControllerRangeOperation::Delete => {
+            document.delete_pattern_controller_range(pattern_id, stream, start_tick, end_tick)
+        }
+    }
+    .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    let operation = match operation {
+        PatternControllerRangeOperation::Linear => "linearized",
+        PatternControllerRangeOperation::Spline => "spline-interpolated",
+        PatternControllerRangeOperation::Delete => "deleted",
+    };
+    println!(
+        "{operation} {changed} raw controller points in pattern {pattern_id}, channel {}, flags {}, ticks {}..={} to {}",
+        stream.0,
+        stream.1,
+        start_tick.min(end_tick),
+        start_tick.max(end_tick),
+        output.display()
+    );
+    Ok(())
+}
+
 fn delete_pattern_controller(
     input: &Path,
     output: &Path,
@@ -3130,17 +5543,103 @@ fn quantize_notes(
     strength: f64,
     swing: f64,
 ) -> Result<(), String> {
+    quantize_notes_with_options(
+        input,
+        output,
+        pattern_id,
+        channel_id,
+        QuantizeNoteOptions {
+            grid_ticks,
+            start_strength: strength,
+            swing,
+            ..QuantizeNoteOptions::default()
+        },
+    )
+}
+
+fn quantize_notes_with_options(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    options: QuantizeNoteOptions,
+) -> Result<(), String> {
+    quantize_notes_with_scope(input, output, pattern_id, channel_id, None, options)
+}
+
+fn quantize_notes_with_scope(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    note_indices: Option<&[usize]>,
+    options: QuantizeNoteOptions,
+) -> Result<(), String> {
     let (_, mut document) = load_document(input)?;
-    let changed = document
-        .quantize_pattern_notes(pattern_id, channel_id, grid_ticks, strength, swing)
-        .map_err(|error| error.to_string())?;
+    let changed = match note_indices {
+        Some(note_indices) => document.quantize_pattern_note_selection_with_options(
+            pattern_id,
+            channel_id,
+            note_indices,
+            options,
+        ),
+        None => document.quantize_pattern_notes_with_options(pattern_id, channel_id, options),
+    }
+    .map_err(|error| error.to_string())?;
     let bytes = document
         .encode_lossless()
         .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
     fs::write(output, bytes)
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
-        "quantized {changed} notes in pattern {pattern_id}, channel {channel_id} to {}",
+        "quantized {changed} notes in pattern {pattern_id}, channel {channel_id} ({}) to {}",
+        if note_indices.is_some() {
+            "selected notes"
+        } else {
+            "all channel notes"
+        },
+        output.display()
+    );
+    Ok(())
+}
+
+fn rotate_notes_with_scope(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    note_indices: Option<&[usize]>,
+    snap_ticks: u32,
+    direction: PatternNoteRotation,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let changed = match note_indices {
+        Some(note_indices) => document.rotate_pattern_note_selection(
+            pattern_id,
+            channel_id,
+            note_indices,
+            snap_ticks,
+            direction,
+        ),
+        None => document.rotate_pattern_notes(pattern_id, channel_id, snap_ticks, direction),
+    }
+    .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "rotated {changed} notes in pattern {pattern_id}, channel {channel_id} ({}) {snap_ticks} ticks {} in {}",
+        if note_indices.is_some() {
+            "selected notes"
+        } else {
+            "all channel notes"
+        },
+        match direction {
+            PatternNoteRotation::Left => "left",
+            PatternNoteRotation::Right => "right",
+        },
         output.display()
     );
     Ok(())
@@ -3152,17 +5651,36 @@ fn legato_notes(
     pattern_id: u16,
     channel_id: u16,
 ) -> Result<(), String> {
+    legato_notes_with_scope(input, output, pattern_id, channel_id, None)
+}
+
+fn legato_notes_with_scope(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    note_indices: Option<&[usize]>,
+) -> Result<(), String> {
     let (_, mut document) = load_document(input)?;
-    let changed = document
-        .legato_pattern_notes(pattern_id, channel_id)
-        .map_err(|error| error.to_string())?;
+    let changed = match note_indices {
+        Some(note_indices) => {
+            document.legato_pattern_note_selection(pattern_id, channel_id, note_indices)
+        }
+        None => document.legato_pattern_notes(pattern_id, channel_id),
+    }
+    .map_err(|error| error.to_string())?;
     let bytes = document
         .encode_lossless()
         .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
     fs::write(output, bytes)
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
-        "extended {changed} notes in pattern {pattern_id}, channel {channel_id} to {}",
+        "extended {changed} notes in pattern {pattern_id}, channel {channel_id} ({}) to {}",
+        if note_indices.is_some() {
+            "selected notes"
+        } else {
+            "all channel notes"
+        },
         output.display()
     );
     Ok(())
@@ -3175,51 +5693,145 @@ fn chop_notes(
     channel_id: u16,
     divisions: u8,
 ) -> Result<(), String> {
+    chop_notes_with_scope(input, output, pattern_id, channel_id, None, divisions)
+}
+
+fn chop_notes_with_scope(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    note_indices: Option<&[usize]>,
+    divisions: u8,
+) -> Result<(), String> {
     let (_, mut document) = load_document(input)?;
-    let created = document
-        .chop_pattern_notes(pattern_id, channel_id, divisions)
-        .map_err(|error| error.to_string())?;
+    let created = match note_indices {
+        Some(note_indices) => {
+            document.chop_pattern_note_selection(pattern_id, channel_id, note_indices, divisions)
+        }
+        None => document.chop_pattern_notes(pattern_id, channel_id, divisions),
+    }
+    .map_err(|error| error.to_string())?;
     let bytes = document
         .encode_lossless()
         .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
     fs::write(output, bytes)
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
-        "created {created} chopped notes in pattern {pattern_id}, channel {channel_id} using {divisions} divisions in {}",
+        "created {created} chopped notes in pattern {pattern_id}, channel {channel_id} ({}) using {divisions} divisions in {}",
+        if note_indices.is_some() {
+            "selected notes"
+        } else {
+            "all channel notes"
+        },
+        output.display()
+    );
+    Ok(())
+}
+
+fn quick_chop_notes_with_scope(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    note_indices: Option<&[usize]>,
+    snap_ticks: u32,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let created = match note_indices {
+        Some(note_indices) => document.quick_chop_pattern_note_selection(
+            pattern_id,
+            channel_id,
+            note_indices,
+            snap_ticks,
+        ),
+        None => document.quick_chop_pattern_notes(pattern_id, channel_id, snap_ticks),
+    }
+    .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "created {created} Quick Chop notes in pattern {pattern_id}, channel {channel_id} ({}) at {snap_ticks} ticks in {}",
+        if note_indices.is_some() {
+            "selected notes"
+        } else {
+            "all channel notes"
+        },
         output.display()
     );
     Ok(())
 }
 
 fn glue_notes(input: &Path, output: &Path, pattern_id: u16, channel_id: u16) -> Result<(), String> {
+    glue_notes_with_scope(input, output, pattern_id, channel_id, None)
+}
+
+fn glue_notes_with_scope(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    note_indices: Option<&[usize]>,
+) -> Result<(), String> {
     let (_, mut document) = load_document(input)?;
-    let removed = document
-        .glue_pattern_notes(pattern_id, channel_id)
-        .map_err(|error| error.to_string())?;
+    let removed = match note_indices {
+        Some(note_indices) => {
+            document.glue_pattern_note_selection(pattern_id, channel_id, note_indices)
+        }
+        None => document.glue_pattern_notes(pattern_id, channel_id),
+    }
+    .map_err(|error| error.to_string())?;
     let bytes = document
         .encode_lossless()
         .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
     fs::write(output, bytes)
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
-        "joined notes and removed {removed} records in pattern {pattern_id}, channel {channel_id} to {}",
+        "joined notes and removed {removed} records in pattern {pattern_id}, channel {channel_id} ({}) to {}",
+        if note_indices.is_some() {
+            "selected notes"
+        } else {
+            "all channel notes"
+        },
         output.display()
     );
     Ok(())
 }
 
 fn flip_notes(input: &Path, output: &Path, pattern_id: u16, channel_id: u16) -> Result<(), String> {
+    flip_notes_with_scope(input, output, pattern_id, channel_id, None)
+}
+
+fn flip_notes_with_scope(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    note_indices: Option<&[usize]>,
+) -> Result<(), String> {
     let (_, mut document) = load_document(input)?;
-    let changed = document
-        .flip_pattern_notes(pattern_id, channel_id)
-        .map_err(|error| error.to_string())?;
+    let changed = match note_indices {
+        Some(note_indices) => {
+            document.flip_pattern_note_selection(pattern_id, channel_id, note_indices)
+        }
+        None => document.flip_pattern_notes(pattern_id, channel_id),
+    }
+    .map_err(|error| error.to_string())?;
     let bytes = document
         .encode_lossless()
         .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
     fs::write(output, bytes)
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
-        "flipped {changed} note positions in pattern {pattern_id}, channel {channel_id} to {}",
+        "flipped {changed} note positions in pattern {pattern_id}, channel {channel_id} ({}) to {}",
+        if note_indices.is_some() {
+            "selected notes"
+        } else {
+            "all channel notes"
+        },
         output.display()
     );
     Ok(())
@@ -3233,21 +5845,75 @@ fn strum_notes(
     spread_ticks: u32,
     descending: bool,
 ) -> Result<(), String> {
+    strum_notes_with_options(
+        input,
+        output,
+        pattern_id,
+        channel_id,
+        StrumOptions {
+            spread_ticks,
+            descending,
+            ..StrumOptions::default()
+        },
+    )
+}
+
+fn strum_notes_with_options(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    options: StrumOptions,
+) -> Result<(), String> {
+    strum_notes_with_scope(input, output, pattern_id, channel_id, None, options)
+}
+
+fn strum_notes_with_scope(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    note_indices: Option<&[usize]>,
+    options: StrumOptions,
+) -> Result<(), String> {
     let (_, mut document) = load_document(input)?;
-    let changed = document
-        .strum_pattern_notes(pattern_id, channel_id, spread_ticks, descending)
-        .map_err(|error| error.to_string())?;
+    let changed = match note_indices {
+        Some(note_indices) => document.strum_pattern_note_selection_with_options(
+            pattern_id,
+            channel_id,
+            note_indices,
+            options,
+        ),
+        None => document.strum_pattern_notes_with_options(pattern_id, channel_id, options),
+    }
+    .map_err(|error| error.to_string())?;
     let bytes = document
         .encode_lossless()
         .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
     fs::write(output, bytes)
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
-        "strummed {changed} notes in pattern {pattern_id}, channel {channel_id} with {spread_ticks} ticks of spread ({}) to {}",
-        if descending { "down" } else { "up" },
+        "strummed {changed} notes in pattern {pattern_id}, channel {channel_id} ({}) with {} ticks of spread, velocity amount {}, and velocity tension {}% ({}) to {}",
+        if note_indices.is_some() {
+            "selected notes"
+        } else {
+            "all channel notes"
+        },
+        options.spread_ticks,
+        options.velocity_amount,
+        options.velocity_tension_percent,
+        if options.descending { "down" } else { "up" },
         output.display()
     );
     Ok(())
+}
+
+fn parse_strum_direction(value: &str) -> Result<bool, String> {
+    match value {
+        "up" => Ok(false),
+        "down" => Ok(true),
+        _ => Err("strum direction must be 'up' or 'down'".to_owned()),
+    }
 }
 
 fn flam_notes(
@@ -3259,22 +5925,97 @@ fn flam_notes(
     velocity: u8,
     before: bool,
 ) -> Result<(), String> {
+    flam_notes_with_options(
+        input,
+        output,
+        pattern_id,
+        channel_id,
+        None,
+        FlamOptions {
+            stroke_ticks,
+            velocity,
+            before,
+            group_notes: false,
+        },
+    )
+}
+
+fn flam_notes_with_options(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    note_indices: Option<&[usize]>,
+    options: FlamOptions,
+) -> Result<(), String> {
     let (_, mut document) = load_document(input)?;
-    let created = document
-        .flam_pattern_notes(pattern_id, channel_id, stroke_ticks, velocity, before)
-        .map_err(|error| error.to_string())?;
+    let created = match note_indices {
+        Some(note_indices) => document.flam_pattern_note_selection_with_options(
+            pattern_id,
+            channel_id,
+            note_indices,
+            options,
+        ),
+        None => document.flam_pattern_notes_with_options(pattern_id, channel_id, options),
+    }
+    .map_err(|error| error.to_string())?;
     let bytes = document
         .encode_lossless()
         .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
     fs::write(output, bytes)
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
-        "added {created} flam strokes in pattern {pattern_id}, channel {channel_id} ({}) to {}",
-        if before {
+        "added {created} flam strokes in pattern {pattern_id}, channel {channel_id}, {} ({}, {}) to {}",
+        if note_indices.is_some() {
+            "selected notes"
+        } else {
+            "all channel notes"
+        },
+        if options.before {
             "before notes"
         } else {
             "after notes"
         },
+        if options.group_notes {
+            "grouped"
+        } else {
+            "not grouped"
+        },
+        output.display()
+    );
+    Ok(())
+}
+
+fn generate_random_notes(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    options: RandomNoteGeneratorOptions,
+    scale: Option<(u8, &[u8])>,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let created = match scale {
+        Some((scale_root, scale_intervals)) => document.generate_random_pattern_notes_with_scale(
+            pattern_id,
+            channel_id,
+            options,
+            scale_root,
+            scale_intervals,
+        ),
+        None => document.generate_random_pattern_notes(pattern_id, channel_id, options),
+    }
+    .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "generated {created} seeded notes in pattern {pattern_id}, channel {channel_id} from tick {} to {} using seed {} to {}",
+        options.start_tick,
+        options.end_tick,
+        options.seed,
         output.display()
     );
     Ok(())
@@ -3287,7 +6028,7 @@ fn randomize_notes(
     channel_id: u16,
     options: RandomizerOptions,
 ) -> Result<(), String> {
-    randomize_notes_inner(input, output, pattern_id, channel_id, options, None)
+    randomize_notes_inner(input, output, pattern_id, channel_id, None, options, None)
 }
 
 fn randomize_notes_with_scale(
@@ -3304,8 +6045,29 @@ fn randomize_notes_with_scale(
         output,
         pattern_id,
         channel_id,
+        None,
         options,
         Some((scale_root, scale_intervals)),
+    )
+}
+
+fn randomize_notes_selection(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    note_indices: &[usize],
+    options: RandomizerOptions,
+    scale: Option<(u8, &[u8])>,
+) -> Result<(), String> {
+    randomize_notes_inner(
+        input,
+        output,
+        pattern_id,
+        channel_id,
+        Some(note_indices),
+        options,
+        scale,
     )
 }
 
@@ -3314,19 +6076,32 @@ fn randomize_notes_inner(
     output: &Path,
     pattern_id: u16,
     channel_id: u16,
+    note_indices: Option<&[usize]>,
     options: RandomizerOptions,
     scale: Option<(u8, &[u8])>,
 ) -> Result<(), String> {
     let (_, mut document) = load_document(input)?;
-    let changed = match scale {
-        Some((scale_root, scale_intervals)) => document.randomize_pattern_notes_with_scale(
+    let changed = match (note_indices, scale) {
+        (Some(note_indices), Some((scale_root, scale_intervals))) => document
+            .randomize_pattern_note_selection_with_scale(
+                pattern_id,
+                channel_id,
+                note_indices,
+                options,
+                scale_root,
+                scale_intervals,
+            ),
+        (Some(note_indices), None) => {
+            document.randomize_pattern_note_selection(pattern_id, channel_id, note_indices, options)
+        }
+        (None, Some((scale_root, scale_intervals))) => document.randomize_pattern_notes_with_scale(
             pattern_id,
             channel_id,
             options,
             scale_root,
             scale_intervals,
         ),
-        None => document.randomize_pattern_notes(pattern_id, channel_id, options),
+        (None, None) => document.randomize_pattern_notes(pattern_id, channel_id, options),
     }
     .map_err(|error| error.to_string())?;
     let bytes = document
@@ -3348,26 +6123,44 @@ fn humanize_notes(
     pattern_id: u16,
     channel_id: u16,
     seed: u64,
-    timing_range_ticks: u32,
-    velocity_variation_percent: u8,
+    options: HumanizerOptions,
+) -> Result<(), String> {
+    humanize_notes_with_options(input, output, pattern_id, channel_id, None, seed, options)
+}
+
+fn humanize_notes_with_options(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    note_indices: Option<&[usize]>,
+    seed: u64,
+    options: HumanizerOptions,
 ) -> Result<(), String> {
     let (_, mut document) = load_document(input)?;
-    let changed = document
-        .humanize_pattern_notes(
+    let changed = match note_indices {
+        Some(note_indices) => document.humanize_pattern_note_selection_with_options(
             pattern_id,
             channel_id,
+            note_indices,
             seed,
-            timing_range_ticks,
-            velocity_variation_percent,
-        )
-        .map_err(|error| error.to_string())?;
+            options,
+        ),
+        None => document.humanize_pattern_notes_with_options(pattern_id, channel_id, seed, options),
+    }
+    .map_err(|error| error.to_string())?;
     let bytes = document
         .encode_lossless()
         .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
     fs::write(output, bytes)
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
-        "humanized {changed} notes in pattern {pattern_id}, channel {channel_id} with seed {seed} to {}",
+        "humanized {changed} {} in pattern {pattern_id}, channel {channel_id} with seed {seed} to {}",
+        if note_indices.is_some() {
+            "selected notes"
+        } else {
+            "channel notes"
+        },
         output.display()
     );
     Ok(())
@@ -3397,6 +6190,44 @@ fn limit_notes(
     Ok(())
 }
 
+fn limit_notes_with_options(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    note_indices: Option<&[usize]>,
+    options: LimitNoteOptions<'_>,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let changed = match note_indices {
+        Some(note_indices) => document.limit_pattern_note_selection_range_with_options(
+            pattern_id,
+            channel_id,
+            note_indices,
+            options,
+        ),
+        None => document.limit_pattern_note_range_with_options(pattern_id, channel_id, options),
+    }
+    .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "limited {changed} note pitches in pattern {pattern_id}, channel {channel_id} ({}) to {}..={} in {}",
+        if note_indices.is_some() {
+            "selected notes"
+        } else {
+            "all channel notes"
+        },
+        options.minimum_key,
+        options.maximum_key,
+        output.display()
+    );
+    Ok(())
+}
+
 fn arpeggiate_notes(
     input: &Path,
     output: &Path,
@@ -3404,17 +6235,77 @@ fn arpeggiate_notes(
     channel_id: u16,
     options: ArpeggioOptions,
 ) -> Result<(), String> {
+    arpeggiate_notes_with_scope(input, output, pattern_id, channel_id, None, options)
+}
+
+fn arpeggiate_notes_with_scope(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    note_indices: Option<&[usize]>,
+    options: ArpeggioOptions,
+) -> Result<(), String> {
     let (_, mut document) = load_document(input)?;
-    let created = document
-        .arpeggiate_pattern_notes(pattern_id, channel_id, options)
-        .map_err(|error| error.to_string())?;
+    let created = match note_indices {
+        Some(note_indices) => document.arpeggiate_pattern_note_selection(
+            pattern_id,
+            channel_id,
+            note_indices,
+            options,
+        ),
+        None => document.arpeggiate_pattern_notes(pattern_id, channel_id, options),
+    }
+    .map_err(|error| error.to_string())?;
     let bytes = document
         .encode_lossless()
         .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
     fs::write(output, bytes)
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
-        "generated {created} arpeggiated notes in pattern {pattern_id}, channel {channel_id} to {}",
+        "generated {created} arpeggiated notes in pattern {pattern_id}, channel {channel_id} ({}) to {}",
+        if note_indices.is_some() {
+            "selected notes"
+        } else {
+            "all channel notes"
+        },
+        output.display()
+    );
+    Ok(())
+}
+
+fn riff_machine_notes_with_scope(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    note_indices: Option<&[usize]>,
+    options: RiffMachineOptions<'_>,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let created = match note_indices {
+        Some(note_indices) => document.riff_machine_pattern_note_selection(
+            pattern_id,
+            channel_id,
+            note_indices,
+            options,
+        ),
+        None => document.riff_machine_pattern_notes(pattern_id, channel_id, options),
+    }
+    .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "created {created} Riff Machine notes in pattern {pattern_id}, channel {channel_id} ({}) with seed {} in {}",
+        if note_indices.is_some() {
+            "selected notes"
+        } else {
+            "all channel notes"
+        },
+        options.seed,
         output.display()
     );
     Ok(())
@@ -3427,9 +6318,54 @@ fn slice_notes(
     channel_id: u16,
     position_ticks: u32,
 ) -> Result<(), String> {
+    slice_notes_with_scope(input, output, pattern_id, channel_id, None, position_ticks)
+}
+
+fn slice_notes_with_scope(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    note_indices: Option<&[usize]>,
+    position_ticks: u32,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let created = match note_indices {
+        Some(note_indices) => document.slice_pattern_note_selection(
+            pattern_id,
+            channel_id,
+            note_indices,
+            position_ticks,
+        ),
+        None => document.slice_pattern_notes(pattern_id, channel_id, position_ticks),
+    }
+    .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "sliced {created} notes at tick {position_ticks} in pattern {pattern_id}, channel {channel_id} ({}) to {}",
+        if note_indices.is_some() {
+            "selected notes"
+        } else {
+            "all channel notes"
+        },
+        output.display()
+    );
+    Ok(())
+}
+
+fn slice_notes_at_positions(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    note_cuts: &[(u16, usize, u32)],
+) -> Result<(), String> {
     let (_, mut document) = load_document(input)?;
     let created = document
-        .slice_pattern_notes(pattern_id, channel_id, position_ticks)
+        .slice_pattern_notes_at_positions(pattern_id, note_cuts)
         .map_err(|error| error.to_string())?;
     let bytes = document
         .encode_lossless()
@@ -3437,7 +6373,115 @@ fn slice_notes(
     fs::write(output, bytes)
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
-        "sliced {created} notes at tick {position_ticks} in pattern {pattern_id}, channel {channel_id} to {}",
+        "created {created} sliced notes in pattern {pattern_id} from {} note cuts in {}",
+        note_cuts.len(),
+        output.display()
+    );
+    Ok(())
+}
+
+fn scale_levels_notes_with_scope(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    note_indices: Option<&[usize]>,
+    options: ScaleLevelsOptions,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let changed = match note_indices {
+        Some(note_indices) => document.scale_pattern_note_selection_levels_with_options(
+            pattern_id,
+            channel_id,
+            note_indices,
+            options,
+        ),
+        None => document.scale_pattern_note_levels_with_options(pattern_id, channel_id, options),
+    }
+    .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "scaled velocity levels for {changed} notes in pattern {pattern_id}, channel {channel_id} ({}) to {}",
+        if note_indices.is_some() {
+            "selected notes"
+        } else {
+            "all channel notes"
+        },
+        output.display()
+    );
+    Ok(())
+}
+
+fn articulate_notes_with_scope(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    note_indices: Option<&[usize]>,
+    options: ArticulateOptions,
+    only_with_selection: bool,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let changed = match note_indices {
+        Some(note_indices) => document.articulate_pattern_note_selection(
+            pattern_id,
+            channel_id,
+            note_indices,
+            options,
+            only_with_selection,
+        ),
+        None => document.articulate_pattern_notes(pattern_id, channel_id, options),
+    }
+    .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "articulated lengths for {changed} notes in pattern {pattern_id}, channel {channel_id} ({}) to {}",
+        if note_indices.is_some() {
+            "selected notes"
+        } else {
+            "all channel notes"
+        },
+        output.display()
+    );
+    Ok(())
+}
+
+fn claw_notes_with_scope(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    note_indices: Option<&[usize]>,
+    options: ClawMachineOptions,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let changed = match note_indices {
+        Some(note_indices) => {
+            document.claw_pattern_note_selection(pattern_id, channel_id, note_indices, options)
+        }
+        None => document.claw_pattern_notes(pattern_id, channel_id, options),
+    }
+    .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "applied Claw Machine to {changed} notes in pattern {pattern_id}, channel {channel_id} ({}) to {}",
+        if note_indices.is_some() {
+            "selected notes"
+        } else {
+            "all channel notes"
+        },
         output.display()
     );
     Ok(())
@@ -3462,6 +6506,34 @@ fn add_note(input: &Path, output: &Path, pattern_id: u16, note: PatternNote) -> 
     Ok(())
 }
 
+fn add_notes(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    notes: &[PatternNote],
+) -> Result<(), String> {
+    let channel_id = notes
+        .first()
+        .ok_or_else(|| "at least one note must be supplied".to_owned())?
+        .channel_id;
+    let (_, mut document) = load_document(input)?;
+    document
+        .add_pattern_notes(pattern_id, notes)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "added {} notes to pattern {pattern_id}, channel {} in {}",
+        notes.len(),
+        channel_id,
+        output.display()
+    );
+    Ok(())
+}
+
 fn create_pattern(input: &Path, output: &Path) -> Result<(), String> {
     let (_, mut document) = load_document(input)?;
     let pattern_id = document
@@ -3473,6 +6545,23 @@ fn create_pattern(input: &Path, output: &Path) -> Result<(), String> {
     fs::write(output, bytes)
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!("created empty pattern {pattern_id} in {}", output.display());
+    Ok(())
+}
+
+fn duplicate_pattern(input: &Path, output: &Path, pattern_id: u16) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let duplicate_id = document
+        .duplicate_pattern(pattern_id)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "duplicated pattern {pattern_id} as pattern {duplicate_id} in {}",
+        output.display()
+    );
     Ok(())
 }
 
@@ -3494,6 +6583,38 @@ fn delete_note(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "deleted note {note_index} from pattern {pattern_id}, channel {channel_id} to {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn delete_notes_with_scope(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    note_indices: Option<&[usize]>,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let deleted = match note_indices {
+        Some(note_indices) => {
+            document.delete_pattern_note_selection(pattern_id, channel_id, note_indices)
+        }
+        None => document.delete_pattern_notes(pattern_id, channel_id),
+    }
+    .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "deleted {deleted} notes in pattern {pattern_id}, channel {channel_id} ({}) to {}",
+        if note_indices.is_some() {
+            "selected notes"
+        } else {
+            "all channel notes"
+        },
         output.display()
     );
     Ok(())
@@ -3527,6 +6648,68 @@ fn import_midi_track(
     Ok(())
 }
 
+fn create_playlist_pattern_clip(
+    input: &Path,
+    output: &Path,
+    arrangement_id: u16,
+    pattern_id: u16,
+    position_ticks: u32,
+    length_ticks: u32,
+    track_index: u16,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let clip_index = document
+        .create_playlist_pattern_clip(
+            arrangement_id,
+            pattern_id,
+            position_ticks,
+            length_ticks,
+            track_index,
+        )
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "created Playlist Pattern Clip {clip_index} for pattern {pattern_id} at tick {position_ticks}, length {length_ticks}, track {track_index} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn create_playlist_audio_clip(
+    input: &Path,
+    output: &Path,
+    arrangement_id: u16,
+    channel_id: u16,
+    position_ticks: u32,
+    length_ticks: u32,
+    track_index: u16,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let clip_index = document
+        .create_playlist_audio_clip(
+            arrangement_id,
+            channel_id,
+            position_ticks,
+            length_ticks,
+            track_index,
+        )
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "created Playlist Audio Clip {clip_index} for channel {channel_id} at tick {position_ticks}, length {length_ticks}, track {track_index} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
 fn edit_clip(
     input: &Path,
     output: &Path,
@@ -3554,6 +6737,28 @@ fn edit_clip(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "wrote arrangement {arrangement_id} clip {clip_index} with position {position} and length {length} to {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn delete_playlist_clip(
+    input: &Path,
+    output: &Path,
+    arrangement_id: u16,
+    clip_index: usize,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .delete_playlist_clip(arrangement_id, clip_index)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "deleted Playlist clip {clip_index} from arrangement {arrangement_id} in {}",
         output.display()
     );
     Ok(())

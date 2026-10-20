@@ -4,8 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -22,6 +21,7 @@ use mp3lame_encoder::{
 #[cfg(test)]
 use vorbis_rs::VorbisDecoder;
 use vorbis_rs::{VorbisBitrateManagementStrategy, VorbisEncoder, VorbisEncoderBuilder};
+use vst3_host::midi::{MidiChannel, MidiEvent};
 
 use crate::audio::{
     AudioInputRecording, MIXER_TRACK_METER_COUNT, MixerTrackPeakMeters, StreamingAudioWriter,
@@ -590,6 +590,81 @@ pub enum SamplerLiveNoteEvent {
     },
 }
 
+/// Source channel and resolved Sampler destinations for live MIDI audition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SamplerLiveInputRouting {
+    /// Channel receiving the selected Pattern's live MIDI input.
+    pub source_channel_id: u16,
+    /// Enabled Sampler channels that may receive routed notes from the source.
+    pub target_channel_ids: BTreeSet<u16>,
+}
+
+/// Live MIDI and Sampler controller state for a mixed-child Layer source.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LayerLiveInputEvent {
+    /// MIDI message forwarded to VST3 children and interpreted for Sampler children as applicable.
+    Midi(Vst3LiveInputEvent),
+    /// Updated Sampler pitch-bend offset for an input MIDI channel.
+    SamplerPitchBend { channel: u8, cents: i16 },
+    /// Reset Sampler sustain, pan, and pitch-bend state for an input MIDI channel.
+    SamplerResetControllers {
+        channel: u8,
+        pan: u8,
+        pitch_bend_cents: i16,
+    },
+}
+
+/// Prepared destinations and Sampler settings for a mixed-child Layer input stream.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LayerLiveInputConfig {
+    /// Channel receiving the selected Pattern's live MIDI input.
+    pub source_channel_id: u16,
+    /// Enabled Sampler children that receive routed Layer notes.
+    pub sampler_target_channel_ids: BTreeSet<u16>,
+    /// Loaded VST3 children that receive routed Layer notes.
+    pub vst3_target_channel_ids: BTreeSet<u16>,
+    /// Saved-project location used to resolve Sampler sample paths.
+    pub project_path: PathBuf,
+    /// Sample rate, resampling, and selected Pattern used for Sampler preparation.
+    pub sampler_options: SamplerPatternRenderOptions,
+}
+
+/// Live MIDI messages sent to a selected VST3 channel while transport is stopped.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Vst3LiveInputEvent {
+    NoteOn {
+        channel: u8,
+        key: u8,
+        velocity: u8,
+    },
+    NoteOff {
+        channel: u8,
+        key: u8,
+    },
+    ControlChange {
+        channel: u8,
+        controller: u8,
+        value: u8,
+    },
+    ProgramChange {
+        channel: u8,
+        program: u8,
+    },
+    PitchBend {
+        channel: u8,
+        value: u16,
+    },
+    ChannelPressure {
+        channel: u8,
+        pressure: u8,
+    },
+    PolyphonicPressure {
+        channel: u8,
+        key: u8,
+        pressure: u8,
+    },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SamplerPatternRenderSummary {
     pub frames: u64,
@@ -969,14 +1044,82 @@ fn playlist_performance_sampler_clip_candidates(
                 && pattern.controllers.is_empty()
                 && pattern.notes.iter().all(|note| {
                     note.is_muted()
-                        || channels.get(&note.channel_id).is_some_and(|channel| {
-                            channel.kind() == Some(0) && channel.enabled() != Some(false)
-                        })
+                        || playlist_performance_sampler_note_source_supported(
+                            note.channel_id,
+                            &channels,
+                        )
                 }))
             .then_some(index)
         })
         .collect::<BTreeSet<_>>();
     Ok(candidates)
+}
+
+fn playlist_performance_sampler_note_source_supported(
+    source_channel_id: u16,
+    channels: &HashMap<u16, ChannelSummary>,
+) -> bool {
+    let Some(source) = channels.get(&source_channel_id) else {
+        return false;
+    };
+    if source.enabled() == Some(false) {
+        return false;
+    }
+    if source.layer_child_ids().is_some() {
+        return performance_layer_leaf_channel_ids(source_channel_id, channels).is_some_and(
+            |leaf_ids| {
+                !leaf_ids.is_empty()
+                    && leaf_ids.iter().all(|channel_id| {
+                        channels
+                            .get(channel_id)
+                            .is_some_and(|child| child.kind() == Some(0))
+                    })
+            },
+        );
+    }
+    source.kind() == Some(0)
+}
+
+fn performance_layer_leaf_channel_ids(
+    source_channel_id: u16,
+    channels: &HashMap<u16, ChannelSummary>,
+) -> Option<BTreeSet<u16>> {
+    fn collect(
+        channel_id: u16,
+        channels: &HashMap<u16, ChannelSummary>,
+        active_layers: &mut BTreeSet<u16>,
+        leaves: &mut BTreeSet<u16>,
+    ) -> Option<()> {
+        let channel = channels.get(&channel_id)?;
+        if channel.enabled() == Some(false) {
+            return None;
+        }
+        let Some(child_ids) = channel.layer_child_ids() else {
+            leaves.insert(channel_id);
+            return Some(());
+        };
+        if child_ids.is_empty() || !active_layers.insert(channel_id) {
+            return None;
+        }
+        let mut seen = BTreeSet::new();
+        for child_id in child_ids {
+            if !seen.insert(*child_id) {
+                continue;
+            }
+            collect(*child_id, channels, active_layers, leaves)?;
+        }
+        active_layers.remove(&channel_id);
+        Some(())
+    }
+
+    let mut leaves = BTreeSet::new();
+    collect(
+        source_channel_id,
+        channels,
+        &mut BTreeSet::new(),
+        &mut leaves,
+    )?;
+    Some(leaves)
 }
 
 /// Return enabled Audio Clips before the Start marker that can be launched in Performance Mode.
@@ -1026,6 +1169,73 @@ pub fn playlist_performance_audio_clip_indices(
             .then_some(index)
         })
         .collect())
+}
+
+fn playlist_performance_vst3_note_source_supported(
+    source_channel_id: u16,
+    channels: &HashMap<u16, ChannelSummary>,
+    loaded_vst3_channels: &BTreeSet<u16>,
+) -> bool {
+    let Some(source) = channels.get(&source_channel_id) else {
+        return false;
+    };
+    if source.enabled() == Some(false) {
+        return false;
+    }
+    if source.layer_child_ids().is_some() {
+        return performance_layer_leaf_channel_ids(source_channel_id, channels).is_some_and(
+            |leaf_ids| {
+                !leaf_ids.is_empty()
+                    && leaf_ids.iter().all(|channel_id| {
+                        loaded_vst3_channels.contains(channel_id)
+                            && channels.get(channel_id).is_some_and(|child| {
+                                child.kind() != Some(3) && child.plugin_identifier().is_some()
+                            })
+                    })
+            },
+        );
+    }
+    loaded_vst3_channels.contains(&source_channel_id) && source.plugin_identifier().is_some()
+}
+
+fn playlist_performance_note_source_route_kinds(
+    source_channel_id: u16,
+    channels: &HashMap<u16, ChannelSummary>,
+    loaded_vst3_channels: &BTreeSet<u16>,
+) -> Option<(bool, bool)> {
+    let source = channels.get(&source_channel_id)?;
+    if source.enabled() == Some(false) {
+        return None;
+    }
+    if source.layer_child_ids().is_some() {
+        let leaf_ids = performance_layer_leaf_channel_ids(source_channel_id, channels)?;
+        if leaf_ids.is_empty() {
+            return None;
+        }
+        let (mut has_sampler, mut has_vst3) = (false, false);
+        for child_id in leaf_ids {
+            let child = channels.get(&child_id)?;
+            if child.kind() == Some(0) {
+                has_sampler = true;
+            } else if loaded_vst3_channels.contains(&child_id)
+                && child.plugin_identifier().is_some()
+            {
+                has_vst3 = true;
+            } else {
+                return None;
+            }
+        }
+        return Some((has_sampler, has_vst3));
+    }
+    if source.kind() == Some(0) {
+        Some((true, false))
+    } else if loaded_vst3_channels.contains(&source_channel_id)
+        && source.plugin_identifier().is_some()
+    {
+        Some((false, true))
+    } else {
+        None
+    }
 }
 
 fn playlist_performance_vst3_clip_candidates(
@@ -1085,13 +1295,92 @@ fn playlist_performance_vst3_clip_candidates(
                 && pattern.controllers.is_empty()
                 && !notes.is_empty()
                 && notes.iter().all(|note| {
-                    loaded_vst3_channels.contains(&note.channel_id)
-                        && channels.get(&note.channel_id).is_some_and(|channel| {
-                            channel.enabled() != Some(false)
-                                && channel.plugin_identifier().is_some()
-                        })
+                    playlist_performance_vst3_note_source_supported(
+                        note.channel_id,
+                        &channels,
+                        loaded_vst3_channels,
+                    )
                 }))
             .then_some(index)
+        })
+        .collect())
+}
+
+fn playlist_performance_mixed_source_clip_candidates(
+    document: &FlpDocument,
+    arrangement_id: u16,
+    performance_zone_end_tick: u32,
+    loaded_vst3_channels: &BTreeSet<u16>,
+) -> Result<BTreeSet<usize>, String> {
+    if loaded_vst3_channels.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let arrangement = document
+        .arrangements()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|arrangement| arrangement.id == arrangement_id)
+        .ok_or_else(|| format!("arrangement {arrangement_id} was not found"))?;
+    let patterns = document
+        .patterns()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|pattern| (pattern.id, pattern))
+        .collect::<HashMap<_, _>>();
+    let channels = document
+        .channels()
+        .into_iter()
+        .map(|channel| (channel.id(), channel))
+        .collect::<HashMap<_, _>>();
+    let disabled_tracks = document
+        .playlist_tracks()
+        .into_iter()
+        .filter(|track| track.enabled == Some(false))
+        .map(|track| track.id)
+        .collect::<BTreeSet<_>>();
+    Ok(arrangement
+        .clips
+        .iter()
+        .enumerate()
+        .filter_map(|(index, clip)| {
+            let PlaylistClipTarget::Pattern { id } = clip.target() else {
+                return None;
+            };
+            let track_id = clip.playlist_track_id()?;
+            let pattern = patterns.get(&id)?;
+            let notes = pattern
+                .notes
+                .iter()
+                .filter(|note| !note.is_muted())
+                .collect::<Vec<_>>();
+            let (mut has_sampler, mut has_vst3) = (false, false);
+            let sources_supported = notes.iter().all(|note| {
+                let Some((note_has_sampler, note_has_vst3)) =
+                    playlist_performance_note_source_route_kinds(
+                        note.channel_id,
+                        &channels,
+                        loaded_vst3_channels,
+                    )
+                else {
+                    return false;
+                };
+                has_sampler |= note_has_sampler;
+                has_vst3 |= note_has_vst3;
+                true
+            });
+            (clip.position_ticks < performance_zone_end_tick
+                && clip.length_ticks > 0
+                && !clip.is_muted()
+                && !disabled_tracks.contains(&track_id)
+                && clip
+                    .scale
+                    .is_none_or(|scale| scale.is_finite() && (scale - 1.0).abs() <= 1e-9)
+                && pattern.controllers.is_empty()
+                && !notes.is_empty()
+                && sources_supported
+                && has_sampler
+                && has_vst3)
+                .then_some(index)
         })
         .collect())
 }
@@ -1110,8 +1399,8 @@ pub fn playlist_performance_clip_indices(
     )
 }
 
-/// Return supported Performance Mode clips, treating only loaded direct VST3 Pattern channels as
-/// launchable plugin sources.
+/// Return supported Performance Mode clips, including Pattern Clips that combine enabled Sampler
+/// and loaded VST3 destinations.
 pub fn playlist_performance_clip_indices_with_vst3(
     document: &FlpDocument,
     arrangement_id: u16,
@@ -1129,6 +1418,12 @@ pub fn playlist_performance_clip_indices_with_vst3(
         performance_zone_end_tick,
     )?);
     clip_indices.extend(playlist_performance_vst3_clip_candidates(
+        document,
+        arrangement_id,
+        performance_zone_end_tick,
+        loaded_vst3_channels,
+    )?);
+    clip_indices.extend(playlist_performance_mixed_source_clip_candidates(
         document,
         arrangement_id,
         performance_zone_end_tick,
@@ -1168,19 +1463,26 @@ pub fn playlist_performance_clip_indices_with_vst3(
     Ok(clip_indices)
 }
 
-/// Return only VST3 Pattern Clips on tracks whose Performance Zone media is fully supported.
+/// Return VST3 and mixed Sampler/VST3 Pattern Clips on tracks whose Performance Zone media is fully
+/// supported.
 pub fn playlist_performance_vst3_clip_indices(
     document: &FlpDocument,
     arrangement_id: u16,
     performance_zone_end_tick: u32,
     loaded_vst3_channels: &BTreeSet<u16>,
 ) -> Result<BTreeSet<usize>, String> {
-    let candidates = playlist_performance_vst3_clip_candidates(
+    let mut candidates = playlist_performance_vst3_clip_candidates(
         document,
         arrangement_id,
         performance_zone_end_tick,
         loaded_vst3_channels,
     )?;
+    candidates.extend(playlist_performance_mixed_source_clip_candidates(
+        document,
+        arrangement_id,
+        performance_zone_end_tick,
+        loaded_vst3_channels,
+    )?);
     let supported = playlist_performance_clip_indices_with_vst3(
         document,
         arrangement_id,
@@ -1190,7 +1492,8 @@ pub fn playlist_performance_vst3_clip_indices(
     Ok(candidates.intersection(&supported).copied().collect())
 }
 
-/// Return direct VST3 channels referenced by eligible Performance Mode Pattern Clips.
+/// Return VST3 channels referenced directly or through nested Layer sources in Performance Mode
+/// Pattern Clips.
 pub fn playlist_performance_vst3_channel_ids(
     document: &FlpDocument,
     arrangement_id: u16,
@@ -1208,6 +1511,11 @@ pub fn playlist_performance_vst3_channel_ids(
         .into_iter()
         .map(|pattern| (pattern.id, pattern))
         .collect::<HashMap<_, _>>();
+    let channels = document
+        .channels()
+        .into_iter()
+        .map(|channel| (channel.id(), channel))
+        .collect::<HashMap<_, _>>();
     Ok(clip_indices
         .iter()
         .filter_map(|clip_index| arrangement.clips.get(*clip_index))
@@ -1220,7 +1528,17 @@ pub fn playlist_performance_vst3_channel_ids(
                 .notes
                 .iter()
                 .filter(|note| !note.is_muted())
-                .map(|note| note.channel_id)
+                .flat_map(|note| {
+                    performance_layer_leaf_channel_ids(note.channel_id, &channels)
+                        .unwrap_or_default()
+                })
+        })
+        .filter(|channel_id| {
+            channels.get(channel_id).is_some_and(|channel| {
+                channel.kind() != Some(3)
+                    && channel.enabled() != Some(false)
+                    && channel.plugin_identifier().is_some()
+            })
         })
         .collect())
 }
@@ -1652,8 +1970,8 @@ pub fn stream_playlist_with_vst3_to_device_with_monitor(
 /// Stream arrangement audio while accepting quantized Audio and Sampler Clip launches.
 ///
 /// The arrangement must contain supported clips before the named Start marker. Launches replace
-/// content from the same Playlist track and repeat at the clip's tick length. Loaded direct VST3
-/// Pattern channels can receive live clip launches alongside Sampler and Audio Clips.
+/// content from the same Playlist track and repeat at the clip's tick length. Loaded VST3 Pattern
+/// Clips can receive live launches alongside Sampler and Audio Clips.
 pub fn stream_playlist_performance_with_vst3_to_device(
     document: &FlpDocument,
     project_path: impl AsRef<Path>,
@@ -1683,6 +2001,12 @@ pub fn stream_playlist_performance_with_vst3_to_device(
         options.arrangement_id,
         performance.performance_zone_end_tick,
     )?;
+    performance_sampler_clip_indices.extend(playlist_performance_mixed_source_clip_candidates(
+        document,
+        options.arrangement_id,
+        performance.performance_zone_end_tick,
+        &loaded_vst3_channels,
+    )?);
     let mut performance_audio_clip_indices = playlist_performance_audio_clip_indices(
         document,
         options.arrangement_id,
@@ -4089,51 +4413,91 @@ pub fn stream_sampler_pattern_to_device(
     )
 }
 
-/// Stream live MIDI note events through one Sampler channel while transport is stopped.
+/// Stream live MIDI note events through one or more Sampler channels while transport is stopped.
 ///
-/// The pattern is used to prepare the selected channel's sample and routing state. Its saved
+/// The pattern is used to prepare each destination channel's sample and routing state. Its saved
 /// notes are not played; note events arrive through `events` and are rendered on the worker.
-pub fn stream_sampler_midi_input_to_device(
+fn prepare_live_sampler_destinations(
     document: &FlpDocument,
-    project_path: impl AsRef<Path>,
+    project_path: &Path,
     options: SamplerPatternRenderOptions,
-    channel_id: u16,
-    events: Receiver<SamplerLiveNoteEvent>,
-    writer: &StreamingAudioWriter,
-    cancelled: &AtomicBool,
-) -> Result<(), String> {
+    source_channel_id: u16,
+    target_channel_ids: &BTreeSet<u16>,
+    cancelled: Option<&AtomicBool>,
+) -> Result<(PreparedSamplerPattern, HashMap<u16, i16>), String> {
     let channels = document.channels();
-    let channel = channels
+    let channels_by_id = channels
         .iter()
-        .find(|channel| channel.id() == channel_id)
-        .ok_or_else(|| format!("Sampler channel {channel_id} was not found"))?;
-    if channel.kind() != Some(0) || channel.enabled() == Some(false) {
+        .map(|channel| (channel.id(), channel))
+        .collect::<HashMap<_, _>>();
+    let source_channel = channels_by_id
+        .get(&source_channel_id)
+        .ok_or_else(|| format!("MIDI source channel {source_channel_id} was not found"))?;
+    if source_channel.enabled() == Some(false) {
         return Err(format!(
-            "channel {channel_id} is not an enabled Sampler channel"
+            "MIDI source channel {source_channel_id} is disabled"
         ));
     }
+    let expected_target_channel_ids = if source_channel.layer_child_ids().is_some() {
+        let mut expected_targets = BTreeSet::new();
+        collect_live_sampler_layer_targets(
+            source_channel,
+            &channels_by_id,
+            &mut BTreeSet::new(),
+            &mut expected_targets,
+        );
+        expected_targets
+    } else if source_channel.kind() == Some(0) {
+        BTreeSet::from([source_channel_id])
+    } else {
+        return Err(format!(
+            "MIDI source channel {source_channel_id} is not a Sampler or Layer"
+        ));
+    };
+    if target_channel_ids != &expected_target_channel_ids {
+        return Err(format!(
+            "Sampler destinations for source channel {source_channel_id} changed before audition started"
+        ));
+    }
+    if target_channel_ids.is_empty() {
+        return Err(format!(
+            "MIDI source channel {source_channel_id} has no Sampler destinations"
+        ));
+    }
+    for target_channel_id in target_channel_ids {
+        let Some(channel) = channels_by_id.get(target_channel_id) else {
+            return Err(format!("Sampler channel {target_channel_id} was not found"));
+        };
+        if channel.kind() != Some(0) || channel.enabled() == Some(false) {
+            return Err(format!(
+                "channel {target_channel_id} is not an enabled Sampler channel"
+            ));
+        }
+    }
 
-    let mut preview_document = document.clone();
-    let pattern = preview_document
+    let mut preparation_document = document.clone();
+    let pattern_exists = preparation_document
         .patterns()
         .map_err(|error| error.to_string())?
         .into_iter()
-        .find(|pattern| pattern.id == options.pattern_id)
-        .ok_or_else(|| format!("pattern {} was not found", options.pattern_id))?;
-    if !pattern
-        .notes
-        .iter()
-        .any(|note| note.channel_id == channel_id && !note.is_muted())
-    {
-        preview_document
+        .any(|pattern| pattern.id == options.pattern_id);
+    if !pattern_exists {
+        return Err(format!("pattern {} was not found", options.pattern_id));
+    }
+    for target_channel_id in target_channel_ids {
+        let channel = channels_by_id[target_channel_id];
+        let key = channel
+            .keyboard_key_region()
+            .map_or(SAMPLER_ROOT_KEY, |(low, _)| low.min(127));
+        preparation_document
             .add_pattern_note(
                 options.pattern_id,
                 PatternNote {
                     position: 0,
                     flags: crate::PATTERN_NOTE_DEFAULT_FLAGS,
-                    channel_id,
+                    channel_id: *target_channel_id,
                     length: 1,
-                    key: SAMPLER_ROOT_KEY,
+                    key,
                     group: 0,
                     fine_pitch: 120,
                     reserved: 0,
@@ -4149,21 +4513,83 @@ pub fn stream_sampler_midi_input_to_device(
     }
 
     let render = prepare_sampler_pattern_for_channel(
-        &preview_document,
+        &preparation_document,
+        project_path,
+        options,
+        cancelled,
+        Some(target_channel_ids),
+    )?;
+    let mut pitch_offsets_by_channel = HashMap::new();
+    for target_channel_id in target_channel_ids {
+        let source = render
+            .sources_by_channel
+            .get(target_channel_id)
+            .ok_or_else(|| format!("Sampler channel {target_channel_id} has no resolved sample"))?;
+        let channel = channels_by_id[target_channel_id];
+        pitch_offsets_by_channel.insert(
+            *target_channel_id,
+            sampler_note_pitch_offset_semitones(
+                channel,
+                source.root_key,
+                document.metadata().master_pitch_cents(),
+            ),
+        );
+    }
+    Ok((render, pitch_offsets_by_channel))
+}
+
+fn collect_live_sampler_layer_targets(
+    layer: &ChannelSummary,
+    channels_by_id: &HashMap<u16, &ChannelSummary>,
+    active_layers: &mut BTreeSet<u16>,
+    targets: &mut BTreeSet<u16>,
+) {
+    if !active_layers.insert(layer.id()) {
+        return;
+    }
+    let mut seen = BTreeSet::new();
+    for child_id in layer.layer_child_ids().unwrap_or_default() {
+        if !seen.insert(*child_id) {
+            continue;
+        }
+        let Some(child) = channels_by_id.get(child_id) else {
+            continue;
+        };
+        if child.enabled() == Some(false) {
+            continue;
+        }
+        if child.layer_child_ids().is_some() {
+            collect_live_sampler_layer_targets(child, channels_by_id, active_layers, targets);
+        } else if child.kind() == Some(0) {
+            targets.insert(*child_id);
+        }
+    }
+    active_layers.remove(&layer.id());
+}
+
+pub fn stream_sampler_midi_input_to_device(
+    document: &FlpDocument,
+    project_path: impl AsRef<Path>,
+    options: SamplerPatternRenderOptions,
+    routing: SamplerLiveInputRouting,
+    events: Receiver<SamplerLiveNoteEvent>,
+    writer: &StreamingAudioWriter,
+    cancelled: &AtomicBool,
+) -> Result<(), String> {
+    let SamplerLiveInputRouting {
+        source_channel_id,
+        target_channel_ids,
+    } = routing;
+    let channels = document.channels();
+    let (render, pitch_offsets_by_channel) = prepare_live_sampler_destinations(
+        document,
         project_path.as_ref(),
         options,
+        source_channel_id,
+        &target_channel_ids,
         Some(cancelled),
-        Some(channel_id),
     )?;
-    let source = render
-        .sources_by_channel
-        .get(&channel_id)
-        .ok_or_else(|| format!("Sampler channel {channel_id} has no resolved sample"))?;
-    let pitch_offset = sampler_note_pitch_offset_semitones(
-        channel,
-        source.root_key,
-        document.metadata().master_pitch_cents(),
-    );
+    let channel_router = ChannelNoteRouter::new(channels);
     let empty_notes = [];
     let mut engine = SamplerVoiceEngine::with_resampling_quality_and_pan_law(
         &render.sources_by_channel,
@@ -4181,6 +4607,8 @@ pub fn stream_sampler_midi_input_to_device(
     const LIVE_BLOCK_FRAMES: usize = 128;
     let mut block = vec![0.0f32; LIVE_BLOCK_FRAMES * 2];
     let mut block_start = 0u64;
+    let mut note_targets = HashMap::<(u8, u8), VecDeque<Vec<(u16, u16)>>>::new();
+    let mut note_seed = 0u64;
     loop {
         check_cancelled(Some(cancelled))?;
         if writer.is_cancelled() {
@@ -4193,12 +4621,20 @@ pub fn stream_sampler_midi_input_to_device(
                     key,
                     velocity,
                 }) => {
-                    let input_key = u16::from(key.min(127));
-                    if channel
-                        .keyboard_key_region()
-                        .is_none_or(|(low, high)| (low..=high).contains(&input_key))
-                    {
-                        let note_key = transpose_sampler_note_key(input_key, pitch_offset);
+                    let source_key = key.min(127);
+                    let routed_targets = channel_router
+                        .targets_for_note(source_channel_id, note_seed, u16::from(source_key))
+                        .into_iter()
+                        .filter(|target_channel_id| target_channel_ids.contains(target_channel_id));
+                    note_seed = note_seed.wrapping_add(1);
+                    let mut active_targets = Vec::new();
+                    for target_channel_id in routed_targets {
+                        let pitch_offset = pitch_offsets_by_channel
+                            .get(&target_channel_id)
+                            .copied()
+                            .unwrap_or_default();
+                        let note_key =
+                            transpose_sampler_note_key(u16::from(source_key), pitch_offset);
                         if let Some(slot_index) = engine.start_voice(ScheduledSamplerNote {
                             clip_index: 0,
                             playlist_track_id: None,
@@ -4206,20 +4642,37 @@ pub fn stream_sampler_midi_input_to_device(
                             stop_tick: None,
                             start_frame: block_start,
                             stop_frame: Some(u64::MAX),
-                            channel_id,
+                            channel_id: target_channel_id,
                             key: note_key,
                             velocity,
                             pan: engine.live_midi_pan(midi_channel),
                             fine_pitch_offset_cents: 0,
                         }) {
                             engine.set_voice_input_midi_channel(slot_index, midi_channel);
+                            active_targets.push((target_channel_id, note_key));
                         }
                     }
+                    note_targets
+                        .entry((midi_channel & 0x0F, source_key))
+                        .or_default()
+                        .push_back(active_targets);
                 }
                 Ok(SamplerLiveNoteEvent::NoteOff { channel, key }) => {
-                    let input_key = u16::from(key.min(127));
-                    let note_key = transpose_sampler_note_key(input_key, pitch_offset);
-                    engine.release_note(channel_id, note_key, channel);
+                    let source_note = (channel & 0x0F, key.min(127));
+                    let active_targets = note_targets
+                        .get_mut(&source_note)
+                        .and_then(VecDeque::pop_front);
+                    if note_targets
+                        .get(&source_note)
+                        .is_some_and(VecDeque::is_empty)
+                    {
+                        note_targets.remove(&source_note);
+                    }
+                    if let Some(active_targets) = active_targets {
+                        for (target_channel_id, note_key) in active_targets {
+                            engine.release_note(target_channel_id, note_key, channel);
+                        }
+                    }
                 }
                 Ok(SamplerLiveNoteEvent::PitchBend { channel, cents }) => {
                     engine.apply_live_pitch_bend(channel, cents);
@@ -4228,9 +4681,11 @@ pub fn stream_sampler_midi_input_to_device(
                     engine.apply_live_pan(channel, value);
                 }
                 Ok(SamplerLiveNoteEvent::AllNotesOff { channel }) => {
+                    note_targets.retain(|(midi_channel, _), _| *midi_channel != (channel & 0x0F));
                     engine.release_live_notes(channel);
                 }
                 Ok(SamplerLiveNoteEvent::AllSoundOff { channel }) => {
+                    note_targets.retain(|(midi_channel, _), _| *midi_channel != (channel & 0x0F));
                     engine.stop_live_voices(channel);
                 }
                 Ok(SamplerLiveNoteEvent::Sustain { channel, down }) => {
@@ -4254,6 +4709,467 @@ pub fn stream_sampler_midi_input_to_device(
         writer.write_stereo_samples(&block)?;
         block_start = block_start.saturating_add(LIVE_BLOCK_FRAMES as u64);
     }
+}
+
+#[derive(Clone, Copy)]
+enum LiveLayerNoteDestination {
+    Sampler {
+        channel_id: u16,
+        key: u16,
+    },
+    Vst3 {
+        channel_id: u16,
+        note_id: i32,
+        key: u8,
+    },
+}
+
+/// Stream a mixed Sampler/VST3 Layer through one synchronized live audio path.
+pub fn stream_mixed_layer_midi_input_to_device(
+    mut processor: Vst3PlaylistStreamProcessor,
+    document: FlpDocument,
+    config: LayerLiveInputConfig,
+    events: Receiver<LayerLiveInputEvent>,
+    writer: &StreamingAudioWriter,
+    cancelled: &AtomicBool,
+) -> Result<(), String> {
+    let available_vst3_channels = processor.performance_channel_ids();
+    if !config
+        .vst3_target_channel_ids
+        .is_subset(&available_vst3_channels)
+    {
+        return Err(format!(
+            "one or more VST3 children for Layer {} are not available for live MIDI audition",
+            config.source_channel_id
+        ));
+    }
+    if config.sampler_target_channel_ids.is_empty() || config.vst3_target_channel_ids.is_empty() {
+        return Err("mixed Layer audition needs both Sampler and VST3 destinations".to_owned());
+    }
+    if !config
+        .sampler_target_channel_ids
+        .is_disjoint(&config.vst3_target_channel_ids)
+    {
+        return Err("mixed Layer destinations overlap".to_owned());
+    }
+
+    let (sampler_render, sampler_pitch_offsets) = prepare_live_sampler_destinations(
+        &document,
+        &config.project_path,
+        config.sampler_options,
+        config.source_channel_id,
+        &config.sampler_target_channel_ids,
+        Some(cancelled),
+    )?;
+    let channels = document.channels();
+    let channel_router = ChannelNoteRouter::new(channels);
+    let master_output = MixerMasterOutput::from_document(&document);
+    let empty_notes = [];
+    let mut sampler_engine = SamplerVoiceEngine::with_resampling_quality_and_pan_law(
+        &sampler_render.sources_by_channel,
+        &empty_notes,
+        sampler_render.voice_limit,
+        (f64::from(sampler_render.summary.sample_rate) * SAMPLER_RELEASE_SECONDS)
+            .round()
+            .max(1.0) as usize,
+        sampler_render.summary.sample_rate,
+        sampler_render.resampling_quality,
+        sampler_render.pan_law,
+    );
+    sampler_engine.mixer_transforms_by_channel = Some(&sampler_render.mixer_transforms_by_channel);
+
+    const LIVE_BLOCK_FRAMES: usize = 128;
+    let mut block = vec![0.0f32; LIVE_BLOCK_FRAMES * 2];
+    let mut sampler_block = vec![0.0f32; LIVE_BLOCK_FRAMES * 2];
+    let mut direct_source_delay =
+        crate::audio::StereoFrameDelay::new(processor.pdc_direct_source_delay_frames())?;
+    let mut note_targets = HashMap::<(u8, u8), VecDeque<Vec<LiveLayerNoteDestination>>>::new();
+    let mut note_seed = 0u64;
+    processor.start_processing()?;
+    let stream_result = (|| {
+        let mut block_start = 0u64;
+        loop {
+            if cancelled.load(Ordering::Acquire) || writer.is_cancelled() {
+                return Err("Layer input audition was stopped".to_owned());
+            }
+            let mut disconnected = false;
+            loop {
+                match events.try_recv() {
+                    Ok(LayerLiveInputEvent::Midi(Vst3LiveInputEvent::NoteOn {
+                        channel,
+                        key,
+                        velocity,
+                    })) => {
+                        let source_key = key.min(127);
+                        let routed_targets = channel_router
+                            .targets_for_note(
+                                config.source_channel_id,
+                                note_seed,
+                                u16::from(source_key),
+                            )
+                            .into_iter()
+                            .filter(|target_channel_id| {
+                                config
+                                    .sampler_target_channel_ids
+                                    .contains(target_channel_id)
+                                    || config.vst3_target_channel_ids.contains(target_channel_id)
+                            });
+                        note_seed = note_seed.wrapping_add(1);
+                        let mut active_targets = Vec::new();
+                        for target_channel_id in routed_targets {
+                            if config
+                                .sampler_target_channel_ids
+                                .contains(&target_channel_id)
+                            {
+                                let pitch_offset = sampler_pitch_offsets
+                                    .get(&target_channel_id)
+                                    .copied()
+                                    .unwrap_or_default();
+                                let rendered_key =
+                                    transpose_sampler_note_key(u16::from(source_key), pitch_offset);
+                                if let Some(slot_index) =
+                                    sampler_engine.start_voice(ScheduledSamplerNote {
+                                        clip_index: 0,
+                                        playlist_track_id: None,
+                                        start_tick: 0,
+                                        stop_tick: None,
+                                        start_frame: block_start,
+                                        stop_frame: Some(u64::MAX),
+                                        channel_id: target_channel_id,
+                                        key: rendered_key,
+                                        velocity,
+                                        pan: sampler_engine.live_midi_pan(channel),
+                                        fine_pitch_offset_cents: 0,
+                                    })
+                                {
+                                    sampler_engine
+                                        .set_voice_input_midi_channel(slot_index, channel);
+                                    active_targets.push(LiveLayerNoteDestination::Sampler {
+                                        channel_id: target_channel_id,
+                                        key: rendered_key,
+                                    });
+                                }
+                            } else if config.vst3_target_channel_ids.contains(&target_channel_id) {
+                                let (note_id, rendered_key) = processor
+                                    .schedule_live_input_note_on(
+                                        target_channel_id,
+                                        channel,
+                                        source_key,
+                                        velocity,
+                                    )?;
+                                active_targets.push(LiveLayerNoteDestination::Vst3 {
+                                    channel_id: target_channel_id,
+                                    note_id,
+                                    key: rendered_key,
+                                });
+                            }
+                        }
+                        note_targets
+                            .entry((channel & 0x0F, source_key))
+                            .or_default()
+                            .push_back(active_targets);
+                    }
+                    Ok(LayerLiveInputEvent::Midi(Vst3LiveInputEvent::NoteOff { channel, key })) => {
+                        let source_note = (channel & 0x0F, key.min(127));
+                        let active_targets = note_targets
+                            .get_mut(&source_note)
+                            .and_then(VecDeque::pop_front);
+                        if note_targets
+                            .get(&source_note)
+                            .is_some_and(VecDeque::is_empty)
+                        {
+                            note_targets.remove(&source_note);
+                        }
+                        if let Some(active_targets) = active_targets {
+                            for target in active_targets {
+                                match target {
+                                    LiveLayerNoteDestination::Sampler { channel_id, key } => {
+                                        sampler_engine.release_note(channel_id, key, channel);
+                                    }
+                                    LiveLayerNoteDestination::Vst3 {
+                                        channel_id,
+                                        note_id,
+                                        key,
+                                    } => {
+                                        processor.schedule_live_input_note_off(
+                                            channel_id, channel, key, note_id,
+                                        )?;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Ok(LayerLiveInputEvent::Midi(
+                        live_event @ Vst3LiveInputEvent::PolyphonicPressure { channel, key, .. },
+                    )) => {
+                        let source_note = (channel & 0x0F, key.min(127));
+                        let affected_channels = note_targets
+                            .get(&source_note)
+                            .into_iter()
+                            .flatten()
+                            .flatten()
+                            .filter_map(|target| match target {
+                                LiveLayerNoteDestination::Vst3 { channel_id, .. } => {
+                                    Some(*channel_id)
+                                }
+                                LiveLayerNoteDestination::Sampler { .. } => None,
+                            })
+                            .collect::<BTreeSet<_>>();
+                        let midi_event = live_input_controller_event(live_event)?;
+                        for channel_id in affected_channels {
+                            processor.schedule_live_input_midi_event(channel_id, midi_event)?;
+                        }
+                    }
+                    Ok(LayerLiveInputEvent::Midi(live_event)) => {
+                        if let Vst3LiveInputEvent::ControlChange {
+                            channel,
+                            controller,
+                            value,
+                        } = live_event
+                        {
+                            match controller {
+                                10 => sampler_engine.apply_live_pan(channel, value),
+                                64 => sampler_engine.set_live_sustain(channel, value >= 64),
+                                120 => {
+                                    note_targets.retain(|(midi_channel, _), _| {
+                                        *midi_channel != (channel & 0x0F)
+                                    });
+                                    sampler_engine.stop_live_voices(channel);
+                                }
+                                123..=127 => {
+                                    note_targets.retain(|(midi_channel, _), _| {
+                                        *midi_channel != (channel & 0x0F)
+                                    });
+                                    sampler_engine.release_live_notes(channel);
+                                }
+                                _ => {}
+                            }
+                        }
+                        let midi_event = live_input_controller_event(live_event)?;
+                        for channel_id in &config.vst3_target_channel_ids {
+                            processor.schedule_live_input_midi_event(*channel_id, midi_event)?;
+                        }
+                    }
+                    Ok(LayerLiveInputEvent::SamplerPitchBend { channel, cents }) => {
+                        sampler_engine.apply_live_pitch_bend(channel, cents);
+                    }
+                    Ok(LayerLiveInputEvent::SamplerResetControllers {
+                        channel,
+                        pan,
+                        pitch_bend_cents,
+                    }) => {
+                        sampler_engine.set_live_sustain(channel, false);
+                        sampler_engine.apply_live_pan(channel, pan);
+                        sampler_engine.apply_live_pitch_bend(channel, pitch_bend_cents);
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+            if disconnected {
+                break;
+            }
+            sampler_engine.render_block(block_start, LIVE_BLOCK_FRAMES, &mut sampler_block);
+            direct_source_delay.process_interleaved(&mut sampler_block)?;
+            block.fill(0.0);
+            for (mixed, sampler_sample) in block.iter_mut().zip(&sampler_block) {
+                *mixed += *sampler_sample;
+            }
+            processor.mix_next_block(&mut block)?;
+            master_output.apply(&mut block);
+            writer.write_stereo_samples(&block)?;
+            block_start = block_start.saturating_add(LIVE_BLOCK_FRAMES as u64);
+        }
+        Ok(())
+    })();
+
+    let cleanup_result = processor.stop_live_input_notes();
+    let stop_result = processor.stop_processing();
+    stream_result.and(cleanup_result).and(stop_result)
+}
+
+/// Stream live MIDI events through prepared VST3 channels while transport is stopped.
+///
+/// Arrangement notes are removed from the prepared live stream before this function is called.
+/// The processor still supplies each channel's mixer routing, latency compensation, and pitch
+/// settings while note events arrive on the worker thread. Layer sources route notes through the
+/// same key-range and Random selection rules used by rendered patterns.
+pub fn stream_vst3_midi_input_to_device(
+    mut processor: Vst3PlaylistStreamProcessor,
+    document: FlpDocument,
+    source_channel_id: u16,
+    target_channel_ids: BTreeSet<u16>,
+    events: Receiver<Vst3LiveInputEvent>,
+    writer: &StreamingAudioWriter,
+    cancelled: &AtomicBool,
+) -> Result<(), String> {
+    let available_channel_ids = processor.performance_channel_ids();
+    if !target_channel_ids.is_subset(&available_channel_ids) {
+        return Err(format!(
+            "one or more VST3 channels for source {source_channel_id} are not available for live MIDI audition"
+        ));
+    }
+    let channel_router = ChannelNoteRouter::new(document.channels());
+    let master_output = MixerMasterOutput::from_document(&document);
+    processor.start_processing()?;
+
+    const LIVE_BLOCK_FRAMES: usize = 128;
+    let mut block = vec![0.0f32; LIVE_BLOCK_FRAMES * 2];
+    let mut note_ids = HashMap::<(u8, u8), VecDeque<Vec<(u16, i32, u8)>>>::new();
+    let mut note_seed = 0u64;
+    let stream_result = (|| {
+        loop {
+            if cancelled.load(Ordering::Acquire) || writer.is_cancelled() {
+                return Err("VST3 input audition was stopped".to_owned());
+            }
+            let mut disconnected = false;
+            loop {
+                match events.try_recv() {
+                    Ok(Vst3LiveInputEvent::NoteOn {
+                        channel,
+                        key,
+                        velocity,
+                    }) => {
+                        let source_key = key.min(127);
+                        let routed_targets = channel_router
+                            .targets_for_note(source_channel_id, note_seed, u16::from(source_key))
+                            .into_iter()
+                            .filter(|target_id| target_channel_ids.contains(target_id));
+                        note_seed = note_seed.wrapping_add(1);
+                        let mut active_targets = Vec::new();
+                        for target_channel_id in routed_targets {
+                            let (note_id, rendered_key) = processor.schedule_live_input_note_on(
+                                target_channel_id,
+                                channel,
+                                source_key,
+                                velocity,
+                            )?;
+                            active_targets.push((target_channel_id, note_id, rendered_key));
+                        }
+                        note_ids
+                            .entry((channel & 0x0F, source_key))
+                            .or_default()
+                            .push_back(active_targets);
+                    }
+                    Ok(Vst3LiveInputEvent::NoteOff { channel, key }) => {
+                        let source_note = (channel & 0x0F, key.min(127));
+                        let active_note =
+                            note_ids.get_mut(&source_note).and_then(VecDeque::pop_front);
+                        if note_ids.get(&source_note).is_some_and(VecDeque::is_empty) {
+                            note_ids.remove(&source_note);
+                        }
+                        if let Some(active_targets) = active_note {
+                            for (target_channel_id, note_id, rendered_key) in active_targets {
+                                processor.schedule_live_input_note_off(
+                                    target_channel_id,
+                                    channel,
+                                    rendered_key,
+                                    note_id,
+                                )?;
+                            }
+                        }
+                    }
+                    Ok(
+                        live_event @ Vst3LiveInputEvent::PolyphonicPressure { channel, key, .. },
+                    ) => {
+                        let source_note = (channel & 0x0F, key.min(127));
+                        let affected_targets = note_ids
+                            .get(&source_note)
+                            .into_iter()
+                            .flatten()
+                            .flatten()
+                            .map(|(target_channel_id, _, _)| *target_channel_id)
+                            .collect::<BTreeSet<_>>();
+                        let midi_event = live_input_controller_event(live_event)?;
+                        for target_channel_id in affected_targets {
+                            processor
+                                .schedule_live_input_midi_event(target_channel_id, midi_event)?;
+                        }
+                    }
+                    Ok(live_event) => {
+                        if let Vst3LiveInputEvent::ControlChange {
+                            channel,
+                            controller: 120 | 123..=127,
+                            ..
+                        } = live_event
+                        {
+                            note_ids
+                                .retain(|(midi_channel, _), _| *midi_channel != (channel & 0x0F));
+                        }
+                        let midi_event = live_input_controller_event(live_event)?;
+                        for target_channel_id in &target_channel_ids {
+                            processor
+                                .schedule_live_input_midi_event(*target_channel_id, midi_event)?;
+                        }
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+            if disconnected {
+                break;
+            }
+            processor.mix_next_block(&mut block)?;
+            master_output.apply(&mut block);
+            writer.write_stereo_samples(&block)?;
+        }
+        Ok(())
+    })();
+
+    let cleanup_result = processor.stop_live_input_notes();
+    let stop_result = processor.stop_processing();
+    stream_result.and(cleanup_result).and(stop_result)
+}
+
+fn live_input_controller_event(event: Vst3LiveInputEvent) -> Result<MidiEvent, String> {
+    let channel = match event {
+        Vst3LiveInputEvent::ControlChange { channel, .. }
+        | Vst3LiveInputEvent::ProgramChange { channel, .. }
+        | Vst3LiveInputEvent::PitchBend { channel, .. }
+        | Vst3LiveInputEvent::ChannelPressure { channel, .. }
+        | Vst3LiveInputEvent::PolyphonicPressure { channel, .. } => {
+            MidiChannel::from_index(channel & 0x0F)
+                .ok_or_else(|| "MIDI channel is outside 0..15".to_owned())?
+        }
+        Vst3LiveInputEvent::NoteOn { .. } | Vst3LiveInputEvent::NoteOff { .. } => {
+            return Err("note events need VST3 note IDs".to_owned());
+        }
+    };
+    Ok(match event {
+        Vst3LiveInputEvent::ControlChange {
+            controller, value, ..
+        } => MidiEvent::ControlChange {
+            channel,
+            controller: controller.min(127),
+            value: value.min(127),
+        },
+        Vst3LiveInputEvent::ProgramChange { program, .. } => MidiEvent::ProgramChange {
+            channel,
+            program: program.min(127),
+        },
+        Vst3LiveInputEvent::PitchBend { value, .. } => MidiEvent::PitchBend {
+            channel,
+            value: value.min(16_383),
+        },
+        Vst3LiveInputEvent::ChannelPressure { pressure, .. } => MidiEvent::ChannelAftertouch {
+            channel,
+            pressure: pressure.min(127),
+        },
+        Vst3LiveInputEvent::PolyphonicPressure { key, pressure, .. } => MidiEvent::PolyAftertouch {
+            channel,
+            note: key.min(127),
+            pressure: pressure.min(127),
+        },
+        Vst3LiveInputEvent::NoteOn { .. } | Vst3LiveInputEvent::NoteOff { .. } => {
+            unreachable!("note variants were handled before conversion")
+        }
+    })
 }
 
 fn stream_prepared_sampler_pattern(
@@ -5522,6 +6438,7 @@ impl PlaylistPerformanceRuntime {
         if !sources.vst3_clip_indices.is_empty() {
             let patterns = document.patterns().map_err(|error| error.to_string())?;
             let channels = document.channels();
+            let channel_router = ChannelNoteRouter::new(channels.clone());
             let channels_by_id = channels
                 .iter()
                 .map(|channel| (channel.id(), channel))
@@ -5551,19 +6468,24 @@ impl PlaylistPerformanceRuntime {
                         .get(&channel_id)
                         .map_or(128, |channel| channel.swing_mix())
                 },
-                |channel_id, _, _| {
-                    if !sources.vst3_channel_ids.contains(&channel_id) {
-                        return Vec::new();
-                    }
-                    channels_by_id
-                        .get(&channel_id)
-                        .filter(|channel| {
-                            channel.enabled() != Some(false)
-                                && channel.plugin_identifier().is_some()
-                                && mixer_route_audibility.allows_channel(channel.mixer_track())
+                |channel_id, note_seed, key| {
+                    channel_router
+                        .targets_for_note(channel_id, note_seed, key)
+                        .into_iter()
+                        .filter(|target_channel_id| {
+                            sources.vst3_channel_ids.contains(target_channel_id)
                         })
-                        .map(|_| vec![channel_id])
-                        .unwrap_or_default()
+                        .filter(|target_channel_id| {
+                            channels_by_id
+                                .get(target_channel_id)
+                                .is_some_and(|channel| {
+                                    channel.enabled() != Some(false)
+                                        && channel.plugin_identifier().is_some()
+                                        && mixer_route_audibility
+                                            .allows_channel(channel.mixer_track())
+                                })
+                        })
+                        .collect()
                 },
             )?;
             let mut notes_by_clip = HashMap::<usize, Vec<PerformanceVst3Note>>::new();
@@ -6440,6 +7362,7 @@ impl PlaylistPerformanceRuntime {
     ) -> Result<(), String> {
         let is_sampler_clip = self.clips_by_index.contains_key(&launch.clip_index);
         let is_audio_clip = self.audio_clips_by_index.contains_key(&launch.clip_index);
+        let is_vst3_clip = self.vst3_clips_by_index.contains_key(&launch.clip_index);
         let (track_id, length_ticks) =
             if let Some(clip) = self.clips_by_index.get(&launch.clip_index) {
                 (clip.track_id, clip.length_ticks)
@@ -6476,7 +7399,8 @@ impl PlaylistPerformanceRuntime {
                     first_pass_scheduled: false,
                 },
             );
-        } else if is_audio_clip {
+        }
+        if is_audio_clip {
             self.active_audio_by_track.insert(
                 track_id,
                 ActivePerformanceAudioClip {
@@ -6488,7 +7412,8 @@ impl PlaylistPerformanceRuntime {
                     first_pass_scheduled: false,
                 },
             );
-        } else {
+        }
+        if is_vst3_clip {
             self.active_vst3_by_track.insert(
                 track_id,
                 ActivePerformanceVst3Clip {
@@ -7111,7 +8036,7 @@ fn prepare_sampler_pattern_for_channel(
     project_path: &Path,
     options: SamplerPatternRenderOptions,
     cancelled: Option<&AtomicBool>,
-    channel_filter: Option<u16>,
+    channel_filter: Option<&BTreeSet<u16>>,
 ) -> Result<PreparedSamplerPattern, String> {
     check_cancelled(cancelled)?;
     if !(8_000..=384_000).contains(&options.sample_rate) {
@@ -7166,7 +8091,7 @@ fn prepare_sampler_pattern_for_channel(
                 .map(move |target_channel_id| (note, target_channel_id))
         })
         .filter(|(_, target_channel_id)| {
-            channel_filter.is_none_or(|channel_id| *target_channel_id == channel_id)
+            channel_filter.is_none_or(|channel_ids| channel_ids.contains(target_channel_id))
         })
         .collect::<Vec<_>>();
     let sampler_note_count = sampler_notes.len();

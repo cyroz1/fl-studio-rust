@@ -35,6 +35,7 @@ static NEXT_RENDER_FILE_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_VST3_NOTE_EXPRESSION_ID: AtomicU64 = AtomicU64::new(0);
 const VST3_NOTE_EXPRESSION_ID_START: u64 = 1 << 30;
 const VST3_NOTE_EXPRESSION_ID_COUNT: u64 = 1 << 30;
+const LIVE_VST3_INPUT_TRACK_ID: u32 = u32::MAX;
 const MAX_STEREO_BUFFER_BYTES: usize = 512 * 1024 * 1024;
 const MAX_VST3_AUTOMATION_POINTS: usize = 1_000_000;
 const MAX_PDC_DELAY_BYTES: u64 = 128 * 1024 * 1024;
@@ -255,6 +256,181 @@ impl Vst3PlaylistStreamProcessor {
             .filter(|stream| stream.live_performance)
             .map(|stream| stream.channel_id)
             .collect()
+    }
+
+    /// Remove the prepared arrangement notes from one live performance stream before input starts.
+    pub fn clear_live_input_events(&mut self, channel_id: u16) -> Result<(), String> {
+        let stream = self
+            .streams
+            .iter_mut()
+            .find(|stream| stream.channel_id == channel_id && stream.live_performance)
+            .ok_or_else(|| format!("VST3 channel {channel_id} is not available for live input"))?;
+        self.notes_scheduled = self
+            .notes_scheduled
+            .saturating_sub(stream.render.note_count);
+        stream.render.note_count = 0;
+        stream.render.events.clear();
+        stream.next_event = 0;
+        stream.active_performance_notes.clear();
+        Ok(())
+    }
+
+    pub(crate) fn schedule_live_input_note_on(
+        &mut self,
+        channel_id: u16,
+        midi_channel: u8,
+        key: u8,
+        velocity: u8,
+    ) -> Result<(i32, u8), String> {
+        let midi_channel = MidiChannel::from_index(midi_channel & 0x0F)
+            .ok_or_else(|| "MIDI channel is outside 0..15".to_owned())?;
+        let stream = self
+            .streams
+            .iter_mut()
+            .find(|stream| stream.channel_id == channel_id && stream.live_performance)
+            .ok_or_else(|| format!("VST3 channel {channel_id} is not available for live input"))?;
+        let note =
+            (i16::from(key.min(127)) + stream.note_pitch_offset_semitones).clamp(0, 127) as u8;
+        let note_id = next_vst3_note_expression_id();
+        let frame = stream.source_frame;
+        queue_live_vst3_input_event(
+            stream,
+            ScheduledMidiEvent {
+                frame,
+                priority: 1,
+                event: MidiEvent::NoteOn {
+                    channel: midi_channel,
+                    note,
+                    velocity: velocity.min(127),
+                },
+                fine_pitch_offset_cents: 0,
+                note_id,
+                note_pan: 64,
+                note_release: 64,
+                performance_track_id: Some(LIVE_VST3_INPUT_TRACK_ID),
+            },
+        );
+        self.notes_scheduled = self.notes_scheduled.saturating_add(1);
+        Ok((note_id, note))
+    }
+
+    pub(crate) fn schedule_live_input_note_off(
+        &mut self,
+        channel_id: u16,
+        midi_channel: u8,
+        key: u8,
+        note_id: i32,
+    ) -> Result<(), String> {
+        let midi_channel = MidiChannel::from_index(midi_channel & 0x0F)
+            .ok_or_else(|| "MIDI channel is outside 0..15".to_owned())?;
+        let stream = self
+            .streams
+            .iter_mut()
+            .find(|stream| stream.channel_id == channel_id && stream.live_performance)
+            .ok_or_else(|| format!("VST3 channel {channel_id} is not available for live input"))?;
+        let frame = stream.source_frame.saturating_add(1);
+        queue_live_vst3_input_event(
+            stream,
+            ScheduledMidiEvent {
+                frame,
+                priority: 0,
+                event: MidiEvent::NoteOff {
+                    channel: midi_channel,
+                    note: key.min(127),
+                    velocity: 0,
+                },
+                fine_pitch_offset_cents: 0,
+                note_id,
+                note_pan: 64,
+                note_release: 64,
+                performance_track_id: Some(LIVE_VST3_INPUT_TRACK_ID),
+            },
+        );
+        Ok(())
+    }
+
+    pub(crate) fn schedule_live_input_midi_event(
+        &mut self,
+        channel_id: u16,
+        event: MidiEvent,
+    ) -> Result<(), String> {
+        let stream = self
+            .streams
+            .iter_mut()
+            .find(|stream| stream.channel_id == channel_id && stream.live_performance)
+            .ok_or_else(|| format!("VST3 channel {channel_id} is not available for live input"))?;
+        let event = match event {
+            MidiEvent::ControlChange { .. }
+            | MidiEvent::ProgramChange { .. }
+            | MidiEvent::PitchBend { .. }
+            | MidiEvent::ChannelAftertouch { .. } => event,
+            MidiEvent::PolyAftertouch {
+                channel,
+                note,
+                pressure,
+            } => MidiEvent::PolyAftertouch {
+                channel,
+                note: (i16::from(note) + stream.note_pitch_offset_semitones).clamp(0, 127) as u8,
+                pressure,
+            },
+            _ => return Err("only live VST3 controller messages can use this path".to_owned()),
+        };
+        let frame = stream.source_frame;
+        queue_live_vst3_input_event(
+            stream,
+            ScheduledMidiEvent {
+                frame,
+                priority: 1,
+                event,
+                fine_pitch_offset_cents: 0,
+                note_id: -1,
+                note_pan: 64,
+                note_release: 64,
+                performance_track_id: Some(LIVE_VST3_INPUT_TRACK_ID),
+            },
+        );
+        Ok(())
+    }
+
+    pub(crate) fn stop_live_input_notes(&mut self) -> Result<(), String> {
+        for stream in &mut self.streams {
+            if !stream.live_performance {
+                continue;
+            }
+            let stop_frame = stream.source_frame;
+            let note_offs = stream
+                .active_performance_notes
+                .iter()
+                .filter(|(_, event)| event.performance_track_id == Some(LIVE_VST3_INPUT_TRACK_ID))
+                .filter_map(|(_, event)| {
+                    let MidiEvent::NoteOn { channel, note, .. } = event.event else {
+                        return None;
+                    };
+                    Some(ScheduledMidiEvent {
+                        frame: stop_frame,
+                        priority: 0,
+                        event: MidiEvent::NoteOff {
+                            channel,
+                            note,
+                            velocity: 0,
+                        },
+                        ..*event
+                    })
+                })
+                .collect::<Vec<_>>();
+            let mut pending_events = stream.render.events.split_off(stream.next_event);
+            pending_events
+                .retain(|event| event.performance_track_id != Some(LIVE_VST3_INPUT_TRACK_ID));
+            pending_events.extend(note_offs.iter().copied());
+            pending_events.sort_by_key(|event| (event.frame, event.priority));
+            stream.render.events.extend(pending_events);
+            if !note_offs.is_empty() {
+                let output_frames = stream.pending_output.len().saturating_add(1);
+                let mut discarded_output = Vec::new();
+                stream.render_output_frames(output_frames, &mut discarded_output)?;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn schedule_performance_notes(
@@ -533,6 +709,13 @@ impl Vst3PlaylistStreamProcessor {
         }
         first_error.map_or(Ok(()), Err)
     }
+}
+
+fn queue_live_vst3_input_event(stream: &mut PlaylistPluginStream, event: ScheduledMidiEvent) {
+    let mut pending_events = stream.render.events.split_off(stream.next_event);
+    pending_events.push(event);
+    pending_events.sort_by_key(|event| (event.frame, event.priority));
+    stream.render.events.extend(pending_events);
 }
 
 fn plugin_latency_in_output_frames(
@@ -2639,6 +2822,11 @@ fn send_scheduled_midi_event(
 ) -> Result<(), String> {
     let pitch_offset_cents =
         combined_pitch_offset_cents(project_pitch_offset_cents, fine_pitch_offset_cents);
+    if !matches!(event, MidiEvent::NoteOn { .. } | MidiEvent::NoteOff { .. }) {
+        return plugin
+            .send_midi_event_at(event, sample_offset)
+            .map_err(|error| error.to_string());
+    }
     if note.supports_pan {
         let mut plugin_event = plugin_event_with_pitch_offset_and_note_id(
             event,
