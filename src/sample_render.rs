@@ -1909,8 +1909,13 @@ pub fn stream_audio_clips_to_device(
     writer: &StreamingAudioWriter,
     cancelled: &AtomicBool,
 ) -> Result<AudioClipRenderSummary, String> {
-    let render =
-        prepare_audio_clip_render(document, project_path.as_ref(), options, Some(cancelled))?;
+    let render = prepare_audio_clip_render(
+        document,
+        project_path.as_ref(),
+        options,
+        false,
+        Some(cancelled),
+    )?;
     require_audio_clips(&render)?;
     stream_prepared_audio_clip_render(
         &render,
@@ -2071,10 +2076,16 @@ pub fn stream_playlist_performance_with_vst3_to_device(
             start_from_song_start: false,
             soloed_playlist_track_range: options.soloed_playlist_track_range,
         },
+        performance.meters.is_some(),
         Some(cancelled),
     )?;
-    let mut sampler =
-        prepare_sampler_arrangement(document, project_path, options, Some(cancelled))?;
+    let mut sampler = prepare_sampler_arrangement(
+        document,
+        project_path,
+        options,
+        performance.meters.is_some(),
+        Some(cancelled),
+    )?;
     let runtime = PlaylistPerformanceRuntime::new(
         document,
         options,
@@ -2224,9 +2235,16 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
             start_from_song_start: false,
             soloed_playlist_track_range: options.soloed_playlist_track_range,
         },
+        meters.is_some(),
         Some(cancelled),
     )?;
-    let sampler = prepare_sampler_arrangement(document, project_path, options, Some(cancelled))?;
+    let sampler = prepare_sampler_arrangement(
+        document,
+        project_path,
+        options,
+        meters.is_some(),
+        Some(cancelled),
+    )?;
     if audio.clips.is_empty()
         && sampler.notes.is_empty()
         && vst3_processor
@@ -2524,9 +2542,11 @@ fn render_playlist_with_vst3_cancellable(
             start_from_song_start: false,
             soloed_playlist_track_range: options.soloed_playlist_track_range,
         },
+        false,
         Some(cancelled),
     )?;
-    let sampler = prepare_sampler_arrangement(document, project_path, options, Some(cancelled))?;
+    let sampler =
+        prepare_sampler_arrangement(document, project_path, options, false, Some(cancelled))?;
     if audio.clips.is_empty()
         && sampler.notes.is_empty()
         && vst3_processor
@@ -2914,9 +2934,11 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
             start_from_song_start: false,
             soloed_playlist_track_range: options.soloed_playlist_track_range,
         },
+        false,
         Some(cancelled),
     )?;
-    let sampler = prepare_sampler_arrangement(document, project_path, options, Some(cancelled))?;
+    let sampler =
+        prepare_sampler_arrangement(document, project_path, options, false, Some(cancelled))?;
     if audio.clips.is_empty()
         && sampler.notes.is_empty()
         && vst3_processor
@@ -4657,7 +4679,7 @@ pub fn render_sampler_pattern_to_stereo_buffer(
     project_path: impl AsRef<Path>,
     options: SamplerPatternRenderOptions,
 ) -> Result<(Vec<f32>, SamplerPatternRenderSummary), String> {
-    let render = prepare_sampler_pattern(document, project_path.as_ref(), options, None)?;
+    let render = prepare_sampler_pattern(document, project_path.as_ref(), options, false, None)?;
     let output_frames = usize::try_from(render.summary.frames)
         .map_err(|_| "sampler render is too large for this platform".to_owned())?;
     let output_samples = output_frames
@@ -4696,8 +4718,13 @@ pub fn stream_sampler_pattern_to_device(
     writer: &StreamingAudioWriter,
     cancelled: &AtomicBool,
 ) -> Result<SamplerPatternRenderSummary, String> {
-    let render =
-        prepare_sampler_pattern(document, project_path.as_ref(), options, Some(cancelled))?;
+    let render = prepare_sampler_pattern(
+        document,
+        project_path.as_ref(),
+        options,
+        false,
+        Some(cancelled),
+    )?;
     stream_prepared_sampler_pattern(
         &render,
         Some(cancelled),
@@ -4868,10 +4895,17 @@ fn stream_sampler_pattern_loop_from_tick_with_vst3_to_device(
             document,
             project_path.as_ref(),
             options,
+            live_master_meters.is_some(),
             Some(cancelled),
         )?
     } else {
-        prepare_sampler_pattern(document, project_path.as_ref(), options, Some(cancelled))?
+        prepare_sampler_pattern(
+            document,
+            project_path.as_ref(),
+            options,
+            live_master_meters.is_some(),
+            Some(cancelled),
+        )?
     };
     let mut master_output = render.master_output.clone();
     if let Some(meters) = live_master_meters {
@@ -5851,7 +5885,7 @@ fn render_audio_clips_to_stereo_buffer_inner(
     cancelled: Option<&AtomicBool>,
 ) -> Result<(Vec<f32>, AudioClipRenderSummary), String> {
     crate::audio::enable_denormal_protection();
-    let render = prepare_audio_clip_render(document, project_path, options, cancelled)?;
+    let render = prepare_audio_clip_render(document, project_path, options, false, cancelled)?;
     require_audio_clips(&render)?;
     let output_frames = render.summary.frames;
 
@@ -5930,6 +5964,7 @@ fn prepare_audio_clip_render(
     document: &FlpDocument,
     project_path: &Path,
     options: AudioClipRenderOptions,
+    include_muted_mixer_sources: bool,
     cancelled: Option<&AtomicBool>,
 ) -> Result<PreparedAudioClipRender, String> {
     check_cancelled(cancelled)?;
@@ -6008,10 +6043,12 @@ fn prepare_audio_clip_render(
         let Some(channel) = channels.iter().find(|channel| channel.id() == id) else {
             continue;
         };
-        if channel.kind() != Some(4)
-            || channel.enabled() == Some(false)
-            || !mixer_route_audibility.allows_channel(channel.mixer_track())
-        {
+        let mixer_route_allowed = if include_muted_mixer_sources {
+            mixer_route_audibility.allows_live_source_channel(channel.mixer_track())
+        } else {
+            mixer_route_audibility.allows_channel(channel.mixer_track())
+        };
+        if channel.kind() != Some(4) || channel.enabled() == Some(false) || !mixer_route_allowed {
             continue;
         }
         if clip
@@ -6425,6 +6462,7 @@ fn prepare_sampler_arrangement(
     document: &FlpDocument,
     project_path: &Path,
     options: PlaylistRenderOptions,
+    include_muted_mixer_sources: bool,
     cancelled: Option<&AtomicBool>,
 ) -> Result<PreparedSamplerArrangement, String> {
     check_cancelled(cancelled)?;
@@ -6492,7 +6530,12 @@ fn prepare_sampler_arrangement(
                         .is_some_and(|channel| {
                             channel.kind() == Some(0)
                                 && channel.enabled() != Some(false)
-                                && mixer_route_audibility.allows_channel(channel.mixer_track())
+                                && if include_muted_mixer_sources {
+                                    mixer_route_audibility
+                                        .allows_live_source_channel(channel.mixer_track())
+                                } else {
+                                    mixer_route_audibility.allows_channel(channel.mixer_track())
+                                }
                         })
                 })
                 .collect()
@@ -7087,7 +7130,7 @@ impl PlaylistPerformanceRuntime {
                                     channel.enabled() != Some(false)
                                         && channel.plugin_identifier().is_some()
                                         && mixer_route_audibility
-                                            .allows_channel(channel.mixer_track())
+                                            .allows_live_source_channel(channel.mixer_track())
                                 })
                         })
                         .collect()
@@ -8632,9 +8675,22 @@ fn prepare_sampler_pattern(
     document: &FlpDocument,
     project_path: &Path,
     options: SamplerPatternRenderOptions,
+    include_muted_mixer_sources: bool,
     cancelled: Option<&AtomicBool>,
 ) -> Result<PreparedSamplerPattern, String> {
-    prepare_sampler_pattern_for_channel(document, project_path, options, cancelled, None)
+    if include_muted_mixer_sources {
+        prepare_sampler_pattern_for_channel_internal(
+            document,
+            project_path,
+            options,
+            cancelled,
+            None,
+            false,
+            true,
+        )
+    } else {
+        prepare_sampler_pattern_for_channel(document, project_path, options, cancelled, None)
+    }
 }
 
 fn prepare_sampler_pattern_for_channel(
@@ -8651,6 +8707,7 @@ fn prepare_sampler_pattern_for_channel(
         cancelled,
         channel_filter,
         false,
+        false,
     )
 }
 
@@ -8658,6 +8715,7 @@ fn prepare_sampler_pattern_allow_empty(
     document: &FlpDocument,
     project_path: &Path,
     options: SamplerPatternRenderOptions,
+    include_muted_mixer_sources: bool,
     cancelled: Option<&AtomicBool>,
 ) -> Result<PreparedSamplerPattern, String> {
     prepare_sampler_pattern_for_channel_internal(
@@ -8667,6 +8725,7 @@ fn prepare_sampler_pattern_allow_empty(
         cancelled,
         None,
         true,
+        include_muted_mixer_sources,
     )
 }
 
@@ -8677,6 +8736,7 @@ fn prepare_sampler_pattern_for_channel_internal(
     cancelled: Option<&AtomicBool>,
     channel_filter: Option<&BTreeSet<u16>>,
     allow_empty: bool,
+    include_muted_mixer_sources: bool,
 ) -> Result<PreparedSamplerPattern, String> {
     check_cancelled(cancelled)?;
     if !(8_000..=384_000).contains(&options.sample_rate) {
@@ -8725,7 +8785,12 @@ fn prepare_sampler_pattern_for_channel_internal(
                         .is_some_and(|channel| {
                             channel.kind() == Some(0)
                                 && channel.enabled() != Some(false)
-                                && mixer_route_audibility.allows_channel(channel.mixer_track())
+                                && if include_muted_mixer_sources {
+                                    mixer_route_audibility
+                                        .allows_live_source_channel(channel.mixer_track())
+                                } else {
+                                    mixer_route_audibility.allows_channel(channel.mixer_track())
+                                }
                         })
                 })
                 .map(move |target_channel_id| (note, target_channel_id))
@@ -10951,6 +11016,7 @@ mod tests {
                 saved_pan_raw,
                 saved_stereo_separation_raw,
                 saved_signal_flags: None,
+                saved_enabled: None,
                 pan_law_raw: Some(2),
                 output_transform,
                 insert_meter_transforms,
@@ -11369,6 +11435,7 @@ mod tests {
                 saved_pan_raw: None,
                 saved_stereo_separation_raw: None,
                 saved_signal_flags: Some((false, false)),
+                saved_enabled: None,
                 pan_law_raw: Some(2),
                 output_transform: MixerSourceRouteTransform::default(),
                 insert_meter_transforms: meter_transforms.clone(),
@@ -11424,6 +11491,7 @@ mod tests {
                 saved_pan_raw: None,
                 saved_stereo_separation_raw: None,
                 saved_signal_flags: Some((false, false)),
+                saved_enabled: None,
                 pan_law_raw: Some(2),
                 output_transform: MixerSourceRouteTransform::default(),
                 insert_meter_transforms: Vec::new(),
@@ -11450,6 +11518,69 @@ mod tests {
         cloned_control.apply_output_frame(controls, &mut cloned_frame);
         assert!(frame[0] < cloned_frame[0]);
         assert!(frame[1] < cloned_frame[1]);
+    }
+
+    #[test]
+    fn live_mixer_source_mute_smooths_direct_and_send_routes() {
+        let meter_transforms = vec![
+            (1, MixerSourceRouteTransform::default()),
+            (2, MixerSourceRouteTransform::default().scaled(0.5)),
+        ];
+        let source_control = LiveMixerSourceControl::new(
+            MixerLiveSourceRoutePlan {
+                track: 1,
+                source_transform: MixerSourceRouteTransform::default(),
+                saved_fader_gain: 1.0,
+                saved_pan_raw: None,
+                saved_stereo_separation_raw: None,
+                saved_signal_flags: None,
+                saved_enabled: Some(true),
+                pan_law_raw: Some(2),
+                output_transform: MixerSourceRouteTransform::default(),
+                insert_meter_transforms: meter_transforms.clone(),
+            },
+            48_000,
+        );
+        let meters = MixerTrackPeakMeters::default();
+        meters.set_live_mixer_insert_enabled(1, Some(true));
+        let targets = source_control.targets(&meters).unwrap();
+
+        let mut frame = [1.0, 0.25];
+        let controls = source_control.next_frame_controls(&targets);
+        source_control.apply_output_frame(controls, &mut frame);
+        assert_eq!(frame, [1.0, 0.25]);
+
+        meters.set_live_mixer_insert_enabled(1, Some(false));
+        let controls = source_control.next_frame_controls(&targets);
+        frame = [1.0, 0.25];
+        source_control.apply_output_frame(controls, &mut frame);
+        assert!(frame[0] < 1.0 && frame[0] > 0.99);
+        assert!(frame[1] < 0.25 && frame[1] > 0.24);
+
+        let mut direct_meter = [1.0, 0.25];
+        source_control.apply_meter_frame(controls, meter_transforms[0].1, &mut direct_meter);
+        assert_eq!(direct_meter, frame);
+        let mut send_meter = [1.0, 0.25];
+        source_control.apply_meter_frame(controls, meter_transforms[1].1, &mut send_meter);
+        assert!((send_meter[0] - frame[0] * 0.5).abs() < 1e-6);
+        assert!((send_meter[1] - frame[1] * 0.5).abs() < 1e-6);
+
+        for _ in 0..100_000 {
+            let controls = source_control.next_frame_controls(&targets);
+            frame = [1.0, 0.25];
+            source_control.apply_output_frame(controls, &mut frame);
+        }
+        assert!(frame[0].abs() < 0.001);
+        assert!(frame[1].abs() < 0.001);
+
+        meters.set_live_mixer_insert_enabled(1, Some(true));
+        for _ in 0..100_000 {
+            let controls = source_control.next_frame_controls(&targets);
+            frame = [1.0, 0.25];
+            source_control.apply_output_frame(controls, &mut frame);
+        }
+        assert!((frame[0] - 1.0).abs() < 0.001);
+        assert!((frame[1] - 0.25).abs() < 0.001);
     }
 
     #[test]
@@ -12593,6 +12724,7 @@ mod tests {
                     saved_pan_raw: None,
                     saved_stereo_separation_raw: None,
                     saved_signal_flags: None,
+                    saved_enabled: None,
                     pan_law_raw: Some(2),
                     output_transform: MixerSourceRouteTransform::default().scaled(1.5),
                     insert_meter_transforms: vec![
