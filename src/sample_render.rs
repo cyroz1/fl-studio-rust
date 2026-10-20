@@ -9265,6 +9265,7 @@ impl<'a> SamplerVoiceEngine<'a> {
                         if let Some((source_control, controls)) = live_controls {
                             source_control.apply_meter_frame(
                                 controls,
+                                *track,
                                 *transform,
                                 &mut meter_frame,
                             );
@@ -10695,7 +10696,12 @@ fn mix_clip_window_into_stereo_with_quality_and_meter(
                     right * clip.gain * right_pan_gain,
                 ];
                 if let Some((source_control, controls)) = live_controls {
-                    source_control.apply_meter_frame(controls, *transform, &mut meter_frame);
+                    source_control.apply_meter_frame(
+                        controls,
+                        *track,
+                        *transform,
+                        &mut meter_frame,
+                    );
                 } else {
                     transform.apply_frame(&mut meter_frame);
                 }
@@ -11020,6 +11026,7 @@ mod tests {
                 pan_law_raw: Some(2),
                 output_transform,
                 insert_meter_transforms,
+                ..MixerLiveSourceRoutePlan::default()
             },
             sample_rate,
         )
@@ -11399,10 +11406,20 @@ mod tests {
         assert!((frame[0] + frame[1]).abs() < 1e-6);
 
         let mut direct_meter = [1.0, -1.0];
-        source_control.apply_meter_frame(controls, meter_transforms[0].1, &mut direct_meter);
+        source_control.apply_meter_frame(
+            controls,
+            meter_transforms[0].0,
+            meter_transforms[0].1,
+            &mut direct_meter,
+        );
         assert_eq!(direct_meter, frame);
         let mut send_meter = [1.0, -1.0];
-        source_control.apply_meter_frame(controls, meter_transforms[1].1, &mut send_meter);
+        source_control.apply_meter_frame(
+            controls,
+            meter_transforms[1].0,
+            meter_transforms[1].1,
+            &mut send_meter,
+        );
         assert!((send_meter[0] - frame[0] * 0.5).abs() < 1e-6);
         assert!((send_meter[1] - frame[1] * 0.5).abs() < 1e-6);
 
@@ -11416,7 +11433,12 @@ mod tests {
 
         let controls = source_control.next_frame_controls(&targets);
         send_meter = [1.0, -1.0];
-        source_control.apply_meter_frame(controls, meter_transforms[1].1, &mut send_meter);
+        source_control.apply_meter_frame(
+            controls,
+            meter_transforms[1].0,
+            meter_transforms[1].1,
+            &mut send_meter,
+        );
         assert!(send_meter[0].abs() < 0.0005);
         assert!(send_meter[1].abs() < 0.0005);
     }
@@ -11439,6 +11461,7 @@ mod tests {
                 pan_law_raw: Some(2),
                 output_transform: MixerSourceRouteTransform::default(),
                 insert_meter_transforms: meter_transforms.clone(),
+                ..MixerLiveSourceRoutePlan::default()
             },
             48_000,
         );
@@ -11459,10 +11482,20 @@ mod tests {
         assert!(frame[1] > 0.25 && frame[1] < 0.26);
 
         let mut direct_meter = [1.0, 0.25];
-        source_control.apply_meter_frame(controls, meter_transforms[0].1, &mut direct_meter);
+        source_control.apply_meter_frame(
+            controls,
+            meter_transforms[0].0,
+            meter_transforms[0].1,
+            &mut direct_meter,
+        );
         assert_eq!(direct_meter, frame);
         let mut send_meter = [1.0, 0.25];
-        source_control.apply_meter_frame(controls, meter_transforms[1].1, &mut send_meter);
+        source_control.apply_meter_frame(
+            controls,
+            meter_transforms[1].0,
+            meter_transforms[1].1,
+            &mut send_meter,
+        );
         assert!((send_meter[0] - frame[0] * 0.5).abs() < 1e-6);
         assert!((send_meter[1] - frame[1] * 0.5).abs() < 1e-6);
 
@@ -11476,7 +11509,12 @@ mod tests {
 
         let controls = source_control.next_frame_controls(&targets);
         let mut send_meter = [1.0, 0.25];
-        source_control.apply_meter_frame(controls, meter_transforms[1].1, &mut send_meter);
+        source_control.apply_meter_frame(
+            controls,
+            meter_transforms[1].0,
+            meter_transforms[1].1,
+            &mut send_meter,
+        );
         assert!((send_meter[0] + 0.125).abs() < 0.0005);
         assert!((send_meter[1] + 0.5).abs() < 0.0005);
     }
@@ -11495,6 +11533,7 @@ mod tests {
                 pan_law_raw: Some(2),
                 output_transform: MixerSourceRouteTransform::default(),
                 insert_meter_transforms: Vec::new(),
+                ..MixerLiveSourceRoutePlan::default()
             },
             48_000,
         );
@@ -11538,6 +11577,7 @@ mod tests {
                 pan_law_raw: Some(2),
                 output_transform: MixerSourceRouteTransform::default(),
                 insert_meter_transforms: meter_transforms.clone(),
+                ..MixerLiveSourceRoutePlan::default()
             },
             48_000,
         );
@@ -11558,10 +11598,20 @@ mod tests {
         assert!(frame[1] < 0.25 && frame[1] > 0.24);
 
         let mut direct_meter = [1.0, 0.25];
-        source_control.apply_meter_frame(controls, meter_transforms[0].1, &mut direct_meter);
+        source_control.apply_meter_frame(
+            controls,
+            meter_transforms[0].0,
+            meter_transforms[0].1,
+            &mut direct_meter,
+        );
         assert_eq!(direct_meter, frame);
         let mut send_meter = [1.0, 0.25];
-        source_control.apply_meter_frame(controls, meter_transforms[1].1, &mut send_meter);
+        source_control.apply_meter_frame(
+            controls,
+            meter_transforms[1].0,
+            meter_transforms[1].1,
+            &mut send_meter,
+        );
         assert!((send_meter[0] - frame[0] * 0.5).abs() < 1e-6);
         assert!((send_meter[1] - frame[1] * 0.5).abs() < 1e-6);
 
@@ -11581,6 +11631,119 @@ mod tests {
         }
         assert!((frame[0] - 1.0).abs() < 0.001);
         assert!((frame[1] - 0.25).abs() < 0.001);
+    }
+
+    #[test]
+    fn live_mixer_send_levels_smooth_nested_output_and_insert_meters() {
+        let source_control = LiveMixerSourceControl::new(
+            MixerLiveSourceRoutePlan {
+                track: 1,
+                source_transform: MixerSourceRouteTransform::default(),
+                saved_fader_gain: 1.0,
+                saved_pan_raw: None,
+                saved_stereo_separation_raw: None,
+                saved_signal_flags: None,
+                saved_enabled: Some(true),
+                pan_law_raw: Some(2),
+                output_transform: MixerSourceRouteTransform::default().scaled(0.5),
+                insert_meter_transforms: vec![
+                    (1, MixerSourceRouteTransform::default()),
+                    (2, MixerSourceRouteTransform::default().scaled(0.5)),
+                ],
+                live_send_target_keys: vec![
+                    crate::MixerLiveSendTargetKey {
+                        source_track: 1,
+                        destination_track: 2,
+                    },
+                    crate::MixerLiveSendTargetKey {
+                        source_track: 2,
+                        destination_track: 0,
+                    },
+                ],
+                saved_live_send_gains: vec![0.5, 1.0],
+                live_send_output_paths: Some(vec![crate::MixerLiveSendOutputPath {
+                    transform: MixerSourceRouteTransform::default(),
+                    send_gains: vec![
+                        crate::MixerLiveSendGain {
+                            target_index: Some(0),
+                            saved_gain: 0.5,
+                        },
+                        crate::MixerLiveSendGain {
+                            target_index: Some(1),
+                            saved_gain: 1.0,
+                        },
+                    ],
+                }]),
+                live_send_meter_paths: vec![
+                    crate::MixerLiveSendMeterPath {
+                        track: 1,
+                        transform: MixerSourceRouteTransform::default(),
+                        send_gains: Vec::new(),
+                    },
+                    crate::MixerLiveSendMeterPath {
+                        track: 2,
+                        transform: MixerSourceRouteTransform::default(),
+                        send_gains: vec![crate::MixerLiveSendGain {
+                            target_index: Some(0),
+                            saved_gain: 0.5,
+                        }],
+                    },
+                ],
+            },
+            48_000,
+        );
+        let meters = MixerTrackPeakMeters::default();
+        let targets = source_control.targets(&meters).unwrap();
+
+        let mut frame = [1.0, 0.25];
+        let mut controls = source_control.next_frame_controls(&targets);
+        source_control.apply_output_frame(controls, &mut frame);
+        assert_eq!(frame, [0.5, 0.125]);
+
+        meters.set_live_mixer_send_level_raw(1, 2, Some(12_800));
+        controls = source_control.next_frame_controls(&targets);
+        frame = [1.0, 0.25];
+        source_control.apply_output_frame(controls, &mut frame);
+        assert!(frame[0] > 0.5 && frame[0] < 0.51);
+        let mut destination_meter = [1.0, 0.25];
+        source_control.apply_meter_frame(
+            controls,
+            2,
+            MixerSourceRouteTransform::default().scaled(0.5),
+            &mut destination_meter,
+        );
+        assert_eq!(destination_meter, [frame[0], frame[1]]);
+
+        for _ in 0..100_000 {
+            controls = source_control.next_frame_controls(&targets);
+        }
+        frame = [1.0, 0.25];
+        source_control.apply_output_frame(controls, &mut frame);
+        assert!((frame[0] - 1.0).abs() < 0.001);
+        assert!((frame[1] - 0.25).abs() < 0.001);
+
+        meters.set_live_mixer_send_level_raw(2, 0, Some(6_400));
+        controls = source_control.next_frame_controls(&targets);
+        frame = [1.0, 0.25];
+        source_control.apply_output_frame(controls, &mut frame);
+        assert!(frame[0] < 1.0 && frame[0] > 0.99);
+        destination_meter = [1.0, 0.25];
+        source_control.apply_meter_frame(
+            controls,
+            2,
+            MixerSourceRouteTransform::default().scaled(0.5),
+            &mut destination_meter,
+        );
+        assert!((destination_meter[0] - 1.0).abs() < 0.001);
+        assert!((destination_meter[1] - 0.25).abs() < 0.001);
+
+        for _ in 0..100_000 {
+            controls = source_control.next_frame_controls(&targets);
+        }
+        frame = [1.0, 0.25];
+        source_control.apply_output_frame(controls, &mut frame);
+        assert!((frame[0] - 0.5).abs() < 0.001);
+        assert!((frame[1] - 0.125).abs() < 0.001);
     }
 
     #[test]
@@ -12731,6 +12894,7 @@ mod tests {
                         (1, MixerSourceRouteTransform::default()),
                         (2, MixerSourceRouteTransform::default().scaled(0.5)),
                     ],
+                    ..MixerLiveSourceRoutePlan::default()
                 },
             )]),
             mixer_meter_transforms_by_channel: HashMap::from([(

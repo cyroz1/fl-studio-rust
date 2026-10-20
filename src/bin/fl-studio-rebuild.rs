@@ -58,7 +58,7 @@ use flp_rebuild::{
     AutomationPoint, AutomationPointEdit, ChannelGroupSummary, ChannelSortOrder, ChannelSummary,
     ChannelType, ClawMachineOptions, FlamOptions, FlpDocument, FlpError, FstPreset, FstPresetKind,
     HumanizerOptions, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerInsertSummary,
-    MixerParameterKind, MixerParameterRecord, PATTERN_NOTE_DEFAULT_FLAGS,
+    MixerParameterKind, MixerParameterRecord, MixerSendSummary, PATTERN_NOTE_DEFAULT_FLAGS,
     PATTERN_NOTE_DEFAULT_RELEASE, PATTERN_NOTE_SLIDE_FLAG, Pattern, PatternController,
     PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation, PayloadEncoding,
     PlaylistClip, PlaylistClipEdit, PlaylistClipSelectionClipboard, PlaylistClipTarget,
@@ -372,6 +372,28 @@ fn candidate_mixer_insert_enabled(
         .iter()
         .find(|insert| insert.ordinal() == insert_ordinal)
         .and_then(MixerInsertSummary::enabled)
+}
+
+fn candidate_live_mixer_send_key(
+    sends: &[MixerSendSummary],
+    selected_send: &MixerSendSummary,
+) -> Option<(usize, usize)> {
+    if selected_send.enabled() != Some(true) {
+        return None;
+    }
+    let destination_track = usize::from(selected_send.route_parameter_id().checked_sub(64)?);
+    if destination_track >= MIXER_TRACK_METER_COUNT {
+        return None;
+    }
+    let matching_routes = sends
+        .iter()
+        .filter(|send| {
+            send.enabled() == Some(true)
+                && send.insert_ordinal() == selected_send.insert_ordinal()
+                && send.route_parameter_id() == selected_send.route_parameter_id()
+        })
+        .count();
+    (matching_routes == 1).then_some((selected_send.insert_ordinal(), destination_track))
 }
 
 fn candidate_mixer_master_signal_flags(document: &FlpDocument) -> Option<(bool, bool)> {
@@ -9508,6 +9530,18 @@ impl DawUi {
                 track,
                 candidate_mixer_insert_enabled(&inserts, track),
             );
+        }
+        let sends = document.mixer_send_summaries().unwrap_or_default();
+        for send in &sends {
+            if let Some((source_track, destination_track)) =
+                candidate_live_mixer_send_key(&sends, send)
+            {
+                self.mixer_track_peak_meters.set_live_mixer_send_level_raw(
+                    source_track,
+                    destination_track,
+                    Some(send.value()),
+                );
+            }
         }
     }
 
@@ -35702,9 +35736,23 @@ impl DawUi {
             let mut applied_live_mixer_insert_stereo_separation_raw = None;
             let mut applied_live_master_pan = None;
             let mut applied_live_master_stereo_separation = None;
+            let mut applied_live_mixer_send_levels = Vec::new();
             for (event_index, record_index, value) in parameter_edits {
                 match document.set_mixer_parameter_record_value(event_index, record_index, value) {
                     Ok(()) => {
+                        if let Ok(sends) = document.mixer_send_summaries()
+                            && let Some(send) = sends.iter().find(|send| {
+                                send.parameter_location() == (event_index, record_index)
+                            })
+                            && let Some((source_track, destination_track)) =
+                                candidate_live_mixer_send_key(&sends, send)
+                        {
+                            applied_live_mixer_send_levels.push((
+                                source_track,
+                                destination_track,
+                                value,
+                            ));
+                        }
                         if let Some((master_event, master_record, gain)) =
                             live_master_fader_gain_edit
                             && master_event == event_index
@@ -35780,6 +35828,13 @@ impl DawUi {
             if let Some(separation_raw) = applied_live_master_stereo_separation {
                 self.mixer_track_peak_meters
                     .set_live_master_stereo_separation_raw(Some(separation_raw));
+            }
+            for (source_track, destination_track, level_raw) in applied_live_mixer_send_levels {
+                self.mixer_track_peak_meters.set_live_mixer_send_level_raw(
+                    source_track,
+                    destination_track,
+                    Some(level_raw),
+                );
             }
         }
         if !send_flag_edits.is_empty()
