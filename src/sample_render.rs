@@ -8558,7 +8558,7 @@ fn prepare_sampler_pattern_for_channel_internal(
     project_path: &Path,
     options: SamplerPatternRenderOptions,
     cancelled: Option<&AtomicBool>,
-    channel_filter: Option<u16>,
+    channel_filter: Option<&BTreeSet<u16>>,
     allow_empty: bool,
 ) -> Result<PreparedSamplerPattern, String> {
     check_cancelled(cancelled)?;
