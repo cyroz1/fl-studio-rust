@@ -44,6 +44,7 @@ pub const MIXER_TRACK_METER_COUNT: usize = i8::MAX as usize + 1;
 pub struct MixerTrackPeakMeters {
     peaks: [AtomicU32; MIXER_TRACK_METER_COUNT],
     live_mixer_insert_fader_raw: [Arc<AtomicI32>; MIXER_TRACK_METER_COUNT],
+    live_mixer_insert_pan_raw: [Arc<AtomicI32>; MIXER_TRACK_METER_COUNT],
     live_master_fader_gain: Arc<AtomicU32>,
     live_master_pan_raw: Arc<AtomicI32>,
     live_master_stereo_separation_raw: Arc<AtomicI32>,
@@ -58,6 +59,7 @@ impl Default for MixerTrackPeakMeters {
             live_mixer_insert_fader_raw: std::array::from_fn(|_| {
                 Arc::new(AtomicI32::new(i32::MIN))
             }),
+            live_mixer_insert_pan_raw: std::array::from_fn(|_| Arc::new(AtomicI32::new(i32::MIN))),
             live_master_fader_gain: Arc::new(AtomicU32::new(1.0_f32.to_bits())),
             live_master_pan_raw: Arc::new(AtomicI32::new(i32::MIN)),
             live_master_stereo_separation_raw: Arc::new(AtomicI32::new(i32::MIN)),
@@ -113,6 +115,24 @@ impl MixerTrackPeakMeters {
 
     pub(crate) fn live_mixer_insert_fader_raw(&self, track: usize) -> Option<Arc<AtomicI32>> {
         self.live_mixer_insert_fader_raw.get(track).cloned()
+    }
+
+    /// Set a non-Master Mixer insert's live pan target in FLP raw units.
+    ///
+    /// The render worker reads the target without taking a lock and smooths supported source pan
+    /// changes over 20 ms. `None` keeps the saved route transform in effect.
+    pub fn set_live_mixer_insert_pan_raw(&self, track: usize, pan_raw: Option<i32>) {
+        let Some(target) = self.live_mixer_insert_pan_raw.get(track) else {
+            return;
+        };
+        let value = pan_raw
+            .filter(|value| (-6_400..=6_400).contains(value))
+            .unwrap_or(i32::MIN);
+        target.store(value, Ordering::Release);
+    }
+
+    pub(crate) fn live_mixer_insert_pan_raw(&self, track: usize) -> Option<Arc<AtomicI32>> {
+        self.live_mixer_insert_pan_raw.get(track).cloned()
     }
 
     pub(crate) fn live_master_fader_gain(&self) -> Arc<AtomicU32> {
@@ -185,6 +205,146 @@ impl MixerTrackPeakMeters {
         if let Some(slot) = self.peaks.get(track) {
             slot.fetch_max(peak.to_bits(), Ordering::Release);
         }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct LiveMixerSourceControl {
+    route_plan: crate::MixerLiveSourceRoutePlan,
+    current_gain_bits: Arc<AtomicU32>,
+    current_pan_raw_bits: Arc<AtomicU32>,
+    gain_started: Arc<AtomicBool>,
+    pan_started: Arc<AtomicBool>,
+    smoothing_alpha: f32,
+}
+
+impl Clone for LiveMixerSourceControl {
+    fn clone(&self) -> Self {
+        Self {
+            route_plan: self.route_plan.clone(),
+            current_gain_bits: Arc::new(AtomicU32::new(
+                self.current_gain_bits.load(Ordering::Relaxed),
+            )),
+            current_pan_raw_bits: Arc::new(AtomicU32::new(
+                self.current_pan_raw_bits.load(Ordering::Relaxed),
+            )),
+            gain_started: Arc::new(AtomicBool::new(self.gain_started.load(Ordering::Relaxed))),
+            pan_started: Arc::new(AtomicBool::new(self.pan_started.load(Ordering::Relaxed))),
+            smoothing_alpha: self.smoothing_alpha,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct LiveMixerSourceTargets {
+    fader_raw: Arc<AtomicI32>,
+    pan_raw: Arc<AtomicI32>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct LiveMixerSourceFrameControls {
+    gain: f32,
+    pan_raw: Option<f32>,
+    pan_law_raw: Option<u8>,
+}
+
+impl LiveMixerSourceControl {
+    pub(crate) fn new(route_plan: crate::MixerLiveSourceRoutePlan, sample_rate: u32) -> Self {
+        Self {
+            current_gain_bits: Arc::new(AtomicU32::new(route_plan.saved_fader_gain.to_bits())),
+            current_pan_raw_bits: Arc::new(AtomicU32::new(
+                (route_plan.saved_pan_raw.unwrap_or_default() as f32).to_bits(),
+            )),
+            gain_started: Arc::new(AtomicBool::new(false)),
+            pan_started: Arc::new(AtomicBool::new(false)),
+            smoothing_alpha: output_gain_smoothing_alpha(sample_rate as f32),
+            route_plan,
+        }
+    }
+
+    pub(crate) fn targets(&self, meters: &MixerTrackPeakMeters) -> Option<LiveMixerSourceTargets> {
+        Some(LiveMixerSourceTargets {
+            fader_raw: meters.live_mixer_insert_fader_raw(self.route_plan.track)?,
+            pan_raw: meters.live_mixer_insert_pan_raw(self.route_plan.track)?,
+        })
+    }
+
+    pub(crate) fn insert_meter_transforms(&self) -> &[(usize, crate::MixerSourceRouteTransform)] {
+        &self.route_plan.insert_meter_transforms
+    }
+
+    pub(crate) fn next_frame_controls(
+        &self,
+        targets: &LiveMixerSourceTargets,
+    ) -> LiveMixerSourceFrameControls {
+        let fader_target = targets.fader_raw.load(Ordering::Acquire);
+        let target_gain = if (0..=16_000).contains(&fader_target) {
+            fader_target as f32 / 10_000.0
+        } else {
+            self.route_plan.saved_fader_gain
+        };
+        let current_gain = if self.gain_started.swap(true, Ordering::Relaxed) {
+            f32::from_bits(self.current_gain_bits.load(Ordering::Relaxed))
+        } else {
+            target_gain
+        };
+        let gain = smooth_output_gain(current_gain, target_gain, self.smoothing_alpha);
+        self.current_gain_bits
+            .store(gain.to_bits(), Ordering::Relaxed);
+
+        let pan_target = targets.pan_raw.load(Ordering::Acquire);
+        let target_pan_raw = if (-6_400..=6_400).contains(&pan_target) {
+            Some(pan_target as f32)
+        } else {
+            self.route_plan.saved_pan_raw.map(|pan_raw| pan_raw as f32)
+        };
+        let pan_raw = target_pan_raw.map(|target_pan_raw| {
+            let current_pan_raw = if self.pan_started.swap(true, Ordering::Relaxed) {
+                f32::from_bits(self.current_pan_raw_bits.load(Ordering::Relaxed))
+            } else {
+                target_pan_raw
+            };
+            let next_pan_raw =
+                current_pan_raw + (target_pan_raw - current_pan_raw) * self.smoothing_alpha;
+            self.current_pan_raw_bits
+                .store(next_pan_raw.to_bits(), Ordering::Relaxed);
+            next_pan_raw
+        });
+
+        LiveMixerSourceFrameControls {
+            gain,
+            pan_raw,
+            pan_law_raw: self.route_plan.pan_law_raw,
+        }
+    }
+
+    pub(crate) fn apply_output_frame(
+        &self,
+        controls: LiveMixerSourceFrameControls,
+        frame: &mut [f32; 2],
+    ) {
+        self.route_plan.source_transform.apply_frame(frame);
+        if let Some(pan_raw) = controls.pan_raw {
+            crate::apply_mixer_pan_raw_f32(frame, pan_raw, controls.pan_law_raw);
+        }
+        frame[0] *= controls.gain;
+        frame[1] *= controls.gain;
+        self.route_plan.output_transform.apply_frame(frame);
+    }
+
+    pub(crate) fn apply_meter_frame(
+        &self,
+        controls: LiveMixerSourceFrameControls,
+        route_transform: crate::MixerSourceRouteTransform,
+        frame: &mut [f32; 2],
+    ) {
+        self.route_plan.source_transform.apply_frame(frame);
+        if let Some(pan_raw) = controls.pan_raw {
+            crate::apply_mixer_pan_raw_f32(frame, pan_raw, controls.pan_law_raw);
+        }
+        frame[0] *= controls.gain;
+        frame[1] *= controls.gain;
+        route_transform.apply_frame(frame);
     }
 }
 

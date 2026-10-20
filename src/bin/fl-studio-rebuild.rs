@@ -9462,6 +9462,22 @@ impl DawUi {
             .set_live_master_enabled(candidate_mixer_master_enabled(document));
         self.mixer_track_peak_meters
             .set_live_master_signal_flags(candidate_mixer_master_signal_flags(document));
+
+        let parameters = document.mixer_parameter_records().unwrap_or_default();
+        for track in 1..=i8::MAX as usize {
+            let live_fader_raw =
+                unique_candidate_mixer_parameter(&parameters, track, MixerParameterKind::Volume)
+                    .map(MixerParameterRecord::value)
+                    .filter(|value| (0..=16_000).contains(value));
+            let live_pan_raw =
+                unique_candidate_mixer_parameter(&parameters, track, MixerParameterKind::Pan)
+                    .map(MixerParameterRecord::value)
+                    .filter(|value| (-6_400..=6_400).contains(value));
+            self.mixer_track_peak_meters
+                .set_live_mixer_insert_fader_raw(track, live_fader_raw);
+            self.mixer_track_peak_meters
+                .set_live_mixer_insert_pan_raw(track, live_pan_raw);
+        }
     }
 
     fn start_performance_mode_playback(&mut self) {
@@ -34776,6 +34792,7 @@ impl DawUi {
         let mut parameter_edits = Vec::new();
         let mut live_master_fader_gain_edit = None;
         let mut live_mixer_insert_fader_edit = None;
+        let mut live_mixer_insert_pan_edit = None;
         let mut live_master_pan_edit = None;
         let mut live_master_stereo_separation_edit = None;
         let mut send_flag_edits = Vec::new();
@@ -35045,6 +35062,16 @@ impl DawUi {
                                                                         pan_record.record_index(),
                                                                         pan_value,
                                                                     ));
+                                                                } else {
+                                                                    live_mixer_insert_pan_edit =
+                                                                        Some((
+                                                                            insert.ordinal(),
+                                                                            pan_record
+                                                                                .event_index(),
+                                                                            pan_record
+                                                                                .record_index(),
+                                                                            pan_value,
+                                                                        ));
                                                                 }
                                                             }
                                                             let pan_label = if pan_value == 0 {
@@ -35620,6 +35647,7 @@ impl DawUi {
         {
             let mut applied_live_master_fader_gain = None;
             let mut applied_live_mixer_insert_fader_raw = None;
+            let mut applied_live_mixer_insert_pan_raw = None;
             let mut applied_live_master_pan = None;
             let mut applied_live_master_stereo_separation = None;
             for (event_index, record_index, value) in parameter_edits {
@@ -35638,6 +35666,13 @@ impl DawUi {
                             && insert_record == record_index
                         {
                             applied_live_mixer_insert_fader_raw = Some((track, volume_raw));
+                        }
+                        if let Some((track, insert_event, insert_record, pan_raw)) =
+                            live_mixer_insert_pan_edit
+                            && insert_event == event_index
+                            && insert_record == record_index
+                        {
+                            applied_live_mixer_insert_pan_raw = Some((track, pan_raw));
                         }
                         if let Some((master_event, master_record, pan_raw)) = live_master_pan_edit
                             && master_event == event_index
@@ -35669,6 +35704,10 @@ impl DawUi {
             if let Some((track, volume_raw)) = applied_live_mixer_insert_fader_raw {
                 self.mixer_track_peak_meters
                     .set_live_mixer_insert_fader_raw(track, Some(volume_raw));
+            }
+            if let Some((track, pan_raw)) = applied_live_mixer_insert_pan_raw {
+                self.mixer_track_peak_meters
+                    .set_live_mixer_insert_pan_raw(track, Some(pan_raw));
             }
             if let Some(pan_raw) = applied_live_master_pan {
                 self.mixer_track_peak_meters
