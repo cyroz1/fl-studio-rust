@@ -35267,7 +35267,6 @@ impl DawUi {
                 self.midi_input_error = None;
                 if connected_device_missing {
                     self.stop_live_sampler_input_for_device_change();
-                    self.stop_live_vst3_input_for_device_change();
                     self.stop_midi_input_thru();
                     self.midi_output_gain_learning = false;
                     self.midi_play_pause_learning = false;
@@ -35324,7 +35323,6 @@ impl DawUi {
         self.midi_play_pause_cc_active = false;
         self.release_all_midi_performance_clips();
         self.stop_live_sampler_input_for_device_change();
-        self.stop_live_vst3_input_for_device_change();
         self.stop_midi_input_thru();
         let previous_connection = self.midi_input_connection.take();
         drop(previous_connection);
@@ -35354,7 +35352,6 @@ impl DawUi {
     fn disconnect_midi_input(&mut self) {
         self.release_all_midi_performance_clips();
         self.stop_live_sampler_input_for_device_change();
-        self.stop_live_vst3_input_for_device_change();
         self.stop_midi_input_thru();
         self.midi_output_gain_learning = false;
         self.midi_play_pause_learning = false;
