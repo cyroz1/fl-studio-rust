@@ -54657,7 +54657,7 @@ mod tests {
         ];
 
         let automation = pattern_vst3_parameter_automation_for_channel(
-            &[link.clone()],
+            std::slice::from_ref(&link),
             Some(&project_path),
             6,
             &controllers,
