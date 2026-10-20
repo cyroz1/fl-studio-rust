@@ -32,10 +32,10 @@ use flp_rebuild::sample_render::{
     PlaylistPerformanceStream, PlaylistRenderOptions, PlaylistRenderRange, PlaylistRenderSummary,
     PlaylistStreamMonitor, PlaylistTempoMap, ResamplingQuality, SamplerPatternRenderOptions,
     SamplerPatternRenderSummary, WavChannelMode, WavDitherMode, WavSampleFormat,
-    nearest_playlist_audio_clip_zero_crossing_tick,
-    playlist_performance_clip_indices_with_vst3, playlist_performance_static_document_with_vst3,
-    playlist_performance_vst3_channel_ids, playlist_performance_vst3_clip_indices,
-    render_audio_clips_to_file, render_playlist_mixer_stems_with_vst3_cancellable,
+    nearest_playlist_audio_clip_zero_crossing_tick, playlist_performance_clip_indices_with_vst3,
+    playlist_performance_static_document_with_vst3, playlist_performance_vst3_channel_ids,
+    playlist_performance_vst3_clip_indices, render_audio_clips_to_file,
+    render_playlist_mixer_stems_with_vst3_cancellable,
     render_playlist_with_vst3_to_file_from_frame_cancellable,
     render_playlist_with_vst3_to_flac_cancellable, render_playlist_with_vst3_to_mp3_cancellable,
     render_playlist_with_vst3_to_ogg_cancellable, render_playlist_with_vst3_to_wav_cancellable,
@@ -43,30 +43,27 @@ use flp_rebuild::sample_render::{
     stream_playlist_performance_with_vst3_to_device,
     stream_playlist_with_vst3_to_device_with_monitor, stream_sampler_midi_input_to_device,
     stream_sampler_pattern_loop_to_device, stream_sampler_pattern_to_device,
-    stream_vst3_midi_input_to_device,
-    write_input_recording_to_wav,
+    stream_vst3_midi_input_to_device, write_input_recording_to_wav,
 };
 use flp_rebuild::sample_render::{
     LayerLiveInputEvent, SamplerLiveInputRouting, SamplerLiveNoteEvent, Vst3LiveInputEvent,
 };
 use flp_rebuild::vst3::{
-    MAX_REPORTED_TAIL_SECONDS, Vst3HostRuntime, Vst3PatternRenderOptions,
-    Vst3PatternStreamHandle,
+    MAX_REPORTED_TAIL_SECONDS, Vst3HostRuntime, Vst3PatternRenderOptions, Vst3PatternStreamHandle,
 };
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, Arrangement, ArticulateOptions, AutomationChannel,
     AutomationPoint, AutomationPointEdit, ChannelGroupSummary, ChannelSortOrder, ChannelSummary,
     ChannelType, ClawMachineOptions, FlamOptions, FlpDocument, FlpError, FstPreset, FstPresetKind,
     HumanizerOptions, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerParameterKind,
-    MixerParameterRecord, PATTERN_NOTE_DEFAULT_FLAGS, PATTERN_NOTE_DEFAULT_RELEASE, Pattern,
-    PatternController, PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation,
-    PayloadEncoding, PlaylistClip, PlaylistClipEdit, PlaylistClipSelectionClipboard,
-    PlaylistClipTarget, PlaylistTrack, PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress,
-    PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit, QuantizeNoteMode, QuantizeNoteOptions,
-    RandomNoteChordMap, RandomNoteGeneratorOptions, RandomizerOptions, RiffMachineOptions,
-    RiffMachineQuantizeMode, ScaleLevelsOptions, StrumOptions, TimeMarker, TimeMarkerEdit,
-    VstPluginStateMetadata,
-    PATTERN_NOTE_SLIDE_FLAG,
+    MixerParameterRecord, PATTERN_NOTE_DEFAULT_FLAGS, PATTERN_NOTE_DEFAULT_RELEASE,
+    PATTERN_NOTE_SLIDE_FLAG, Pattern, PatternController, PatternControllerEdit, PatternNote,
+    PatternNoteEdit, PatternNoteRotation, PayloadEncoding, PlaylistClip, PlaylistClipEdit,
+    PlaylistClipSelectionClipboard, PlaylistClipTarget, PlaylistTrack, PlaylistTrackEdit,
+    PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit,
+    ProjectSettingsEdit, QuantizeNoteMode, QuantizeNoteOptions, RandomNoteChordMap,
+    RandomNoteGeneratorOptions, RandomizerOptions, RiffMachineOptions, RiffMachineQuantizeMode,
+    ScaleLevelsOptions, StrumOptions, TimeMarker, TimeMarkerEdit, VstPluginStateMetadata,
 };
 use md5::{Digest, Md5};
 
