@@ -4185,6 +4185,7 @@ mod tests {
                     source_transform: MixerSourceRouteTransform::default(),
                     saved_fader_gain: 1.0,
                     saved_pan_raw: Some(-6_400),
+                    saved_stereo_separation_raw: None,
                     pan_law_raw: Some(2),
                     output_transform: MixerSourceRouteTransform::default(),
                     insert_meter_transforms: Vec::new(),
@@ -4226,6 +4227,7 @@ mod tests {
                 source_transform: MixerSourceRouteTransform::default(),
                 saved_fader_gain: 1.0,
                 saved_pan_raw: None,
+                saved_stereo_separation_raw: None,
                 pan_law_raw: Some(2),
                 output_transform: MixerSourceRouteTransform::default(),
                 insert_meter_transforms: vec![

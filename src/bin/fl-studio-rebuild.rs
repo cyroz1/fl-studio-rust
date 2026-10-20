@@ -9473,10 +9473,14 @@ impl DawUi {
                 unique_candidate_mixer_parameter(&parameters, track, MixerParameterKind::Pan)
                     .map(MixerParameterRecord::value)
                     .filter(|value| (-6_400..=6_400).contains(value));
+            let live_stereo_separation_raw = candidate_mixer_stereo_separation(&parameters, track)
+                .map(MixerParameterRecord::value);
             self.mixer_track_peak_meters
                 .set_live_mixer_insert_fader_raw(track, live_fader_raw);
             self.mixer_track_peak_meters
                 .set_live_mixer_insert_pan_raw(track, live_pan_raw);
+            self.mixer_track_peak_meters
+                .set_live_mixer_insert_stereo_separation_raw(track, live_stereo_separation_raw);
         }
     }
 
@@ -34793,6 +34797,7 @@ impl DawUi {
         let mut live_master_fader_gain_edit = None;
         let mut live_mixer_insert_fader_edit = None;
         let mut live_mixer_insert_pan_edit = None;
+        let mut live_mixer_insert_stereo_separation_edit = None;
         let mut live_master_pan_edit = None;
         let mut live_master_stereo_separation_edit = None;
         let mut send_flag_edits = Vec::new();
@@ -35169,6 +35174,14 @@ impl DawUi {
                                                                 if insert.ordinal() == 0 {
                                                                     live_master_stereo_separation_edit =
                                                                         Some((
+                                                                            record.event_index(),
+                                                                            record.record_index(),
+                                                                            separation_value,
+                                                                        ));
+                                                                } else {
+                                                                    live_mixer_insert_stereo_separation_edit =
+                                                                        Some((
+                                                                            insert.ordinal(),
                                                                             record.event_index(),
                                                                             record.record_index(),
                                                                             separation_value,
@@ -35648,6 +35661,7 @@ impl DawUi {
             let mut applied_live_master_fader_gain = None;
             let mut applied_live_mixer_insert_fader_raw = None;
             let mut applied_live_mixer_insert_pan_raw = None;
+            let mut applied_live_mixer_insert_stereo_separation_raw = None;
             let mut applied_live_master_pan = None;
             let mut applied_live_master_stereo_separation = None;
             for (event_index, record_index, value) in parameter_edits {
@@ -35687,6 +35701,14 @@ impl DawUi {
                         {
                             applied_live_master_stereo_separation = Some(separation_raw);
                         }
+                        if let Some((track, insert_event, insert_record, separation_raw)) =
+                            live_mixer_insert_stereo_separation_edit
+                            && insert_event == event_index
+                            && insert_record == record_index
+                        {
+                            applied_live_mixer_insert_stereo_separation_raw =
+                                Some((track, separation_raw));
+                        }
                         self.dirty = true;
                         self.status = format!(
                             "Edited Mixer parameter event {event_index}, record {record_index}"
@@ -35708,6 +35730,10 @@ impl DawUi {
             if let Some((track, pan_raw)) = applied_live_mixer_insert_pan_raw {
                 self.mixer_track_peak_meters
                     .set_live_mixer_insert_pan_raw(track, Some(pan_raw));
+            }
+            if let Some((track, separation_raw)) = applied_live_mixer_insert_stereo_separation_raw {
+                self.mixer_track_peak_meters
+                    .set_live_mixer_insert_stereo_separation_raw(track, Some(separation_raw));
             }
             if let Some(pan_raw) = applied_live_master_pan {
                 self.mixer_track_peak_meters
