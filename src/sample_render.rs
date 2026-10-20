@@ -4467,6 +4467,9 @@ fn stream_prepared_playlist_render_with_performance(
     );
     let mut direct_source_delay = crate::audio::StereoFrameDelay::new(direct_source_delay_frames)?;
     if let Some(processor) = render.vst3_processor.as_deref_mut() {
+        if let Some(meters) = meters {
+            processor.set_live_mixer_fader_targets(meters);
+        }
         processor.start_processing()?;
     }
     let track_groups = audio_clips_grouped_by_mixer_track(&render.audio.clips);
@@ -4904,6 +4907,9 @@ fn stream_sampler_pattern_loop_from_tick_with_vst3_to_device(
         engine.live_mixer_fader_targets = Some(meters);
     }
     if let Some(processor) = playback.vst3_processor.as_mut() {
+        if let Some(meters) = live_master_meters {
+            processor.set_live_mixer_fader_targets(meters);
+        }
         processor.start_processing()?;
     }
     let sampler_delay_frames = playback.vst3_processor.as_ref().map_or(

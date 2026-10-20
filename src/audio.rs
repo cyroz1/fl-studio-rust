@@ -98,8 +98,9 @@ impl MixerTrackPeakMeters {
 
     /// Set a non-Master Mixer insert's live fader target in FLP raw units.
     ///
-    /// Sampler Pattern playback reads the target without taking a lock and smooths supported
-    /// direct-route changes over 20 ms. `None` keeps the saved route transform in effect.
+    /// Live Playlist, Pattern, and Performance render workers read the target without taking a
+    /// lock and smooth supported direct-route changes over 20 ms. `None` keeps the saved route
+    /// transform in effect.
     pub fn set_live_mixer_insert_fader_raw(&self, track: usize, volume_raw: Option<i32>) {
         let Some(target) = self.live_mixer_insert_fader_raw.get(track) else {
             return;
