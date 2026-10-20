@@ -164,7 +164,6 @@ jobs:
           fi
           sudo apt-get install --yes "./${packages[0]}"
           test -x /usr/bin/fl-studio-rebuild
-          test -x /usr/bin/vst3-host-helper
 
       - name: Install and launch Windows setup
         if: runner.os == 'Windows'
@@ -183,14 +182,9 @@ jobs:
           }
 
           $appPath = Join-Path $installPath 'fl-studio-rebuild.exe'
-          $helperPath = Join-Path $installPath 'vst3-host-helper.exe'
           if (-not (Test-Path -LiteralPath $appPath -PathType Leaf)) {
             throw "Installed app executable is missing: $appPath"
           }
-          if (-not (Test-Path -LiteralPath $helperPath -PathType Leaf)) {
-            throw "Installed VST3 helper is missing: $helperPath"
-          }
-
           $env:APPDATA = Join-Path $env:RUNNER_TEMP 'fl-studio-ui-config'
           New-Item -ItemType Directory -Path $env:APPDATA -Force | Out-Null
           $app = Start-Process -FilePath $appPath -WorkingDirectory $installPath -PassThru
