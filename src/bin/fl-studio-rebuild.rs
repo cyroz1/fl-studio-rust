@@ -91,7 +91,7 @@ use midi_output::{
     ConnectedMidiOutput, MIDI_TEST_NOTE_OFF, MIDI_TEST_NOTE_ON, MidiClockScheduler,
     MidiOutputDevice, MidiPatternLoopScheduler, MidiPlaylistScheduler, ScheduledMidiFrameMessage,
     ScheduledMidiMessage, ScheduledMidiTickMessage, connect_output_device,
-    enumerate_output_devices, midi_program_change_message, pattern_loop_frame_messages,
+    enumerate_output_devices, midi_patch_setup_messages, pattern_loop_frame_messages,
     pattern_preview_messages, playlist_playback_messages,
 };
 use midi_thru::{MidiThruSettings, MidiThruWorker};
@@ -4243,6 +4243,8 @@ struct DawUi {
     midi_connect_output_on_startup: bool,
     midi_output_error: Option<String>,
     midi_output_connection: Option<ConnectedMidiOutput>,
+    midi_output_bank_msb: [Option<u8>; 16],
+    midi_output_bank_lsb: [Option<u8>; 16],
     midi_output_programs: [Option<u8>; 16],
     midi_output_send_clock: bool,
     midi_output_send_playlist_notes: bool,
@@ -5059,6 +5061,8 @@ impl DawUi {
             connect_input_on_startup: midi_connect_input_on_startup,
             output_id: midi_selected_output_id,
             connect_output_on_startup: midi_connect_output_on_startup,
+            bank_msb: midi_output_bank_msb,
+            bank_lsb: midi_output_bank_lsb,
             programs: midi_output_programs,
             send_clock: midi_output_send_clock,
             send_playlist_notes: midi_output_send_playlist_notes,
@@ -5449,6 +5453,8 @@ impl DawUi {
             midi_connect_output_on_startup,
             midi_output_error,
             midi_output_connection: None,
+            midi_output_bank_msb,
+            midi_output_bank_lsb,
             midi_output_programs,
             midi_output_send_clock,
             midi_output_send_playlist_notes,
@@ -39149,6 +39155,8 @@ impl DawUi {
             connect_input_on_startup: self.midi_connect_input_on_startup,
             output_id: self.midi_selected_output_id.clone(),
             connect_output_on_startup: self.midi_connect_output_on_startup,
+            bank_msb: self.midi_output_bank_msb,
+            bank_lsb: self.midi_output_bank_lsb,
             programs: self.midi_output_programs,
             send_clock: self.midi_output_send_clock,
             send_playlist_notes: self.midi_output_send_playlist_notes,
@@ -39304,8 +39312,8 @@ impl DawUi {
                 let all_notes_off_error = connection.send_all_notes_off().err();
                 self.midi_output_connection = Some(connection);
                 self.midi_selected_output_id = Some(device_id);
-                let program_error = self.send_midi_output_programs().err();
-                let connection_error = all_notes_off_error.or(program_error);
+                let setup_error = self.send_midi_output_channel_setup().err();
+                let connection_error = all_notes_off_error.or(setup_error);
                 self.midi_output_error = connection_error.clone();
                 self.status = connection_error.map_or_else(
                     || format!("Connected MIDI output: {}", device.name),
@@ -39334,15 +39342,17 @@ impl DawUi {
         }
     }
 
-    fn send_midi_output_programs(&mut self) -> Result<(), String> {
+    fn send_midi_output_channel_setup(&mut self) -> Result<(), String> {
+        let messages = midi_patch_setup_messages(
+            &self.midi_output_bank_msb,
+            &self.midi_output_bank_lsb,
+            &self.midi_output_programs,
+        )?;
         let Some(connection) = self.midi_output_connection.as_mut() else {
             return Ok(());
         };
-        for (channel, program) in self.midi_output_programs.iter().copied().enumerate() {
-            if let Some(program) = program {
-                let message = midi_program_change_message(channel as u8, program)?;
-                connection.send(&message)?;
-            }
+        for message in messages {
+            connection.send(&message)?;
         }
         Ok(())
     }
@@ -39385,9 +39395,9 @@ impl DawUi {
             self.status = "Stop transport MIDI output before sending a test note".to_owned();
             return;
         }
-        if let Err(error) = self.send_midi_output_programs() {
+        if let Err(error) = self.send_midi_output_channel_setup() {
             self.midi_output_error = Some(error.clone());
-            self.status = format!("Could not send MIDI program setup: {error}");
+            self.status = format!("Could not send MIDI bank/program setup: {error}");
             return;
         }
         let Some(connection) = self.midi_output_connection.as_mut() else {
@@ -39563,9 +39573,9 @@ impl DawUi {
         match result {
             Ok(messages) if messages.is_empty() => self.midi_output_error = None,
             Ok(messages) => {
-                if let Err(error) = self.send_midi_output_programs() {
+                if let Err(error) = self.send_midi_output_channel_setup() {
                     self.midi_output_error = Some(error.clone());
-                    self.status = format!("Could not send MIDI program setup: {error}");
+                    self.status = format!("Could not send MIDI bank/program setup: {error}");
                     return;
                 }
                 let output = self.midi_output_connection.as_ref().cloned();
@@ -39729,9 +39739,9 @@ impl DawUi {
             self.midi_output_error = None;
             return;
         }
-        if let Err(error) = self.send_midi_output_programs() {
+        if let Err(error) = self.send_midi_output_channel_setup() {
             self.midi_output_error = Some(error.clone());
-            self.status = format!("Could not send MIDI program setup: {error}");
+            self.status = format!("Could not send MIDI bank/program setup: {error}");
             return;
         }
         let Some(output) = self.midi_output_connection.as_ref().cloned() else {
@@ -39843,9 +39853,9 @@ impl DawUi {
             self.status = format!("Pattern {pattern_id} has no MIDI-playable notes");
             return;
         }
-        if let Err(error) = self.send_midi_output_programs() {
+        if let Err(error) = self.send_midi_output_channel_setup() {
             self.midi_output_error = Some(error.clone());
-            self.status = format!("Could not send MIDI program setup: {error}");
+            self.status = format!("Could not send MIDI bank/program setup: {error}");
             return;
         }
         self.midi_pattern_playback = Some(ActiveMidiPatternPlayback {
@@ -43820,24 +43830,63 @@ impl DawUi {
         {
             self.persist_midi_device_selections();
         }
-        let mut output_programs_changed = false;
+        let mut output_patch_selection_changed = false;
         let midi_output_stopped = !self.playing
             && self.midi_output_test_note_off_at.is_none()
             && self.midi_playlist_playback.is_none()
             && self.midi_pattern_transport.is_none()
             && self.midi_pattern_playback.is_none();
-        ui.collapsing("MIDI Program Change per channel", |ui| {
+        ui.collapsing("MIDI Bank Select and Program per channel", |ui| {
             ui.small(
-                "Choose a MIDI program for each output channel. Zero leaves the external instrument's patch unchanged; values 1–128 send MIDI programs 0–127.",
+                "Choose Bank Select MSB/LSB and Program values for each output channel. Zero leaves that field unchanged; values 1–128 send MIDI values 0–127. Bank Select messages are sent before Program Change.",
             );
             ui.add_enabled_ui(midi_output_stopped, |ui| {
                 egui::Grid::new("midi-output-program-grid")
-                    .num_columns(2)
+                    .num_columns(4)
                     .show(ui, |ui| {
+                        ui.label("Channel");
+                        ui.label("Bank MSB");
+                        ui.label("Bank LSB");
+                        ui.label("Program");
+                        ui.end_row();
                         for channel in 0..16 {
+                            let mut displayed_bank_msb = self.midi_output_bank_msb[channel]
+                                .map_or(0, |value| u16::from(value) + 1);
+                            let mut displayed_bank_lsb = self.midi_output_bank_lsb[channel]
+                                .map_or(0, |value| u16::from(value) + 1);
                             let mut displayed_program = self.midi_output_programs[channel]
                                 .map_or(0, |program| u16::from(program) + 1);
                             ui.label(format!("Channel {}", channel + 1));
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut displayed_bank_msb)
+                                        .range(0..=128)
+                                        .prefix("MSB "),
+                                )
+                                .on_hover_text(
+                                    "0 disables Bank Select MSB; 1–128 send MIDI values 0–127",
+                                )
+                                .changed()
+                            {
+                                self.midi_output_bank_msb[channel] = (displayed_bank_msb != 0)
+                                    .then_some((displayed_bank_msb - 1) as u8);
+                                output_patch_selection_changed = true;
+                            }
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut displayed_bank_lsb)
+                                        .range(0..=128)
+                                        .prefix("LSB "),
+                                )
+                                .on_hover_text(
+                                    "0 disables Bank Select LSB; 1–128 send MIDI values 0–127",
+                                )
+                                .changed()
+                            {
+                                self.midi_output_bank_lsb[channel] = (displayed_bank_lsb != 0)
+                                    .then_some((displayed_bank_lsb - 1) as u8);
+                                output_patch_selection_changed = true;
+                            }
                             if ui
                                 .add(
                                     egui::DragValue::new(&mut displayed_program)
@@ -43851,21 +43900,21 @@ impl DawUi {
                             {
                                 self.midi_output_programs[channel] =
                                     (displayed_program != 0).then_some((displayed_program - 1) as u8);
-                                output_programs_changed = true;
+                                output_patch_selection_changed = true;
                             }
                             ui.end_row();
                         }
                     });
             });
             if !midi_output_stopped {
-                ui.small("Stop MIDI output before changing program assignments.");
+                ui.small("Stop MIDI output before changing bank/program assignments.");
             }
         });
-        if output_programs_changed {
+        if output_patch_selection_changed {
             self.persist_midi_device_selections();
-            if let Err(error) = self.send_midi_output_programs() {
+            if let Err(error) = self.send_midi_output_channel_setup() {
                 self.midi_output_error = Some(error.clone());
-                self.status = format!("Could not send MIDI program setup: {error}");
+                self.status = format!("Could not send MIDI bank/program setup: {error}");
             }
         }
         ui.horizontal(|ui| {
@@ -48914,6 +48963,8 @@ struct MidiDeviceSelections {
     connect_input_on_startup: bool,
     output_id: Option<String>,
     connect_output_on_startup: bool,
+    bank_msb: [Option<u8>; 16],
+    bank_lsb: [Option<u8>; 16],
     programs: [Option<u8>; 16],
     send_clock: bool,
     send_playlist_notes: bool,
@@ -48935,6 +48986,8 @@ impl Default for MidiDeviceSelections {
             connect_input_on_startup: false,
             output_id: None,
             connect_output_on_startup: false,
+            bank_msb: [None; 16],
+            bank_lsb: [None; 16],
             programs: [None; 16],
             send_clock: false,
             send_playlist_notes: false,
@@ -49024,11 +49077,13 @@ fn parse_midi_thru_preferences(contents: &str) -> (bool, Option<u8>) {
 
 fn encode_midi_device_selections(selections: &MidiDeviceSelections) -> String {
     format!(
-        "input={}\nconnect_input_on_startup={}\noutput={}\nconnect_output_on_startup={}\nprograms={}\nclock={}\nplaylist_notes={}\npattern_notes={}\nfixed_velocity={}\nperformance_channel={}\nrecord_audio={}\nrecord_notes={}\nrecord_automation={}\nrecord_automation_controller={}\nrecord_automation_channel={}\nrecord_automation_flags={}\n",
+        "input={}\nconnect_input_on_startup={}\noutput={}\nconnect_output_on_startup={}\nbank_msb={}\nbank_lsb={}\nprograms={}\nclock={}\nplaylist_notes={}\npattern_notes={}\nfixed_velocity={}\nperformance_channel={}\nrecord_audio={}\nrecord_notes={}\nrecord_automation={}\nrecord_automation_controller={}\nrecord_automation_channel={}\nrecord_automation_flags={}\n",
         encode_midi_device_id(selections.input_id.as_deref().unwrap_or_default()),
         u8::from(selections.connect_input_on_startup),
         encode_midi_device_id(selections.output_id.as_deref().unwrap_or_default()),
         u8::from(selections.connect_output_on_startup),
+        encode_midi_output_values(&selections.bank_msb),
+        encode_midi_output_values(&selections.bank_lsb),
         encode_midi_output_programs(&selections.programs),
         u8::from(selections.send_clock),
         u8::from(selections.send_playlist_notes),
@@ -49055,6 +49110,14 @@ fn parse_midi_device_selections(contents: &str) -> MidiDeviceSelections {
             selections.output_id = decode_midi_device_id(encoded_id);
         } else if let Some(enabled) = line.strip_prefix("connect_output_on_startup=") {
             selections.connect_output_on_startup = enabled == "1";
+        } else if let Some(bank_msb) = line.strip_prefix("bank_msb=") {
+            if let Some(bank_msb) = parse_midi_output_values(bank_msb) {
+                selections.bank_msb = bank_msb;
+            }
+        } else if let Some(bank_lsb) = line.strip_prefix("bank_lsb=") {
+            if let Some(bank_lsb) = parse_midi_output_values(bank_lsb) {
+                selections.bank_lsb = bank_lsb;
+            }
         } else if let Some(programs) = line.strip_prefix("programs=") {
             if let Some(programs) = parse_midi_output_programs(programs) {
                 selections.programs = programs;
@@ -49099,26 +49162,34 @@ fn parse_midi_device_selections(contents: &str) -> MidiDeviceSelections {
 }
 
 fn encode_midi_output_programs(programs: &[Option<u8>; 16]) -> String {
-    programs
+    encode_midi_output_values(programs)
+}
+
+fn encode_midi_output_values(values: &[Option<u8>; 16]) -> String {
+    values
         .iter()
-        .map(|program| program.map_or_else(|| "-".to_owned(), |program| program.to_string()))
+        .map(|value| value.map_or_else(|| "-".to_owned(), |value| value.to_string()))
         .collect::<Vec<_>>()
         .join(",")
 }
 
 fn parse_midi_output_programs(encoded: &str) -> Option<[Option<u8>; 16]> {
-    let programs = encoded
+    parse_midi_output_values(encoded)
+}
+
+fn parse_midi_output_values(encoded: &str) -> Option<[Option<u8>; 16]> {
+    let values = encoded
         .split(',')
         .map(|field| match field {
             "-" => Some(None),
             _ => field
                 .parse::<u8>()
                 .ok()
-                .filter(|program| *program <= 127)
+                .filter(|value| *value <= 127)
                 .map(Some),
         })
         .collect::<Option<Vec<_>>>()?;
-    programs.try_into().ok()
+    values.try_into().ok()
 }
 
 fn should_auto_connect_midi_input(
@@ -53828,7 +53899,7 @@ mod tests {
         midi_vst3_parameter_mapping_for_target, midi_vst3_parameter_mappings_for_cc,
         next_piano_roll_note_group, note_from_grid_position, parse_midi_control_change_mapping,
         parse_midi_controller_templates, parse_midi_device_selections,
-        parse_midi_mixer_control_mappings, parse_midi_output_programs,
+        parse_midi_mixer_control_mappings, parse_midi_output_programs, parse_midi_output_values,
         parse_midi_vst3_parameter_mappings, parse_pattern_vst3_parameter_links,
         parse_window_layout_presets, pattern_loop_frame_at_tick, pattern_loop_tick_at_frame,
         pattern_vst3_parameter_automation_for_channel, pattern_vst3_parameter_link_for_target,
@@ -54939,7 +55010,12 @@ mod tests {
     fn midi_device_selections_round_trip_opaque_port_ids() {
         let input_id = "alsa:card=Keyboard\tport\n雪";
         let output_id = "CoreMIDI:0123456789ABCDEF";
+        let mut bank_msb = [None; 16];
+        let mut bank_lsb = [None; 16];
         let mut programs = [None; 16];
+        bank_msb[0] = Some(0);
+        bank_lsb[0] = Some(127);
+        bank_lsb[15] = Some(4);
         programs[0] = Some(0);
         programs[15] = Some(127);
         let selections = MidiDeviceSelections {
@@ -54947,6 +55023,8 @@ mod tests {
             connect_input_on_startup: true,
             output_id: Some(output_id.to_owned()),
             connect_output_on_startup: true,
+            bank_msb,
+            bank_lsb,
             programs,
             send_clock: true,
             send_playlist_notes: true,
@@ -54981,9 +55059,19 @@ mod tests {
                 ..MidiDeviceSelections::default()
             }
         );
+        let legacy = parse_midi_device_selections(
+            "input=\nconnect_input_on_startup=0\noutput=\nconnect_output_on_startup=0\nprograms=-,1,-,-,-,-,-,-,-,-,-,-,-,-,-,-\n",
+        );
+        assert_eq!(legacy.bank_msb, [None; 16]);
+        assert_eq!(legacy.bank_lsb, [None; 16]);
+        assert_eq!(legacy.programs[1], Some(1));
         assert_eq!(parse_midi_output_programs("0,1,-"), None);
         assert_eq!(
             parse_midi_output_programs("128,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-"),
+            None
+        );
+        assert_eq!(
+            parse_midi_output_values("-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,128"),
             None
         );
     }

@@ -1002,6 +1002,43 @@ pub fn midi_program_change_message(channel: u8, program: u8) -> Result<[u8; 2], 
     Ok([0xC0 | channel, program])
 }
 
+pub fn midi_control_change_message(
+    channel: u8,
+    controller: u8,
+    value: u8,
+) -> Result<[u8; 3], String> {
+    if channel > 15 {
+        return Err("MIDI control-change channel must be between 0 and 15".to_owned());
+    }
+    if controller > 127 {
+        return Err("MIDI controller number must be between 0 and 127".to_owned());
+    }
+    if value > 127 {
+        return Err("MIDI control-change value must be between 0 and 127".to_owned());
+    }
+    Ok([0xB0 | channel, controller, value])
+}
+
+pub fn midi_patch_setup_messages(
+    bank_msb: &[Option<u8>; 16],
+    bank_lsb: &[Option<u8>; 16],
+    programs: &[Option<u8>; 16],
+) -> Result<Vec<Vec<u8>>, String> {
+    let mut messages = Vec::new();
+    for channel in 0..16 {
+        if let Some(value) = bank_msb[channel] {
+            messages.push(midi_control_change_message(channel as u8, 0, value)?.to_vec());
+        }
+        if let Some(value) = bank_lsb[channel] {
+            messages.push(midi_control_change_message(channel as u8, 32, value)?.to_vec());
+        }
+        if let Some(program) = programs[channel] {
+            messages.push(midi_program_change_message(channel as u8, program)?.to_vec());
+        }
+    }
+    Ok(messages)
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -1011,10 +1048,10 @@ mod tests {
 
     use super::{
         ScheduledMidiFrameMessage, all_notes_off_message, due_midi_playlist_message_end,
-        midi_clock_pulse_count_at_tick, midi_clock_pulse_frame, midi_pattern_active_note_ons,
-        midi_program_change_message, midi_sixteenth_notes_from_tick,
-        midi_song_position_pointer_message, midi_tick_messages, pattern_loop_frame_messages,
-        pattern_preview_messages,
+        midi_clock_pulse_count_at_tick, midi_clock_pulse_frame, midi_control_change_message,
+        midi_patch_setup_messages, midi_pattern_active_note_ons, midi_program_change_message,
+        midi_sixteenth_notes_from_tick, midi_song_position_pointer_message, midi_tick_messages,
+        pattern_loop_frame_messages, pattern_preview_messages,
     };
     use flp_rebuild::midi::{MidiChannelMapping, MidiExportNote, MidiExportTrack, MidiFile};
 
@@ -1030,6 +1067,44 @@ mod tests {
         assert_eq!(midi_program_change_message(15, 127).unwrap(), [0xCF, 127]);
         assert!(midi_program_change_message(16, 0).is_err());
         assert!(midi_program_change_message(0, 128).is_err());
+    }
+
+    #[test]
+    fn control_change_encodes_channel_and_seven_bit_values() {
+        assert_eq!(midi_control_change_message(0, 0, 0).unwrap(), [0xB0, 0, 0]);
+        assert_eq!(
+            midi_control_change_message(15, 127, 127).unwrap(),
+            [0xBF, 127, 127]
+        );
+        assert!(midi_control_change_message(16, 0, 0).is_err());
+        assert!(midi_control_change_message(0, 128, 0).is_err());
+        assert!(midi_control_change_message(0, 0, 128).is_err());
+    }
+
+    #[test]
+    fn patch_setup_sends_bank_msb_then_lsb_then_program_per_channel() {
+        let mut bank_msb = [None; 16];
+        let mut bank_lsb = [None; 16];
+        let mut programs = [None; 16];
+        bank_msb[0] = Some(1);
+        bank_lsb[0] = Some(2);
+        programs[0] = Some(3);
+        bank_lsb[15] = Some(127);
+        programs[15] = Some(127);
+
+        assert_eq!(
+            midi_patch_setup_messages(&bank_msb, &bank_lsb, &programs).unwrap(),
+            vec![
+                vec![0xB0, 0, 1],
+                vec![0xB0, 32, 2],
+                vec![0xC0, 3],
+                vec![0xBF, 32, 127],
+                vec![0xCF, 127],
+            ]
+        );
+
+        programs[15] = Some(128);
+        assert!(midi_patch_setup_messages(&bank_msb, &bank_lsb, &programs).is_err());
     }
 
     #[test]
