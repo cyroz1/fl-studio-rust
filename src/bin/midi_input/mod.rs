@@ -540,6 +540,12 @@ struct ActiveMidiNote {
     fine_pitch: u8,
 }
 
+struct SustainedMidiNote {
+    key: u8,
+    note: ActiveMidiNote,
+    release_velocity: Option<u8>,
+}
+
 pub struct MidiPatternRecorder {
     pattern_id: u16,
     channel_id: u16,
@@ -554,7 +560,9 @@ pub struct MidiPatternRecorder {
     started_at: Instant,
     timestamp_origin_micros: Option<u64>,
     channel_state: [MidiInputChannelState; 16],
+    sustain_channels: [bool; 16],
     active_notes: BTreeMap<(u8, u8), VecDeque<ActiveMidiNote>>,
+    sustained_notes: BTreeMap<u8, Vec<SustainedMidiNote>>,
     notes: Vec<PatternNote>,
     started_note_count: usize,
     last_position_tick: u32,
@@ -613,7 +621,9 @@ impl MidiPatternRecorder {
             started_at,
             timestamp_origin_micros: None,
             channel_state: [MidiInputChannelState::default(); 16],
+            sustain_channels: [false; 16],
             active_notes: BTreeMap::new(),
+            sustained_notes: BTreeMap::new(),
             notes: Vec::new(),
             started_note_count: 0,
             last_position_tick: 0,
@@ -713,21 +723,82 @@ impl MidiPatternRecorder {
                     self.active_notes.remove(&event_key);
                 }
                 if let Some(active_note) = ended_note {
-                    let note =
-                        self.make_note(active_note, tick, channel, key, Some(release_velocity));
-                    self.notes.push(note);
+                    self.finish_or_sustain_note(
+                        active_note,
+                        tick,
+                        channel,
+                        key,
+                        Some(release_velocity),
+                    );
                 }
             }
             MidiInputEvent::ControlChange {
                 channel,
-                controller: 120 | 123..=127,
+                controller: 64,
+                value,
+            } => {
+                let Some(sustain) = self.sustain_channels.get_mut(usize::from(channel)) else {
+                    return;
+                };
+                let was_enabled = *sustain;
+                *sustain = value >= 64;
+                if was_enabled && !*sustain {
+                    self.finish_sustained_notes(channel, tick);
+                }
+            }
+            MidiInputEvent::ControlChange {
+                channel,
+                controller: 120,
                 ..
-            } => self.finish_channel_notes(channel, tick),
+            } => self.stop_channel_notes(channel, tick),
+            MidiInputEvent::ControlChange {
+                channel,
+                controller: 121,
+                ..
+            } => {
+                if let Some(sustain) = self.sustain_channels.get_mut(usize::from(channel)) {
+                    *sustain = false;
+                }
+                self.finish_sustained_notes(channel, tick);
+            }
+            MidiInputEvent::ControlChange {
+                channel,
+                controller: 123..=127,
+                ..
+            } => self.release_channel_notes(channel, tick),
             _ => {}
         }
     }
 
-    fn finish_channel_notes(&mut self, channel: u8, end_tick: u32) {
+    fn finish_or_sustain_note(
+        &mut self,
+        active_note: ActiveMidiNote,
+        end_tick: u32,
+        channel: u8,
+        key: u8,
+        release_velocity: Option<u8>,
+    ) {
+        if self
+            .sustain_channels
+            .get(usize::from(channel))
+            .copied()
+            .unwrap_or(false)
+        {
+            self.sustained_notes
+                .entry(channel)
+                .or_default()
+                .push(SustainedMidiNote {
+                    key,
+                    note: active_note,
+                    release_velocity,
+                });
+        } else {
+            self.notes
+                .push(self.make_note(active_note, end_tick, channel, key, release_velocity));
+        }
+    }
+
+    fn release_channel_notes(&mut self, channel: u8, end_tick: u32) {
         let active_keys = self
             .active_notes
             .keys()
@@ -737,11 +808,50 @@ impl MidiPatternRecorder {
         for (active_channel, key) in active_keys {
             if let Some(active) = self.active_notes.remove(&(active_channel, key)) {
                 for active_note in active {
-                    let note = self.make_note(active_note, end_tick, active_channel, key, None);
-                    self.notes.push(note);
+                    self.finish_or_sustain_note(active_note, end_tick, active_channel, key, None);
                 }
             }
         }
+    }
+
+    fn finish_sustained_notes(&mut self, channel: u8, end_tick: u32) {
+        if let Some(sustained) = self.sustained_notes.remove(&channel) {
+            for sustained_note in sustained {
+                self.notes.push(self.make_note(
+                    sustained_note.note,
+                    end_tick,
+                    channel,
+                    sustained_note.key,
+                    sustained_note.release_velocity,
+                ));
+            }
+        }
+    }
+
+    fn stop_channel_notes(&mut self, channel: u8, end_tick: u32) {
+        if let Some(sustain) = self.sustain_channels.get_mut(usize::from(channel)) {
+            *sustain = false;
+        }
+        let active_keys = self
+            .active_notes
+            .keys()
+            .copied()
+            .filter(|(active_channel, _)| *active_channel == channel)
+            .collect::<Vec<_>>();
+        for (active_channel, key) in active_keys {
+            if let Some(active) = self.active_notes.remove(&(active_channel, key)) {
+                for active_note in active {
+                    self.notes.push(self.make_note(
+                        active_note,
+                        end_tick,
+                        active_channel,
+                        key,
+                        None,
+                    ));
+                }
+            }
+        }
+        self.finish_sustained_notes(channel, end_tick);
     }
 
     pub fn finish(
@@ -766,6 +876,18 @@ impl MidiPatternRecorder {
         for ((channel, key), active) in std::mem::take(&mut self.active_notes) {
             for active_note in active {
                 let note = self.make_note(active_note, finish_tick, channel, key, None);
+                self.notes.push(note);
+            }
+        }
+        for (channel, sustained) in std::mem::take(&mut self.sustained_notes) {
+            for sustained_note in sustained {
+                let note = self.make_note(
+                    sustained_note.note,
+                    finish_tick,
+                    channel,
+                    sustained_note.key,
+                    sustained_note.release_velocity,
+                );
                 self.notes.push(note);
             }
         }
@@ -1094,6 +1216,157 @@ mod tests {
         assert_eq!(result.notes[1].pan, 128);
         assert_eq!(result.notes[1].mod_x, 255);
         assert_eq!(result.notes[1].mod_y, 0);
+    }
+
+    #[test]
+    fn sustain_pedal_defers_recorded_note_off_until_pedal_release() {
+        let started_at = Instant::now();
+        let mut recorder = MidiPatternRecorder::new(
+            MidiPatternRecorderSettings {
+                pattern_id: 1,
+                channel_id: 2,
+                project_path: None,
+                ppq: 96,
+                tempo_bpm: 120.0,
+                start_tick: 0,
+                snap_ticks: None,
+                timing_offset_ms: 0,
+                song_timeline_start: None,
+            },
+            started_at,
+        )
+        .expect("valid project timing should create a recorder");
+        let message = |elapsed_ms, event| ReceivedMidiMessage {
+            timestamp_micros: 1_000_000 + elapsed_ms * 1_000,
+            received_at: started_at + Duration::from_millis(elapsed_ms),
+            event,
+        };
+        recorder.record(message(
+            50,
+            MidiInputEvent::ControlChange {
+                channel: 0,
+                controller: 64,
+                value: 127,
+            },
+        ));
+        recorder.record(message(
+            100,
+            MidiInputEvent::NoteOn {
+                channel: 0,
+                key: 60,
+                velocity: 100,
+            },
+        ));
+        recorder.record(message(
+            100,
+            MidiInputEvent::NoteOn {
+                channel: 1,
+                key: 64,
+                velocity: 90,
+            },
+        ));
+        recorder.record(message(
+            200,
+            MidiInputEvent::NoteOff {
+                channel: 0,
+                key: 60,
+                velocity: 88,
+            },
+        ));
+        recorder.record(message(
+            200,
+            MidiInputEvent::NoteOff {
+                channel: 1,
+                key: 64,
+                velocity: 70,
+            },
+        ));
+        assert_eq!(recorder.notes.len(), 1);
+        assert_eq!(recorder.notes[0].key, 64);
+
+        recorder.record(message(
+            300,
+            MidiInputEvent::ControlChange {
+                channel: 0,
+                controller: 64,
+                value: 63,
+            },
+        ));
+
+        let result = recorder.finish(None, started_at + Duration::from_millis(400));
+        let sustained = result
+            .notes
+            .iter()
+            .find(|note| note.key == 60)
+            .expect("the sustained note should be recorded");
+        assert_eq!(sustained.length, 39);
+        assert_eq!(
+            sustained.release,
+            midi_release_velocity_to_fl_note_release(88)
+        );
+        let other_channel = result
+            .notes
+            .iter()
+            .find(|note| note.key == 64)
+            .expect("the note on the other channel should finish immediately");
+        assert_eq!(other_channel.length, 19);
+    }
+
+    #[test]
+    fn stopping_recording_finishes_notes_deferred_by_sustain() {
+        let started_at = Instant::now();
+        let mut recorder = MidiPatternRecorder::new(
+            MidiPatternRecorderSettings {
+                pattern_id: 1,
+                channel_id: 2,
+                project_path: None,
+                ppq: 96,
+                tempo_bpm: 120.0,
+                start_tick: 0,
+                snap_ticks: None,
+                timing_offset_ms: 0,
+                song_timeline_start: None,
+            },
+            started_at,
+        )
+        .expect("valid project timing should create a recorder");
+        let message = |elapsed_ms, event| ReceivedMidiMessage {
+            timestamp_micros: 1_000_000 + elapsed_ms * 1_000,
+            received_at: started_at + Duration::from_millis(elapsed_ms),
+            event,
+        };
+        recorder.record(message(
+            50,
+            MidiInputEvent::ControlChange {
+                channel: 0,
+                controller: 64,
+                value: 64,
+            },
+        ));
+        recorder.record(message(
+            100,
+            MidiInputEvent::NoteOn {
+                channel: 0,
+                key: 60,
+                velocity: 100,
+            },
+        ));
+        recorder.record(message(
+            200,
+            MidiInputEvent::NoteOff {
+                channel: 0,
+                key: 60,
+                velocity: 88,
+            },
+        ));
+
+        let result = recorder.finish(Some(1_300_000), started_at + Duration::from_millis(300));
+        assert_eq!(result.notes.len(), 1);
+        assert_eq!(result.notes[0].length, 39);
+        assert_eq!(
+            result.notes[0].release,
+            midi_release_velocity_to_fl_note_release(88)
+        );
     }
 
     #[test]
