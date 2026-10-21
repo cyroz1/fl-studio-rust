@@ -5965,8 +5965,8 @@ impl FlpDocument {
         Ok(new_id)
     }
 
-    /// Duplicates a pattern's note records, name, and explicit length into a new pattern.
-    /// Unknown events and all existing pattern bytes remain untouched.
+    /// Duplicates a pattern's note records, raw `0xDF` controller events, name, and explicit
+    /// length into a new pattern. Unknown events and all existing pattern bytes remain untouched.
     pub fn duplicate_pattern(&mut self, pattern_id: u16) -> Result<u16, FlpError> {
         let source_pattern = self
             .patterns()?
@@ -6017,11 +6017,13 @@ impl FlpDocument {
                 .iter()
                 .rposition(|event| event.opcode == 0xA4 && event.payload.len() == 4)
         });
-        let metadata_events = source_region
+        let duplicate_auxiliary_events = source_region
             .iter()
             .enumerate()
-            .filter(|(index, _)| {
-                Some(*index) == name_event_index || Some(*index) == length_event_index
+            .filter(|(index, event)| {
+                event.opcode == 0xDF
+                    || Some(*index) == name_event_index
+                    || Some(*index) == length_event_index
             })
             .map(|(_, event)| event.clone())
             .collect::<Vec<_>>();
@@ -6053,14 +6055,14 @@ impl FlpDocument {
         if let Some(payload) = source_note_payload {
             candidate.events[new_note_event_index].replace_data_payload(payload)?;
         }
-        if !metadata_events.is_empty() {
+        if !duplicate_auxiliary_events.is_empty() {
             let insert_index = new_marker_index
                 .checked_add(2)
                 .filter(|index| *index <= candidate.events.len())
                 .ok_or(FlpError::LengthOverflow)?;
             candidate
                 .events
-                .splice(insert_index..insert_index, metadata_events);
+                .splice(insert_index..insert_index, duplicate_auxiliary_events);
         }
         candidate.refresh_event_offsets()?;
         *self = candidate;
@@ -27874,7 +27876,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicating_a_pattern_copies_notes_name_and_length_losslessly() {
+    fn duplicating_a_pattern_copies_notes_controllers_name_and_length_losslessly() {
         let mut note = note_record(48, 0, 192, 64, 93);
         note[5] = 0xA5;
         note[11] = 0x37;
@@ -27882,6 +27884,10 @@ mod tests {
         append_data_event(&mut stream, 0xC7, b"26.0.0\0");
         stream.extend_from_slice(&[0x40, 0, 0, 0x41, 7, 0, 0xD0, 0x18]);
         stream.extend_from_slice(&note);
+        let first_controller_payload = [0x10, 0, 0, 0, 0xA5, 0x5A, 0x03, 0xFE, 0x01, 0, 0xC0, 0x7F];
+        let second_controller_payload = [0x20, 0, 0, 0, 0x6B, 0x4D, 0x07, 0x81, 0, 0, 0x80, 0x3F];
+        append_data_event(&mut stream, 0xDF, &first_controller_payload);
+        append_data_event(&mut stream, 0xDF, &second_controller_payload);
         stream.extend_from_slice(&[0xA4, 0x80, 0x07, 0, 0]);
         append_project_info_string(&mut stream, 0xC1, "Verse");
         stream.extend_from_slice(&[0x40, 1, 0, 0x15, 2]);
@@ -27905,6 +27911,8 @@ mod tests {
             .find(|pattern| pattern.id == new_pattern_id)
             .unwrap();
         assert_eq!(duplicate.notes, source.notes);
+        assert_eq!(duplicate.controllers, source.controllers);
+        assert_eq!(duplicate.controllers.len(), 2);
         assert_eq!(duplicate.length_ticks, Some(1920));
         assert_eq!(duplicate.name.as_deref(), Some("Verse"));
 
@@ -27916,13 +27924,23 @@ mod tests {
             })
             .expect("duplicate marker should be present");
         assert_eq!(document.events()[duplicate_marker + 1].opcode(), 0xD0);
-        assert_eq!(document.events()[duplicate_marker + 2].opcode(), 0xA4);
-        assert_eq!(document.events()[duplicate_marker + 3].opcode(), 0xC1);
+        assert_eq!(document.events()[duplicate_marker + 2].opcode(), 0xDF);
+        assert_eq!(
+            document.events()[duplicate_marker + 2].payload(),
+            first_controller_payload
+        );
+        assert_eq!(document.events()[duplicate_marker + 3].opcode(), 0xDF);
+        assert_eq!(
+            document.events()[duplicate_marker + 3].payload(),
+            second_controller_payload
+        );
+        assert_eq!(document.events()[duplicate_marker + 4].opcode(), 0xA4);
+        assert_eq!(document.events()[duplicate_marker + 5].opcode(), 0xC1);
         let event_bytes_without_duplicate = document
             .events()
             .iter()
             .enumerate()
-            .filter(|(index, _)| !(*index >= duplicate_marker && *index < duplicate_marker + 4))
+            .filter(|(index, _)| !(*index >= duplicate_marker && *index < duplicate_marker + 6))
             .map(|(_, event)| event.wire_bytes().to_vec())
             .collect::<Vec<_>>();
         assert_eq!(event_bytes_without_duplicate, original_event_bytes);
@@ -27936,6 +27954,7 @@ mod tests {
             .find(|pattern| pattern.id == new_pattern_id)
             .unwrap();
         assert_eq!(reopened_duplicate.notes, source.notes);
+        assert_eq!(reopened_duplicate.controllers, source.controllers);
         assert_eq!(reopened_duplicate.length_ticks, Some(1920));
         assert_eq!(reopened_duplicate.name.as_deref(), Some("Verse"));
         assert_eq!(reopened.trailing_bytes(), &[0xB2]);
