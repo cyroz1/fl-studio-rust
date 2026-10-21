@@ -1183,7 +1183,7 @@ pub fn playlist_performance_audio_clip_indices(
                 && !disabled_tracks.contains(&track_id)
                 && clip
                     .scale
-                    .is_some_and(|scale| scale.is_finite() && (scale - 1.0).abs() <= 1e-9)
+                    .is_none_or(|scale| scale.is_finite() && (scale - 1.0).abs() <= 1e-9)
                 && channel.kind() == Some(4)
                 && channel.enabled() != Some(false)
                 && channel.sample_path().is_some())
@@ -11018,6 +11018,79 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64};
 
     static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(1);
+
+    fn performance_audio_clip_fixture(record_size: usize, scale: Option<f64>) -> FlpDocument {
+        fn append_data_event(event_stream: &mut Vec<u8>, opcode: u8, payload: &[u8]) {
+            assert!(payload.len() < 128);
+            event_stream.extend_from_slice(&[opcode, payload.len() as u8]);
+            event_stream.extend_from_slice(payload);
+        }
+
+        assert!(matches!(record_size, 80 | 88));
+        let mut event_stream = Vec::new();
+        append_data_event(&mut event_stream, 0xC7, b"26.0.0\0");
+        event_stream.extend_from_slice(&[0x40, 0, 0, 0x15, 4]);
+        append_data_event(&mut event_stream, 0xC4, b"performance.wav\0");
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        event_stream.extend_from_slice(&[0x63, 0, 0]);
+
+        let mut playlist_clip = vec![0_u8; record_size];
+        playlist_clip[4..6].copy_from_slice(&0x5000_u16.to_le_bytes());
+        playlist_clip[6..8].copy_from_slice(&0_u16.to_le_bytes());
+        playlist_clip[8..12].copy_from_slice(&384_u32.to_le_bytes());
+        playlist_clip[12..14].copy_from_slice(&499_u16.to_le_bytes());
+        if record_size == 88 {
+            playlist_clip[24..28].copy_from_slice(&0_u32.to_le_bytes());
+            playlist_clip[28..32].copy_from_slice(&384_u32.to_le_bytes());
+        } else {
+            playlist_clip[24..28].copy_from_slice(&(-1.0_f32).to_le_bytes());
+            playlist_clip[28..32].copy_from_slice(&(-1.0_f32).to_le_bytes());
+            if let Some(scale) = scale {
+                playlist_clip[64..72].copy_from_slice(&scale.to_le_bytes());
+            }
+        }
+        append_data_event(&mut event_stream, 0xE9, &playlist_clip);
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"FLhd");
+        bytes.extend_from_slice(&6_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&96_u16.to_le_bytes());
+        bytes.extend_from_slice(b"FLdt");
+        bytes.extend_from_slice(&(event_stream.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&event_stream);
+        FlpDocument::parse(&bytes).expect("Performance Mode Audio Clip fixture should parse")
+    }
+
+    #[test]
+    fn performance_mode_accepts_default_scale_2026_audio_clips_without_scale_fields() {
+        let modern = performance_audio_clip_fixture(88, None);
+        let modern_clip = &modern.arrangements().unwrap()[0].clips[0];
+        assert_eq!(modern_clip.record_size, 88);
+        assert_eq!(modern_clip.scale, None);
+        assert_eq!(
+            playlist_performance_audio_clip_indices(&modern, 0, 384).unwrap(),
+            BTreeSet::from([0])
+        );
+        assert_eq!(
+            playlist_performance_clip_indices(&modern, 0, 384).unwrap(),
+            BTreeSet::from([0])
+        );
+
+        let legacy = performance_audio_clip_fixture(80, Some(1.0));
+        assert_eq!(
+            playlist_performance_audio_clip_indices(&legacy, 0, 384).unwrap(),
+            BTreeSet::from([0])
+        );
+
+        let stretched = performance_audio_clip_fixture(80, Some(0.75));
+        assert!(
+            playlist_performance_audio_clip_indices(&stretched, 0, 384)
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     fn test_live_mixer_source_control(
         track: usize,
