@@ -232,6 +232,9 @@ pub struct FlpDocument {
     trailing_bytes: Vec<u8>,
 }
 
+/// Result of importing MIDI into a new FL Studio project.
+pub type MidiNewProjectImportResult = (FlpDocument, usize, Vec<(u16, u16)>);
+
 #[derive(Clone, Copy)]
 struct MidiTrackImportSettings {
     import_time_signatures: bool,
@@ -14126,7 +14129,7 @@ impl FlpDocument {
         midi: &midi::MidiFile,
         template_channel_id: u16,
         track_indices: &[usize],
-    ) -> Result<(FlpDocument, usize, Vec<(u16, u16)>), FlpError> {
+    ) -> Result<MidiNewProjectImportResult, FlpError> {
         Self::new_project_from_midi_selected_tracks_with_options(
             template,
             midi,
@@ -14146,7 +14149,7 @@ impl FlpDocument {
         template_channel_id: u16,
         track_indices: &[usize],
         options: midi::MidiImportOptions,
-    ) -> Result<(FlpDocument, usize, Vec<(u16, u16)>), FlpError> {
+    ) -> Result<MidiNewProjectImportResult, FlpError> {
         if template.header().format() != 0 {
             return Err(FlpError::UnsupportedEdit(
                 "new MIDI project imports require a full FL Studio project template",
