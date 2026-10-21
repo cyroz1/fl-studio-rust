@@ -3843,6 +3843,8 @@ struct RecoveryPrompt {
     source_path: PathBuf,
     backup_path: PathBuf,
     is_revert: bool,
+    is_untitled: bool,
+    template_path: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -3951,6 +3953,7 @@ struct DawUi {
     document: Option<FlpDocument>,
     current_path: Option<PathBuf>,
     new_project_template_path: Option<PathBuf>,
+    untitled_autosave_key: Option<PathBuf>,
     package_workspace: Option<ProjectPackageWorkspace>,
     view: MainView,
     ui_scale: f32,
@@ -5167,6 +5170,7 @@ impl DawUi {
             document: None,
             current_path: None,
             new_project_template_path: None,
+            untitled_autosave_key: None,
             package_workspace: None,
             view: MainView::Playlist,
             ui_scale,
@@ -5652,6 +5656,9 @@ impl DawUi {
             app.open_project(path);
         } else if let Some(prompt) = latest_recovery_prompt() {
             app.last_autosave_path = Some(prompt.backup_path.clone());
+            if prompt.is_untitled {
+                app.untitled_autosave_key = Some(prompt.source_path.clone());
+            }
             app.recovery_prompt = Some(prompt);
         }
         app
@@ -6565,6 +6572,13 @@ impl DawUi {
                 self.selected_arrangement = document.arrangements().ok().and_then(|arrangements| {
                     arrangements.first().map(|arrangement| arrangement.id)
                 });
+                if self
+                    .untitled_autosave_key
+                    .as_deref()
+                    .is_some_and(|key| !project_paths_equal(key, target_path))
+                {
+                    self.clear_untitled_autosave();
+                }
                 self.current_path = Some(target_path.to_path_buf());
                 self.new_project_template_path = None;
                 self.package_workspace = package_workspace;
@@ -7380,8 +7394,15 @@ impl DawUi {
     }
 
     fn revert_to_last_autosave(&mut self) {
-        let (Some(source_path), Some(backup_path)) =
-            (self.current_path.clone(), self.last_autosave_path.clone())
+        let Some(backup_path) = self.last_autosave_path.clone() else {
+            self.status = "No autosave is available for this project".to_owned();
+            return;
+        };
+        let is_untitled = self.current_path.is_none();
+        let Some(source_path) = self
+            .current_path
+            .clone()
+            .or_else(|| self.untitled_autosave_key.clone())
         else {
             self.status = "No autosave is available for this project".to_owned();
             return;
@@ -7395,6 +7416,10 @@ impl DawUi {
             source_path,
             backup_path,
             is_revert: true,
+            is_untitled,
+            template_path: is_untitled
+                .then(|| self.new_project_template_path.clone())
+                .flatten(),
         });
     }
 
@@ -7413,17 +7438,27 @@ impl DawUi {
         if !self.autosave_before_risky {
             return;
         }
-        let (Some(source_path), Some(document)) =
-            (self.current_path.clone(), self.document.as_ref())
-        else {
+        let (Some(source_path), Some(document)) = (
+            self.current_path
+                .clone()
+                .or_else(|| self.untitled_autosave_key.clone()),
+            self.document.as_ref(),
+        ) else {
             return;
         };
+        let is_untitled = self.current_path.is_none();
+        let template_path = is_untitled
+            .then(|| self.new_project_template_path.clone())
+            .flatten();
         let mut document = document.clone();
         let plugin_state_warnings = self.capture_loaded_vst3_state(&mut document);
         let result = document
             .encode_lossless()
             .map_err(|error| error.to_string())
             .and_then(|bytes| {
+                if is_untitled {
+                    write_untitled_backup_metadata(&source_path, template_path.as_deref())?;
+                }
                 write_project_backup(
                     &source_path,
                     &bytes,
@@ -7449,12 +7484,22 @@ impl DawUi {
     }
 
     fn start_backup_write(&mut self, purpose: BackupPurpose) {
-        let (Some(source_path), Some(document)) =
-            (self.current_path.clone(), self.document.as_ref())
-        else {
+        let source_path = self.current_path.clone().or_else(|| match purpose {
+            BackupPurpose::Autosave => self.untitled_autosave_key.clone(),
+            BackupPurpose::Manual => None,
+        });
+        let Some(source_path) = source_path else {
             self.status = "Save the project before creating a backup".to_owned();
             return;
         };
+        let Some(document) = self.document.as_ref() else {
+            self.status = "Open a project before creating a backup".to_owned();
+            return;
+        };
+        let is_untitled = self.current_path.is_none();
+        let template_path = is_untitled
+            .then(|| self.new_project_template_path.clone())
+            .flatten();
         let mut document = document.clone();
         let plugin_state_warnings = self.capture_loaded_vst3_state(&mut document);
         let bytes = match document.encode_lossless() {
@@ -7466,11 +7511,19 @@ impl DawUi {
         };
         let retention = self.backup_retention;
         let worker_source = source_path.clone();
+        let worker_template_path = template_path.clone();
         let (sender, receiver) = mpsc::channel();
         let worker = match thread::Builder::new()
             .name("flp-autosave".to_owned())
             .spawn(move || {
-                let result = write_project_backup(&worker_source, &bytes, purpose, retention);
+                let result = if is_untitled {
+                    write_untitled_backup_metadata(&worker_source, worker_template_path.as_deref())
+                        .and_then(|()| {
+                            write_project_backup(&worker_source, &bytes, purpose, retention)
+                        })
+                } else {
+                    write_project_backup(&worker_source, &bytes, purpose, retention)
+                };
                 let _ = sender.send(result);
             }) {
             Ok(worker) => worker,
@@ -7518,10 +7571,14 @@ impl DawUi {
         }
         match (purpose, result) {
             (BackupPurpose::Autosave, Ok(path)) => {
-                let is_current_project = self
-                    .current_path
-                    .as_deref()
-                    .is_some_and(|current_path| project_paths_equal(current_path, &source_path));
+                let is_current_project =
+                    self.current_path.as_deref().is_some_and(|current_path| {
+                        project_paths_equal(current_path, &source_path)
+                    }) || (self.current_path.is_none()
+                        && self
+                            .untitled_autosave_key
+                            .as_deref()
+                            .is_some_and(|key| project_paths_equal(key, &source_path)));
                 if is_current_project {
                     self.last_autosave_path = Some(path.clone());
                     self.status = format!(
@@ -7552,13 +7609,33 @@ impl DawUi {
             .then(|| Instant::now() + Duration::from_secs(u64::from(self.autosave_minutes) * 60));
     }
 
+    fn clear_untitled_autosave(&mut self) {
+        let Some(key) = self.untitled_autosave_key.take() else {
+            return;
+        };
+        if self
+            .pending_backup_write
+            .as_ref()
+            .is_some_and(|pending| project_paths_equal(&pending.source_path, &key))
+            && let Some(pending) = self.pending_backup_write.take()
+        {
+            let _ = pending.worker.join();
+        }
+        remove_untitled_project_backup(&key);
+        self.last_autosave_path = None;
+        self.autosave_deadline = None;
+    }
+
     fn advance_autosave(&mut self, context: &egui::Context) {
         self.poll_backup_write();
         if self.pending_backup_write.is_some() {
             context.request_repaint_after(Duration::from_millis(500));
             return;
         }
-        if self.autosave_minutes == 0 || !self.dirty || self.current_path.is_none() {
+        if self.autosave_minutes == 0
+            || !self.dirty
+            || (self.current_path.is_none() && self.untitled_autosave_key.is_none())
+        {
             self.autosave_deadline = None;
             return;
         }
@@ -7600,6 +7677,9 @@ impl DawUi {
         .show(context, |ui| {
             if prompt.is_revert {
                 ui.label("Replace the current project with its latest autosave?");
+            } else if prompt.is_untitled {
+                ui.label("An autosaved copy of an untitled project is available.");
+                ui.label("Recover the autosaved version?");
             } else {
                 ui.label("A newer autosave is available for this project.");
                 ui.label(prompt.source_path.display().to_string());
@@ -7633,9 +7713,18 @@ impl DawUi {
         } else if dismiss {
             self.recovery_prompt = None;
             if !prompt.is_revert {
-                let _ = fs::remove_file(&prompt.backup_path);
-                if self.last_autosave_path.as_ref() == Some(&prompt.backup_path) {
-                    self.last_autosave_path = None;
+                if prompt.is_untitled
+                    && self
+                        .untitled_autosave_key
+                        .as_deref()
+                        .is_some_and(|key| project_paths_equal(key, &prompt.source_path))
+                {
+                    self.clear_untitled_autosave();
+                } else {
+                    let _ = fs::remove_file(&prompt.backup_path);
+                    if self.last_autosave_path.as_ref() == Some(&prompt.backup_path) {
+                        self.last_autosave_path = None;
+                    }
                 }
             }
         } else if !open {
@@ -7761,6 +7850,7 @@ impl DawUi {
                 self.install_midi_project(context, *document, template_path, imported, destinations)
             }
             PendingProjectChange::Exit => {
+                self.clear_untitled_autosave();
                 self.close_approved = true;
                 context.send_viewport_cmd(egui::ViewportCommand::Close);
             }
@@ -7869,6 +7959,7 @@ impl DawUi {
         self.current_path = None;
         self.package_workspace = None;
         self.new_project_template_path = Some(template_path);
+        self.untitled_autosave_key = new_untitled_project_autosave_key();
         self.saved_project_hash = None;
         self.dirty = true;
         self.autosave_deadline = None;
@@ -7906,10 +7997,26 @@ impl DawUi {
             .and_then(|bytes| FlpDocument::parse(&bytes).ok())
             .and_then(|document| project_hash(&document));
         if self.load_project_from(&prompt.backup_path, &prompt.source_path, false) {
+            if prompt.is_untitled {
+                let recent_key = fs::canonicalize(&prompt.source_path)
+                    .unwrap_or_else(|_| prompt.source_path.clone());
+                self.browser_recent_projects
+                    .retain(|recent| recent != &recent_key);
+                let _ = save_recent_projects(&self.browser_recent_projects);
+                self.current_path = None;
+                self.package_workspace = None;
+                self.new_project_template_path = prompt.template_path.clone();
+                self.untitled_autosave_key = Some(prompt.source_path.clone());
+                self.refresh_audio_waveform_paths();
+            }
             self.saved_project_hash = original_hash;
             self.dirty = true;
             self.last_autosave_path = Some(prompt.backup_path.clone());
-            self.status = format!("Recovered autosave for {}", prompt.source_path.display());
+            self.status = if prompt.is_untitled {
+                "Recovered untitled project from autosave".to_owned()
+            } else {
+                format!("Recovered autosave for {}", prompt.source_path.display())
+            };
         }
     }
 
@@ -8961,6 +9068,7 @@ impl DawUi {
             Ok(()) => {
                 saved_bytes.hash(&mut hasher);
                 let saved_hash = hasher.finish();
+                self.clear_untitled_autosave();
                 self.current_path = Some(path.to_path_buf());
                 self.new_project_template_path = None;
                 if let Some(workspace) = package_workspace_after_save {
@@ -50261,12 +50369,51 @@ fn user_data_directory() -> Option<PathBuf> {
     .map(|root| root.join("fl-studio-rebuild"))
 }
 
+fn new_untitled_project_autosave_key() -> Option<PathBuf> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    let directory = user_data_directory()?.join("Untitled Projects");
+    fs::create_dir_all(&directory).ok()?;
+    Some(directory.join(format!("untitled-{}-{nonce}.flp", std::process::id())))
+}
+
 fn project_backup_directory(project_path: &Path) -> Option<PathBuf> {
     Some(
         user_data_directory()?
             .join("Backups")
             .join(stable_project_id(project_path)),
     )
+}
+
+fn write_untitled_backup_metadata(
+    project_path: &Path,
+    template_path: Option<&Path>,
+) -> Result<(), String> {
+    let directory = project_backup_directory(project_path)
+        .ok_or_else(|| "the user data folder is not available".to_owned())?;
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("could not create {}: {error}", directory.display()))?;
+    write_file_atomically(&directory.join("untitled.project"), b"untitled\n")
+        .map_err(|error| format!("could not record untitled project metadata: {error}"))?;
+    let template_metadata = directory.join("template.path");
+    if let Some(template_path) = template_path {
+        write_file_atomically(
+            &template_metadata,
+            template_path.to_string_lossy().as_bytes(),
+        )
+        .map_err(|error| format!("could not record project template path: {error}"))?;
+    } else {
+        let _ = fs::remove_file(template_metadata);
+    }
+    Ok(())
+}
+
+fn remove_untitled_project_backup(project_path: &Path) {
+    if let Some(directory) = project_backup_directory(project_path) {
+        let _ = fs::remove_dir_all(directory);
+    }
 }
 
 fn stable_project_id(project_path: &Path) -> String {
@@ -50449,6 +50596,12 @@ fn recovery_prompt_for_project(project_path: &Path) -> Option<RecoveryPrompt> {
         source_path: project_path.to_path_buf(),
         backup_path,
         is_revert: false,
+        is_untitled: directory.join("untitled.project").is_file(),
+        template_path: fs::read_to_string(directory.join("template.path"))
+            .ok()
+            .map(|path| path.trim().to_owned())
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from),
     })
 }
 
