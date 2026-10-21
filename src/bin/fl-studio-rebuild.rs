@@ -3731,7 +3731,7 @@ struct RecoveryPrompt {
 enum PendingProjectChange {
     Open(PathBuf),
     NewProject {
-        document: FlpDocument,
+        document: Box<FlpDocument>,
         template_path: PathBuf,
         imported: usize,
         destinations: Vec<(u16, u16)>,
@@ -7396,7 +7396,7 @@ impl DawUi {
                 imported,
                 destinations,
             } => {
-                self.install_midi_project(context, document, template_path, imported, destinations)
+                self.install_midi_project(context, *document, template_path, imported, destinations)
             }
             PendingProjectChange::Exit => {
                 self.close_approved = true;
@@ -7449,7 +7449,7 @@ impl DawUi {
         match result {
             Ok((document, imported, destinations)) => {
                 self.pending_project_change = Some(PendingProjectChange::NewProject {
-                    document,
+                    document: Box::new(document),
                     template_path,
                     imported,
                     destinations,
