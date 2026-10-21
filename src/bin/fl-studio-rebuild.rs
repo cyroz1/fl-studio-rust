@@ -28524,13 +28524,13 @@ impl DawUi {
         let mut new_project_midi_request = None;
         let mut choose_project_template = false;
         let mut clear_midi_import = false;
+        let selected_sampler_template = self.selected_note_channel.filter(|channel_id| {
+            available_midi_channels
+                .iter()
+                .any(|channel| channel.id() == *channel_id && channel.kind() == Some(0))
+        });
         if let Some(pending) = &mut self.pending_midi_import {
             ui.horizontal(|ui| {
-                let selected_sampler_template = self.selected_note_channel.filter(|channel_id| {
-                    available_midi_channels
-                        .iter()
-                        .any(|channel| channel.id() == *channel_id && channel.kind() == Some(0))
-                });
                 ui.small(pending.path.file_name().map_or_else(
                     || "MIDI".to_owned(),
                     |name| name.to_string_lossy().into_owned(),
