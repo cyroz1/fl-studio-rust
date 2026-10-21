@@ -992,6 +992,16 @@ fn all_notes_off_message(channel: u8) -> [u8; 3] {
     [0xB0 | (channel & 0x0F), 123, 0]
 }
 
+pub fn midi_program_change_message(channel: u8, program: u8) -> Result<[u8; 2], String> {
+    if channel > 15 {
+        return Err("MIDI program-change channel must be between 0 and 15".to_owned());
+    }
+    if program > 127 {
+        return Err("MIDI program number must be between 0 and 127".to_owned());
+    }
+    Ok([0xC0 | channel, program])
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -1002,8 +1012,9 @@ mod tests {
     use super::{
         ScheduledMidiFrameMessage, all_notes_off_message, due_midi_playlist_message_end,
         midi_clock_pulse_count_at_tick, midi_clock_pulse_frame, midi_pattern_active_note_ons,
-        midi_sixteenth_notes_from_tick, midi_song_position_pointer_message, midi_tick_messages,
-        pattern_loop_frame_messages, pattern_preview_messages,
+        midi_program_change_message, midi_sixteenth_notes_from_tick,
+        midi_song_position_pointer_message, midi_tick_messages, pattern_loop_frame_messages,
+        pattern_preview_messages,
     };
     use flp_rebuild::midi::{MidiChannelMapping, MidiExportNote, MidiExportTrack, MidiFile};
 
@@ -1011,6 +1022,14 @@ mod tests {
     fn all_notes_off_uses_the_requested_midi_channel() {
         assert_eq!(all_notes_off_message(0), [0xB0, 123, 0]);
         assert_eq!(all_notes_off_message(15), [0xBF, 123, 0]);
+    }
+
+    #[test]
+    fn program_change_encodes_channel_and_zero_based_program() {
+        assert_eq!(midi_program_change_message(0, 0).unwrap(), [0xC0, 0]);
+        assert_eq!(midi_program_change_message(15, 127).unwrap(), [0xCF, 127]);
+        assert!(midi_program_change_message(16, 0).is_err());
+        assert!(midi_program_change_message(0, 128).is_err());
     }
 
     #[test]
