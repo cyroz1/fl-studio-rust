@@ -6894,6 +6894,7 @@ struct PerformanceVst3Note {
     midi_channel: u8,
     fine_pitch_offset_cents: i16,
     pan: u8,
+    mod_x: u8,
     release: u8,
 }
 
@@ -7176,6 +7177,7 @@ impl PlaylistPerformanceRuntime {
                         midi_channel: placed.note.midi_channel,
                         fine_pitch_offset_cents: placed.note.fine_pitch_offset_cents(),
                         pan: placed.note.pan,
+                        mod_x: placed.note.mod_x,
                         release: placed.note.release,
                     });
             }
@@ -7865,6 +7867,7 @@ impl PlaylistPerformanceRuntime {
                             midi_channel: template.midi_channel,
                             fine_pitch_offset_cents: template.fine_pitch_offset_cents,
                             pan: template.pan,
+                            mod_x: template.mod_x,
                             release: template.release,
                         });
                 }
