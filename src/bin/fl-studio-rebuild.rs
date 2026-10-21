@@ -28903,14 +28903,6 @@ impl DawUi {
             let release_variation_percent = self.humanize_release_variation_percent;
             let mod_x_variation_percent = self.humanize_mod_x_variation_percent;
             let mod_y_variation_percent = self.humanize_mod_y_variation_percent;
-            let options = HumanizerOptions {
-                timing_range_ticks,
-                velocity_variation_percent,
-                pan_variation_percent,
-                release_variation_percent,
-                mod_x_variation_percent,
-                mod_y_variation_percent,
-            };
             let result = self
                 .document
                 .as_mut()
@@ -28925,6 +28917,14 @@ impl DawUi {
                                 })?
                         }
                         None => timing_range_ticks,
+                    };
+                    let options = HumanizerOptions {
+                        timing_range_ticks,
+                        velocity_variation_percent,
+                        pan_variation_percent,
+                        release_variation_percent,
+                        mod_x_variation_percent,
+                        mod_y_variation_percent,
                     };
                     let result = if edit_selection_only {
                         document.humanize_pattern_note_selection_with_options(
