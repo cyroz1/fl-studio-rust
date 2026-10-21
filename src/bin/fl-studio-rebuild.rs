@@ -58,15 +58,15 @@ use flp_rebuild::vst3::{
 };
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, Arrangement, ArticulateOptions, AutomationChannel,
-    AutomationPoint, AutomationPointEdit, ChannelGroupSummary, ChannelNoteRouter, ChannelSortOrder,
-    ChannelSummary, ChannelType, ClawMachineOptions, FlamOptions, FlpDocument, FlpError, FstPreset,
-    FstPresetKind, HumanizerOptions, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit,
-    MixerInsertSummary, MixerParameterKind, MixerParameterRecord, MixerSendSummary,
-    PATTERN_NOTE_DEFAULT_FLAGS, PATTERN_NOTE_DEFAULT_RELEASE, PATTERN_NOTE_SLIDE_FLAG, Pattern,
-    PatternController, PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation,
-    PayloadEncoding, PlaylistClip, PlaylistClipEdit, PlaylistClipSelectionClipboard,
-    PlaylistClipTarget, PlaylistTrack, PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress,
-    PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit, QuantizeNoteMode, QuantizeNoteOptions,
+    AutomationPoint, AutomationPointEdit, ChannelGroupSummary, ChannelSortOrder, ChannelSummary,
+    ChannelType, ClawMachineOptions, FlamOptions, FlpDocument, FlpError, FstPreset, FstPresetKind,
+    HumanizerOptions, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerInsertSummary,
+    MixerParameterKind, MixerParameterRecord, MixerSendSummary, PATTERN_NOTE_DEFAULT_FLAGS,
+    PATTERN_NOTE_DEFAULT_RELEASE, PATTERN_NOTE_SLIDE_FLAG, Pattern, PatternController,
+    PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation, PayloadEncoding,
+    PlaylistClip, PlaylistClipEdit, PlaylistClipSelectionClipboard, PlaylistClipTarget,
+    PlaylistTrack, PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync,
+    ProjectInfoEdit, ProjectSettingsEdit, QuantizeNoteMode, QuantizeNoteOptions,
     RandomNoteChordMap, RandomNoteGeneratorOptions, RandomizerOptions, RiffMachineOptions,
     RiffMachineQuantizeMode, ScaleLevelsOptions, StrumOptions, TimeMarker, TimeMarkerEdit,
     VstPluginStateMetadata,
@@ -25360,18 +25360,12 @@ impl DawUi {
                         !note.is_muted() && sampler_channel_ids.contains(&note.channel_id)
                     })
                 });
-        let pattern_note_router = ChannelNoteRouter::new(channels.clone());
         let has_loaded_vst3_pattern_notes = self
             .selected_pattern
             .and_then(|pattern_id| patterns.iter().find(|pattern| pattern.id == pattern_id))
             .is_some_and(|pattern| {
-                pattern.notes.iter().enumerate().any(|(note_index, note)| {
-                    !note.is_muted()
-                        && pattern_note_router
-                            .targets_for_note(note.channel_id, note_index as u64, note.key)
-                            .iter()
-                            .any(|channel_id| self.channel_vst3_instances.contains_key(channel_id))
-                })
+                !self.channel_vst3_instances.is_empty()
+                    && pattern.notes.iter().any(|note| !note.is_muted())
             });
         let mut add_note_requested = false;
         let mut open_midi_requested = false;
@@ -29895,20 +29889,6 @@ impl DawUi {
         };
         let instances = self.channel_vst3_instances.clone();
         let project_channels = document.channels();
-        let note_router = ChannelNoteRouter::new(project_channels);
-        let channel_ids = notes
-            .iter()
-            .enumerate()
-            .filter(|(_, note)| !note.is_muted())
-            .flat_map(|(note_index, note)| {
-                note_router.targets_for_note(note.channel_id, note_index as u64, note.key)
-            })
-            .filter(|channel_id| instances.contains_key(channel_id))
-            .collect::<BTreeSet<_>>();
-        if channel_ids.is_empty() {
-            self.status = "The selected Pattern has no notes on loaded VST3 channels".to_owned();
-            return;
-        }
 
         let insert_placement = if insert_into_playlist {
             if !project_has_audio_clip_template(&document) {
@@ -29929,34 +29909,33 @@ impl DawUi {
 
         let ppq = document.header().ppq();
         let tempo_bpm = document.metadata().tempo_bpm().unwrap_or(self.tempo_bpm);
-        let channels = channel_ids
+        let channels = project_channels
             .iter()
-            .filter_map(|channel_id| {
-                let instance_id = instances.get(channel_id).copied()?;
+            .filter_map(|project_channel| {
+                let channel_id = project_channel.id();
+                let instance_id = instances.get(&channel_id).copied()?;
                 Some(Vst3PatternChannelRenderRequest {
                     instance_id,
                     options: Vst3PatternRenderOptions {
-                        channel_id: *channel_id,
+                        channel_id,
                         ppq,
                         tempo_bpm,
                         tail_seconds: 2.0,
                         global_swing_mix_raw: 0,
                         channel_swing_mix_raw: 0,
                         pitch_offset_cents: project_channel_master_pitch_offset_cents(
-                            &document,
-                            *channel_id,
+                            &document, channel_id,
                         ),
                         note_pitch_offset_semitones:
                             project_channel_master_pitch_note_offset_semitones(
-                                &document,
-                                *channel_id,
+                                &document, channel_id,
                             ),
                     },
                 })
             })
             .collect::<Vec<_>>();
         if channels.is_empty() {
-            self.status = "No loaded VST3 Pattern channels are available to render".to_owned();
+            self.status = "No loaded VST3 project channels are available to render".to_owned();
             return;
         }
 
