@@ -56,6 +56,7 @@ pub struct MidiOutputDevice {
 #[derive(Clone)]
 pub struct ConnectedMidiOutput {
     connection: Arc<SharedMidiOutputConnection>,
+    channel_connections: [Option<Arc<SharedMidiOutputConnection>>; 16],
     pub device_id: String,
     pub device_name: String,
 }
@@ -375,7 +376,43 @@ pub fn enumerate_output_devices() -> Result<Vec<MidiOutputDevice>, String> {
         .collect()
 }
 
-pub fn connect_output_device(device_id: &str) -> Result<ConnectedMidiOutput, String> {
+pub fn connect_output_device_with_routes(
+    device_id: &str,
+    channel_device_ids: &[Option<String>; 16],
+) -> Result<ConnectedMidiOutput, String> {
+    let (connection, device_name) = connect_shared_output_device(device_id)?;
+    let mut connected_routes: Vec<(String, Arc<SharedMidiOutputConnection>)> = Vec::new();
+    let mut channel_connections = std::array::from_fn(|_| None);
+
+    for (channel, route_id) in channel_device_ids.iter().enumerate() {
+        let Some(route_id) = route_id.as_deref() else {
+            continue;
+        };
+        if route_id == device_id {
+            continue;
+        }
+        let route_connection =
+            if let Some((_, connection)) = connected_routes.iter().find(|(id, _)| id == route_id) {
+                Arc::clone(connection)
+            } else {
+                let (connection, _) = connect_shared_output_device(route_id)?;
+                connected_routes.push((route_id.to_owned(), Arc::clone(&connection)));
+                connection
+            };
+        channel_connections[channel] = Some(route_connection);
+    }
+
+    Ok(ConnectedMidiOutput {
+        connection,
+        channel_connections,
+        device_id: device_id.to_owned(),
+        device_name,
+    })
+}
+
+fn connect_shared_output_device(
+    device_id: &str,
+) -> Result<(Arc<SharedMidiOutputConnection>, String), String> {
     let output = MidiOutput::new("FL Studio Rebuild MIDI Output")
         .map_err(|error| format!("could not initialize MIDI output: {error}"))?;
     let port = output
@@ -389,39 +426,41 @@ pub fn connect_output_device(device_id: &str) -> Result<ConnectedMidiOutput, Str
     let connection = output
         .connect(&port, "FL Studio Rebuild")
         .map_err(|error| format!("could not connect to MIDI output: {error}"))?;
-    Ok(ConnectedMidiOutput {
-        connection: Arc::new(SharedMidiOutputConnection {
+    Ok((
+        Arc::new(SharedMidiOutputConnection {
             connection: Mutex::new(connection),
         }),
-        device_id: device_id.to_owned(),
         device_name,
-    })
+    ))
 }
 
 impl ConnectedMidiOutput {
     pub fn send(&mut self, message: &[u8]) -> Result<(), String> {
-        self.connection
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .send(message)
-            .map_err(|error| format!("could not send MIDI output: {error}"))
+        if let Some(channel) = midi_channel_for_message(message) {
+            let connection = self.channel_connections[channel]
+                .as_ref()
+                .unwrap_or(&self.connection);
+            return send_on_connection(connection, message);
+        }
+        if is_transport_message(message) {
+            let mut first_error = None;
+            for connection in self.unique_connections() {
+                if let Err(error) = send_on_connection(&connection, message)
+                    && first_error.is_none()
+                {
+                    first_error = Some(error);
+                }
+            }
+            return first_error.map_or(Ok(()), Err);
+        }
+        send_on_connection(&self.connection, message)
     }
 
     pub fn send_all_notes_off(&mut self) -> Result<(), String> {
-        let mut connection = self
-            .connection
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut first_error = None;
         for channel in 0..16 {
-            if let Err(error) = connection
-                .send(&all_notes_off_message(channel))
-                .map_err(|error| format!("could not send MIDI output: {error}"))
-                && first_error.is_none()
-            {
-                first_error = Some(error);
+            if let Err(error) = self.send(&all_notes_off_message(channel)) {
+                first_error.get_or_insert(error);
             }
         }
         match first_error {
@@ -429,6 +468,45 @@ impl ConnectedMidiOutput {
             None => Ok(()),
         }
     }
+
+    fn unique_connections(&self) -> Vec<Arc<SharedMidiOutputConnection>> {
+        let mut connections = vec![Arc::clone(&self.connection)];
+        for connection in self.channel_connections.iter().flatten() {
+            if !connections
+                .iter()
+                .any(|existing| Arc::ptr_eq(existing, connection))
+            {
+                connections.push(Arc::clone(connection));
+            }
+        }
+        connections
+    }
+}
+
+fn midi_channel_for_message(message: &[u8]) -> Option<usize> {
+    message
+        .first()
+        .copied()
+        .filter(|status| (0x80..=0xEF).contains(status))
+        .map(|status| usize::from(status & 0x0F))
+}
+
+fn is_transport_message(message: &[u8]) -> bool {
+    message
+        .first()
+        .is_some_and(|status| matches!(status, 0xF2 | 0xF8 | 0xFA | 0xFB | 0xFC))
+}
+
+fn send_on_connection(
+    connection: &Arc<SharedMidiOutputConnection>,
+    message: &[u8],
+) -> Result<(), String> {
+    connection
+        .connection
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .send(message)
+        .map_err(|error| format!("could not send MIDI output: {error}"))
 }
 
 impl Drop for SharedMidiOutputConnection {
@@ -1048,10 +1126,11 @@ mod tests {
 
     use super::{
         ScheduledMidiFrameMessage, all_notes_off_message, due_midi_playlist_message_end,
-        midi_clock_pulse_count_at_tick, midi_clock_pulse_frame, midi_control_change_message,
-        midi_patch_setup_messages, midi_pattern_active_note_ons, midi_program_change_message,
-        midi_sixteenth_notes_from_tick, midi_song_position_pointer_message, midi_tick_messages,
-        pattern_loop_frame_messages, pattern_preview_messages,
+        is_transport_message, midi_channel_for_message, midi_clock_pulse_count_at_tick,
+        midi_clock_pulse_frame, midi_control_change_message, midi_patch_setup_messages,
+        midi_pattern_active_note_ons, midi_program_change_message, midi_sixteenth_notes_from_tick,
+        midi_song_position_pointer_message, midi_tick_messages, pattern_loop_frame_messages,
+        pattern_preview_messages,
     };
     use flp_rebuild::midi::{MidiChannelMapping, MidiExportNote, MidiExportTrack, MidiFile};
 
@@ -1059,6 +1138,21 @@ mod tests {
     fn all_notes_off_uses_the_requested_midi_channel() {
         assert_eq!(all_notes_off_message(0), [0xB0, 123, 0]);
         assert_eq!(all_notes_off_message(15), [0xBF, 123, 0]);
+    }
+
+    #[test]
+    fn channel_messages_select_their_stored_port_and_transport_broadcasts() {
+        for status in [0x80, 0x90, 0xA0, 0xB0, 0xC0, 0xD0, 0xE0] {
+            assert_eq!(midi_channel_for_message(&[status | 0x0F]), Some(15));
+        }
+        assert_eq!(midi_channel_for_message(&[]), None);
+        assert_eq!(midi_channel_for_message(&[0xF8]), None);
+
+        for status in [0xF2, 0xF8, 0xFA, 0xFB, 0xFC] {
+            assert!(is_transport_message(&[status]));
+        }
+        assert!(!is_transport_message(&[0xF0]));
+        assert!(!is_transport_message(&[0xF1]));
     }
 
     #[test]

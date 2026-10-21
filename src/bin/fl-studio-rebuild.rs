@@ -90,7 +90,7 @@ use midi_input::{
 use midi_output::{
     ConnectedMidiOutput, MIDI_TEST_NOTE_OFF, MIDI_TEST_NOTE_ON, MidiClockScheduler,
     MidiOutputDevice, MidiPatternLoopScheduler, MidiPlaylistScheduler, ScheduledMidiFrameMessage,
-    ScheduledMidiMessage, ScheduledMidiTickMessage, connect_output_device,
+    ScheduledMidiMessage, ScheduledMidiTickMessage, connect_output_device_with_routes,
     enumerate_output_devices, midi_patch_setup_messages, pattern_loop_frame_messages,
     pattern_preview_messages, playlist_playback_messages,
 };
@@ -4243,6 +4243,7 @@ struct DawUi {
     midi_connect_output_on_startup: bool,
     midi_output_error: Option<String>,
     midi_output_connection: Option<ConnectedMidiOutput>,
+    midi_output_channel_routes: [Option<String>; 16],
     midi_output_bank_msb: [Option<u8>; 16],
     midi_output_bank_lsb: [Option<u8>; 16],
     midi_output_programs: [Option<u8>; 16],
@@ -5061,6 +5062,7 @@ impl DawUi {
             connect_input_on_startup: midi_connect_input_on_startup,
             output_id: midi_selected_output_id,
             connect_output_on_startup: midi_connect_output_on_startup,
+            output_channel_routes: midi_output_channel_routes,
             bank_msb: midi_output_bank_msb,
             bank_lsb: midi_output_bank_lsb,
             programs: midi_output_programs,
@@ -5453,6 +5455,7 @@ impl DawUi {
             midi_connect_output_on_startup,
             midi_output_error,
             midi_output_connection: None,
+            midi_output_channel_routes,
             midi_output_bank_msb,
             midi_output_bank_lsb,
             midi_output_programs,
@@ -39155,6 +39158,7 @@ impl DawUi {
             connect_input_on_startup: self.midi_connect_input_on_startup,
             output_id: self.midi_selected_output_id.clone(),
             connect_output_on_startup: self.midi_connect_output_on_startup,
+            output_channel_routes: self.midi_output_channel_routes.clone(),
             bank_msb: self.midi_output_bank_msb,
             bank_lsb: self.midi_output_bank_lsb,
             programs: self.midi_output_programs,
@@ -39285,6 +39289,23 @@ impl DawUi {
                     self.disconnect_midi_output();
                     self.midi_output_error =
                         Some("The connected MIDI output is no longer available".to_owned());
+                } else if self.midi_output_connection.is_some()
+                    && self
+                        .midi_output_channel_routes
+                        .iter()
+                        .flatten()
+                        .any(|route_id| {
+                            !self
+                                .midi_output_devices
+                                .iter()
+                                .any(|device| &device.id == route_id)
+                        })
+                {
+                    self.disconnect_midi_output();
+                    self.midi_output_error = Some(
+                        "A MIDI channel route is no longer available; refresh the device list"
+                            .to_owned(),
+                    );
                 }
             }
             Err(error) => self.midi_output_error = Some(error),
@@ -39307,7 +39328,7 @@ impl DawUi {
             return;
         };
         self.disconnect_midi_output();
-        match connect_output_device(&device_id) {
+        match connect_output_device_with_routes(&device_id, &self.midi_output_channel_routes) {
             Ok(mut connection) => {
                 let all_notes_off_error = connection.send_all_notes_off().err();
                 self.midi_output_connection = Some(connection);
@@ -43836,6 +43857,72 @@ impl DawUi {
             && self.midi_playlist_playback.is_none()
             && self.midi_pattern_transport.is_none()
             && self.midi_pattern_playback.is_none();
+        let mut output_route_selection_changed = false;
+        ui.collapsing("MIDI output port per channel", |ui| {
+            ui.small(
+                "Route each MIDI channel to a separate output port. Unassigned channels use the selected output device. Clock and transport messages go to every connected output.",
+            );
+            ui.add_enabled_ui(midi_output_stopped, |ui| {
+                egui::Grid::new("midi-output-route-grid")
+                    .num_columns(2)
+                    .show(ui, |ui| {
+                        ui.label("Channel");
+                        ui.label("Output port");
+                        ui.end_row();
+                        for channel in 0..16 {
+                            ui.label(format!("Channel {}", channel + 1));
+                            let selected_name = self.midi_output_channel_routes[channel]
+                                .as_ref()
+                                .and_then(|id| {
+                                    self.midi_output_devices
+                                        .iter()
+                                        .find(|device| &device.id == id)
+                                })
+                                .map_or_else(
+                                    || {
+                                        if self.midi_output_channel_routes[channel].is_some() {
+                                            "Saved output unavailable"
+                                        } else {
+                                            "Default output"
+                                        }
+                                    },
+                                    |device| device.name.as_str(),
+                                );
+                            egui::ComboBox::from_id_salt(("midi-output-route", channel))
+                                .selected_text(selected_name)
+                                .width(280.0)
+                                .show_ui(ui, |ui| {
+                                    output_route_selection_changed |= ui
+                                        .selectable_value(
+                                            &mut self.midi_output_channel_routes[channel],
+                                            None,
+                                            "Default output",
+                                        )
+                                        .changed();
+                                    for device in &self.midi_output_devices {
+                                        output_route_selection_changed |= ui
+                                            .selectable_value(
+                                                &mut self.midi_output_channel_routes[channel],
+                                                Some(device.id.clone()),
+                                                &device.name,
+                                            )
+                                            .changed();
+                                    }
+                                });
+                            ui.end_row();
+                        }
+                    });
+            });
+            if !midi_output_stopped {
+                ui.small("Stop MIDI output before changing channel routes.");
+            }
+        });
+        if output_route_selection_changed {
+            self.persist_midi_device_selections();
+            if self.midi_output_connection.is_some() {
+                self.connect_selected_midi_output();
+            }
+        }
         ui.collapsing("MIDI Bank Select and Program per channel", |ui| {
             ui.small(
                 "Choose Bank Select MSB/LSB and Program values for each output channel. Zero leaves that field unchanged; values 1–128 send MIDI values 0–127. Bank Select messages are sent before Program Change.",
@@ -48963,6 +49050,7 @@ struct MidiDeviceSelections {
     connect_input_on_startup: bool,
     output_id: Option<String>,
     connect_output_on_startup: bool,
+    output_channel_routes: [Option<String>; 16],
     bank_msb: [Option<u8>; 16],
     bank_lsb: [Option<u8>; 16],
     programs: [Option<u8>; 16],
@@ -48986,6 +49074,7 @@ impl Default for MidiDeviceSelections {
             connect_input_on_startup: false,
             output_id: None,
             connect_output_on_startup: false,
+            output_channel_routes: std::array::from_fn(|_| None),
             bank_msb: [None; 16],
             bank_lsb: [None; 16],
             programs: [None; 16],
@@ -49077,11 +49166,12 @@ fn parse_midi_thru_preferences(contents: &str) -> (bool, Option<u8>) {
 
 fn encode_midi_device_selections(selections: &MidiDeviceSelections) -> String {
     format!(
-        "input={}\nconnect_input_on_startup={}\noutput={}\nconnect_output_on_startup={}\nbank_msb={}\nbank_lsb={}\nprograms={}\nclock={}\nplaylist_notes={}\npattern_notes={}\nfixed_velocity={}\nperformance_channel={}\nrecord_audio={}\nrecord_notes={}\nrecord_automation={}\nrecord_automation_controller={}\nrecord_automation_channel={}\nrecord_automation_flags={}\n",
+        "input={}\nconnect_input_on_startup={}\noutput={}\nconnect_output_on_startup={}\noutput_routes={}\nbank_msb={}\nbank_lsb={}\nprograms={}\nclock={}\nplaylist_notes={}\npattern_notes={}\nfixed_velocity={}\nperformance_channel={}\nrecord_audio={}\nrecord_notes={}\nrecord_automation={}\nrecord_automation_controller={}\nrecord_automation_channel={}\nrecord_automation_flags={}\n",
         encode_midi_device_id(selections.input_id.as_deref().unwrap_or_default()),
         u8::from(selections.connect_input_on_startup),
         encode_midi_device_id(selections.output_id.as_deref().unwrap_or_default()),
         u8::from(selections.connect_output_on_startup),
+        encode_midi_output_routes(&selections.output_channel_routes),
         encode_midi_output_values(&selections.bank_msb),
         encode_midi_output_values(&selections.bank_lsb),
         encode_midi_output_programs(&selections.programs),
@@ -49110,6 +49200,10 @@ fn parse_midi_device_selections(contents: &str) -> MidiDeviceSelections {
             selections.output_id = decode_midi_device_id(encoded_id);
         } else if let Some(enabled) = line.strip_prefix("connect_output_on_startup=") {
             selections.connect_output_on_startup = enabled == "1";
+        } else if let Some(routes) = line.strip_prefix("output_routes=") {
+            if let Some(routes) = parse_midi_output_routes(routes) {
+                selections.output_channel_routes = routes;
+            }
         } else if let Some(bank_msb) = line.strip_prefix("bank_msb=") {
             if let Some(bank_msb) = parse_midi_output_values(bank_msb) {
                 selections.bank_msb = bank_msb;
@@ -49163,6 +49257,30 @@ fn parse_midi_device_selections(contents: &str) -> MidiDeviceSelections {
 
 fn encode_midi_output_programs(programs: &[Option<u8>; 16]) -> String {
     encode_midi_output_values(programs)
+}
+
+fn encode_midi_output_routes(routes: &[Option<String>; 16]) -> String {
+    routes
+        .iter()
+        .map(|route| {
+            route
+                .as_deref()
+                .map(encode_midi_device_id)
+                .unwrap_or_else(|| "-".to_owned())
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn parse_midi_output_routes(encoded: &str) -> Option<[Option<String>; 16]> {
+    let routes = encoded
+        .split(',')
+        .map(|route| match route {
+            "-" => Some(None),
+            _ => decode_midi_device_id(route).map(Some),
+        })
+        .collect::<Option<Vec<_>>>()?;
+    routes.try_into().ok()
 }
 
 fn encode_midi_output_values(values: &[Option<u8>; 16]) -> String {
@@ -53892,16 +54010,18 @@ mod tests {
         candidate_matches_vst_identity, candidate_mixer_controls,
         candidate_mixer_stereo_separation, detect_chord_name, detect_piano_roll_channel_scale,
         detect_piano_roll_scale, encode_midi_device_id, encode_midi_device_selections,
-        first_available_playlist_track, is_performance_clip_trigger_channel_event,
-        midi_button_press_edge, midi_cc_to_mixer_fader_raw, midi_cc_to_mixer_pan_raw,
+        encode_midi_output_routes, first_available_playlist_track,
+        is_performance_clip_trigger_channel_event, midi_button_press_edge,
+        midi_cc_to_mixer_fader_raw, midi_cc_to_mixer_pan_raw,
         midi_cc_to_mixer_stereo_separation_raw, midi_controller_binding_for_device,
         midi_mixer_button_press_edge, midi_mixer_control_for_cc,
         midi_vst3_parameter_mapping_for_target, midi_vst3_parameter_mappings_for_cc,
         next_piano_roll_note_group, note_from_grid_position, parse_midi_control_change_mapping,
         parse_midi_controller_templates, parse_midi_device_selections,
-        parse_midi_mixer_control_mappings, parse_midi_output_programs, parse_midi_output_values,
-        parse_midi_vst3_parameter_mappings, parse_pattern_vst3_parameter_links,
-        parse_window_layout_presets, pattern_loop_frame_at_tick, pattern_loop_tick_at_frame,
+        parse_midi_mixer_control_mappings, parse_midi_output_programs, parse_midi_output_routes,
+        parse_midi_output_values, parse_midi_vst3_parameter_mappings,
+        parse_pattern_vst3_parameter_links, parse_window_layout_presets,
+        pattern_loop_frame_at_tick, pattern_loop_tick_at_frame,
         pattern_vst3_parameter_automation_for_channel, pattern_vst3_parameter_link_for_target,
         piano_roll_color_group_note_ids, piano_roll_controller_stroke_points,
         piano_roll_controller_value_at, piano_roll_controller_value_range,
@@ -55023,6 +55143,12 @@ mod tests {
             connect_input_on_startup: true,
             output_id: Some(output_id.to_owned()),
             connect_output_on_startup: true,
+            output_channel_routes: {
+                let mut routes = std::array::from_fn(|_| None);
+                routes[0] = Some("alsa:device,one".to_owned());
+                routes[15] = Some("macos:port-15".to_owned());
+                routes
+            },
             bank_msb,
             bank_lsb,
             programs,
@@ -55041,13 +55167,20 @@ mod tests {
         let encoded = encode_midi_device_selections(&selections);
 
         assert_eq!(parse_midi_device_selections(&encoded), selections);
+        assert_eq!(
+            parse_midi_output_routes(&encode_midi_output_routes(
+                &selections.output_channel_routes
+            )),
+            Some(selections.output_channel_routes)
+        );
+        assert!(parse_midi_output_routes("broken").is_none());
     }
 
     #[test]
     fn midi_device_selections_skip_malformed_or_unknown_entries() {
         assert_eq!(
             parse_midi_device_selections(
-                "input=0\noutput=xyz\nclock=invalid\nperformance_channel=16\nrecord_automation_controller=128\nrecord_automation_channel=256\nrecord_automation_flags=-1\nother=01\n"
+                "input=0\noutput=xyz\noutput_routes=broken\nclock=invalid\nperformance_channel=16\nrecord_automation_controller=128\nrecord_automation_channel=256\nrecord_automation_flags=-1\nother=01\n"
             ),
             MidiDeviceSelections::default()
         );
