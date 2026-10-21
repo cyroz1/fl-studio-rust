@@ -3364,10 +3364,13 @@ fn parse_midi_track_selection(value: &str, track_count: usize) -> Result<Vec<usi
 
 fn parse_midi_pattern_target(value: &str) -> Result<Option<u16>, String> {
     if value == "new" {
-        Ok(None)
-    } else {
-        parse_u16(value, "pattern id").map(Some)
+        return Ok(None);
     }
+    let pattern_id = parse_u16(value, "pattern id")?;
+    if pattern_id == 0 {
+        return Err("pattern id must be greater than zero".to_owned());
+    }
+    Ok(Some(pattern_id))
 }
 
 fn parse_u8(value: &str, description: &str) -> Result<u8, String> {
