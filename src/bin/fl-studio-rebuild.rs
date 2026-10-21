@@ -10990,12 +10990,13 @@ impl DawUi {
                             ui.close();
                         }
                     });
+                    let can_render_sampler_pattern = self.document.is_some()
+                        && self.selected_pattern.is_some()
+                        && self.sample_project_path().is_some()
+                        && self.pending_sampler_pattern_render.is_none();
                     if ui
                         .add_enabled(
-                            self.document.is_some()
-                                && self.selected_pattern.is_some()
-                                && self.sample_project_path().is_some()
-                                && self.pending_sampler_pattern_render.is_none(),
+                            can_render_sampler_pattern,
                             egui::Button::new("Render Sampler pattern…"),
                         )
                         .clicked()
@@ -29734,7 +29735,7 @@ impl DawUi {
         let channel_swing_mix_raw = project_channel_swing_mix_raw(&document, channel_id);
         let pitch_offset_cents = project_channel_master_pitch_offset_cents(&document, channel_id);
         let note_pitch_offset_semitones =
-            project_channel_master_pitch_note_offset_semitones(document, channel_id);
+            project_channel_master_pitch_note_offset_semitones(&document, channel_id);
         let selected_format = self.playlist_song_output_format;
         let output_format = self.audio_render_output();
         let dialog_title = if insert_into_playlist {
