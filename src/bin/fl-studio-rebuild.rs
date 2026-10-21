@@ -28519,6 +28519,7 @@ impl DawUi {
             .unwrap_or_default();
         let mut import_midi_request = None;
         let mut import_all_midi_request = None;
+        let mut import_named_midi_patterns_request = None;
         let mut create_sampler_midi_request = None;
         let mut create_format2_midi_request = None;
         let mut new_project_midi_request = None;
@@ -28769,6 +28770,23 @@ impl DawUi {
                         options,
                     ));
                 }
+            }
+            if !pending.start_new_project
+                && ui
+                    .add_enabled(
+                        self.document.is_some()
+                            && self.selected_note_channel.is_some()
+                            && pending.midi_channel_mask != 0,
+                        egui::Button::new("Import all tracks as named patterns"),
+                    )
+                    .on_hover_text(
+                        "Create one named Pattern per MIDI track on the selected channel.",
+                    )
+                    .clicked()
+            {
+                let mut pattern_options = options;
+                pattern_options.set_mixer_tracks_for_new_channels = false;
+                import_named_midi_patterns_request = Some((pending.midi.clone(), pattern_options));
             }
             clear_midi_import = ui.button("Clear").clicked();
             ui.checkbox(
@@ -29054,6 +29072,51 @@ impl DawUi {
                     }
                     Err(error) => self.status = error.to_string(),
                 }
+            }
+        }
+        if let Some((midi, options)) = import_named_midi_patterns_request {
+            let result = self.document.as_mut().zip(self.selected_note_channel).map(
+                |(document, channel_id)| {
+                    (
+                        channel_id,
+                        document.import_midi_tracks_to_new_patterns_with_options(
+                            &midi, channel_id, options,
+                        ),
+                    )
+                },
+            );
+            match result {
+                Some((channel_id, Ok(imported_tracks))) => {
+                    let imported_notes = imported_tracks
+                        .iter()
+                        .map(|(_, imported)| *imported)
+                        .sum::<usize>();
+                    self.stop_project_playback();
+                    if let Some((pattern_id, _)) = imported_tracks.first() {
+                        self.selected_pattern = Some(*pattern_id);
+                    }
+                    self.selected_note = imported_tracks
+                        .iter()
+                        .find(|(_, imported)| *imported > 0)
+                        .map(|(pattern_id, _)| (*pattern_id, channel_id, 0));
+                    self.selected_piano_notes.clear();
+                    if let Some((pattern_id, _)) =
+                        imported_tracks.iter().find(|(_, imported)| *imported > 0)
+                    {
+                        self.selected_piano_notes
+                            .insert((*pattern_id, channel_id, 0));
+                    }
+                    self.dirty = !imported_tracks.is_empty();
+                    if let Some(document) = self.document.as_ref() {
+                        patterns = document.patterns().unwrap_or_default();
+                    }
+                    self.status = format!(
+                        "Imported {} MIDI tracks and {imported_notes} notes into named patterns",
+                        imported_tracks.len()
+                    );
+                }
+                Some((_, Err(error))) => self.status = error.to_string(),
+                None => self.status = "No project or target channel is available".to_owned(),
             }
         }
         if let Some((midi, track_indices, target_pattern_id, template_channel_id, options)) =

@@ -2688,6 +2688,39 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 )?,
             )
         }
+        [command, input, midi_path, output, channel_id, options @ ..]
+            if command == "import-midi-named-patterns" =>
+        {
+            let options = match options {
+                [] => MidiImportOptions::default(),
+                [zero_velocity_note_ons] => {
+                    parse_midi_import_options(zero_velocity_note_ons, "0")?
+                }
+                [zero_velocity_note_ons, realign_events] => {
+                    parse_midi_import_options(zero_velocity_note_ons, realign_events)?
+                }
+                [zero_velocity_note_ons, realign_events, midi_channels] => {
+                    parse_midi_import_options_with_channels(
+                        zero_velocity_note_ons,
+                        realign_events,
+                        midi_channels,
+                    )?
+                }
+                _ => {
+                    return Err(
+                        "import-midi-named-patterns accepts at most three MIDI import options"
+                            .to_owned(),
+                    );
+                }
+            };
+            import_midi_tracks_to_named_patterns(
+                Path::new(input),
+                Path::new(midi_path),
+                Path::new(output),
+                parse_u16(channel_id, "channel id")?,
+                options,
+            )
+        }
         [command, input, midi_path, output, pattern_id, track_numbers, channel_ids]
             if command == "import-midi-selected" =>
         {
@@ -3100,6 +3133,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild create-playlist-audio-clip <input.flp> <output.flp> <arrangement-id> <channel-id> <position-ticks> <length-ticks> <track-index:zero-based>\n",
             "  flp-rebuild import-midi <input.flp> <input.mid> <output.flp> <track> <pattern-id|new> <channel-id> [zero-velocity-note-ons:0|1] [realign-events:0|1] [midi-channels:all|none|1,2,...,16]\n",
             "  flp-rebuild import-midi-all <input.flp> <input.mid> <output.flp> <pattern-id|new> <channel-ids-comma-separated> [zero-velocity-note-ons:0|1] [realign-events:0|1] [midi-channels:all|none|1,2,...,16]\n",
+            "  flp-rebuild import-midi-named-patterns <input.flp> <input.mid> <output.flp> <channel-id> [zero-velocity-note-ons:0|1] [realign-events:0|1] [midi-channels:all|none|1,2,...,16]\n",
             "  flp-rebuild import-midi-selected <input.flp> <input.mid> <output.flp> <pattern-id|new> <track-numbers:all|1,2,...> <selected-track-channel-ids-comma-separated> [zero-velocity-note-ons:0|1 realign-events:0|1 midi-channels:all|none|1,2,...,16]\n",
             "  flp-rebuild import-midi-sampler-tracks-selected <input.flp> <input.mid> <output.flp> <pattern-id|new> <template-channel-id> <track-numbers:all|1,2,...> [zero-velocity-note-ons:0|1 realign-events:0|1 midi-channels:all|none|1,2,...,16 set-mixer-tracks:0|1]\n",
             "  flp-rebuild import-midi-format2-selected <input.flp> <input.mid> <output.flp> <template-channel-id> <track-numbers:all|1,2,...> [zero-velocity-note-ons:0|1 realign-events:0|1 midi-channels:all|none|1,2,...,16 set-mixer-tracks:0|1]\n",
@@ -7347,6 +7381,43 @@ fn import_midi_tracks(
     println!(
         "imported {imported} MIDI notes from {} tracks into pattern {pattern_id} in {}",
         midi.tracks().len(),
+        output.display()
+    );
+    Ok(())
+}
+
+fn import_midi_tracks_to_named_patterns(
+    input: &Path,
+    midi_path: &Path,
+    output: &Path,
+    channel_id: u16,
+    options: MidiImportOptions,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let midi_bytes = fs::read(midi_path)
+        .map_err(|error| format!("could not read {}: {error}", midi_path.display()))?;
+    let midi = MidiFile::parse(&midi_bytes)
+        .map_err(|error| format!("could not parse {}: {error}", midi_path.display()))?;
+    let imported_tracks = document
+        .import_midi_tracks_to_new_patterns_with_options(&midi, channel_id, options)
+        .map_err(|error| error.to_string())?;
+    let imported_notes = imported_tracks
+        .iter()
+        .map(|(_, imported)| *imported)
+        .sum::<usize>();
+    let pattern_ids = imported_tracks
+        .iter()
+        .map(|(pattern_id, _)| pattern_id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "imported {} MIDI tracks ({imported_notes} notes) into named patterns [{pattern_ids}] on channel {channel_id} in {}",
+        imported_tracks.len(),
         output.display()
     );
     Ok(())

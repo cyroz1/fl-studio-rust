@@ -13948,6 +13948,17 @@ impl FlpDocument {
         }
         let mut candidate = self.clone();
         let pattern_id = candidate.create_pattern()?;
+        if track_indices.len() == 1
+            && let Some(track_name) = midi
+                .tracks()
+                .get(track_indices[0])
+                .and_then(|track| track.name())
+                .filter(|name| !name.trim().is_empty() && !name.contains('\0'))
+            && let Ok(payload) =
+                encode_project_string(&track_name, candidate.project_strings_use_utf16())
+        {
+            candidate.insert_new_pattern_name(pattern_id, payload)?;
+        }
         let imported = candidate.import_midi_selected_tracks_with_options(
             midi,
             pattern_id,
@@ -13957,6 +13968,97 @@ impl FlpDocument {
         )?;
         *self = candidate;
         Ok((pattern_id, imported))
+    }
+
+    /// Imports every MIDI track into its own Pattern on one FL Studio channel.
+    ///
+    /// Pattern creation and note import are atomic. MIDI track names are copied to their
+    /// Patterns when the project can represent them. Results follow MIDI track order and
+    /// contain `(pattern_id, imported_note_count)` for each track.
+    pub fn import_midi_tracks_to_new_patterns(
+        &mut self,
+        midi: &midi::MidiFile,
+        channel_id: u16,
+    ) -> Result<Vec<(u16, usize)>, FlpError> {
+        self.import_midi_tracks_to_new_patterns_with_options(
+            midi,
+            channel_id,
+            midi::MidiImportOptions::default(),
+        )
+    }
+
+    /// Imports every MIDI track into a separately named Pattern using the supplied options.
+    ///
+    /// If any track fails, the source document remains unchanged. Format-2 tracks are also
+    /// imported separately, matching their independent sequence semantics.
+    pub fn import_midi_tracks_to_new_patterns_with_options(
+        &mut self,
+        midi: &midi::MidiFile,
+        channel_id: u16,
+        options: midi::MidiImportOptions,
+    ) -> Result<Vec<(u16, usize)>, FlpError> {
+        self.require_unique_channel(channel_id)?;
+        if midi.tracks().is_empty() {
+            return Err(FlpError::UnsupportedEdit(
+                "MIDI import requires at least one track",
+            ));
+        }
+        let mut candidate = self.clone();
+        let mut imported_tracks = Vec::with_capacity(midi.tracks().len());
+        for (track_index, track) in midi.tracks().iter().enumerate() {
+            let pattern_id = candidate.create_pattern()?;
+            if let Some(track_name) = track
+                .name()
+                .filter(|name| !name.trim().is_empty() && !name.contains('\0'))
+                && let Ok(payload) =
+                    encode_project_string(&track_name, candidate.project_strings_use_utf16())
+            {
+                candidate.insert_new_pattern_name(pattern_id, payload)?;
+            }
+            let imported = candidate.import_midi_track_with_options(
+                midi,
+                track_index,
+                pattern_id,
+                channel_id,
+                options,
+            )?;
+            imported_tracks.push((pattern_id, imported));
+        }
+        *self = candidate;
+        Ok(imported_tracks)
+    }
+
+    fn insert_new_pattern_name(
+        &mut self,
+        pattern_id: u16,
+        payload: Vec<u8>,
+    ) -> Result<(), FlpError> {
+        let mut markers = self.events.iter().enumerate().filter(|(_, event)| {
+            event.opcode == 0x41
+                && event.encoding == PayloadEncoding::Word
+                && event.payload.as_slice() == pattern_id.to_le_bytes()
+        });
+        let Some((marker_index, _)) = markers.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the new Pattern marker could not be found",
+            ));
+        };
+        if markers.next().is_some() {
+            return Err(FlpError::UnsupportedEdit("the new Pattern id is ambiguous"));
+        }
+        if !self
+            .events
+            .get(marker_index + 1)
+            .is_some_and(Self::is_pattern_note_event)
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "the new Pattern note event could not be found",
+            ));
+        }
+        let name_event = FlpEvent::new_data(0xC1, payload)?;
+        self.events.insert(marker_index + 2, name_event);
+        self.refresh_event_offsets()?;
+        Ok(())
     }
 
     /// Creates one named Sampler channel per format-0/1 MIDI track by copying the selected
@@ -21408,6 +21510,25 @@ mod tests {
         bytes
     }
 
+    fn midi_fixture_named_tracks(tracks: &[(&str, &[u8])], division: u16) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"MThd");
+        bytes.extend_from_slice(&6u32.to_be_bytes());
+        bytes.extend_from_slice(&1u16.to_be_bytes());
+        bytes.extend_from_slice(&(tracks.len() as u16).to_be_bytes());
+        bytes.extend_from_slice(&division.to_be_bytes());
+        for (name, events) in tracks {
+            let name_bytes = name.as_bytes();
+            let mut track = vec![0x00, 0xFF, 0x03, name_bytes.len() as u8];
+            track.extend_from_slice(name_bytes);
+            track.extend_from_slice(events);
+            bytes.extend_from_slice(b"MTrk");
+            bytes.extend_from_slice(&(track.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(&track);
+        }
+        bytes
+    }
+
     #[test]
     fn decodes_observed_mixer_insert_fields_without_rewriting_source_events() {
         let mut event_stream = Vec::new();
@@ -27648,16 +27769,14 @@ mod tests {
 
     #[test]
     fn selected_midi_tracks_can_be_imported_into_a_new_pattern_atomically() {
-        let midi = MidiFile::parse(&midi_tracks_fixture(
-            &[
-                &[
-                    0x00, 0x90, 0x3C, 0x64, 0x83, 0x60, 0x80, 0x3C, 0x00, 0x00, 0xFF, 0x2F, 0x00,
-                ],
-                &[
-                    0x00, 0x90, 0x43, 0x50, 0x81, 0x70, 0x80, 0x43, 0x00, 0x00, 0xFF, 0x2F, 0x00,
-                ],
-            ],
-            1,
+        let first_track = [
+            0x00, 0x90, 0x3C, 0x64, 0x83, 0x60, 0x80, 0x3C, 0x00, 0x00, 0xFF, 0x2F, 0x00,
+        ];
+        let second_track = [
+            0x00, 0x90, 0x43, 0x50, 0x81, 0x70, 0x80, 0x43, 0x00, 0x00, 0xFF, 0x2F, 0x00,
+        ];
+        let midi = MidiFile::parse(&midi_fixture_named_tracks(
+            &[("Piano", &first_track), ("Bass", &second_track)],
             480,
         ))
         .expect("two-track MIDI fixture should parse");
@@ -27681,6 +27800,7 @@ mod tests {
         assert_eq!(patterns.len(), 2);
         assert!(patterns[0].notes.is_empty());
         assert_eq!(patterns[1].id, pattern_id);
+        assert_eq!(patterns[1].name.as_deref(), Some("Bass"));
         assert_eq!(patterns[1].notes.len(), 1);
         assert_eq!(
             (patterns[1].notes[0].channel_id, patterns[1].notes[0].key),
@@ -27702,6 +27822,54 @@ mod tests {
                     &[1],
                     MidiImportOptions::default(),
                 )
+                .is_err()
+        );
+        assert_eq!(rejected.encode_lossless().unwrap(), original);
+    }
+
+    #[test]
+    fn all_midi_tracks_can_create_named_patterns_atomically() {
+        let first_track = [
+            0x00, 0x90, 0x3C, 0x64, // C4 begins at tick 0.
+            0x83, 0x60, 0x80, 0x3C, 0x40, // C4 ends at tick 480.
+            0x00, 0xFF, 0x2F, 0x00,
+        ];
+        let second_track = [
+            0x00, 0x91, 0x43, 0x50, // G4 begins at tick 0 on MIDI channel 1.
+            0x83, 0x60, 0x81, 0x43, 0x30, // G4 ends at tick 480.
+            0x00, 0xFF, 0x2F, 0x00,
+        ];
+        let midi = MidiFile::parse(&midi_fixture_named_tracks(
+            &[("Piano", &first_track), ("Bass", &second_track)],
+            480,
+        ))
+        .expect("named MIDI tracks should parse");
+        let project_events = [
+            0x40, 0, 0, 0x15, 0, 0x40, 1, 0, 0x15, 0, 0x41, 7, 0, 0xD0, 0,
+        ];
+        let original = flp_fixture(&project_events, &[], &[]);
+        let mut document = FlpDocument::parse(&original).expect("project fixture should parse");
+
+        let imported_tracks = document
+            .import_midi_tracks_to_new_patterns(&midi, 0)
+            .expect("all MIDI tracks should import atomically");
+
+        assert_eq!(imported_tracks, [(8, 1), (9, 1)]);
+        let patterns = document.patterns().expect("patterns should decode");
+        assert_eq!(patterns.len(), 3);
+        assert_eq!(patterns[1].name.as_deref(), Some("Piano"));
+        assert_eq!(patterns[1].notes.len(), 1);
+        assert_eq!(patterns[1].notes[0].key, 60);
+        assert_eq!(patterns[1].notes[0].channel_id, 0);
+        assert_eq!(patterns[2].name.as_deref(), Some("Bass"));
+        assert_eq!(patterns[2].notes.len(), 1);
+        assert_eq!(patterns[2].notes[0].key, 67);
+        assert_eq!(patterns[2].notes[0].channel_id, 0);
+
+        let mut rejected = FlpDocument::parse(&original).unwrap();
+        assert!(
+            rejected
+                .import_midi_tracks_to_new_patterns(&midi, u16::MAX)
                 .is_err()
         );
         assert_eq!(rejected.encode_lossless().unwrap(), original);
