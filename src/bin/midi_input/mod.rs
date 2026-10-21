@@ -633,6 +633,20 @@ impl MidiPatternRecorder {
         self.channel_state = channel_state;
     }
 
+    /// Returns the Pattern-relative position for a received MIDI message using the same
+    /// timestamp origin, tempo map, and input offset as recorded notes.
+    pub fn position_for_message(&mut self, message: ReceivedMidiMessage) -> Option<u32> {
+        if message.received_at < self.started_at {
+            return None;
+        }
+        let tick = self
+            .tick_for_message(message.timestamp_micros, message.received_at)
+            .saturating_add(self.start_tick)
+            .min(MAX_NOTE_TICK);
+        self.last_position_tick = self.last_position_tick.max(tick);
+        Some(tick)
+    }
+
     pub fn record(&mut self, message: ReceivedMidiMessage) {
         self.record_with_velocity_override(message, None);
     }
@@ -651,14 +665,9 @@ impl MidiPatternRecorder {
             }
             _ => {}
         }
-        if message.received_at < self.started_at {
+        let Some(tick) = self.position_for_message(message) else {
             return;
-        }
-        let tick = self
-            .tick_for_message(message.timestamp_micros, message.received_at)
-            .saturating_add(self.start_tick)
-            .min(MAX_NOTE_TICK);
-        self.last_position_tick = self.last_position_tick.max(tick);
+        };
         match message.event {
             MidiInputEvent::NoteOn {
                 channel,

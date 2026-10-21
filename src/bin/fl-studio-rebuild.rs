@@ -160,6 +160,7 @@ const MIDI_RECORDING_OFFSET_MAX_MS: i16 = 200;
 const AUDIO_RECORDING_OFFSET_MIN_MS: i16 = -200;
 const AUDIO_RECORDING_OFFSET_MAX_MS: i16 = 200;
 const MIDI_FIXED_RECORDING_VELOCITY: u8 = 100;
+const MAX_CAPTURED_PATTERN_CONTROLLER_POINTS: usize = 100_000;
 const MAX_BROWSER_RECURSIVE_SCAN_ENTRIES: usize = 20_000;
 const AUTOSAVE_INTERVALS_MINUTES: [u8; 5] = [0, 1, 5, 10, 15];
 const BACKUP_RETENTION_OPTIONS: [usize; 4] = [5, 10, 20, 50];
@@ -4229,6 +4230,10 @@ struct DawUi {
     midi_recording_offset_ms: i16,
     midi_record_fixed_velocity: bool,
     record_notes_enabled: bool,
+    record_automation_enabled: bool,
+    midi_record_automation_controller: u8,
+    midi_record_automation_channel: u8,
+    midi_record_automation_flags: u8,
     midi_record_toggle_requested: bool,
     midi_input_refresh_requested: bool,
     midi_input_toggle_requested: bool,
@@ -4586,8 +4591,95 @@ struct AudioRecordingSession {
 struct ActiveMidiRecording {
     recorder: MidiPatternRecorder,
     fixed_velocity: Option<u8>,
+    record_notes: bool,
+    automation: Option<MidiAutomationRecording>,
     playlist_recording_target: Option<MidiPlaylistRecordingTarget>,
     scale_snap: Option<DetectedPianoRollScale>,
+}
+
+struct MidiAutomationRecording {
+    controller: u8,
+    stream: (u8, u8),
+    points: Vec<(u32, f32)>,
+    overflowed: bool,
+}
+
+impl MidiAutomationRecording {
+    fn new(controller: u8, stream: (u8, u8)) -> Self {
+        Self {
+            controller: controller.min(127),
+            stream,
+            points: Vec::new(),
+            overflowed: false,
+        }
+    }
+
+    fn record(&mut self, position: u32, value: u8) {
+        let point = (position, f32::from(value.min(127)) / 127.0);
+        if let Some(last) = self.points.last_mut() {
+            if last.0 == position {
+                *last = point;
+                return;
+            }
+            if last.1.to_bits() == point.1.to_bits() {
+                return;
+            }
+        }
+        if self.points.len() >= MAX_CAPTURED_PATTERN_CONTROLLER_POINTS {
+            self.overflowed = true;
+            return;
+        }
+        self.points.push(point);
+    }
+
+    fn normalized_points(&self) -> Vec<(u32, f32)> {
+        let mut points = self.points.clone();
+        points.sort_by_key(|(position, _)| *position);
+        let mut normalized: Vec<(u32, f32)> = Vec::with_capacity(points.len());
+        for (position, value) in points {
+            if let Some(last) = normalized.last_mut()
+                && last.0 == position
+            {
+                last.1 = value;
+            } else if normalized
+                .last()
+                .is_none_or(|(_, last_value): &(u32, f32)| last_value.to_bits() != value.to_bits())
+            {
+                normalized.push((position, value));
+            }
+        }
+        normalized
+    }
+}
+
+fn record_pattern_controller_points(
+    document: &mut FlpDocument,
+    pattern_id: u16,
+    stream: (u8, u8),
+    points: &[(u32, f32)],
+) -> Result<usize, String> {
+    if points.is_empty() {
+        return Ok(0);
+    }
+    let stream_exists = document
+        .patterns()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|pattern| pattern.id == pattern_id)
+        .ok_or_else(|| "the selected Pattern no longer exists".to_owned())?
+        .controllers
+        .iter()
+        .any(|point| (point.channel, point.flags) == stream);
+    if !stream_exists {
+        let (position, value) = points[0];
+        document
+            .create_pattern_controller_stream(pattern_id, stream.0, stream.1, position, value)
+            .map_err(|error| error.to_string())?;
+    }
+    document
+        .draw_pattern_controller_points(pattern_id, stream, points)
+        .map_err(|error| error.to_string())?;
+    Ok(points.len())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4796,11 +4888,26 @@ fn midi_cc_to_mixer_stereo_separation_raw(value: u8) -> i32 {
 
 impl ActiveMidiRecording {
     fn record(&mut self, message: ReceivedMidiMessage) {
-        if let Some(fixed_velocity) = self.fixed_velocity {
-            self.recorder
-                .record_with_velocity_override(message, Some(fixed_velocity));
-        } else {
-            self.recorder.record(message);
+        if let Some(automation) = &mut self.automation {
+            let position = self.recorder.position_for_message(message);
+            if let (
+                Some(position),
+                MidiInputEvent::ControlChange {
+                    controller, value, ..
+                },
+            ) = (position, message.event)
+                && controller == automation.controller
+            {
+                automation.record(position, value);
+            }
+        }
+        if self.record_notes {
+            if let Some(fixed_velocity) = self.fixed_velocity {
+                self.recorder
+                    .record_with_velocity_override(message, Some(fixed_velocity));
+            } else {
+                self.recorder.record(message);
+            }
         }
     }
 }
@@ -4957,6 +5064,10 @@ impl DawUi {
             performance_channel: performance_midi_channel,
             record_audio: record_audio_enabled,
             record_notes: record_notes_enabled,
+            record_automation: record_automation_enabled,
+            record_automation_controller: midi_record_automation_controller,
+            record_automation_channel: midi_record_automation_channel,
+            record_automation_flags: midi_record_automation_flags,
         } = load_midi_device_selections();
         let (midi_input_thru_snap_to_scale, midi_input_thru_output_channel) =
             load_midi_thru_preferences();
@@ -5323,6 +5434,10 @@ impl DawUi {
             midi_recording_offset_ms,
             midi_record_fixed_velocity,
             record_notes_enabled,
+            record_automation_enabled,
+            midi_record_automation_controller,
+            midi_record_automation_channel,
+            midi_record_automation_flags,
             midi_record_toggle_requested: false,
             midi_input_refresh_requested: false,
             midi_input_toggle_requested: false,
@@ -11757,14 +11872,18 @@ impl DawUi {
                     .as_ref()
                     .is_none_or(AudioEngine::input_active)
                 && !audio_recording_finalizing;
-            let (start_audio_recording, start_notes_recording) = recording_input_targets(
+            let (start_audio_recording, start_notes_recording, start_automation_recording) = recording_input_targets(
                 self.record_audio_enabled,
                 self.record_notes_enabled,
+                self.record_automation_enabled,
                 can_record_audio,
                 self.midi_input_connection.is_some() && self.document.is_some(),
             );
-            let can_record =
-                recording_midi || recording_audio || start_audio_recording || start_notes_recording;
+            let start_midi_recording = start_notes_recording || start_automation_recording;
+            let can_record = recording_midi
+                || recording_audio
+                || start_audio_recording
+                || start_midi_recording;
             let recording = recording_midi || recording_audio;
             let record_button = egui::Button::new(
                 egui::RichText::new(if recording { "■" } else { "●" }).color(if recording {
@@ -11781,6 +11900,21 @@ impl DawUi {
                         "Finish audio and MIDI note recording"
                     } else if recording_audio {
                         "Finish audio recording"
+                    } else if recording_midi
+                        && self
+                            .midi_recording
+                            .as_ref()
+                            .is_some_and(|recording| recording.automation.is_some())
+                    {
+                        if self
+                            .midi_recording
+                            .as_ref()
+                            .is_some_and(|recording| recording.record_notes)
+                        {
+                            "Finish MIDI notes and CC automation recording"
+                        } else {
+                            "Finish MIDI CC automation recording"
+                        }
                     } else if recording_midi {
                         "Finish MIDI note recording"
                     } else if audio_recording_finalizing {
@@ -11800,15 +11934,36 @@ impl DawUi {
                     record_filters_changed |= ui
                         .checkbox(&mut self.record_notes_enabled, "Notes")
                         .changed();
-                    let mut automation_filter_enabled = false;
-                    ui.add_enabled(
-                        false,
-                        egui::Checkbox::new(&mut automation_filter_enabled, "Automation"),
-                    )
-                    .on_hover_text("Automation recording is not available yet.");
+                    record_filters_changed |= ui
+                        .checkbox(&mut self.record_automation_enabled, "CC automation")
+                        .on_hover_text(
+                            "Record the selected CC into this Pattern stream; use the Plug-ins panel to link the stream to a loaded VST3 parameter.",
+                        )
+                        .changed();
+                    ui.add_enabled_ui(self.record_automation_enabled, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("CC");
+                            record_filters_changed |= ui
+                                .add(egui::DragValue::new(
+                                    &mut self.midi_record_automation_controller,
+                                ).range(0..=127))
+                                .changed();
+                            ui.label("Raw stream");
+                            record_filters_changed |= ui
+                                .add(egui::DragValue::new(
+                                    &mut self.midi_record_automation_channel,
+                                ).range(0..=u8::MAX))
+                                .changed();
+                            record_filters_changed |= ui
+                                .add(egui::DragValue::new(
+                                    &mut self.midi_record_automation_flags,
+                                ).range(0..=u8::MAX))
+                                .changed();
+                        });
+                    });
                 });
                 ui.separator();
-                ui.label("Audio and Notes can be recorded together.");
+                ui.label("Audio, Notes, and CC automation can be recorded together.");
             });
             if record_filters_changed {
                 self.persist_midi_device_selections();
@@ -11821,7 +11976,7 @@ impl DawUi {
                     self.midi_record_toggle_requested = true;
                 }
                 if !recording && can_record {
-                    if start_notes_recording {
+                    if start_midi_recording {
                         self.midi_record_toggle_requested = true;
                     }
                     if start_audio_recording {
@@ -38910,6 +39065,10 @@ impl DawUi {
             performance_channel: self.performance_midi_channel,
             record_audio: self.record_audio_enabled,
             record_notes: self.record_notes_enabled,
+            record_automation: self.record_automation_enabled,
+            record_automation_controller: self.midi_record_automation_controller,
+            record_automation_channel: self.midi_record_automation_channel,
+            record_automation_flags: self.midi_record_automation_flags,
         };
         if let Err(error) = save_midi_device_selections(&selections) {
             self.status = format!("Could not save MIDI device selections: {error}");
@@ -39643,12 +39802,18 @@ impl DawUi {
     }
 
     fn start_midi_recording(&mut self) {
+        let record_notes = self.record_notes_enabled;
+        let record_automation = self.record_automation_enabled;
+        if !record_notes && !record_automation {
+            self.status = "Enable Notes or CC automation in the Record filter first".to_owned();
+            return;
+        }
         if self.midi_input_connection.is_none() {
-            self.status = "Connect a MIDI input before recording notes".to_owned();
+            self.status = "Connect a MIDI input before recording".to_owned();
             return;
         }
         let Some(document) = &self.document else {
-            self.status = "Open a project before recording MIDI notes".to_owned();
+            self.status = "Open a project before recording MIDI data".to_owned();
             return;
         };
         let patterns = match document.patterns() {
@@ -39677,9 +39842,14 @@ impl DawUi {
                     .find(|channel_id| channels.iter().any(|channel| channel.id() == *channel_id))
             })
             .or_else(|| channels.first().map(ChannelSummary::id));
-        let Some(channel_id) = selected_channel else {
-            self.status = "Add a channel before recording MIDI notes".to_owned();
-            return;
+        let channel_id = match (record_notes, selected_channel) {
+            (true, Some(channel_id)) => channel_id,
+            (true, None) => {
+                self.status = "Add a channel before recording MIDI notes".to_owned();
+                return;
+            }
+            (false, Some(channel_id)) => channel_id,
+            (false, None) => 0,
         };
         let playback_arrangement_id = self.selected_arrangement.unwrap_or(0);
         let playhead_tick = self.current_playhead_tick();
@@ -39700,7 +39870,7 @@ impl DawUi {
                 playlist_pattern_recording_offset(playhead_tick, pattern_id, &arrangement.clips)
             })
             .unwrap_or(0);
-        let playlist_recording_target =
+        let playlist_recording_target = if record_notes {
             song_timeline_start
                 .as_ref()
                 .and(playhead_tick)
@@ -39734,13 +39904,17 @@ impl DawUi {
                             },
                         ))
                     }
-                });
-        let snap_ticks = (self.midi_record_snap != PianoRollSnap::None).then(|| {
-            self.midi_record_snap.ticks(
-                document.header().ppq(),
-                document.metadata().time_signature(),
-            )
-        });
+                })
+        } else {
+            None
+        };
+        let snap_ticks =
+            (record_notes && self.midi_record_snap != PianoRollSnap::None).then(|| {
+                self.midi_record_snap.ticks(
+                    document.header().ppq(),
+                    document.metadata().time_signature(),
+                )
+            });
         match MidiPatternRecorder::new(
             MidiPatternRecorderSettings {
                 pattern_id,
@@ -39758,6 +39932,7 @@ impl DawUi {
             Ok(mut recorder) => {
                 recorder.set_channel_state(self.midi_input_channel_state);
                 let scale_snap = (self.midi_record_snap_to_scale
+                    && record_notes
                     && self.piano_roll_scale != PianoRollScale::None)
                     .then_some(DetectedPianoRollScale {
                         root: self.piano_roll_scale_root,
@@ -39765,19 +39940,41 @@ impl DawUi {
                     });
                 self.midi_recording = Some(ActiveMidiRecording {
                     recorder,
-                    fixed_velocity: self
-                        .midi_record_fixed_velocity
+                    fixed_velocity: (record_notes && self.midi_record_fixed_velocity)
                         .then_some(MIDI_FIXED_RECORDING_VELOCITY),
+                    record_notes,
+                    automation: record_automation.then(|| {
+                        MidiAutomationRecording::new(
+                            self.midi_record_automation_controller,
+                            (
+                                self.midi_record_automation_channel,
+                                self.midi_record_automation_flags,
+                            ),
+                        )
+                    }),
                     playlist_recording_target,
                     scale_snap,
                 });
-                let channel_name = channels
-                    .iter()
-                    .find(|channel| channel.id() == channel_id)
-                    .and_then(ChannelSummary::display_name)
-                    .unwrap_or("Channel");
+                let mut recording_targets = Vec::new();
+                if record_notes {
+                    let channel_name = channels
+                        .iter()
+                        .find(|channel| channel.id() == channel_id)
+                        .and_then(ChannelSummary::display_name)
+                        .unwrap_or("Channel");
+                    recording_targets.push(format!("notes on {channel_name}"));
+                }
+                if record_automation {
+                    recording_targets.push(format!(
+                        "CC{} to raw stream ({}, {})",
+                        self.midi_record_automation_controller,
+                        self.midi_record_automation_channel,
+                        self.midi_record_automation_flags
+                    ));
+                }
                 self.status = format!(
-                    "Recording MIDI to Pattern {pattern_id} from tick {recording_start_tick} · {channel_name}{}; press Record to finish",
+                    "Recording {} to Pattern {pattern_id} from tick {recording_start_tick}{}; press Record to finish",
+                    recording_targets.join(" and "),
                     match playlist_recording_target {
                         Some(MidiPlaylistRecordingTarget::AddClip(_)) => {
                             " · Playlist clip will be added at the start position"
@@ -39804,27 +40001,45 @@ impl DawUi {
         };
         let ActiveMidiRecording {
             recorder,
+            automation,
             playlist_recording_target,
             scale_snap,
             ..
         } = recording;
         let result = recorder.finish(stop_timestamp_micros, finished_at);
         let mut notes = result.notes;
+        let snapped_to_scale = scale_snap.is_some();
         if let Some(scale) = scale_snap {
             snap_recorded_midi_notes_to_scale(&mut notes, scale);
         }
-        if notes.is_empty() {
-            self.status = if result.overflowed {
-                "MIDI recording reached its note limit before any note was completed".to_owned()
+        let automation_info = automation.map(|automation| {
+            (
+                automation.controller,
+                automation.stream,
+                automation.overflowed,
+                automation.normalized_points(),
+            )
+        });
+        let automation_points = automation_info
+            .as_ref()
+            .map_or_else(Vec::new, |(_, _, _, points)| points.clone());
+        let automation_overflowed = automation_info
+            .as_ref()
+            .is_some_and(|(_, _, overflowed, _)| *overflowed);
+        if notes.is_empty() && automation_points.is_empty() {
+            self.status = if result.overflowed || automation_overflowed {
+                "MIDI recording reached a capture limit before any event could be committed"
+                    .to_owned()
             } else {
-                "MIDI recording ended without complete notes".to_owned()
+                "MIDI recording ended without captured notes or selected CC changes".to_owned()
             };
             return;
         }
         if self.current_path != result.project_path {
             self.status = format!(
-                "Discarded {} MIDI note(s) because the active project changed during recording",
-                notes.len()
+                "Discarded {} MIDI note(s) and {} CC point(s) because the active project changed during recording",
+                notes.len(),
+                automation_points.len()
             );
             return;
         }
@@ -39845,120 +40060,156 @@ impl DawUi {
             }
         };
         let mut updated = document.clone();
-        match updated.add_pattern_notes(result.pattern_id, &notes) {
-            Ok(()) => {
-                let playlist_recording_result =
-                    playlist_recording_target.map(|target| match target {
-                        MidiPlaylistRecordingTarget::AddClip(placement) => {
-                            create_recorded_pattern_playlist_clip(
-                                &mut updated,
-                                result.pattern_id,
-                                placement,
-                            )
-                            .map(|(clip_index, track_index)| {
-                                MidiPlaylistRecordingOutcome::ClipAdded {
-                                    placement,
-                                    clip_index,
-                                    track_index,
-                                }
-                            })
-                        }
-                        MidiPlaylistRecordingTarget::ExtendClip(extension) => {
-                            extend_recorded_pattern_playlist_clip(
-                                &mut updated,
-                                result.pattern_id,
-                                extension,
-                                &notes,
-                            )
-                            .map(|new_length_ticks| {
-                                MidiPlaylistRecordingOutcome::ClipExtended {
-                                    extension,
-                                    new_length_ticks,
-                                }
-                            })
-                        }
-                    });
-                self.document = Some(updated);
-                if let Some(snapshot) = undo_snapshot {
-                    self.remember_undo_snapshot(snapshot);
-                }
-                self.selected_pattern = Some(result.pattern_id);
-                self.selected_note_channel = Some(result.channel_id);
-                self.dirty = true;
-                let mut status = if result.overflowed {
-                    format!(
-                        "Recorded {} MIDI note(s); the capture limit was reached and later notes were ignored",
-                        notes.len()
+        if !notes.is_empty()
+            && let Err(error) = updated.add_pattern_notes(result.pattern_id, &notes)
+        {
+            self.status = format!("Could not add recorded MIDI notes: {error}");
+            return;
+        }
+        if let Some((_, stream, _, _)) = automation_info.as_ref()
+            && let Err(error) = record_pattern_controller_points(
+                &mut updated,
+                result.pattern_id,
+                *stream,
+                &automation_points,
+            )
+        {
+            self.status = format!("Could not save recorded MIDI CC automation: {error}");
+            return;
+        }
+        let playlist_recording_result = if notes.is_empty() {
+            None
+        } else {
+            playlist_recording_target.map(|target| match target {
+                MidiPlaylistRecordingTarget::AddClip(placement) => {
+                    create_recorded_pattern_playlist_clip(
+                        &mut updated,
+                        result.pattern_id,
+                        placement,
                     )
-                } else {
-                    format!(
-                        "Recorded {} MIDI note(s) into Pattern {}",
-                        notes.len(),
-                        result.pattern_id
-                    )
-                };
-                if let Some(scale) = scale_snap {
-                    status.push_str(&format!(
-                        " · snapped to {} {}",
-                        PITCH_CLASSES[usize::from(scale.root)],
-                        scale.scale.label()
-                    ));
-                }
-                if let Some(recording_result) = playlist_recording_result {
-                    match recording_result {
-                        Ok(MidiPlaylistRecordingOutcome::ClipAdded {
+                    .map(|(clip_index, track_index)| {
+                        MidiPlaylistRecordingOutcome::ClipAdded {
                             placement,
                             clip_index,
                             track_index,
-                        }) => {
-                            self.selected_arrangement = Some(placement.arrangement_id);
-                            self.selected_clip = Some(clip_index);
-                            self.selected_playlist_clips.clear();
-                            self.selected_playlist_clips.insert(clip_index);
-                            self.playlist_selection_anchor = Some(clip_index);
-                            self.view = MainView::Playlist;
-                            status.push_str(&format!(
-                                " · Playlist clip added on track {} at tick {}",
-                                track_index + 1,
-                                placement.start_tick
-                            ));
                         }
-                        Ok(MidiPlaylistRecordingOutcome::ClipExtended {
+                    })
+                }
+                MidiPlaylistRecordingTarget::ExtendClip(extension) => {
+                    extend_recorded_pattern_playlist_clip(
+                        &mut updated,
+                        result.pattern_id,
+                        extension,
+                        &notes,
+                    )
+                    .map(|new_length_ticks| {
+                        MidiPlaylistRecordingOutcome::ClipExtended {
                             extension,
                             new_length_ticks,
-                        }) => {
-                            self.selected_arrangement = Some(extension.arrangement_id);
-                            self.selected_clip = Some(extension.clip_index);
-                            self.selected_playlist_clips.clear();
-                            self.selected_playlist_clips.insert(extension.clip_index);
-                            self.playlist_selection_anchor = Some(extension.clip_index);
-                            self.view = MainView::Playlist;
-                            match new_length_ticks {
-                                Some(length_ticks) => status.push_str(&format!(
-                                    " · Playlist clip extended to {length_ticks} ticks"
-                                )),
-                                None => status.push_str(
-                                    " · active Playlist clip already contains the recorded notes",
-                                ),
-                            }
                         }
-                        Err(error) => {
-                            let action = match playlist_recording_target {
-                                Some(MidiPlaylistRecordingTarget::ExtendClip(_)) => {
-                                    "Playlist clip not extended"
-                                }
-                                _ => "Playlist clip not added",
-                            };
-                            status.push_str(&format!(" · notes saved; {action}: {error}"));
-                        }
-                    }
+                    })
                 }
-                self.status = status;
-            }
-            Err(error) => {
-                self.status = format!("Could not add recorded MIDI notes: {error}");
+            })
+        };
+        self.document = Some(updated);
+        if let Some(snapshot) = undo_snapshot {
+            self.remember_undo_snapshot(snapshot);
+        }
+        self.selected_pattern = Some(result.pattern_id);
+        if !notes.is_empty() {
+            self.selected_note_channel = Some(result.channel_id);
+        } else if !automation_points.is_empty() {
+            self.view = MainView::PianoRoll;
+        }
+        self.dirty = true;
+        let mut status_parts = Vec::new();
+        if !notes.is_empty() {
+            if result.overflowed {
+                status_parts.push(format!(
+                    "Recorded {} MIDI note(s); later notes were ignored after the note limit",
+                    notes.len()
+                ));
+            } else {
+                status_parts.push(format!(
+                    "Recorded {} MIDI note(s) into Pattern {}",
+                    notes.len(),
+                    result.pattern_id
+                ));
             }
         }
+        if let Some((controller, (channel, flags), overflowed, _)) = automation_info
+            && !automation_points.is_empty()
+        {
+            let suffix = if overflowed {
+                "; later CC changes were ignored after the point limit"
+            } else {
+                ""
+            };
+            status_parts.push(format!(
+                "Recorded {} CC{controller} point(s) into raw Pattern stream ({channel}, {flags}){suffix}; no parameter link was created",
+                automation_points.len()
+            ));
+        }
+        let mut status = status_parts.join(" · ");
+        if snapped_to_scale && let Some(scale) = scale_snap {
+            status.push_str(&format!(
+                " · snapped to {} {}",
+                PITCH_CLASSES[usize::from(scale.root)],
+                scale.scale.label()
+            ));
+        }
+        if let Some(recording_result) = playlist_recording_result {
+            match recording_result {
+                Ok(MidiPlaylistRecordingOutcome::ClipAdded {
+                    placement,
+                    clip_index,
+                    track_index,
+                }) => {
+                    self.selected_arrangement = Some(placement.arrangement_id);
+                    self.selected_clip = Some(clip_index);
+                    self.selected_playlist_clips.clear();
+                    self.selected_playlist_clips.insert(clip_index);
+                    self.playlist_selection_anchor = Some(clip_index);
+                    self.view = MainView::Playlist;
+                    status.push_str(&format!(
+                        " · Playlist clip added on track {} at tick {}",
+                        track_index + 1,
+                        placement.start_tick
+                    ));
+                }
+                Ok(MidiPlaylistRecordingOutcome::ClipExtended {
+                    extension,
+                    new_length_ticks,
+                }) => {
+                    self.selected_arrangement = Some(extension.arrangement_id);
+                    self.selected_clip = Some(extension.clip_index);
+                    self.selected_playlist_clips.clear();
+                    self.selected_playlist_clips.insert(extension.clip_index);
+                    self.playlist_selection_anchor = Some(extension.clip_index);
+                    self.view = MainView::Playlist;
+                    match new_length_ticks {
+                        Some(length_ticks) => {
+                            status.push_str(&format!(
+                                " · Playlist clip extended to {length_ticks} ticks"
+                            ));
+                        }
+                        None => status.push_str(
+                            " · active Playlist clip already contains the recorded notes",
+                        ),
+                    }
+                }
+                Err(error) => {
+                    let action = match playlist_recording_target {
+                        Some(MidiPlaylistRecordingTarget::ExtendClip(_)) => {
+                            "Playlist clip not extended"
+                        }
+                        _ => "Playlist clip not added",
+                    };
+                    status.push_str(&format!(" · notes saved; {action}: {error}"));
+                }
+            }
+        }
+        self.status = status;
     }
 
     fn toggle_midi_recording(&mut self, history_snapshot_available: bool) {
@@ -48453,12 +48704,14 @@ fn midi_controller_binding_for_device(
 fn recording_input_targets(
     audio_filter_enabled: bool,
     notes_filter_enabled: bool,
+    automation_filter_enabled: bool,
     audio_available: bool,
-    notes_available: bool,
-) -> (bool, bool) {
+    midi_input_available: bool,
+) -> (bool, bool, bool) {
     (
         audio_filter_enabled && audio_available,
-        notes_filter_enabled && notes_available,
+        notes_filter_enabled && midi_input_available,
+        automation_filter_enabled && midi_input_available,
     )
 }
 
@@ -48475,6 +48728,10 @@ struct MidiDeviceSelections {
     performance_channel: u8,
     record_audio: bool,
     record_notes: bool,
+    record_automation: bool,
+    record_automation_controller: u8,
+    record_automation_channel: u8,
+    record_automation_flags: u8,
 }
 
 impl Default for MidiDeviceSelections {
@@ -48491,6 +48748,10 @@ impl Default for MidiDeviceSelections {
             performance_channel: 0,
             record_audio: true,
             record_notes: true,
+            record_automation: false,
+            record_automation_controller: 1,
+            record_automation_channel: 0,
+            record_automation_flags: 0,
         }
     }
 }
@@ -48568,7 +48829,7 @@ fn parse_midi_thru_preferences(contents: &str) -> (bool, Option<u8>) {
 
 fn encode_midi_device_selections(selections: &MidiDeviceSelections) -> String {
     format!(
-        "input={}\nconnect_input_on_startup={}\noutput={}\nconnect_output_on_startup={}\nclock={}\nplaylist_notes={}\npattern_notes={}\nfixed_velocity={}\nperformance_channel={}\nrecord_audio={}\nrecord_notes={}\n",
+        "input={}\nconnect_input_on_startup={}\noutput={}\nconnect_output_on_startup={}\nclock={}\nplaylist_notes={}\npattern_notes={}\nfixed_velocity={}\nperformance_channel={}\nrecord_audio={}\nrecord_notes={}\nrecord_automation={}\nrecord_automation_controller={}\nrecord_automation_channel={}\nrecord_automation_flags={}\n",
         encode_midi_device_id(selections.input_id.as_deref().unwrap_or_default()),
         u8::from(selections.connect_input_on_startup),
         encode_midi_device_id(selections.output_id.as_deref().unwrap_or_default()),
@@ -48579,7 +48840,11 @@ fn encode_midi_device_selections(selections: &MidiDeviceSelections) -> String {
         u8::from(selections.fixed_velocity),
         selections.performance_channel.min(15),
         u8::from(selections.record_audio),
-        u8::from(selections.record_notes)
+        u8::from(selections.record_notes),
+        u8::from(selections.record_automation),
+        selections.record_automation_controller.min(127),
+        selections.record_automation_channel,
+        selections.record_automation_flags
     )
 }
 
@@ -48612,6 +48877,22 @@ fn parse_midi_device_selections(contents: &str) -> MidiDeviceSelections {
             selections.record_audio = enabled == "1";
         } else if let Some(enabled) = line.strip_prefix("record_notes=") {
             selections.record_notes = enabled == "1";
+        } else if let Some(enabled) = line.strip_prefix("record_automation=") {
+            selections.record_automation = enabled == "1";
+        } else if let Some(controller) = line.strip_prefix("record_automation_controller=") {
+            if let Ok(controller) = controller.parse::<u8>()
+                && controller <= 127
+            {
+                selections.record_automation_controller = controller;
+            }
+        } else if let Some(channel) = line.strip_prefix("record_automation_channel=") {
+            if let Ok(channel) = channel.parse::<u8>() {
+                selections.record_automation_channel = channel;
+            }
+        } else if let Some(flags) = line.strip_prefix("record_automation_flags=")
+            && let Ok(flags) = flags.parse::<u8>()
+        {
+            selections.record_automation_flags = flags;
         }
     }
     selections
@@ -53304,16 +53585,17 @@ mod tests {
     use super::{
         ActivePlaylistClipDrag, Arrangement, ChannelDisplayFilter, DetachedWindowKind,
         DetachedWindowPlacement, DetachedWindowPlacements, DetectedPianoRollScale, FlpDocument,
-        MainView, MidiControlChangeMapping, MidiControllerCcBinding, MidiControllerTemplate,
-        MidiDeviceSelections, MidiInputDevice, MidiInputEvent, MidiMixerControlMapping,
-        MidiMixerControlTarget, MidiOutputDevice, MidiVst3ParameterMapping,
-        MidiVst3ParameterTarget, PIANO_ROLL_RULER_HEIGHT, Pattern, PatternController, PatternNote,
-        PatternVst3ParameterLink, PianoRollChordStamp, PianoRollGrid, PianoRollScale,
-        PianoRollSnap, PlaylistClip, PlaylistClipDragKind, PlaylistTempoMap, PlaylistTrack,
-        PluginCandidate, PluginFormat, TimeSelectionShift, TouchGesture, TouchTapTracker,
-        TouchZoomConfig, WINDOW_LAYOUT_PRESETS_HEADER, WindowLayoutPreset,
-        audio_recording_start_tick_with_offset, built_in_midi_controller_templates,
-        candidate_live_mixer_send_key, candidate_matches_vst_identity, candidate_mixer_controls,
+        MainView, MidiAutomationRecording, MidiControlChangeMapping, MidiControllerCcBinding,
+        MidiControllerTemplate, MidiDeviceSelections, MidiInputDevice, MidiInputEvent,
+        MidiMixerControlMapping, MidiMixerControlTarget, MidiOutputDevice,
+        MidiVst3ParameterMapping, MidiVst3ParameterTarget, PIANO_ROLL_RULER_HEIGHT, Pattern,
+        PatternController, PatternNote, PatternVst3ParameterLink, PianoRollChordStamp,
+        PianoRollGrid, PianoRollScale, PianoRollSnap, PlaylistClip, PlaylistClipDragKind,
+        PlaylistTempoMap, PlaylistTrack, PluginCandidate, PluginFormat, TimeSelectionShift,
+        TouchGesture, TouchTapTracker, TouchZoomConfig, WINDOW_LAYOUT_PRESETS_HEADER,
+        WindowLayoutPreset, audio_recording_start_tick_with_offset,
+        built_in_midi_controller_templates, candidate_live_mixer_send_key,
+        candidate_matches_vst_identity, candidate_mixer_controls,
         candidate_mixer_stereo_separation, detect_chord_name, detect_piano_roll_channel_scale,
         detect_piano_roll_scale, encode_midi_device_id, encode_midi_device_selections,
         first_available_playlist_track, is_performance_clip_trigger_channel_event,
@@ -53342,17 +53624,18 @@ mod tests {
         playlist_pattern_clip_join_candidates, playlist_pattern_clip_split_supported,
         playlist_pattern_recording_placement_tick, playlist_seek_tick_to_frame,
         playlist_signature_at_tick, playlist_song_position_label, playlist_track_group_range,
-        playlist_track_is_hidden, recolor_piano_roll_notes, recording_input_targets,
-        remove_midi_vst3_parameter_mapping, remove_pattern_vst3_parameter_link,
-        sample_editor_selection_for_drag, serialize_midi_controller_templates,
-        serialize_midi_mixer_control_mappings, serialize_midi_vst3_parameter_mappings,
-        serialize_pattern_vst3_parameter_links, serialize_window_layout_presets,
-        should_auto_connect_midi_input, should_auto_connect_midi_output, snap_note_tick,
-        snap_piano_roll_key_to_scale, snap_recorded_midi_notes_to_scale,
-        toggle_piano_roll_note_group_selection, touch_pan_zoom_scroll_offset, track_two_finger_tap,
-        update_channel_rack_selection, update_layer_child_selection,
-        update_piano_roll_box_selection, upsert_midi_mixer_control_mapping,
-        upsert_midi_vst3_parameter_mapping, upsert_pattern_vst3_parameter_link, zoom_to_fit,
+        playlist_track_is_hidden, recolor_piano_roll_notes, record_pattern_controller_points,
+        recording_input_targets, remove_midi_vst3_parameter_mapping,
+        remove_pattern_vst3_parameter_link, sample_editor_selection_for_drag,
+        serialize_midi_controller_templates, serialize_midi_mixer_control_mappings,
+        serialize_midi_vst3_parameter_mappings, serialize_pattern_vst3_parameter_links,
+        serialize_window_layout_presets, should_auto_connect_midi_input,
+        should_auto_connect_midi_output, snap_note_tick, snap_piano_roll_key_to_scale,
+        snap_recorded_midi_notes_to_scale, toggle_piano_roll_note_group_selection,
+        touch_pan_zoom_scroll_offset, track_two_finger_tap, update_channel_rack_selection,
+        update_layer_child_selection, update_piano_roll_box_selection,
+        upsert_midi_mixer_control_mapping, upsert_midi_vst3_parameter_mapping,
+        upsert_pattern_vst3_parameter_link, zoom_to_fit,
     };
 
     fn mixer_send_route_fixture() -> FlpDocument {
@@ -54445,6 +54728,10 @@ mod tests {
             performance_channel: 6,
             record_audio: false,
             record_notes: true,
+            record_automation: true,
+            record_automation_controller: 74,
+            record_automation_channel: 240,
+            record_automation_flags: 129,
         };
         let encoded = encode_midi_device_selections(&selections);
 
@@ -54455,7 +54742,7 @@ mod tests {
     fn midi_device_selections_skip_malformed_or_unknown_entries() {
         assert_eq!(
             parse_midi_device_selections(
-                "input=0\noutput=xyz\nclock=invalid\nperformance_channel=16\nother=01\n"
+                "input=0\noutput=xyz\nclock=invalid\nperformance_channel=16\nrecord_automation_controller=128\nrecord_automation_channel=256\nrecord_automation_flags=-1\nother=01\n"
             ),
             MidiDeviceSelections::default()
         );
@@ -55393,25 +55680,92 @@ mod tests {
     #[test]
     fn recording_input_targets_follow_enabled_filters_and_available_inputs() {
         assert_eq!(
-            recording_input_targets(true, true, true, true),
-            (true, true)
+            recording_input_targets(true, true, true, true, true),
+            (true, true, true)
         );
         assert_eq!(
-            recording_input_targets(false, true, true, true),
-            (false, true)
+            recording_input_targets(false, true, true, true, true),
+            (false, true, true)
         );
         assert_eq!(
-            recording_input_targets(true, true, false, true),
-            (false, true)
+            recording_input_targets(true, true, true, false, true),
+            (false, true, true)
         );
         assert_eq!(
-            recording_input_targets(true, false, true, true),
-            (true, false)
+            recording_input_targets(true, true, true, true, false),
+            (true, false, false)
         );
         assert_eq!(
-            recording_input_targets(false, false, true, true),
-            (false, false)
+            recording_input_targets(false, false, false, true, true),
+            (false, false, false)
         );
+    }
+
+    #[test]
+    fn midi_automation_recording_normalizes_and_coalesces_cc_values() {
+        let mut recording = MidiAutomationRecording::new(74, (3, 0x91));
+        recording.record(0, 0);
+        recording.record(96, 64);
+        recording.record(96, 127);
+        recording.record(192, 127);
+        recording.record(288, 32);
+
+        assert_eq!(
+            recording.normalized_points(),
+            vec![(0, 0.0), (96, 1.0), (288, 32.0 / 127.0)]
+        );
+        assert!(!recording.overflowed);
+    }
+
+    #[test]
+    fn midi_automation_recording_sorts_out_of_order_timestamps() {
+        let mut recording = MidiAutomationRecording::new(1, (0, 0));
+        recording.record(288, 127);
+        recording.record(0, 0);
+        recording.record(96, 64);
+
+        assert_eq!(
+            recording.normalized_points(),
+            vec![(0, 0.0), (96, 64.0 / 127.0), (288, 1.0)]
+        );
+    }
+
+    #[test]
+    fn recording_midi_cc_creates_then_appends_to_raw_pattern_stream() {
+        let mut document = piano_roll_color_fixture();
+        let first_points = [(0, 0.25), (96, 0.75)];
+        assert_eq!(
+            record_pattern_controller_points(&mut document, 7, (3, 0x91), &first_points),
+            Ok(2)
+        );
+
+        let next_points = [(192, 0.5)];
+        assert_eq!(
+            record_pattern_controller_points(&mut document, 7, (3, 0x91), &next_points),
+            Ok(1)
+        );
+
+        let controllers = document
+            .patterns()
+            .unwrap()
+            .into_iter()
+            .find(|pattern| pattern.id == 7)
+            .unwrap()
+            .controllers;
+        let recorded = controllers
+            .iter()
+            .filter(|point| (point.channel, point.flags) == (3, 0x91))
+            .collect::<Vec<_>>();
+        assert_eq!(recorded.len(), 3);
+        assert_eq!(
+            recorded
+                .iter()
+                .map(|point| (point.position, point.value()))
+                .collect::<Vec<_>>(),
+            vec![(0, 0.25), (96, 0.75), (192, 0.5)]
+        );
+        let roundtrip = FlpDocument::parse(&document.encode_lossless().unwrap()).unwrap();
+        assert_eq!(roundtrip.patterns().unwrap()[0].controllers.len(), 3);
     }
 
     #[test]
