@@ -2207,6 +2207,33 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_bool(only_with_selection, "only with selection")?,
             )
         }
+        [command, input, output, pattern_id, channel_id, preset]
+            if command == "articulate-preset" =>
+        {
+            articulate_notes_with_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                None,
+                parse_articulate_preset(preset)?,
+                false,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, preset, note_indices]
+            if command == "articulate-selected-preset" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            articulate_notes_with_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Some(&note_indices),
+                parse_articulate_preset(preset)?,
+                false,
+            )
+        }
         [command, input, output, pattern_id, channel_id, period_ticks, trash_every,
             time_distortion, remove_short_notes, stretch_to_compensate]
             if command == "claw-notes" =>
@@ -3304,6 +3331,9 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild scale-levels-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <center:-100..100> <tension:-100..100> <multiplier:0..200> <offset:-100..100>\n",
             "  flp-rebuild articulate-notes <input.flp> <output.flp> <pattern-id> <channel-id> <multiplier:10..100> <variation:0..100> <seed> <use-original-lengths:0|1> <chop-chords:0|1>\n",
             "  flp-rebuild articulate-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <multiplier:10..100> <variation:0..100> <seed> <use-original-lengths:0|1> <chop-chords:0|1> <only-with-selection:0|1>\n",
+            "  flp-rebuild articulate-preset <input.flp> <output.flp> <pattern-id> <channel-id> <legato|portato|staccato|small-gap|chop-chords>\n",
+            "  flp-rebuild articulate-selected-preset <input.flp> <output.flp> <pattern-id> <channel-id> <legato|portato|staccato|small-gap|chop-chords> <note-indices:comma-separated-zero-based>\n",
+            "    Articulate presets use the Piano roll quick settings with variation disabled.\n",
             "  flp-rebuild claw-notes <input.flp> <output.flp> <pattern-id> <channel-id> <period-ticks:16+> <trash-every:2..16> <time-distortion:-100..100> <remove-short-notes:0|1> <stretch-to-compensate:0|1>\n",
             "  flp-rebuild claw-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <period-ticks:16+> <trash-every:2..16> <time-distortion:-100..100> <remove-short-notes:0|1> <stretch-to-compensate:0|1>\n",
             "  flp-rebuild add-note <input.flp> <output.flp> <pattern-id> <channel-id> <position> <length> <key> <velocity>\n",
@@ -3853,6 +3883,29 @@ fn parse_scale_name(value: &str) -> Result<&'static [u8], String> {
         "super-locrian-bb7" => Ok(&[0, 1, 3, 4, 6, 8, 9]),
         _ => Err("scale name must be major, major-locrian, harmonic-major, double-harmonic-major, ionian-sharp-5, ionian-sharp-2, ionian-sharp-2-sharp-6, ionian-augmented-sharp-2, dorian, dorian-b2, ukrainian-dorian-b2, dorian-sharp-4, dorian-b5, phrygian, phrygian-b4, ultraphrygian, ultraphrygian-bb3, phrygian-dominant, lydian, lydian-sharp-2, lydian-sharp-2-sharp-6, lydian-sharp-3-sharp-6, lydian-sharp-6, lydian-b3, lydian-augmented-sharp-2, lydian-augmented-sharp-3, lydian-augmented-sharp-6, lydian-augmented-dominant, lydian-augmented, lydian-dominant, lydian-dominant-b6, mixolydian, mixolydian-augmented, mixolydian-augmented-sharp-2, mixolydian-b2, mixolydian-b6, natural-minor, locrian, locrian-dominant, locrian-natural-2, locrian-natural-6, locrian-bb7, locrian-bb3-bb7, ultra-locrian-bb3, harmonic-minor, harmonic-minor-b5, melodic-minor, melodic-minor-sharp-5, neapolitan-minor, neapolitan-minor-sharp-4, romanian-minor, neapolitan-major, hungarian-minor, hungarian-major, hungarian-major-mode-2, chromatic-hypophrygian-inverse, persian, oriental, blues, major-pentatonic, minor-pentatonic, whole-tone, whole-half-diminished, half-whole-diminished, half-diminished-b4, altered, altered-dominant-natural-6, altered-dominant-bb3, or super-locrian-bb7".to_owned()),
     }
+}
+
+fn parse_articulate_preset(value: &str) -> Result<ArticulateOptions, String> {
+    let (multiplier_percent, use_original_lengths, chop_chords) = match value {
+        "legato" => (100, false, false),
+        "portato" => (90, false, false),
+        "staccato" => (50, true, false),
+        "small-gap" => (98, false, false),
+        "chop-chords" => (100, true, true),
+        _ => {
+            return Err(
+                "Articulate preset must be legato, portato, staccato, small-gap, or chop-chords"
+                    .to_owned(),
+            );
+        }
+    };
+    Ok(ArticulateOptions {
+        multiplier_percent,
+        variation_percent: 0,
+        seed: 1,
+        use_original_lengths,
+        chop_chords,
+    })
 }
 
 fn parse_arpeggio_range_pattern(value: &str) -> Result<ArpeggioRangePattern, String> {
