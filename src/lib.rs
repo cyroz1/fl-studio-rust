@@ -461,6 +461,7 @@ pub struct ChannelSummary {
     keyboard_main_pitch: Option<bool>,
     keyboard_add_root: Option<bool>,
     keyboard_key_region: Option<(u32, u32)>,
+    stretch_settings: Option<ChannelStretchSettings>,
     ping_pong_loop: bool,
     swing_mix: Option<u16>,
     group_number: Option<i32>,
@@ -503,6 +504,83 @@ pub struct ChannelLevelAdjustmentsEdit {
     pub mod_y_raw: Option<i32>,
 }
 
+/// Raw time-stretch settings from the channel Parameters (`0xC7`) payload.
+///
+/// The four values are retained in FL Studio's stored units. Their field offsets and
+/// stretch-mode codes follow the independently documented PyFLP channel layout; this
+/// project does not yet apply them during audio playback or rendering.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChannelStretchSettings {
+    time_raw: u32,
+    pitch_raw: i32,
+    multiplier_raw: i32,
+    mode_raw: i32,
+}
+
+/// Raw time-stretch fields that can be changed on an existing channel Parameters event.
+/// Fields set to `None` remain unchanged. The edit requires one unambiguous Parameters
+/// event containing all four fields.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ChannelStretchSettingsEdit {
+    pub time_raw: Option<u32>,
+    pub pitch_raw: Option<i32>,
+    pub multiplier_raw: Option<i32>,
+    pub mode_raw: Option<i32>,
+}
+
+/// Known FL Studio sample time-stretch modes stored in Channel Parameters.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChannelStretchMode {
+    Stretch,
+    Resample,
+    Elastique3Generic,
+    Elastique3Mono,
+    SliceStretch,
+    SliceMap,
+    Auto,
+    Elastique2Generic,
+    Elastique2Transient,
+    Elastique2Mono,
+    Elastique2Speech,
+    Unknown(i32),
+}
+
+impl ChannelStretchMode {
+    pub fn from_raw(raw: i32) -> Self {
+        match raw {
+            -1 => Self::Stretch,
+            0 => Self::Resample,
+            1 => Self::Elastique3Generic,
+            2 => Self::Elastique3Mono,
+            3 => Self::SliceStretch,
+            4 => Self::SliceMap,
+            5 => Self::Auto,
+            6 => Self::Elastique2Generic,
+            7 => Self::Elastique2Transient,
+            8 => Self::Elastique2Mono,
+            9 => Self::Elastique2Speech,
+            other => Self::Unknown(other),
+        }
+    }
+
+    pub fn raw(self) -> i32 {
+        match self {
+            Self::Stretch => -1,
+            Self::Resample => 0,
+            Self::Elastique3Generic => 1,
+            Self::Elastique3Mono => 2,
+            Self::SliceStretch => 3,
+            Self::SliceMap => 4,
+            Self::Auto => 5,
+            Self::Elastique2Generic => 6,
+            Self::Elastique2Transient => 7,
+            Self::Elastique2Mono => 8,
+            Self::Elastique2Speech => 9,
+            Self::Unknown(raw) => raw,
+        }
+    }
+}
+
 impl ChannelLevelAdjustments {
     fn decode(payload: &[u8]) -> Option<Self> {
         (payload.len() >= 20).then(|| Self {
@@ -534,6 +612,28 @@ impl ChannelLevelAdjustments {
 
     pub fn mod_y_raw(&self) -> i32 {
         self.mod_y
+    }
+}
+
+impl ChannelStretchSettings {
+    pub fn time_raw(&self) -> u32 {
+        self.time_raw
+    }
+
+    pub fn pitch_raw(&self) -> i32 {
+        self.pitch_raw
+    }
+
+    pub fn multiplier_raw(&self) -> i32 {
+        self.multiplier_raw
+    }
+
+    pub fn mode_raw(&self) -> i32 {
+        self.mode_raw
+    }
+
+    pub fn mode(&self) -> ChannelStretchMode {
+        ChannelStretchMode::from_raw(self.mode_raw)
     }
 }
 
@@ -763,6 +863,12 @@ impl ChannelSummary {
     /// Missing Parameters data defaults to disabled.
     pub fn keyboard_add_to_key_enabled(&self) -> bool {
         self.keyboard_add_root.unwrap_or(false)
+    }
+
+    /// Raw per-channel stretching values from the unique, sufficiently long Parameters event.
+    /// Returns `None` when no decoded event contains all four fields.
+    pub fn stretch_settings(&self) -> Option<ChannelStretchSettings> {
+        self.stretch_settings
     }
 
     /// Returns the project's pitch offset for this channel, or zero when the channel is not
@@ -4143,6 +4249,30 @@ impl FlpDocument {
                 0xC7 if matches!(event.encoding, PayloadEncoding::Data { .. })
                     && ascii_version(&event.payload).is_none() =>
                 {
+                    if event.payload.len() >= 116 && channel.stretch_settings.is_none() {
+                        channel.stretch_settings = Some(ChannelStretchSettings {
+                            time_raw: u32::from_le_bytes(
+                                event.payload[100..104]
+                                    .try_into()
+                                    .expect("the stretch-time field has four bytes"),
+                            ),
+                            pitch_raw: i32::from_le_bytes(
+                                event.payload[104..108]
+                                    .try_into()
+                                    .expect("the stretch-pitch field has four bytes"),
+                            ),
+                            multiplier_raw: i32::from_le_bytes(
+                                event.payload[108..112]
+                                    .try_into()
+                                    .expect("the stretch-multiplier field has four bytes"),
+                            ),
+                            mode_raw: i32::from_le_bytes(
+                                event.payload[112..116]
+                                    .try_into()
+                                    .expect("the stretch-mode field has four bytes"),
+                            ),
+                        });
+                    }
                     if event.payload.len() >= 76 && channel.keyboard_key_region.is_none() {
                         let low = u32::from_le_bytes(
                             event.payload[68..72]
@@ -16640,6 +16770,94 @@ impl FlpDocument {
         Ok(())
     }
 
+    /// Edits raw time-stretch settings in an existing channel Parameters (`0xC7`) event.
+    ///
+    /// The 32-bit fields at payload offsets 100, 104, 108, and 112 are preserved unless
+    /// selected. The edit requires a unique Parameters event of at least 116 bytes and
+    /// does not create missing state or change audio playback behavior.
+    pub fn edit_channel_stretch_settings(
+        &mut self,
+        channel_id: u16,
+        edit: ChannelStretchSettingsEdit,
+    ) -> Result<(), FlpError> {
+        if edit.time_raw.is_none()
+            && edit.pitch_raw.is_none()
+            && edit.multiplier_raw.is_none()
+            && edit.mode_raw.is_none()
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "at least one time-stretch field must be supplied",
+            ));
+        }
+        if edit.mode_raw.is_some_and(|raw| {
+            matches!(
+                ChannelStretchMode::from_raw(raw),
+                ChannelStretchMode::Unknown(_)
+            )
+        }) {
+            return Err(FlpError::UnsupportedEdit(
+                "the time-stretch mode must be a documented value from -1 through 9",
+            ));
+        }
+
+        self.require_unique_channel(channel_id)?;
+        let channel = self
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id() == channel_id)
+            .expect("the unique channel was checked above");
+        if !matches!(channel.kind, Some(0 | 2 | 4)) {
+            return Err(FlpError::UnsupportedEdit(
+                "time-stretch settings can only be edited on Sampler, Native instrument, or Audio Clip channels",
+            ));
+        }
+
+        let c7_events = channel
+            .event_range()
+            .filter(|index| self.events[*index].opcode == 0xC7)
+            .collect::<Vec<_>>();
+        let mut parameter_events = c7_events.iter().copied().filter(|index| {
+            matches!(self.events[*index].encoding, PayloadEncoding::Data { .. })
+                && ascii_version(&self.events[*index].payload).is_none()
+        });
+        let parameters_index = parameter_events.next();
+        if parameter_events.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel has multiple Parameters (`0xC7`) events",
+            ));
+        }
+        let Some(parameters_index) = parameters_index else {
+            return Err(FlpError::UnsupportedEdit(if c7_events.is_empty() {
+                "the selected channel has no existing Parameters (`0xC7`) event"
+            } else {
+                "the selected channel's `0xC7` event is not a recognized Parameters payload"
+            }));
+        };
+        if self.events[parameters_index].payload.len() < 116 {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel's Parameters event does not contain all time-stretch fields",
+            ));
+        }
+
+        let mut candidate = self.clone();
+        let mut payload = candidate.events[parameters_index].payload.clone();
+        if let Some(time_raw) = edit.time_raw {
+            payload[100..104].copy_from_slice(&time_raw.to_le_bytes());
+        }
+        if let Some(pitch_raw) = edit.pitch_raw {
+            payload[104..108].copy_from_slice(&pitch_raw.to_le_bytes());
+        }
+        if let Some(multiplier_raw) = edit.multiplier_raw {
+            payload[108..112].copy_from_slice(&multiplier_raw.to_le_bytes());
+        }
+        if let Some(mode_raw) = edit.mode_raw {
+            payload[112..116].copy_from_slice(&mode_raw.to_le_bytes());
+        }
+        candidate.events[parameters_index].replace_data_payload(payload)?;
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
     /// Sets the per-channel multiplier for Channel Rack swing in FL's 0..=128 range.
     /// The `0x61` word event defaults to 128 (100%) when absent. Sampler and Native instrument (generator)
     /// channels can be edited; audio, Layer, Automation, and unknown channel types are not supported.
@@ -18765,9 +18983,10 @@ fn decode_vst_text(bytes: &[u8]) -> Option<String> {
 mod tests {
     use super::{
         ArticulateOptions, ChannelGroupSummary, ChannelLevelAdjustmentsEdit, ChannelNoteRouter,
-        ChannelSortOrder, ChannelSummary, ClawMachineOptions, FlpDocument, FlpError, FlpEvent,
-        FstPreset, FstPresetKind, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit,
-        MixerInsertSummary, MixerLiveInsertEnabledGain, MixerLiveSendGain, MixerLiveSendOutputPath,
+        ChannelSortOrder, ChannelStretchMode, ChannelStretchSettingsEdit, ChannelSummary,
+        ClawMachineOptions, FlpDocument, FlpError, FlpEvent, FstPreset, FstPresetKind,
+        LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerInsertSummary,
+        MixerLiveInsertEnabledGain, MixerLiveSendGain, MixerLiveSendOutputPath,
         MixerLiveSendTargetKey, MixerParameterKind, MixerParameterRecord, MixerRouteAudibility,
         MixerSendSummary, MixerSourceRouteTransform, PATTERN_NOTE_DEFAULT_FLAGS,
         PATTERN_NOTE_SLIDE_FLAG, PLAYLIST_CLIP_MUTED_FLAG, PatternController,
@@ -23815,6 +24034,122 @@ mod tests {
         let short_document = FlpDocument::parse(&flp_fixture(&short_event_stream, &[], &[]))
             .expect("short parameters fixture should parse");
         assert_eq!(short_document.channels()[0].keyboard_key_region(), None);
+    }
+
+    #[test]
+    fn decodes_and_edits_channel_time_stretch_settings_losslessly() {
+        let mut parameters = vec![0xA5; 168];
+        parameters[100..104].copy_from_slice(&0x1234_5678_u32.to_le_bytes());
+        parameters[104..108].copy_from_slice(&(-1200_i32).to_le_bytes());
+        parameters[108..112].copy_from_slice(&1250_i32.to_le_bytes());
+        parameters[112..116].copy_from_slice(&1_i32.to_le_bytes());
+        let mut event_stream = vec![0x40, 7, 0, 0x15, 0];
+        append_data_event(&mut event_stream, 0xC7, &parameters);
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        let input = flp_fixture(&event_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+
+        let settings = document.channels()[0]
+            .stretch_settings()
+            .expect("full Time Stretching fields should decode");
+        assert_eq!(settings.time_raw(), 0x1234_5678);
+        assert_eq!(settings.pitch_raw(), -1200);
+        assert_eq!(settings.multiplier_raw(), 1250);
+        assert_eq!(settings.mode_raw(), 1);
+        assert_eq!(settings.mode(), ChannelStretchMode::Elastique3Generic);
+        assert_eq!(document.encode_lossless().unwrap(), input);
+
+        let mut expected_parameters = parameters.clone();
+        expected_parameters[100..104].copy_from_slice(&192_u32.to_le_bytes());
+        expected_parameters[104..108].copy_from_slice(&300_i32.to_le_bytes());
+        expected_parameters[108..112].copy_from_slice(&(-250_i32).to_le_bytes());
+        expected_parameters[112..116].copy_from_slice(&0_i32.to_le_bytes());
+        document
+            .edit_channel_stretch_settings(
+                7,
+                ChannelStretchSettingsEdit {
+                    time_raw: Some(192),
+                    pitch_raw: Some(300),
+                    multiplier_raw: Some(-250),
+                    mode_raw: Some(0),
+                },
+            )
+            .expect("existing stretch settings should be editable");
+        let edited_event = document
+            .events()
+            .iter()
+            .find(|event| event.opcode() == 0xC7)
+            .expect("Parameters event should remain present");
+        assert_eq!(edited_event.payload(), expected_parameters);
+        assert_eq!(
+            document.channels()[0].stretch_settings().unwrap().mode(),
+            ChannelStretchMode::Resample
+        );
+        let encoded = document
+            .encode_lossless()
+            .expect("edited project should encode");
+        let reopened = FlpDocument::parse(&encoded).expect("edited project should reopen");
+        assert_eq!(reopened.channels(), document.channels());
+    }
+
+    #[test]
+    fn time_stretch_editor_rejects_missing_short_ambiguous_and_unknown_settings() {
+        let edit = ChannelStretchSettingsEdit {
+            mode_raw: Some(0),
+            ..ChannelStretchSettingsEdit::default()
+        };
+
+        let missing_bytes = flp_fixture(&[0x40, 7, 0, 0x15, 0, 0x62, 0, 0], &[], &[]);
+        let mut missing = FlpDocument::parse(&missing_bytes).expect("fixture should parse");
+        let before = missing.clone();
+        assert!(matches!(
+            missing.edit_channel_stretch_settings(7, edit),
+            Err(FlpError::UnsupportedEdit(_))
+        ));
+        assert_eq!(missing, before);
+
+        let mut short_stream = vec![0x40, 7, 0, 0x15, 0];
+        append_data_event(&mut short_stream, 0xC7, &[0; 115]);
+        short_stream.extend_from_slice(&[0x62, 0, 0]);
+        let mut short = FlpDocument::parse(&flp_fixture(&short_stream, &[], &[]))
+            .expect("short fixture should parse");
+        let before = short.clone();
+        assert!(matches!(
+            short.edit_channel_stretch_settings(7, edit),
+            Err(FlpError::UnsupportedEdit(_))
+        ));
+        assert_eq!(short, before);
+
+        let mut duplicate_stream = vec![0x40, 7, 0, 0x15, 0];
+        append_data_event(&mut duplicate_stream, 0xC7, &[0; 116]);
+        append_data_event(&mut duplicate_stream, 0xC7, &[0; 116]);
+        duplicate_stream.extend_from_slice(&[0x62, 0, 0]);
+        let mut duplicate = FlpDocument::parse(&flp_fixture(&duplicate_stream, &[], &[]))
+            .expect("duplicate fixture should parse");
+        let before = duplicate.clone();
+        assert!(matches!(
+            duplicate.edit_channel_stretch_settings(7, edit),
+            Err(FlpError::UnsupportedEdit(_))
+        ));
+        assert_eq!(duplicate, before);
+
+        let mut full_stream = vec![0x40, 7, 0, 0x15, 0];
+        append_data_event(&mut full_stream, 0xC7, &[0; 116]);
+        full_stream.extend_from_slice(&[0x62, 0, 0]);
+        let mut unknown_mode = FlpDocument::parse(&flp_fixture(&full_stream, &[], &[]))
+            .expect("full fixture should parse");
+        let before = unknown_mode.clone();
+        assert!(matches!(
+            unknown_mode.edit_channel_stretch_settings(
+                7,
+                ChannelStretchSettingsEdit {
+                    mode_raw: Some(10),
+                    ..ChannelStretchSettingsEdit::default()
+                }
+            ),
+            Err(FlpError::UnsupportedEdit(_))
+        ));
+        assert_eq!(unknown_mode, before);
     }
 
     #[test]

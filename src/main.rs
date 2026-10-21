@@ -15,13 +15,13 @@ use flp_rebuild::sample_render::{
 use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions};
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, ArticulateOptions, AutomationPointEdit,
-    ChannelLevelAdjustmentsEdit, ChannelSortOrder, ClawMachineOptions, FlamOptions, FlpDocument,
-    FstPreset, HumanizerOptions, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit,
-    PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation, PlaylistClipEdit,
-    PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit,
-    ProjectSettingsEdit, QuantizeNoteMode, QuantizeNoteOptions, RandomNoteChordMap,
-    RandomNoteGeneratorOptions, RandomizerOptions, RiffMachineOptions, RiffMachineQuantizeMode,
-    ScaleLevelsOptions, StrumOptions, TimeMarkerEdit,
+    ChannelLevelAdjustmentsEdit, ChannelSortOrder, ChannelStretchSettingsEdit, ClawMachineOptions,
+    FlamOptions, FlpDocument, FstPreset, HumanizerOptions, LimitNoteOptions, LimitSnapDirection,
+    MixerInsertEdit, PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation,
+    PlaylistClipEdit, PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress,
+    PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit, QuantizeNoteMode, QuantizeNoteOptions,
+    RandomNoteChordMap, RandomNoteGeneratorOptions, RandomizerOptions, RiffMachineOptions,
+    RiffMachineQuantizeMode, ScaleLevelsOptions, StrumOptions, TimeMarkerEdit,
 };
 
 struct MidiControlChangeImport<'a> {
@@ -726,6 +726,24 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 Path::new(output),
                 parse_u16(channel_id, "channel id")?,
                 parse_mixer_track(mixer_track)?,
+            )
+        }
+        [command, input, output, channel_id, time_raw, pitch_raw, multiplier_raw, mode_raw]
+            if command == "edit-channel-stretch-settings" =>
+        {
+            edit_channel_stretch_settings(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(channel_id, "channel id")?,
+                ChannelStretchSettingsEdit {
+                    time_raw: parse_optional_u32(time_raw, "stretch time raw")?,
+                    pitch_raw: parse_optional_i32(pitch_raw, "stretch pitch raw")?,
+                    multiplier_raw: parse_optional_i32(
+                        multiplier_raw,
+                        "stretch multiplier raw",
+                    )?,
+                    mode_raw: parse_optional_i32(mode_raw, "stretch mode raw")?,
+                },
             )
         }
         [command, input, output, channel_id, volume, pan] if command == "set-channel-levels" => {
@@ -3206,6 +3224,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild set-channel-main-pitch <input.flp> <output.flp> <channel-id> <0|1>\n",
             "  flp-rebuild set-channel-add-to-key <input.flp> <output.flp> <channel-id> <0|1>\n",
             "  flp-rebuild set-channel-mixer-track <input.flp> <output.flp> <channel-id> <mixer-track:-1=Current|0=Master|1..127=insert>\n",
+            "  flp-rebuild edit-channel-stretch-settings <input.flp> <output.flp> <channel-id> <time-raw|-> <pitch-raw|-> <multiplier-raw|-> <mode:-1..9|->\n",
             "  flp-rebuild edit-channel-level-adjustments <input.flp> <output.flp> <channel-id> <event-index> <pan-raw|-> <volume-raw|-> <mod-x-raw|-> <mod-y-raw|->\n",
             "  flp-rebuild set-channel-swing <input.flp> <output.flp> <channel-id> <percent-0..100>\n",
             "  flp-rebuild set-layer-children <input.flp> <output.flp> <layer-channel-id> <child-ids-comma-separated|->\n",
@@ -4816,7 +4835,7 @@ fn list_channels(path: &Path) -> Result<(), String> {
     println!("channels: {}", channels.len());
     for channel in channels {
         println!(
-            "id={} kind={} type={:?} enabled={} zipped={} main_pitch={} add_to_key={} color={:?} volume={:?} pan={:?} level_adjusts_raw={:?} swing_mix_raw={:?} layer_children={:?} layer_flags={:?} plugin={} name={} sample_path={:?} events={:?}",
+            "id={} kind={} type={:?} enabled={} zipped={} main_pitch={} add_to_key={} stretch_settings={:?} color={:?} volume={:?} pan={:?} level_adjusts_raw={:?} swing_mix_raw={:?} layer_children={:?} layer_flags={:?} plugin={} name={} sample_path={:?} events={:?}",
             channel.id(),
             channel
                 .kind()
@@ -4828,6 +4847,7 @@ fn list_channels(path: &Path) -> Result<(), String> {
             channel.zipped(),
             channel.keyboard_main_pitch_enabled(),
             channel.keyboard_add_to_key_enabled(),
+            channel.stretch_settings(),
             channel.color(),
             channel.volume(),
             channel.pan(),
@@ -6111,6 +6131,28 @@ fn set_channel_mixer_track(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "routed channel {channel_id} to Mixer track {mixer_track} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn edit_channel_stretch_settings(
+    input: &Path,
+    output: &Path,
+    channel_id: u16,
+    edit: ChannelStretchSettingsEdit,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .edit_channel_stretch_settings(channel_id, edit)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "edited channel {channel_id} time-stretch settings in {}",
         output.display()
     );
     Ok(())
