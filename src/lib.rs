@@ -1297,11 +1297,36 @@ pub struct PatternNoteEdit {
     pub mod_y: Option<u8>,
 }
 
+/// Direction used by the Riff Machine's built-in arpeggiation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArpeggioDirection {
     Up,
     Down,
     UpDown,
+}
+
+/// Pitch traversal used by the Piano roll Arpeggiator's Range Pattern setting.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArpeggioRangePattern {
+    /// Repeat the range from low to high.
+    Up,
+    /// Repeat the range from high to low.
+    Down,
+    /// Traverse low to high, then back down without repeating the endpoints.
+    UpDown,
+    /// Traverse low to high and high to low, repeating both turning notes.
+    Alternate,
+}
+
+/// Event that ends a repeated Piano roll arpeggio pass.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArpeggioSyncMode {
+    /// Apply one arpeggio pass without repeating it.
+    Time,
+    /// Repeat until every note in the source chord has ended.
+    Block,
+    /// Repeat until the first note in the source chord ends.
+    Chord,
 }
 
 /// Direction used when a limited pitch needs to move onto a selected scale.
@@ -1358,7 +1383,8 @@ pub struct ArpeggioOptions {
     pub step_ticks: u32,
     pub range_octaves: u8,
     pub gate_percent: u8,
-    pub direction: ArpeggioDirection,
+    pub range_pattern: ArpeggioRangePattern,
+    pub sync: ArpeggioSyncMode,
 }
 
 /// Timing mode for the Riff Machine's Groove stage.
@@ -11553,7 +11579,8 @@ impl FlpDocument {
             step_ticks,
             range_octaves,
             gate_percent,
-            direction,
+            range_pattern,
+            sync,
         } = options;
         if step_ticks == 0 {
             return Err(FlpError::UnsupportedEdit(
@@ -11605,24 +11632,16 @@ impl FlpDocument {
             if chord.len() < 2 {
                 continue;
             }
-            let end = group
+            let block_end = group
                 .iter()
                 .map(|(_, note)| u64::from(note.position) + u64::from(note.length))
                 .max()
                 .unwrap_or(u64::from(onset));
-            let duration = end.saturating_sub(u64::from(onset));
-            if duration == 0 {
-                continue;
-            }
-            remove_indices.extend(group.iter().map(|(note_index, _)| *note_index));
-            let step_count = duration.div_ceil(u64::from(step_ticks));
-            if step_count > 1_000_000
-                || additions.len().saturating_add(step_count as usize) > 1_000_000
-            {
-                return Err(FlpError::UnsupportedEdit(
-                    "arpeggiator would create more than one million notes",
-                ));
-            }
+            let chord_end = group
+                .iter()
+                .map(|(_, note)| u64::from(note.position) + u64::from(note.length))
+                .min()
+                .unwrap_or(u64::from(onset));
 
             let mut pitches = Vec::with_capacity(chord.len() * usize::from(range_octaves));
             for octave in 0..range_octaves {
@@ -11638,12 +11657,42 @@ impl FlpDocument {
                     pitches.push(pitch);
                 }
             }
-            if direction == ArpeggioDirection::Down {
+            if range_pattern == ArpeggioRangePattern::Down {
                 pitches.reverse();
             }
             let mut order = (0..pitches.len()).collect::<Vec<_>>();
-            if direction == ArpeggioDirection::UpDown && pitches.len() > 2 {
-                order.extend((1..pitches.len() - 1).rev());
+            match range_pattern {
+                ArpeggioRangePattern::UpDown if pitches.len() > 2 => {
+                    order.extend((1..pitches.len() - 1).rev());
+                }
+                ArpeggioRangePattern::Alternate => {
+                    order.extend((0..pitches.len()).rev());
+                }
+                _ => {}
+            }
+            let block_duration = block_end.saturating_sub(u64::from(onset));
+            let duration = match sync {
+                ArpeggioSyncMode::Time => {
+                    let cycle_steps =
+                        u64::try_from(order.len()).map_err(|_| FlpError::LengthOverflow)?;
+                    u64::from(step_ticks)
+                        .checked_mul(cycle_steps)
+                        .ok_or(FlpError::LengthOverflow)?
+                }
+                ArpeggioSyncMode::Block => block_duration,
+                ArpeggioSyncMode::Chord => chord_end.saturating_sub(u64::from(onset)),
+            };
+            if duration == 0 {
+                continue;
+            }
+            remove_indices.extend(group.iter().map(|(note_index, _)| *note_index));
+            let step_count = duration.div_ceil(u64::from(step_ticks));
+            if step_count > 1_000_000
+                || additions.len().saturating_add(step_count as usize) > 1_000_000
+            {
+                return Err(FlpError::UnsupportedEdit(
+                    "arpeggiator would create more than one million notes",
+                ));
             }
             let note_length = (u64::from(step_ticks) * u64::from(gate_percent) / 100).max(1);
             for step_index in 0..step_count {
@@ -11891,7 +11940,12 @@ impl FlpDocument {
                 step_ticks: options.step_ticks,
                 range_octaves: options.range_octaves,
                 gate_percent: options.gate_percent,
-                direction: options.direction,
+                range_pattern: match options.direction {
+                    ArpeggioDirection::Up => ArpeggioRangePattern::Up,
+                    ArpeggioDirection::Down => ArpeggioRangePattern::Down,
+                    ArpeggioDirection::UpDown => ArpeggioRangePattern::UpDown,
+                },
+                sync: ArpeggioSyncMode::Block,
             },
         )?;
         if arpeggiated == 0 {
@@ -19001,20 +19055,21 @@ fn decode_vst_text(bytes: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArticulateOptions, ChannelGroupSummary, ChannelLevelAdjustmentsEdit, ChannelNoteRouter,
-        ChannelSortOrder, ChannelStretchMode, ChannelStretchSettingsEdit, ChannelSummary,
-        ClawMachineOptions, FlpDocument, FlpError, FlpEvent, FstPreset, FstPresetKind,
-        LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerInsertSummary,
-        MixerLiveInsertEnabledGain, MixerLiveSendGain, MixerLiveSendOutputPath,
-        MixerLiveSendTargetKey, MixerParameterKind, MixerParameterRecord, MixerRouteAudibility,
-        MixerSendSummary, MixerSourceRouteTransform, PATTERN_NOTE_DEFAULT_FLAGS,
-        PATTERN_NOTE_SLIDE_FLAG, PLAYLIST_CLIP_MUTED_FLAG, PatternController,
-        PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation, PayloadEncoding,
-        PlaylistClipEdit, PlaylistClipTarget, PlaylistTrackEdit, PlaylistTrackMotion,
-        PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit,
-        RandomizerOptions, RiffMachineOptions, RiffMachineQuantizeMode, ScaleLevelsOptions,
-        TimeMarkerEdit, apply_mixer_pan, apply_mixer_stereo_separation, midi::MidiChannelMapping,
-        midi::MidiEventKind, midi::MidiFile, midi::MidiImportOptions, note_pitch_in_scale,
+        ArpeggioOptions, ArpeggioRangePattern, ArpeggioSyncMode, ArticulateOptions,
+        ChannelGroupSummary, ChannelLevelAdjustmentsEdit, ChannelNoteRouter, ChannelSortOrder,
+        ChannelStretchMode, ChannelStretchSettingsEdit, ChannelSummary, ClawMachineOptions,
+        FlpDocument, FlpError, FlpEvent, FstPreset, FstPresetKind, LimitNoteOptions,
+        LimitSnapDirection, MixerInsertEdit, MixerInsertSummary, MixerLiveInsertEnabledGain,
+        MixerLiveSendGain, MixerLiveSendOutputPath, MixerLiveSendTargetKey, MixerParameterKind,
+        MixerParameterRecord, MixerRouteAudibility, MixerSendSummary, MixerSourceRouteTransform,
+        PATTERN_NOTE_DEFAULT_FLAGS, PATTERN_NOTE_SLIDE_FLAG, PLAYLIST_CLIP_MUTED_FLAG,
+        PatternController, PatternControllerEdit, PatternNote, PatternNoteEdit,
+        PatternNoteRotation, PayloadEncoding, PlaylistClipEdit, PlaylistClipTarget,
+        PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync,
+        ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions, RiffMachineOptions,
+        RiffMachineQuantizeMode, ScaleLevelsOptions, TimeMarkerEdit, apply_mixer_pan,
+        apply_mixer_stereo_separation, midi::MidiChannelMapping, midi::MidiEventKind,
+        midi::MidiFile, midi::MidiImportOptions, note_pitch_in_scale,
         parse_vst_plugin_state_metadata, riff_machine_groove_note_timing,
     };
 
@@ -26544,6 +26599,124 @@ mod tests {
             )
             .expect("centered multiply should scale around its pivot");
         assert_eq!(centered.patterns().unwrap()[0].notes[0].velocity, 65);
+    }
+
+    #[test]
+    fn arpeggiator_sync_modes_control_repetitions_and_chord_end() {
+        let input = pattern_fixture(
+            &[
+                note_record(0, 0, 48, 60, 100),
+                note_record(0, 0, 120, 64, 90),
+                note_record(0, 0, 120, 67, 80),
+            ],
+            &[0xFF, 0],
+        );
+        for (sync, expected_positions) in [
+            (ArpeggioSyncMode::Time, vec![0, 24, 48]),
+            (ArpeggioSyncMode::Block, vec![0, 24, 48, 72, 96]),
+            (ArpeggioSyncMode::Chord, vec![0, 24]),
+        ] {
+            let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+            let created = document
+                .arpeggiate_pattern_notes(
+                    7,
+                    0,
+                    ArpeggioOptions {
+                        step_ticks: 24,
+                        range_octaves: 1,
+                        gate_percent: 100,
+                        range_pattern: ArpeggioRangePattern::Up,
+                        sync,
+                    },
+                )
+                .expect("sync mode should generate an arpeggio");
+            let notes = document.patterns().unwrap().remove(0).notes;
+            let generated_positions = notes
+                .iter()
+                .filter(|note| note.channel_id == 0)
+                .map(|note| note.position)
+                .collect::<Vec<_>>();
+            assert_eq!(created, expected_positions.len());
+            assert_eq!(generated_positions, expected_positions);
+        }
+    }
+
+    #[test]
+    fn arpeggiator_time_sync_completes_one_pass_for_short_chords() {
+        let input = pattern_fixture(
+            &[
+                note_record(0, 0, 48, 60, 100),
+                note_record(0, 0, 48, 64, 90),
+                note_record(0, 0, 48, 67, 80),
+            ],
+            &[0xFF, 0],
+        );
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+        let created = document
+            .arpeggiate_pattern_notes(
+                7,
+                0,
+                ArpeggioOptions {
+                    step_ticks: 24,
+                    range_octaves: 1,
+                    gate_percent: 100,
+                    range_pattern: ArpeggioRangePattern::Up,
+                    sync: ArpeggioSyncMode::Time,
+                },
+            )
+            .expect("Time sync should complete its one-pass loop");
+
+        let notes = document.patterns().unwrap().remove(0).notes;
+        let generated_positions = notes
+            .iter()
+            .filter(|note| note.channel_id == 0)
+            .map(|note| note.position)
+            .collect::<Vec<_>>();
+        assert_eq!(created, 3);
+        assert_eq!(generated_positions, vec![0, 24, 48]);
+    }
+
+    #[test]
+    fn arpeggiator_alternate_range_pattern_repeats_turning_notes() {
+        let input = pattern_fixture(
+            &[
+                note_record(0, 0, 144, 60, 100),
+                note_record(0, 0, 144, 64, 90),
+                note_record(0, 0, 144, 67, 80),
+            ],
+            &[0xFF, 0],
+        );
+        for (range_pattern, expected_keys) in [
+            (ArpeggioRangePattern::UpDown, vec![60, 64, 67, 64]),
+            (
+                ArpeggioRangePattern::Alternate,
+                vec![60, 64, 67, 67, 64, 60],
+            ),
+        ] {
+            let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+            let created = document
+                .arpeggiate_pattern_notes(
+                    7,
+                    0,
+                    ArpeggioOptions {
+                        step_ticks: 24,
+                        range_octaves: 1,
+                        gate_percent: 100,
+                        range_pattern,
+                        sync: ArpeggioSyncMode::Time,
+                    },
+                )
+                .expect("range pattern should generate a riff");
+
+            let notes = document.patterns().unwrap().remove(0).notes;
+            let generated_keys = notes
+                .iter()
+                .filter(|note| note.channel_id == 0)
+                .map(|note| note.key)
+                .collect::<Vec<_>>();
+            assert_eq!(created, expected_keys.len());
+            assert_eq!(generated_keys, expected_keys);
+        }
     }
 
     #[test]

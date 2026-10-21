@@ -57,12 +57,13 @@ use flp_rebuild::vst3::{
     Vst3PlaylistLiveInputSender, Vst3PlaylistLiveInputSession, Vst3PlaylistStreamProcessor,
 };
 use flp_rebuild::{
-    ArpeggioDirection, ArpeggioOptions, Arrangement, ArticulateOptions, AutomationChannel,
-    AutomationPoint, AutomationPointEdit, ChannelGroupSummary, ChannelSortOrder,
-    ChannelStretchMode, ChannelStretchSettingsEdit, ChannelSummary, ChannelType,
-    ClawMachineOptions, FlamOptions, FlpDocument, FlpError, FstPreset, FstPresetKind,
-    HumanizerOptions, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerInsertSummary,
-    MixerParameterKind, MixerParameterRecord, MixerSendSummary, PATTERN_NOTE_DEFAULT_FLAGS,
+    ArpeggioDirection, ArpeggioOptions, ArpeggioRangePattern, ArpeggioSyncMode, Arrangement,
+    ArticulateOptions, AutomationChannel, AutomationPoint, AutomationPointEdit,
+    ChannelGroupSummary, ChannelNoteRouter, ChannelSortOrder, ChannelStretchMode,
+    ChannelStretchSettingsEdit, ChannelSummary, ChannelType, ClawMachineOptions, FlamOptions,
+    FlpDocument, FlpError, FstPreset, FstPresetKind, HumanizerOptions, LimitNoteOptions,
+    LimitSnapDirection, MixerInsertEdit, MixerInsertSummary, MixerParameterKind,
+    MixerParameterRecord, MixerSendSummary, PATTERN_NOTE_DEFAULT_FLAGS,
     PATTERN_NOTE_DEFAULT_RELEASE, PATTERN_NOTE_SLIDE_FLAG, Pattern, PatternController,
     PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation, PayloadEncoding,
     PlaylistClip, PlaylistClipEdit, PlaylistClipSelectionClipboard, PlaylistClipTarget,
@@ -114,7 +115,7 @@ const PURPLE: Color32 = Color32::from_rgb(150, 93, 181);
 const ORANGE: Color32 = Color32::from_rgb(195, 129, 61);
 const RED: Color32 = Color32::from_rgb(252, 67, 46);
 
-fn humanize_note_division_ticks(ppq: u16, denominator: u16) -> Option<u32> {
+fn tempo_relative_note_division_ticks(ppq: u16, denominator: u16) -> Option<u32> {
     if ppq == 0 || !matches!(denominator, 1 | 2 | 4 | 8 | 16 | 32 | 64 | 128) {
         return None;
     }
@@ -4102,9 +4103,12 @@ struct DawUi {
     note_limit_snap_to_scale: bool,
     note_limit_snap_direction: LimitSnapDirection,
     arpeggiator_step_ticks: u32,
+    arpeggiator_step_note_division: Option<u16>,
     arpeggiator_range_octaves: u8,
     arpeggiator_gate_percent: u8,
-    arpeggiator_direction: ArpeggioDirection,
+    arpeggiator_range_pattern: ArpeggioRangePattern,
+    riff_machine_direction: ArpeggioDirection,
+    arpeggiator_sync_mode: ArpeggioSyncMode,
     riff_seed: u64,
     riff_velocity_variation_percent: u8,
     riff_pan_variation_percent: u8,
@@ -5315,9 +5319,12 @@ impl DawUi {
             note_limit_snap_to_scale: false,
             note_limit_snap_direction: LimitSnapDirection::Up,
             arpeggiator_step_ticks: 24,
+            arpeggiator_step_note_division: None,
             arpeggiator_range_octaves: 1,
             arpeggiator_gate_percent: 80,
-            arpeggiator_direction: ArpeggioDirection::Up,
+            arpeggiator_range_pattern: ArpeggioRangePattern::Up,
+            riff_machine_direction: ArpeggioDirection::Up,
+            arpeggiator_sync_mode: ArpeggioSyncMode::Block,
             riff_seed: 1,
             riff_velocity_variation_percent: 10,
             riff_pan_variation_percent: 0,
@@ -26865,24 +26872,24 @@ impl DawUi {
                                 .text("Gate (%)"),
                         );
                         egui::ComboBox::from_id_salt("piano-roll-riff-direction")
-                            .selected_text(match self.arpeggiator_direction {
+                            .selected_text(match self.riff_machine_direction {
                                 ArpeggioDirection::Up => "Direction: Up",
                                 ArpeggioDirection::Down => "Direction: Down",
                                 ArpeggioDirection::UpDown => "Direction: Up / Down",
                             })
                             .show_ui(ui, |ui| {
                                 ui.selectable_value(
-                                    &mut self.arpeggiator_direction,
+                                    &mut self.riff_machine_direction,
                                     ArpeggioDirection::Up,
                                     "Up",
                                 );
                                 ui.selectable_value(
-                                    &mut self.arpeggiator_direction,
+                                    &mut self.riff_machine_direction,
                                     ArpeggioDirection::Down,
                                     "Down",
                                 );
                                 ui.selectable_value(
-                                    &mut self.arpeggiator_direction,
+                                    &mut self.riff_machine_direction,
                                     ArpeggioDirection::UpDown,
                                     "Up / Down",
                                 );
@@ -27084,9 +27091,12 @@ impl DawUi {
                             if ui.button("Reset").clicked() {
                                 let defaults = RiffMachineOptions::default();
                                 self.arpeggiator_step_ticks = defaults.step_ticks;
+                                self.arpeggiator_step_note_division = None;
                                 self.arpeggiator_range_octaves = defaults.range_octaves;
                                 self.arpeggiator_gate_percent = defaults.gate_percent;
-                                self.arpeggiator_direction = defaults.direction;
+                                self.riff_machine_direction = defaults.direction;
+                                self.arpeggiator_range_pattern = ArpeggioRangePattern::Up;
+                                self.arpeggiator_sync_mode = ArpeggioSyncMode::Block;
                                 self.note_limit_minimum_key = defaults.minimum_key as u8;
                                 self.note_limit_maximum_key = defaults.maximum_key as u8;
                                 self.note_limit_wrap_to_bottom = defaults.wrap_to_bottom;
@@ -28284,10 +28294,38 @@ impl DawUi {
                             });
                     },
                 );
-                ui.add(
-                    egui::Slider::new(&mut self.arpeggiator_step_ticks, 1..=384)
-                        .text("Arpeggiator step (ticks)"),
+                let step_unit = self.arpeggiator_step_note_division.map_or_else(
+                    || "Ticks".to_owned(),
+                    |denominator| format!("1/{denominator} note"),
                 );
+                egui::ComboBox::from_id_salt("piano-roll-arpeggiator-step-unit")
+                    .selected_text(step_unit)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.arpeggiator_step_note_division,
+                            None,
+                            "Ticks",
+                        );
+                        for denominator in [1, 2, 4, 8, 16, 32, 64, 128] {
+                            ui.selectable_value(
+                                &mut self.arpeggiator_step_note_division,
+                                Some(denominator),
+                                format!("1/{denominator} note"),
+                            );
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "Note divisions are converted using project PPQ, so their playback duration follows tempo changes.",
+                    );
+                if let Some(denominator) = self.arpeggiator_step_note_division {
+                    ui.label(format!("Step: 1/{denominator} note"));
+                } else {
+                    ui.add(
+                        egui::Slider::new(&mut self.arpeggiator_step_ticks, 1..=384)
+                            .text("Arpeggiator step (ticks)"),
+                    );
+                }
                 ui.add(
                     egui::Slider::new(&mut self.arpeggiator_range_octaves, 1..=4)
                         .text("Arpeggiator octaves"),
@@ -28297,26 +28335,55 @@ impl DawUi {
                         .text("Arpeggiator gate (%)"),
                 );
                 egui::ComboBox::from_id_salt("piano-roll-arpeggiator-direction")
-                    .selected_text(match self.arpeggiator_direction {
-                        ArpeggioDirection::Up => "Arpeggiator: Up",
-                        ArpeggioDirection::Down => "Arpeggiator: Down",
-                        ArpeggioDirection::UpDown => "Arpeggiator: Up/Down",
+                    .selected_text(match self.arpeggiator_range_pattern {
+                        ArpeggioRangePattern::Up => "Arpeggiator: Up",
+                        ArpeggioRangePattern::Down => "Arpeggiator: Down",
+                        ArpeggioRangePattern::UpDown => "Arpeggiator: Up/Down",
+                        ArpeggioRangePattern::Alternate => "Arpeggiator: Alternate",
                     })
                     .show_ui(ui, |ui| {
                         ui.selectable_value(
-                            &mut self.arpeggiator_direction,
-                            ArpeggioDirection::Up,
+                            &mut self.arpeggiator_range_pattern,
+                            ArpeggioRangePattern::Up,
                             "Up",
                         );
                         ui.selectable_value(
-                            &mut self.arpeggiator_direction,
-                            ArpeggioDirection::Down,
+                            &mut self.arpeggiator_range_pattern,
+                            ArpeggioRangePattern::Down,
                             "Down",
                         );
                         ui.selectable_value(
-                            &mut self.arpeggiator_direction,
-                            ArpeggioDirection::UpDown,
+                            &mut self.arpeggiator_range_pattern,
+                            ArpeggioRangePattern::UpDown,
                             "Up / Down",
+                        );
+                        ui.selectable_value(
+                            &mut self.arpeggiator_range_pattern,
+                            ArpeggioRangePattern::Alternate,
+                            "Alternate",
+                        );
+                    });
+                egui::ComboBox::from_id_salt("piano-roll-arpeggiator-sync")
+                    .selected_text(match self.arpeggiator_sync_mode {
+                        ArpeggioSyncMode::Time => "Sync: Time",
+                        ArpeggioSyncMode::Block => "Sync: Block",
+                        ArpeggioSyncMode::Chord => "Sync: Chord",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.arpeggiator_sync_mode,
+                            ArpeggioSyncMode::Time,
+                            "Time",
+                        );
+                        ui.selectable_value(
+                            &mut self.arpeggiator_sync_mode,
+                            ArpeggioSyncMode::Block,
+                            "Block",
+                        );
+                        ui.selectable_value(
+                            &mut self.arpeggiator_sync_mode,
+                            ArpeggioSyncMode::Chord,
+                            "Chord",
                         );
                     });
                 ui.add(
@@ -28910,7 +28977,7 @@ impl DawUi {
                 .and_then(|document| {
                     let timing_range_ticks = match timing_note_division {
                         Some(denominator) => {
-                            humanize_note_division_ticks(document.header().ppq(), denominator)
+                            tempo_relative_note_division_ticks(document.header().ppq(), denominator)
                                 .ok_or_else(|| {
                                     "humanize note division cannot be mapped using the project PPQ"
                                         .to_owned()
@@ -29011,14 +29078,27 @@ impl DawUi {
                 (self.selected_pattern, self.selected_note_channel)
         {
             let step_ticks = self.arpeggiator_step_ticks;
+            let step_note_division = self.arpeggiator_step_note_division;
             let range_octaves = self.arpeggiator_range_octaves;
             let gate_percent = self.arpeggiator_gate_percent;
-            let direction = self.arpeggiator_direction;
+            let range_pattern = self.arpeggiator_range_pattern;
+            let sync = self.arpeggiator_sync_mode;
             let result = self
                 .document
                 .as_mut()
                 .ok_or_else(|| "no project is open".to_owned())
                 .and_then(|document| {
+                    let step_ticks = match step_note_division {
+                        Some(denominator) => tempo_relative_note_division_ticks(
+                            document.header().ppq(),
+                            denominator,
+                        )
+                        .ok_or_else(|| {
+                            "arpeggiator note division cannot be mapped using the project PPQ"
+                                .to_owned()
+                        })?,
+                        None => step_ticks,
+                    };
                     let result = if edit_selection_only {
                         document.arpeggiate_pattern_note_selection(
                             pattern_id,
@@ -29028,7 +29108,8 @@ impl DawUi {
                                 step_ticks,
                                 range_octaves,
                                 gate_percent,
-                                direction,
+                                range_pattern,
+                                sync,
                             },
                         )
                     } else {
@@ -29039,7 +29120,8 @@ impl DawUi {
                                 step_ticks,
                                 range_octaves,
                                 gate_percent,
-                                direction,
+                                range_pattern,
+                                sync,
                             },
                         )
                     };
@@ -29076,7 +29158,7 @@ impl DawUi {
                 step_ticks: self.arpeggiator_step_ticks,
                 range_octaves: self.arpeggiator_range_octaves,
                 gate_percent: self.arpeggiator_gate_percent,
-                direction: self.arpeggiator_direction,
+                direction: self.riff_machine_direction,
                 mirror_horizontal: self.riff_mirror_horizontal,
                 preserve_start_times: self.riff_preserve_start_times,
                 mirror_vertical: self.riff_mirror_vertical,
