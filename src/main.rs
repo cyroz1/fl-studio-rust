@@ -1851,15 +1851,11 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 Path::new(output),
                 parse_u16(pattern_id, "pattern id")?,
                 parse_u16(channel_id, "channel id")?,
-                parse_u64(seed, "humanize seed")?,
-                HumanizerOptions {
-                    timing_range_ticks: parse_u32(timing_range, "timing range")?,
-                    velocity_variation_percent: parse_u8(
-                        velocity_variation,
-                        "velocity variation",
-                    )?,
-                    ..HumanizerOptions::default()
-                },
+                HumanizeCommandOptions::new(
+                    parse_u64(seed, "humanize seed")?,
+                    timing_range,
+                    parse_u8(velocity_variation, "velocity variation")?,
+                ),
             )
         }
         [command, input, output, pattern_id, channel_id, seed, timing_range, velocity_variation,
@@ -1871,17 +1867,16 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 Path::new(output),
                 parse_u16(pattern_id, "pattern id")?,
                 parse_u16(channel_id, "channel id")?,
-                parse_u64(seed, "humanize seed")?,
-                HumanizerOptions {
-                    timing_range_ticks: parse_u32(timing_range, "timing range")?,
-                    velocity_variation_percent: parse_u8(
-                        velocity_variation,
-                        "velocity variation",
-                    )?,
+                HumanizeCommandOptions {
                     pan_variation_percent: parse_u8(pan_variation, "pan variation")?,
                     release_variation_percent: parse_u8(release_variation, "release variation")?,
                     mod_x_variation_percent: parse_u8(mod_x_variation, "Mod X variation")?,
                     mod_y_variation_percent: parse_u8(mod_y_variation, "Mod Y variation")?,
+                    ..HumanizeCommandOptions::new(
+                        parse_u64(seed, "humanize seed")?,
+                        timing_range,
+                        parse_u8(velocity_variation, "velocity variation")?,
+                    )
                 },
             )
         }
@@ -1896,15 +1891,11 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u16(pattern_id, "pattern id")?,
                 parse_u16(channel_id, "channel id")?,
                 Some(&note_indices),
-                parse_u64(seed, "humanize seed")?,
-                HumanizerOptions {
-                    timing_range_ticks: parse_u32(timing_range, "timing range")?,
-                    velocity_variation_percent: parse_u8(
-                        velocity_variation,
-                        "velocity variation",
-                    )?,
-                    ..HumanizerOptions::default()
-                },
+                HumanizeCommandOptions::new(
+                    parse_u64(seed, "humanize seed")?,
+                    timing_range,
+                    parse_u8(velocity_variation, "velocity variation")?,
+                ),
             )
         }
         [command, input, output, pattern_id, channel_id, note_indices, seed, timing_range,
@@ -1919,17 +1910,16 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u16(pattern_id, "pattern id")?,
                 parse_u16(channel_id, "channel id")?,
                 Some(&note_indices),
-                parse_u64(seed, "humanize seed")?,
-                HumanizerOptions {
-                    timing_range_ticks: parse_u32(timing_range, "timing range")?,
-                    velocity_variation_percent: parse_u8(
-                        velocity_variation,
-                        "velocity variation",
-                    )?,
+                HumanizeCommandOptions {
                     pan_variation_percent: parse_u8(pan_variation, "pan variation")?,
                     release_variation_percent: parse_u8(release_variation, "release variation")?,
                     mod_x_variation_percent: parse_u8(mod_x_variation, "Mod X variation")?,
                     mod_y_variation_percent: parse_u8(mod_y_variation, "Mod Y variation")?,
+                    ..HumanizeCommandOptions::new(
+                        parse_u64(seed, "humanize seed")?,
+                        timing_range,
+                        parse_u8(velocity_variation, "velocity variation")?,
+                    )
                 },
             )
         }
@@ -3259,8 +3249,9 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild randomize-notes-scale <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <velocity:-100..100> <pan:-100..100> <pitch-range:0..24> <bipolar:0|1> <reset:0|1> <scale-name> <scale-root:0..11> [release:-100..100 mod-x:-100..100 mod-y:-100..100]\n",
             "  flp-rebuild randomize-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <seed> <velocity:-100..100> <pan:-100..100> <pitch-range:0..24> <bipolar:0|1> <reset:0|1> [release:-100..100 mod-x:-100..100 mod-y:-100..100]\n",
             "  flp-rebuild randomize-notes-selected-scale <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <seed> <velocity:-100..100> <pan:-100..100> <pitch-range:0..24> <bipolar:0|1> <reset:0|1> <scale-name> <scale-root:0..11> [release:-100..100 mod-x:-100..100 mod-y:-100..100]\n",
-            "  flp-rebuild humanize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <timing-range-ticks> <velocity-variation-0..100> [pan-variation-0..100 release-variation-0..100 mod-x-variation-0..100 mod-y-variation-0..100]\n",
-            "  flp-rebuild humanize-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <seed> <timing-range-ticks> <velocity-variation-0..100> [pan-variation-0..100 release-variation-0..100 mod-x-variation-0..100 mod-y-variation-0..100]\n",
+            "  flp-rebuild humanize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <seed> <timing-range-ticks|1/n> <velocity-variation-0..100> [pan-variation-0..100 release-variation-0..100 mod-x-variation-0..100 mod-y-variation-0..100]\n",
+            "  flp-rebuild humanize-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <seed> <timing-range-ticks|1/n> <velocity-variation-0..100> [pan-variation-0..100 release-variation-0..100 mod-x-variation-0..100 mod-y-variation-0..100]\n",
+            "    Humanize timing accepts ticks or 1/1, 1/2, 1/4, 1/8, 1/16, 1/32, 1/64, or 1/128, rounded to project ticks using PPQ.\n",
             "  flp-rebuild limit-notes <input.flp> <output.flp> <pattern-id> <channel-id> <minimum-key-0..127> <maximum-key-0..127> [wrap-to-bottom:0|1 scale-name|none scale-root:0..11|-> snap-direction:up|down|alternate]\n",
             "  flp-rebuild limit-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <minimum-key-0..127> <maximum-key-0..127> [wrap-to-bottom:0|1 scale-name|none scale-root:0..11|-> snap-direction:up|down|alternate]\n",
             "  flp-rebuild arp-notes <input.flp> <output.flp> <pattern-id> <channel-id> <step-ticks> <range-octaves-1..4> <gate-1..100> <up|down|up-down>\n",
@@ -3443,6 +3434,69 @@ fn parse_flam_placement(value: &str) -> Result<bool, String> {
         "before" => Ok(true),
         "after" => Ok(false),
         _ => Err("flam placement must be 'before' or 'after'".to_owned()),
+    }
+}
+
+fn parse_humanize_timing_range(value: &str, document: &FlpDocument) -> Result<u32, String> {
+    let Some((numerator, denominator)) = value.split_once('/') else {
+        return parse_u32(value, "humanize timing range ticks");
+    };
+    if numerator != "1" {
+        return Err("humanize note division must be written as 1/<denominator>".to_owned());
+    }
+    let denominator = parse_u16(denominator, "humanize note division denominator")?;
+    if !matches!(denominator, 1 | 2 | 4 | 8 | 16 | 32 | 64 | 128) {
+        return Err("humanize note division must be between 1/1 and 1/128".to_owned());
+    }
+
+    let ppq = document.header().ppq();
+    if ppq == 0 {
+        return Err("humanize note division cannot be mapped with a zero project PPQ".to_owned());
+    }
+    let quarter_note_ticks = u64::from(ppq) * 4;
+    let denominator = u64::from(denominator);
+    let ticks = (quarter_note_ticks + denominator / 2) / denominator;
+    if ticks == 0 {
+        return Err("humanize note division rounds to less than one project tick".to_owned());
+    }
+    u32::try_from(ticks)
+        .map_err(|_| "humanize note division exceeds the supported tick range".to_owned())
+}
+
+#[derive(Clone, Copy)]
+struct HumanizeCommandOptions<'a> {
+    seed: u64,
+    timing_range: &'a str,
+    velocity_variation_percent: u8,
+    pan_variation_percent: u8,
+    release_variation_percent: u8,
+    mod_x_variation_percent: u8,
+    mod_y_variation_percent: u8,
+}
+
+impl<'a> HumanizeCommandOptions<'a> {
+    fn new(seed: u64, timing_range: &'a str, velocity_variation_percent: u8) -> Self {
+        let defaults = HumanizerOptions::default();
+        Self {
+            seed,
+            timing_range,
+            velocity_variation_percent,
+            pan_variation_percent: defaults.pan_variation_percent,
+            release_variation_percent: defaults.release_variation_percent,
+            mod_x_variation_percent: defaults.mod_x_variation_percent,
+            mod_y_variation_percent: defaults.mod_y_variation_percent,
+        }
+    }
+
+    fn resolve(self, document: &FlpDocument) -> Result<HumanizerOptions, String> {
+        Ok(HumanizerOptions {
+            timing_range_ticks: parse_humanize_timing_range(self.timing_range, document)?,
+            velocity_variation_percent: self.velocity_variation_percent,
+            pan_variation_percent: self.pan_variation_percent,
+            release_variation_percent: self.release_variation_percent,
+            mod_x_variation_percent: self.mod_x_variation_percent,
+            mod_y_variation_percent: self.mod_y_variation_percent,
+        })
     }
 }
 
@@ -7063,10 +7117,9 @@ fn humanize_notes(
     output: &Path,
     pattern_id: u16,
     channel_id: u16,
-    seed: u64,
-    options: HumanizerOptions,
+    options: HumanizeCommandOptions<'_>,
 ) -> Result<(), String> {
-    humanize_notes_with_options(input, output, pattern_id, channel_id, None, seed, options)
+    humanize_notes_with_options(input, output, pattern_id, channel_id, None, options)
 }
 
 fn humanize_notes_with_options(
@@ -7075,19 +7128,24 @@ fn humanize_notes_with_options(
     pattern_id: u16,
     channel_id: u16,
     note_indices: Option<&[usize]>,
-    seed: u64,
-    options: HumanizerOptions,
+    options: HumanizeCommandOptions<'_>,
 ) -> Result<(), String> {
     let (_, mut document) = load_document(input)?;
+    let humanizer_options = options.resolve(&document)?;
     let changed = match note_indices {
         Some(note_indices) => document.humanize_pattern_note_selection_with_options(
             pattern_id,
             channel_id,
             note_indices,
-            seed,
-            options,
+            options.seed,
+            humanizer_options,
         ),
-        None => document.humanize_pattern_notes_with_options(pattern_id, channel_id, seed, options),
+        None => document.humanize_pattern_notes_with_options(
+            pattern_id,
+            channel_id,
+            options.seed,
+            humanizer_options,
+        ),
     }
     .map_err(|error| error.to_string())?;
     let bytes = document
@@ -7096,12 +7154,13 @@ fn humanize_notes_with_options(
     fs::write(output, bytes)
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
-        "humanized {changed} {} in pattern {pattern_id}, channel {channel_id} with seed {seed} to {}",
+        "humanized {changed} {} in pattern {pattern_id}, channel {channel_id} with seed {} to {}",
         if note_indices.is_some() {
             "selected notes"
         } else {
             "channel notes"
         },
+        options.seed,
         output.display()
     );
     Ok(())
