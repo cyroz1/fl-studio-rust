@@ -304,7 +304,7 @@ Options: license Elastique, or integrate Rubber Band (GPL — license conflict
 with MIT; would need a commercial Rubber Band license or a clean-room
 implementation).
 
-- `[partial]` Channel Parameters expose the saved time, pitch, multiplier, and mode fields in the channel summary and allow lossless API/CLI edits for an existing unique full-length `0xC7` event. Known mode values are decoded; stretch settings are not yet applied to playback or rendering, and clip-level settings still need format mapping and native comparison ([format observations](format-observations.md#channel-time-stretch-settings)).
+- `[partial]` Channel Parameters expose the saved time, pitch, multiplier, and mode fields in the channel summary and allow lossless API/CLI/Channel Rack edits for an existing unique full-length `0xC7` event. The Channel Rack displays the saved raw fields and known mode choices under each eligible channel's Time stretch section. Stretch settings are not yet applied to playback or rendering, and clip-level settings still need format mapping and native comparison ([format observations](format-observations.md#channel-time-stretch-settings)).
 - `[todo]` Offline "stretch" with preserved transients
 - `[todo]` Pitch shifting independent of tempo
 

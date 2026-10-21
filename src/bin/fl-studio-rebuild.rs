@@ -58,8 +58,9 @@ use flp_rebuild::vst3::{
 };
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, Arrangement, ArticulateOptions, AutomationChannel,
-    AutomationPoint, AutomationPointEdit, ChannelGroupSummary, ChannelSortOrder, ChannelSummary,
-    ChannelType, ClawMachineOptions, FlamOptions, FlpDocument, FlpError, FstPreset, FstPresetKind,
+    AutomationPoint, AutomationPointEdit, ChannelGroupSummary, ChannelSortOrder,
+    ChannelStretchMode, ChannelStretchSettingsEdit, ChannelSummary, ChannelType,
+    ClawMachineOptions, FlamOptions, FlpDocument, FlpError, FstPreset, FstPresetKind,
     HumanizerOptions, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerInsertSummary,
     MixerParameterKind, MixerParameterRecord, MixerSendSummary, PATTERN_NOTE_DEFAULT_FLAGS,
     PATTERN_NOTE_DEFAULT_RELEASE, PATTERN_NOTE_SLIDE_FLAG, Pattern, PatternController,
@@ -21909,6 +21910,7 @@ impl DawUi {
         let mut layer_edits = Vec::new();
         let mut layer_flag_edits = Vec::new();
         let mut channel_mixer_track_edits = Vec::<(Vec<u16>, i8)>::new();
+        let mut channel_stretch_edits = Vec::new();
         let mut step_toggles = Vec::<(u16, Vec<usize>, u32, StepToggleOperation)>::new();
         let mut step_note_additions = Vec::<(u16, u32, u16)>::new();
         let mut mute_removed_steps_changed = false;
@@ -22892,6 +22894,75 @@ impl DawUi {
                                 }
                             });
                         }
+                        if let Some(settings) = channel.stretch_settings() {
+                            let mut time_raw = settings.time_raw();
+                            let mut pitch_raw = settings.pitch_raw();
+                            let mut multiplier_raw = settings.multiplier_raw();
+                            let mut mode_raw = settings.mode_raw();
+                            let mut time_changed = false;
+                            let mut pitch_changed = false;
+                            let mut multiplier_changed = false;
+                            let mut mode_changed = false;
+                            ui.collapsing("Time stretch", |ui| {
+                                ui.small(
+                                    "Stored raw fields; stretching is not yet applied to playback or renders.",
+                                );
+                                ui.horizontal_wrapped(|ui| {
+                                    time_changed = ui
+                                        .add(
+                                            egui::DragValue::new(&mut time_raw)
+                                                .prefix("Time raw "),
+                                        )
+                                        .on_hover_text("Raw saved time-stretch field")
+                                        .changed();
+                                    pitch_changed = ui
+                                        .add(
+                                            egui::DragValue::new(&mut pitch_raw)
+                                                .prefix("Pitch raw "),
+                                        )
+                                        .on_hover_text("Raw saved pitch field")
+                                        .changed();
+                                    multiplier_changed = ui
+                                        .add(
+                                            egui::DragValue::new(&mut multiplier_raw)
+                                                .prefix("Multiplier raw "),
+                                        )
+                                        .on_hover_text("Raw saved multiplier field")
+                                        .changed();
+                                });
+                                egui::ComboBox::from_id_salt(("channel-stretch-mode", channel.id()))
+                                    .selected_text(format!("Mode: {}", channel_stretch_mode_label(mode_raw)))
+                                    .show_ui(ui, |ui| {
+                                        for (raw, label) in [
+                                            (-1, "Stretch (-1)"),
+                                            (0, "Resample (0)"),
+                                            (1, "Elastique 3 Generic (1)"),
+                                            (2, "Elastique 3 Mono (2)"),
+                                            (3, "Slice Stretch (3)"),
+                                            (4, "Slice Map (4)"),
+                                            (5, "Auto (5)"),
+                                            (6, "Elastique 2 Generic (6)"),
+                                            (7, "Elastique 2 Transient (7)"),
+                                            (8, "Elastique 2 Mono (8)"),
+                                            (9, "Elastique 2 Speech (9)"),
+                                        ] {
+                                            mode_changed |=
+                                                ui.selectable_value(&mut mode_raw, raw, label).changed();
+                                        }
+                                    });
+                            });
+                            if time_changed || pitch_changed || multiplier_changed || mode_changed {
+                                channel_stretch_edits.push((
+                                    channel.id(),
+                                    ChannelStretchSettingsEdit {
+                                        time_raw: time_changed.then_some(time_raw),
+                                        pitch_raw: pitch_changed.then_some(pitch_raw),
+                                        multiplier_raw: multiplier_changed.then_some(multiplier_raw),
+                                        mode_raw: mode_changed.then_some(mode_raw),
+                                    },
+                                ));
+                            }
+                        }
                         }
                     });
                 if volume_changed || pan_changed {
@@ -23411,6 +23482,23 @@ impl DawUi {
                     }
                     Err(error) => {
                         self.status = format!("Could not update Layer children: {error}");
+                    }
+                }
+            }
+        }
+        if !channel_stretch_edits.is_empty()
+            && let Some(document) = self.document.as_mut()
+        {
+            for (channel_id, edit) in channel_stretch_edits {
+                match document.edit_channel_stretch_settings(channel_id, edit) {
+                    Ok(()) => {
+                        self.dirty = true;
+                        self.status = format!("Channel {channel_id} stretch settings updated");
+                    }
+                    Err(error) => {
+                        self.status = format!(
+                            "Could not update channel {channel_id} stretch settings: {error}"
+                        );
                     }
                 }
             }
@@ -46891,6 +46979,24 @@ fn channel_type_icon_description(channel_type: Option<ChannelType>) -> String {
         Some(ChannelType::Unknown(raw)) => format!("Unknown channel type {raw}"),
         None => "Unclassified channel".to_owned(),
     }
+}
+
+fn channel_stretch_mode_label(raw: i32) -> String {
+    let name = match ChannelStretchMode::from_raw(raw) {
+        ChannelStretchMode::Stretch => "Stretch",
+        ChannelStretchMode::Resample => "Resample",
+        ChannelStretchMode::Elastique3Generic => "Elastique 3 Generic",
+        ChannelStretchMode::Elastique3Mono => "Elastique 3 Mono",
+        ChannelStretchMode::SliceStretch => "Slice Stretch",
+        ChannelStretchMode::SliceMap => "Slice Map",
+        ChannelStretchMode::Auto => "Auto",
+        ChannelStretchMode::Elastique2Generic => "Elastique 2 Generic",
+        ChannelStretchMode::Elastique2Transient => "Elastique 2 Transient",
+        ChannelStretchMode::Elastique2Mono => "Elastique 2 Mono",
+        ChannelStretchMode::Elastique2Speech => "Elastique 2 Speech",
+        ChannelStretchMode::Unknown(_) => return format!("Unknown ({raw})"),
+    };
+    format!("{name} ({raw})")
 }
 
 fn paint_channel_type_icon(
