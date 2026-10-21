@@ -2302,6 +2302,24 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 },
             )
         }
+        [command, input, output, pattern_id, channel_id, position, length, key, velocity, quality, inversion]
+            if command == "add-chord" =>
+        {
+            add_chord(
+                Path::new(input),
+                Path::new(output),
+                quality,
+                ChordStampCliOptions {
+                    pattern_id: parse_u16(pattern_id, "pattern id")?,
+                    channel_id: parse_u16(channel_id, "channel id")?,
+                    position: parse_u32(position, "chord position")?,
+                    length: parse_u32(length, "chord note length")?,
+                    root_key: parse_u16(key, "root note key")?,
+                    velocity: parse_u8(velocity, "note velocity")?,
+                    inversion: parse_usize(inversion, "chord inversion")?,
+                },
+            )
+        }
         [command, input, output, pattern_id, channel_id, note_specs]
             if command == "add-notes" =>
         {
@@ -3337,6 +3355,9 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild claw-notes <input.flp> <output.flp> <pattern-id> <channel-id> <period-ticks:16+> <trash-every:2..16> <time-distortion:-100..100> <remove-short-notes:0|1> <stretch-to-compensate:0|1>\n",
             "  flp-rebuild claw-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <period-ticks:16+> <trash-every:2..16> <time-distortion:-100..100> <remove-short-notes:0|1> <stretch-to-compensate:0|1>\n",
             "  flp-rebuild add-note <input.flp> <output.flp> <pattern-id> <channel-id> <position> <length> <key> <velocity>\n",
+            "  flp-rebuild add-chord <input.flp> <output.flp> <pattern-id> <channel-id> <position> <length> <root-key> <velocity> <quality> <inversion>\n",
+            "    Manual qualities: major, minor, diminished, augmented, sus2, sus4, power, dominant7, major7, minor7, major6, minor6, add9, minor-add9, diminished7, half-diminished7, minor-major7, dominant7-flat5, dominant7-sharp5, dominant7-flat9, dominant7-sharp9, dominant9, major9, minor9, dominant11, minor11, dominant13.\n",
+            "    Inversion 0 keeps root position; each inversion raises the lowest pitch by one octave.\n",
             "  flp-rebuild add-notes <input.flp> <output.flp> <pattern-id> <channel-id> <notes:position:length:key:velocity,...>\n",
             "  flp-rebuild delete-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index>\n",
             "  flp-rebuild delete-notes <input.flp> <output.flp> <pattern-id> <channel-id>\n",
@@ -3539,6 +3560,17 @@ fn parse_tempo_relative_ticks(
 
 fn parse_humanize_timing_range(value: &str, document: &FlpDocument) -> Result<u32, String> {
     parse_tempo_relative_ticks(value, document, "humanize timing range ticks")
+}
+
+#[derive(Clone, Copy)]
+struct ChordStampCliOptions {
+    pattern_id: u16,
+    channel_id: u16,
+    position: u32,
+    length: u32,
+    root_key: u16,
+    velocity: u8,
+    inversion: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -3882,6 +3914,39 @@ fn parse_scale_name(value: &str) -> Result<&'static [u8], String> {
         "altered-dominant-bb3" => Ok(&[0, 1, 2, 4, 6, 8, 10]),
         "super-locrian-bb7" => Ok(&[0, 1, 3, 4, 6, 8, 9]),
         _ => Err("scale name must be major, major-locrian, harmonic-major, double-harmonic-major, ionian-sharp-5, ionian-sharp-2, ionian-sharp-2-sharp-6, ionian-augmented-sharp-2, dorian, dorian-b2, ukrainian-dorian-b2, dorian-sharp-4, dorian-b5, phrygian, phrygian-b4, ultraphrygian, ultraphrygian-bb3, phrygian-dominant, lydian, lydian-sharp-2, lydian-sharp-2-sharp-6, lydian-sharp-3-sharp-6, lydian-sharp-6, lydian-b3, lydian-augmented-sharp-2, lydian-augmented-sharp-3, lydian-augmented-sharp-6, lydian-augmented-dominant, lydian-augmented, lydian-dominant, lydian-dominant-b6, mixolydian, mixolydian-augmented, mixolydian-augmented-sharp-2, mixolydian-b2, mixolydian-b6, natural-minor, locrian, locrian-dominant, locrian-natural-2, locrian-natural-6, locrian-bb7, locrian-bb3-bb7, ultra-locrian-bb3, harmonic-minor, harmonic-minor-b5, melodic-minor, melodic-minor-sharp-5, neapolitan-minor, neapolitan-minor-sharp-4, romanian-minor, neapolitan-major, hungarian-minor, hungarian-major, hungarian-major-mode-2, chromatic-hypophrygian-inverse, persian, oriental, blues, major-pentatonic, minor-pentatonic, whole-tone, whole-half-diminished, half-whole-diminished, half-diminished-b4, altered, altered-dominant-natural-6, altered-dominant-bb3, or super-locrian-bb7".to_owned()),
+    }
+}
+
+fn parse_chord_intervals(value: &str) -> Result<&'static [u8], String> {
+    match value {
+        "major" => Ok(&[0, 4, 7]),
+        "minor" => Ok(&[0, 3, 7]),
+        "diminished" => Ok(&[0, 3, 6]),
+        "augmented" => Ok(&[0, 4, 8]),
+        "sus2" => Ok(&[0, 2, 7]),
+        "sus4" => Ok(&[0, 5, 7]),
+        "power" => Ok(&[0, 7, 12]),
+        "dominant7" => Ok(&[0, 4, 7, 10]),
+        "major7" => Ok(&[0, 4, 7, 11]),
+        "minor7" => Ok(&[0, 3, 7, 10]),
+        "major6" => Ok(&[0, 4, 7, 9]),
+        "minor6" => Ok(&[0, 3, 7, 9]),
+        "add9" => Ok(&[0, 4, 7, 14]),
+        "minor-add9" => Ok(&[0, 3, 7, 14]),
+        "diminished7" => Ok(&[0, 3, 6, 9]),
+        "half-diminished7" => Ok(&[0, 3, 6, 10]),
+        "minor-major7" => Ok(&[0, 3, 7, 11]),
+        "dominant7-flat5" => Ok(&[0, 4, 6, 10]),
+        "dominant7-sharp5" => Ok(&[0, 4, 8, 10]),
+        "dominant7-flat9" => Ok(&[0, 4, 7, 10, 13]),
+        "dominant7-sharp9" => Ok(&[0, 4, 7, 10, 15]),
+        "dominant9" => Ok(&[0, 4, 7, 10, 14]),
+        "major9" => Ok(&[0, 4, 7, 11, 14]),
+        "minor9" => Ok(&[0, 3, 7, 10, 14]),
+        "dominant11" => Ok(&[0, 4, 7, 10, 14, 17]),
+        "minor11" => Ok(&[0, 3, 7, 10, 14, 17]),
+        "dominant13" => Ok(&[0, 4, 7, 10, 14, 17, 21]),
+        _ => Err("chord quality must be one of the supported manual stamp names".to_owned()),
     }
 }
 
@@ -7639,6 +7704,83 @@ fn add_note(input: &Path, output: &Path, pattern_id: u16, note: PatternNote) -> 
         "added note to pattern {pattern_id}, channel {} at {} ticks to {}",
         note.channel_id,
         note.position,
+        output.display()
+    );
+    Ok(())
+}
+
+fn add_chord(
+    input: &Path,
+    output: &Path,
+    quality: &str,
+    options: ChordStampCliOptions,
+) -> Result<(), String> {
+    let ChordStampCliOptions {
+        pattern_id,
+        channel_id,
+        position,
+        length,
+        root_key,
+        velocity,
+        inversion,
+    } = options;
+    if root_key > 127 {
+        return Err("root note key must be between 0 and 127".to_owned());
+    }
+    if velocity > 127 {
+        return Err("note velocity must be between 0 and 127".to_owned());
+    }
+    if length == 0 {
+        return Err("chord note length must be greater than zero".to_owned());
+    }
+    let intervals = parse_chord_intervals(quality)?;
+    let mut pitches = intervals
+        .iter()
+        .filter_map(|interval| root_key.checked_add(u16::from(*interval)))
+        .filter(|key| *key <= 127)
+        .collect::<Vec<_>>();
+    if pitches.is_empty() {
+        return Err("the selected chord has no notes in the MIDI key range".to_owned());
+    }
+    if inversion >= pitches.len() {
+        return Err(format!(
+            "chord inversion must be between 0 and {} for this quality",
+            pitches.len() - 1
+        ));
+    }
+    for _ in 0..inversion {
+        let lowest = pitches.remove(0);
+        let raised = lowest
+            .checked_add(12)
+            .filter(|key| *key <= 127)
+            .ok_or_else(|| "the selected chord inversion exceeds MIDI key 127".to_owned())?;
+        pitches.push(raised);
+    }
+    pitches.sort_unstable();
+    let notes = pitches
+        .into_iter()
+        .map(|key| PatternNote {
+            position,
+            channel_id,
+            length,
+            key,
+            velocity,
+            ..PatternNote::default()
+        })
+        .collect::<Vec<_>>();
+
+    let (_, mut document) = load_document(input)?;
+    document
+        .add_pattern_notes(pattern_id, &notes)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "added {} {quality} chord notes at tick {position} in pattern {pattern_id}, channel {channel_id} to {}",
+        notes.len(),
         output.display()
     );
     Ok(())

@@ -139,6 +139,7 @@ flp-rebuild articulate-notes-selected <input.flp> <output.flp> <pattern-id> <cha
 flp-rebuild claw-notes <input.flp> <output.flp> <pattern-id> <channel-id> <period-ticks:16+> <trash-every:2..16> <time-distortion:-100..100> <remove-short-notes:0|1> <stretch-to-compensate:0|1>
 flp-rebuild claw-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <period-ticks:16+> <trash-every:2..16> <time-distortion:-100..100> <remove-short-notes:0|1> <stretch-to-compensate:0|1>
 flp-rebuild add-note <input.flp> <output.flp> <pattern-id> <channel-id> <position> <length> <key> <velocity>
+flp-rebuild add-chord <input.flp> <output.flp> <pattern-id> <channel-id> <position> <length> <root-key> <velocity> <quality> <inversion>
 flp-rebuild add-notes <input.flp> <output.flp> <pattern-id> <channel-id> <notes:position:length:key:velocity,...>
 flp-rebuild delete-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index>
 flp-rebuild delete-notes <input.flp> <output.flp> <pattern-id> <channel-id>
@@ -162,7 +163,7 @@ flp-rebuild create-time-marker <input.flp> <output.flp> <arrangement-id> <positi
 flp-rebuild delete-time-marker <input.flp> <output.flp> <arrangement-id> <marker-index>
 ```
 
-`add-notes` appends multiple notes to one channel in a pattern using comma-separated `position:length:key:velocity` tuples; each record gets the same neutral defaults as `add-note`. `delete-notes` removes every note from one pattern channel while preserving other channels. `delete-notes-selected` removes only the comma-separated zero-based channel-local indexes; `delete-note` remains available for one index.
+`add-notes` appends multiple notes to one channel in a pattern using comma-separated `position:length:key:velocity` tuples; each record gets the same neutral defaults as `add-note`. `add-chord` appends a manual chord voicing from a named quality, MIDI root key, velocity, position, length, and inversion; root-position notes stay within MIDI keys 0–127, and inversions that would exceed that range are rejected. `delete-notes` removes every note from one pattern channel while preserving other channels. `delete-notes-selected` removes only the comma-separated zero-based channel-local indexes; `delete-note` remains available for one index.
 
 For MIDI import commands, use `new` as the Pattern target to create a Pattern in the current
 project. The project must contain an existing Pattern marker and a uniquely recognized
