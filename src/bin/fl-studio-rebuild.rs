@@ -52,9 +52,9 @@ use flp_rebuild::sample_render::{
     write_input_recording_to_wav,
 };
 use flp_rebuild::vst3::{
-    MAX_REPORTED_TAIL_SECONDS, Vst3HostRuntime, Vst3PatternChannelRenderRequest,
-    Vst3PatternRenderOptions, Vst3PatternStreamHandle, Vst3PlaylistLiveInputSender,
-    Vst3PlaylistLiveInputSession, Vst3PlaylistStreamProcessor,
+    MAX_REPORTED_TAIL_SECONDS, Vst3AutomationPoint, Vst3HostRuntime, Vst3ParameterAutomation,
+    Vst3PatternChannelRenderRequest, Vst3PatternRenderOptions, Vst3PatternStreamHandle,
+    Vst3PlaylistLiveInputSender, Vst3PlaylistLiveInputSession, Vst3PlaylistStreamProcessor,
 };
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, Arrangement, ArticulateOptions, AutomationChannel,
@@ -4211,6 +4211,7 @@ struct DawUi {
     midi_output_gain_mapping: Option<MidiControlChangeMapping>,
     midi_mixer_control_mappings: Vec<MidiMixerControlMapping>,
     midi_vst3_parameter_mappings: Vec<MidiVst3ParameterMapping>,
+    pattern_vst3_parameter_links: Vec<PatternVst3ParameterLink>,
     midi_vst3_parameter_learning: Option<MidiVst3ParameterTarget>,
     midi_mixer_button_cc_active: BTreeSet<(String, u8, u8)>,
     midi_mixer_control_learning: Option<MidiMixerControlLearning>,
@@ -4613,6 +4614,15 @@ struct MidiVst3ParameterMapping {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct PatternVst3ParameterLink {
+    project_path: String,
+    pattern_id: u16,
+    stream_channel: u8,
+    stream_flags: u8,
+    target: MidiVst3ParameterTarget,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct MidiMixerControlMapping {
     input_device_id: String,
     channel: u8,
@@ -4957,6 +4967,7 @@ impl DawUi {
         let midi_output_gain_mapping = load_midi_output_gain_mapping();
         let midi_mixer_control_mappings = load_midi_mixer_control_mappings();
         let midi_vst3_parameter_mappings = load_midi_vst3_parameter_mappings();
+        let pattern_vst3_parameter_links = load_pattern_vst3_parameter_links();
         let midi_play_pause_mapping = load_midi_play_pause_mapping();
         let midi_controller_templates = load_midi_controller_templates();
         let live_resampling_quality = load_live_resampling_quality();
@@ -5294,6 +5305,7 @@ impl DawUi {
             midi_output_gain_mapping,
             midi_mixer_control_mappings,
             midi_vst3_parameter_mappings,
+            pattern_vst3_parameter_links,
             midi_vst3_parameter_learning: None,
             midi_mixer_button_cc_active: BTreeSet::new(),
             midi_mixer_control_learning: None,
@@ -6436,6 +6448,60 @@ impl DawUi {
             .map(|workspace| workspace.sample_project_path().to_path_buf())
             .or_else(|| self.current_path.clone())
             .or_else(|| self.new_project_template_path.clone())
+    }
+
+    fn selected_pattern_vst3_parameter_source(&self) -> Option<(String, u16, u8, u8)> {
+        let project_path = self.current_path.as_ref()?.to_string_lossy().into_owned();
+        let pattern_id = self.selected_pattern?;
+        let (stream_channel, stream_flags) = self.piano_roll_controller_stream?;
+        let pattern = self
+            .document
+            .as_ref()?
+            .patterns()
+            .ok()?
+            .into_iter()
+            .find(|pattern| pattern.id == pattern_id)?;
+        pattern
+            .controllers
+            .iter()
+            .any(|point| point.channel == stream_channel && point.flags == stream_flags)
+            .then_some((project_path, pattern_id, stream_channel, stream_flags))
+    }
+
+    fn pattern_vst3_parameter_automations_for_pattern(
+        &self,
+        pattern_id: u16,
+        controllers: &[PatternController],
+        ppq: u16,
+    ) -> BTreeMap<u16, Vec<Vst3ParameterAutomation>> {
+        let (Some(project_path), Some(host)) =
+            (self.current_path.as_deref(), self.vst3_host.as_ref())
+        else {
+            return BTreeMap::new();
+        };
+        let loaded_plugins = host.loaded_plugins();
+        let mut automations = BTreeMap::new();
+        for (&channel_id, &instance_id) in &self.channel_vst3_instances {
+            let Some(plugin) = loaded_plugins
+                .iter()
+                .find(|plugin| plugin.id == instance_id)
+            else {
+                continue;
+            };
+            let lanes = pattern_vst3_parameter_automation_for_channel(
+                &self.pattern_vst3_parameter_links,
+                Some(project_path),
+                pattern_id,
+                controllers,
+                channel_id,
+                &plugin.uid,
+                ppq,
+            );
+            if !lanes.is_empty() {
+                automations.insert(channel_id, lanes);
+            }
+        }
+        automations
     }
 
     fn make_audio_clip_unique_as_sample(
@@ -29760,12 +29826,12 @@ impl DawUi {
         } else {
             None
         };
-        let notes = match document.patterns() {
+        let (notes, controllers) = match document.patterns() {
             Ok(patterns) => match patterns
                 .into_iter()
                 .find(|pattern| pattern.id == pattern_id)
             {
-                Some(pattern) => pattern.notes,
+                Some(pattern) => (pattern.notes, pattern.controllers),
                 None => {
                     self.status = format!("Pattern {pattern_id} was not found");
                     return;
@@ -29777,6 +29843,8 @@ impl DawUi {
             }
         };
         let ppq = document.header().ppq();
+        let pattern_automations =
+            self.pattern_vst3_parameter_automations_for_pattern(pattern_id, &controllers, ppq);
         let tempo_bpm = document.metadata().tempo_bpm().unwrap_or(self.tempo_bpm);
         let global_swing_mix_raw = document.metadata().global_swing_mix();
         let channel_swing_mix_raw = project_channel_swing_mix_raw(&document, channel_id);
@@ -29820,7 +29888,7 @@ impl DawUi {
             .as_ref()
             .ok_or_else(|| "VST3 host is not initialized".to_owned())
             .and_then(|host| {
-                host.render_pattern_channel_to_file(
+                host.render_pattern_channel_to_file_with_automation(
                     instance_id,
                     &notes,
                     Vst3PatternRenderOptions {
@@ -29833,6 +29901,10 @@ impl DawUi {
                         pitch_offset_cents,
                         note_pitch_offset_semitones,
                     },
+                    pattern_automations
+                        .get(&channel_id)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]),
                     &path,
                     AudioFileRenderOptions {
                         output_format,
@@ -29871,12 +29943,12 @@ impl DawUi {
             self.status = "Open a project before rendering VST3 channels".to_owned();
             return;
         };
-        let notes = match document.patterns() {
+        let (notes, controllers) = match document.patterns() {
             Ok(patterns) => match patterns
                 .into_iter()
                 .find(|pattern| pattern.id == pattern_id)
             {
-                Some(pattern) => pattern.notes,
+                Some(pattern) => (pattern.notes, pattern.controllers),
                 None => {
                     self.status = format!("Pattern {pattern_id} was not found");
                     return;
@@ -29887,6 +29959,11 @@ impl DawUi {
                 return;
             }
         };
+        let pattern_automations = self.pattern_vst3_parameter_automations_for_pattern(
+            pattern_id,
+            &controllers,
+            document.header().ppq(),
+        );
         let instances = self.channel_vst3_instances.clone();
         let project_channels = document.channels();
 
@@ -29916,6 +29993,10 @@ impl DawUi {
                 let instance_id = instances.get(&channel_id).copied()?;
                 Some(Vst3PatternChannelRenderRequest {
                     instance_id,
+                    parameter_automation: pattern_automations
+                        .get(&channel_id)
+                        .cloned()
+                        .unwrap_or_default(),
                     options: Vst3PatternRenderOptions {
                         channel_id,
                         ppq,
@@ -30640,12 +30721,12 @@ impl DawUi {
             self.status = "Open a project before previewing a pattern".to_owned();
             return;
         };
-        let notes = match document.patterns() {
+        let (notes, controllers) = match document.patterns() {
             Ok(patterns) => match patterns
                 .into_iter()
                 .find(|pattern| pattern.id == pattern_id)
             {
-                Some(pattern) => pattern.notes,
+                Some(pattern) => (pattern.notes, pattern.controllers),
                 None => {
                     self.status = format!("Pattern {pattern_id} was not found");
                     return;
@@ -30657,6 +30738,8 @@ impl DawUi {
             }
         };
         let ppq = document.header().ppq();
+        let pattern_automations =
+            self.pattern_vst3_parameter_automations_for_pattern(pattern_id, &controllers, ppq);
         let tempo_bpm = document.metadata().tempo_bpm().unwrap_or(self.tempo_bpm);
         let global_swing_mix_raw = document.metadata().global_swing_mix();
         let channel_swing_mix_raw = project_channel_swing_mix_raw(document, channel_id);
@@ -30698,7 +30781,7 @@ impl DawUi {
             .as_ref()
             .ok_or_else(|| "VST3 host is not initialized".to_owned())
             .and_then(|host| {
-                host.prepare_pattern_channel_stream(
+                host.prepare_pattern_channel_stream_with_automation(
                     instance_id,
                     &notes,
                     Vst3PatternRenderOptions {
@@ -30711,6 +30794,10 @@ impl DawUi {
                         pitch_offset_cents,
                         note_pitch_offset_semitones,
                     },
+                    pattern_automations
+                        .get(&channel_id)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]),
                 )
             });
         let prepared = match prepared {
@@ -30828,16 +30915,39 @@ impl DawUi {
         } else {
             0
         };
+        let pattern_automations = if loop_length_ticks.is_some() {
+            let pattern = match document.patterns() {
+                Ok(patterns) => patterns
+                    .into_iter()
+                    .find(|pattern| pattern.id == pattern_id),
+                Err(error) => {
+                    self.status = format!("Could not decode Pattern automation: {error}");
+                    return;
+                }
+            };
+            let Some(pattern) = pattern else {
+                self.status = format!("Pattern {pattern_id} was not found");
+                return;
+            };
+            self.pattern_vst3_parameter_automations_for_pattern(
+                pattern_id,
+                &pattern.controllers,
+                document.header().ppq(),
+            )
+        } else {
+            BTreeMap::new()
+        };
         let vst3_processor = if let Some(loop_length_ticks) = loop_length_ticks {
             self.vst3_host
                 .as_ref()
                 .map(|host| {
-                    host.prepare_pattern_loop_stream(
+                    host.prepare_pattern_loop_stream_with_automation(
                         document,
                         pattern_id,
                         loop_length_ticks,
                         device_rate,
                         &self.channel_vst3_instances,
+                        &pattern_automations,
                     )
                 })
                 .transpose()
@@ -44099,6 +44209,20 @@ impl DawUi {
         let mut midi_vst3_learn_request = None;
         let mut midi_vst3_cancel_learning = false;
         let mut midi_vst3_remove_mapping = None;
+        let mut pattern_vst3_link_request: Option<(String, u16, u8, u8, MidiVst3ParameterTarget)> =
+            None;
+        let mut pattern_vst3_unlink_request: Option<(PathBuf, u16, MidiVst3ParameterTarget)> = None;
+        let pattern_vst3_source = self.selected_pattern_vst3_parameter_source();
+        let pattern_vst3_link_hint = pattern_vst3_source.is_none().then(|| {
+            if self.selected_pattern.is_some()
+                && self.piano_roll_controller_stream.is_some()
+                && self.current_path.is_none()
+            {
+                "Save the project before linking its Pattern Event stream."
+            } else {
+                "Select an existing stream in the Piano roll Events lane to link it."
+            }
+        });
         let clap_note_preview_busy = self
             .clap_note_preview_states
             .values()
@@ -44717,6 +44841,9 @@ impl DawUi {
                             (*instance_id == info.id).then_some(*channel_id)
                         });
                 egui::CollapsingHeader::new("Parameters").show(ui, |ui| {
+                    if let Some(hint) = pattern_vst3_link_hint {
+                        ui.small(egui::RichText::new(hint).color(MUTED));
+                    }
                     let parameters = self
                         .vst3_host
                         .as_ref()
@@ -44737,6 +44864,20 @@ impl DawUi {
                                 target,
                             )
                         });
+                        let pattern_link = self
+                            .current_path
+                            .as_deref()
+                            .zip(self.selected_pattern)
+                            .and_then(|(project_path, pattern_id)| {
+                                target.as_ref().and_then(|target| {
+                                    pattern_vst3_parameter_link_for_target(
+                                        &self.pattern_vst3_parameter_links,
+                                        project_path,
+                                        pattern_id,
+                                        target,
+                                    )
+                                })
+                            });
                         ui.horizontal(|ui| {
                             let label = if parameter.unit.is_empty() {
                                 parameter.name.clone()
@@ -44784,6 +44925,70 @@ impl DawUi {
                                         midi_vst3_remove_mapping = Some(target.clone());
                                     }
                                 }
+
+                                if let Some(link) = pattern_link {
+                                    ui.small(format!(
+                                        "Pattern {} · event channel {} · flags 0x{:02X}",
+                                        link.pattern_id, link.stream_channel, link.stream_flags
+                                    ));
+                                }
+                                let selected_stream_is_linked =
+                                    pattern_vst3_source.as_ref().is_some_and(
+                                        |(
+                                            project_path,
+                                            pattern_id,
+                                            stream_channel,
+                                            stream_flags,
+                                        )| {
+                                            pattern_link.is_some_and(|link| {
+                                                project_paths_equal(
+                                                    Path::new(&link.project_path),
+                                                    Path::new(project_path),
+                                                ) && link.pattern_id == *pattern_id
+                                                    && link.stream_channel == *stream_channel
+                                                    && link.stream_flags == *stream_flags
+                                            })
+                                        },
+                                    );
+                                if let Some((
+                                    project_path,
+                                    pattern_id,
+                                    stream_channel,
+                                    stream_flags,
+                                )) = pattern_vst3_source.as_ref()
+                                {
+                                    if selected_stream_is_linked {
+                                        ui.small("Linked");
+                                    } else if ui
+                                        .add_enabled(
+                                            !parameter.is_read_only,
+                                            egui::Button::new(if pattern_link.is_some() {
+                                                "Relink Event"
+                                            } else {
+                                                "Link Event"
+                                            }),
+                                        )
+                                        .clicked()
+                                    {
+                                        pattern_vst3_link_request = Some((
+                                            project_path.clone(),
+                                            *pattern_id,
+                                            *stream_channel,
+                                            *stream_flags,
+                                            target.clone(),
+                                        ));
+                                    }
+                                } else if !parameter.is_read_only {
+                                    ui.add_enabled(false, egui::Button::new("Link Event"));
+                                }
+                                if pattern_link.is_some()
+                                    && ui.small_button("Clear event").clicked()
+                                    && let (Some(project_path), Some(pattern_id)) =
+                                        (self.current_path.as_ref(), self.selected_pattern)
+                                {
+                                    pattern_vst3_unlink_request =
+                                        Some((project_path.clone(), pattern_id, target.clone()));
+                                }
                             }
                         });
                         if target.is_none() {
@@ -44828,6 +45033,54 @@ impl DawUi {
         if let Some(target) = midi_vst3_learn_request {
             self.midi_vst3_parameter_learning = Some(target.clone());
             self.status = format!("Move a MIDI CC to link it to {}", target.parameter_name);
+        }
+
+        if let Some((project_path, pattern_id, stream_channel, stream_flags, target)) =
+            pattern_vst3_link_request
+        {
+            upsert_pattern_vst3_parameter_link(
+                &mut self.pattern_vst3_parameter_links,
+                PatternVst3ParameterLink {
+                    project_path,
+                    pattern_id,
+                    stream_channel,
+                    stream_flags,
+                    target: target.clone(),
+                },
+            );
+            self.status = save_pattern_vst3_parameter_links(&self.pattern_vst3_parameter_links)
+                .err()
+                .map_or_else(
+                    || {
+                        format!(
+                            "Linked Pattern {pattern_id} event stream to {} on this machine",
+                            target.parameter_name
+                        )
+                    },
+                    |error| {
+                        format!(
+                            "Linked Pattern event stream for this session; could not save it: {error}"
+                        )
+                    },
+                );
+        }
+        if let Some((project_path, pattern_id, target)) = pattern_vst3_unlink_request {
+            remove_pattern_vst3_parameter_link(
+                &mut self.pattern_vst3_parameter_links,
+                &project_path,
+                pattern_id,
+                &target,
+            );
+            self.status = save_pattern_vst3_parameter_links(&self.pattern_vst3_parameter_links)
+                .err()
+                .map_or_else(
+                    || format!("Cleared Pattern event link for {}", target.parameter_name),
+                    |error| {
+                        format!(
+                            "Cleared Pattern event link for this session; could not save it: {error}"
+                        )
+                    },
+                );
         }
 
         if let Some(id) = open_id
@@ -47374,6 +47627,10 @@ fn midi_vst3_parameter_mappings_file() -> Option<PathBuf> {
     midi_control_change_mapping_file("midi-vst3-parameter-mappings.txt")
 }
 
+fn pattern_vst3_parameter_links_file() -> Option<PathBuf> {
+    midi_control_change_mapping_file("pattern-vst3-parameter-links.txt")
+}
+
 fn legacy_midi_mixer_fader_mapping_file() -> Option<PathBuf> {
     midi_control_change_mapping_file("midi-mixer-fader-mapping.txt")
 }
@@ -47411,6 +47668,13 @@ fn load_midi_vst3_parameter_mappings() -> Vec<MidiVst3ParameterMapping> {
     midi_vst3_parameter_mappings_file()
         .and_then(|path| fs::read_to_string(path).ok())
         .map(|contents| parse_midi_vst3_parameter_mappings(&contents))
+        .unwrap_or_default()
+}
+
+fn load_pattern_vst3_parameter_links() -> Vec<PatternVst3ParameterLink> {
+    pattern_vst3_parameter_links_file()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .map(|contents| parse_pattern_vst3_parameter_links(&contents))
         .unwrap_or_default()
 }
 
@@ -47557,6 +47821,18 @@ fn save_midi_vst3_parameter_mappings(mappings: &[MidiVst3ParameterMapping]) -> R
     fs::create_dir_all(parent)
         .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
     fs::write(&path, serialize_midi_vst3_parameter_mappings(mappings))
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
+fn save_pattern_vst3_parameter_links(links: &[PatternVst3ParameterLink]) -> Result<(), String> {
+    let path = pattern_vst3_parameter_links_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the Pattern VST3 parameter link path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(&path, serialize_pattern_vst3_parameter_links(links))
         .map_err(|error| format!("could not write {}: {error}", path.display()))
 }
 
@@ -47751,6 +48027,193 @@ fn serialize_midi_vst3_parameter_mappings(mappings: &[MidiVst3ParameterMapping])
         contents.push_str(&mapping.target.parameter_id.to_string());
         contents.push('\t');
         contents.push_str(&encode_midi_device_id(&mapping.target.parameter_name));
+        contents.push('\n');
+    }
+    contents
+}
+
+fn valid_pattern_vst3_parameter_link(link: &PatternVst3ParameterLink) -> bool {
+    !link.project_path.is_empty()
+        && !link.target.plugin_uid.is_empty()
+        && !link.target.parameter_name.is_empty()
+}
+
+fn same_pattern_vst3_parameter_link_target(
+    link: &PatternVst3ParameterLink,
+    project_path: &Path,
+    pattern_id: u16,
+    target: &MidiVst3ParameterTarget,
+) -> bool {
+    project_paths_equal(Path::new(&link.project_path), project_path)
+        && link.pattern_id == pattern_id
+        && same_midi_vst3_parameter_target(&link.target, target)
+}
+
+fn upsert_pattern_vst3_parameter_link(
+    links: &mut Vec<PatternVst3ParameterLink>,
+    link: PatternVst3ParameterLink,
+) {
+    if !valid_pattern_vst3_parameter_link(&link) {
+        return;
+    }
+    links.retain(|existing| {
+        !same_pattern_vst3_parameter_link_target(
+            existing,
+            Path::new(&link.project_path),
+            link.pattern_id,
+            &link.target,
+        )
+    });
+    links.push(link);
+}
+
+fn remove_pattern_vst3_parameter_link(
+    links: &mut Vec<PatternVst3ParameterLink>,
+    project_path: &Path,
+    pattern_id: u16,
+    target: &MidiVst3ParameterTarget,
+) {
+    links.retain(|link| {
+        !same_pattern_vst3_parameter_link_target(link, project_path, pattern_id, target)
+    });
+}
+
+fn pattern_vst3_parameter_link_for_target<'a>(
+    links: &'a [PatternVst3ParameterLink],
+    project_path: &Path,
+    pattern_id: u16,
+    target: &MidiVst3ParameterTarget,
+) -> Option<&'a PatternVst3ParameterLink> {
+    links.iter().find(|link| {
+        same_pattern_vst3_parameter_link_target(link, project_path, pattern_id, target)
+    })
+}
+
+fn pattern_vst3_parameter_automation_for_channel(
+    links: &[PatternVst3ParameterLink],
+    project_path: Option<&Path>,
+    pattern_id: u16,
+    controllers: &[PatternController],
+    target_channel_id: u16,
+    plugin_uid: &str,
+    ppq: u16,
+) -> Vec<Vst3ParameterAutomation> {
+    let Some(project_path) = project_path else {
+        return Vec::new();
+    };
+    if ppq == 0 || plugin_uid.is_empty() {
+        return Vec::new();
+    }
+
+    links
+        .iter()
+        .filter(|link| {
+            project_paths_equal(Path::new(&link.project_path), project_path)
+                && link.pattern_id == pattern_id
+                && link.target.project_channel_id == target_channel_id
+                && link.target.plugin_uid == plugin_uid
+        })
+        .filter_map(|link| {
+            let points = controllers
+                .iter()
+                .filter(|point| {
+                    point.channel == link.stream_channel && point.flags == link.stream_flags
+                })
+                .filter_map(|point| {
+                    let value = point.value();
+                    (value.is_finite() && (0.0..=1.0).contains(&value)).then_some(
+                        Vst3AutomationPoint {
+                            position_beats: f64::from(point.position) / f64::from(ppq),
+                            value: f64::from(value),
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            (!points.is_empty()).then_some(Vst3ParameterAutomation {
+                parameter_id: link.target.parameter_id,
+                points,
+            })
+        })
+        .collect()
+}
+
+fn parse_pattern_vst3_parameter_links(contents: &str) -> Vec<PatternVst3ParameterLink> {
+    let mut links = Vec::new();
+    for line in contents.lines() {
+        let Some(encoded) = line.strip_prefix("link=") else {
+            continue;
+        };
+        let mut fields = encoded.split('\t');
+        let Some(project_path) = fields.next().and_then(decode_midi_device_id) else {
+            continue;
+        };
+        let Some(pattern_id) = fields.next().and_then(|field| field.parse::<u16>().ok()) else {
+            continue;
+        };
+        let Some(stream_channel) = fields.next().and_then(|field| field.parse::<u8>().ok()) else {
+            continue;
+        };
+        let Some(stream_flags) = fields.next().and_then(|field| field.parse::<u8>().ok()) else {
+            continue;
+        };
+        let Some(project_channel_id) = fields.next().and_then(|field| field.parse::<u16>().ok())
+        else {
+            continue;
+        };
+        let Some(plugin_uid) = fields.next().and_then(decode_midi_device_id) else {
+            continue;
+        };
+        let Some(parameter_id) = fields.next().and_then(|field| field.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(parameter_name) = fields.next().and_then(decode_midi_device_id) else {
+            continue;
+        };
+        if fields.next().is_some() {
+            continue;
+        }
+        upsert_pattern_vst3_parameter_link(
+            &mut links,
+            PatternVst3ParameterLink {
+                project_path,
+                pattern_id,
+                stream_channel,
+                stream_flags,
+                target: MidiVst3ParameterTarget {
+                    project_channel_id,
+                    plugin_uid,
+                    parameter_id,
+                    parameter_name,
+                },
+            },
+        );
+    }
+    links
+}
+
+fn serialize_pattern_vst3_parameter_links(links: &[PatternVst3ParameterLink]) -> String {
+    let mut contents = String::from("version=1\n");
+    let mut normalized = Vec::new();
+    for link in links {
+        upsert_pattern_vst3_parameter_link(&mut normalized, link.clone());
+    }
+    for link in normalized {
+        contents.push_str("link=");
+        contents.push_str(&encode_midi_device_id(&link.project_path));
+        contents.push('\t');
+        contents.push_str(&link.pattern_id.to_string());
+        contents.push('\t');
+        contents.push_str(&link.stream_channel.to_string());
+        contents.push('\t');
+        contents.push_str(&link.stream_flags.to_string());
+        contents.push('\t');
+        contents.push_str(&link.target.project_channel_id.to_string());
+        contents.push('\t');
+        contents.push_str(&encode_midi_device_id(&link.target.plugin_uid));
+        contents.push('\t');
+        contents.push_str(&link.target.parameter_id.to_string());
+        contents.push('\t');
+        contents.push_str(&encode_midi_device_id(&link.target.parameter_name));
         contents.push('\n');
     }
     contents
@@ -52845,12 +53308,12 @@ mod tests {
         MidiDeviceSelections, MidiInputDevice, MidiInputEvent, MidiMixerControlMapping,
         MidiMixerControlTarget, MidiOutputDevice, MidiVst3ParameterMapping,
         MidiVst3ParameterTarget, PIANO_ROLL_RULER_HEIGHT, Pattern, PatternController, PatternNote,
-        PianoRollChordStamp, PianoRollGrid, PianoRollScale, PianoRollSnap, PlaylistClip,
-        PlaylistClipDragKind, PlaylistTempoMap, PlaylistTrack, PluginCandidate, PluginFormat,
-        TimeSelectionShift, TouchGesture, TouchTapTracker, TouchZoomConfig,
-        WINDOW_LAYOUT_PRESETS_HEADER, WindowLayoutPreset, audio_recording_start_tick_with_offset,
-        built_in_midi_controller_templates, candidate_live_mixer_send_key,
-        candidate_matches_vst_identity, candidate_mixer_controls,
+        PatternVst3ParameterLink, PianoRollChordStamp, PianoRollGrid, PianoRollScale,
+        PianoRollSnap, PlaylistClip, PlaylistClipDragKind, PlaylistTempoMap, PlaylistTrack,
+        PluginCandidate, PluginFormat, TimeSelectionShift, TouchGesture, TouchTapTracker,
+        TouchZoomConfig, WINDOW_LAYOUT_PRESETS_HEADER, WindowLayoutPreset,
+        audio_recording_start_tick_with_offset, built_in_midi_controller_templates,
+        candidate_live_mixer_send_key, candidate_matches_vst_identity, candidate_mixer_controls,
         candidate_mixer_stereo_separation, detect_chord_name, detect_piano_roll_channel_scale,
         detect_piano_roll_scale, encode_midi_device_id, encode_midi_device_selections,
         first_available_playlist_track, is_performance_clip_trigger_channel_event,
@@ -52861,7 +53324,9 @@ mod tests {
         next_piano_roll_note_group, note_from_grid_position, parse_midi_control_change_mapping,
         parse_midi_controller_templates, parse_midi_device_selections,
         parse_midi_mixer_control_mappings, parse_midi_vst3_parameter_mappings,
-        parse_window_layout_presets, pattern_loop_frame_at_tick, pattern_loop_tick_at_frame,
+        parse_pattern_vst3_parameter_links, parse_window_layout_presets,
+        pattern_loop_frame_at_tick, pattern_loop_tick_at_frame,
+        pattern_vst3_parameter_automation_for_channel, pattern_vst3_parameter_link_for_target,
         piano_roll_color_group_note_ids, piano_roll_controller_stroke_points,
         piano_roll_controller_value_at, piano_roll_controller_value_range,
         piano_roll_cross_pattern_ghost_notes, piano_roll_discard_length_edit,
@@ -52878,15 +53343,16 @@ mod tests {
         playlist_pattern_recording_placement_tick, playlist_seek_tick_to_frame,
         playlist_signature_at_tick, playlist_song_position_label, playlist_track_group_range,
         playlist_track_is_hidden, recolor_piano_roll_notes, recording_input_targets,
-        remove_midi_vst3_parameter_mapping, sample_editor_selection_for_drag,
-        serialize_midi_controller_templates, serialize_midi_mixer_control_mappings,
-        serialize_midi_vst3_parameter_mappings, serialize_window_layout_presets,
+        remove_midi_vst3_parameter_mapping, remove_pattern_vst3_parameter_link,
+        sample_editor_selection_for_drag, serialize_midi_controller_templates,
+        serialize_midi_mixer_control_mappings, serialize_midi_vst3_parameter_mappings,
+        serialize_pattern_vst3_parameter_links, serialize_window_layout_presets,
         should_auto_connect_midi_input, should_auto_connect_midi_output, snap_note_tick,
         snap_piano_roll_key_to_scale, snap_recorded_midi_notes_to_scale,
         toggle_piano_roll_note_group_selection, touch_pan_zoom_scroll_offset, track_two_finger_tap,
         update_channel_rack_selection, update_layer_child_selection,
         update_piano_roll_box_selection, upsert_midi_mixer_control_mapping,
-        upsert_midi_vst3_parameter_mapping, zoom_to_fit,
+        upsert_midi_vst3_parameter_mapping, upsert_pattern_vst3_parameter_link, zoom_to_fit,
     };
 
     fn mixer_send_route_fixture() -> FlpDocument {
@@ -54103,6 +54569,130 @@ mod tests {
             2
         );
         assert!(midi_vst3_parameter_mappings_for_cc(&mappings, "other", 15, 74).is_empty());
+    }
+
+    #[test]
+    fn pattern_vst3_parameter_links_round_trip_and_replace_per_project_pattern_target() {
+        let project_path = std::env::temp_dir().join("automation project 雪.flp");
+        let project_key = project_path.to_string_lossy().into_owned();
+        let target = MidiVst3ParameterTarget {
+            project_channel_id: 23,
+            plugin_uid: "com.example.synth\tuid".to_owned(),
+            parameter_id: 7,
+            parameter_name: "Cutoff 雪".to_owned(),
+        };
+        let link = PatternVst3ParameterLink {
+            project_path: project_key.clone(),
+            pattern_id: 4,
+            stream_channel: 3,
+            stream_flags: 0x24,
+            target: target.clone(),
+        };
+        let other_target = PatternVst3ParameterLink {
+            target: MidiVst3ParameterTarget {
+                project_channel_id: 23,
+                plugin_uid: "com.example.synth\tuid".to_owned(),
+                parameter_id: 8,
+                parameter_name: "Resonance".to_owned(),
+            },
+            stream_channel: 5,
+            stream_flags: 0x18,
+            ..link.clone()
+        };
+        let encoded = serialize_pattern_vst3_parameter_links(&[link.clone(), other_target.clone()]);
+        assert_eq!(
+            parse_pattern_vst3_parameter_links(&encoded),
+            vec![link.clone(), other_target.clone()]
+        );
+
+        let replacement = PatternVst3ParameterLink {
+            stream_channel: 9,
+            stream_flags: 0x44,
+            ..link.clone()
+        };
+        let mut links = vec![link, other_target.clone()];
+        upsert_pattern_vst3_parameter_link(&mut links, replacement.clone());
+        assert_eq!(links, vec![other_target.clone(), replacement]);
+        assert_eq!(
+            pattern_vst3_parameter_link_for_target(&links, &project_path, 4, &target),
+            Some(&links[1])
+        );
+        assert!(
+            pattern_vst3_parameter_link_for_target(&links, &project_path, 5, &target).is_none()
+        );
+
+        remove_pattern_vst3_parameter_link(&mut links, &project_path, 4, &target);
+        assert_eq!(links, vec![other_target]);
+    }
+
+    #[test]
+    fn pattern_vst3_parameter_automation_maps_only_normalized_points_from_its_linked_stream() {
+        let project_path = std::env::temp_dir().join("automation project.flp");
+        let link = PatternVst3ParameterLink {
+            project_path: project_path.to_string_lossy().into_owned(),
+            pattern_id: 6,
+            stream_channel: 2,
+            stream_flags: 0x31,
+            target: MidiVst3ParameterTarget {
+                project_channel_id: 17,
+                plugin_uid: "com.example.synth".to_owned(),
+                parameter_id: 42,
+                parameter_name: "Cutoff".to_owned(),
+            },
+        };
+        let point = |position, channel, flags, value: f32| PatternController {
+            position,
+            channel,
+            flags,
+            value_bits: value.to_bits(),
+            ..PatternController::default()
+        };
+        let controllers = [
+            point(0, 2, 0x31, 0.25),
+            point(96, 2, 0x31, 0.75),
+            point(48, 9, 0x31, 0.9),
+            point(64, 2, 0x30, 0.5),
+            point(120, 2, 0x31, 1.5),
+            point(144, 2, 0x31, f32::NAN),
+        ];
+
+        let automation = pattern_vst3_parameter_automation_for_channel(
+            &[link.clone()],
+            Some(&project_path),
+            6,
+            &controllers,
+            17,
+            "com.example.synth",
+            96,
+        );
+        assert_eq!(
+            automation,
+            vec![flp_rebuild::vst3::Vst3ParameterAutomation {
+                parameter_id: 42,
+                points: vec![
+                    flp_rebuild::vst3::Vst3AutomationPoint {
+                        position_beats: 0.0,
+                        value: 0.25,
+                    },
+                    flp_rebuild::vst3::Vst3AutomationPoint {
+                        position_beats: 1.0,
+                        value: 0.75,
+                    },
+                ],
+            }]
+        );
+        assert!(
+            pattern_vst3_parameter_automation_for_channel(
+                &[link],
+                Some(&project_path),
+                6,
+                &controllers,
+                17,
+                "different-plugin",
+                96,
+            )
+            .is_empty()
+        );
     }
 
     #[test]
