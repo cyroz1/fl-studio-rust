@@ -29919,37 +29919,36 @@ impl DawUi {
         let ppq = document.header().ppq();
         let tempo_bpm = document.metadata().tempo_bpm().unwrap_or(self.tempo_bpm);
         let global_swing_mix_raw = document.metadata().global_swing_mix();
-        let channels =
-            channel_ids
-                .iter()
-                .filter_map(|channel_id| {
-                    let instance_id = instances.get(channel_id).copied()?;
-                    Some(Vst3PatternChannelRenderRequest {
-                        instance_id,
-                        notes: &notes,
-                        options: Vst3PatternRenderOptions {
-                            channel_id: *channel_id,
-                            ppq,
-                            tempo_bpm,
-                            tail_seconds: 2.0,
-                            global_swing_mix_raw,
-                            channel_swing_mix_raw: project_channel_swing_mix_raw(
+        let channels = channel_ids
+            .iter()
+            .filter_map(|channel_id| {
+                let instance_id = instances.get(channel_id).copied()?;
+                Some(Vst3PatternChannelRenderRequest {
+                    instance_id,
+                    notes: &notes,
+                    options: Vst3PatternRenderOptions {
+                        channel_id: *channel_id,
+                        ppq,
+                        tempo_bpm,
+                        tail_seconds: 2.0,
+                        global_swing_mix_raw,
+                        channel_swing_mix_raw: project_channel_swing_mix_raw(
+                            &document,
+                            *channel_id,
+                        ),
+                        pitch_offset_cents: project_channel_master_pitch_offset_cents(
+                            &document,
+                            *channel_id,
+                        ),
+                        note_pitch_offset_semitones:
+                            project_channel_master_pitch_note_offset_semitones(
                                 &document,
                                 *channel_id,
                             ),
-                            pitch_offset_cents: project_channel_master_pitch_offset_cents(
-                                &document,
-                                *channel_id,
-                            ),
-                            note_pitch_offset_semitones:
-                                project_channel_vst3_note_pitch_offset_semitones(
-                                    &document,
-                                    *channel_id,
-                                ),
-                        },
-                    })
+                    },
                 })
-                .collect::<Vec<_>>();
+            })
+            .collect::<Vec<_>>();
         if channels.is_empty() {
             self.status = "No loaded VST3 Pattern channels are available to render".to_owned();
             return;
