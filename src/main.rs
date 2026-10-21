@@ -2320,6 +2320,26 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 },
             )
         }
+        [command, input, output, pattern_id, channel_id, position, length, key, velocity, quality, scale, scale_root, inversion]
+            if command == "add-scale-chord" =>
+        {
+            add_scale_chord(
+                Path::new(input),
+                Path::new(output),
+                quality,
+                scale,
+                parse_u8(scale_root, "scale root")?,
+                ChordStampCliOptions {
+                    pattern_id: parse_u16(pattern_id, "pattern id")?,
+                    channel_id: parse_u16(channel_id, "channel id")?,
+                    position: parse_u32(position, "chord position")?,
+                    length: parse_u32(length, "chord note length")?,
+                    root_key: parse_u16(key, "chord root or top key")?,
+                    velocity: parse_u8(velocity, "note velocity")?,
+                    inversion: parse_usize(inversion, "chord inversion")?,
+                },
+            )
+        }
         [command, input, output, pattern_id, channel_id, note_specs]
             if command == "add-notes" =>
         {
@@ -3356,6 +3376,9 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild claw-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <period-ticks:16+> <trash-every:2..16> <time-distortion:-100..100> <remove-short-notes:0|1> <stretch-to-compensate:0|1>\n",
             "  flp-rebuild add-note <input.flp> <output.flp> <pattern-id> <channel-id> <position> <length> <key> <velocity>\n",
             "  flp-rebuild add-chord <input.flp> <output.flp> <pattern-id> <channel-id> <position> <length> <root-key> <velocity> <quality> <inversion>\n",
+            "  flp-rebuild add-scale-chord <input.flp> <output.flp> <pattern-id> <channel-id> <position> <length> <root-or-top-key> <velocity> <quality> <scale|none> <scale-root:0..11> <inversion>\n",
+            "    Scale qualities: scale-triad, scale-seventh, scale-ninth, scale-eleventh, scale-thirteenth, top-down-triad, top-down-seventh.\n",
+            "    Scale intervals stack diatonic thirds; top-down stamps put the snapped key at the top. With scale=none, scale chords use major intervals.\n",
             "    Manual qualities: major, minor, diminished, augmented, sus2, sus4, power, dominant7, major7, minor7, major6, minor6, add9, minor-add9, diminished7, half-diminished7, minor-major7, dominant7-flat5, dominant7-sharp5, dominant7-flat9, dominant7-sharp9, dominant9, major9, minor9, dominant11, minor11, dominant13.\n",
             "    Inversion 0 keeps root position; each inversion raises the lowest pitch by one octave.\n",
             "  flp-rebuild add-notes <input.flp> <output.flp> <pattern-id> <channel-id> <notes:position:length:key:velocity,...>\n",
@@ -3948,6 +3971,158 @@ fn parse_chord_intervals(value: &str) -> Result<&'static [u8], String> {
         "dominant13" => Ok(&[0, 4, 7, 10, 14, 17, 21]),
         _ => Err("chord quality must be one of the supported manual stamp names".to_owned()),
     }
+}
+
+fn parse_chord_scale(value: &str) -> Result<&'static [u8], String> {
+    if value == "none" {
+        Ok(&[0, 2, 4, 5, 7, 9, 11])
+    } else {
+        parse_scale_name(value)
+    }
+}
+
+fn scale_chord_pitches(
+    root_key: u16,
+    scale_intervals: &[u8],
+    scale_root: u8,
+    quality: &str,
+) -> Result<Vec<u16>, String> {
+    if scale_root > 11 {
+        return Err("scale root must be between 0 and 11".to_owned());
+    }
+    if root_key > 127 {
+        return Err("chord root or top key must be between 0 and 127".to_owned());
+    }
+    if scale_intervals.is_empty() {
+        return Err("the selected chord scale has no intervals".to_owned());
+    }
+
+    let (degrees, top_down_note_count): (&[usize], Option<usize>) = match quality {
+        "scale-triad" => (&[0, 2, 4], None),
+        "scale-seventh" => (&[0, 2, 4, 6], None),
+        "scale-ninth" => (&[0, 2, 4, 6, 8], None),
+        "scale-eleventh" => (&[0, 2, 4, 6, 8, 10], None),
+        "scale-thirteenth" => (&[0, 2, 4, 6, 8, 10, 12], None),
+        "top-down-triad" => (&[], Some(3)),
+        "top-down-seventh" => (&[], Some(4)),
+        _ => {
+            return Err("scale chord quality must be scale-triad, scale-seventh, scale-ninth, scale-eleventh, scale-thirteenth, top-down-triad, or top-down-seventh".to_owned());
+        }
+    };
+
+    let contains_scale_pitch = |key: u16| {
+        let relative_pitch_class = ((key % 12 + 12 - u16::from(scale_root)) % 12) as u8;
+        scale_intervals.contains(&relative_pitch_class)
+    };
+    let snap_to_scale = |target: u16| {
+        (0..=127u16)
+            .filter(|key| contains_scale_pitch(*key))
+            .min_by_key(|key| key.abs_diff(target))
+            .ok_or_else(|| "the selected scale contains no MIDI pitches".to_owned())
+    };
+
+    let pitches = if let Some(note_count) = top_down_note_count {
+        let top_key = snap_to_scale(root_key)?;
+        let relative_pitch_class = ((top_key % 12 + 12 - u16::from(scale_root)) % 12) as u8;
+        let top_degree = scale_intervals
+            .iter()
+            .position(|interval| *interval == relative_pitch_class)
+            .ok_or_else(|| "could not locate the top note in the selected scale".to_owned())?;
+        let scale_anchor = i32::from(top_key) - i32::from(scale_intervals[top_degree]);
+        let scale_len = i32::try_from(scale_intervals.len())
+            .map_err(|_| "the selected scale has too many intervals".to_owned())?;
+        let top_degree = i32::try_from(top_degree)
+            .map_err(|_| "the selected scale has too many intervals".to_owned())?;
+        let mut pitches = Vec::new();
+        for voice in 0..note_count {
+            let voice = i32::try_from(voice)
+                .map_err(|_| "the selected chord has too many voices".to_owned())?;
+            let scale_index = top_degree - voice * 2;
+            let octave_offset = scale_index.div_euclid(scale_len);
+            let degree = usize::try_from(scale_index.rem_euclid(scale_len))
+                .map_err(|_| "could not calculate the selected scale degree".to_owned())?;
+            let key = scale_anchor + octave_offset * 12 + i32::from(scale_intervals[degree]);
+            if !(0..=127).contains(&key) {
+                return Err(
+                    "the selected top-down chord does not fit the MIDI key range".to_owned(),
+                );
+            }
+            pitches
+                .push(u16::try_from(key).map_err(|_| "could not encode a chord pitch".to_owned())?);
+        }
+        pitches
+    } else {
+        let snapped_root = snap_to_scale(root_key)?;
+        let scale_degree = scale_intervals
+            .iter()
+            .position(|interval| {
+                (u16::from(scale_root) + u16::from(*interval)) % 12 == snapped_root % 12
+            })
+            .ok_or_else(|| "could not locate the chord root in the selected scale".to_owned())?;
+        let scale_anchor = i32::from(snapped_root) - i32::from(scale_intervals[scale_degree]);
+        let scale_len = i32::try_from(scale_intervals.len())
+            .map_err(|_| "the selected scale has too many intervals".to_owned())?;
+        degrees
+            .iter()
+            .filter_map(|degree| {
+                let scale_index =
+                    i32::try_from(scale_degree).ok()? + i32::try_from(*degree).ok()?;
+                let octave_offset = scale_index / scale_len;
+                let degree = usize::try_from(scale_index % scale_len).ok()?;
+                let key = scale_anchor + octave_offset * 12 + i32::from(scale_intervals[degree]);
+                if !(0..=127).contains(&key) {
+                    return None;
+                }
+                u16::try_from(key).ok()
+            })
+            .collect()
+    };
+    Ok(pitches)
+}
+
+fn unscaled_scale_chord_pitches(root_key: u16, quality: &str) -> Result<Vec<u16>, String> {
+    if root_key > 127 {
+        return Err("chord root or top key must be between 0 and 127".to_owned());
+    }
+    let intervals: &[u8] = match quality {
+        "scale-triad" => &[0, 4, 7],
+        "scale-seventh" => &[0, 4, 7, 11],
+        "scale-ninth" => &[0, 4, 7, 11, 14],
+        "scale-eleventh" => &[0, 4, 7, 11, 14, 17],
+        "scale-thirteenth" => &[0, 4, 7, 11, 14, 17, 21],
+        _ => {
+            return Err("scale chord quality must be scale-triad, scale-seventh, scale-ninth, scale-eleventh, or scale-thirteenth when no scale is selected".to_owned());
+        }
+    };
+    Ok(intervals
+        .iter()
+        .filter_map(|interval| root_key.checked_add(u16::from(*interval)))
+        .filter(|key| *key <= 127)
+        .collect())
+}
+
+fn apply_chord_inversion(pitches: &mut Vec<u16>, inversion: usize) -> Result<(), String> {
+    pitches.sort_unstable();
+    if inversion >= pitches.len() && inversion != 0 {
+        return Err(format!(
+            "chord inversion must be between 0 and {} for this chord",
+            pitches.len().saturating_sub(1)
+        ));
+    }
+    for _ in 0..inversion {
+        let lowest = pitches
+            .first()
+            .copied()
+            .ok_or_else(|| "the selected chord contains no MIDI pitches".to_owned())?;
+        let raised = lowest
+            .checked_add(12)
+            .filter(|key| *key <= 127)
+            .ok_or_else(|| "the selected chord inversion exceeds MIDI key 127".to_owned())?;
+        pitches.remove(0);
+        pitches.push(raised);
+    }
+    pitches.sort_unstable();
+    Ok(())
 }
 
 fn parse_articulate_preset(value: &str) -> Result<ArticulateOptions, String> {
@@ -7780,6 +7955,71 @@ fn add_chord(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "added {} {quality} chord notes at tick {position} in pattern {pattern_id}, channel {channel_id} to {}",
+        notes.len(),
+        output.display()
+    );
+    Ok(())
+}
+
+fn add_scale_chord(
+    input: &Path,
+    output: &Path,
+    quality: &str,
+    scale_name: &str,
+    scale_root: u8,
+    options: ChordStampCliOptions,
+) -> Result<(), String> {
+    let ChordStampCliOptions {
+        pattern_id,
+        channel_id,
+        position,
+        length,
+        root_key,
+        velocity,
+        inversion,
+    } = options;
+    if length == 0 {
+        return Err("chord note length must be greater than zero".to_owned());
+    }
+    if velocity > 127 {
+        return Err("note velocity must be between 0 and 127".to_owned());
+    }
+    if scale_root > 11 {
+        return Err("scale root must be between 0 and 11".to_owned());
+    }
+    let mut pitches = if scale_name == "none" && quality.starts_with("scale-") {
+        unscaled_scale_chord_pitches(root_key, quality)?
+    } else {
+        let scale_intervals = parse_chord_scale(scale_name)?;
+        scale_chord_pitches(root_key, scale_intervals, scale_root, quality)?
+    };
+    if pitches.is_empty() {
+        return Err("the selected chord has no notes in the MIDI key range".to_owned());
+    }
+    apply_chord_inversion(&mut pitches, inversion)?;
+    let notes = pitches
+        .into_iter()
+        .map(|key| PatternNote {
+            position,
+            channel_id,
+            length,
+            key,
+            velocity,
+            ..PatternNote::default()
+        })
+        .collect::<Vec<_>>();
+
+    let (_, mut document) = load_document(input)?;
+    document
+        .add_pattern_notes(pattern_id, &notes)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "added {} {quality} chord notes in {scale_name} at tick {position} in pattern {pattern_id}, channel {channel_id} to {}",
         notes.len(),
         output.display()
     );
