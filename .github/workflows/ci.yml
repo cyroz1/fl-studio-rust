@@ -70,8 +70,13 @@ jobs:
             fi
           done
 
+          if [[ "$present" -eq 0 ]]; then
+            echo "::notice::Apple signing secrets are not configured; CI will build and launch an unsigned macOS app locally without publishing a macOS installer."
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if [[ "$present" -ne "${#secret_names[@]}" ]]; then
-            echo "::error::A Gatekeeper-ready macOS installer requires all six Apple signing and notarization secrets listed in docs/macos-ci-packaging.md; found $present of ${#secret_names[@]}."
+            echo "::error::Configure all six Apple signing and notarization secrets listed in docs/macos-ci-packaging.md; found $present of ${#secret_names[@]}."
             exit 1
           fi
           echo "available=true" >> "$GITHUB_OUTPUT"
@@ -1241,6 +1246,52 @@ jobs:
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
         run: cargo packager --release --config Packager.signed.toml
 
+      - name: Build unsigned macOS app for CI smoke check
+        if: runner.os == 'macOS' && steps.macos-signing-status.outputs.available != 'true'
+        run: cargo packager --release
+
+      - name: Launch unsigned macOS app locally
+        if: runner.os == 'macOS' && steps.macos-signing-status.outputs.available != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          app_bundles=(dist/*.app)
+          if (( ${#app_bundles[@]} != 1 )); then
+            echo "::error::Expected exactly one unsigned macOS app bundle; found ${#app_bundles[@]}."
+            printf '%s\n' "${app_bundles[@]}"
+            exit 1
+          fi
+          app_path="${app_bundles[0]}"
+          app_executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app_path/Contents/Info.plist")"
+          app_binary="$app_path/Contents/MacOS/$app_executable"
+          if [[ ! -x "$app_binary" ]]; then
+            echo "::error::The unsigned macOS app executable is missing or not executable."
+            exit 1
+          fi
+
+          app_log="$RUNNER_TEMP/fl-studio-unsigned-launch.log"
+          "$app_binary" > "$app_log" 2>&1 &
+          app_pid=$!
+          cleanup() {
+            kill "$app_pid" 2>/dev/null || true
+            wait "$app_pid" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          for attempt in $(seq 1 15); do
+            if ! kill -0 "$app_pid" 2>/dev/null; then
+              set +e
+              wait "$app_pid"
+              app_status=$?
+              set -e
+              echo "::error::The unsigned macOS app exited during launch with status $app_status."
+              cat "$app_log"
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "Unsigned macOS app remained running after launch."
+
       - name: Sign, notarize, and verify macOS disk image
         if: runner.os == 'macOS' && steps.macos-signing-status.outputs.available == 'true'
         shell: bash
@@ -1374,6 +1425,7 @@ jobs:
           echo "Installed macOS app remained running after launch."
 
       - name: Stage exactly one platform installer
+        if: runner.os != 'macOS' || steps.macos-signing-status.outputs.available == 'true'
         shell: bash
         run: |
           shopt -s nullglob

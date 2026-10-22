@@ -1,8 +1,8 @@
 # macOS CI packaging
 
-Each platform job uploads exactly one installer artifact: a Linux AppImage, a Windows setup executable, or a macOS disk image (`.dmg`). CI installs and launches each packaged app before upload. The macOS job signs and notarizes both the app and disk image, validates their stapled tickets, and checks Gatekeeper acceptance for the disk image and installed app. App bundles, screenshots, and intermediate files are not uploaded.
+Linux and Windows jobs upload their installer artifacts. When all six Apple signing secrets are configured, the macOS job uploads one signed and notarized disk image (`.dmg`) after installing and launching the app and validating its stapled tickets and Gatekeeper acceptance. When none of the Apple signing secrets are configured, CI builds and launches the unsigned app locally as a smoke check but does not upload a macOS artifact. App bundles, screenshots, and intermediate files are not uploaded.
 
-The macOS job requires all six Apple signing and notarization secrets below. It fails before packaging if any secret is missing, so CI never publishes an unsigned app that Gatekeeper could label “damaged.” Add the secrets under **Settings → Secrets and variables → Actions**:
+Signed macOS distribution requires all six Apple signing and notarization secrets below. With no secrets configured, CI skips signing and only runs a local smoke check. A partially configured set fails before packaging so misconfigured signing cannot silently fall back to an unsigned build. Add the secrets under **Settings → Secrets and variables → Actions**:
 
 | Secret | Value |
 |---|---|
