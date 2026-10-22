@@ -461,6 +461,7 @@ pub struct ChannelSummary {
     sampler_volume_envelope_enabled: Option<bool>,
     sampler_max_polyphony_raw: Option<u32>,
     sampler_mono_enabled: Option<bool>,
+    channel_cut_groups: Option<(u16, u16)>,
     envelope_lfo_events_seen: u8,
     sampler_flags: Option<u32>,
     sampler_root_note: Option<u32>,
@@ -870,6 +871,11 @@ impl ChannelSummary {
         (self.kind == Some(0))
             .then_some(self.sampler_mono_enabled)
             .flatten()
+    }
+
+    /// Saved `(Cut, Cut by)` channel group numbers from event `0x84`, when present.
+    pub fn channel_cut_groups(&self) -> Option<(u16, u16)> {
+        self.channel_cut_groups
     }
 
     /// Whether a kind-0 Sampler uses embedded sample loop points.
@@ -4398,6 +4404,15 @@ impl FlpDocument {
                     if event.payload.len() >= 9 && channel.sampler_mono_enabled.is_none() {
                         channel.sampler_mono_enabled = Some(event.payload[8] & 1 != 0);
                     }
+                }
+                0x84 if event.encoding == PayloadEncoding::Dword
+                    && event.payload.len() == 4
+                    && channel.channel_cut_groups.is_none() =>
+                {
+                    channel.channel_cut_groups = Some((
+                        u16::from_le_bytes([event.payload[0], event.payload[1]]),
+                        u16::from_le_bytes([event.payload[2], event.payload[3]]),
+                    ));
                 }
                 0x8F if event.encoding == PayloadEncoding::Dword
                     && event.payload.len() == 4
@@ -24495,6 +24510,28 @@ mod tests {
             None
         );
         assert_eq!(audio_document.channels()[0].sampler_mono_enabled(), None);
+    }
+
+    #[test]
+    fn decodes_channel_cut_and_cut_by_groups_losslessly() {
+        let mut event_stream = vec![0x40, 7, 0, 0x15, 0, 0x84];
+        event_stream.extend_from_slice(&7_u16.to_le_bytes());
+        event_stream.extend_from_slice(&11_u16.to_le_bytes());
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        let input = flp_fixture(&event_stream, &[], &[]);
+        let document = FlpDocument::parse(&input).expect("cut-group fixture should parse");
+
+        assert_eq!(document.channels()[0].channel_cut_groups(), Some((7, 11)));
+        assert_eq!(document.encode_lossless().unwrap(), input);
+
+        let mut instrument_channel = event_stream;
+        instrument_channel[4] = 4;
+        let instrument_document = FlpDocument::parse(&flp_fixture(&instrument_channel, &[], &[]))
+            .expect("instrument fixture should parse");
+        assert_eq!(
+            instrument_document.channels()[0].channel_cut_groups(),
+            Some((7, 11))
+        );
     }
 
     #[test]

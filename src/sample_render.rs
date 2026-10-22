@@ -6528,6 +6528,9 @@ fn prepare_sampler_arrangement(
         return Err("project PPQ must be greater than zero".to_owned());
     }
     let pan_law = project_pan_law(document);
+    let fast_declick_for_cut_groups = document
+        .project_settings()
+        .is_some_and(|settings| settings.fast_declick_for_cut_groups);
     let arrangement = document
         .arrangements()
         .map_err(|error| error.to_string())?
@@ -6739,6 +6742,8 @@ fn prepare_sampler_arrangement(
                 volume_envelope_enabled: channel.sampler_volume_envelope_enabled().unwrap_or(false),
                 max_polyphony_raw: channel.sampler_max_polyphony_raw(),
                 mono_enabled: channel.sampler_mono_enabled().unwrap_or(false),
+                channel_cut_groups: channel.channel_cut_groups(),
+                fast_declick_for_cut_groups,
                 key_range: sample_metadata.key_range,
                 velocity_range: sample_metadata.velocity_range,
                 root_key: resolve_sampler_channel_root_key(
@@ -6906,6 +6911,8 @@ struct SamplerVoiceSource {
     volume_envelope_enabled: bool,
     max_polyphony_raw: Option<u32>,
     mono_enabled: bool,
+    channel_cut_groups: Option<(u16, u16)>,
+    fast_declick_for_cut_groups: bool,
     key_range: Option<(u8, u8)>,
     velocity_range: Option<(u8, u8)>,
     root_key: u16,
@@ -8891,6 +8898,9 @@ fn prepare_sampler_pattern_for_channel_internal(
         .find(|pattern| pattern.id == options.pattern_id)
         .ok_or_else(|| format!("pattern {} was not found", options.pattern_id))?;
     let pan_law = project_pan_law(document);
+    let fast_declick_for_cut_groups = document
+        .project_settings()
+        .is_some_and(|settings| settings.fast_declick_for_cut_groups);
     let global_swing_mix_raw = document.metadata().global_swing_mix();
     let channels = document.channels();
     let mixer_route_audibility = MixerRouteAudibility::from_document(document);
@@ -9074,6 +9084,8 @@ fn prepare_sampler_pattern_for_channel_internal(
                 volume_envelope_enabled: channel.sampler_volume_envelope_enabled().unwrap_or(false),
                 max_polyphony_raw: channel.sampler_max_polyphony_raw(),
                 mono_enabled: channel.sampler_mono_enabled().unwrap_or(false),
+                channel_cut_groups: channel.channel_cut_groups(),
+                fast_declick_for_cut_groups,
                 key_range: sample_metadata.key_range,
                 velocity_range: sample_metadata.velocity_range,
                 root_key: resolve_sampler_channel_root_key(
@@ -9283,6 +9295,8 @@ struct SamplerVoice {
     live_mixer_source_control: Option<(LiveMixerSourceControl, LiveMixerSourceTargets)>,
     mixer_meter_transforms: Vec<(usize, MixerSourceRouteTransform)>,
     release_remaining: Option<usize>,
+    release_total_frames: Option<usize>,
+    release_cosine: bool,
 }
 
 impl<'a> SamplerVoiceEngine<'a> {
@@ -9388,7 +9402,18 @@ impl<'a> SamplerVoiceEngine<'a> {
                         *voice_slot = None;
                         continue;
                     }
-                    Some(remaining) => remaining as f32 / self.release_frames as f32,
+                    Some(remaining) => {
+                        let total = voice
+                            .release_total_frames
+                            .unwrap_or(self.release_frames)
+                            .max(1) as f32;
+                        if voice.release_cosine {
+                            let progress = 1.0 - remaining as f32 / total;
+                            0.5 * (1.0 + (std::f32::consts::PI * progress).cos())
+                        } else {
+                            remaining as f32 / total
+                        }
+                    }
                     None => 1.0,
                 };
                 let source_frames = voice.source.frame_count();
@@ -9483,6 +9508,38 @@ impl<'a> SamplerVoiceEngine<'a> {
         let source = self.sources_by_channel.get(&note.channel_id)?;
         if !source.accepts_note(note.key, note.velocity) {
             return None;
+        }
+        if let Some(cut_group) = source
+            .channel_cut_groups
+            .map(|(cut_group, _)| cut_group)
+            .filter(|cut_group| *cut_group != 0)
+        {
+            let sources_by_channel = self.sources_by_channel;
+            let voices_to_cut = self
+                .voices
+                .iter()
+                .enumerate()
+                .filter_map(|(index, voice)| {
+                    let voice = voice.as_ref()?;
+                    let cut_by = sources_by_channel
+                        .get(&voice.channel_id)?
+                        .channel_cut_groups?
+                        .1;
+                    (cut_by == cut_group).then_some(index)
+                })
+                .collect::<Vec<_>>();
+            let fast_declick_frames = (f64::from(self.output_sample_rate) * 0.010)
+                .round()
+                .max(1.0) as usize;
+            for voice_index in voices_to_cut {
+                if source.fast_declick_for_cut_groups {
+                    if let Some(voice) = self.voices[voice_index].as_mut() {
+                        begin_sampler_voice_fast_cut_declick(voice, fast_declick_frames);
+                    }
+                } else {
+                    self.voices[voice_index] = None;
+                }
+            }
         }
         if source.mono_enabled {
             for voice in self
@@ -9609,6 +9666,8 @@ impl<'a> SamplerVoiceEngine<'a> {
             live_mixer_source_control,
             mixer_meter_transforms,
             release_remaining: None,
+            release_total_frames: None,
+            release_cosine: false,
         });
         Some(slot_index)
     }
@@ -9773,7 +9832,17 @@ fn begin_sampler_voice_release(voice: &mut SamplerVoice, release_frames: usize) 
     voice.release_started = true;
     if voice.volume_envelope_enabled {
         voice.release_remaining = Some(release_frames);
+        voice.release_total_frames = Some(release_frames);
+        voice.release_cosine = false;
     }
+}
+
+fn begin_sampler_voice_fast_cut_declick(voice: &mut SamplerVoice, fade_frames: usize) {
+    voice.key_released = true;
+    voice.release_started = true;
+    voice.release_remaining = Some(fade_frames);
+    voice.release_total_frames = Some(fade_frames);
+    voice.release_cosine = true;
 }
 
 fn advance_sampler_voice_position(voice: &mut SamplerVoice) {
@@ -13445,6 +13514,8 @@ mod tests {
                     volume_envelope_enabled: false,
                     max_polyphony_raw: None,
                     mono_enabled: false,
+                    channel_cut_groups: None,
+                    fast_declick_for_cut_groups: false,
                     key_range: None,
                     velocity_range: None,
                     root_key: SAMPLER_ROOT_KEY,
@@ -14045,6 +14116,8 @@ mod tests {
                 volume_envelope_enabled: true,
                 max_polyphony_raw: None,
                 mono_enabled: false,
+                channel_cut_groups: None,
+                fast_declick_for_cut_groups: false,
                 key_range: None,
                 velocity_range: None,
                 root_key: SAMPLER_ROOT_KEY,
@@ -14101,6 +14174,8 @@ mod tests {
                 volume_envelope_enabled: false,
                 max_polyphony_raw: None,
                 mono_enabled: false,
+                channel_cut_groups: None,
+                fast_declick_for_cut_groups: false,
                 key_range: None,
                 velocity_range: None,
                 root_key: SAMPLER_ROOT_KEY,
@@ -14153,6 +14228,8 @@ mod tests {
                 volume_envelope_enabled: false,
                 max_polyphony_raw: None,
                 mono_enabled: false,
+                channel_cut_groups: None,
+                fast_declick_for_cut_groups: false,
                 key_range: None,
                 velocity_range: None,
                 root_key: SAMPLER_ROOT_KEY,
@@ -14220,6 +14297,8 @@ mod tests {
                 volume_envelope_enabled: false,
                 max_polyphony_raw: None,
                 mono_enabled: false,
+                channel_cut_groups: None,
+                fast_declick_for_cut_groups: false,
                 key_range: None,
                 velocity_range: None,
                 root_key: SAMPLER_ROOT_KEY,
@@ -14273,6 +14352,8 @@ mod tests {
                 volume_envelope_enabled: false,
                 max_polyphony_raw: None,
                 mono_enabled: false,
+                channel_cut_groups: None,
+                fast_declick_for_cut_groups: false,
                 key_range: None,
                 velocity_range: None,
                 root_key: SAMPLER_ROOT_KEY,
@@ -14344,6 +14425,8 @@ mod tests {
                 volume_envelope_enabled: false,
                 max_polyphony_raw: None,
                 mono_enabled: false,
+                channel_cut_groups: None,
+                fast_declick_for_cut_groups: false,
                 key_range: None,
                 velocity_range: None,
                 root_key: SAMPLER_ROOT_KEY,
@@ -14401,6 +14484,8 @@ mod tests {
                 volume_envelope_enabled: true,
                 max_polyphony_raw: None,
                 mono_enabled: false,
+                channel_cut_groups: None,
+                fast_declick_for_cut_groups: false,
                 key_range: None,
                 velocity_range: None,
                 root_key: SAMPLER_ROOT_KEY,
@@ -14455,6 +14540,8 @@ mod tests {
                 volume_envelope_enabled: false,
                 max_polyphony_raw: None,
                 mono_enabled: false,
+                channel_cut_groups: None,
+                fast_declick_for_cut_groups: false,
                 key_range: None,
                 velocity_range: None,
                 root_key: SAMPLER_ROOT_KEY,
@@ -14503,6 +14590,8 @@ mod tests {
                 volume_envelope_enabled: false,
                 max_polyphony_raw: None,
                 mono_enabled: false,
+                channel_cut_groups: None,
+                fast_declick_for_cut_groups: false,
                 key_range: None,
                 velocity_range: None,
                 root_key: SAMPLER_ROOT_KEY,
@@ -14549,6 +14638,8 @@ mod tests {
                 volume_envelope_enabled: false,
                 max_polyphony_raw: None,
                 mono_enabled: false,
+                channel_cut_groups: None,
+                fast_declick_for_cut_groups: false,
                 key_range: None,
                 velocity_range: None,
                 root_key: SAMPLER_ROOT_KEY,
@@ -14601,6 +14692,8 @@ mod tests {
                 volume_envelope_enabled: false,
                 max_polyphony_raw: None,
                 mono_enabled: false,
+                channel_cut_groups: None,
+                fast_declick_for_cut_groups: false,
                 key_range: None,
                 velocity_range: None,
                 root_key: SAMPLER_ROOT_KEY,
@@ -14653,6 +14746,8 @@ mod tests {
                 volume_envelope_enabled: true,
                 max_polyphony_raw: None,
                 mono_enabled: false,
+                channel_cut_groups: None,
+                fast_declick_for_cut_groups: false,
                 key_range: None,
                 velocity_range: None,
                 root_key: SAMPLER_ROOT_KEY,
@@ -14720,6 +14815,8 @@ mod tests {
                 volume_envelope_enabled: false,
                 max_polyphony_raw: None,
                 mono_enabled: false,
+                channel_cut_groups: None,
+                fast_declick_for_cut_groups: false,
                 key_range: None,
                 velocity_range: None,
                 root_key: SAMPLER_ROOT_KEY,
@@ -14768,6 +14865,8 @@ mod tests {
                 volume_envelope_enabled: false,
                 max_polyphony_raw: None,
                 mono_enabled: false,
+                channel_cut_groups: None,
+                fast_declick_for_cut_groups: false,
                 key_range: None,
                 velocity_range: None,
                 root_key: 48,
@@ -14823,6 +14922,8 @@ mod tests {
             volume_envelope_enabled: false,
             max_polyphony_raw: None,
             mono_enabled: false,
+            channel_cut_groups: None,
+            fast_declick_for_cut_groups: false,
             key_range: Some((48, 72)),
             velocity_range: Some((32, 96)),
             root_key: SAMPLER_ROOT_KEY,
@@ -14894,6 +14995,8 @@ mod tests {
                 volume_envelope_enabled: false,
                 max_polyphony_raw: None,
                 mono_enabled: false,
+                channel_cut_groups: None,
+                fast_declick_for_cut_groups: false,
                 key_range: None,
                 velocity_range: None,
                 root_key: SAMPLER_ROOT_KEY,
@@ -14942,6 +15045,8 @@ mod tests {
                 volume_envelope_enabled: false,
                 max_polyphony_raw: None,
                 mono_enabled: false,
+                channel_cut_groups: None,
+                fast_declick_for_cut_groups: false,
                 key_range: None,
                 velocity_range: None,
                 root_key: SAMPLER_ROOT_KEY,
@@ -14998,6 +15103,8 @@ mod tests {
                     volume_envelope_enabled: false,
                     max_polyphony_raw: None,
                     mono_enabled: false,
+                    channel_cut_groups: None,
+                    fast_declick_for_cut_groups: false,
                     key_range: None,
                     velocity_range: None,
                     root_key: SAMPLER_ROOT_KEY,
@@ -15018,6 +15125,8 @@ mod tests {
                     volume_envelope_enabled: false,
                     max_polyphony_raw: None,
                     mono_enabled: false,
+                    channel_cut_groups: None,
+                    fast_declick_for_cut_groups: false,
                     key_range: None,
                     velocity_range: None,
                     root_key: SAMPLER_ROOT_KEY,
@@ -15085,6 +15194,8 @@ mod tests {
                     volume_envelope_enabled: false,
                     max_polyphony_raw: Some(1),
                     mono_enabled: false,
+                    channel_cut_groups: None,
+                    fast_declick_for_cut_groups: false,
                     key_range: None,
                     velocity_range: None,
                     root_key: SAMPLER_ROOT_KEY,
@@ -15108,6 +15219,8 @@ mod tests {
                     volume_envelope_enabled: false,
                     max_polyphony_raw: None,
                     mono_enabled: false,
+                    channel_cut_groups: None,
+                    fast_declick_for_cut_groups: false,
                     key_range: None,
                     velocity_range: None,
                     root_key: SAMPLER_ROOT_KEY,
@@ -15205,6 +15318,8 @@ mod tests {
                 volume_envelope_enabled: true,
                 max_polyphony_raw: Some(1),
                 mono_enabled: true,
+                channel_cut_groups: None,
+                fast_declick_for_cut_groups: false,
                 key_range: None,
                 velocity_range: None,
                 root_key: SAMPLER_ROOT_KEY,
@@ -15267,6 +15382,149 @@ mod tests {
                 .flatten()
                 .any(|voice| voice.started_frame == 1 && !voice.release_started)
         );
+    }
+
+    #[test]
+    fn sampler_cut_groups_stop_matching_channels_and_leave_other_groups_alone() {
+        let make_source = |sample: f32, groups| SamplerVoiceSource {
+            audio: Arc::new(DecodedAudio {
+                sample_rate: 1_000,
+                channels: vec![vec![sample; 16]],
+            }),
+            gain: 1.0,
+            pan: -1.0,
+            reverse: false,
+            volume_envelope_enabled: false,
+            max_polyphony_raw: None,
+            mono_enabled: false,
+            channel_cut_groups: groups,
+            fast_declick_for_cut_groups: false,
+            key_range: None,
+            velocity_range: None,
+            root_key: SAMPLER_ROOT_KEY,
+            fine_tune_cents: 0.0,
+            loop_bounds: None,
+            ping_pong_loop: false,
+            release_loop_bounds: None,
+            release_ping_pong_loop: false,
+        };
+        let sources = HashMap::from([
+            (1, make_source(1.0, Some((0, 7)))),
+            (2, make_source(10.0, Some((7, 0)))),
+            (3, make_source(3.0, Some((0, 8)))),
+        ]);
+        let notes = [1, 3, 2].map(|channel_id| ScheduledSamplerNote {
+            clip_index: 0,
+            playlist_track_id: None,
+            start_tick: 0,
+            stop_tick: None,
+            start_frame: if channel_id == 2 { 1 } else { 0 },
+            stop_frame: None,
+            channel_id,
+            key: SAMPLER_ROOT_KEY,
+            velocity: 127,
+            pan: 64,
+            fine_pitch_offset_cents: 0,
+            layer_gain: 1.0,
+        });
+        let mut engine = SamplerVoiceEngine::new(&sources, &notes, 4, 4, 1_000);
+        let mut output = vec![0.0; 6];
+        engine.render_block(0, 3, &mut output);
+
+        assert_eq!(output[0], 4.0);
+        assert_eq!(output[2], 13.0);
+        assert!(
+            !engine
+                .voices
+                .iter()
+                .flatten()
+                .any(|voice| voice.channel_id == 1)
+        );
+        assert!(
+            engine
+                .voices
+                .iter()
+                .flatten()
+                .any(|voice| voice.channel_id == 2)
+        );
+        assert!(
+            engine
+                .voices
+                .iter()
+                .flatten()
+                .any(|voice| voice.channel_id == 3)
+        );
+    }
+
+    #[test]
+    fn fast_declick_for_cut_groups_fades_then_stops_the_previous_sample() {
+        let make_source = |sample: f32, groups, fast_declick_for_cut_groups| SamplerVoiceSource {
+            audio: Arc::new(DecodedAudio {
+                sample_rate: 1_000,
+                channels: vec![vec![sample; 32]],
+            }),
+            gain: 1.0,
+            pan: -1.0,
+            reverse: false,
+            volume_envelope_enabled: false,
+            max_polyphony_raw: None,
+            mono_enabled: false,
+            channel_cut_groups: groups,
+            fast_declick_for_cut_groups,
+            key_range: None,
+            velocity_range: None,
+            root_key: SAMPLER_ROOT_KEY,
+            fine_tune_cents: 0.0,
+            loop_bounds: None,
+            ping_pong_loop: false,
+            release_loop_bounds: None,
+            release_ping_pong_loop: false,
+        };
+        let sources = HashMap::from([
+            (1, make_source(1.0, Some((0, 7)), false)),
+            (2, make_source(10.0, Some((7, 0)), true)),
+        ]);
+        let notes = [1, 2].map(|channel_id| ScheduledSamplerNote {
+            clip_index: 0,
+            playlist_track_id: None,
+            start_tick: 0,
+            stop_tick: None,
+            start_frame: u64::from(channel_id == 2),
+            stop_frame: None,
+            channel_id,
+            key: SAMPLER_ROOT_KEY,
+            velocity: 127,
+            pan: 64,
+            fine_pitch_offset_cents: 0,
+            layer_gain: 1.0,
+        });
+        let mut engine = SamplerVoiceEngine::new(&sources, &notes, 4, 4, 1_000);
+        let mut initial = vec![0.0; 4];
+        engine.render_block(0, 2, &mut initial);
+
+        assert_eq!(initial[0], 1.0);
+        assert_eq!(initial[2], 11.0);
+        let fading_voice = engine
+            .voices
+            .iter()
+            .flatten()
+            .find(|voice| voice.channel_id == 1)
+            .expect("fast declick should retain the voice during its fade");
+        assert_eq!(fading_voice.release_remaining, Some(9));
+        assert!(fading_voice.release_cosine);
+
+        let mut fade_tail = vec![0.0; 18];
+        engine.render_block(2, 9, &mut fade_tail);
+        assert!(
+            !engine
+                .voices
+                .iter()
+                .flatten()
+                .any(|voice| voice.channel_id == 1)
+        );
+        let mut after_fade = vec![0.0; 2];
+        engine.render_block(11, 1, &mut after_fade);
+        assert_eq!(after_fade, [10.0, 0.0]);
     }
 
     #[test]
