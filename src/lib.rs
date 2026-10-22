@@ -459,6 +459,8 @@ pub struct ChannelSummary {
     sampler_fade_out_raw: Option<u16>,
     sampler_fade_in_raw: Option<u16>,
     sampler_volume_envelope_enabled: Option<bool>,
+    sampler_max_polyphony_raw: Option<u32>,
+    sampler_mono_enabled: Option<bool>,
     envelope_lfo_events_seen: u8,
     sampler_flags: Option<u32>,
     sampler_root_note: Option<u32>,
@@ -851,6 +853,22 @@ impl ChannelSummary {
     pub fn sampler_volume_envelope_enabled(&self) -> Option<bool> {
         (self.kind == Some(0))
             .then_some(self.sampler_volume_envelope_enabled)
+            .flatten()
+    }
+
+    /// Saved raw Sampler Max Polyphony value from the channel's `0xDD` event, when present.
+    /// Playback currently treats zero as unrestricted; this sentinel still needs native-save
+    /// confirmation.
+    pub fn sampler_max_polyphony_raw(&self) -> Option<u32> {
+        (self.kind == Some(0))
+            .then_some(self.sampler_max_polyphony_raw)
+            .flatten()
+    }
+
+    /// Whether the Sampler's Mono flag is set in the channel's `0xDD` event, when present.
+    pub fn sampler_mono_enabled(&self) -> Option<bool> {
+        (self.kind == Some(0))
+            .then_some(self.sampler_mono_enabled)
             .flatten()
     }
 
@@ -4366,6 +4384,20 @@ impl FlpDocument {
                     }
                     channel.envelope_lfo_events_seen =
                         channel.envelope_lfo_events_seen.saturating_add(1);
+                }
+                0xDD if matches!(event.encoding, PayloadEncoding::Data { .. }) => {
+                    // PyFLP maps 0xDD to Max Polyphony (u32), Slide (u32), and
+                    // flags (u8), with Mono stored in bit 0 of flags.
+                    if event.payload.len() >= 4 && channel.sampler_max_polyphony_raw.is_none() {
+                        channel.sampler_max_polyphony_raw = Some(u32::from_le_bytes(
+                            event.payload[..4]
+                                .try_into()
+                                .expect("the polyphony maximum has four bytes"),
+                        ));
+                    }
+                    if event.payload.len() >= 9 && channel.sampler_mono_enabled.is_none() {
+                        channel.sampler_mono_enabled = Some(event.payload[8] & 1 != 0);
+                    }
                 }
                 0x8F if event.encoding == PayloadEncoding::Dword
                     && event.payload.len() == 4
@@ -24436,6 +24468,33 @@ mod tests {
             audio_document.channels()[0].sampler_volume_envelope_enabled(),
             None
         );
+    }
+
+    #[test]
+    fn decodes_sampler_max_polyphony_and_mono_settings_losslessly() {
+        let mut event_stream = vec![0x40, 7, 0, 0x15, 0];
+        let mut polyphony = Vec::new();
+        polyphony.extend_from_slice(&3_u32.to_le_bytes());
+        polyphony.extend_from_slice(&250_u32.to_le_bytes());
+        polyphony.push(1);
+        append_data_event(&mut event_stream, 0xDD, &polyphony);
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        let input = flp_fixture(&event_stream, &[], &[]);
+        let document = FlpDocument::parse(&input).expect("polyphony fixture should parse");
+
+        assert_eq!(document.channels()[0].sampler_max_polyphony_raw(), Some(3));
+        assert_eq!(document.channels()[0].sampler_mono_enabled(), Some(true));
+        assert_eq!(document.encode_lossless().unwrap(), input);
+
+        let mut audio_channel = event_stream;
+        audio_channel[4] = 4;
+        let audio_input = flp_fixture(&audio_channel, &[], &[]);
+        let audio_document = FlpDocument::parse(&audio_input).expect("audio clip should parse");
+        assert_eq!(
+            audio_document.channels()[0].sampler_max_polyphony_raw(),
+            None
+        );
+        assert_eq!(audio_document.channels()[0].sampler_mono_enabled(), None);
     }
 
     #[test]
