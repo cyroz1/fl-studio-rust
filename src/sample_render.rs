@@ -6628,6 +6628,10 @@ fn prepare_sampler_arrangement(
                 .sampler_uses_loop_points()
                 .then_some(sample_metadata.loop_points)
                 .flatten();
+            let release_loop_points = channel
+                .sampler_uses_loop_points()
+                .then_some(sample_metadata.release_loop_points)
+                .flatten();
             let audio = if let Some(audio) = decoded_by_path.get(&resolved_path) {
                 Arc::clone(audio)
             } else {
@@ -6660,6 +6664,8 @@ fn prepare_sampler_arrangement(
                 audio
             };
             let loop_bounds = validated_sampler_loop_bounds(loop_points, audio.frame_count());
+            let release_loop_bounds =
+                validated_sampler_loop_bounds(release_loop_points, audio.frame_count());
             let (gain, pan) = channel_gain_pan(channel.volume(), channel.pan());
             source_entry.insert(SamplerVoiceSource {
                 audio,
@@ -6681,6 +6687,8 @@ fn prepare_sampler_arrangement(
                 ping_pong_loop: sample_metadata
                     .ping_pong_loop
                     .unwrap_or_else(|| channel.sampler_ping_pong_loop_enabled()),
+                release_loop_bounds,
+                release_ping_pong_loop: sample_metadata.release_ping_pong_loop.unwrap_or(false),
             });
             let route_plan =
                 mixer_route_audibility.source_route_plan_for_channel(channel.mixer_track());
@@ -6827,6 +6835,8 @@ struct SamplerVoiceSource {
     fine_tune_cents: f64,
     loop_bounds: Option<SampleBounds>,
     ping_pong_loop: bool,
+    release_loop_bounds: Option<SampleBounds>,
+    release_ping_pong_loop: bool,
 }
 
 impl SamplerVoiceSource {
@@ -8913,6 +8923,10 @@ fn prepare_sampler_pattern_for_channel_internal(
                 .sampler_uses_loop_points()
                 .then_some(sample_metadata.loop_points)
                 .flatten();
+            let release_loop_points = channel
+                .sampler_uses_loop_points()
+                .then_some(sample_metadata.release_loop_points)
+                .flatten();
             let audio = if let Some(audio) = decoded_by_path.get(&resolved_path) {
                 Arc::clone(audio)
             } else {
@@ -8945,6 +8959,8 @@ fn prepare_sampler_pattern_for_channel_internal(
                 audio
             };
             let loop_bounds = validated_sampler_loop_bounds(loop_points, audio.frame_count());
+            let release_loop_bounds =
+                validated_sampler_loop_bounds(release_loop_points, audio.frame_count());
             let (gain, pan) = channel_gain_pan(channel.volume(), channel.pan());
             source_entry.insert(SamplerVoiceSource {
                 audio,
@@ -8966,6 +8982,8 @@ fn prepare_sampler_pattern_for_channel_internal(
                 ping_pong_loop: sample_metadata
                     .ping_pong_loop
                     .unwrap_or_else(|| channel.sampler_ping_pong_loop_enabled()),
+                release_loop_bounds,
+                release_ping_pong_loop: sample_metadata.release_ping_pong_loop.unwrap_or(false),
             });
             let route_plan =
                 mixer_route_audibility.source_route_plan_for_channel(channel.mixer_track());
@@ -9138,6 +9156,8 @@ struct SamplerVoice {
     key_released: bool,
     loop_bounds: Option<SampleBounds>,
     ping_pong_loop: bool,
+    release_loop_bounds: Option<SampleBounds>,
+    release_ping_pong_loop: bool,
     stop_frame: Option<u64>,
     started_frame: u64,
     gain: f32,
@@ -9419,6 +9439,8 @@ impl<'a> SamplerVoiceEngine<'a> {
             key_released: false,
             loop_bounds: source.loop_bounds,
             ping_pong_loop: source.ping_pong_loop,
+            release_loop_bounds: source.release_loop_bounds,
+            release_ping_pong_loop: source.release_ping_pong_loop,
             stop_frame: note.stop_frame,
             started_frame: note.start_frame,
             gain: source.gain * velocity_gain,
@@ -9591,18 +9613,24 @@ impl<'a> SamplerVoiceEngine<'a> {
 
 fn advance_sampler_voice_position(voice: &mut SamplerVoice) {
     let mut next_position = voice.source_position + voice.source_step;
-    let Some(bounds) = voice.loop_bounds else {
+    let is_releasing = voice.release_remaining.is_some();
+    let (loop_bounds, ping_pong_loop) = if is_releasing {
+        (voice.release_loop_bounds, voice.release_ping_pong_loop)
+    } else {
+        (voice.loop_bounds, voice.ping_pong_loop)
+    };
+    let Some(bounds) = loop_bounds else {
         voice.source_position = next_position;
         return;
     };
-    if voice.stop_frame.is_none() || voice.release_remaining.is_some() {
+    if voice.stop_frame.is_none() && !is_releasing {
         voice.source_position = next_position;
         return;
     }
 
     let start = bounds.start as f64;
     let end = bounds.end as f64;
-    if !voice.ping_pong_loop {
+    if !ping_pong_loop {
         let loop_length = end - start;
         if (voice.source_step > 0.0 && next_position >= end)
             || (voice.source_step < 0.0 && next_position < start)
@@ -13196,6 +13224,8 @@ mod tests {
                     fine_tune_cents: 0.0,
                     loop_bounds: None,
                     ping_pong_loop: false,
+                    release_loop_bounds: None,
+                    release_ping_pong_loop: false,
                 },
             )]),
             mixer_transforms_by_channel: HashMap::from([(
@@ -13788,6 +13818,8 @@ mod tests {
                 fine_tune_cents: 0.0,
                 loop_bounds: None,
                 ping_pong_loop: false,
+                release_loop_bounds: None,
+                release_ping_pong_loop: false,
             },
         )]);
         let notes = [ScheduledSamplerNote {
@@ -13838,6 +13870,8 @@ mod tests {
                 fine_tune_cents: 0.0,
                 loop_bounds: None,
                 ping_pong_loop: false,
+                release_loop_bounds: None,
+                release_ping_pong_loop: false,
             },
         )]);
         let notes = [ScheduledSamplerNote {
@@ -13885,6 +13919,8 @@ mod tests {
                 fine_tune_cents: 0.0,
                 loop_bounds: None,
                 ping_pong_loop: false,
+                release_loop_bounds: None,
+                release_ping_pong_loop: false,
             },
         )]);
         let notes = [
@@ -13949,6 +13985,8 @@ mod tests {
                 fine_tune_cents: 0.0,
                 loop_bounds: None,
                 ping_pong_loop: false,
+                release_loop_bounds: None,
+                release_ping_pong_loop: false,
             },
         )]);
         let mut engine = SamplerVoiceEngine::new(&sources, &[], 1, 4, 4);
@@ -14000,6 +14038,8 @@ mod tests {
                 fine_tune_cents: 0.0,
                 loop_bounds: None,
                 ping_pong_loop: false,
+                release_loop_bounds: None,
+                release_ping_pong_loop: false,
             },
         )]);
         let transforms = HashMap::from([(
@@ -14049,6 +14089,8 @@ mod tests {
                 fine_tune_cents: 0.0,
                 loop_bounds: None,
                 ping_pong_loop: false,
+                release_loop_bounds: None,
+                release_ping_pong_loop: false,
             },
         )]);
         let notes = [ScheduledSamplerNote {
@@ -14089,6 +14131,8 @@ mod tests {
                 fine_tune_cents: 0.0,
                 loop_bounds: Some(SampleBounds { start: 1, end: 4 }),
                 ping_pong_loop: false,
+                release_loop_bounds: None,
+                release_ping_pong_loop: false,
             },
         )]);
         let notes = [ScheduledSamplerNote {
@@ -14135,6 +14179,8 @@ mod tests {
                 fine_tune_cents: 0.0,
                 loop_bounds: Some(SampleBounds { start: 1, end: 4 }),
                 ping_pong_loop: true,
+                release_loop_bounds: None,
+                release_ping_pong_loop: false,
             },
         )]);
         let notes = [ScheduledSamplerNote {
@@ -14164,6 +14210,68 @@ mod tests {
     }
 
     #[test]
+    fn sampler_voice_switches_to_the_release_loop_when_the_note_ends() {
+        let sources = HashMap::from([(
+            7,
+            SamplerVoiceSource {
+                audio: Arc::new(DecodedAudio {
+                    sample_rate: 4,
+                    channels: vec![vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]],
+                }),
+                gain: 1.0,
+                pan: -1.0,
+                reverse: false,
+                key_range: None,
+                velocity_range: None,
+                root_key: SAMPLER_ROOT_KEY,
+                fine_tune_cents: 0.0,
+                loop_bounds: None,
+                ping_pong_loop: false,
+                release_loop_bounds: Some(SampleBounds { start: 2, end: 4 }),
+                release_ping_pong_loop: false,
+            },
+        )]);
+        let notes = [ScheduledSamplerNote {
+            clip_index: 0,
+            playlist_track_id: None,
+            start_tick: 0,
+            stop_tick: None,
+            start_frame: 0,
+            stop_frame: Some(2),
+            channel_id: 7,
+            key: SAMPLER_ROOT_KEY,
+            velocity: 127,
+            pan: 64,
+            fine_pitch_offset_cents: 0,
+        }];
+        let mut engine = SamplerVoiceEngine::new(&sources, &notes, 1, 6, 4);
+        let mut output = vec![0.0; 16];
+        engine.render_block(0, 8, &mut output);
+
+        assert_eq!(
+            output,
+            vec![
+                0.0,
+                0.0,
+                1.0,
+                0.0,
+                2.0,
+                0.0,
+                2.5,
+                0.0,
+                4.0 / 3.0,
+                0.0,
+                1.5,
+                0.0,
+                2.0 / 3.0,
+                0.0,
+                0.5,
+                0.0,
+            ]
+        );
+    }
+
+    #[test]
     fn sampler_voice_resamples_at_output_rate_and_transposes_by_note_key() {
         let source = Arc::new(DecodedAudio {
             sample_rate: 8,
@@ -14182,6 +14290,8 @@ mod tests {
                 fine_tune_cents: 0.0,
                 loop_bounds: None,
                 ping_pong_loop: false,
+                release_loop_bounds: None,
+                release_ping_pong_loop: false,
             },
         )]);
         let notes = [ScheduledSamplerNote {
@@ -14224,6 +14334,8 @@ mod tests {
                 fine_tune_cents: 0.0,
                 loop_bounds: None,
                 ping_pong_loop: false,
+                release_loop_bounds: None,
+                release_ping_pong_loop: false,
             },
         )]);
         let notes = [ScheduledSamplerNote {
@@ -14273,6 +14385,8 @@ mod tests {
             fine_tune_cents: 0.0,
             loop_bounds: None,
             ping_pong_loop: false,
+            release_loop_bounds: None,
+            release_ping_pong_loop: false,
         };
 
         assert!(source.accepts_note(48, 32));
@@ -14322,6 +14436,8 @@ mod tests {
                 fine_tune_cents: 0.0,
                 loop_bounds: None,
                 ping_pong_loop: false,
+                release_loop_bounds: None,
+                release_ping_pong_loop: false,
             },
         )]);
         let notes = [ScheduledSamplerNote {
@@ -14364,6 +14480,8 @@ mod tests {
                 fine_tune_cents: 0.0,
                 loop_bounds: None,
                 ping_pong_loop: false,
+                release_loop_bounds: None,
+                release_ping_pong_loop: false,
             },
         )]);
         let notes = [ScheduledSamplerNote {
@@ -14414,6 +14532,8 @@ mod tests {
                     fine_tune_cents: 0.0,
                     loop_bounds: None,
                     ping_pong_loop: false,
+                    release_loop_bounds: None,
+                    release_ping_pong_loop: false,
                 },
             ),
             (
@@ -14429,6 +14549,8 @@ mod tests {
                     fine_tune_cents: 0.0,
                     loop_bounds: None,
                     ping_pong_loop: false,
+                    release_loop_bounds: None,
+                    release_ping_pong_loop: false,
                 },
             ),
         ]);
