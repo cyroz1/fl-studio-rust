@@ -456,6 +456,8 @@ pub struct ChannelSummary {
     color: Option<u32>,
     mixer_track: Option<i8>,
     sampler_fx_flags: Option<u16>,
+    sampler_fade_out_raw: Option<u16>,
+    sampler_fade_in_raw: Option<u16>,
     sampler_flags: Option<u32>,
     sampler_root_note: Option<u32>,
     keyboard_main_pitch: Option<bool>,
@@ -820,6 +822,24 @@ impl ChannelSummary {
             && self
                 .sampler_fx_flags
                 .is_some_and(|flags| flags & (1 << 1) != 0)
+    }
+
+    /// Saved raw Sampler precomputed Fade Out value (`0x4B`), when present.
+    /// FL Studio documents a 0..=1024 range and applies this in its sample-processing tools; the
+    /// current audio renderer does not apply that processing yet.
+    pub fn sampler_fade_out_raw(&self) -> Option<u16> {
+        (self.kind == Some(0))
+            .then_some(self.sampler_fade_out_raw)
+            .flatten()
+    }
+
+    /// Saved raw Sampler precomputed Fade In value (`0x4C`), when present.
+    /// FL Studio documents a 0..=1024 range and applies this in its sample-processing tools; the
+    /// current audio renderer does not apply that processing yet.
+    pub fn sampler_fade_in_raw(&self) -> Option<u16> {
+        (self.kind == Some(0))
+            .then_some(self.sampler_fade_in_raw)
+            .flatten()
     }
 
     /// Whether a kind-0 Sampler uses embedded sample loop points.
@@ -4294,6 +4314,16 @@ impl FlpDocument {
                 {
                     channel.sampler_fx_flags =
                         Some(u16::from_le_bytes([event.payload[0], event.payload[1]]));
+                }
+                0x4B if event.encoding == PayloadEncoding::Word && event.payload.len() == 2 => {
+                    channel.sampler_fade_out_raw.get_or_insert_with(|| {
+                        u16::from_le_bytes([event.payload[0], event.payload[1]])
+                    });
+                }
+                0x4C if event.encoding == PayloadEncoding::Word && event.payload.len() == 2 => {
+                    channel.sampler_fade_in_raw.get_or_insert_with(|| {
+                        u16::from_le_bytes([event.payload[0], event.payload[1]])
+                    });
                 }
                 0x8F if event.encoding == PayloadEncoding::Dword
                     && event.payload.len() == 4
@@ -15965,6 +15995,104 @@ impl FlpDocument {
         Ok(())
     }
 
+    /// Sets a Sampler's saved precomputed Fade Out (`0x4B`) and Fade In (`0x4C`) values.
+    ///
+    /// FL Studio documents both controls in the 0..=1024 range. The operation updates recognized
+    /// word events or inserts missing ones beside the channel's other Sampler FX controls, while
+    /// preserving every unrelated event. These are sample-processing controls; their signal
+    /// processing is not yet applied by this project's playback and render paths.
+    pub fn set_sampler_quick_fades(
+        &mut self,
+        channel_id: u16,
+        fade_out_raw: u16,
+        fade_in_raw: u16,
+    ) -> Result<(), FlpError> {
+        if fade_out_raw > 1024 || fade_in_raw > 1024 {
+            return Err(FlpError::UnsupportedEdit(
+                "Sampler Fade In and Fade Out must be in the 0..=1024 range",
+            ));
+        }
+
+        self.require_unique_channel(channel_id)?;
+        let channel = self
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id() == channel_id)
+            .expect("the unique channel was checked above");
+        if channel.kind != Some(ChannelType::Sampler.raw()) {
+            return Err(FlpError::UnsupportedEdit(
+                "precomputed Fade In and Fade Out apply only to Sampler channels",
+            ));
+        }
+
+        for opcode in [0x4B, 0x4C] {
+            let matching_events = channel
+                .event_range()
+                .filter(|index| self.events[*index].opcode == opcode)
+                .collect::<Vec<_>>();
+            if matching_events.len() > 1 {
+                return Err(FlpError::UnsupportedEdit(
+                    "the selected Sampler has duplicate Fade In or Fade Out events",
+                ));
+            }
+            if let Some(index) = matching_events.first() {
+                let event = &self.events[*index];
+                if event.encoding != PayloadEncoding::Word || event.payload.len() != 2 {
+                    return Err(FlpError::UnsupportedEdit(
+                        "the selected Sampler has an unrecognized Fade In or Fade Out event",
+                    ));
+                }
+            }
+        }
+
+        let mut candidate = self.clone();
+        for (opcode, value) in [(0x4B, fade_out_raw), (0x4C, fade_in_raw)] {
+            let channel = candidate
+                .channels()
+                .into_iter()
+                .find(|channel| channel.id() == channel_id)
+                .expect("the unique Sampler remains present");
+            let existing = channel.event_range().find(|index| {
+                let event = &candidate.events[*index];
+                event.opcode == opcode
+                    && event.encoding == PayloadEncoding::Word
+                    && event.payload.len() == 2
+            });
+            if let Some(index) = existing {
+                candidate.events[index].replace_word_payload(value)?;
+                continue;
+            }
+
+            let insertion_index = channel
+                .event_range()
+                .find(|index| {
+                    let event = &candidate.events[*index];
+                    matches!(event.opcode, 0x46 | 0x4B | 0x4C) && event.opcode > opcode
+                })
+                .or_else(|| {
+                    channel
+                        .event_range()
+                        .rfind(|index| {
+                            matches!(candidate.events[*index].opcode, 0x46 | 0x4B | 0x4C)
+                        })
+                        .map(|index| index + 1)
+                })
+                .or_else(|| {
+                    channel
+                        .event_range()
+                        .find(|index| candidate.events[*index].opcode == 0x15)
+                        .map(|index| index + 1)
+                })
+                .unwrap_or(channel.end_event_index);
+            candidate
+                .events
+                .insert(insertion_index, FlpEvent::new_word(opcode, value));
+        }
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
     /// Edits established raw fields in one channel's existing `0xD5` Level Adjusts event.
     ///
     /// `event_index` is the global FLP event index, available from `channel-events` and
@@ -24166,6 +24294,80 @@ mod tests {
             assert_eq!(document.channels()[0].sample_reversed(), expected);
             assert_eq!(document.encode_lossless().unwrap(), input);
         }
+    }
+
+    #[test]
+    fn decodes_and_edits_sampler_precomputed_fades_losslessly() {
+        let tail = [0xD1, 0xD2];
+        let input = flp_fixture(
+            &[
+                0x40, 7, 0, 0x15, 0, 0x46, 0x34, 0x12, 0x4B, 100, 0, 0x4C, 200, 0, 0x62, 0, 0,
+            ],
+            &[],
+            &tail,
+        );
+        let mut document = FlpDocument::parse(&input).expect("Sampler fade fixture should parse");
+        let channel = &document.channels()[0];
+        assert_eq!(channel.sampler_fade_out_raw(), Some(100));
+        assert_eq!(channel.sampler_fade_in_raw(), Some(200));
+        assert_eq!(document.encode_lossless().unwrap(), input);
+
+        document
+            .set_sampler_quick_fades(7, 512, 256)
+            .expect("recognized precomputed fades should be editable");
+        let updated = document.channels().remove(0);
+        assert_eq!(updated.sampler_fade_out_raw(), Some(512));
+        assert_eq!(updated.sampler_fade_in_raw(), Some(256));
+        assert_eq!(
+            document
+                .events()
+                .iter()
+                .find(|event| event.opcode() == 0x46)
+                .expect("other Sampler FX control should remain")
+                .payload(),
+            &[0x34, 0x12]
+        );
+        let encoded = document
+            .encode_lossless()
+            .expect("updated project should encode");
+        assert!(encoded.ends_with(&tail));
+        let reparsed = FlpDocument::parse(&encoded).expect("updated project should parse");
+        assert_eq!(reparsed.channels()[0].sampler_fade_out_raw(), Some(512));
+        assert_eq!(reparsed.channels()[0].sampler_fade_in_raw(), Some(256));
+
+        let before_invalid = document.encode_lossless().unwrap();
+        assert!(document.set_sampler_quick_fades(7, 1025, 0).is_err());
+        assert_eq!(document.encode_lossless().unwrap(), before_invalid);
+        assert!(document.set_sampler_quick_fades(99, 0, 0).is_err());
+        assert_eq!(document.encode_lossless().unwrap(), before_invalid);
+    }
+
+    #[test]
+    fn inserts_missing_sampler_fade_events_beside_sampler_fx_controls() {
+        let input = flp_fixture(
+            &[0x40, 7, 0, 0x15, 0, 0x46, 0x34, 0x12, 0x62, 0, 0],
+            &[],
+            &[],
+        );
+        let mut document = FlpDocument::parse(&input).expect("Sampler fixture should parse");
+        document
+            .set_sampler_quick_fades(7, 320, 640)
+            .expect("missing Fade events should be created");
+        let channel = document.channels().remove(0);
+        assert_eq!(channel.sampler_fade_out_raw(), Some(320));
+        assert_eq!(channel.sampler_fade_in_raw(), Some(640));
+        let channel_events = channel
+            .event_range()
+            .map(|index| document.events()[index].opcode())
+            .collect::<Vec<_>>();
+        assert!(
+            channel_events
+                .windows(3)
+                .any(|window| window == [0x46, 0x4B, 0x4C])
+        );
+        let encoded = document.encode_lossless().unwrap();
+        let reparsed = FlpDocument::parse(&encoded).unwrap();
+        assert_eq!(reparsed.channels()[0].sampler_fade_out_raw(), Some(320));
     }
 
     #[test]

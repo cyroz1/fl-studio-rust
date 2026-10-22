@@ -22087,6 +22087,7 @@ impl DawUi {
         let mut level_edits = Vec::new();
         let mut global_swing_edit = None;
         let mut channel_swing_edits = Vec::new();
+        let mut sampler_fade_edits = Vec::new();
         let mut layer_edits = Vec::new();
         let mut layer_flag_edits = Vec::new();
         let mut layer_fade_edits = Vec::new();
@@ -22338,11 +22339,16 @@ impl DawUi {
                 let mut layer_child_apply = None;
                 let mut layer_flags_apply = None;
                 let mut layer_fade_apply = None;
+                let mut sampler_fade_apply = None;
                 let layer_flags = channel.layer_flags();
                 let mut layer_random = channel.layer_random_enabled().unwrap_or(false);
                 let mut layer_crossfade = channel.layer_crossfade_enabled().unwrap_or(false);
                 let layer_fade_raw = channel.layer_fade_raw();
                 let mut layer_fade = layer_fade_raw.unwrap_or(0);
+                let sampler_fade_out_raw = channel.sampler_fade_out_raw();
+                let sampler_fade_in_raw = channel.sampler_fade_in_raw();
+                let mut sampler_fade_out = sampler_fade_out_raw.unwrap_or(0);
+                let mut sampler_fade_in = sampler_fade_in_raw.unwrap_or(0);
                 egui::Frame::new()
                     .fill(PANEL_DARK)
                     .inner_margin(4.0)
@@ -23094,6 +23100,43 @@ impl DawUi {
                                 }
                             });
                         }
+                        if channel.kind() == Some(0) {
+                            ui.collapsing("Precomputed sample fades", |ui| {
+                                ui.small(
+                                    "Saved sample-processing controls. They are not applied by this renderer yet.",
+                                );
+                                let valid_values = sampler_fade_out_raw
+                                    .is_none_or(|value| value <= 1024)
+                                    && sampler_fade_in_raw
+                                        .is_none_or(|value| value <= 1024);
+                                if valid_values {
+                                    let fade_out_changed = ui
+                                        .add(
+                                            egui::Slider::new(&mut sampler_fade_out, 0..=1024)
+                                                .text("Fade Out"),
+                                        )
+                                        .changed();
+                                    let fade_in_changed = ui
+                                        .add(
+                                            egui::Slider::new(&mut sampler_fade_in, 0..=1024)
+                                                .text("Fade In"),
+                                        )
+                                        .changed();
+                                    if fade_out_changed || fade_in_changed {
+                                        sampler_fade_apply =
+                                            Some((sampler_fade_out, sampler_fade_in));
+                                    }
+                                } else {
+                                    ui.colored_label(
+                                        ORANGE,
+                                        format!(
+                                            "Unsupported saved fade values: Out {:?}, In {:?}",
+                                            sampler_fade_out_raw, sampler_fade_in_raw
+                                        ),
+                                    );
+                                }
+                            });
+                        }
                         if let Some(settings) = channel.stretch_settings() {
                             let mut time_raw = settings.time_raw();
                             let mut pitch_raw = settings.pitch_raw();
@@ -23176,6 +23219,9 @@ impl DawUi {
                 }
                 if let Some(fade_raw) = layer_fade_apply {
                     layer_fade_edits.push((channel.id(), fade_raw));
+                }
+                if let Some((fade_out_raw, fade_in_raw)) = sampler_fade_apply {
+                    sampler_fade_edits.push((channel.id(), fade_out_raw, fade_in_raw));
                 }
                 if !zipped && let Some(pattern) = &selected_pattern {
                     ui.horizontal_wrapped(|ui| {
@@ -23446,6 +23492,23 @@ impl DawUi {
                 }
                 Some(Err(error)) => {
                     self.status = format!("Could not change channel swing mix: {error}");
+                }
+                None => {}
+            }
+        }
+        for (channel_id, fade_out_raw, fade_in_raw) in sampler_fade_edits {
+            let result = self.document.as_mut().map(|document| {
+                document.set_sampler_quick_fades(channel_id, fade_out_raw, fade_in_raw)
+            });
+            match result {
+                Some(Ok(())) => {
+                    self.dirty = true;
+                    self.status = format!(
+                        "Channel {channel_id} saved precomputed fades: Out {fade_out_raw}, In {fade_in_raw}"
+                    );
+                }
+                Some(Err(error)) => {
+                    self.status = format!("Could not change Sampler precomputed fades: {error}");
                 }
                 None => {}
             }
