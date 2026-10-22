@@ -28,7 +28,7 @@ use crate::audio::{
     AudioInputRecording, LiveMixerSourceControl, LiveMixerSourceTargets, MIXER_TRACK_METER_COUNT,
     MixerTrackPeakMeters, StereoFrameDelay, StreamingAudioWriter,
 };
-use crate::media::{DecodedAudio, SamplePathResolver, decode_audio_file, wav_sampler_metadata};
+use crate::media::{DecodedAudio, SamplePathResolver, decode_audio_file, sample_sampler_metadata};
 use crate::vst3::{PlaylistMidiNote, Vst3PlaylistStreamProcessor};
 use crate::{
     Arrangement, ChannelNoteRouter, ChannelSummary, FlpDocument, MixerInsertSignalTransform,
@@ -6623,10 +6623,10 @@ fn prepare_sampler_arrangement(
                     continue;
                 }
             };
-            let wave_metadata = wav_sampler_metadata(&resolved_path).unwrap_or_default();
+            let sample_metadata = sample_sampler_metadata(&resolved_path).unwrap_or_default();
             let loop_points = channel
                 .sampler_uses_loop_points()
-                .then_some(wave_metadata.loop_points)
+                .then_some(sample_metadata.loop_points)
                 .flatten();
             let audio = if let Some(audio) = decoded_by_path.get(&resolved_path) {
                 Arc::clone(audio)
@@ -6663,15 +6663,15 @@ fn prepare_sampler_arrangement(
             let (gain, pan) = channel_gain_pan(channel.volume(), channel.pan());
             source_entry.insert(SamplerVoiceSource {
                 audio,
-                gain: gain * sampler_wav_gain(wave_metadata.gain_db),
+                gain: gain * sampler_metadata_gain(sample_metadata.gain_db),
                 pan,
                 reverse: channel.sample_reversed(),
                 root_key: resolve_sampler_channel_root_key(
                     channel,
-                    wave_metadata.root_key,
+                    sample_metadata.root_key,
                     options.read_sample_root_note,
                 ),
-                fine_tune_cents: wave_metadata.fine_tune_cents.unwrap_or_default()
+                fine_tune_cents: sample_metadata.fine_tune_cents.unwrap_or_default()
                     + f64::from(channel.master_pitch_render_offset_cents(
                         document.metadata().master_pitch_cents(),
                     )),
@@ -8881,10 +8881,10 @@ fn prepare_sampler_pattern_for_channel_internal(
                     continue;
                 }
             };
-            let wave_metadata = wav_sampler_metadata(&resolved_path).unwrap_or_default();
+            let sample_metadata = sample_sampler_metadata(&resolved_path).unwrap_or_default();
             let loop_points = channel
                 .sampler_uses_loop_points()
-                .then_some(wave_metadata.loop_points)
+                .then_some(sample_metadata.loop_points)
                 .flatten();
             let audio = if let Some(audio) = decoded_by_path.get(&resolved_path) {
                 Arc::clone(audio)
@@ -8921,15 +8921,15 @@ fn prepare_sampler_pattern_for_channel_internal(
             let (gain, pan) = channel_gain_pan(channel.volume(), channel.pan());
             source_entry.insert(SamplerVoiceSource {
                 audio,
-                gain: gain * sampler_wav_gain(wave_metadata.gain_db),
+                gain: gain * sampler_metadata_gain(sample_metadata.gain_db),
                 pan,
                 reverse: channel.sample_reversed(),
                 root_key: resolve_sampler_channel_root_key(
                     channel,
-                    wave_metadata.root_key,
+                    sample_metadata.root_key,
                     options.read_sample_root_note,
                 ),
-                fine_tune_cents: wave_metadata.fine_tune_cents.unwrap_or_default()
+                fine_tune_cents: sample_metadata.fine_tune_cents.unwrap_or_default()
                     + f64::from(channel.master_pitch_render_offset_cents(
                         document.metadata().master_pitch_cents(),
                     )),
@@ -9631,8 +9631,12 @@ fn sampler_note_pan(channel_pan: f32, note_pan: u8) -> f32 {
     (channel_pan + note_pan_offset).clamp(-1.0, 1.0)
 }
 
-fn sampler_wav_gain(gain_db: Option<i8>) -> f32 {
-    gain_db.map_or(1.0, |gain_db| 10.0f32.powf(f32::from(gain_db) / 20.0))
+fn sampler_metadata_gain(gain_db: Option<i16>) -> f32 {
+    gain_db.map_or(1.0, |gain_db| {
+        10.0f64
+            .powf(f64::from(gain_db) / 20.0)
+            .min(f64::from(f32::MAX)) as f32
+    })
 }
 
 fn audio_clip_master_pitch_ratio(pitch_offset_cents: i16) -> f64 {
@@ -14195,11 +14199,12 @@ mod tests {
     }
 
     #[test]
-    fn sampler_wav_gain_converts_decibels_to_linear_amplitude() {
-        assert_eq!(sampler_wav_gain(None), 1.0);
-        assert_eq!(sampler_wav_gain(Some(0)), 1.0);
-        assert!((sampler_wav_gain(Some(-6)) - 10.0f32.powf(-6.0 / 20.0)).abs() < 1e-6);
-        assert_eq!(sampler_wav_gain(Some(20)), 10.0);
+    fn sampler_metadata_gain_converts_decibels_to_linear_amplitude() {
+        assert_eq!(sampler_metadata_gain(None), 1.0);
+        assert_eq!(sampler_metadata_gain(Some(0)), 1.0);
+        assert!((sampler_metadata_gain(Some(-6)) - 10.0f32.powf(-6.0 / 20.0)).abs() < 1e-6);
+        assert_eq!(sampler_metadata_gain(Some(20)), 10.0);
+        assert!(sampler_metadata_gain(Some(i16::MAX)).is_finite());
     }
 
     #[test]

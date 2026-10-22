@@ -395,13 +395,13 @@ pub fn decode_audio_file(path: impl AsRef<Path>) -> Result<DecodedAudio, String>
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub(crate) struct WavSamplerMetadata {
-    /// Root key from `inst`, falling back to the `smpl` MIDI unity note.
+pub(crate) struct SamplerFileMetadata {
+    /// Root key from WAVE `inst`/`smpl` or AIFF `INST` metadata.
     pub(crate) root_key: Option<u16>,
-    /// Fine tuning in cents from WAVE `inst` or `smpl` pitch metadata.
+    /// Fine tuning in cents from WAVE or AIFF sampler metadata.
     pub(crate) fine_tune_cents: Option<f64>,
-    /// Suggested sample gain from the signed `inst` decibel field.
-    pub(crate) gain_db: Option<i8>,
+    /// Suggested sample gain from the signed instrument-chunk decibel field.
+    pub(crate) gain_db: Option<i16>,
     /// First valid `smpl` loop as half-open source-frame bounds.
     pub(crate) loop_points: Option<(usize, usize)>,
 }
@@ -410,7 +410,7 @@ pub(crate) struct WavSamplerMetadata {
 ///
 /// The `inst` root key takes precedence over the `smpl` MIDI unity note. WAVE stores loop ends
 /// inclusively, while playback code uses an exclusive end. Invalid or absent metadata is ignored.
-pub(crate) fn wav_sampler_metadata(path: &Path) -> Option<WavSamplerMetadata> {
+pub(crate) fn wav_sampler_metadata(path: &Path) -> Option<SamplerFileMetadata> {
     let mut file = File::open(path).ok()?;
     let file_length = file.metadata().ok()?.len();
     if file_length < 12 {
@@ -450,7 +450,7 @@ pub(crate) fn wav_sampler_metadata(path: &Path) -> Option<WavSamplerMetadata> {
                 file.seek(SeekFrom::Start(body_start)).ok()?;
                 let mut instrument = [0; 7];
                 file.read_exact(&mut instrument).ok()?;
-                inst_gain_db.get_or_insert_with(|| i8::from_le_bytes([instrument[2]]));
+                inst_gain_db.get_or_insert_with(|| i16::from(i8::from_le_bytes([instrument[2]])));
                 if instrument[0] <= 127 {
                     inst_root_key = Some(u16::from(instrument[0]));
                     let fine_tune_cents = i8::from_le_bytes([instrument[1]]);
@@ -519,7 +519,7 @@ pub(crate) fn wav_sampler_metadata(path: &Path) -> Option<WavSamplerMetadata> {
         }
     }
 
-    let metadata = WavSamplerMetadata {
+    let metadata = SamplerFileMetadata {
         root_key: inst_root_key.or(smpl_root_key),
         fine_tune_cents: inst_fine_tune_cents.or(smpl_fine_tune_cents),
         gain_db: inst_gain_db,
@@ -527,6 +527,83 @@ pub(crate) fn wav_sampler_metadata(path: &Path) -> Option<WavSamplerMetadata> {
     };
     (metadata.root_key.is_some() || metadata.gain_db.is_some() || metadata.loop_points.is_some())
         .then_some(metadata)
+}
+
+/// Read root, tuning, and gain metadata from a standard AIFF or AIFF-C `INST` chunk.
+///
+/// AIFF marker-based sustain and release loops are not included here. Invalid or absent sampler
+/// metadata is ignored, leaving the project's channel root key and default tuning in effect.
+pub(crate) fn aiff_sampler_metadata(path: &Path) -> Option<SamplerFileMetadata> {
+    let mut file = File::open(path).ok()?;
+    let file_length = file.metadata().ok()?.len();
+    if file_length < 12 {
+        return None;
+    }
+    let mut header = [0; 12];
+    file.read_exact(&mut header).ok()?;
+    if &header[..4] != b"FORM" || !matches!(&header[8..12], b"AIFF" | b"AIFC") {
+        return None;
+    }
+    let form_size = u64::from(u32::from_be_bytes(header[4..8].try_into().ok()?));
+    let form_end = 8u64.checked_add(form_size)?;
+    if form_size < 4 || form_end > file_length {
+        return None;
+    }
+
+    let mut cursor = 12u64;
+    let mut instrument_chunk_seen = false;
+    let mut root_key = None;
+    let mut fine_tune_cents = None;
+    let mut gain_db = None;
+    while cursor.checked_add(8)? <= form_end {
+        file.seek(SeekFrom::Start(cursor)).ok()?;
+        let mut chunk_header = [0; 8];
+        file.read_exact(&mut chunk_header).ok()?;
+        let chunk_size = u64::from(u32::from_be_bytes(chunk_header[4..8].try_into().ok()?));
+        let body_start = cursor.checked_add(8)?;
+        let body_end = body_start.checked_add(chunk_size)?;
+        if body_end > form_end {
+            return None;
+        }
+
+        if &chunk_header[..4] == b"INST" && !instrument_chunk_seen {
+            instrument_chunk_seen = true;
+            if chunk_size == 20 {
+                file.seek(SeekFrom::Start(body_start)).ok()?;
+                let mut instrument = [0; 20];
+                file.read_exact(&mut instrument).ok()?;
+                gain_db = Some(i16::from_be_bytes([instrument[6], instrument[7]]));
+                if instrument[0] <= 127 {
+                    root_key = Some(u16::from(instrument[0]));
+                    let detune_cents = i8::from_be_bytes([instrument[1]]);
+                    if (-50..=50).contains(&detune_cents) {
+                        fine_tune_cents = Some(f64::from(detune_cents));
+                    }
+                }
+            }
+        }
+
+        cursor = body_end.checked_add(chunk_size & 1)?;
+        if cursor > form_end {
+            return None;
+        }
+    }
+    if cursor != form_end {
+        return None;
+    }
+
+    let metadata = SamplerFileMetadata {
+        root_key,
+        fine_tune_cents,
+        gain_db,
+        loop_points: None,
+    };
+    (metadata.root_key.is_some() || metadata.gain_db.is_some()).then_some(metadata)
+}
+
+/// Read sampler metadata from the supported WAVE and AIFF-family chunk formats.
+pub(crate) fn sample_sampler_metadata(path: &Path) -> Option<SamplerFileMetadata> {
+    wav_sampler_metadata(path).or_else(|| aiff_sampler_metadata(path))
 }
 
 /// Decode an audio file for the Browser and return interleaved stereo samples at the output rate.
@@ -1650,6 +1727,23 @@ mod tests {
         bytes
     }
 
+    fn aiff_with_chunks(form_type: &[u8; 4], chunks: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
+        let mut body = form_type.to_vec();
+        for (id, payload) in chunks {
+            body.extend_from_slice(*id);
+            body.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            body.extend_from_slice(payload);
+            if payload.len() % 2 != 0 {
+                body.push(0);
+            }
+        }
+
+        let mut bytes = b"FORM".to_vec();
+        bytes.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(&body);
+        bytes
+    }
+
     #[test]
     fn waveform_summary_keeps_stereo_channels_separate_and_combined() {
         let audio = DecodedAudio {
@@ -1898,6 +1992,65 @@ mod tests {
         let metadata = wav_sampler_metadata(&path).expect("valid smpl root should parse");
         assert_eq!(metadata.root_key, Some(60));
         assert_eq!(metadata.fine_tune_cents, Some(50.0));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reads_aiff_instrument_root_detune_and_gain_from_aiff_and_aifc() {
+        let root = fixture_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("instrument.aiff");
+        let mut instrument = [0u8; 20];
+        instrument[0] = 72;
+        instrument[1] = (-23i8).to_be_bytes()[0];
+        instrument[2] = 24;
+        instrument[3] = 96;
+        instrument[4] = 1;
+        instrument[5] = 127;
+        instrument[6..8].copy_from_slice(&(-6i16).to_be_bytes());
+
+        for form_type in [b"AIFF", b"AIFC"] {
+            let bytes =
+                aiff_with_chunks(form_type, &[(b"JUNK", &[1, 2, 3]), (b"INST", &instrument)]);
+            std::fs::write(&path, bytes).unwrap();
+
+            let metadata = sample_sampler_metadata(&path).expect("AIFF sampler metadata parses");
+            assert_eq!(metadata.root_key, Some(72));
+            assert_eq!(metadata.fine_tune_cents, Some(-23.0));
+            assert_eq!(metadata.gain_db, Some(-6));
+            assert_eq!(metadata.loop_points, None);
+        }
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_invalid_or_truncated_aiff_instrument_chunks() {
+        let root = fixture_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("invalid-instrument.aiff");
+        let mut instrument = [0u8; 20];
+        instrument[0] = 128;
+        instrument[1] = 51;
+        instrument[6..8].copy_from_slice(&3i16.to_be_bytes());
+        std::fs::write(&path, aiff_with_chunks(b"AIFF", &[(b"INST", &instrument)])).unwrap();
+        let metadata = aiff_sampler_metadata(&path).expect("AIFF gain remains usable");
+        assert_eq!(metadata.root_key, None);
+        assert_eq!(metadata.fine_tune_cents, None);
+        assert_eq!(metadata.gain_db, Some(3));
+
+        std::fs::write(
+            &path,
+            aiff_with_chunks(b"AIFF", &[(b"INST", &instrument[..19])]),
+        )
+        .unwrap();
+        assert_eq!(aiff_sampler_metadata(&path), None);
+
+        let mut truncated = aiff_with_chunks(b"AIFF", &[(b"INST", &instrument)]);
+        truncated[4..8].copy_from_slice(&u32::MAX.to_be_bytes());
+        std::fs::write(&path, truncated).unwrap();
+        assert_eq!(aiff_sampler_metadata(&path), None);
 
         std::fs::remove_dir_all(root).unwrap();
     }
