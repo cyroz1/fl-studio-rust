@@ -6676,7 +6676,9 @@ fn prepare_sampler_arrangement(
                         document.metadata().master_pitch_cents(),
                     )),
                 loop_bounds,
-                ping_pong_loop: channel.sampler_ping_pong_loop_enabled(),
+                ping_pong_loop: sample_metadata
+                    .ping_pong_loop
+                    .unwrap_or_else(|| channel.sampler_ping_pong_loop_enabled()),
             });
             let route_plan =
                 mixer_route_audibility.source_route_plan_for_channel(channel.mixer_track());
@@ -8934,7 +8936,9 @@ fn prepare_sampler_pattern_for_channel_internal(
                         document.metadata().master_pitch_cents(),
                     )),
                 loop_bounds,
-                ping_pong_loop: channel.sampler_ping_pong_loop_enabled(),
+                ping_pong_loop: sample_metadata
+                    .ping_pong_loop
+                    .unwrap_or_else(|| channel.sampler_ping_pong_loop_enabled()),
             });
             let route_plan =
                 mixer_route_audibility.source_route_plan_for_channel(channel.mixer_track());

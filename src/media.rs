@@ -402,8 +402,10 @@ pub(crate) struct SamplerFileMetadata {
     pub(crate) fine_tune_cents: Option<f64>,
     /// Suggested sample gain from the signed instrument-chunk decibel field.
     pub(crate) gain_db: Option<i16>,
-    /// First valid `smpl` loop as half-open source-frame bounds.
+    /// First supported WAVE or AIFF sustain loop as half-open source-frame bounds.
     pub(crate) loop_points: Option<(usize, usize)>,
+    /// AIFF `INST` loop mode when its sustain markers resolve to valid frame bounds.
+    pub(crate) ping_pong_loop: Option<bool>,
 }
 
 /// Read standard sampler metadata from a RIFF/WAVE file.
@@ -524,15 +526,16 @@ pub(crate) fn wav_sampler_metadata(path: &Path) -> Option<SamplerFileMetadata> {
         fine_tune_cents: inst_fine_tune_cents.or(smpl_fine_tune_cents),
         gain_db: inst_gain_db,
         loop_points,
+        ping_pong_loop: None,
     };
     (metadata.root_key.is_some() || metadata.gain_db.is_some() || metadata.loop_points.is_some())
         .then_some(metadata)
 }
 
-/// Read root, tuning, and gain metadata from a standard AIFF or AIFF-C `INST` chunk.
+/// Read sampler metadata from a standard AIFF or AIFF-C `INST` and `MARK` chunk.
 ///
-/// AIFF marker-based sustain and release loops are not included here. Invalid or absent sampler
-/// metadata is ignored, leaving the project's channel root key and default tuning in effect.
+/// The sustain loop uses half-open frame bounds. Release loops are not included. Invalid or absent
+/// sampler metadata is ignored, leaving the project's channel root key and default tuning in effect.
 pub(crate) fn aiff_sampler_metadata(path: &Path) -> Option<SamplerFileMetadata> {
     let mut file = File::open(path).ok()?;
     let file_length = file.metadata().ok()?.len();
@@ -552,9 +555,12 @@ pub(crate) fn aiff_sampler_metadata(path: &Path) -> Option<SamplerFileMetadata> 
 
     let mut cursor = 12u64;
     let mut instrument_chunk_seen = false;
+    let mut marker_chunk_seen = false;
     let mut root_key = None;
     let mut fine_tune_cents = None;
     let mut gain_db = None;
+    let mut sustain_loop = None;
+    let mut marker_positions = None;
     while cursor.checked_add(8)? <= form_end {
         file.seek(SeekFrom::Start(cursor)).ok()?;
         let mut chunk_header = [0; 8];
@@ -580,7 +586,15 @@ pub(crate) fn aiff_sampler_metadata(path: &Path) -> Option<SamplerFileMetadata> 
                         fine_tune_cents = Some(f64::from(detune_cents));
                     }
                 }
+                sustain_loop = Some((
+                    i16::from_be_bytes([instrument[8], instrument[9]]),
+                    i16::from_be_bytes([instrument[10], instrument[11]]),
+                    i16::from_be_bytes([instrument[12], instrument[13]]),
+                ));
             }
+        } else if &chunk_header[..4] == b"MARK" && !marker_chunk_seen {
+            marker_chunk_seen = true;
+            marker_positions = read_aiff_marker_positions(&mut file, body_start, chunk_size);
         }
 
         cursor = body_end.checked_add(chunk_size & 1)?;
@@ -592,13 +606,88 @@ pub(crate) fn aiff_sampler_metadata(path: &Path) -> Option<SamplerFileMetadata> 
         return None;
     }
 
+    let (loop_points, ping_pong_loop) = sustain_loop
+        .and_then(|(play_mode, begin_marker, end_marker)| {
+            if !matches!(play_mode, 1 | 2) {
+                return None;
+            }
+            let markers = marker_positions.as_ref()?;
+            let start = markers
+                .iter()
+                .find_map(|(marker_id, frame)| (*marker_id == begin_marker).then_some(*frame))?;
+            let end = markers
+                .iter()
+                .find_map(|(marker_id, frame)| (*marker_id == end_marker).then_some(*frame))?;
+            (start < end).then_some((Some((start, end)), Some(play_mode == 2)))
+        })
+        .unwrap_or((None, None));
     let metadata = SamplerFileMetadata {
         root_key,
         fine_tune_cents,
         gain_db,
-        loop_points: None,
+        loop_points,
+        ping_pong_loop,
     };
-    (metadata.root_key.is_some() || metadata.gain_db.is_some()).then_some(metadata)
+    (metadata.root_key.is_some() || metadata.gain_db.is_some() || metadata.loop_points.is_some())
+        .then_some(metadata)
+}
+
+fn read_aiff_marker_positions(
+    file: &mut File,
+    body_start: u64,
+    chunk_size: u64,
+) -> Option<Vec<(i16, usize)>> {
+    const MAX_MARKER_CHUNK_BYTES: u64 = 18 * 1024 * 1024;
+
+    if !(2..=MAX_MARKER_CHUNK_BYTES).contains(&chunk_size) {
+        return None;
+    }
+    file.seek(SeekFrom::Start(body_start)).ok()?;
+    let mut count_bytes = [0; 2];
+    file.read_exact(&mut count_bytes).ok()?;
+    let marker_count = usize::from(u16::from_be_bytes(count_bytes));
+    let mut consumed = 2u64;
+    let mut positions: Vec<(i16, usize)> = Vec::with_capacity(marker_count.min(4096));
+    let mut duplicate_ids = Vec::new();
+
+    for _ in 0..marker_count {
+        if consumed.checked_add(7)? > chunk_size {
+            return None;
+        }
+        let mut marker_header = [0; 7];
+        file.read_exact(&mut marker_header).ok()?;
+        let marker_id = i16::from_be_bytes([marker_header[0], marker_header[1]]);
+        let frame = u32::from_be_bytes([
+            marker_header[2],
+            marker_header[3],
+            marker_header[4],
+            marker_header[5],
+        ]) as usize;
+        let name_length = u64::from(marker_header[6]);
+        let record_size = 7u64.checked_add(name_length)?;
+        let padded_record_size = record_size.checked_add(record_size & 1)?;
+        consumed = consumed.checked_add(padded_record_size)?;
+        if consumed > chunk_size {
+            return None;
+        }
+        file.seek(SeekFrom::Start(body_start.checked_add(consumed)?))
+            .ok()?;
+
+        if marker_id <= 0 || duplicate_ids.contains(&marker_id) {
+            continue;
+        }
+        if let Some(existing_index) = positions
+            .iter()
+            .position(|(existing_id, _)| *existing_id == marker_id)
+        {
+            positions.remove(existing_index);
+            duplicate_ids.push(marker_id);
+        } else {
+            positions.push((marker_id, frame));
+        }
+    }
+
+    (consumed == chunk_size).then_some(positions)
 }
 
 /// Read sampler metadata from the supported WAVE and AIFF-family chunk formats.
@@ -1744,6 +1833,23 @@ mod tests {
         bytes
     }
 
+    fn aiff_marker_chunk(markers: &[(i16, u32, &str)]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(markers.len() as u16).to_be_bytes());
+        for (marker_id, frame, name) in markers {
+            let name = name.as_bytes();
+            assert!(name.len() <= usize::from(u8::MAX));
+            payload.extend_from_slice(&marker_id.to_be_bytes());
+            payload.extend_from_slice(&frame.to_be_bytes());
+            payload.push(name.len() as u8);
+            payload.extend_from_slice(name);
+            if (7 + name.len()) % 2 != 0 {
+                payload.push(0);
+            }
+        }
+        payload
+    }
+
     #[test]
     fn waveform_summary_keeps_stereo_channels_separate_and_combined() {
         let audio = DecodedAudio {
@@ -2021,6 +2127,103 @@ mod tests {
             assert_eq!(metadata.gain_db, Some(-6));
             assert_eq!(metadata.loop_points, None);
         }
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reads_aiff_sustain_loop_markers_in_either_chunk_order() {
+        let root = fixture_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("sustain-loop.aiff");
+        let markers = aiff_marker_chunk(&[(11, 20, "loop"), (12, 80, "end")]);
+        let mut instrument = [0u8; 20];
+        instrument[0] = 60;
+        instrument[8..10].copy_from_slice(&1i16.to_be_bytes());
+        instrument[10..12].copy_from_slice(&11i16.to_be_bytes());
+        instrument[12..14].copy_from_slice(&12i16.to_be_bytes());
+
+        for (chunks, expected_ping_pong) in [
+            (
+                vec![
+                    (b"MARK", markers.as_slice()),
+                    (b"INST", instrument.as_slice()),
+                ],
+                Some(false),
+            ),
+            (
+                vec![
+                    (b"INST", instrument.as_slice()),
+                    (b"MARK", markers.as_slice()),
+                ],
+                Some(false),
+            ),
+        ] {
+            let bytes = aiff_with_chunks(b"AIFF", &chunks);
+            std::fs::write(&path, bytes).unwrap();
+            let metadata = aiff_sampler_metadata(&path).expect("AIFF loop metadata parses");
+            assert_eq!(metadata.loop_points, Some((20, 80)));
+            assert_eq!(metadata.ping_pong_loop, expected_ping_pong);
+        }
+
+        instrument[8..10].copy_from_slice(&2i16.to_be_bytes());
+        std::fs::write(
+            &path,
+            aiff_with_chunks(b"AIFF", &[(b"INST", &instrument), (b"MARK", &markers)]),
+        )
+        .unwrap();
+        let metadata = aiff_sampler_metadata(&path).expect("AIFF ping-pong loop parses");
+        assert_eq!(metadata.loop_points, Some((20, 80)));
+        assert_eq!(metadata.ping_pong_loop, Some(true));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ignores_invalid_aiff_sustain_loop_modes_and_marker_references() {
+        let root = fixture_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("invalid-loop.aiff");
+        let markers = aiff_marker_chunk(&[(11, 80, "end"), (12, 20, "begin")]);
+        let mut instrument = [0u8; 20];
+        instrument[0] = 60;
+        instrument[8..10].copy_from_slice(&1i16.to_be_bytes());
+        instrument[10..12].copy_from_slice(&11i16.to_be_bytes());
+        instrument[12..14].copy_from_slice(&12i16.to_be_bytes());
+        std::fs::write(
+            &path,
+            aiff_with_chunks(b"AIFF", &[(b"MARK", &markers), (b"INST", &instrument)]),
+        )
+        .unwrap();
+        let reversed = aiff_sampler_metadata(&path).expect("root metadata remains usable");
+        assert_eq!(reversed.root_key, Some(60));
+        assert_eq!(reversed.loop_points, None);
+        assert_eq!(reversed.ping_pong_loop, None);
+
+        instrument[8..10].copy_from_slice(&3i16.to_be_bytes());
+        std::fs::write(
+            &path,
+            aiff_with_chunks(b"AIFF", &[(b"INST", &instrument), (b"MARK", &markers)]),
+        )
+        .unwrap();
+        let unsupported = aiff_sampler_metadata(&path).expect("root metadata remains usable");
+        assert_eq!(unsupported.loop_points, None);
+
+        let duplicate_markers =
+            aiff_marker_chunk(&[(11, 20, "one"), (11, 80, "two"), (12, 90, "end")]);
+        instrument[8..10].copy_from_slice(&1i16.to_be_bytes());
+        instrument[10..12].copy_from_slice(&11i16.to_be_bytes());
+        instrument[12..14].copy_from_slice(&12i16.to_be_bytes());
+        std::fs::write(
+            &path,
+            aiff_with_chunks(
+                b"AIFF",
+                &[(b"INST", &instrument), (b"MARK", &duplicate_markers)],
+            ),
+        )
+        .unwrap();
+        let duplicate = aiff_sampler_metadata(&path).expect("root metadata remains usable");
+        assert_eq!(duplicate.loop_points, None);
 
         std::fs::remove_dir_all(root).unwrap();
     }
