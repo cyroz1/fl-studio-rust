@@ -1127,7 +1127,8 @@ impl ChannelNoteRouter {
 
     /// Returns Sampler route gains for the saved Layer crossfade position.
     /// Non-crossfaded routes have gain 1.0. Crossfade is applied only when all
-    /// active children are built-in Sampler channels; VST3 routes retain gain 1.
+    /// active child subtrees lead exclusively to built-in Sampler channels;
+    /// VST3 routes retain gain 1.
     pub(crate) fn targets_for_note_with_gain(
         &self,
         source_channel_id: u16,
@@ -1192,9 +1193,8 @@ impl ChannelNoteRouter {
             && channel.layer_fade_raw().is_some()
             && !children.is_empty()
             && children.iter().all(|child_id| {
-                self.channels_by_id
-                    .get(child_id)
-                    .is_some_and(|child| child.channel_type() == Some(ChannelType::Sampler))
+                let mut active_layers = state.active_layers.clone();
+                self.layer_subtree_targets_only_samplers(*child_id, state.key, &mut active_layers)
             })
         {
             let fade = f32::from(channel.layer_fade_raw().unwrap_or_default()) / 256.0;
@@ -1219,6 +1219,50 @@ impl ChannelNoteRouter {
             }
         }
         state.active_layers.remove(&channel_id);
+    }
+
+    fn layer_subtree_targets_only_samplers(
+        &self,
+        channel_id: u16,
+        key: u16,
+        active_layers: &mut HashSet<u16>,
+    ) -> bool {
+        let Some(channel) = self.channels_by_id.get(&channel_id) else {
+            return false;
+        };
+        if channel.enabled == Some(false) || !channel_accepts_key(channel, key) {
+            return false;
+        }
+        match channel.channel_type() {
+            Some(ChannelType::Sampler) => true,
+            Some(ChannelType::Layer) => {
+                if !active_layers.insert(channel_id) {
+                    return false;
+                }
+                let mut seen_children = HashSet::new();
+                let children = channel
+                    .layer_children
+                    .iter()
+                    .copied()
+                    .filter(|child_id| seen_children.insert(*child_id))
+                    .filter(|child_id| {
+                        self.channels_by_id.get(child_id).is_some_and(|child| {
+                            child.enabled != Some(false)
+                                && (child.channel_type() != Some(ChannelType::Layer)
+                                    || !active_layers.contains(child_id))
+                                && channel_accepts_key(child, key)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let supports_crossfade = !children.is_empty()
+                    && children.iter().all(|child_id| {
+                        self.layer_subtree_targets_only_samplers(*child_id, key, active_layers)
+                    });
+                active_layers.remove(&channel_id);
+                supports_crossfade
+            }
+            _ => false,
+        }
     }
 }
 
@@ -21038,6 +21082,38 @@ mod tests {
         flp_fixture(&event_stream, &[], &[])
     }
 
+    fn nested_layer_crossfade_fixture(mixed_inner: bool) -> Vec<u8> {
+        let mut event_stream = vec![0x40, 0, 0, 0x15, 3, 0x90];
+        event_stream.extend_from_slice(&2u32.to_le_bytes());
+        for child in [1_u16, 2] {
+            event_stream.push(0x5E);
+            event_stream.extend_from_slice(&child.to_le_bytes());
+        }
+        let mut outer_parameters = vec![0; 92];
+        outer_parameters[68..72].copy_from_slice(&0u32.to_le_bytes());
+        outer_parameters[72..76].copy_from_slice(&127u32.to_le_bytes());
+        outer_parameters[88..92].copy_from_slice(&128u32.to_le_bytes());
+        append_data_event(&mut event_stream, 0xC7, &outer_parameters);
+
+        event_stream.extend_from_slice(&[0x40, 1, 0, 0x15, 3, 0x90]);
+        event_stream.extend_from_slice(&2u32.to_le_bytes());
+        for child in [3_u16, 4] {
+            event_stream.push(0x5E);
+            event_stream.extend_from_slice(&child.to_le_bytes());
+        }
+        let mut inner_parameters = vec![0; 92];
+        inner_parameters[68..72].copy_from_slice(&0u32.to_le_bytes());
+        inner_parameters[72..76].copy_from_slice(&127u32.to_le_bytes());
+        inner_parameters[88..92].copy_from_slice(&128u32.to_le_bytes());
+        append_data_event(&mut event_stream, 0xC7, &inner_parameters);
+
+        for (child, kind) in [(2_u8, 0), (3, 0), (4, u8::from(mixed_inner) * 2)] {
+            event_stream.extend_from_slice(&[0x40, child, 0, 0x15, kind]);
+        }
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        flp_fixture(&event_stream, &[], &[])
+    }
+
     #[test]
     fn decodes_time_markers_and_preserves_unknown_position_bits() {
         let mut event_stream = vec![0x63, 7, 0];
@@ -30971,6 +31047,26 @@ mod tests {
             }
             assert_eq!(actual, expected);
         }
+    }
+
+    #[test]
+    fn layer_crossfade_composes_gains_through_sampler_only_nested_layers() {
+        let document = FlpDocument::parse(&nested_layer_crossfade_fixture(false))
+            .expect("nested Layer crossfade fixture should parse");
+        let router = ChannelNoteRouter::new(document.channels());
+        let actual = router.targets_for_note_with_gain(0, 0, 60);
+        assert_eq!(actual, vec![(3, 0.25), (4, 0.25), (2, 0.5)]);
+    }
+
+    #[test]
+    fn layer_crossfade_keeps_nested_mixed_children_at_unity_gain() {
+        let document = FlpDocument::parse(&nested_layer_crossfade_fixture(true))
+            .expect("nested mixed Layer fixture should parse");
+        let router = ChannelNoteRouter::new(document.channels());
+        assert_eq!(
+            router.targets_for_note_with_gain(0, 0, 60),
+            vec![(3, 1.0), (4, 1.0), (2, 1.0)]
+        );
     }
 
     #[test]
