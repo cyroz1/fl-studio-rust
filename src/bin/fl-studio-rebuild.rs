@@ -5102,6 +5102,31 @@ fn recolor_piano_roll_notes(
     Ok(note_count)
 }
 
+fn next_empty_pattern_id(patterns: &[Pattern], after_pattern_id: Option<u16>) -> Option<u16> {
+    let mut empty_ids = patterns
+        .iter()
+        .filter(|pattern| {
+            pattern.notes.is_empty()
+                && pattern.controllers.is_empty()
+                && pattern.time_markers.is_empty()
+        })
+        .map(|pattern| pattern.id)
+        .collect::<Vec<_>>();
+    empty_ids.sort_unstable();
+    empty_ids.dedup();
+
+    empty_ids
+        .iter()
+        .copied()
+        .find(|pattern_id| after_pattern_id.is_none_or(|after| *pattern_id > after))
+        .or_else(|| {
+            empty_ids
+                .first()
+                .copied()
+                .filter(|pattern_id| Some(*pattern_id) != after_pattern_id)
+        })
+}
+
 impl DawUi {
     fn new(creation: &eframe::CreationContext<'_>, initial_project: Option<PathBuf>) -> Self {
         install_ui_fonts(&creation.egui_ctx);
@@ -8204,18 +8229,43 @@ impl DawUi {
         }
     }
 
-    fn create_pattern(&mut self) {
+    fn create_pattern(&mut self) -> Option<u16> {
         let Some(document) = self.document.as_mut() else {
             self.status = "Open a project before creating a pattern".to_owned();
-            return;
+            return None;
         };
         match document.create_pattern() {
             Ok(pattern_id) => {
                 self.selected_pattern = Some(pattern_id);
                 self.dirty = true;
                 self.status = format!("Created empty pattern {pattern_id}");
+                Some(pattern_id)
             }
-            Err(error) => self.status = format!("Could not create a pattern: {error}"),
+            Err(error) => {
+                self.status = format!("Could not create a pattern: {error}");
+                None
+            }
+        }
+    }
+
+    fn select_next_empty_pattern(&mut self) -> Option<u16> {
+        let Some(document) = self.document.as_ref() else {
+            self.status = "Open a project before selecting an empty pattern".to_owned();
+            return None;
+        };
+        let patterns = match document.patterns() {
+            Ok(patterns) => patterns,
+            Err(error) => {
+                self.status = format!("Could not inspect patterns: {error}");
+                return None;
+            }
+        };
+        if let Some(pattern_id) = next_empty_pattern_id(&patterns, self.selected_pattern) {
+            self.selected_pattern = Some(pattern_id);
+            self.status = format!("Selected empty pattern {pattern_id}");
+            Some(pattern_id)
+        } else {
+            self.create_pattern()
         }
     }
 
@@ -11526,7 +11576,7 @@ impl DawUi {
                     .add_enabled(self.document.is_some(), egui::Button::new("New pattern"))
                     .clicked()
                 {
-                    self.create_pattern();
+                    let _ = self.create_pattern();
                     ui.close();
                 }
             });
@@ -11911,6 +11961,9 @@ impl DawUi {
                     ("F6", "Channel Rack"),
                     ("F7", "Piano roll"),
                     ("F9", "Mixer"),
+                    ("F2", "Rename selected pattern"),
+                    ("F4", "Select next empty pattern and name it"),
+                    ("Ctrl/Cmd+F4", "Select or create next empty pattern"),
                     ("Ctrl/Cmd+O", "Open project"),
                     ("Ctrl/Cmd+R", "Render Playlist mix"),
                     ("Ctrl/Cmd+Shift+M", "Export song MIDI"),
@@ -12305,7 +12358,7 @@ impl DawUi {
                     .on_hover_text("Create a new pattern")
                     .clicked()
                 {
-                    self.create_pattern();
+                    let _ = self.create_pattern();
                 }
             }
         });
@@ -46728,6 +46781,30 @@ impl eframe::App for DawUi {
         }
         ui.painter()
             .rect_filled(ui.max_rect(), egui::CornerRadius::ZERO, APP_BACKGROUND);
+        let pattern_creation_shortcut = if ui.ctx().egui_wants_keyboard_input() {
+            None
+        } else {
+            ui.input_mut(|input| {
+                if input.consume_key(egui::Modifiers::COMMAND, egui::Key::F4) {
+                    Some(false)
+                } else if input.consume_key(egui::Modifiers::NONE, egui::Key::F4) {
+                    Some(true)
+                } else {
+                    None
+                }
+            })
+        };
+        if let Some(open_name_editor) = pattern_creation_shortcut
+            && let Some(pattern_id) = self.select_next_empty_pattern()
+            && open_name_editor
+        {
+            self.open_pattern_rename_dialog(pattern_id);
+        }
+        let rename_pattern_requested = !ui.ctx().egui_wants_keyboard_input()
+            && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F2));
+        if rename_pattern_requested && let Some(pattern_id) = self.selected_pattern {
+            self.open_pattern_rename_dialog(pattern_id);
+        }
         let open_project_requested = !ui.ctx().egui_wants_keyboard_input()
             && ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::O));
         if open_project_requested {
@@ -55157,12 +55234,12 @@ mod tests {
         midi_cc_to_mixer_stereo_separation_raw, midi_controller_binding_for_device,
         midi_mixer_button_press_edge, midi_mixer_control_for_cc,
         midi_vst3_parameter_mapping_for_target, midi_vst3_parameter_mappings_for_cc,
-        next_piano_roll_note_group, note_from_grid_position, parse_midi_control_change_mapping,
-        parse_midi_controller_templates, parse_midi_device_selections,
-        parse_midi_mixer_control_mappings, parse_midi_output_programs, parse_midi_output_routes,
-        parse_midi_output_values, parse_midi_vst3_parameter_mappings,
-        parse_pattern_vst3_parameter_links, parse_window_layout_presets,
-        pattern_loop_frame_at_tick, pattern_loop_tick_at_frame,
+        next_empty_pattern_id, next_piano_roll_note_group, note_from_grid_position,
+        parse_midi_control_change_mapping, parse_midi_controller_templates,
+        parse_midi_device_selections, parse_midi_mixer_control_mappings,
+        parse_midi_output_programs, parse_midi_output_routes, parse_midi_output_values,
+        parse_midi_vst3_parameter_mappings, parse_pattern_vst3_parameter_links,
+        parse_window_layout_presets, pattern_loop_frame_at_tick, pattern_loop_tick_at_frame,
         pattern_vst3_parameter_automation_for_channel, pattern_vst3_parameter_link_for_target,
         piano_roll_color_group_note_ids, piano_roll_controller_stroke_points,
         piano_roll_controller_value_at, piano_roll_controller_value_range,
@@ -55192,6 +55269,30 @@ mod tests {
         upsert_midi_mixer_control_mapping, upsert_midi_vst3_parameter_mapping,
         upsert_pattern_vst3_parameter_link, zoom_to_fit,
     };
+
+    #[test]
+    fn next_empty_pattern_uses_pattern_order_wraps_and_skips_the_current_slot() {
+        let patterns = [
+            Pattern {
+                id: 1,
+                ..Pattern::default()
+            },
+            Pattern {
+                id: 2,
+                controllers: vec![PatternController::default()],
+                ..Pattern::default()
+            },
+            Pattern {
+                id: 4,
+                ..Pattern::default()
+            },
+        ];
+        assert_eq!(next_empty_pattern_id(&patterns, None), Some(1));
+        assert_eq!(next_empty_pattern_id(&patterns, Some(1)), Some(4));
+        assert_eq!(next_empty_pattern_id(&patterns, Some(2)), Some(4));
+        assert_eq!(next_empty_pattern_id(&patterns, Some(4)), Some(1));
+        assert_eq!(next_empty_pattern_id(&patterns[..1], Some(1)), None);
+    }
 
     fn mixer_send_route_fixture() -> FlpDocument {
         fn append_data_event(event_stream: &mut Vec<u8>, opcode: u8, payload: &[u8]) {
