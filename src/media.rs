@@ -446,6 +446,7 @@ pub(crate) fn wav_sampler_metadata(path: &Path) -> Option<SamplerFileMetadata> {
     let mut smpl_root_key = None;
     let mut smpl_fine_tune_cents = None;
     let mut loop_points = None;
+    let mut ping_pong_loop = None;
     while cursor.checked_add(8)? <= riff_end {
         file.seek(SeekFrom::Start(cursor)).ok()?;
         let mut chunk_header = [0; 8];
@@ -517,6 +518,11 @@ pub(crate) fn wav_sampler_metadata(path: &Path) -> Option<SamplerFileMetadata> {
                             .ok()?;
                         let mut first_loop = [0; 24];
                         file.read_exact(&mut first_loop).ok()?;
+                        let loop_type = u32::from_le_bytes(
+                            first_loop[4..8]
+                                .try_into()
+                                .expect("the WAVE loop type has four bytes"),
+                        );
                         let start = u32::from_le_bytes(
                             first_loop[8..12]
                                 .try_into()
@@ -527,10 +533,12 @@ pub(crate) fn wav_sampler_metadata(path: &Path) -> Option<SamplerFileMetadata> {
                                 .try_into()
                                 .expect("the WAVE loop end has four bytes"),
                         );
-                        if let Some(end) = end_inclusive.checked_add(1)
+                        if matches!(loop_type, 0 | 1)
+                            && let Some(end) = end_inclusive.checked_add(1)
                             && start < end
                         {
                             loop_points = Some((start as usize, end as usize));
+                            ping_pong_loop = Some(loop_type == 1);
                         }
                     }
                 }
@@ -551,7 +559,7 @@ pub(crate) fn wav_sampler_metadata(path: &Path) -> Option<SamplerFileMetadata> {
         key_range: inst_key_range,
         velocity_range: inst_velocity_range,
         loop_points,
-        ping_pong_loop: None,
+        ping_pong_loop,
         release_loop_points: None,
         release_ping_pong_loop: None,
     };
@@ -1852,9 +1860,14 @@ mod tests {
     }
 
     fn wav_with_sampler_loop_fixture() -> Vec<u8> {
+        wav_with_sampler_loop_type_fixture(0)
+    }
+
+    fn wav_with_sampler_loop_type_fixture(loop_type: u32) -> Vec<u8> {
         let mut sampler = vec![0u8; 60];
         sampler[12..16].copy_from_slice(&60u32.to_le_bytes());
         sampler[28..32].copy_from_slice(&1u32.to_le_bytes());
+        sampler[36 + 4..36 + 8].copy_from_slice(&loop_type.to_le_bytes());
         sampler[36 + 8..36 + 12].copy_from_slice(&2u32.to_le_bytes());
         sampler[36 + 12..36 + 16].copy_from_slice(&4u32.to_le_bytes());
 
@@ -2098,6 +2111,37 @@ mod tests {
             wav_sampler_metadata(&path).and_then(|metadata| metadata.loop_points),
             Some((2, 5))
         );
+        assert_eq!(
+            wav_sampler_metadata(&path).and_then(|metadata| metadata.ping_pong_loop),
+            Some(false)
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reads_supported_wave_sampler_loop_directions_and_ignores_unsupported_types() {
+        let root = fixture_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("loop-direction.wav");
+
+        for (loop_type, expected_points, expected_ping_pong) in [
+            (0, Some((2, 5)), Some(false)),
+            (1, Some((2, 5)), Some(true)),
+            (2, None, None),
+            (32, None, None),
+        ] {
+            std::fs::write(&path, wav_with_sampler_loop_type_fixture(loop_type)).unwrap();
+            let metadata = wav_sampler_metadata(&path).expect("WAVE sampler header should parse");
+            assert_eq!(
+                metadata.loop_points, expected_points,
+                "loop type {loop_type}"
+            );
+            assert_eq!(
+                metadata.ping_pong_loop, expected_ping_pong,
+                "loop type {loop_type}"
+            );
+        }
 
         std::fs::remove_dir_all(root).unwrap();
     }
